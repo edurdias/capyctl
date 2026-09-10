@@ -1,0 +1,38 @@
+# mllm schema sketch; not an implemented configuration or tested engine recipe.
+schema_version: 1
+kind: server
+name: lab
+state_dir: /var/lib/mllm/server
+listeners:
+  management:
+    bind: "10.10.0.10:7443"
+    advertise_url: "https://mllm.lab:7443"
+    authentication: admin_token
+  agents:
+    bind: "10.10.0.10:7444"
+    advertise_url: "https://mllm.lab:7444"
+    authentication: mtls
+  inference:
+    bind: "10.10.0.10:8443"
+    advertise_url: "https://mllm.lab:8443"
+    authentication: api_key
+tls:
+  mode: managed
+  identity_dir: /var/lib/mllm/server/identity
+enrollment:
+  method: invitation
+  default_invitation_ttl: "15m"
+scheduler:
+  residency: exclusive_per_pool
+  queue:
+    max_requests_per_deployment: 32
+    max_buffered_bytes_total: "64MiB"
+    wait_timeout: "10m"
+lifecycle_defaults:
+  activation: on_demand
+  parking: auto
+  ready_idle_timeout: "5m"
+  parked_idle_timeout: "30m"
+logging:
+  level: info
+  log_prompts: false

@@ -1,0 +1,28 @@
+# mllm schema sketch; not an implemented configuration or tested engine recipe.
+schema_version: 1
+kind: standalone
+server:
+  name: local
+  state_dir: ./state/server
+  listeners:
+    management:
+      bind: "127.0.0.1:7443"
+      authentication: admin_token
+    inference:
+      bind: "127.0.0.1:8443"
+      authentication: api_key
+  tls:
+    mode: managed
+    identity_dir: ./state/server/identity
+host:
+  name: local
+  state_dir: ./state/host
+  connection: embedded
+  resource_policy:
+    allowed_devices: auto
+    memory:
+      accounting: auto
+      system:
+        managed_limit: auto
+        free_reserve: auto
+  runtime_profiles: {}

@@ -1,0 +1,28 @@
+# mllm schema sketch; not an implemented configuration or tested engine recipe.
+schema_version: 1
+kind: deployment
+name: coding-small
+ownership: managed
+model:
+  path: /srv/models/coding-small-r1
+runtime_profile: vllm-patched
+placement:
+  hosts: ["host-a"]
+resources:
+  per_host:
+    devices: ["gpu:0"]
+    memory:
+      system:
+        activation_peak: "48GiB"
+        ready_budget: "40GiB"
+        parked_budget: "2GiB"
+route:
+  model_id: coding-small
+lifecycle:
+  activation: on_demand
+  parking: auto
+kv_cache:
+  integration: none
+engine_args:
+  - --max-model-len
+  - "65536"

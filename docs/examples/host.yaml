@@ -1,0 +1,65 @@
+# mllm schema sketch; not an implemented configuration or tested engine recipe.
+schema_version: 1
+kind: host
+name: host-a
+state_dir: /var/lib/mllm/host
+server:
+  url: "https://mllm.lab:7444"
+  identity_dir: /var/lib/mllm/host/identity
+resource_policy:
+  allowed_devices: ["gpu:0"]
+  memory:
+    accounting: auto
+    system:
+      managed_limit: "96GiB"
+      free_reserve: "12GiB"
+      host_kv_limit: "16GiB"
+      parked_limit: "16GiB"
+  max_parked_groups: 3
+storage_pools:
+  checkpoints:
+    path: /srv/models
+    access: read_only
+  kv-local:
+    path: /srv/mllm/kv-cache
+    aggregate_limit: "200GiB"
+    filesystem_free_reserve: "50GiB"
+network:
+  ingress:
+    mode: when_api_facing
+    bind: "10.10.0.21:8444"
+    advertise_url: "https://host-a.lab:8444"
+    authentication: router_mtls
+    tls: managed
+  engine_api:
+    bind: "127.0.0.1"
+    port_range: [8100, 8199]
+runtime_profiles:
+  vllm-stock:
+    adapter: vllm
+    launch:
+      type: exec
+      command: ["/opt/vllm/bin/vllm", "serve"]
+      argument_contract: native
+  vllm-patched:
+    adapter: vllm
+    launch:
+      type: exec
+      command: ["/opt/inference/start-vllm-patched"]
+      argument_contract: native
+      working_directory: /opt/inference
+      environment_file: /etc/mllm/runtime/vllm-patched.env
+  sglang-patched:
+    adapter: sglang
+    launch:
+      type: exec
+      command: ["/opt/sglang/bin/python", "-m", "sglang.launch_server"]
+      argument_contract: native
+security:
+  allow_development_engine_controls: false
+supervision:
+  process_mode: foreground
+  stop_grace_period: "30s"
+logging:
+  level: info
+  log_prompts: false

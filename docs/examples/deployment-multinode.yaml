@@ -1,0 +1,37 @@
+# mllm schema sketch; not an implemented configuration or tested engine recipe.
+schema_version: 1
+kind: deployment
+name: coding-large
+ownership: managed
+model:
+  path: /srv/models/coding-large-r1
+runtime_profile: sglang-patched
+placement:
+  hosts: ["host-a", "host-b"]
+  head: host-a
+topology:
+  tensor_parallel: 2
+  pipeline_parallel: 1
+resources:
+  per_host:
+    devices: ["gpu:0"]
+    memory:
+      system:
+        activation_peak: "80GiB"
+        ready_budget: "72GiB"
+        parked_budget: "8GiB"
+route:
+  model_id: coding-large
+lifecycle:
+  activation: on_demand
+  parking: auto
+kv_cache:
+  integration: hicache
+  ownership: private
+  availability: required
+  per_host:
+    host_memory_budget: "6GiB"
+    storage:
+      pool: kv-local
+      max_bytes: "80GiB"
+      reclaimable: true
