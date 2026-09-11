@@ -5,7 +5,6 @@ use mllm_protocol::{deadline_ok, now_unix_ms, PROTOCOL_VERSION, SKEW_TOLERANCE_M
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tokio_stream::StreamExt;
 use tonic::transport::{Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
 

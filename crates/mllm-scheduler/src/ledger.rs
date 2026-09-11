@@ -71,10 +71,16 @@ pub fn index_by_domain(reservations: &[Reservation]) -> DomainOwners {
 
 /// Total bytes charged on a domain: the union over all owners, including the
 /// candidate's own current reservations. Shared-service owners are counted
-/// once because F0 enforces unique owner ids.
+/// once because F0 enforces unique owner ids. Saturating: hostile inputs
+/// must never wrap into a spurious admission grant.
 pub fn charged_bytes(ledger: &DomainOwners, domain: &str) -> i64 {
     ledger
         .get(domain)
-        .map(|owners| owners.values().flatten().map(|r| r.bytes).sum())
+        .map(|owners| {
+            owners
+                .values()
+                .flatten()
+                .fold(0i64, |acc, r| acc.saturating_add(r.bytes))
+        })
         .unwrap_or(0)
 }

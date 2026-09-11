@@ -325,6 +325,16 @@ impl crate::Store {
         Ok(())
     }
 
+    /// All journal evidence recorded for an operation, in insertion order.
+    pub fn journal_evidence(&self, operation_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT evidence FROM journal_entries WHERE operation_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([operation_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// The most recent operation recorded for a deployment.
     pub fn latest_operation(
         &self,

@@ -24,7 +24,7 @@ fn t08_id_returned_after_persistence_survives_new_client() {
     let id = {
         let s = Store::open(&path).unwrap(); // "process 1"
         let accepted = s.accept_deployment(req("d1", "k1")).unwrap();
-        accepted.deployment_id.clone()
+        accepted.deployment_id
     }; // store dropped
     let s2 = Store::open(&path).unwrap(); // "new client"
     let row = s2.get_deployment(&id.to_string()).unwrap().unwrap();

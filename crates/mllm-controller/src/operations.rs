@@ -7,9 +7,9 @@
 //! Semantics this module commits to:
 //!
 //! * `AdapterError::Uncertain` never resolves to a fabricated success: the
-//!   observed state goes to RECONCILING, and reconciliation confirms only
-//!   what the adapter can prove (a Ready engine phase). Anything it cannot
-//!   prove resolves RECONCILING → FAILED (legal via the table's
+//!   observed state goes to RECONCILING. F0 reconciliation is fail-closed:
+//!   it never consults the adapter to confirm an outcome, so every failure
+//!   or uncertainty resolves RECONCILING → FAILED (legal via the table's
 //!   reconciliation outcomes).
 //! * Deterministic adapter failures (policy denial, crash, launcher
 //!   failure) also route through RECONCILING → FAILED so FAILED is only
@@ -18,7 +18,7 @@
 //!   against a synthetic 128 GiB system-memory observation resolved by
 //!   `resolve_auto` (F0 has no real topology discovery; the value is the
 //!   documented synthetic host). The candidate's activation peak is the
-//!   fake engine's resident-footprint constant.
+//!   F0 synthetic footprint constant (`F0_SYNTHETIC_ACTIVATION_PEAK`).
 //! * Idempotency key derivation (design rule: SHA-256 over server context
 //!   id + deployment name + canonical manifest bytes) lives here, where
 //!   the submission is composed: for F0 the context id is the literal
@@ -42,10 +42,10 @@ use mllm_scheduler::ledger::{Domain, DomainKind, HostLimits};
 use mllm_store::{AcceptDeployment, NewOperation, OpState, Store, StoreError};
 use sha2::{Digest, Sha256};
 
-/// F0 fake-engine constants carried into the ledger: the synthetic
-/// candidate sizes use the fake engine's own footprint constants so the
-/// ledger entries describe the same deployment the engine simulates.
-use mllm_adapters::fake::FULL_RESIDENT_BYTES;
+/// F0 synthetic activation footprint charged as the candidate's peak in
+/// admission (F0 has no real adapters; real adapters source peaks from
+/// their recipes in F1).
+const F0_SYNTHETIC_ACTIVATION_PEAK: i64 = 4096;
 
 /// Synthetic host observation backing F0 admission (no topology
 /// discovery): 128 GiB of observed system memory, resolved by
@@ -491,7 +491,7 @@ impl ExecTask {
         let member = Self::member(dep);
         let result: Result<(), (bool, String)> = match step {
             Step::Admit => self
-                .admission_check(dep)
+                .admission_check(dep, op, state)
                 .map_err(|code| (false, code))
                 .map(|_| ()),
             Step::Spawn => {
@@ -604,7 +604,7 @@ impl ExecTask {
                             );
                             Ok(())
                         }
-                        Err(e) => Err((false, terminate_code(&e))),
+                        Err(e) => Err((false, spawn_code(&e))),
                     },
                     None => Err((false, "no_live_handle".to_string())),
                 }
@@ -626,9 +626,9 @@ impl ExecTask {
         })
     }
 
-    /// Deterministic failure / uncertainty resolution: observed goes
-    /// RECONCILING → the outcome the adapter can actually prove. Only a
-    /// proven-Ready engine resolves to Ready; anything unprovable fails
+    /// Failure/uncertainty resolution: observed goes RECONCILING → FAILED.
+    /// F0 reconciliation is fail-closed — it never consults the adapter to
+    /// confirm an outcome, so every failure or uncertainty lands in FAILED
     /// (never a fabricated success).
     async fn finish(
         &self,
@@ -673,10 +673,17 @@ impl ExecTask {
     }
 
     /// F0 admission: a synthetic 128 GiB system observation (documented
-    /// in the module docs), auto-resolved limits, the fake engine's
-    /// resident footprint as the activation peak, and an empty ledger
-    /// (fresh host). Runs the mllm-scheduler ledger end-to-end.
-    fn admission_check(&self, dep: &str) -> Result<(), String> {
+    /// in the module docs), auto-resolved limits, the F0 synthetic
+    /// footprint as the activation peak, and an empty ledger (fresh
+    /// host). Runs the mllm-scheduler ledger end-to-end and, on success,
+    /// journals the auto-resolution provenance (policy version, observed
+    /// bytes, resolved limits) as evidence.
+    fn admission_check(
+        &self,
+        dep: &str,
+        op: &OperationId,
+        state: LifecycleState,
+    ) -> Result<(), String> {
         let observed = SYNTHETIC_SYSTEM_OBSERVED_BYTES;
         let resolved = resolve_auto(observed)
             .map_err(|d| format!("{}:{}", d.code, d.detail))
@@ -699,12 +706,23 @@ impl ExecTask {
         let candidate = Candidate {
             owner: OwnerAccountId(dep.to_string()),
             domain: "system".to_string(),
-            activation_peak: FULL_RESIDENT_BYTES,
+            activation_peak: F0_SYNTHETIC_ACTIVATION_PEAK,
             parked_budget: None,
             category: None,
             devices: vec![],
         };
         admit(&domains, &[], &candidate, &limits).map_err(|reason| format!("{reason:?}"))?;
+        self.journal(
+            op,
+            state,
+            format!(
+                r#"{{"event":"admitted","policy_version":{v},"observed_bytes":{obs},"managed_limit":{ml},"free_reserve":{fr},"owner":"{dep}"}}"#,
+                v = resolved.policy_version,
+                obs = resolved.observed_bytes,
+                ml = resolved.managed_limit,
+                fr = resolved.free_reserve,
+            ),
+        );
         Ok(())
     }
 }
@@ -724,13 +742,6 @@ fn adapter_code(err: &AdapterError) -> String {
 }
 
 fn spawn_code(err: &LauncherError) -> String {
-    match err {
-        LauncherError::SpawnFailed(detail) => format!("spawn_failed:{detail}"),
-        LauncherError::TerminateFailed(detail) => format!("terminate_failed:{detail}"),
-    }
-}
-
-fn terminate_code(err: &LauncherError) -> String {
     match err {
         LauncherError::SpawnFailed(detail) => format!("spawn_failed:{detail}"),
         LauncherError::TerminateFailed(detail) => format!("terminate_failed:{detail}"),
@@ -838,6 +849,30 @@ mod tests {
         // No new operation was recorded for the illegal request.
         let after = c.store.lock().unwrap().latest_operation(&dep).unwrap().unwrap();
         assert_eq!(before.id, after.id);
+    }
+
+    #[tokio::test]
+    async fn admission_journals_auto_resolution_provenance() {
+        use mllm_scheduler::auto::AUTO_POLICY_VERSION;
+        let (c, _engine, _launcher) = controller(FakeEngine::new());
+        let dep = c.submit_deploy(req("m1")).await.unwrap();
+        drive(&c, &dep, LifecycleAction::Start, Ok(LifecycleState::Ready)).await;
+        let store = c.store.lock().unwrap();
+        let op = store.latest_operation(&dep).unwrap().unwrap();
+        let evidence = store.journal_evidence(&op.id).unwrap();
+        let resolved = resolve_auto(SYNTHETIC_SYSTEM_OBSERVED_BYTES).unwrap();
+        let expected = format!(
+            r#"{{"event":"admitted","policy_version":{v},"observed_bytes":{obs},"managed_limit":{ml},"free_reserve":{fr},"owner":"{dep}"}}"#,
+            v = resolved.policy_version,
+            obs = resolved.observed_bytes,
+            ml = resolved.managed_limit,
+            fr = resolved.free_reserve,
+        );
+        assert!(
+            evidence.contains(&expected),
+            "admitted evidence must carry the resolved auto values; got {evidence:?}"
+        );
+        assert_eq!(resolved.policy_version, AUTO_POLICY_VERSION);
     }
 
     #[test]

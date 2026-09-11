@@ -67,15 +67,19 @@ pub fn admit(
     let mut parked = 0i64;
     for r in reservations.iter().filter(|r| r.domain == candidate.domain) {
         match r.category {
-            Some(Category::HostKv) => host_kv += r.bytes,
-            Some(Category::ParkedResidue) => parked += r.bytes,
+            Some(Category::HostKv) => host_kv = host_kv.saturating_add(r.bytes),
+            Some(Category::ParkedResidue) => parked = parked.saturating_add(r.bytes),
             _ => {}
         }
     }
     match candidate.category {
-        Some(Category::HostKv) => host_kv += candidate.activation_peak,
+        Some(Category::HostKv) => host_kv = host_kv.saturating_add(candidate.activation_peak),
         Some(Category::ParkedResidue) => {
-            parked += candidate.parked_budget.unwrap_or(candidate.activation_peak)
+            parked = parked.saturating_add(
+                candidate
+                    .parked_budget
+                    .unwrap_or(candidate.activation_peak),
+            )
         }
         _ => {}
     }
@@ -98,7 +102,7 @@ pub fn admit(
     // own reservations. When the candidate itself holds a Parked reservation, its
     // budget replaces rather than stacks (replace-don't-stack).
     let charged = charged_bytes(&ledger, &candidate.domain)
-        + rollup_bytes(domains, reservations, &candidate.domain);
+        .saturating_add(rollup_bytes(domains, reservations, &candidate.domain));
     let holds_parked = ledger
         .get(&candidate.domain)
         .and_then(|owners| owners.get(&candidate.owner))
@@ -109,7 +113,7 @@ pub fn admit(
         } else {
             0
         };
-    if charged + delta > limits.managed_limit {
+    if charged.saturating_add(delta) > limits.managed_limit {
         return Err(BlockReason::InsufficientResources);
     }
 
@@ -145,8 +149,7 @@ fn rollup_bytes(domains: &[Domain], reservations: &[Reservation], target: &str) 
     reservations
         .iter()
         .filter(|r| r.domain != target && !domains.iter().any(|d| d.id == r.domain))
-        .map(|r| r.bytes)
-        .sum()
+        .fold(0i64, |acc, r| acc.saturating_add(r.bytes))
 }
 
 #[cfg(test)]
@@ -323,6 +326,30 @@ mod tests {
         let all: Vec<Reservation> = [c_parked].into_iter().chain(others).collect();
         assert!(matches!(
             admit(&[], &all, &cand, &limits),
+            Err(BlockReason::InsufficientResources)
+        ));
+    }
+
+    #[test]
+    fn hostile_huge_values_block_instead_of_overflowing() {
+        // i64::MAX/2-sized reservations must saturate, not wrap into a
+        // spurious admission grant (or panic in debug builds).
+        let limits = HostLimits {
+            managed_limit: 96 * GI_B,
+            free_reserve: 12 * GI_B,
+            host_kv_limit: None,
+            parked_limit: None,
+            observation_ttl_secs: 60,
+            now_unix: 0,
+        };
+        let huge = i64::MAX / 2;
+        let existing = vec![res("A", huge), res("B", huge)];
+        let cand = Candidate {
+            activation_peak: huge,
+            ..cand_min()
+        };
+        assert!(matches!(
+            admit(&[sys(128 * GI_B, 0)], &existing, &cand, &limits),
             Err(BlockReason::InsufficientResources)
         ));
     }
