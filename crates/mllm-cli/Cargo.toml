@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+clap = { workspace = true }
 thiserror = { workspace = true }
 
 [[bin]]
