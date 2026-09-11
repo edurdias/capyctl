@@ -3,6 +3,16 @@ name = "mllm-protocol"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.13"

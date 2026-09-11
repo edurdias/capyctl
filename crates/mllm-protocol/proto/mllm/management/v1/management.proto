@@ -1,0 +1,131 @@
+syntax = "proto3";
+package mllm.management.v1;
+
+// Common envelope for every command and report.
+message Envelope {
+  string host_id = 1;
+  string deployment_id = 2;     // empty for host-scoped operations
+  int64  generation = 3;
+  string operation_id = 4;
+  int64  deadline_unix_ms = 5;
+  string protocol_version = 6;  // "1"
+  string expected_state = 7;    // expected observed-state precondition
+  string profile_fingerprint = 8; // expected runtime build fingerprint
+}
+
+// --- Bootstrap (server-authenticated enrollment; exercised in F3) ---
+service Bootstrap {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+message EnrollRequest {
+  string invitation_id = 1;
+  string invitation_secret = 2;   // single-use; server verifies + burns
+  string host_name = 3;
+  bytes  client_public_key = 4;   // host-generated key retained locally
+}
+message EnrollResponse {
+  string host_id = 1;
+  string server_certificate = 2;  // CA/trust material for pinning
+  int64  lease_expires_unix = 3;
+}
+
+// --- Agent control (agent-initiated bidirectional stream) ---
+service AgentControl {
+  rpc Session(stream AgentToServer) returns (stream ServerToAgent);
+}
+
+message AgentToServer {
+  oneof msg {
+    Connect connect = 1;
+    ReportInventory report_inventory = 2;
+    ReportOperationResult report_operation_result = 3;
+  }
+}
+message Connect {
+  string host_id = 1;
+  string protocol_version = 2;
+  bytes  journal_resume_token = 3;   // bounded operation history
+  Envelope envelope = 4;
+}
+message ReportInventory {
+  repeated DomainObservation domains = 1;
+  repeated RuntimeProfileStatus profiles = 2;
+  Envelope envelope = 3;
+}
+message DomainObservation {
+  string domain_id = 1;        // stable local identity
+  string kind = 2;             // system | device_memory | filesystem | remote_storage
+  int64  observed_bytes = 3;   // -1 = unknown (closes admission upstream)
+  int64  observed_at_unix = 4;
+}
+message RuntimeProfileStatus {
+  string name = 1;
+  string build_fingerprint = 2;
+  string eligibility = 3;      // unknown | qualified | unsupported | disabled
+  string reason = 4;
+}
+message ReportOperationResult {
+  string operation_id = 1;
+  string state = 2;            // accepted | rejected | applied | failed | ambiguous
+  string error_code = 3;
+  string evidence_json = 4;    // observations, exit status, released bytes
+  Envelope envelope = 5;
+}
+
+message ServerToAgent {
+  oneof msg {
+    LaunchMember launch_member = 1;
+    OpenIngressGate open_ingress_gate = 2;
+    Inspect inspect = 3;
+    GroupControl group_control = 4;
+    TerminateMember terminate_member = 5;
+    CancelWork cancel_work = 6;
+  }
+}
+message LaunchMember {
+  string profile_name = 1;
+  string profile_fingerprint = 2;
+  ResourcePlan plan = 3;
+  string rendered_command_json = 4;   // full argv + env, secrets redacted upstream
+  string role = 5;                    // head | worker | ingress
+  string member_id = 6;
+  Envelope envelope = 7;              // appended pre-freeze; additive, never renumbered
+}
+message OpenIngressGate {
+  string member_id = 1;
+  int64  generation = 2;
+  string router_identity_fingerprint = 3;
+  Envelope envelope = 4;
+}
+message Inspect {
+  string member_id = 1;              // empty = whole host
+  Envelope envelope = 2;
+}
+message GroupControl {
+  string deployment_id = 1;
+  int64  generation = 2;
+  string action = 3;                 // prepare_park | park | restore | reload_weights
+  string lead_member_id = 4;         // collective invoked once through the lead
+  Envelope envelope = 5;
+}
+message TerminateMember {
+  string member_id = 1;
+  string owned_handle = 2;           // PID + start identity / container id
+  int32  grace_period_seconds = 3;
+  Envelope envelope = 4;
+}
+message CancelWork {
+  string member_id = 1;
+  string request_ref = 2;            // backend-issued request identity
+  bool   require_acknowledgement = 3;
+  Envelope envelope = 4;
+}
+message ResourcePlan {
+  repeated DomainAllocation allocations = 1;
+  repeated string exclusive_devices = 2;
+}
+message DomainAllocation {
+  string domain_id = 1;
+  int64  bytes = 2;
+  string phase = 3;                  // activation | ready | parked
+}
