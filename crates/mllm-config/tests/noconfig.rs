@@ -21,8 +21,24 @@ fn t02_missing_implicit_generates_once_with_protected_files() {
     };
     assert!(created_identity);
     assert!(config_path.exists());
-    let mode = config_path.metadata().unwrap().permissions().mode();
-    assert_eq!(mode & 0o077, 0, "no group/other bits on generated config");
+    // Exact owner-only modes: config 0600, state root + identity dir 0700.
+    let mode = |p: &_| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&config_path),
+        0o600,
+        "generated config is owner-read/write only"
+    );
+    assert_eq!(mode(&d), 0o700, "state root is owner-only");
+    assert_eq!(
+        mode(&d.join("identity")),
+        0o700,
+        "identity dir is owner-only"
+    );
+    assert_eq!(
+        mode(&d.join("identity").join("credentials")),
+        0o600,
+        "credentials are owner-only"
+    );
     // Second call loads, not regenerates: mtime unchanged
     let m1 = fs::metadata(&config_path).unwrap().modified().unwrap();
     let out2 = resolve_startup(ConfigKind::Standalone, None, &d).unwrap();
@@ -68,6 +84,10 @@ fn explicit_missing_path_fails() {
     let d = temp_state_dir();
     let missing = d.join("nope.yaml");
     let err = resolve_startup(ConfigKind::Standalone, Some(&missing), &d).unwrap_err();
+    assert!(
+        matches!(err.code, mllm_config::ConfigErrorCode::Io),
+        "{err}"
+    );
     assert!(err.detail.contains("does not exist"), "{err}");
     // No silent generation through the explicit path.
     assert!(credential_fingerprint(&d).count() == 0);
@@ -111,11 +131,16 @@ fn generated_config_passes_task3_validate() {
     let creds = fs::read_to_string(d.join("identity").join("credentials")).unwrap();
     assert!(creds.contains("admin_token: "));
     assert!(creds.contains("api_key: "));
-    let mode = fs::metadata(d.join("identity").join("credentials"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o077, 0, "credentials are owner-only");
+    // Exact owner-only modes after standalone generation.
+    let mode = |p: &_| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600, "config file is 0600");
+    assert_eq!(
+        mode(&d.join("identity").join("credentials")),
+        0o600,
+        "credentials are 0600"
+    );
+    assert_eq!(mode(&d.join("identity")), 0o700, "identity dir is 0700");
+    assert_eq!(mode(&d), 0o700, "state root is 0700");
 }
 
 #[test]
@@ -126,4 +151,8 @@ fn non_standalone_generation_is_rejected() {
         err.code,
         mllm_config::ConfigErrorCode::UnsupportedCombination
     ));
+    // Validate before side effects: no identity dir or config tree is
+    // created for a rejected generation.
+    assert!(!d.join("identity").exists());
+    assert!(!d.join("config").exists());
 }

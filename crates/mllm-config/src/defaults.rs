@@ -8,24 +8,38 @@
 //! | No `--config`; implicit config exists and is valid | Load and validate it. |
 //! | No `--config`; implicit config exists and is invalid | Error — invalid content is never a reset trigger. |
 //! | No `--config`; no implicit config | Atomically generate the standalone default (server + embedded host), local-only authenticated listeners, per-user absolute paths, protected credentials at `state_dir/identity/credentials`. No engine execution. |
-//! | Explicit path missing | Fail — generation only happens for the implicit no-config case. |
+//! | Explicit path missing | Fail with [`ConfigErrorCode::Io`] — generation only happens for the implicit no-config case. |
 //! | Explicit path invalid | Fail — propagate the validation error. |
+//!
+//! Ordering guarantees: the generated document is rendered and validated
+//! *before* any side effect (no identity directory is orphaned by a
+//! validation failure), then credentials, then the config file.
 //!
 //! Atomicity: files are written to a `NamedTempFile` next to their final
 //! location with `0600` permissions set before an atomic `rename`
-//! (replaces any concurrent loser deterministically); directories are
-//! created `0700`; the credentials file is created with
+//! (replaces any concurrent loser deterministically); the state root and
+//! generated directories are `0700`; the credentials file is created with
 //! `OpenOptions::create_new` (exclusive), so the first committer wins and
-//! concurrent starts never regenerate or clobber credentials. This module
-//! never executes engines and never touches `mllm-adapters`.
+//! concurrent starts never regenerate or clobber credentials.
+//!
+//! Fail-closed entropy: credentials come from the OS entropy source only.
+//! If it cannot be read, generation fails loudly with [`ConfigErrorCode::Io`]
+//! and nothing is written — guessable credentials are never generated.
+//! This module never executes engines and never touches `mllm-adapters`.
 
 use crate::error::{ConfigError, ConfigErrorCode};
 use crate::schema::ConfigKind;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
+
+/// OS entropy source for credential generation.
+const ENTROPY_SOURCE: &str = "/dev/urandom";
+
+/// Credential length in bytes (rendered as 64 hex chars).
+const CREDENTIAL_BYTES: usize = 32;
 
 /// Result of resolving the startup configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +69,7 @@ pub fn resolve_startup(
         Some(path) => {
             if !path.exists() {
                 return Err(ConfigError::new(
-                    ConfigErrorCode::MissingRequired,
+                    ConfigErrorCode::Io,
                     "config",
                     format!("explicit config path `{}` does not exist", path.display()),
                 ));
@@ -73,8 +87,7 @@ pub fn resolve_startup(
                     config_path.to_string_lossy().into_owned(),
                 ))
             } else {
-                let created_identity = write_credentials(state_dir).map_err(io_err)?;
-                let (config_path, _bytes) = generate_default(kind, state_dir)?;
+                let (config_path, created_identity, _bytes) = create_default(kind, state_dir)?;
                 Ok(LoadOutcome::Generated {
                     config_path,
                     created_identity,
@@ -93,6 +106,17 @@ pub fn generate_default(
     kind: ConfigKind,
     state_dir: &Path,
 ) -> Result<(PathBuf, Vec<u8>), ConfigError> {
+    create_default(kind, state_dir).map(|(path, _created_identity, bytes)| (path, bytes))
+}
+
+/// Shared generation pipeline: kind check, private state root, render and
+/// validate (no side effects yet), credentials (once), atomic config write.
+///
+/// Returns `(config_path, created_identity, config_bytes)`.
+fn create_default(
+    kind: ConfigKind,
+    state_dir: &Path,
+) -> Result<(PathBuf, bool, Vec<u8>), ConfigError> {
     if kind != ConfigKind::Standalone {
         return Err(ConfigError::new(
             ConfigErrorCode::UnsupportedCombination,
@@ -103,25 +127,28 @@ pub fn generate_default(
             ),
         ));
     }
-    let config_dir = ensure_private_dir(&state_dir.join("config")).map_err(io_err)?;
-    // Credential-once: if a concurrent start already wrote them, this is a
-    // no-op. The generated config references `identity_dir`, not secrets.
-    write_credentials(state_dir).map_err(io_err)?;
-
+    ensure_private_dir(state_dir).map_err(io_err)?;
     let yaml = render_standalone(state_dir);
     // Integration check: a generated document must pass Task 3 validation
-    // before any file touches disk.
+    // before any file or directory is created (validate before side
+    // effects, SPEC §15.3).
     crate::strict_yaml::validate(&yaml, kind)?;
 
+    // Credential-once: if a concurrent start already wrote them, this is a
+    // no-op. The generated config references `identity_dir`, not secrets.
+    let created_identity = write_credentials(state_dir)?;
+
+    let config_dir = ensure_private_dir(&state_dir.join("config")).map_err(io_err)?;
     let config_path = config_dir.join("standalone.yaml");
     let mut tmp = NamedTempFile::new_in(&config_dir).map_err(io_err)?;
     tmp.write_all(yaml.as_bytes()).map_err(io_err)?;
+    use std::io::Write as _;
     tmp.flush().map_err(io_err)?;
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o600)).map_err(io_err)?;
     // Atomic on Linux: concurrent renames are safe; identical content makes
     // the winner deterministic.
     tmp.persist(&config_path).map_err(|e| io_err(e.error))?;
-    Ok((config_path, yaml.into_bytes()))
+    Ok((config_path, created_identity, yaml.into_bytes()))
 }
 
 /// Implicit role config location for F0: `<state_dir>/config/<kind>.yaml`.
@@ -134,14 +161,22 @@ fn implicit_config_path(kind: ConfigKind, state_dir: &Path) -> PathBuf {
 fn read_config(path: &Path) -> Result<String, ConfigError> {
     fs::read_to_string(path).map_err(|e| {
         ConfigError::new(
-            ConfigErrorCode::SchemaVersion,
+            ConfigErrorCode::Io,
             "config",
             format!("failed to read `{}`: {e}", path.display()),
         )
     })
 }
 
-/// Create `path` (and parents) with owner-only `0700` permissions.
+/// Create `path` (and parents) with owner-only `0700` permissions on
+/// `path` itself.
+///
+/// `create_dir_all` may leave newly created directories at the process
+/// umask (typically `0755`), so `path` is chmod'd to `0700` explicitly.
+/// The state root is passed here first (see [`create_default`]), so the
+/// `config`/`identity` subdirectories are always nested inside an already
+/// owner-only root; shared ancestors outside the state root are never
+/// touched.
 fn ensure_private_dir(path: &Path) -> std::io::Result<PathBuf> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -154,8 +189,19 @@ fn ensure_private_dir(path: &Path) -> std::io::Result<PathBuf> {
 /// `OpenOptions::create_new` succeeds only for the first committer; every
 /// concurrent start observes `AlreadyExists` and keeps the existing
 /// credentials. Returns whether this call created them.
-fn write_credentials(state_dir: &Path) -> std::io::Result<bool> {
-    let identity_dir = ensure_private_dir(&state_dir.join("identity"))?;
+///
+/// Fail-closed: credentials are read from [`ENTROPY_SOURCE`] *before* any
+/// file is created; an unreadable entropy source is a loud
+/// [`ConfigErrorCode::Io`] error and no credentials file is written.
+fn write_credentials(state_dir: &Path) -> Result<bool, ConfigError> {
+    write_credentials_from(state_dir, ENTROPY_SOURCE)
+}
+
+/// [`write_credentials`] with an injectable entropy source (test seam).
+fn write_credentials_from(state_dir: &Path, entropy: &str) -> Result<bool, ConfigError> {
+    let token = hex_string(os_random_bytes_from(entropy, CREDENTIAL_BYTES)?);
+    let key = hex_string(os_random_bytes_from(entropy, CREDENTIAL_BYTES)?);
+    let identity_dir = ensure_private_dir(&state_dir.join("identity")).map_err(io_err)?;
     let path = identity_dir.join("credentials");
     match OpenOptions::new()
         .write(true)
@@ -164,20 +210,24 @@ fn write_credentials(state_dir: &Path) -> std::io::Result<bool> {
         .open(&path)
     {
         Ok(mut file) => {
-            writeln!(file, "admin_token: {}", random_hex(32)).map_err(|e| {
-                let _ = fs::remove_file(&path);
-                e
-            })?;
-            writeln!(file, "api_key: {}", random_hex(32)).map_err(|e| {
-                let _ = fs::remove_file(&path);
-                e
-            })?;
-            file.flush()?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            Ok(true)
+            use std::io::Write as _;
+            let result = (|| {
+                writeln!(file, "admin_token: {token}")?;
+                writeln!(file, "api_key: {key}")?;
+                file.flush()?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    let _ = fs::remove_file(&path);
+                    Err(io_err(e))
+                }
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(e),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -217,35 +267,31 @@ fn render_standalone(state_dir: &Path) -> String {
 }
 
 fn io_err(e: std::io::Error) -> ConfigError {
-    ConfigError::new(
-        ConfigErrorCode::SchemaVersion,
-        "config",
-        format!("io error: {e}"),
-    )
+    ConfigError::new(ConfigErrorCode::Io, "config", format!("io error: {e}"))
 }
 
-/// Random hex string from the OS entropy source, with a deterministic
-/// xorshift fallback so generation never hard-fails on unusual systems.
-fn random_hex(n_bytes: usize) -> String {
+/// Read `n_bytes` from `source`; fail loudly if the OS entropy source is
+/// unavailable — there is no fallback, because predictable credentials are
+/// worse than none.
+fn os_random_bytes_from(source: &str, n_bytes: usize) -> Result<Vec<u8>, ConfigError> {
     let mut buf = vec![0u8; n_bytes];
-    let filled = File::open("/dev/urandom")
+    File::open(source)
         .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !filled {
-        let mut state = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E3779B97F4A7C15)
-            ^ ((std::process::id() as u64) << 32)
-            ^ (&buf as *const _ as u64);
-        for b in buf.iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *b = (state >> 24) as u8;
-        }
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+        .map_err(|e| {
+            ConfigError::new(
+                ConfigErrorCode::Io,
+                "identity.credentials",
+                format!(
+                    "cannot read OS entropy source `{source}`: {e} — \
+                     refusing to generate guessable credentials"
+                ),
+            )
+        })?;
+    Ok(buf)
+}
+
+fn hex_string(bytes: Vec<u8>) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -273,13 +319,37 @@ mod tests {
     }
 
     #[test]
-    fn dirs_are_owner_only() {
+    fn dirs_are_owner_only_including_state_root() {
         let d = temp_dir();
-        ensure_private_dir(&d.join("a").join("b")).unwrap();
-        let mode = fs::metadata(d.join("a").join("b"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0);
+        ensure_private_dir(&d).unwrap();
+        ensure_private_dir(&d.join("identity")).unwrap();
+        assert_eq!(
+            fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(d.join("identity"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn unreadable_entropy_fails_loudly_without_writing_credentials() {
+        let d = temp_dir();
+        let err = write_credentials_from(&d, "/nonexistent/entropy").unwrap_err();
+        assert!(matches!(err.code, ConfigErrorCode::Io), "{err}");
+        assert!(err.detail.contains("guessable credentials"), "{err}");
+        // Fail-closed: no credentials file was written.
+        assert!(!d.join("identity").join("credentials").exists());
+    }
+
+    #[test]
+    fn real_entropy_is_readable_in_test_environments() {
+        let bytes = os_random_bytes_from(ENTROPY_SOURCE, CREDENTIAL_BYTES).unwrap();
+        assert_eq!(bytes.len(), CREDENTIAL_BYTES);
     }
 }

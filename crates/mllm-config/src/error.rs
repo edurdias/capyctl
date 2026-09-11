@@ -23,6 +23,12 @@ pub enum ConfigErrorCode {
     ContradictoryConnection,
     #[error("schema version / kind mismatch")]
     SchemaVersion,
+    /// Filesystem/OS-level failures: unreadable files, missing paths
+    /// (including an explicit config path that does not exist), failed
+    /// atomic writes, unreadable OS entropy. Callers distinguishing
+    /// "not found" from other I/O problems should inspect `detail`.
+    #[error("io error")]
+    Io,
 }
 
 /// A config validation failure: code plus dotted path and human detail.
