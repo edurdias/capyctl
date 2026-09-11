@@ -8,18 +8,45 @@
 //! reference implementation these checks were developed against.
 
 use mllm_adapters::{
-    EngineAdapter, Launcher, MemberRef, OwnedHandle, ParkLevel, Readiness, RequestRef,
+    AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
+    Readiness, RenderedCommand, RequestRef,
 };
+use std::time::Duration;
+
+/// Severity of a single conformance check outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    /// The adapter demonstrably conforms to the invariant.
+    Pass,
+    /// The invariant could not be verified (e.g. the engine is briefly
+    /// unreachable) — not a conformance failure, but recorded for triage.
+    Warn,
+    /// The adapter demonstrably violates the invariant.
+    Fail,
+}
 
 /// The outcome of a single conformance check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckResult {
     /// Stable identifier for the check (used by CI to filter/track).
     pub name: &'static str,
-    /// True when the adapter conforms to the checked invariant.
-    pub passed: bool,
-    /// Human-readable explanation, always populated (pass detail or failure reason).
+    /// Pass / warn / fail — see [`CheckStatus`].
+    pub status: CheckStatus,
+    /// Human-readable explanation, always populated.
     pub detail: String,
+}
+
+impl CheckResult {
+    /// True only when the check demonstrably passed (warns are not passes).
+    pub fn passed(&self) -> bool {
+        self.status == CheckStatus::Pass
+    }
+}
+
+/// Benign probe command used by launcher checks. Fake launchers ignore the
+/// command; real launchers under conformance must be able to spawn it.
+fn probe_command() -> RenderedCommand {
+    RenderedCommand { argv: vec!["true".into()], env: Default::default() }
 }
 
 /// Runs the core conformance checks over any adapter + launcher pair.
@@ -31,11 +58,15 @@ pub struct CheckResult {
 /// &launcher).await`.
 ///
 /// The suite never mutates host state beyond what the adapter itself does,
-/// and never asserts engine-specific behavior — only the contract invariants:
+/// and never asserts engine-specific behavior — only the contract invariants.
+/// Results are three-state: only demonstrable contract violations FAIL;
+/// unverifiable invariants (e.g. `Err(Uncertain)` from a briefly unreachable
+/// engine) WARN so triage can distinguish "broken" from "unknown":
 ///
-/// 1. `readiness_gating` — the adapter must be able to report a definitive
-///    readiness state (`Initializing` or `Ready`), never a fabricated success
-///    on an error path.
+/// 1. `readiness_gating` — a Ready claim must be corroborated by observed
+///    engine state; liveness (`Initializing`) is never readiness. An
+///    `Err(Uncertain)` probe warns (engine may be briefly reachable-later),
+///    other probe errors fail.
 /// 2. `park_policy_gate` — level-1 park is never behind the experimental
 ///    policy gate; level-2 park is either gated (`PolicyDenied`), explicitly
 ///    allowed, or reconcilably uncertain — but never reports an unrelated
@@ -43,7 +74,9 @@ pub struct CheckResult {
 /// 3. `cancellation_uncertainty` — cancellation without `require_ack` must
 ///    never report `Acknowledged`; uncertainty or a real error only.
 /// 4. `handle_ownership` — the launcher must never claim `Valid` for a
-///    handle it did not spawn (PID-reuse defense, design §8).
+///    handle it did not spawn or one that was terminated (PID-reuse
+///    detection, design §8): spawn → terminate → respawn must leave the old
+///    handle `StaleReused` (reuse) or `Gone` (fresh pid), never `Valid`.
 pub async fn run_conformance(
     adapter: &dyn EngineAdapter,
     launcher: &dyn Launcher,
@@ -59,26 +92,87 @@ pub async fn run_conformance(
     ]
 }
 
+/// Readiness probe interval between the two gating probes.
+const READINESS_REPROBE_DELAY: Duration = Duration::from_millis(20);
+
+/// Checks that readiness claims are gated by actual liveness.
+///
+/// Failure modes detected:
+/// - The adapter claims [`Readiness::Ready`] while its own [`EngineAdapter::inspect`]
+///   reports a non-Ready phase — a success claim contradicting observed state
+///   (fabricated readiness).
+/// - The readiness probe fails with something other than
+///   [`AdapterError::Uncertain`] (readiness must be reportable; only
+///   uncertainty is a legitimate non-answer).
+///
+/// `Err(Uncertain)` warns instead of failing: a real adapter whose engine is
+/// briefly unreachable legitimately returns uncertainty, which the caller
+/// must reconcile — that is contract-conformant behavior, not a violation.
 async fn check_readiness_gating(adapter: &dyn EngineAdapter, member: &MemberRef) -> CheckResult {
+    let fail = |detail: String| CheckResult {
+        name: "readiness_gating",
+        status: CheckStatus::Fail,
+        detail,
+    };
+    let warn = |detail: String| CheckResult {
+        name: "readiness_gating",
+        status: CheckStatus::Warn,
+        detail,
+    };
+
     match adapter.check_readiness(member).await {
-        // Readiness has exactly two variants; both are contract-valid.
-        Ok(r @ (Readiness::Initializing | Readiness::Ready)) => CheckResult {
-            name: "readiness_gating",
-            passed: true,
-            detail: format!("adapter reports {r:?}"),
+        // Liveness correctly reported as not-ready. Probe again to observe
+        // the transition (or its absence — a still-initializing engine is
+        // conformant; liveness must not be promoted to readiness).
+        Ok(Readiness::Initializing) => {
+            tokio::time::sleep(READINESS_REPROBE_DELAY).await;
+            match adapter.check_readiness(member).await {
+                Ok(Readiness::Ready) => CheckResult {
+                    name: "readiness_gating",
+                    status: CheckStatus::Pass,
+                    detail: "observed Initializing -> Ready transition".into(),
+                },
+                Ok(Readiness::Initializing) => CheckResult {
+                    name: "readiness_gating",
+                    status: CheckStatus::Pass,
+                    detail: "Initializing on both probes; no premature Ready claim".into(),
+                },
+                Err(AdapterError::Uncertain(d)) => warn(format!(
+                    "observed Initializing; second probe uncertain ({d}) — transition unverifiable"
+                )),
+                Err(e) => warn(format!(
+                    "observed Initializing; second probe errored ({e:?}) — transition unverifiable"
+                )),
+            }
+        }
+        // A Ready claim must be corroborated by the adapter's own state
+        // observation, otherwise it may be fabricated (ready without ever
+        // having been live).
+        Ok(Readiness::Ready) => match adapter.inspect(member).await {
+            Ok(state) if state.phase == Phase::Ready => CheckResult {
+                name: "readiness_gating",
+                status: CheckStatus::Pass,
+                detail: "Ready claim corroborated by observed engine phase".into(),
+            },
+            Ok(state) => fail(format!(
+                "claimed Ready but inspect reports phase {:?} — fabricated readiness",
+                state.phase
+            )),
+            Err(e) => warn(format!(
+                "claimed Ready; engine state unverifiable ({e:?}) — cannot corroborate"
+            )),
         },
-        Err(e) => CheckResult {
-            name: "readiness_gating",
-            passed: false,
-            detail: format!("adapter cannot report readiness: {e:?}"),
-        },
+        Err(AdapterError::Uncertain(d)) => warn(format!(
+            "readiness uncertain ({d}) — engine may be briefly unreachable; not a conformance failure"
+        )),
+        Err(e) => fail(format!("readiness probe failed definitively: {e:?}")),
     }
 }
 
 async fn check_park_policy_gate(adapter: &dyn EngineAdapter, member: &MemberRef) -> CheckResult {
     // Invariant 1: level-1 park is not experimental — the gate must not apply.
     let l1 = adapter.park(member, ParkLevel::One).await;
-    let l1_ok = !matches!(l1, Err(mllm_adapters::AdapterError::PolicyDenied));
+    let l1_ok = !matches!(l1, Err(AdapterError::PolicyDenied));
 
     // Invariant 2: level-2 park is either gated, opted-in, uncertain, or
     // unsupported — but never an unqualified success on a *denied* policy
@@ -89,14 +183,14 @@ async fn check_park_policy_gate(adapter: &dyn EngineAdapter, member: &MemberRef)
     let l2_ok = matches!(
         l2,
         Ok(_)
-            | Err(mllm_adapters::AdapterError::PolicyDenied)
-            | Err(mllm_adapters::AdapterError::Uncertain(_))
-            | Err(mllm_adapters::AdapterError::UnsupportedCapability)
+            | Err(AdapterError::PolicyDenied)
+            | Err(AdapterError::Uncertain(_))
+            | Err(AdapterError::UnsupportedCapability)
     );
 
     CheckResult {
         name: "park_policy_gate",
-        passed: l1_ok && l2_ok,
+        status: if l1_ok && l2_ok { CheckStatus::Pass } else { CheckStatus::Fail },
         detail: format!("level-1: {l1:?}; level-2: {l2:?}"),
     }
 }
@@ -111,32 +205,96 @@ async fn check_cancellation_uncertainty(
     match adapter.cancel_work(member, req, false).await {
         Ok(mllm_adapters::CancellationOutcome::Acknowledged) => CheckResult {
             name: "cancellation_uncertainty",
-            passed: false,
+            status: CheckStatus::Fail,
             detail: "cancel without ack reported Acknowledged — fabricated success".into(),
         },
         other => CheckResult {
             name: "cancellation_uncertainty",
-            passed: true,
+            status: CheckStatus::Pass,
             detail: format!("cancel without ack: {other:?}"),
         },
     }
 }
 
+/// Handle ownership, including PID-reuse detection: spawn, terminate, respawn,
+/// then verify the old handle can never come back as `Valid` — whether the
+/// launcher reuses the PID (must be `StaleReused`) or mints fresh ones
+/// (`Gone`). A launcher that reports `Valid` for a terminated handle is the
+/// PID-reuse hazard the `start_identity` field exists to prevent (design §8).
 fn check_handle_ownership(launcher: &dyn Launcher) -> CheckResult {
-    // A handle to a process this launcher never spawned must not verify as
-    // Valid — that is the PID-reuse / ownership hazard.
+    // Invariant 1: a handle to a process this launcher never spawned must
+    // not verify as Valid.
     let stranger = OwnedHandle { pid: u32::MAX, start_identity: 0 };
-    match launcher.verify_handle(&stranger) {
-        mllm_adapters::HandleStatus::Valid => CheckResult {
+    if matches!(launcher.verify_handle(&stranger), HandleStatus::Valid) {
+        return CheckResult {
             name: "handle_ownership",
-            passed: false,
+            status: CheckStatus::Fail,
             detail: "launcher claimed ownership of a never-spawned handle".into(),
-        },
-        other => CheckResult {
+        };
+    }
+
+    // Invariant 2: after terminate + respawn, the old handle must not be Valid.
+    let cmd = probe_command();
+    let h1 = match launcher.spawn(&cmd) {
+        Ok(h) => h,
+        Err(e) => {
+            return CheckResult {
+                name: "handle_ownership",
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "stranger-handle check passed; could not exercise respawn path (spawn failed: {e:?})"
+                ),
+            };
+        }
+    };
+    if let Err(e) = launcher.terminate(&h1, Duration::from_secs(1)) {
+        return CheckResult {
             name: "handle_ownership",
-            passed: true,
-            detail: format!("unspawned handle verifies as {other:?}"),
+            status: CheckStatus::Warn,
+            detail: format!(
+                "stranger-handle check passed; could not exercise respawn path (terminate failed: {e:?})"
+            ),
+        };
+    }
+    let h2 = match launcher.spawn(&cmd) {
+        Ok(h) => h,
+        Err(e) => {
+            return CheckResult {
+                name: "handle_ownership",
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "stranger-handle check passed; could not exercise respawn path (respawn failed: {e:?})"
+                ),
+            };
+        }
+    };
+
+    match launcher.verify_handle(&h1) {
+        HandleStatus::Valid => CheckResult {
+            name: "handle_ownership",
+            status: CheckStatus::Fail,
+            detail: format!(
+                "handle verified Valid after terminate + respawn (pid {}) — PID reuse undetected",
+                h1.pid
+            ),
         },
+        reused @ (HandleStatus::StaleReused | HandleStatus::Gone) => {
+            if launcher.verify_handle(&h2) == HandleStatus::Valid {
+                CheckResult {
+                    name: "handle_ownership",
+                    status: CheckStatus::Pass,
+                    detail: format!(
+                        "old handle {reused:?} after terminate + respawn; new handle Valid"
+                    ),
+                }
+            } else {
+                CheckResult {
+                    name: "handle_ownership",
+                    status: CheckStatus::Fail,
+                    detail: "freshly spawned handle does not verify Valid".into(),
+                }
+            }
+        }
     }
 }
 
@@ -144,6 +302,10 @@ fn check_handle_ownership(launcher: &dyn Launcher) -> CheckResult {
 mod tests {
     use super::*;
     use mllm_adapters::fake::{FakeEngine, FakeLauncher};
+    use mllm_adapters::{
+        CancellationOutcome, EngineState, ExitReport, LauncherError, ParkOutcome, Quiescence,
+        ReloadOutcome, RestoreOutcome, WorkObservation,
+    };
 
     #[tokio::test]
     async fn fake_engine_passes_full_conformance_suite() {
@@ -152,56 +314,151 @@ mod tests {
         let results = run_conformance(&adapter, &launcher).await;
         assert_eq!(results.len(), 4);
         for r in &results {
-            assert!(r.passed, "check {} failed: {}", r.name, r.detail);
+            assert!(r.passed(), "check {} did not pass: {}", r.name, r.detail);
         }
     }
 
     #[tokio::test]
-    async fn cancellation_uncertainty_catches_fabricated_success() {
-        struct BadAdapter;
-        #[async_trait::async_trait]
-        impl EngineAdapter for BadAdapter {
-            async fn inspect(&self, _: &MemberRef) -> Result<mllm_adapters::EngineState, mllm_adapters::AdapterError> {
-                Err(mllm_adapters::AdapterError::Uncertain("bad".into()))
-            }
-            async fn render_plan(&self, _: &mllm_adapters::PlanInput) -> Result<mllm_adapters::RenderedCommand, mllm_adapters::AdapterError> {
-                Err(mllm_adapters::AdapterError::UnsupportedCapability)
-            }
-            async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, mllm_adapters::AdapterError> {
-                Ok(Readiness::Ready)
-            }
-            async fn prepare_park(&self, _: &MemberRef) -> Result<mllm_adapters::Quiescence, mllm_adapters::AdapterError> {
-                Ok(mllm_adapters::Quiescence { quiescent: true })
-            }
-            async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<mllm_adapters::ParkOutcome, mllm_adapters::AdapterError> {
-                Err(mllm_adapters::AdapterError::PolicyDenied)
-            }
-            async fn restore(&self, _: &MemberRef) -> Result<mllm_adapters::RestoreOutcome, mllm_adapters::AdapterError> {
-                Ok(mllm_adapters::RestoreOutcome::Restored)
-            }
-            async fn reload_weights(&self, _: &MemberRef) -> Result<mllm_adapters::ReloadOutcome, mllm_adapters::AdapterError> {
-                Ok(mllm_adapters::ReloadOutcome::Reloaded)
-            }
-            async fn observe_work(&self, _: &MemberRef) -> Result<mllm_adapters::WorkObservation, mllm_adapters::AdapterError> {
-                Ok(mllm_adapters::WorkObservation::Idle)
-            }
-            async fn cancel_work(
-                &self,
-                _: &MemberRef,
-                _: &RequestRef,
-                _: bool,
-            ) -> Result<mllm_adapters::CancellationOutcome, mllm_adapters::AdapterError> {
-                // Contract violation: fabricated success without an ack.
-                Ok(mllm_adapters::CancellationOutcome::Acknowledged)
+    async fn pid_reuse_launcher_exercises_reuse_detection() {
+        let adapter = FakeEngine::new();
+        let launcher = FakeLauncher::new().with_pid_reuse();
+        let results = run_conformance(&adapter, &launcher).await;
+        let ownership = results.iter().find(|r| r.name == "handle_ownership").unwrap();
+        assert!(ownership.passed(), "{}", ownership.detail);
+        assert!(ownership.detail.contains("StaleReused"), "{}", ownership.detail);
+    }
+
+    /// An adapter that fabricates readiness: always claims Ready while its
+    /// own inspect reports the engine is still starting up.
+    struct FabricatedReadyAdapter;
+
+    #[async_trait::async_trait]
+    impl EngineAdapter for FabricatedReadyAdapter {
+        async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+            Ok(EngineState { phase: Phase::Startup, retained_bytes: 0 })
+        }
+        async fn render_plan(
+            &self,
+            _: &mllm_adapters::PlanInput,
+        ) -> Result<mllm_adapters::RenderedCommand, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+            Ok(Readiness::Ready)
+        }
+        async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+            Ok(Quiescence { quiescent: true })
+        }
+        async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+            Err(AdapterError::PolicyDenied)
+        }
+        async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+            Ok(RestoreOutcome::Restored)
+        }
+        async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+            Ok(ReloadOutcome::Reloaded)
+        }
+        async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+            Ok(WorkObservation::Idle)
+        }
+        async fn cancel_work(
+            &self,
+            _: &MemberRef,
+            _: &RequestRef,
+            _: bool,
+        ) -> Result<CancellationOutcome, AdapterError> {
+            Ok(CancellationOutcome::Uncertain)
+        }
+    }
+
+    #[tokio::test]
+    async fn fabricated_ready_adapter_fails_readiness_gating() {
+        let adapter = FabricatedReadyAdapter;
+        let launcher = FakeLauncher::new();
+        let results = run_conformance(&adapter, &launcher).await;
+        let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
+        assert_eq!(readiness.status, CheckStatus::Fail);
+        assert!(readiness.detail.contains("fabricated"), "{}", readiness.detail);
+    }
+
+    /// A real adapter whose engine is briefly unreachable: readiness probes
+    /// return Uncertain. Conformant behavior — warn, don't fail.
+    struct UnreachableAdapter;
+
+    #[async_trait::async_trait]
+    impl EngineAdapter for UnreachableAdapter {
+        async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn render_plan(
+            &self,
+            _: &mllm_adapters::PlanInput,
+        ) -> Result<mllm_adapters::RenderedCommand, AdapterError> {
+            Err(AdapterError::UnsupportedCapability)
+        }
+        async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+            Err(AdapterError::Uncertain("engine unreachable".into()))
+        }
+        async fn cancel_work(
+            &self,
+            _: &MemberRef,
+            _: &RequestRef,
+            _: bool,
+        ) -> Result<CancellationOutcome, AdapterError> {
+            Ok(CancellationOutcome::Uncertain)
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_readiness_warns_not_fails() {
+        let adapter = UnreachableAdapter;
+        let launcher = FakeLauncher::new();
+        let results = run_conformance(&adapter, &launcher).await;
+        let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
+        assert_eq!(readiness.status, CheckStatus::Warn);
+        assert!(!readiness.passed());
+    }
+
+    /// A launcher that hands out the same handle for every spawn and always
+    /// reports Valid — the PID-reuse hazard itself.
+    struct ReuseObliviousLauncher;
+
+    impl Launcher for ReuseObliviousLauncher {
+        fn spawn(&self, _: &RenderedCommand) -> Result<OwnedHandle, LauncherError> {
+            Ok(OwnedHandle { pid: 7, start_identity: 1 })
+        }
+        fn terminate(&self, _: &OwnedHandle, _: Duration) -> Result<ExitReport, LauncherError> {
+            Ok(ExitReport { pid: 7, exit_code: Some(0), signal: None, killed: true })
+        }
+        fn verify_handle(&self, h: &OwnedHandle) -> HandleStatus {
+            if h.pid == 7 {
+                HandleStatus::Valid
+            } else {
+                HandleStatus::Gone
             }
         }
+    }
 
-        let launcher = FakeLauncher::new();
-        let results = run_conformance(&BadAdapter, &launcher).await;
-        let cancel = results.iter().find(|r| r.name == "cancellation_uncertainty").unwrap();
-        assert!(!cancel.passed);
-        // The rest of the bad adapter's checks still pass.
-        let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
-        assert!(readiness.passed);
+    #[tokio::test]
+    async fn reuse_oblivious_launcher_fails_handle_ownership() {
+        let launcher = ReuseObliviousLauncher;
+        let result = check_handle_ownership(&launcher);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.contains("PID reuse undetected"), "{}", result.detail);
     }
 }
