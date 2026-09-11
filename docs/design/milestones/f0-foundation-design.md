@@ -22,12 +22,12 @@ Six slices in build order; each leaves a coherent tested product.
 
 | Slice | Deliverable | Tests |
 |---|---|---|
-| S1 — Workspace + domain | Cargo workspace (11 crates); lifecycle state machine; identity types; stale-generation rejection | Transition-table property tests; generation rejection |
+| S1 — Workspace + domain | Cargo workspace — all 11 crates of the full-picture layout: `mllm-domain`, `mllm-store`, `mllm-scheduler`, `mllm-protocol`, `mllm-controller`, `mllm-router`, `mllm-agent`, `mllm-adapters`, `mllm-launchers`, `mllm-config`, `mllm-cli` (later slices populate the empty crates); lifecycle state machine; identity types; stale-generation rejection | Transition-table property tests; generation rejection |
 | S2 — Config | Strict YAML schema v1; §15.2 no-config matrix; `init`/`validate config` | T02, T03, T04 |
 | S3 — Store | SQLite schema; transactional acceptance; migrations; idempotency keys | T08, T09 |
-| S4 — Ledger | Physical-domain accounting; exclusive pools; `auto` resolution; admission blocking | T26, T27 |
+| S4 — Ledger | Physical-domain accounting; exclusive pools; `auto` resolution; admission blocking | T26, T27, and a sub-limit block scenario (retained host-KV owners exceeding `host_kv_limit`) |
 | S5 — Contracts + fake engine | Adapter/launcher/agent traits; fake-engine harness | Fake-engine scenario suite |
-| S6 — CLI + proto freeze | Full action-first parser; role startup wiring; frozen proto v1 | T01 |
+| S6 — CLI + proto freeze | Full action-first parser; role startup wiring; frozen proto v1 with a wire-level round-trip (AgentControl stream plus report/replay against the fake engine over a real in-process gRPC channel) | T01 plus the round-trip scenario |
 
 ## 3. Domain model (`mllm-domain`)
 
@@ -76,8 +76,12 @@ deployments(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
             schema_version INTEGER NOT NULL, created_at, updated_at)
 operations(id TEXT PRIMARY KEY, deployment_id TEXT REFERENCES deployments,
            kind TEXT NOT NULL, state TEXT NOT NULL, error_code TEXT,
-           idempotency_key TEXT UNIQUE, revision_precondition TEXT,
+           idempotency_key TEXT UNIQUE,
            accepted_at, updated_at)
+                                                   -- revision preconditions are
+                                                   -- intentionally absent until the
+                                                   -- revision-aware update design
+                                                   -- exists (SPEC §19 defers it)
 generation_history(deployment_id, generation, started_at, ended_at, outcome)
 owners(id TEXT PRIMARY KEY, kind TEXT NOT NULL, deployment_id TEXT NULL)
 reservations(owner_id TEXT REFERENCES owners, domain_id TEXT,
@@ -95,10 +99,20 @@ schema_migrations(version INTEGER PRIMARY KEY)
 Acceptance flow (T08/T09): `deploy model` opens one transaction inserting the deployment,
 its initial operation, and initial reservation intent; commit; return the ID. The
 `idempotency_key` unique index makes a retry after a lost response resolve to the
-existing deployment. Status queries are read-only and never activate anything.
+existing deployment. Idempotency keys are derived, not minted as random client state:
+the CLI computes `SHA-256(server context id, deployment name, canonical manifest bytes)`
+as the key, so a retry after a lost response reuses the same key without client-side
+persistence. The same key arriving with different content is rejected as a conflict
+error (`idempotency_conflict`), never silently resolved to the existing deployment.
+Intentionally re-deploying identical content as a new deployment requires a distinct
+`name` (names are unique), which yields a distinct key. Status queries are read-only and
+never activate anything.
 
 Migrations are forward-only, applied at startup inside a transaction, and versioned in
 `schema_migrations`. Backups: `sqlite3 .backup`-style consistent file copy documented at F0.
+Store files, WAL/journal sidecars, and generated state directories are created owner-only
+(0700 directories, 0600 files), matching the config creation posture; a permissions test
+runs alongside T04.
 
 ## 5. Resource ledger (`mllm-scheduler`)
 
@@ -120,7 +134,7 @@ unified-memory hosts; host RAM only on discrete-GPU hosts), `device_memory` per 
 ### 5.2 Admission check
 
 ```text
-charged(D)        = Σ bytes of all owners ≠ C
+charged(D)        = Σ bytes of all owners (including C's current reservations)
 transition_delta  = if C has a parked reservation on D:
                       activation_peak − parked_budget   # replace, don't stack
                     else activation_peak
@@ -131,7 +145,20 @@ pass iff charged(D) + transition_delta ≤ managed_limit(D)
 ```
 
 Block reasons are structured codes: `insufficient_resources`, `unreconciled_ownership`,
-`device_conflict`, `category_limit`, `unknown_topology`, `no_safe_estimate`.
+`device_conflict`, `category_limit`, `unknown_topology`, `no_safe_estimate`,
+`stale_observation`.
+
+Observation freshness: `observed_free(D)` comes from the newest recorded domain
+observation. If that observation is older than the observation TTL (v1 constant:
+60 seconds, versioned alongside the auto-resolution policy), the admission check fails
+with `stale_observation` instead of passing — stale data never authorizes capacity.
+F0's fake inventory stamps synthetic observations so the TTL path is exercised without
+hardware; F3 supplies live per-host observations under the same rule.
+
+Transition-peak validation: when replacing a parked reservation, `activation_peak` must
+cover the retained parked footprint at every instant of the wake transition (SPEC §7.3
+requires validating the transition's true peak). Admission rejects the transition when it
+does not, and the S4 slice tests include a restore-peak case.
 
 ### 5.3 `auto` resolution (v1 constants, locked)
 
@@ -190,7 +217,11 @@ json` for machine mode; structured error codes; stable exit codes:
 | 4 | Insufficient resources |
 | 5 | Unsupported capability |
 | 6 | Unreconciled ownership |
+| 7 | Device conflict (exclusive device overlap) |
+| 8 | Category sub-limit exceeded |
 | 10 | Activation timeout |
+| 11 | Host topology unknown |
+| 12 | No safe resource estimate |
 
 List/status commands never activate models as a side effect (T01, T08).
 
@@ -206,14 +237,25 @@ Package `mllm.management.v1`. Full skeleton with frozen field numbers is in
   `CancelWork`), agent→server reports (`Connect`, `ReportInventory`,
   `ReportOperationResult`).
 
-All commands carry `host_id`, `deployment_id`, `generation`, `operation_id`, `deadline`,
-and permitted resource plan (SPEC §13.1). At-least-once delivery replays known results;
-the agent rejects stale generations and incompatible protocol versions.
+All commands carry identity through the embedded Envelope — `host_id`, `deployment_id`,
+`generation`, `operation_id`, `deadline`, `expected_state`, and `profile_fingerprint`
+(SPEC §13.1); `LaunchMember` additionally carries the permitted resource plan.
+At-least-once delivery replays known results; the agent rejects stale generations and
+incompatible protocol versions.
+
+Deadline semantics under clock skew: `deadline_unix_ms` is compared against the receiver's
+clock with a versioned skew tolerance (v1 constant: 30 seconds). An agent treats a command
+as expired only when `now > deadline + tolerance`; a server treats a report arriving after
+its own deadline the same way. Skew beyond tolerance is an explicit, named agent report
+condition (`clock_skew_exceeded`) carried in `ReportOperationResult` — never silent
+rejection. The F0 harness exercises both directions (agent clock ahead/behind) so the
+tolerance path is tested before the field freeze ships.
 
 ## 9. Fake engine and contracts (`mllm-adapters`, `tests/harness`)
 
 Adapter trait = SPEC §8.3 operation set: `inspect`, `render_plan`, `check_readiness`,
-`prepare_park`, `park`, `restore`, `observe_work`, `cancel_work`. Launcher trait owns
+`prepare_park`, `park`, `restore`, `reload_weights`, `observe_work`, `cancel_work`.
+Launcher trait owns
 spawn/terminate/exit reporting with PID + start-identity handles; PID reuse is detected
 (SPEC §13.2).
 
@@ -234,11 +276,19 @@ The fake adapter sits beside future vLLM/SGLang adapters behind the same trait; 
 conformance suite runs against `fake` first, giving F1/F2 their regression base without
 GPUs.
 
+Security gate (carried from SPEC §9.1): deep-park and collective-control operations
+(level-2 park semantics, `reload_weights`) are experimental and denied by default; they
+are enabled only by explicit host policy opt-in (T21). The conformance suite covers
+default-denial behavior from F0 onward, so the gate is regression-tested before any real
+adapter lands.
+
 ## 10. Toolchain
 
 Stable Rust. `tokio` async runtime; `tonic` + `prost` for gRPC; `rusqlite` with explicit
 transactions for predictable transactional semantics (wrapped in a small async facade);
-`serde` + `serde_yaml` for strict config; `clap` for the CLI grammar; `ulid` for
+`serde` with a strict YAML loader built on `saphyr-parser`/`yaml-rust2` feeding serde
+types — duplicate-key detection is required and `serde_yaml` is archived (it resolves
+duplicate keys last-wins); `clap` for the CLI grammar; `ulid` for
 deployment IDs. Dev/test: `cargo test`, `proptest` for transition-table properties,
 `tempfile` for per-test state dirs. Exact crate versions are pinned in the implementation
 plan.
@@ -246,10 +296,12 @@ plan.
 ## 11. F0 exit gate
 
 State, allocation, idempotency, and bootstrap/default tests pass without GPUs (SPEC §18):
-T01–T04, T08, T09, T26, T27 green; fake-engine scenario suite green; proto compiles and
-is version-checked; `mllm start standalone` boots an embedded server + host against the
-store with a fake engine deployment completing the full lifecycle STOPPED → STARTING →
-READY → DRAINING → PARKING → PARKED → WAKING → READY and STOPPED.
+T01–T04, T08, T09, T26, T27 green; fake-engine scenario suite green; proto compiles,
+is version-checked, and passes a wire-level AgentControl round-trip over a real gRPC
+channel against the fake engine — the freeze is declared only after stream evidence, so
+F3 adds no compatibility shims; `mllm start standalone` boots an embedded server + host
+against the store with a fake engine deployment completing the full lifecycle STOPPED →
+STARTING → READY → DRAINING → PARKING → PARKED → WAKING → READY and STOPPED.
 
 ## Appendix A — Frozen proto skeleton
 
@@ -265,6 +317,8 @@ message Envelope {
   string operation_id = 4;
   int64  deadline_unix_ms = 5;
   string protocol_version = 6;  // "1"
+  string expected_state = 7;    // expected observed-state precondition
+  string profile_fingerprint = 8; // expected runtime build fingerprint
 }
 
 // --- Bootstrap (server-authenticated enrollment; exercised in F3) ---
@@ -299,10 +353,12 @@ message Connect {
   string host_id = 1;
   string protocol_version = 2;
   bytes  journal_resume_token = 3;   // bounded operation history
+  Envelope envelope = 4;
 }
 message ReportInventory {
   repeated DomainObservation domains = 1;
   repeated RuntimeProfileStatus profiles = 2;
+  Envelope envelope = 3;
 }
 message DomainObservation {
   string domain_id = 1;        // stable local identity
@@ -321,6 +377,7 @@ message ReportOperationResult {
   string state = 2;            // accepted | rejected | applied | failed | ambiguous
   string error_code = 3;
   string evidence_json = 4;    // observations, exit status, released bytes
+  Envelope envelope = 5;
 }
 
 message ServerToAgent {
@@ -340,30 +397,36 @@ message LaunchMember {
   string rendered_command_json = 4;   // full argv + env, secrets redacted upstream
   string role = 5;                    // head | worker | ingress
   string member_id = 6;
+  Envelope envelope = 7;              // appended pre-freeze; additive, never renumbered
 }
 message OpenIngressGate {
   string member_id = 1;
   int64  generation = 2;
   string router_identity_fingerprint = 3;
+  Envelope envelope = 4;
 }
 message Inspect {
   string member_id = 1;              // empty = whole host
+  Envelope envelope = 2;
 }
 message GroupControl {
   string deployment_id = 1;
   int64  generation = 2;
   string action = 3;                 // prepare_park | park | restore | reload_weights
   string lead_member_id = 4;         // collective invoked once through the lead
+  Envelope envelope = 5;
 }
 message TerminateMember {
   string member_id = 1;
   string owned_handle = 2;           // PID + start identity / container id
   int32  grace_period_seconds = 3;
+  Envelope envelope = 4;
 }
 message CancelWork {
   string member_id = 1;
   string request_ref = 2;            // backend-issued request identity
   bool   require_acknowledgement = 3;
+  Envelope envelope = 4;
 }
 message ResourcePlan {
   repeated DomainAllocation allocations = 1;
