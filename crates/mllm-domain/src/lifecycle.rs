@@ -38,6 +38,29 @@ pub fn legal_transitions() -> &'static [(LifecycleState, LifecycleState)] {
     })
 }
 
+/// A control-plane lifecycle action requested by a caller (T12). The
+/// observed state always moves through the legal table above, never
+/// directly to the action's target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleAction {
+    Start,
+    Park,
+    Stop,
+    Preinitialize,
+}
+
+impl LifecycleAction {
+    /// Stable wire/CLI name for the action.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Park => "park",
+            Self::Stop => "stop",
+            Self::Preinitialize => "preinitialize",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LifecycleState {
     Stopped,

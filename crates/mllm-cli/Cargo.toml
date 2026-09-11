@@ -7,6 +7,15 @@ license.workspace = true
 [dependencies]
 clap = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+mllm-agent = { workspace = true }
+mllm-config = { workspace = true }
+mllm-controller = { workspace = true }
+mllm-store = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mllm-domain = { workspace = true }
 
 [[bin]]
 name = "mllm"

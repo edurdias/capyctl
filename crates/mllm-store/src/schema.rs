@@ -80,6 +80,11 @@ CREATE TABLE journal_entries(
 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
 "#;
 
+/// v2: the observed half of the lifecycle state. v1 shipped before any
+/// writer needed it; the controller operation engine records it (T12).
+pub const SCHEMA_V2: &str =
+    "ALTER TABLE deployments ADD COLUMN observed_state TEXT NOT NULL DEFAULT 'stopped';";
+
 #[cfg(test)]
 mod tests {
     use super::*;

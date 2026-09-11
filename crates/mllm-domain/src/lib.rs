@@ -6,4 +6,4 @@ pub use error::TransitionError;
 pub use identity::{
     DeploymentId, Generation, GenerationMonitor, OperationId, OwnerAccountId, StaleGenerationError,
 };
-pub use lifecycle::{LifecycleState, legal_transitions};
+pub use lifecycle::{LifecycleAction, LifecycleState, legal_transitions};

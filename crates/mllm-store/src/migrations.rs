@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::SCHEMA_V1;
+use crate::schema::{SCHEMA_V1, SCHEMA_V2};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its

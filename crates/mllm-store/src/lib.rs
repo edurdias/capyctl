@@ -15,7 +15,7 @@ use rusqlite::Connection;
 pub use deployments::{
     AcceptDeployment, Accepted, DeploymentRow, NewOperation, OpState, OperationRow,
 };
-
+ 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("conflict: the request clashes with existing store state")]

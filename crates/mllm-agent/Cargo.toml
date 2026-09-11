@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+mllm-adapters = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

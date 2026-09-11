@@ -33,6 +33,8 @@ mllm-scheduler = { path = "crates/mllm-scheduler" }
 mllm-protocol = { path = "crates/mllm-protocol" }
 mllm-config = { path = "crates/mllm-config" }
 mllm-adapters = { path = "crates/mllm-adapters" }
+mllm-agent = { path = "crates/mllm-agent" }
+mllm-controller = { path = "crates/mllm-controller" }
 
 [profile.dev]
 debug = 1

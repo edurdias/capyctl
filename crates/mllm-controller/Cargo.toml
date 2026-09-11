@@ -6,3 +6,11 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ulid = { workspace = true }
+mllm-adapters = { workspace = true }
+mllm-domain = { workspace = true }
+mllm-scheduler = { workspace = true }
+mllm-store = { workspace = true }
