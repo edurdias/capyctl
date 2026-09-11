@@ -1,0 +1,12 @@
+[package]
+name = "mllm-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[[bin]]
+name = "mllm"
+path = "src/main.rs"

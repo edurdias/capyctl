@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mllm-domain", "crates/mllm-store", "crates/mllm-scheduler",
+  "crates/mllm-protocol", "crates/mllm-controller", "crates/mllm-router",
+  "crates/mllm-agent", "crates/mllm-adapters", "crates/mllm-launchers",
+  "crates/mllm-config", "crates/mllm-cli", "tests/harness",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.13"
+prost = "0.13"
+tonic-prost = "0.13"
+rusqlite = { version = "0.37", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+ulid = "1"
+sha2 = "0.10"
+thiserror = "2"
+proptest = "1"
+tempfile = "3"
+hex = "0.4"
+mllm-domain = { path = "crates/mllm-domain" }
+mllm-store = { path = "crates/mllm-store" }
+mllm-scheduler = { path = "crates/mllm-scheduler" }
+mllm-protocol = { path = "crates/mllm-protocol" }
+mllm-config = { path = "crates/mllm-config" }
+mllm-adapters = { path = "crates/mllm-adapters" }
+
+[profile.dev]
+debug = 1
