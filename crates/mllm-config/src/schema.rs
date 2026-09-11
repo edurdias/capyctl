@@ -44,6 +44,12 @@ impl std::str::FromStr for ConfigKind {
 }
 
 /// What shape a known field may take.
+///
+/// Every nested object gets an explicit allowlist — there is no
+/// "accept anything" variant. Where a nested block has no F0 consumer
+/// yet, it uses `Struct(NO_FIELDS)`: the empty allowlist rejects every
+/// unknown key, which keeps the "reject unknown mllm fields" constraint
+/// end-to-end and still parses cleanly when the block is empty.
 pub enum FieldSpec {
     /// Any scalar value.
     Scalar,
@@ -52,11 +58,18 @@ pub enum FieldSpec {
     Unit,
     /// Closed map: only the listed fields allowed (unlisted -> UnknownField).
     Struct(&'static [(&'static str, FieldSpec)]),
-    /// Map whose entries are unrestricted (F0 escape hatch for later growth).
-    OpenMap,
+    /// Mapping whose keys are entry *names* (not mllm fields — e.g.
+    /// `listeners` entries named `management`/`inference`); every value
+    /// must match the given entry spec, so entries themselves stay
+    /// strictly allowlisted.
+    MapOf(&'static FieldSpec),
     /// Sequence of items, each validated against the given spec.
     Seq(&'static FieldSpec),
 }
+
+/// Empty allowlist for nested blocks with no F0 consumer yet: rejects
+/// every unknown key, accepts only empty mappings.
+const NO_FIELDS: &[(&str, FieldSpec)] = &[];
 
 /// Allowlist for one config kind.
 pub struct KindSchema {
@@ -70,6 +83,50 @@ pub struct KindSchema {
 /// sets are filled in.
 pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     const SCALAR: FieldSpec = FieldSpec::Scalar;
+    const UNIT: FieldSpec = FieldSpec::Unit;
+
+    // Listener entry shape (per SPEC §16): each named listener carries
+    // bind address + authentication mode; unknown entry fields rejected.
+    const LISTENER_ENTRY_FIELDS: &[(&str, FieldSpec)] =
+        &[("bind", SCALAR), ("authentication", SCALAR)];
+    static LISTENER_ENTRY: FieldSpec = FieldSpec::Struct(LISTENER_ENTRY_FIELDS);
+    const LISTENERS: FieldSpec = FieldSpec::MapOf(&LISTENER_ENTRY);
+    const SCHEDULER: &[(&str, FieldSpec)] = &[(
+        "queue",
+        FieldSpec::Struct(&[("max_buffered_bytes_total", UNIT)]),
+    )];
+    const TLS: &[(&str, FieldSpec)] = &[("mode", SCALAR), ("identity_dir", SCALAR)];
+    const RESOURCE_POLICY: &[(&str, FieldSpec)] = &[
+        ("allowed_devices", SCALAR),
+        (
+            "memory",
+            FieldSpec::Struct(&[
+                ("accounting", SCALAR),
+                (
+                    "system",
+                    FieldSpec::Struct(&[("managed_limit", SCALAR), ("free_reserve", SCALAR)]),
+                ),
+            ]),
+        ),
+    ];
+    // Standalone `server:`/`host:` blocks mirror the generated standalone
+    // shape minus `kind` (the wrapper document already carries the kind).
+    const STANDALONE_SERVER: &[(&str, FieldSpec)] = &[
+        ("name", SCALAR),
+        ("state_dir", SCALAR),
+        ("listeners", LISTENERS),
+        ("tls", FieldSpec::Struct(TLS)),
+    ];
+    const STANDALONE_HOST: &[(&str, FieldSpec)] = &[
+        ("name", SCALAR),
+        ("state_dir", SCALAR),
+        ("connection", SCALAR),
+        ("resource_policy", FieldSpec::Struct(RESOURCE_POLICY)),
+        // Emitted empty by the generator; empty allowlist accepts `{}`
+        // only until profile shapes are specified.
+        ("runtime_profiles", FieldSpec::Struct(NO_FIELDS)),
+    ];
+
     match kind {
         ConfigKind::Server => &KindSchema {
             required: &["schema_version", "kind", "name"],
@@ -77,14 +134,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
-                ("listeners", FieldSpec::OpenMap),
-                (
-                    "scheduler",
-                    FieldSpec::Struct(&[(
-                        "queue",
-                        FieldSpec::Struct(&[("max_buffered_bytes_total", FieldSpec::Unit)]),
-                    )]),
-                ),
+                ("listeners", LISTENERS),
+                ("scheduler", FieldSpec::Struct(SCHEDULER)),
             ],
         },
         ConfigKind::Host => &KindSchema {
@@ -93,7 +144,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
-                ("listeners", FieldSpec::OpenMap),
+                ("listeners", LISTENERS),
             ],
         },
         ConfigKind::Deployment => &KindSchema {
@@ -103,8 +154,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("kind", SCALAR),
                 ("name", SCALAR),
                 ("model", SCALAR),
-                ("resources", FieldSpec::OpenMap),
-                ("env", FieldSpec::OpenMap),
+                // No F0 consumers yet; empty allowlists reject everything
+                // unknown inside these blocks.
+                ("resources", FieldSpec::Struct(NO_FIELDS)),
+                ("env", FieldSpec::Struct(NO_FIELDS)),
             ],
         },
         ConfigKind::Standalone => &KindSchema {
@@ -113,8 +166,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
-                ("server", FieldSpec::OpenMap),
-                ("host", FieldSpec::OpenMap),
+                ("server", FieldSpec::Struct(STANDALONE_SERVER)),
+                ("host", FieldSpec::Struct(STANDALONE_HOST)),
             ],
         },
     }

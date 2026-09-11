@@ -8,7 +8,10 @@
 //! the expected kind -> `SchemaVersion`, and unit-valued scalars
 //! (`"64MiB"`, `"15m"`) checked against regex
 //! `^(\d+(?:\.\d+)?)\s?(B|KiB|MiB|GiB|TiB|s|m|h|ms)$` -> `InvalidUnit`.
-//! On success a normalized `serde_json::Value` view is returned.
+//! Multi-document streams are rejected outright (single-document configs
+//! only), and `schema_version` must be exactly `1` — both reported with
+//! `SchemaVersion`. On success a normalized `serde_json::Value` view is
+//! returned.
 
 use crate::error::{ConfigError, ConfigErrorCode};
 use crate::schema::{ConfigKind, FieldSpec};
@@ -36,6 +39,7 @@ pub fn parse_strict(kind: ConfigKind, text: &str) -> Result<Value, ConfigError> 
     })?;
     let sch = crate::schema::schema(kind);
     check_kind(obj, kind)?;
+    check_schema_version(obj)?;
     check_required(obj, sch.required)?;
     check_object(obj, sch.fields, "")?;
     Ok(root)
@@ -162,14 +166,26 @@ fn build_value(text: &str) -> Result<Value, ConfigError> {
         path: Vec::new(),
         result: None,
     };
+    let mut doc_count = 0usize;
     for ev in Parser::new_from_str(text) {
         let (event, _span) = ev.map_err(scan_err)?;
         match event {
-            Event::Nothing
-            | Event::StreamStart
-            | Event::StreamEnd
-            | Event::DocumentStart(_)
-            | Event::DocumentEnd => {}
+            Event::Nothing | Event::StreamStart | Event::StreamEnd | Event::DocumentEnd => {}
+            // Config files are single-document: reject any second document
+            // instead of silently letting the last one win.
+            Event::DocumentStart(_) => {
+                doc_count += 1;
+                if doc_count > 1 {
+                    return Err(ConfigError::new(
+                        ConfigErrorCode::SchemaVersion,
+                        "",
+                        format!(
+                            "multi-document YAML stream rejected (document {doc_count}); \
+                             configs must contain exactly one document"
+                        ),
+                    ));
+                }
+            }
             Event::Alias(_) => {
                 return Err(ConfigError::new(
                     ConfigErrorCode::SchemaVersion,
@@ -215,6 +231,12 @@ fn scalar_value(scalar: &str, style: ScalarStyle) -> Value {
 }
 
 fn as_key(scalar: &str) -> String {
+    // Key identity limitation: saphyr does report key style (plain vs
+    // quoted), but the normalized view is a `serde_json::Map<String, _>`,
+    // so `1:` (plain) and `"1":` (quoted) necessarily collapse to the same
+    // string key and are treated as the same key for duplicate detection.
+    // Distinct-identity semantics would require carrying the scalar style
+    // through `pending_key` and a custom map representation.
     scalar.to_string()
 }
 
@@ -223,6 +245,20 @@ fn join(path: &str, key: &str) -> String {
         key.to_string()
     } else {
         format!("{path}.{key}")
+    }
+}
+
+/// `schema_version` must be exactly the integer `1`. Missing values are
+/// handled by the required-field check.
+fn check_schema_version(obj: &Map<String, Value>) -> Result<(), ConfigError> {
+    match obj.get("schema_version") {
+        None => Ok(()),
+        Some(Value::Number(n)) if n.as_i64() == Some(1) => Ok(()),
+        Some(other) => Err(ConfigError::new(
+            ConfigErrorCode::SchemaVersion,
+            "schema_version",
+            format!("unsupported schema_version `{other}`; only 1 is supported"),
+        )),
     }
 }
 
@@ -315,13 +351,12 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
             })?;
             check_object(obj, fields, path)
         }
-        FieldSpec::OpenMap => {
-            if !value.is_object() {
-                return Err(ConfigError::new(
-                    ConfigErrorCode::SchemaVersion,
-                    path,
-                    "expected a mapping",
-                ));
+        FieldSpec::MapOf(entry) => {
+            let obj = value.as_object().ok_or_else(|| {
+                ConfigError::new(ConfigErrorCode::SchemaVersion, path, "expected a mapping")
+            })?;
+            for (name, v) in obj {
+                check_value(v, entry, &join(path, name))?;
             }
             Ok(())
         }
@@ -396,5 +431,63 @@ mod tests {
         let y = "schema_version: 1\nkind: server\nname: lab\n";
         let v = parse_strict(ConfigKind::Server, y).unwrap();
         assert_eq!(v["kind"], "server");
+    }
+
+    #[test]
+    fn unknown_nested_field_rejected() {
+        let y = "schema_version: 1\nkind: server\nname: a\n\
+                 scheduler:\n  queue:\n    frobnicate: 1\n";
+        assert!(matches!(
+            validate(y, ConfigKind::Server),
+            Err(ConfigError {
+                code: ConfigErrorCode::UnknownField,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_standalone_server_block_field_rejected() {
+        let y = "schema_version: 1\nkind: standalone\nname: s\n\
+                 server:\n  frobnicate: true\n";
+        assert!(matches!(
+            validate(y, ConfigKind::Standalone),
+            Err(ConfigError {
+                code: ConfigErrorCode::UnknownField,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn multi_document_rejected() {
+        let y = "schema_version: 1\nkind: server\nname: a\n---\n\
+                 schema_version: 1\nkind: server\nname: b\n";
+        assert!(matches!(
+            validate(y, ConfigKind::Server),
+            Err(ConfigError {
+                code: ConfigErrorCode::SchemaVersion,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn schema_version_two_rejected() {
+        let y = "schema_version: 2\nkind: server\nname: a\n";
+        assert!(matches!(
+            validate(y, ConfigKind::Server),
+            Err(ConfigError {
+                code: ConfigErrorCode::SchemaVersion,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn valid_unit_accepted() {
+        let y = "schema_version: 1\nkind: server\nname: a\nlisteners: {}\n\
+                 scheduler:\n  queue:\n    max_buffered_bytes_total: \"64MiB\"\n";
+        assert!(validate(y, ConfigKind::Server).is_ok());
     }
 }
