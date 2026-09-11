@@ -47,19 +47,19 @@ fn init_targets() {
 #[test]
 fn invite_join_inspect_doctor_qualify() {
     let invite = parse(["mllm", "invite", "host", "--name", "host-a"]).unwrap();
-    matches!(invite, Command::Invite{name} if name == "host-a");
+    assert!(matches!(invite, Command::Invite{name} if name == "host-a"));
 
     let join = parse(["mllm", "join", "host", "--join-file", "host-a.join"]).unwrap();
-    matches!(join, Command::Join{join_file} if join_file == std::path::Path::new("host-a.join"));
+    assert!(matches!(join, Command::Join{join_file} if join_file == std::path::Path::new("host-a.join")));
 
     let inspect_host = parse(["mllm", "inspect", "host", "host-a"]).unwrap();
-    matches!(inspect_host, Command::Inspect{resource: Resource::Host, id: Some(id), effective: false} if id == "host-a");
+    assert!(matches!(inspect_host, Command::Inspect{resource: Resource::Host, id: Some(id), effective: false} if id == "host-a"));
 
     let inspect_dep = parse(["mllm", "inspect", "deployment", "dep_x", "--effective-config"]).unwrap();
-    matches!(inspect_dep, Command::Inspect{resource: Resource::Deployment, id: Some(id), effective: true} if id == "dep_x");
+    assert!(matches!(inspect_dep, Command::Inspect{resource: Resource::Deployment, id: Some(id), effective: true} if id == "dep_x"));
 
     let inspect_cfg = parse(["mllm", "inspect", "config", "--role", "host", "--effective"]).unwrap();
-    matches!(inspect_cfg, Command::Inspect{resource: Resource::Config, id: Some(role), effective: true} if role == "host");
+    assert!(matches!(inspect_cfg, Command::Inspect{resource: Resource::Config, id: Some(role), effective: true} if role == "host"));
 
     assert!(matches!(parse(["mllm", "doctor", "host", "host-a"]),
         Ok(Command::Doctor{host}) if host == "host-a"));
@@ -70,7 +70,7 @@ fn invite_join_inspect_doctor_qualify() {
 #[test]
 fn deploy_flags() {
     let c = parse(["mllm", "deploy", "model", "--file", "d.yaml", "--activate", "--wait"]).unwrap();
-    matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true} if f == std::path::Path::new("d.yaml"));
+    assert!(matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true} if f == std::path::Path::new("d.yaml")));
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn lifecycle_forms() {
 #[test]
 fn validate_config_file() {
     let c = parse(["mllm", "validate", "config", "--file", "host.yaml"]).unwrap();
-    matches!(c, Command::Validate{file} if file == std::path::Path::new("host.yaml"));
+    assert!(matches!(c, Command::Validate{file} if file == std::path::Path::new("host.yaml")));
 }
 
 #[test]
