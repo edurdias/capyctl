@@ -5,3 +5,8 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+mllm-adapters = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
