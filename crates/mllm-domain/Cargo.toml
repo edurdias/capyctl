@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
