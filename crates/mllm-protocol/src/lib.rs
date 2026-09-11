@@ -1,4 +1,5 @@
 pub mod pb {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("mllm.management.v1");
 }
 
