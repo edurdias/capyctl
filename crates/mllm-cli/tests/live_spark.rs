@@ -214,8 +214,8 @@ async fn live_switch_and_park_reload() {
     eprintln!("LIVE: B ready after switch, generation {gen_b}", gen_b = gen_b);
     let a_state = {
         let store = app.controller.store_ref();
-        let s = s.lock().unwrap();
-        s.get_deployment(&a).unwrap().unwrap().observed_state
+        let guard = store.lock().unwrap();
+        guard.get_deployment(&a).unwrap().unwrap().observed_state
     };
     assert_eq!(a_state, LifecycleState::Stopped, "A released on switch");
 
