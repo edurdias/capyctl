@@ -74,6 +74,9 @@ pub struct DeployRequest {
     pub name: String,
     pub kind: String,
     pub manifest: Vec<u8>,
+    /// The public model id clients route to (F1: alias resolution, SPEC
+    /// §10). `None` = catalog-only deployment (no route).
+    pub route_model_id: Option<String>,
 }
 
 /// A handle to a long-running control-plane operation.
@@ -258,7 +261,7 @@ impl Controller {
                 id,
                 name: req.name,
                 kind: req.kind,
-                route_model_id: None,
+                route_model_id: req.route_model_id.clone(),
                 desired_state: LifecycleState::Stopped,
                 schema_version: 1,
                 idempotency_key: key,
@@ -767,6 +770,7 @@ mod tests {
             name: name.to_string(),
             kind: "model".to_string(),
             manifest: format!(r#"{{"kind":"model","name":"{name}"}}"#).into_bytes(),
+            route_model_id: Some(name.to_string()),
         }
     }
 

@@ -10,6 +10,7 @@ fn req_fake_engine(name: &str) -> DeployRequest {
         name: name.to_string(),
         kind: "model".to_string(),
         manifest: format!(r#"{{"kind":"model","name":"{name}"}}"#).into_bytes(),
+        route_model_id: Some(name.to_string()),
     }
 }
 

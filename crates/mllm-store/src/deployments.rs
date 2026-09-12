@@ -454,6 +454,59 @@ impl crate::Store {
             .query_row("SELECT COUNT(*) FROM deployments", [], |row| row.get(0))
             .map_err(StoreError::from)
     }
+
+    /// All enabled route ids for `/v1/models` (F1 design §5): enabled
+    /// routes are listed without waking anything.
+    pub fn list_enabled_route_ids(&self) -> Result<Vec<String>, StoreError> {
+        self.conn
+            .prepare(
+                "SELECT route_model_id FROM deployments \
+                 WHERE admission_enabled = 1 AND suspended = 0 AND route_model_id IS NOT NULL \
+                 ORDER BY route_model_id",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Alias resolution: route_model_id → the deployment serving it (no
+    /// model-name guessing — SPEC §10).
+    pub fn find_deployment_by_route(&self, route: &str) -> Result<Option<DeploymentRow>, StoreError> {
+        let raw: Option<RawDeploymentRow> = self
+            .conn
+            .query_row(
+                "SELECT id, name, kind, route_model_id, desired_state, observed_state,
+                        schema_version
+                 FROM deployments WHERE route_model_id = ?1 ORDER BY updated_at DESC LIMIT 1",
+                [route],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        raw.map(
+            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version)| {
+                Ok(DeploymentRow {
+                    id,
+                    name,
+                    kind,
+                    route_model_id,
+                    desired_state: lifecycle_from_str(&desired_state)?,
+                    observed_state: lifecycle_from_str(&observed_state)?,
+                    schema_version,
+                })
+            },
+        )
+        .transpose()
+    }
 }
 
 #[cfg(test)]

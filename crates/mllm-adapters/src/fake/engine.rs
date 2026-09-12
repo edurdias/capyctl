@@ -251,3 +251,15 @@ impl EngineAdapter for FakeEngine {
         }
     }
 }
+
+#[async_trait]
+impl crate::traits::ChatForward for FakeEngine {
+    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError> {
+        let model = body["model"].as_str().unwrap_or("fake").to_string();
+        Ok(serde_json::json!({
+            "id": "fake-completion",
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
+        }))
+    }
+}

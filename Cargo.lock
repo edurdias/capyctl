@@ -1050,7 +1050,16 @@ dependencies = [
 name = "mllm-router"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "mllm-adapters",
+ "mllm-controller",
+ "mllm-domain",
+ "mllm-store",
+ "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

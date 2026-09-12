@@ -211,3 +211,36 @@ impl EngineAdapter for VllmAdapter {
     }
 }
 
+
+#[async_trait]
+impl crate::traits::ChatForward for VllmAdapter {
+    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError> {
+        // Non-streaming: buffer the SSE stream until [DONE] and join the
+        // chunks into the engine's final JSON (F1 keeps one code path).
+        let mut text = String::new();
+        let end = self
+            .http
+            .chat_completion_stream(body, |c| text.push_str(&c.text))
+            .await
+            .map_err(|e| match e {
+                HttpError::Unreachable(detail) => {
+                    let _ = detail;
+                    AdapterError::Crash(Phase::Startup)
+                }
+                other => AdapterError::Uncertain(format!("chat: {other:?}")),
+            })?;
+        let _ = end;
+        let content: String = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or(text);
+        Ok(serde_json::json!({
+            "model": body["model"],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
+        }))
+    }
+}
