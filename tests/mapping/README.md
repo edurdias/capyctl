@@ -1,152 +1,41 @@
-# F0 coverage mapping — target spec ids → tests
+# F1 Coverage Audit — Test-ID Mapping
 
-Every F0 target test id and the concrete `#[test]` / `#[tokio::test]` functions that
-claim it. Audited at F0 exit gate (commit 932e26f, task 13 of the F0 foundation plan).
-Ids outside the F0 target set (T05–T07, T10–T25, T28–T40) belong to later milestones
-and are deliberately absent.
+Every F1 target test id (F1 design §9 / SPEC §18 F1) mapped to its concrete
+test function(s). Test names grepped from the tree (never invented); live-tier
+evidence cites `docs/runbooks/spark-qualification-f1.md` sections.
 
-| Spec id | Claim | Requirement (F0 tier: fake engine / simulator only) |
-|---|---|---|
-| T01 | `crates/mllm-cli/tests/grammar.rs` | Action-first CLI grammar parses all F0 verbs |
-| T02 | `crates/mllm-config/tests/noconfig.rs` | Missing/implicit config generates once, owner-protected |
-| T03 | `crates/mllm-config/src/strict_yaml.rs` (unit tests) | Strict-YAML config schema: rejects invalid, accepts valid |
-| T04 | `crates/mllm-config/tests/noconfig.rs` | Concurrent inits generate credentials once, no clobber |
-| T08 | `crates/mllm-store/tests/acceptance.rs` | Deployment id persists across new client |
-| T09 | `crates/mllm-store/tests/acceptance.rs` | Same key returns same deployment (idempotency) |
-| T26 | `crates/mllm-scheduler/src/admission.rs` (unit tests) | Unified-memory charging counted once |
-| T27 | `crates/mllm-scheduler/src/admission.rs` (unit tests) | Disjoint devices still share system RAM in accounting |
+| Test | Scenario | Simulator tier (test fns) | Live tier (Spark) |
+|---|---|---|---|
+| T07 | Online host without prepared runtimes | `mllm-agent/tests/doctor.rs::doctor_reports_missing_profile_without_launching` (profile missing → specific failure, no install) | §2 doctor capture; §3 deploy preflight on missing profile |
+| T10 | Administrative stop vs idle stop | `mllm-controller/tests/managed_ops.rs::administrative_stop_blocks_autoactivation`, `::idle_stop_leaves_on_demand_eligible` | restart-only qualification step: live stop/re-deploy |
+| T11 | Attached service | `mllm-controller/tests/attachment.rs::attach_registers_route_and_rejects_lifecycle`, `::attached_usage_is_conservative_not_reclaimable`, `::restart_guarantees_marked_unavailable` | §3: attach a stock-vLLM service, verify routing + lifecycle rejection |
+| T12 | Patched foreground wrapper | `mllm-controller/tests/managed_ops.rs::start_spawns_real_process_and_stop_terminates_it`, `mllm-launchers/tests/exec.rs::terminate_reports_signal_when_grace_expires`, `::spawn_creates_live_handle_and_terminate_stops_group` | real vLLM launch/termination on Spark |
+| T14 | Reserved flags / profile change | `mllm-adapters/tests/vllm_args.rs::reserved_flag_conflicts_fail`, `::user_sleep_flag_is_reserved_not_rendered`, `::fingerprint_redacts_api_key_values` | fingerprint capture via `doctor`; profile-change invalidation at recipe freeze |
+| T15 | Simultaneous activation | `mllm-router/tests/switching.rs::simultaneous_activations_join_one_wake` | §3 simultaneous first requests → single wake |
+| T16 | A → B → A | `mllm-router/tests/switching.rs::a_to_b_to_a_alternates_with_release_evidence` | §3 two-profile alternation with release evidence |
+| T17 | Active streaming during swap | `mllm-router/tests/router_stream.rs::streaming_chat_returns_sse_events_in_order`, `::abandoned_request_keeps_inflight_until_confirmed` | §3 streaming through a switch (if platform allows) |
+| T18 | Late ingress request | `mllm-controller/tests/generations.rs::stale_generation_dispatch_rejected` | stale dispatch at live tier where reachable |
+| T19 | Fairness and queue bounds | `mllm-router/tests/switching.rs::fairness_window_is_bounded_and_non_resetting`, `mllm-router/tests/router_core.rs::queue_bounds_return_structured_error` | — (simulator) |
+| T20 | Park/reload timeout or partial failure | `mllm-controller/tests/park_flow.rs::ambiguous_park_reconciles_without_blind_repeat` | §4 ambiguous park (kill mid-sleep) → reconcile |
+| T21 | Experimental-controls policy | `mllm-controller/tests/policy_gate.rs::vllm_sleep_profile_launch_denied_by_default`, `::opt_in_enables_the_experimental_profile`, `mllm-adapters/tests/vllm_adapter.rs::park_denied_by_default_without_engine_call` | §5 opt-in live path only; denial live check |
 
-## Detailed mapping
+## Supporting evidence (conformance + contracts)
 
-### T01 — action-first grammar (`mllm-cli/tests/grammar.rs`)
+- Fake-engine conformance (runs against ANY adapter): `tests/harness` — readiness
+  gating, park policy gate (level-2-only and profile-gated modes), cancellation
+  uncertainty, handle ownership. The vLLM adapter passes it:
+  `mllm-adapters/tests/vllm_adapter.rs::passes_conformance_suite`.
+- vLLM HTTP client: `mllm-adapters/tests/vllm_http.rs` (SSE, uncertainty on dropped
+  ack, reachability).
+- Argument rendering: `mllm-adapters/tests/vllm_args.rs` (budgets → explicit units,
+  reserved-flag conflicts, secret redaction).
+- Real launcher: `mllm-launchers/tests/exec.rs` (process groups, SIGTERM→SIGKILL
+  escalation, PID-reuse detection).
+- Doctor: `mllm-agent/tests/doctor.rs` (fingerprints, memory observation, no install).
+- Generations/reservations: `mllm-controller/tests/generations.rs`.
+- Standalone wiring: `mllm-cli/tests/roles_f1.rs`, `mllm-cli/tests/standalone_lifecycle.rs`.
 
-- `action_first_grammar` — the core grammar shape (all F0 verbs)
-- `list_and_status_never_activate`
-- `start_roles_with_config`
-- `init_targets`
-- `invite_join_inspect_doctor_qualify`
-- `deploy_flags`
-- `lifecycle_forms`
-- `validate_config_file`
-- `machine_mode_output_flag`
-- `malformed_invocations_rejected`
+## Live-tier ledger
 
-Adjacent exit-code/JSON behavior lives in `crates/mllm-cli/tests/errors.rs`
-(`exit_code_table_matches_design_section_7`, `parse_errors_map_to_invalid_config`,
-`structured_error_json_shape`, `not_yet_implemented_error`,
-`output_format_flag_parsing`).
-
-### T02 — no-config startup + protected generation (`mllm-config/tests/noconfig.rs`)
-
-- `t02_missing_implicit_generates_once_with_protected_files` — generates once,
-  config 0600, state root / identity dir 0700, credentials 0600, no engine
-  execution at startup, second call loads without regenerating (mtime stable)
-
-Supporting same-file coverage: `implicit_existing_invalid_is_an_error_not_a_reset`,
-`explicit_missing_path_fails`, `explicit_invalid_path_fails`,
-`explicit_valid_path_loads_without_generating`,
-`non_standalone_generation_is_rejected`.
-
-### T03 — strict YAML schema (`crates/mllm-config/src/strict_yaml.rs`, `#[cfg(test)] mod`)
-
-- `duplicate_key_rejected`
-- `unknown_mllm_field_rejected`
-- `unknown_nested_field_rejected`
-- `unknown_standalone_server_block_field_rejected`
-- `invalid_unit_rejected`
-- `missing_required_rejected`
-- `multi_document_rejected`
-- `schema_version_two_rejected`
-- `valid_server_parses_to_json_view`
-- `valid_unit_accepted`
-
-Cross-check that generated configs satisfy the T03 schema:
-`generated_config_passes_task3_validate` in `mllm-config/tests/noconfig.rs`.
-
-### T04 — concurrent init (`mllm-config/tests/noconfig.rs`)
-
-- `concurrent_starts_do_not_clobber` — 8 threads resolve startup in parallel
-  against the same state dir; credentials generated exactly once
-
-### T08 / T09 — store acceptance (`mllm-store/tests/acceptance.rs`)
-
-- `t08_id_returned_after_persistence_survives_new_client` — id survives
-  persistence and a fresh client handle
-- `t09_retry_with_same_key_returns_same_deployment` — idempotent retry by key
-
-Supporting same-file coverage: `same_key_different_content_is_conflict`,
-`store_file_is_owner_only`.
-
-### T26 / T27 — admission memory accounting (`mllm-scheduler/src/admission.rs`, `#[cfg(test)] mod`)
-
-- `t26_unified_memory_charged_once` — unified memory charged once
-- `t27_disjoint_devices_still_share_system_ram` — system RAM shared in
-  accounting across disjoint devices
-
-Supporting same-file coverage: `t24_shape_sublimit_blocks_on_retained_host_kv`,
-`replace_dont_stack_includes_candidate_in_charged`,
-`stale_observation_blocks_admission`,
-`transition_peak_must_cover_parked_residue`; sizing constants in
-`mllm-scheduler/src/auto.rs` (`constants_match_adr_0005`,
-`small_host_degenerates_with_diagnostic`).
-
-## Supporting evidence
-
-### Fake-engine scenario suite (`mllm-adapters/tests/fake_scenarios.rs`)
-
-The fake engine is the executable spec for behaviors real F1/F2 adapters must
-honor:
-
-- `slow_startup_liveness_is_not_readiness` — liveness is not readiness
-- `sleep_level_two_discards_weights_and_kv`
-- `level_one_park_keeps_cpu_weight_backup`
-- `ambiguous_park_reports_uncertainty_not_success`
-- `cancellation_without_ack_reports_uncertainty`
-- `deep_park_denied_without_policy_opt_in`
-- `reload_weights_also_denied_without_policy_opt_in`
-- `pid_reuse_rejects_stale_handle`
-- `crash_at_phase_is_reported`
-
-### Conformance suite (`tests/harness/src/lib.rs`, `#[cfg(test)] mod`)
-
-- `fake_engine_passes_full_conformance_suite` — the fake engine passes every
-  harness check
-- Readiness gating: `fabricated_ready_adapter_fails_readiness_gating`,
-  `uncertain_readiness_warns_not_fails` (uncertainty is never fabricated
-  readiness)
-- Park policy gate: `deep_park_denied_without_policy_opt_in` /
-  `reload_weights_also_denied_without_policy_opt_in` (fake_scenarios.rs) and
-  `embedded_host_denies_experimental_deep_park_by_default`
-  (`mllm-agent/src/lib.rs`)
-- Cancellation uncertainty: `cancellation_without_ack_reports_uncertainty`
-  (fake_scenarios.rs) and `cancel_without_ack_is_uncertain_never_success`
-  (`mllm-adapters/src/lib.rs`)
-- Handle ownership: `reuse_oblivious_launcher_fails_handle_ownership` and
-  `pid_reuse_launcher_exercises_reuse_detection` (harness),
-  `pid_reuse_rejects_stale_handle` (fake_scenarios.rs)
-- Launcher contract: `launcher_contract_is_object_safe_and_matches_handle_status`,
-  `payload_types_carry_the_fields_task_9_reads` (`mllm-adapters/src/lib.rs`)
-
-### Wire round-trip and skew tolerance (`mllm-protocol/tests/wire_roundtrip.rs`)
-
-- `agent_control_roundtrip_over_real_channel` — Envelope round-trips over a
-  real tonic channel (simulator-tier transport evidence)
-- `deadline_enforced_with_skew_tolerance`
-- `protocol_version_is_pinned`
-
-### F0 exit-gate lifecycle (`mllm-cli/tests/standalone_lifecycle.rs`)
-
-- `standalone_boot_runs_full_fake_lifecycle` — full embedded lifecycle over the
-  fake engine: deploy → start → ready → stop → stopped
-- `resubmitting_the_same_request_is_idempotent`
-- `stop_is_illegal_from_stopped`
-
-Embedded-host piece-level support: `embedded_host_runs_the_fake_lifecycle_pieces`
-(`mllm-agent/src/lib.rs`).
-
-## Gap check result
-
-All F0 target ids (T01–T04, T08, T09, T26, T27) are claimed by real, named
-tests. No unclaimed ids; no tests were added by this audit. F0 claims nothing
-about real engines, GPUs, or hardware — the fake-engine suite is the simulator
-tier and the wire round-trip is simulator-tier transport evidence.
+Live claims exist ONLY in `docs/runbooks/spark-qualification-f1.md` and are labeled
+`live-tier (Spark)`. Simulator claims above never substitute for them.
