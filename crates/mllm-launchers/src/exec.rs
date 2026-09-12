@@ -85,7 +85,10 @@ impl Launcher for ExecLauncher {
                 .append(true)
                 .open(log)
                 .map_err(|e| LauncherError::SpawnFailed(format!("engine log {log}: {e}")))?;
-            command.stdout(Stdio::from(f.try_clone()?)).stderr(Stdio::from(f));
+            let log_clone = f
+                .try_clone()
+                .map_err(|e| LauncherError::SpawnFailed(format!("engine log clone: {e}")))?;
+            command.stdout(Stdio::from(log_clone)).stderr(Stdio::from(f));
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
