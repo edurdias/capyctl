@@ -214,7 +214,8 @@ Qualification sequence, each step gated:
 2. `mllm doctor host` (now real in F1) captures build fingerprints and memory
    observations; the live recipe is frozen only from reported reality.
 3. **Restart-only live qualification first**: deploy → READY → serve → stop → re-deploy;
-   A→B→A switching across the two profiles (stock + experimental) on the Spark; attach an
+   A→B→A switching across the two restart-only profiles (stock + stock-alt) on the
+   Spark; attach an
    already-running stock-vLLM service and verify routing works while lifecycle commands
    are rejected (T11 live); issue simultaneous first requests against a stopped
    deployment and verify a single wake operation (T15 live). This alone satisfies
