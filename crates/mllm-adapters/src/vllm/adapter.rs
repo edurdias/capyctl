@@ -268,15 +268,14 @@ impl crate::traits::ChatForward for VllmAdapter {
             })?;
         let _ = end;
         // Join the per-chunk delta.content pieces (chunks are independent
-        // JSON objects; concatenation is not valid JSON).
+        // JSON objects; wrap the concatenation into a JSON array and read
+        // each delta).
         let mut content = String::new();
-        for chunk in text.split("}{") {
-            let piece = if chunk.starts_with('{') {
-                format!("{chunk}}}")
-            } else {
-                format!("{}}}", chunk)
-            };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&piece) {
+        let wrapped = format!("[{}]", text.replace("}{", "},{"));
+        if let Ok(serde_json::Value::Array(chunks)) =
+            serde_json::from_str::<serde_json::Value>(&wrapped)
+        {
+            for v in &chunks {
                 if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
                     content.push_str(c);
                 }
