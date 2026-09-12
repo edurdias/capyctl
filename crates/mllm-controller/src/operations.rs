@@ -63,7 +63,10 @@ pub const STANDALONE_CONTEXT_ID: &str = "standalone";
 pub const EMBEDDED_HOST_ID: &str = "embedded-local";
 
 /// How long an operation may run before `wait_terminal` gives up.
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded activation timeout: real engines take minutes to stage weights
+/// (vLLM on GB10: ~1-3 min cold); 10 minutes covers cold init while the
+/// bound keeps a wedged activation a timeout, not a hang (T20).
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
 /// Readiness-poll interval (fake readiness is immediate; real engines
 /// poll this often until their own deadline).
 const READINESS_POLL: Duration = Duration::from_millis(10);
