@@ -131,7 +131,5 @@ async fn chat_completions(
         let sse = stream::stream_response(forward, v, handle);
         return Ok(sse.into_response());
     }
-    let json = chat::dispatch(&state.deps, model, &v)
-        .await
-        .map_err(|(code, msg)| (code, msg))?;
+    let json = chat::dispatch(&state.deps, model, &v).await?;
     Ok(Json(json).into_response())}
