@@ -173,10 +173,19 @@ impl SwitchEngine {
             let work = self.controller.observe_adapter(a).await;
             match work {
                 Ok(mllm_adapters::traits::WorkObservation::Idle) => break,
-                Ok(_) => {
+                // Unknown in-flight state (vLLM exposes no per-request
+                // surface): the drain liveness policy (design §5) — proceed
+                // with the residual uncertainty recorded; never block
+                // forever on unprovable work.
+                Ok(mllm_adapters::traits::WorkObservation::Unknown) => {
+                    self.journal_switch(a, r#"{"event":"drain_unknown","residual":"engine work unprovable"}"#);
+                    break;
+                }
+                Ok(other) => {
                     if Instant::now() >= deadline {
                         return Err(self.fail_switch(a).await);
                     }
+                    let _ = other;
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(e) => {
