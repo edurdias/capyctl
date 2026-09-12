@@ -223,10 +223,7 @@ impl crate::traits::ChatForward for VllmAdapter {
             .chat_completion_stream(body, |c| text.push_str(&c.text))
             .await
             .map_err(|e| match e {
-                HttpError::Unreachable(detail) => {
-                    let _ = detail;
-                    AdapterError::Crash(Phase::Startup)
-                }
+                HttpError::Unreachable(_) => AdapterError::Crash(Phase::Startup),
                 other => AdapterError::Uncertain(format!("chat: {other:?}")),
             })?;
         let _ = end;
@@ -242,5 +239,24 @@ impl crate::traits::ChatForward for VllmAdapter {
             "model": body["model"],
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
         }))
+    }
+
+    async fn forward_chat_stream(
+        &self,
+        body: &serde_json::Value,
+        on_chunk: &mut (dyn FnMut(String) + Send),
+    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        let end = self
+            .http
+            .chat_completion_stream(body, |c| on_chunk(c.text.clone()))
+            .await
+            .map_err(|e| match e {
+                HttpError::Unreachable(_) => AdapterError::Crash(Phase::Startup),
+                other => AdapterError::Uncertain(format!("chat: {other:?}")),
+            })?;
+        Ok(match end {
+            crate::vllm::StreamEnd::Completed => crate::traits::StreamEnded::Completed,
+            crate::vllm::StreamEnd::BackendClosed => crate::traits::StreamEnded::BackendClosed,
+        })
     }
 }

@@ -43,3 +43,97 @@ pub fn admit_request(_deps: &RouterDeps, _deployment: &str) -> Result<(), (Strin
     // core bounds (body size) are checked in the router itself.
     Ok(())
 }
+
+impl InFlight {
+    /// Register one in-flight request. The guard releases on normal
+    /// completion (drop) or confirmed cancellation; `abandon()` marks a
+    /// client disconnect — accounting is retained until an explicit
+    /// release, because a disconnect is not proof the engine stopped
+    /// (F1 design §5).
+    pub fn guard(&self, deployment: &str) -> StreamGuard<'_> {
+        self.increment(deployment);
+        StreamGuard {
+            inflight: BorrowedInFlight { inner: self },
+            deployment: deployment.to_string(),
+            abandoned: false,
+            released: false,
+        }
+    }
+}
+
+/// Guard owning its registry: for the streaming pump task (needs 'static).
+pub struct StaticStreamGuard {
+    inflight: Arc<InFlight>,
+    deployment: String,
+    abandoned: bool,
+    released: bool,
+}
+
+impl InFlight {
+    pub fn guard_arc(self: &Arc<Self>, deployment: &str) -> StaticStreamGuard {
+        self.increment(deployment);
+        StaticStreamGuard {
+            inflight: self.clone(),
+            deployment: deployment.to_string(),
+            abandoned: false,
+            released: false,
+        }
+    }
+}
+
+impl StaticStreamGuard {
+    pub fn abandon(mut self) -> Self {
+        self.abandoned = true;
+        self
+    }
+    pub fn release(mut self) {
+        self.released = true;
+        self.inflight.decrement(&self.deployment);
+    }
+}
+
+impl Drop for StaticStreamGuard {
+    fn drop(&mut self) {
+        if !self.released && !self.abandoned {
+            self.inflight.decrement(&self.deployment);
+        }
+    }
+}
+
+/// Borrowed guard over one admitted request (owned-path accounting).
+pub struct StreamGuard<'a> {
+    inflight: BorrowedInFlight<'a>,
+    deployment: String,
+    abandoned: bool,
+    released: bool,
+}
+
+struct BorrowedInFlight<'a> {
+    inner: &'a InFlight,
+}
+
+impl StreamGuard<'_> {
+    /// The client left. The engine may still be working: retain accounting
+    /// until the backend completes or cancellation is confirmed.
+    pub fn abandon(mut self) -> Self {
+        self.abandoned = true;
+        self
+    }
+
+    /// Backend stream completed or cancellation confirmed: release.
+    pub fn release(mut self) {
+        self.released = true;
+        self.inflight.inner.decrement(&self.deployment);
+    }
+}
+
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released && !self.abandoned {
+            self.inflight.inner.decrement(&self.deployment);
+        }
+        // abandoned guards are released by explicit `release()` after the
+        // backend confirms completion; a leak of abandoned guards is
+        // bounded by the queue-deadline sweeper (switch engine, Task 11).
+    }
+}

@@ -1,38 +1,37 @@
 //! Chat dispatch: resolve the alias to an explicit deployment, admit, and
 //! forward through the deployment's adapter (F1 design §5). Admission
 //! joins one activation operation when the deployment is not READY
-//! (T15 groundwork; full switching lives in `switch.rs`).
+//! (simultaneous requests join one wake — T15).
 
+use axum::http::StatusCode;
+use axum::Json;
 use mllm_domain::LifecycleState;
 
-use crate::admission;
 use crate::RouterDeps;
 
-pub async fn dispatch(
+/// Resolve the alias to an explicit deployment (no model-name guessing —
+/// SPEC §10) and ensure READY, joining the single activation operation.
+/// Returns (deployment id, profile kind).
+pub async fn resolve(
     deps: &RouterDeps,
     model: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, (String, String)> {
-    // Resolve alias → explicit deployment (no model-name guessing).
+) -> Result<(String, String), (StatusCode, Json<serde_json::Value>)> {
     let (deployment_id, kind, observed) = {
         let store = deps.store.lock().unwrap();
         let row = store
             .find_deployment_by_route(model)
-            .map_err(|e| ("internal".to_string(), format!("store: {e}")))?
+            .map_err(|e| err("internal", &format!("store: {e}")))?
             .ok_or_else(|| {
-                (
-                    "unknown_model".to_string(),
-                    format!("no deployment serves model id {model}"),
+                err(
+                    "unknown_model",
+                    &format!("no deployment serves model id {model}"),
                 )
             })?;
-        // admission_enabled/suspended live in the F3 remote schema; F1's
-        // in-process graph treats accepted deployments as enabled (SPEC
-        // §6.3: an on-demand STOPPED deployment is a successful accept).
         (row.id.clone(), row.kind.clone(), row.observed_state)
     };
 
     // Join the deployment's single activation operation when not READY
-    // (simultaneous requests join one wake — T15).
+    // (T15: simultaneous requests join one wake; no duplicate processes).
     if observed != LifecycleState::Ready {
         let op = deps
             .controller
@@ -44,32 +43,66 @@ pub async fn dispatch(
             .await
             .map_err(map_controller)?;
     }
+    Ok((deployment_id, kind))
+}
 
-    // Admission accounting: per-deployment in-flight bound.
-    admission::admit_request(deps, &deployment_id)?;
+/// Non-streaming dispatch: resolve + forward through the deployment's
+/// adapter; the in-flight guard releases on completion (accounting is
+/// conservative on every other path).
+pub async fn dispatch(
+    deps: &RouterDeps,
+    model: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let (deployment_id, kind) = resolve(deps, model).await?;
 
+    // Admission accounting: per-deployment in-flight bound (T19).
+    if deps.inflight.current(&deployment_id)
+        >= deps.limits.max_requests_per_deployment
+    {
+        return Err(err("queue_full", "deployment in-flight bound reached"));
+    }
     let forward = deps
         .forwards
         .get(&kind)
         .ok_or_else(|| {
-            (
-                "unsupported".to_string(),
-                format!("no forwarder for profile {kind}"),
+            err(
+                "unsupported",
+                &format!("no forwarder for profile {kind}"),
             )
         })?
         .clone();
+    let guard = deps.inflight.guard(&deployment_id);
     let resp = forward
         .forward_chat(body)
         .await
-        .map_err(|e| ("engine_error".to_string(), format!("engine: {e:?}")))?;
+        .map_err(|e| err("engine_error", &format!("engine: {e:?}")))?;
+    guard.release();
+    let _ = deployment_id;
     Ok(resp)
 }
 
-fn map_controller(e: mllm_controller::ControllerError) -> (String, String) {
+fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        match code {
+            "unknown_model" => StatusCode::NOT_FOUND,
+            "queue_full" => StatusCode::PAYLOAD_TOO_LARGE,
+            "unsupported" => StatusCode::NOT_IMPLEMENTED,
+            "insufficient_resources" => StatusCode::TOO_MANY_REQUESTS,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        },
+        Json(serde_json::json!({ "code": code, "message": message })),
+    )
+}
+
+fn map_controller(e: mllm_controller::ControllerError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
         mllm_controller::ControllerError::Blocked(b) => {
-            ("insufficient_resources".into(), format!("admission blocked: {b:?}"))
+            err("insufficient_resources", &format!("admission blocked: {b:?}"))
         }
-        other => ("activation_failed".into(), other.to_string()),
+        mllm_controller::ControllerError::UnknownDeployment(d) => {
+            err("unknown_model", &format!("deployment {d} vanished"))
+        }
+        other => err("activation_failed", &other.to_string()),
     }
 }

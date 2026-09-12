@@ -27,6 +27,7 @@ async fn app() -> (axum::Router, Arc<Mutex<Store>>, Arc<Controller>, mllm_store:
         forwards: HashMap::from([("fake".to_string(), adapter)]),
         limits: QueueLimits { max_requests_per_deployment: 2, max_buffered_bytes_total: 1024 },
         api_key: Some("test-key".into()),
+        inflight: Arc::new(mllm_router::admission::InFlight::default()),
     };
     let file_store = Store::open_in_memory().unwrap();
     (mllm_router::serve_router(deps, "127.0.0.1:0".parse().unwrap()), shared, controller, file_store)

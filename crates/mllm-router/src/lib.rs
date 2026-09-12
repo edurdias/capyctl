@@ -5,12 +5,14 @@
 
 pub mod admission;
 pub mod chat;
+pub mod stream;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Json;
 
@@ -32,6 +34,8 @@ pub struct RouterDeps {
     pub limits: QueueLimits,
     /// Shared inference API key (F1: single-owner lab; per-client keys later).
     pub api_key: Option<String>,
+    /// Conservative in-flight accounting (released only on confirmed end).
+    pub inflight: Arc<admission::InFlight>,
 }
 
 #[derive(Clone)]
@@ -95,7 +99,7 @@ async fn chat_completions(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     if !authorized(&headers, &state.deps) {
         return Err(err_json("unauthorized", "missing or valid api key required"));
     }
@@ -109,8 +113,25 @@ async fn chat_completions(
     let Some(model) = v["model"].as_str() else {
         return Err(err_json("invalid_request", "model is required"));
     };
-    chat::dispatch(&state.deps, model, &v)
+    if v["stream"].as_bool() == Some(true) {
+        // Streaming path: resolve + activate, then bridge the engine's SSE.
+        let (deployment_id, kind) = chat::resolve(&state.deps, model).await?;
+        let forward = state
+            .deps
+            .forwards
+            .get(&kind)
+            .cloned()
+            .ok_or_else(|| {
+                err_json("unsupported", &format!("no forwarder for profile {kind}"))
+            })?;
+        let handle = stream::InFlightHandle {
+            inflight: state.deps.inflight.clone(),
+            deployment: deployment_id,
+        };
+        let sse = stream::stream_response(forward, v, handle);
+        return Ok(sse.into_response());
+    }
+    let json = chat::dispatch(&state.deps, model, &v)
         .await
-        .map(Json)
-        .map_err(|(code, msg)| err_json(&code, &msg))
-}
+        .map_err(|(code, msg)| (code, msg))?;
+    Ok(Json(json).into_response())}

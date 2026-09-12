@@ -262,4 +262,19 @@ impl crate::traits::ChatForward for FakeEngine {
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
         }))
     }
+
+    async fn forward_chat_stream(
+        &self,
+        body: &serde_json::Value,
+        on_chunk: &mut (dyn FnMut(String) + Send),
+    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        let model = body["model"].as_str().unwrap_or("fake").to_string();
+        on_chunk(format!(
+            r#"{{"id":"fake-stream","model":"{model}","choices":[{{"delta":{{"content":"hel"}}}}]}}"#
+        ));
+        on_chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string());
+        Ok(crate::traits::StreamEnded::Completed)
+    }
 }
+
+
