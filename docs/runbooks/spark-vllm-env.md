@@ -9,10 +9,10 @@ output; never guess them.
 
 ```bash
 # On the Spark, as the operator:
-python3 -m venv /opt/vllm
-/opt/vllm/bin/pip install --upgrade pip
-/opt/vllm/bin/pip install vllm==<PINNED_VERSION>   # pin set at first doctor capture
-/opt/vllm/bin/vllm --version                        # record this output as the fingerprint
+python3 -m venv ~/mllm-vllm-venv   # /opt requires root on the lab Spark; user-writable venv (recorded deviation)
+~/mllm-vllm-venv/bin/pip install --upgrade pip
+~/mllm-vllm-venv/bin/pip install vllm==<PINNED_VERSION>   # pin set at first doctor capture
+~/mllm-vllm-venv/bin/vllm --version                        # record this output as the fingerprint
 ```
 
 `<PINNED_VERSION>` is chosen at the first live session: install the current stable
@@ -38,7 +38,7 @@ runtime_profiles:
     adapter: vllm
     launch:
       type: exec
-      command: ["/opt/vllm/bin/vllm", "serve"]
+      command: ["$HOME/mllm-vllm-venv/bin/vllm", "serve"]
       argument_contract: native
 ```
 
