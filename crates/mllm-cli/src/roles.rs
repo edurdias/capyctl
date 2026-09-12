@@ -91,6 +91,12 @@ pub async fn start_standalone_with_policy(
     start_standalone_inner(state_dir, policy).await
 }
 
+type AdapterParts = (
+    Arc<dyn mllm_adapters::traits::EngineAdapter>,
+    Arc<dyn mllm_adapters::traits::Launcher>,
+    HashMap<String, Arc<dyn mllm_adapters::traits::ChatForward>>,
+);
+
 /// Live vLLM profile for the Spark qualification (F1 design §8): the
 /// standalone role drives the REAL vLLM adapter over the REAL exec
 /// launcher. F1 qualification wiring via documented env vars; F2 replaces
@@ -130,11 +136,7 @@ async fn start_standalone_inner(
 
     // Live profile: the REAL vLLM adapter + REAL exec launcher (F1 design
     // §8; the profile carries the pinned build's fingerprint).
-    let (adapter, launcher, forwards): (
-        Arc<dyn mllm_adapters::traits::EngineAdapter>,
-        Arc<dyn mllm_adapters::traits::Launcher>,
-        HashMap<String, Arc<dyn mllm_adapters::traits::ChatForward>>,
-    ) = match LiveVllmProfile::from_env() {
+    let (adapter, launcher, forwards): AdapterParts = match LiveVllmProfile::from_env() {
         Some(p) => {
             let base: reqwest::Url = format!("http://127.0.0.1:{}", p.port)
                 .parse()
