@@ -19,8 +19,9 @@ pub const RESERVED_FLAGS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct PlanInputVllm {
+    /// The engine executable (profile-owned launch context, SPEC §8.1).
+    pub engine_bin: String,
     pub model_path: String,
-    pub port: u16,
     pub granted: GrantedBudget,
     /// Engine-native ordinary arguments the operator passes through
     /// (SPEC §8.2: unknown ordinary args pass subject to policy).
@@ -78,7 +79,7 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     }
 
     let mut argv: Vec<String> = vec![
-        "vllm".into(),
+        input.engine_bin.clone(),
         "serve".into(),
         input.model_path.clone(),
     ];

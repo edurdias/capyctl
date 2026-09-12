@@ -8,6 +8,7 @@ use mllm_adapters::vllm::args::{
 
 fn base_input() -> PlanInputVllm {
     PlanInputVllm {
+        engine_bin: "/opt/vllm/bin/vllm".into(),
         model_path: "/srv/models/toy-model".into(),
         port: 8150,
         granted: GrantedBudget {

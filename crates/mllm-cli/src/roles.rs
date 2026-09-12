@@ -142,6 +142,7 @@ async fn start_standalone_inner(
                 .parse()
                 .map_err(|e| StartError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
             let launch = mllm_adapters::vllm::args::PlanInputVllm {
+                engine_bin: p.engine_bin.to_string_lossy().to_string(),
                 model_path: p.model_path.clone(),
                 port: p.port,
                 granted: Default::default(),
