@@ -157,6 +157,9 @@ impl EngineHttp {
                 Some(Ok(bytes)) => {
                     // Normalize CRLF (uvicorn/Starlette SSE): frame parsing
                     // is LF-based.
+                    if std::env::var("MLLM_SSE_DEBUG").is_ok() {
+                        eprintln!("SSE-BYTES: {} bytes: {:?}", bytes.len(), String::from_utf8_lossy(&bytes));
+                    }
                     let decoded = String::from_utf8_lossy(&bytes);
                     buf.push_str(&decoded.replace('\r', ""));
                     // SSE frames are delimited by blank lines; data lines by
