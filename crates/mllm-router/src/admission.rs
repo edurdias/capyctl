@@ -15,6 +15,20 @@ pub struct InFlight {
 }
 
 impl InFlight {
+    /// Atomic-conditional increment (T19): registers one slot only while
+    /// the deployment's in-flight count is below `max`; `false` when the
+    /// bound is reached — the check and the increment share the lock, so
+    /// the check-then-act race cannot over-admit.
+    pub fn try_increment(&self, deployment: &str, max: usize) -> bool {
+        let mut map = self.counts.lock().unwrap();
+        let c = map.entry(deployment.to_string()).or_default();
+        if c.load(Ordering::SeqCst) >= max {
+            return false;
+        }
+        c.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
     pub fn increment(&self, deployment: &str) -> usize {
         let mut map = self.counts.lock().unwrap();
         let c = map.entry(deployment.to_string()).or_default();
@@ -51,12 +65,28 @@ impl InFlight {
     /// release, because a disconnect is not proof the engine stopped
     /// (F1 design §5).
     pub fn guard(&self, deployment: &str) -> StreamGuard<'_> {
-        self.increment(deployment);
+        self.try_increment(deployment, usize::MAX);
         StreamGuard {
             inflight: BorrowedInFlight { inner: self },
             deployment: deployment.to_string(),
             abandoned: false,
             released: false,
+        }
+    }
+
+    /// Register only if the per-deployment in-flight bound allows it
+    /// (atomic-conditional — the bound is enforced under the same lock as
+    /// the increment). `None` = bound reached; no accounting was taken.
+    pub fn try_guard(&self, deployment: &str, max: usize) -> Option<StreamGuard<'_>> {
+        if self.try_increment(deployment, max) {
+            Some(StreamGuard {
+                inflight: BorrowedInFlight { inner: self },
+                deployment: deployment.to_string(),
+                abandoned: false,
+                released: false,
+            })
+        } else {
+            None
         }
     }
 }
@@ -71,12 +101,31 @@ pub struct StaticStreamGuard {
 
 impl InFlight {
     pub fn guard_arc(self: &Arc<Self>, deployment: &str) -> StaticStreamGuard {
-        self.increment(deployment);
+        self.try_increment(deployment, usize::MAX);
         StaticStreamGuard {
             inflight: self.clone(),
             deployment: deployment.to_string(),
             abandoned: false,
             released: false,
+        }
+    }
+
+    /// Owned streaming guard with the in-flight bound enforced atomically
+    /// (T19): `None` = bound reached, no accounting taken.
+    pub fn try_guard_arc(
+        self: &Arc<Self>,
+        deployment: &str,
+        max: usize,
+    ) -> Option<StaticStreamGuard> {
+        if self.try_increment(deployment, max) {
+            Some(StaticStreamGuard {
+                inflight: self.clone(),
+                deployment: deployment.to_string(),
+                abandoned: false,
+                released: false,
+            })
+        } else {
+            None
         }
     }
 }

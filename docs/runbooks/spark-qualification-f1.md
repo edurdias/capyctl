@@ -46,7 +46,8 @@ on the Spark):
 - **Cold init to READY: 62.7s** (deploy → spawn → weight load → API server up →
   mllm readiness via `/v1/models` serving the route id — liveness ≠ readiness).
 - **Real inference through mllm**: chat completion returned the model's tokens
-  (response "live") through controller → adapter → engine SSE → router path.
+  (response "live") through the wired forwarder (controller → adapter → engine
+  SSE; router dispatch exercised at simulator tier).
 - **Stop: engine process group terminated** (verified via `/proc/<pid>` gone);
   administrative stop semantics live.
 - **Restart to READY: 65-69s (page-cache warm)** — warm restart measured
@@ -81,8 +82,6 @@ ssh timeout; suspected reboot/network change).** Stages attempted:
 | switching A→B→A live | pending | Spark unreachable mid-run; resume on return |
 | park/reload cycles (core feature) live | pending | Spark unreachable mid-run; resume on return |
 | T21 default-denial live | simulator-tier so far | policy_gate tests (fake); live denial check pending |
-
-## 5. Evidence ledger
 
 Every step's command + output is recorded in this file at execution; failures are
 recorded as failures (the recipe is revised per the owner decision: park/reload is core

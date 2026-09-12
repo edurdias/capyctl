@@ -53,20 +53,34 @@ pub struct GrantedBudget {
 pub enum ArgsError {
     #[error("reserved flag `{0}` may not be passed through (T14)")]
     ReservedConflict(String),
+    #[error("duplicate engine flag `{0}` (T14: pass-through flags are declared once)")]
+    DuplicateFlag(String),
     #[error("invalid granted budget: {0}")]
     InvalidBudget(String),
 }
 
 pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsError> {
-    // Reserved-flag conflicts fail before anything renders (T14).
+    // Pass-through validation (T14) parses flag/value pairs by position: an
+    // arg starting with `-` is a flag (the next position is its value); a
+    // bare positional (odd-length tail) is engine-native and passes through.
+    // Reserved flags conflict; duplicates of ordinary flags are declared
+    // errors, never misreported as reserved conflicts.
     let mut seen = std::collections::BTreeSet::new();
-    for pair in input.engine_args.chunks(2) {
-        let flag = &pair[0];
-        if RESERVED_FLAGS.contains(&flag.as_str()) {
-            return Err(ArgsError::ReservedConflict(flag.clone()));
-        }
-        if !seen.insert(flag.clone()) {
-            return Err(ArgsError::ReservedConflict(flag.clone()));
+    let mut i = 0;
+    while i < input.engine_args.len() {
+        let arg = &input.engine_args[i];
+        if arg.starts_with('-') {
+            if RESERVED_FLAGS.contains(&arg.as_str()) {
+                return Err(ArgsError::ReservedConflict(arg.clone()));
+            }
+            if !seen.insert(arg.clone()) {
+                return Err(ArgsError::DuplicateFlag(arg.clone()));
+            }
+            // The next position is this flag's value (skipped by the
+            // stride; a trailing flag with no value parses as boolean).
+            i += 2;
+        } else {
+            i += 1;
         }
     }
     // Validate granted budgets are finite and in range.

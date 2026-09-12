@@ -103,6 +103,30 @@ fn hb_gen(r: &Result<u64, mllm_router::switch::SwitchError>) -> u64 {
 }
 
 #[tokio::test]
+async fn follower_joins_instant_leader_without_hang() {
+    // T15 join-slot regression: the target is READY already, so the leader
+    // completes INSTANTLY — between the follower's claim check and its
+    // await. The follower must still return (the published outcome is a
+    // retained watch value, never a one-shot notify that can be lost).
+    let (c, store) = controller();
+    let id = deploy_and_start(&c, "instant-m").await;
+    let sw = Arc::new(mllm_router::switch::SwitchEngine::new(
+        c.clone(),
+        Duration::from_secs(5),
+    ));
+    let sw2 = sw.clone();
+    let id2 = id.clone();
+    let (ga, gb) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), sw.switch_to(&id)),
+        tokio::time::timeout(Duration::from_secs(5), sw2.switch_to(&id2)),
+    );
+    let gen = ga.unwrap().unwrap();
+    assert_eq!(gen, hb_gen(&gb.unwrap()));
+    // A READY target needs no wake: exactly the original Start remains.
+    assert_eq!(start_op_count(&store, &id), 1);
+}
+
+#[tokio::test]
 async fn a_to_b_to_a_alternates_with_release_evidence() {
     let (c, store) = controller();
     let a = deploy_and_start(&c, "model-a").await;

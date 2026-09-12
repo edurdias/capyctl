@@ -77,6 +77,55 @@ fn user_sleep_flag_is_reserved_not_rendered() {
 }
 
 #[test]
+fn odd_length_engine_args_parse_as_flag_value_pairs() {
+    // An odd-length pass-through list parses by position: `flag value`
+    // pairs plus a bare engine-native positional — never read as a flag
+    // (the old chunks(2) parse misread the odd tail as a flag).
+    let mut input = base_input();
+    input.engine_args = vec![
+        "--served-model-name".into(),
+        "toy-model".into(),
+        "--max-model-len".into(),
+        "65536".into(),
+        "--trust-remote-code".into(),
+    ];
+    let cmd = render_command(&input).unwrap();
+    let pos = |a: &str| cmd.argv.iter().position(|x| x == a).unwrap();
+    assert_eq!(cmd.argv[pos("--served-model-name") + 1], "toy-model");
+    assert_eq!(cmd.argv[pos("--max-model-len") + 1], "65536");
+    assert!(cmd.argv.contains(&"--trust-remote-code".to_string()));
+}
+
+#[test]
+fn duplicate_ordinary_flag_is_duplicate_error_not_reserved() {
+    // A duplicate NON-reserved flag is its own error class (T14): the old
+    // behavior misreported it as ReservedConflict.
+    let mut input = base_input();
+    input.engine_args = vec![
+        "--served-model-name".into(),
+        "a".into(),
+        "--served-model-name".into(),
+        "b".into(),
+    ];
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::DuplicateFlag(f)) if f == "--served-model-name"
+    ));
+}
+
+#[test]
+fn duplicate_reserved_flag_still_conflicts() {
+    // The reserved check wins: a reserved flag is a ReservedConflict on
+    // first sight, duplicate or not.
+    let mut input = base_input();
+    input.engine_args = vec!["--port".into(), "9999".into(), "--port".into()];
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::ReservedConflict(f)) if f == "--port"
+    ));
+}
+
+#[test]
 fn sleep_flags_render_only_when_profile_gated_in() {
     let mut gated = base_input();
     gated.sleep_flags = vec!["--enable-sleep-mode".into()];

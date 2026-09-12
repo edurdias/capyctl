@@ -31,20 +31,40 @@ pub async fn resolve(
         (row.id.clone(), row.kind.clone(), row.observed_state)
     };
 
-    // Join the deployment's single activation operation when not READY
-    // (T15: simultaneous requests join one wake; no duplicate processes).
+    // Join the deployment's single activation when not READY (T15:
+    // simultaneous requests join one wake; no duplicate processes, no
+    // double auto_activate). The wake re-checks readiness inside the join:
+    // a concurrent activation may have completed already (activating a
+    // now-READY deployment is illegal, not idempotent).
     if observed != mllm_domain::LifecycleState::Ready {
-        // Auto-activation: wakes on-demand deployments but never undoes an
-        // administrative stop (T10; SPEC §6.3).
-        let op = deps
-            .controller
-            .auto_activate(&deployment_id)
-            .await
-            .map_err(map_controller)?;
-        deps.controller
-            .wait_terminal(&op)
-            .await
-            .map_err(map_controller)?;
+        deps.activation_join
+            .join(&deployment_id, || async {
+                let now_ready = deps
+                    .store
+                    .lock()
+                    .unwrap()
+                    .get_deployment(&deployment_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.observed_state == mllm_domain::LifecycleState::Ready)
+                    .unwrap_or(true);
+                if now_ready {
+                    return Ok(0);
+                }
+                // Auto-activation: wakes on-demand deployments but never
+                // undoes an administrative stop (T10; SPEC §6.3).
+                let op = deps
+                    .controller
+                    .auto_activate(&deployment_id)
+                    .await
+                    .map_err(map_controller)?;
+                deps.controller
+                    .wait_terminal(&op)
+                    .await
+                    .map_err(map_controller)?;
+                Ok(0)
+            })
+            .await?;
     }
 
     Ok((deployment_id, kind))
@@ -60,16 +80,17 @@ pub async fn dispatch(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     let (deployment_id, kind) = resolve(deps, model).await?;
 
-    // Admission accounting: per-deployment in-flight bound (T19).
-    if deps.inflight.current(&deployment_id) >= deps.limits.max_requests_per_deployment {
-        return Err(err("queue_full", "deployment in-flight bound reached"));
-    }
     let forward = deps
         .forwards
         .get(&kind)
         .ok_or_else(|| err("unsupported", &format!("no forwarder for profile {kind}")))?
         .clone();
-    let guard = deps.inflight.guard(&deployment_id);
+    // Admission accounting: per-deployment in-flight bound (T19), enforced
+    // atomically (check + increment share the lock — no over-admission).
+    let guard = deps
+        .inflight
+        .try_guard(&deployment_id, deps.limits.max_requests_per_deployment)
+        .ok_or_else(|| err("queue_full", "deployment in-flight bound reached"))?;
     let resp = forward
         .forward_chat(body)
         .await

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use mllm_agent::Host;
-use mllm_config::defaults::resolve_startup;
+use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::schema::ConfigKind;
 use mllm_controller::Controller;
 use mllm_store::Store;
@@ -58,6 +58,8 @@ pub enum StartError {
     Store(#[from] mllm_store::StoreError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("credentials missing: refusing to serve without a generated api key")]
+    MissingCredentials,
 }
 
 impl From<StartError> for StructuredError {
@@ -132,11 +134,23 @@ async fn start_standalone_inner(
     state_dir: &Path,
     policy: mllm_adapters::fake::ParkPolicy,
 ) -> Result<App, StartError> {
-    resolve_startup(ConfigKind::Standalone, None, state_dir)?;
+    // Fail-closed credentials (SPEC §15.2): the generated api key lives in
+    // the protected credentials file. The hardcoded fallback exists ONLY
+    // for a boot that generated the config (and its credentials) this run
+    // — an existing state dir missing its credentials refuses to serve
+    // instead of serving with a guessable key.
+    let created_this_boot = matches!(
+        resolve_startup(ConfigKind::Standalone, None, state_dir)?,
+        LoadOutcome::Generated { created_identity: true, .. }
+    );
     let db_path = state_dir.join("server").join("srv.sqlite3");
     let store = Rc::new(Store::open(&db_path)?);
     let controller_store = Arc::new(Mutex::new(Store::open(&db_path)?));
-    let api_key = read_api_key(state_dir).unwrap_or_else(|| "mllm-local".to_string());
+    let api_key = match read_api_key(state_dir) {
+        Some(k) => k,
+        None if created_this_boot => "mllm-local".to_string(),
+        None => return Err(StartError::MissingCredentials),
+    };
 
     // Live profile: the REAL vLLM adapter + REAL exec launcher (F1 design
     // §8; the profile carries the pinned build's fingerprint).
@@ -203,7 +217,14 @@ async fn start_standalone_inner(
             (
                 adapter.clone() as Arc<dyn mllm_adapters::traits::EngineAdapter>,
                 launcher,
-                HashMap::from([(p.model_id.clone(), fwd)]),
+                // The live profile is keyed by BOTH the deployment kind the
+                // router resolves at dispatch ("model") and the public
+                // model id (the wired forwarder used by tests/the live tier)
+                // — two keys, same forwarder.
+                HashMap::from([
+                    ("model".to_string(), fwd.clone()),
+                    (p.model_id.clone(), fwd),
+                ]),
             )
         }
         None => {
@@ -241,8 +262,9 @@ async fn start_standalone_inner(
         },
         api_key: Some(api_key.clone()),
         inflight: Arc::new(mllm_router::admission::InFlight::default()),
+        activation_join: Arc::new(mllm_router::WakeJoin::new()),
     };
-    let router = mllm_router::serve_router(deps.clone(), "127.0.0.1:0".parse().unwrap());
+    let router = mllm_router::serve_router(deps.clone());
     Ok(App { controller, store, router, deps, api_key })
 }
 

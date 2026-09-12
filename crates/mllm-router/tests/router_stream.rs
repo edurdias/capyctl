@@ -32,8 +32,9 @@ async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
         limits: QueueLimits { max_requests_per_deployment: 8, max_buffered_bytes_total: 64 * 1024 },
         api_key: Some("test-key".into()),
         inflight: Arc::new(mllm_router::admission::InFlight::default()),
+        activation_join: Arc::new(mllm_router::WakeJoin::new()),
     };
-    (mllm_router::serve_router(deps, "127.0.0.1:0".parse().unwrap()), inflight, controller)
+    (mllm_router::serve_router(deps), inflight, controller)
 }
 
 fn req(_id: &str, name: &str) -> mllm_controller::DeployRequest {

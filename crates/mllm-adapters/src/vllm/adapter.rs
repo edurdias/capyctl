@@ -4,6 +4,9 @@
 
 use async_trait::async_trait;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use crate::fake::ParkPolicy;
 use crate::traits::{
     AdapterError, CancellationOutcome, EngineAdapter, EngineState, MemberRef, ParkLevel,
@@ -26,15 +29,19 @@ pub const fn level2_residue() -> i64 {
 /// vLLM adapter for one managed member's API surface.
 ///
 /// Parked-state observability (F1 design §3): the adapter tracks the last
-/// known park state locally (`parked` flag) and reports `Phase::Parked`
-/// from it; `/v1/models` alone never establishes Ready after a park. The
-/// controller corroborates via operation provenance.
+/// known park state locally per member (`parked` flags keyed by
+/// `member.member_id`) and reports `Phase::Parked` from it; `/v1/models`
+/// alone never establishes Ready after a park. The controller corroborates
+/// via operation provenance. The park state is PER MEMBER (mirroring the
+/// fake's per-member state): the adapter is a per-profile singleton shared
+/// by deployments riding the same profile — member A's park must never
+/// make member B report Parked or Initializing.
 pub struct VllmAdapter {
     http: EngineHttp,
     fingerprint: String,
     policy: ParkPolicy,
     model_id: String,
-    parked: std::sync::atomic::AtomicBool,
+    parked: Mutex<HashMap<String, bool>>,
     /// Launch contract (F1 design §4): the concrete vLLM serve command
     /// this adapter renders for managed launches.
     launch: Option<crate::vllm::args::PlanInputVllm>,
@@ -53,7 +60,7 @@ impl VllmAdapter {
             fingerprint,
             policy,
             model_id,
-            parked: std::sync::atomic::AtomicBool::new(false),
+            parked: Mutex::new(HashMap::new()),
             launch: None,
         }
     }
@@ -74,13 +81,20 @@ impl VllmAdapter {
         }
     }
 
-    fn set_parked(&self, v: bool) {
+    fn set_parked(&self, member: &MemberRef, v: bool) {
         self.parked
-            .store(v, std::sync::atomic::Ordering::SeqCst);
+            .lock()
+            .unwrap()
+            .insert(member.member_id.clone(), v);
     }
 
-    fn is_parked(&self) -> bool {
-        self.parked.load(std::sync::atomic::Ordering::SeqCst)
+    fn is_parked(&self, member: &MemberRef) -> bool {
+        self.parked
+            .lock()
+            .unwrap()
+            .get(&member.member_id)
+            .copied()
+            .unwrap_or(false)
     }
 
     fn uncertain_http(what: &str, e: HttpError) -> AdapterError {
@@ -94,7 +108,7 @@ impl VllmAdapter {
 
 #[async_trait]
 impl EngineAdapter for VllmAdapter {
-    async fn inspect(&self, _member: &MemberRef) -> Result<EngineState, AdapterError> {
+    async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
         // /v1/models presence tells us the API server is up and serving the
         // model id — but after a park the server stays up (F1 design §3),
         // so the local park tracking decides the phase.
@@ -109,7 +123,7 @@ impl EngineAdapter for VllmAdapter {
                 Self::uncertain_http("inspect", e)
             }
         })?;
-        let phase = if self.is_parked() {
+        let phase = if self.is_parked(member) {
             Phase::Parked
         } else if serving.contains(&self.model_id) {
             Phase::Ready
@@ -118,7 +132,11 @@ impl EngineAdapter for VllmAdapter {
         };
         Ok(EngineState {
             phase,
-            retained_bytes: if self.is_parked() { level2_residue() } else { 4096 },
+            retained_bytes: if self.is_parked(member) {
+                level2_residue()
+            } else {
+                4096
+            },
             build_fingerprint: Some(self.fingerprint.clone()),
         })
     }
@@ -149,10 +167,12 @@ impl EngineAdapter for VllmAdapter {
         Ok(cmd)
     }
 
-    async fn check_readiness(&self, _member: &MemberRef) -> Result<Readiness, AdapterError> {
+    async fn check_readiness(&self, member: &MemberRef) -> Result<Readiness, AdapterError> {
         // SPEC §6.1: liveness of an HTTP server is not model readiness.
-        // A parked engine is never Ready (parked-state observability).
-        if self.is_parked() {
+        // A parked engine is never Ready (parked-state observability) —
+        // keyed by THIS member: another deployment's park must not make
+        // this member read Initializing.
+        if self.is_parked(member) {
             return Ok(Readiness::Initializing);
         }
         let ids = match self.http.list_models().await {
@@ -182,7 +202,7 @@ impl EngineAdapter for VllmAdapter {
         }
     }
 
-    async fn park(&self, _member: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+    async fn park(&self, member: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
         // Deep-park security gate (SPEC §9.1 / T21): both sleep levels on the
         // vllm-sleep profile require the host-policy opt-in — the profile
         // itself is gated, not just the operations (design §7).
@@ -197,19 +217,19 @@ impl EngineAdapter for VllmAdapter {
             .map_err(|e| Self::uncertain_http("park", e))?;
         match outcome {
             crate::vllm::SleepOutcome::Applied => {
-                self.set_parked(true);
+                self.set_parked(member, true);
                 Ok(ParkOutcome::Parked { retained_bytes: level2_residue() })
             }
         }
     }
 
-    async fn restore(&self, _member: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+    async fn restore(&self, member: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
         // Waking allocations alone is not successful restoration (SPEC §9.1):
         // wake, then reload weights through the collective, then the caller
         // verifies readiness + generation.
         self.http.wake().await.map_err(|e| Self::uncertain_http("restore wake", e))?;
-        self.reload_weights(_member).await?;
-        self.set_parked(false);
+        self.reload_weights(member).await?;
+        self.set_parked(member, false);
         Ok(RestoreOutcome::Restored)
     }
 
@@ -224,12 +244,12 @@ impl EngineAdapter for VllmAdapter {
         Ok(ReloadOutcome::Reloaded)
     }
 
-    async fn observe_work(&self, _member: &MemberRef) -> Result<WorkObservation, AdapterError> {
+    async fn observe_work(&self, member: &MemberRef) -> Result<WorkObservation, AdapterError> {
         // vLLM exposes no per-request in-flight HTTP surface in the pinned
         // API; accounting rides on stream correlation in the router. The
         // adapter reports what it can prove: nothing observable → Unknown
         // unless parked (a parked engine is provably idle).
-        if self.is_parked() {
+        if self.is_parked(member) {
             return Ok(WorkObservation::Idle);
         }
         Ok(WorkObservation::Unknown)

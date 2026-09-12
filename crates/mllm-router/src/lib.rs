@@ -8,6 +8,8 @@ pub mod chat;
 pub mod stream;
 pub mod switch;
 
+pub use switch::WakeJoin;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,11 @@ pub struct RouterDeps {
     pub api_key: Option<String>,
     /// Conservative in-flight accounting (released only on confirmed end).
     pub inflight: Arc<admission::InFlight>,
+    /// Activation join (T15 at the router tier): concurrent requests waking
+    /// the same non-READY deployment join ONE wake — no double-spawn, no
+    /// duplicate Start operations.
+    pub activation_join:
+        Arc<WakeJoin<(StatusCode, Json<serde_json::Value>)>>,
 }
 
 #[derive(Clone)]
@@ -44,7 +51,7 @@ struct AppState {
     deps: RouterDeps,
 }
 
-pub fn serve_router(deps: RouterDeps, _bind: std::net::SocketAddr) -> axum::Router {
+pub fn serve_router(deps: RouterDeps) -> axum::Router {
     let state = AppState { deps };
     axum::Router::new()
         .route("/v1/models", get(list_models))
@@ -126,11 +133,18 @@ async fn chat_completions(
             .ok_or_else(|| {
                 err_json("unsupported", &format!("no forwarder for profile {kind}"))
             })?;
-        let handle = stream::InFlightHandle {
-            inflight: state.deps.inflight.clone(),
-            deployment: deployment_id,
-        };
-        let sse = stream::stream_response(forward, v, handle);
+        // In-flight bound enforced atomically BEFORE the response is built
+        // (T19): accounting is registered synchronously; the stream guard
+        // releases when the backend stream ends.
+        let guard = state
+            .deps
+            .inflight
+            .try_guard_arc(
+                &deployment_id,
+                state.deps.limits.max_requests_per_deployment,
+            )
+            .ok_or_else(|| err_json("queue_full", "deployment in-flight bound reached"))?;
+        let sse = stream::stream_response(forward, v, guard);
         return Ok(sse.into_response());
     }
     let json = chat::dispatch(&state.deps, model, &v).await?;

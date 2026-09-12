@@ -12,7 +12,13 @@ use mllm_controller::Controller;
 use mllm_router::{QueueLimits, RouterDeps};
 use mllm_store::Store;
 
-async fn app() -> (axum::Router, Arc<Mutex<Store>>, Arc<Controller>, mllm_store::Store) {
+async fn app() -> (
+    axum::Router,
+    Arc<Mutex<Store>>,
+    Arc<Controller>,
+    mllm_store::Store,
+    mllm_router::RouterDeps,
+) {
     let shared = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let fake = Arc::new(FakeEngine::new());
     let adapter = fake.clone() as Arc<dyn mllm_adapters::ChatForward>;
@@ -28,9 +34,10 @@ async fn app() -> (axum::Router, Arc<Mutex<Store>>, Arc<Controller>, mllm_store:
         limits: QueueLimits { max_requests_per_deployment: 2, max_buffered_bytes_total: 1024 },
         api_key: Some("test-key".into()),
         inflight: Arc::new(mllm_router::admission::InFlight::default()),
+        activation_join: Arc::new(mllm_router::WakeJoin::new()),
     };
     let file_store = Store::open_in_memory().unwrap();
-    (mllm_router::serve_router(deps, "127.0.0.1:0".parse().unwrap()), shared, controller, file_store)
+    (mllm_router::serve_router(deps.clone()), shared, controller, file_store, deps)
 }
 
 async fn deploy_ready(
@@ -57,7 +64,7 @@ async fn deploy_ready(
 
 #[tokio::test]
 async fn models_lists_enabled_never_wakes() {
-    let (router, store, controller, _fs) = app().await;
+    let (router, store, controller, _fs, _deps) = app().await;
     let _ = deploy_ready(&router, &controller, "m1").await;
     let _ = store;
     let res = router
@@ -81,7 +88,7 @@ async fn models_lists_enabled_never_wakes() {
 
 #[tokio::test]
 async fn models_does_not_activate_stopped_deployment() {
-    let (router, store, controller, _fs) = app().await;
+    let (router, store, controller, _fs, _deps) = app().await;
     let id = controller
         .submit_deploy(mllm_controller::DeployRequest {
             name: "stopped-m".into(),
@@ -110,7 +117,7 @@ async fn models_does_not_activate_stopped_deployment() {
 
 #[tokio::test]
 async fn unauthenticated_requests_rejected() {
-    let (router, _s, _c, _f) = app().await;
+    let (router, _s, _c, _f, _deps) = app().await;
     let res = router
         .oneshot(
             axum::http::Request::builder()
@@ -125,7 +132,7 @@ async fn unauthenticated_requests_rejected() {
 
 #[tokio::test]
 async fn chat_dispatches_to_ready_deployment() {
-    let (router, _s, controller, _f) = app().await;
+    let (router, _s, controller, _f, _deps) = app().await;
     deploy_ready(&router, &controller, "ready-m").await;
     let res = router
         .oneshot(
@@ -149,7 +156,7 @@ async fn chat_dispatches_to_ready_deployment() {
 
 #[tokio::test]
 async fn queue_bounds_return_structured_error() {
-    let (router, _s, controller, _f) = app().await;
+    let (router, _s, controller, _f, _deps) = app().await;
     deploy_ready(&router, &controller, "bounded-m").await;
     // max_buffered_bytes_total = 1024; a body larger than that is rejected.
     let big = "x".repeat(4096);
@@ -171,4 +178,42 @@ async fn queue_bounds_return_structured_error() {
     let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["code"], "queue_full");
+}
+
+#[tokio::test]
+async fn concurrent_resolves_join_one_wake_at_router_tier() {
+    // T15 at the router tier (auto-activation join): two simultaneous
+    // requests to the SAME non-READY deployment must produce exactly one
+    // Start operation — never a double-spawn or duplicate wake.
+    let (_router, store, controller, _fs, deps) = app().await;
+    let id = controller
+        .submit_deploy(mllm_controller::DeployRequest {
+            name: "wake-router-m".into(),
+            kind: "fake".into(),
+            manifest: b"name: wake-router-m\n".to_vec(),
+            route_model_id: Some("wake-router-m".into()),
+        })
+        .await
+        .unwrap();
+    let (r1, r2) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mllm_router::chat::resolve(&deps, "wake-router-m"),
+        ),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mllm_router::chat::resolve(&deps, "wake-router-m"),
+        ),
+    );
+    // Both resolve successfully (the timeout proves no hang).
+    let (d1, d2) = (r1.unwrap().unwrap(), r2.unwrap().unwrap());
+    assert_eq!(d1.0, id);
+    assert_eq!(d2.0, id);
+    let starts = store
+        .lock()
+        .unwrap()
+        .operations_of_kind(&id, "start")
+        .unwrap()
+        .len();
+    assert_eq!(starts, 1, "exactly one Start operation (T15, router tier)");
 }

@@ -4,6 +4,7 @@
 //! failure branch (A reopens, B fail-fast).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,19 +42,90 @@ pub enum SwitchError {
     AdmissionBlocked(String, String),
 }
 
-struct JoinSlot {
-    notify: tokio::sync::Notify,
+/// Leader/follower wake join (T15): concurrent callers waking the same
+/// target join ONE wake. The leader publishes its outcome on a per-claim
+/// watch channel; followers subscribe BEFORE the claim check, so an outcome
+/// published between the claim check and the await is never lost (a watch
+/// value is retained; `notify_waiters` is not). The joined slot is removed
+/// from the map only AFTER publishing: a caller arriving in that window
+/// reads the completed outcome instead of racing a second wake.
+pub struct WakeJoin<E> {
+    wakes: Mutex<HashMap<String, Arc<JoinSlot<E>>>>,
+}
+
+struct JoinSlot<E> {
+    tx: tokio::sync::watch::Sender<Option<Result<u64, E>>>,
     claimed: std::sync::atomic::AtomicBool,
-    result: Mutex<Option<Result<u64, SwitchError>>>,
+}
+
+impl<E: Clone> Default for WakeJoin<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E: Clone> WakeJoin<E> {
+    pub fn new() -> Self {
+        Self { wakes: Mutex::new(HashMap::new()) }
+    }
+
+    /// Run (or join) the wake for `key`: the first caller of the cohort
+    /// activates; every caller receives the wake's outcome.
+    pub async fn join<F, Fut>(&self, key: &str, wake: F) -> Result<u64, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<u64, E>>,
+    {
+        // Subscribe BEFORE the claim check: a freshly created receiver sees
+        // the current value, so an outcome already published at subscribe
+        // time is observed immediately — no lost wake.
+        let (slot, mut rx) = {
+            let mut wakes = self.wakes.lock().unwrap();
+            let slot = wakes
+                .entry(key.to_string())
+                .or_insert_with(|| {
+                    Arc::new(JoinSlot {
+                        tx: tokio::sync::watch::channel(None).0,
+                        claimed: std::sync::atomic::AtomicBool::new(false),
+                    })
+                })
+                .clone();
+            let rx = slot.tx.subscribe();
+            (slot, rx)
+        };
+        // Exactly one leader claims the wake; the rest await the published
+        // outcome (retained on the watch, not a one-shot notify).
+        if !slot
+            .claimed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let r = wake().await;
+            // Publish BEFORE removing from the map: a caller arriving in
+            // between joins the outcome, never a second wake.
+            let _ = slot.tx.send(Some(r.clone()));
+            self.wakes.lock().unwrap().remove(key);
+            r
+        } else {
+            loop {
+                if let Some(r) = rx.borrow().clone() {
+                    return r;
+                }
+                // The sender lives inside our clone of the slot's Arc, so
+                // `changed` cannot fail before a publish — it only wakes
+                // when the outcome lands.
+                let _ = rx.changed().await;
+            }
+        }
+    }
 }
 
 pub struct SwitchEngine {
     controller: Arc<Controller>,
     /// Bounded drain grace before the best-effort abort (design §5).
     drain_grace: Duration,
-    /// In-flight wake joins: deployment → shared result slot (T15). The
-    /// first caller leads and stores the outcome; followers await and read.
-    wakes: Arc<Mutex<HashMap<String, Arc<JoinSlot>>>>,
+    /// In-flight wake joins (T15): concurrent activations for one target
+    /// join a single wake.
+    wake_join: WakeJoin<SwitchError>,
 }
 
 impl SwitchEngine {
@@ -61,7 +133,7 @@ impl SwitchEngine {
         Self {
             controller,
             drain_grace,
-            wakes: Arc::new(Mutex::new(HashMap::new())),
+            wake_join: WakeJoin::new(),
         }
     }
 
@@ -69,40 +141,7 @@ impl SwitchEngine {
     /// first. Concurrent activations for the same target join one wake
     /// (T15); returns the target's generation after activation (T16).
     pub async fn switch_to(&self, target: &str) -> Result<u64, SwitchError> {
-        // Single-wake join: register interest; the first caller performs the
-        // wake, later callers await its completion (T15).
-        let slot = {
-            let mut joins = self.wakes.lock().unwrap();
-            joins
-                .entry(target.to_string())
-                .or_insert_with(|| {
-                    Arc::new(JoinSlot {
-                        notify: tokio::sync::Notify::new(),
-                        claimed: std::sync::atomic::AtomicBool::new(false),
-                        result: Mutex::new(None),
-                    })
-                })
-                .clone()
-        };
-        // Exactly one leader claims the wake; the rest wait for its result.
-        if !slot
-            .claimed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            let r = self.activate(target).await;
-            *slot.result.lock().unwrap() = Some(r.clone());
-            self.wakes.lock().unwrap().remove(target);
-            slot.notify.notify_waiters();
-            r
-        } else {
-            slot.notify.notified().await;
-            let stored = slot.result.lock().unwrap().clone();
-            if let Some(r) = stored {
-                r
-            } else {
-                self.current_generation(target).await
-            }
-        }
+        self.wake_join.join(target, || self.activate(target)).await
     }
 
     async fn current_generation(&self, target: &str) -> Result<u64, SwitchError> {

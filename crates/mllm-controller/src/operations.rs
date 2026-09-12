@@ -244,6 +244,10 @@ pub struct Controller {
     park_level: mllm_adapters::ParkLevel,
     /// The embedded fake engine handle (qualification/ambiguity injection).
     embedded_fake: Option<Arc<mllm_adapters::fake::FakeEngine>>,
+    /// Bound on how long `wait_terminal` waits for a terminal operation
+    /// state (`OPERATION_TIMEOUT` by default; shortened by tests to
+    /// exercise the timeout branch deterministically).
+    operation_timeout: Duration,
 }
 
 impl Controller {
@@ -275,7 +279,16 @@ impl Controller {
                 mllm_adapters::ParkLevel::One
             },
             embedded_fake: None,
+            operation_timeout: OPERATION_TIMEOUT,
         }
+    }
+
+    /// Test hook: bound the `wait_terminal` deadline (real engines take
+    /// minutes to stage weights; tests use a short bound to exercise the
+    /// timeout branch deterministically).
+    pub fn with_operation_timeout(mut self, d: Duration) -> Self {
+        self.operation_timeout = d;
+        self
     }
 
     /// Attach the embedded fake engine handle (ambiguity injection for the
@@ -335,15 +348,20 @@ impl Controller {
         {
             let store = self.store.lock().unwrap();
             let dep = accepted.deployment_id.to_string();
-            store
-                .insert_reservation(&mllm_store::ReservationRow {
-                    owner_id: dep.clone(),
-                    domain_id: Some("system".into()),
-                    bytes: F0_SYNTHETIC_ACTIVATION_PEAK,
-                    phase: "activation".into(),
-                    exclusive_devices: vec![],
-                })
-                .map_err(ControllerError::from)?;
+            // Idempotent re-submission resolves to the ORIGINAL deployment,
+            // whose reservation intent already persisted — never insert a
+            // duplicate row.
+            if store.reservations_for_owner(&dep)?.is_empty() {
+                store
+                    .insert_reservation(&mllm_store::ReservationRow {
+                        owner_id: dep.clone(),
+                        domain_id: Some("system".into()),
+                        bytes: F0_SYNTHETIC_ACTIVATION_PEAK,
+                        phase: "activation".into(),
+                        exclusive_devices: vec![],
+                    })
+                    .map_err(ControllerError::from)?;
+            }
         }
         Ok(accepted.deployment_id.to_string())
     }
@@ -512,12 +530,14 @@ impl Controller {
 
     /// Wait until the operation reaches a terminal state. `Ok` carries the
     /// deployment's final observed state; a failed operation is an error
-    /// carrying its stable error code.
+    /// carrying its stable error code. Read-only: the generation bump
+    /// belongs to the operation's completion path (one bump per operation
+    /// — awaiting twice never double-bumps).
     pub async fn wait_terminal(
         &self,
         handle: &OperationHandle,
     ) -> Result<LifecycleState, ControllerError> {
-        let deadline = Instant::now() + OPERATION_TIMEOUT;
+        let deadline = Instant::now() + self.operation_timeout;
         loop {
             let (state, error_code, observed) = {
                 let store = self.store.lock().unwrap();
@@ -534,13 +554,6 @@ impl Controller {
             };
             match (state, observed) {
                 (OpState::Succeeded, Some(observed)) => {
-                    // Generation machinery (F1 G3): every successful
-                    // transition bumps the deployment generation and
-                    // records history — monotonic, never reset.
-                    {
-                        let store = self.store.lock().unwrap();
-                        let _ = store.bump_generation(&handle.deployment_id)?;
-                    }
                     return Ok(observed);
                 }
                 (OpState::Failed, _) => {
@@ -551,11 +564,41 @@ impl Controller {
                 }
                 _ => {
                     if Instant::now() >= deadline {
+                        // Orphaned-children guard (design §5): the wedged
+                        // operation must not leave a live engine child
+                        // behind. Best-effort abort, then Timeout.
+                        self.abort_wedged_activation(handle);
                         return Err(ControllerError::Timeout);
                     }
                     tokio::time::sleep(READINESS_POLL).await;
                 }
             }
+        }
+    }
+
+    /// Best-effort abort for a wedged activation (design §5): terminate the
+    /// deployment's owned engine handle (if present) and reconcile the
+    /// observed state to FAILED via the same Reconciling → Failed path the
+    /// failure branch uses. The wedged task may still complete later — a
+    /// late completion re-lands legally through the transition table.
+    fn abort_wedged_activation(&self, handle: &OperationHandle) {
+        let owned = self.handles.lock().unwrap().remove(&handle.deployment_id);
+        {
+            let store = self.store.lock().unwrap();
+            if owned.is_some() {
+                let _ = store.record_journal(
+                    Some(&self.host_id),
+                    Some(&handle.operation_id.0),
+                    Some("failed"),
+                    r#"{"event":"timeout_terminated"}"#,
+                );
+            }
+            // The failure branch's reconcile path (Reconciling → Failed).
+            let _ = store.set_observed_state(&handle.deployment_id, LifecycleState::Reconciling);
+            let _ = store.set_observed_state(&handle.deployment_id, LifecycleState::Failed);
+        }
+        if let Some(h) = owned {
+            let _ = self.launcher.terminate(&h, TERMINATE_GRACE);
         }
     }
 }
@@ -847,11 +890,27 @@ impl ExecTask {
                     at_state,
                     format!(r#"{{"event":"succeeded","action":"{}"}}"#, action.as_str()),
                 );
-                let _ = self.store.lock().unwrap().update_operation_state(
-                    &op.0,
-                    OpState::Succeeded,
-                    None,
-                );
+                // Completion path (F1 G3): the generation bump belongs HERE
+                // — part of journaling "succeeded" — and is idempotent per
+                // operation id: only a Pending/Running → Succeeded
+                // transition bumps, so a completed operation awaited twice
+                // (or awaited by a follower) never double-bumps.
+                {
+                    let store = self.store.lock().unwrap();
+                    let already_terminal = store
+                        .get_operation(&op.0)
+                        .ok()
+                        .flatten()
+                        .map(|row| matches!(row.state, OpState::Succeeded | OpState::Failed))
+                        .unwrap_or(true);
+                    if !already_terminal {
+                        let _ = store.update_operation_state(&op.0, OpState::Succeeded, None);
+                        // Every successful transition bumps the deployment
+                        // generation and records history — monotonic, never
+                        // reset.
+                        let _ = store.bump_generation(dep);
+                    }
+                }
             }
             Err(code) => {
                 // at_state → Reconciling → Failed (both legal pairs).
@@ -1042,6 +1101,59 @@ mod tests {
         }
     }
 
+    /// An adapter whose readiness NEVER flips (Initializing forever): the
+    /// activation wedges — wait_terminal must abort the orphaned engine
+    /// child instead of leaving it live past the timeout.
+    struct NeverReadyAdapter;
+
+    #[async_trait::async_trait]
+    impl EngineAdapter for NeverReadyAdapter {
+        async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+            Ok(EngineState {
+                phase: Phase::Startup,
+                retained_bytes: 0,
+                build_fingerprint: Some("never-ready".into()),
+            })
+        }
+        async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+            Ok(RenderedCommand {
+                argv: vec!["sleep".into(), "60".into()],
+                env: Default::default(),
+            })
+        }
+        async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+            Ok(Readiness::Initializing)
+        }
+        async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+            Ok(WorkObservation::Unknown)
+        }
+        async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn cancel_work(
+            &self,
+            _: &MemberRef,
+            _: &RequestRef,
+            _: bool,
+        ) -> Result<CancellationOutcome, AdapterError> {
+            Ok(CancellationOutcome::Uncertain)
+        }
+    }
+
+    use mllm_adapters::traits::{
+        CancellationOutcome, EngineState, ParkLevel, ParkOutcome, Quiescence,
+        ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
+    };
+
     async fn drive(
         c: &Controller,
         dep: &str,
@@ -1130,6 +1242,80 @@ mod tests {
         // No new operation was recorded for the illegal request.
         let after = c.store.lock().unwrap().latest_operation(&dep).unwrap().unwrap();
         assert_eq!(before.id, after.id);
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_timeout_terminates_handle_and_fails_observed() {
+        // Orphaned-children guard (design §5): an activation wedged in
+        // Initializing-forever readiness → wait_terminal times out, the
+        // spawned engine handle is terminated (best-effort abort), and the
+        // observed state reconciles to FAILED (never a wedged Starting).
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let c = Controller::new_with_policy(
+            store,
+            Arc::new(NeverReadyAdapter),
+            Arc::new(FakeLauncher::new()),
+            mllm_adapters::fake::ParkPolicy::Denied,
+        )
+        .with_operation_timeout(Duration::from_millis(150));
+        let dep = c.submit_deploy(req("never-ready-m")).await.unwrap();
+        let op = c
+            .request_transition(&dep, LifecycleAction::Start)
+            .await
+            .unwrap();
+        assert!(matches!(c.wait_terminal(&op).await, Err(ControllerError::Timeout)));
+        assert!(c.live_pid(&dep).is_none(), "orphaned handle terminated on timeout");
+        let row = c
+            .store_ref()
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.observed_state, LifecycleState::Failed);
+        // The abort is journaled evidence (never a silent kill).
+        let evidence = c
+            .store_ref()
+            .lock()
+            .unwrap()
+            .journal_evidence_of(&dep)
+            .unwrap()
+            .join("\n");
+        assert!(evidence.contains("timeout_terminated"), "evidence: {evidence}");
+    }
+
+    #[tokio::test]
+    async fn generation_bumps_once_per_operation_not_per_wait() {
+        // The bump moved to the operation's completion path (idempotent per
+        // operation id): awaiting the same completed operation twice must
+        // never double-bump.
+        let (c, _engine, _launcher) = controller(FakeEngine::new());
+        let dep = c.submit_deploy(req("bump-once-m")).await.unwrap();
+        let store = c.store_ref();
+        let op = c
+            .request_transition(&dep, LifecycleAction::Start)
+            .await
+            .unwrap();
+        c.wait_terminal(&op).await.unwrap();
+        let gen_after_first = store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap()
+            .current_generation;
+        c.wait_terminal(&op).await.unwrap();
+        let gen_after_second = store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap()
+            .current_generation;
+        assert_eq!(
+            gen_after_first, gen_after_second,
+            "a completed operation awaited twice never double-bumps"
+        );
     }
 
     #[tokio::test]

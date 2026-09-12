@@ -118,6 +118,45 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
 }
 
 #[tokio::test]
+async fn park_state_is_per_member_not_per_profile() {
+    // The adapter is a per-profile singleton shared by deployments riding
+    // the same profile: member A's park must never make member B report
+    // Initializing purely from A's park state (the fake's per-member state
+    // mirrored; F1 design §3 parked-state observability).
+    let (addr, _st) = spawn_mock().await;
+    let a = VllmAdapter::new(
+        format!("http://{addr}").parse().unwrap(),
+        None,
+        "vllm-test-1".into(),
+        ParkPolicy::ExperimentalAllowed,
+        "toy-model".into(),
+    );
+    let ma = MemberRef { deployment_id: "da".into(), member_id: "da-head".into() };
+    let mb = MemberRef { deployment_id: "db".into(), member_id: "db-head".into() };
+
+    // Member A parks (sleep applied → A's park flag set).
+    a.park(&ma, ParkLevel::Two).await.unwrap();
+    assert!(
+        matches!(a.check_readiness(&ma).await.unwrap(), Readiness::Initializing),
+        "A parked → never Ready (parked-state observability)"
+    );
+
+    // Member B shares the adapter: A's park must not leak — the mock
+    // lists the served model, so B reads Ready.
+    assert!(
+        matches!(a.check_readiness(&mb).await.unwrap(), Readiness::Ready),
+        "B must not inherit A's park state (per-member observability)"
+    );
+
+    // B parks independently; A stays parked until restored.
+    a.park(&mb, ParkLevel::Two).await.unwrap();
+    assert!(matches!(a.check_readiness(&mb).await.unwrap(), Readiness::Initializing));
+    a.restore(&ma).await.unwrap();
+    assert!(matches!(a.check_readiness(&ma).await.unwrap(), Readiness::Ready));
+    assert!(matches!(a.check_readiness(&mb).await.unwrap(), Readiness::Initializing));
+}
+
+#[tokio::test]
 async fn cancel_without_ack_is_uncertain_no_call() {
     let (addr, _st) = spawn_mock().await;
     let a = VllmAdapter::new(

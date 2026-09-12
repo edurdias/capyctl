@@ -65,8 +65,11 @@ pub struct EngineHttp {
 
 impl EngineHttp {
     pub fn new(base: reqwest::Url, api_key: Option<String>) -> Self {
+        // NO client-wide total timeout: a 30s total timeout on the shared
+        // client would kill multi-minute SSE chat streams. The bounded
+        // engine-control timeout is applied per control request (see
+        // `control`); the stream path is deliberately unbounded.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(ENGINE_CONTROL_TIMEOUT_SECS))
             .build()
             .expect("reqwest client builds with static config");
         Self {
@@ -85,6 +88,12 @@ impl EngineHttp {
             Some(k) => reqwest::RequestBuilder::bearer_auth(req, k),
             None => req,
         }
+    }
+
+    /// Bounded engine-control request (versioned default, F1 design §5/§8):
+    /// applied per control endpoint only. Chat streams never take it.
+    fn control(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.timeout(Duration::from_secs(ENGINE_CONTROL_TIMEOUT_SECS))
     }
 
     /// Liveness probe. Explicitly NOT readiness (SPEC §6.1) — callers must
@@ -114,14 +123,14 @@ impl EngineHttp {
     /// `Uncertain` — the effect may or may not have been applied.
     pub async fn sleep(&self, level: u8) -> Result<SleepOutcome, HttpError> {
         let url = self.url(&format!("/sleep?level={level}"));
-        let req = self.auth(self.client.post(url));
+        let req = self.control(self.auth(self.client.post(url)));
         self.post_outcome(req, "sleep").await.map(|()| SleepOutcome::Applied)
     }
 
     /// `POST /wake_up` — wake allocations (weights + KV restore are the
     /// caller's responsibility to verify; see `restore` in the adapter).
     pub async fn wake(&self) -> Result<WakeOutcome, HttpError> {
-        let req = self.auth(self.client.post(self.url("/wake_up")));
+        let req = self.control(self.auth(self.client.post(self.url("/wake_up"))));
         self.post_outcome(req, "wake_up")
             .await
             .map(|()| WakeOutcome::Applied)
@@ -131,7 +140,7 @@ impl EngineHttp {
     /// (vLLM security docs [S2]). Reachable only under the deep-park policy
     /// gate; the adapter invokes it exactly once per collective (SPEC §11).
     pub async fn collective_rpc(&self) -> Result<WakeOutcome, HttpError> {
-        let req = self.auth(self.client.post(self.url("/collective_rpc")));
+        let req = self.control(self.auth(self.client.post(self.url("/collective_rpc"))));
         self.post_outcome(req, "collective_rpc")
             .await
             .map(|()| WakeOutcome::Applied)
@@ -144,19 +153,13 @@ impl EngineHttp {
         request: &serde_json::Value,
         mut on_chunk: impl FnMut(&StreamChunk),
     ) -> Result<StreamEnd, HttpError> {
+        // NOTE: no total timeout here — a chat completion stream may run
+        // for minutes; the bounded timeout is control-endpoints only.
         let req = self.auth(self.client.post(self.url("/v1/chat/completions")).json(request));
         let resp = req.send().await.map_err(http_err("chat completions"))?;
         check_status(resp.status())?;
         if !resp.status().is_success() {
             return Err(HttpError::UnexpectedStatus(resp.status().as_u16()));
-        }
-        if std::env::var("MLLM_SSE_DEBUG").is_ok() {
-            eprintln!(
-                "SSE-RESP: status={} ct={:?} len={:?}",
-                resp.status(),
-                resp.headers().get("content-type"),
-                resp.content_length()
-            );
         }
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
@@ -165,9 +168,6 @@ impl EngineHttp {
                 Some(Ok(bytes)) => {
                     // Normalize CRLF (uvicorn/Starlette SSE): frame parsing
                     // is LF-based.
-                    if std::env::var("MLLM_SSE_DEBUG").is_ok() {
-                        eprintln!("SSE-BYTES: {} bytes: {:?}", bytes.len(), String::from_utf8_lossy(&bytes));
-                    }
                     let decoded = String::from_utf8_lossy(&bytes);
                     buf.push_str(&decoded.replace('\r', ""));
                     // SSE frames are delimited by blank lines; data lines by
@@ -182,9 +182,6 @@ impl EngineHttp {
                             if payload == "[DONE]" {
                                 return Ok(StreamEnd::Completed);
                             }
-                            if std::env::var("MLLM_SSE_DEBUG").is_ok() {
-                                eprintln!("SSE-CHUNK: {payload}");
-                            }
                             on_chunk(&StreamChunk {
                                 text: payload.to_string(),
                                 done: false,
@@ -193,15 +190,9 @@ impl EngineHttp {
                     }
                 }
                 Some(Err(e)) => {
-                    if std::env::var("MLLM_SSE_DEBUG").is_ok() {
-                        eprintln!("SSE-ERR: {e}");
-                    }
                     return Err(HttpError::Body(e.to_string()));
                 }
                 None => {
-                    if std::env::var("MLLM_SSE_DEBUG").is_ok() {
-                        eprintln!("SSE-END: buf_len={} frames_seen", buf.len());
-                    }
                     return Ok(StreamEnd::BackendClosed);
                 }
             }
@@ -209,13 +200,13 @@ impl EngineHttp {
     }
 
     async fn get_ok(&self, path: &str) -> Result<(), HttpError> {
-        let req = self.auth(self.client.get(self.url(path)));
+        let req = self.control(self.auth(self.client.get(self.url(path))));
         let resp = req.send().await.map_err(http_err(path))?;
         check_status(resp.status())
     }
 
     async fn get_body(&self, path: &str) -> Result<String, HttpError> {
-        let req = self.auth(self.client.get(self.url(path)));
+        let req = self.control(self.auth(self.client.get(self.url(path))));
         let resp = req.send().await.map_err(http_err(path))?;
         check_status(resp.status())?;
         resp.text()
