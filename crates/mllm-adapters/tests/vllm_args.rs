@@ -31,7 +31,7 @@ fn budgets_render_with_explicit_units() {
     assert_eq!(argv[port + 1], "8150");
     let util = argv.iter().position(|a| a == "--gpu-memory-utilization").unwrap();
     assert_eq!(argv[util + 1], "0.75");
-    let kv = argv.iter().position(|a| a == "--kv-cache-bytes").unwrap();
+    let kv = argv.iter().position(|a| a == "--kv-cache-memory").unwrap();
     assert_eq!(argv[kv + 1], (16u64 * 1024 * 1024 * 1024).to_string());
     // User pass-through args come after the mllm-controlled block:
     let max_len = argv.iter().position(|a| a == "--max-model-len").unwrap();
