@@ -669,6 +669,21 @@ impl crate::Store {
         Ok(rows)
     }
 
+    /// Whether a supervisor integration guarantees restart behavior for a
+    /// deployment (SPEC §5.2: attached without one marks guarantees
+    /// unavailable). F1: only managed deployments carry the guarantee.
+    pub fn has_supervisor_guarantee(&self, id: &str) -> Result<bool, StoreError> {
+        let kind: String = self
+            .conn
+            .query_row(
+                "SELECT kind FROM deployments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)?;
+        Ok(kind != "attached")
+    }
+
     /// Stale-generation check (T18): observed must be >= current.
     pub fn check_generation(&self, deployment_id: &str, observed: i64) -> Result<i64, StoreError> {
         let current: i64 = self

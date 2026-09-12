@@ -46,6 +46,9 @@ use sha2::{Digest, Sha256};
 /// admission (F0 has no real adapters; real adapters source peaks from
 /// their recipes in F1).
 const F0_SYNTHETIC_ACTIVATION_PEAK: i64 = 4096;
+/// Attached deployments: conservative charge until observed otherwise.
+const ATTACHED_CONSERVATIVE_BYTES: i64 = 32 * 1024 * 1024 * 1024;
+const ATTACHED_KIND: &str = "attached";
 
 /// Synthetic host observation backing F0 admission (no topology
 /// discovery): 128 GiB of observed system memory, resolved by
@@ -343,6 +346,14 @@ impl Controller {
             let row = store
                 .get_deployment(deployment)?
                 .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?;
+            if row.kind == ATTACHED_KIND {
+                // Ownership ≠ reachability (T11): attached services are for
+                // routing/observation only — no sleep/kill/restart rights.
+                return Err(ControllerError::OperationFailed {
+                    op: action.as_str().to_string(),
+                    code: "attached_no_lifecycle".to_string(),
+                });
+            }
             row.observed_state
         };
         // Administrative stop marks the deployment suspended up front
@@ -1039,5 +1050,73 @@ mod tests {
             first.deployment_id.to_string(),
             second.deployment_id.to_string()
         );
+    }
+}
+
+/// Attachment request (F1 design §6, SPEC §5.2): register an already-running
+/// service for routing and observation. Grants NO lifecycle permission.
+#[derive(Debug, Clone)]
+pub struct AttachRequest {
+    pub name: String,
+    pub endpoint: String,
+    pub route_model_id: Option<String>,
+    pub manifest: Vec<u8>,
+}
+
+pub struct AttachRequestTag;
+
+impl Controller {
+    /// Attach an already-running service: registration and observation
+    /// only — attaching grants no permission to sleep, kill, restart, or
+    /// evict (SPEC §5.2 / T11). Attached usage is charged conservatively
+    /// (never reclaimable without evidence) and restart guarantees are
+    /// marked unavailable without a configured supervisor integration.
+    pub async fn attach(&self, req: AttachRequest) -> Result<String, ControllerError> {
+        let id = DeploymentId::new();
+        let key = idempotency_key(&self.context_id, &req.name, &req.manifest);
+        let op = OperationId(format!("op-{}", ulid::Ulid::new()));
+        let accepted = {
+            let store = self.store.lock().unwrap();
+            let accepted = store.accept_deployment(AcceptDeployment {
+                id,
+                name: req.name,
+                kind: ATTACHED_KIND.to_string(),
+                route_model_id: req.route_model_id,
+                desired_state: LifecycleState::Ready,
+                schema_version: 1,
+                idempotency_key: key,
+                initial_operation_id: op,
+            })?;
+            let op = accepted.operation_id.clone();
+            store.update_operation_state(&op.0, OpState::Succeeded, None)?;
+            store.record_journal(
+                Some(&self.host_id),
+                Some(&op.0),
+                Some("attached"),
+                &format!(
+                    r#"{{"event":"attached","deployment":"{dep}","endpoint":"{ep}","supervisor":"none"}}"#,
+                    dep = accepted.deployment_id,
+                    ep = req.endpoint,
+                ),
+            )?;
+            accepted
+        };
+        let dep = accepted.deployment_id.to_string();
+        {
+            // Conservative usage: charged once, never reclaimable without
+            // verified evidence (SPEC §5.2: uncertain attached usage is not
+            // reclaimable capacity).
+            let store = self.store.lock().unwrap();
+            store
+                .insert_reservation(&mllm_store::ReservationRow {
+                    owner_id: dep.clone(),
+                    domain_id: Some("system".into()),
+                    bytes: ATTACHED_CONSERVATIVE_BYTES,
+                    phase: "ready".into(),
+                    exclusive_devices: vec![],
+                })
+                .map_err(ControllerError::from)?;
+        }
+        Ok(dep)
     }
 }

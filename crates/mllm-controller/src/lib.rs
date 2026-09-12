@@ -5,4 +5,4 @@
 pub mod operations;
 
 pub use mllm_domain::LifecycleAction;
-pub use operations::{Controller, ControllerError, DeployRequest, OperationHandle};
+pub use operations::{AttachRequest, Controller, ControllerError, DeployRequest, OperationHandle};
