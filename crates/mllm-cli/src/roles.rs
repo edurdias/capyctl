@@ -167,7 +167,13 @@ async fn start_standalone_inner(
                 // ledger's deployment budget bounds the engine's KV pool
                 // (activation peak stays well inside the managed limit).
                 granted: mllm_adapters::vllm::args::GrantedBudget {
-                    kv_cache_bytes: Some(64 * 1024 * 1024 * 1024),
+                    // 16 GiB KV grant: the qualification drives 8-token
+                    // completions, so a large pool is not needed — and a
+                    // smaller grant keeps two engine instances from
+                    // overcommitting the 130 GiB unified domain during the
+                    // stop→start overlap of a switch (freeze observed live
+                    // with 64 GiB, 2026-09-12).
+                    kv_cache_bytes: Some(16 * 1024 * 1024 * 1024),
                     // The utilization gate must pass when the OS has not yet
                     // fully released the previous deployment's memory: the
                     // explicit KV grant sizes the pool (vLLM 0.29 live
@@ -190,6 +196,12 @@ async fn start_standalone_inner(
                     "127.0.0.1".into(),
                     "--served-model-name".into(),
                     p.model_id.clone(),
+                    // Cap the context: vLLM's startup check requires the
+                    // model's max context to fit the KV pool — the model's
+                    // 262K default would demand far more than the grant.
+                    // The qualification drives 8-token completions.
+                    "--max-model-len".into(),
+                    "4096".into(),
                 ],
                 // Development/sleep flags render only under the opt-in
                 // (profile-level gate, F1 design §7): the isolated
