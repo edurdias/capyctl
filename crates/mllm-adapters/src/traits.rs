@@ -207,7 +207,7 @@ pub trait ChatForward: Send + Sync {
     async fn forward_chat_stream(
         &self,
         body: &serde_json::Value,
-        on_chunk: &mut (dyn FnMut(String) + Send),
+        _on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
         let _ = body;
         Err(AdapterError::UnsupportedCapability)
