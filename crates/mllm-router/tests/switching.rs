@@ -135,6 +135,11 @@ async fn a_to_b_to_a_alternates_with_release_evidence() {
     let gen1 = sw.switch_to(&a).await.unwrap(); // already ready → no-op switch
     let b = c.submit_deploy(req("model-b")).await.unwrap();
     let gen2 = sw.switch_to(&b).await.unwrap();
+    assert_eq!(
+        store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state,
+        mllm_domain::LifecycleState::Stopped,
+        "stock model release must terminate the process holding the shared port"
+    );
     // Generations are PER-DEPLOYMENT (monotonic within a deployment): B's
     // generation advanced through its own wake (1 → 2).
     assert!(gen2 >= 1, "B activated with its own generation {gen2}");
@@ -157,6 +162,29 @@ async fn a_to_b_to_a_alternates_with_release_evidence() {
     assert!(gen3 > gen1, "A's own generation advanced through park→wake (T16)");
     let state_a = store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state;
     assert_eq!(state_a, mllm_domain::LifecycleState::Ready);
+}
+
+#[tokio::test]
+async fn qualified_sleep_profile_keeps_park_restore_switch_path() {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let policy = mllm_adapters::fake::ParkPolicy::ExperimentalAllowed;
+    let c = Arc::new(Controller::new_with_policy(
+        store.clone(),
+        Arc::new(mllm_adapters::fake::FakeEngine::new().with_policy(policy)),
+        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        policy,
+    ));
+    let a = c.submit_deploy(DeployRequest { kind: "vllm-sleep".into(), ..req("sleep-a") }).await.unwrap();
+    let b = c.submit_deploy(req("stock-b")).await.unwrap();
+    let sw = mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_secs(5));
+    let gen1 = sw.switch_to(&a).await.unwrap();
+    sw.switch_to(&b).await.unwrap();
+    assert_eq!(store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state,
+        mllm_domain::LifecycleState::Parked);
+    let gen2 = sw.switch_to(&a).await.unwrap();
+    assert!(gen2 > gen1);
+    assert_eq!(store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state,
+        mllm_domain::LifecycleState::Ready);
 }
 
 #[tokio::test]

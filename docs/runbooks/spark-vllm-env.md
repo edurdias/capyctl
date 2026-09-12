@@ -53,6 +53,17 @@ opt-in gates the profile itself, not just the operations (F1 design §7). Privat
 binding and the ingress gate do not erase this warning. Production qualification
 requires a separately reviewed control path.
 
+Qualified lab pin (2026-09-12): vLLM **0.29.0**, uv-managed Python 3.12.14 in
+`~/mllm-vllm-venv2`, Qwen/Qwen3-4B-Instruct-2507 BF16 in
+`~/models/qwen3-4b-instruct`. Both `host-a` and `host-b` use this recipe.
+The launch uses 16 GiB explicit KV cache and a 4096-token maximum context.
+The sleep profile requires both `--enable-sleep-mode` and
+`VLLM_SERVER_DEV_MODE=1`; stock launches explicitly set the latter to 0.
+Restoration calls `/wake_up`, then `/collective_rpc` with
+`{"method":"reload_weights"}`. Checkpoint reload has a 120s client timeout
+(44–50s observed); sleep and wake retain 30s bounds. Full live results and
+the superseded 64 GiB memory recipe are in `spark-qualification-f1.md`.
+
 ## 5. Doctor capture (recipe freeze)
 
 ```bash

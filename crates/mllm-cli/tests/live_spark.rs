@@ -60,6 +60,118 @@ fn live_profile() -> Option<LiveVllmProfile> {
     live_env()
 }
 
+// Failure injection deliberately leaves lifecycle Failed, which has no
+// Stop action in F1. Keep cleanup panic-safe and refuse a reused PID.
+struct LiveProcessCleanup {
+    pid: u32,
+    starttime: String,
+}
+
+impl LiveProcessCleanup {
+    fn starttime(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(19).map(str::to_owned)
+    }
+
+    fn new(pid: u32) -> Self {
+        Self { pid, starttime: Self::starttime(pid).expect("owned engine exists") }
+    }
+}
+
+impl Drop for LiveProcessCleanup {
+    fn drop(&mut self) {
+        if Self::starttime(self.pid).as_ref() == Some(&self.starttime) {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", "--", &format!("-{}", self.pid)]).status();
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_default_denies_sleep_profile() {
+    let Some(_) = live_profile() else { return; };
+    let dir = tempfile::tempdir().unwrap();
+    let app = roles::start_standalone_with_policy(
+        dir.path(), mllm_adapters::fake::ParkPolicy::Denied,
+    ).await.unwrap();
+    let id = app.controller.submit_deploy(DeployRequest {
+        kind: "vllm-sleep".into(),
+        ..req("denied-sleep", "denied-sleep")
+    }).await.unwrap();
+    let result = app.controller.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
+    assert!(matches!(result, Err(mllm_controller::ControllerError::OperationFailed { code, .. }) if code == "policy_denied"));
+    assert!(app.controller.live_pid(&id).is_none(), "denied profile never spawns");
+    eprintln!("LIVE: T21 default policy denied sleep profile before spawn");
+}
+
+#[tokio::test]
+async fn live_ambiguous_park_reconciles() {
+    use mllm_adapters::fake::ParkPolicy;
+    use tokio::io::AsyncReadExt;
+
+    let Some(p) = live_profile() else { return; };
+    let dir = tempfile::Builder::new().prefix("mllm-live").disable_cleanup(true).tempdir().unwrap();
+    eprintln!("LIVE-DIR: {}", dir.path().display());
+    let app = roles::start_standalone_with_policy(dir.path(), ParkPolicy::ExperimentalAllowed).await.unwrap();
+    let id = deploy_and_start(&app, &p.model_id).await;
+    let pid = app.controller.live_pid(&id).unwrap();
+    let cleanup = LiveProcessCleanup::new(pid);
+
+    // The real controller owns this running engine. A second controller
+    // shares its persisted deployment/member state, with only the HTTP
+    // transport redirected through a lost-ack proxy for this park.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let upstream = format!("http://127.0.0.1:{}", p.port);
+    let sleep_url = format!("{upstream}/sleep?level=2");
+    let proxy = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let byte = socket.read_u8().await.unwrap();
+            request.push(byte);
+            assert!(request.len() < 16384);
+        }
+        assert!(request.starts_with(b"POST /sleep?level=2 "));
+        let response = reqwest::Client::new().post(sleep_url).send().await.unwrap();
+        assert!(response.status().is_success(), "real engine applied park");
+        // Drop the downstream connection only AFTER the real engine ack.
+        drop(socket);
+        let mut calls = 1usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while let Ok(Ok((_socket, _))) = tokio::time::timeout_at(deadline, listener.accept()).await {
+            calls += 1;
+        }
+        calls
+    });
+    let adapter = mllm_adapters::vllm::VllmAdapter::new(
+        format!("http://{proxy_addr}").parse().unwrap(), None,
+        p.fingerprint.clone(), ParkPolicy::ExperimentalAllowed, p.model_id.clone(),
+    );
+    let store = app.controller.store_ref().clone();
+    let fault_controller = mllm_controller::Controller::new_with_policy(
+        store.clone(), Arc::new(adapter), Arc::new(mllm_launchers::ExecLauncher::new()),
+        ParkPolicy::ExperimentalAllowed,
+    );
+    let op = fault_controller.request_transition(&id, mllm_domain::LifecycleAction::Park).await.unwrap();
+    let result = fault_controller.wait_terminal(&op).await;
+    let calls = proxy.await.unwrap();
+    let sleeping: serde_json::Value = reqwest::get(format!("{upstream}/is_sleeping")).await.unwrap().json().await.unwrap();
+    let (state, evidence, parks) = {
+        let guard = store.lock().unwrap();
+        (guard.get_deployment(&id).unwrap().unwrap().observed_state,
+         guard.journal_evidence_of(&id).unwrap().join("\n"),
+         guard.operations_of_kind(&id, "park").unwrap().len())
+    };
+    drop(cleanup);
+    assert!(result.is_err(), "lost ack must not become success");
+    assert_eq!(sleeping["is_sleeping"], true);
+    assert_eq!(state, LifecycleState::Failed);
+    assert!(evidence.contains("\"event\":\"uncertain\""));
+    assert_eq!((calls, parks), (1, 1), "one park, no blind repeat");
+    eprintln!("LIVE: T20 real sleep applied, ack dropped; one park; reconciled to Failed");
+}
+
 #[test]
 fn live_restart_only_qualification() {
     let Some((p, rt)) = model_ready() else {
@@ -161,7 +273,7 @@ fn live_restart_only_qualification() {
 }
 
 #[tokio::test]
-async fn live_switch_and_park_reload() {
+async fn live_switch_restart_only() {
     let Some(p) = live_profile() else {
         eprintln!("live env not present; skipping");
         return;
@@ -172,11 +284,9 @@ async fn live_switch_and_park_reload() {
         .tempdir()
         .unwrap();
     eprintln!("LIVE-DIR: {}", dir.path().display());
-    // Experimental profile allowed for the isolated park/reload stage
-    // (design §7: the opt-in gates the profile; recorded per run).
     let app = roles::start_standalone_with_policy(
         dir.path(),
-        mllm_adapters::fake::ParkPolicy::ExperimentalAllowed,
+        mllm_adapters::fake::ParkPolicy::Denied,
     )
     .await
     .unwrap();
@@ -210,16 +320,40 @@ async fn live_switch_and_park_reload() {
     };
     assert_eq!(a_state, LifecycleState::Stopped, "A released on switch");
 
+    let gen_a2 = sw.switch_to(&a).await.unwrap();
+    assert!(gen_a2 > gen_a1);
+    eprintln!("LIVE: A→B→A complete, A generation {gen_a2}");
+    let op = app.controller.request_transition(&a, mllm_domain::LifecycleAction::Stop).await.unwrap();
+    app.controller.wait_terminal(&op).await.unwrap();
+}
+
+#[tokio::test]
+async fn live_park_reload() {
+    let Some(p) = live_profile() else { return; };
+    let dir = tempfile::Builder::new().prefix("mllm-live").disable_cleanup(true).tempdir().unwrap();
+    eprintln!("LIVE-DIR: {}", dir.path().display());
+    let app = roles::start_standalone_with_policy(
+        dir.path(), mllm_adapters::fake::ParkPolicy::ExperimentalAllowed,
+    ).await.unwrap();
+
     // Park → wake cycles under the opt-in (T20 live, 3 clean cycles) —
     // the sleep-enabled deployment S.
     let s_dep = app
         .controller
-        .submit_deploy(req("qwen3-4b-sleep", "qwen3-4b-sleep"))
+        .submit_deploy(DeployRequest {
+            kind: "vllm-sleep".into(),
+            ..req("qwen3-4b-sleep", &p.model_id)
+        })
         .await
         .unwrap();
-    // The sleep deployment S boots with --enable-sleep-mode (opt-in active).
-    // B currently holds the port: stop B first (switch-based release).
-    let _ = sw.switch_to(&s_dep).await.unwrap();
+    let op = app.controller.request_transition(&s_dep, mllm_domain::LifecycleAction::Start).await.unwrap();
+    assert_eq!(app.controller.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
+    let _cleanup = LiveProcessCleanup::new(app.controller.live_pid(&s_dep).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let router_addr = listener.local_addr().unwrap();
+    let router = app.router();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
     for cycle in 1..=3 {
         let op = app
             .controller
@@ -237,6 +371,19 @@ async fn live_switch_and_park_reload() {
             .unwrap();
         let ready = app.controller.wait_terminal(&op2).await.unwrap();
         assert_eq!(ready, LifecycleState::Ready, "cycle {cycle}: woke");
+        let response = client.post(format!("http://{router_addr}/v1/chat/completions"))
+            .bearer_auth(app.api_key())
+            .json(&serde_json::json!({
+                "model": p.model_id,
+                "messages": [{"role": "user", "content": "Say 'live' and nothing else."}],
+                "max_tokens": 8
+            })).send().await.unwrap();
+        let status = response.status();
+        let response: serde_json::Value = response.json().await.unwrap();
+        assert!(status.is_success(), "cycle {cycle}: routed inference: {response}");
+        let content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        assert!(!content.is_empty(), "cycle {cycle}: restored weights produce tokens");
+        eprintln!("LIVE: cycle {cycle} completion: {content}");
         eprintln!("LIVE: cycle {cycle} park→wake clean");
     }
 
@@ -245,4 +392,7 @@ async fn live_switch_and_park_reload() {
         .controller
         .check_dispatch_generation(&s_dep, 0);
     assert!(denied.is_err(), "stale generation rejected (T18 live)");
+    let op = app.controller.request_transition(&s_dep, mllm_domain::LifecycleAction::Stop).await.unwrap();
+    app.controller.wait_terminal(&op).await.unwrap();
+    server.abort();
 }

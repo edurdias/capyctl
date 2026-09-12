@@ -241,13 +241,23 @@ impl SwitchEngine {
             }
         }
         // Release A: park if qualified, else stop (restart-only fallback).
-        let observed = store
+        let deployment = store
             .lock()
             .unwrap()
             .get_deployment(a)
-            .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?
-            .map(|r| r.observed_state);
+            .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+        let observed = deployment.as_ref().map(|r| r.observed_state);
         if observed == Some(LifecycleState::Ready) {
+                // Stock profiles release by stopping: parking would keep
+                // the shared F1 engine port bound. Only the sleep profile
+                // is eligible for the park path (design §7).
+                if deployment.as_ref().is_some_and(|r| r.kind != "vllm-sleep") {
+                    let stop = self.controller.idle_stop(a).await
+                        .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+                    self.controller.wait_terminal(&stop).await
+                        .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+                    return Ok(());
+                }
                 let op = self
                     .controller
                     .request_transition(a, mllm_domain::LifecycleAction::Park)

@@ -52,6 +52,11 @@ async fn do_wake(State(st): State<MockState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"awake": true}))
 }
 
+async fn reload(Json(body): Json<serde_json::Value>) -> StatusCode {
+    assert_eq!(body["method"], "reload_weights");
+    StatusCode::OK
+}
+
 async fn sse() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let body = futures::stream::iter(vec![
         Ok(Event::default().data(r#"{"delta":"hel"}"#)),
@@ -68,6 +73,7 @@ async fn spawn_mock() -> (SocketAddr, MockState) {
         .route("/v1/models", get(models))
         .route("/sleep", post(do_sleep))
         .route("/wake_up", post(do_wake))
+        .route("/collective_rpc", post(reload))
         .route("/v1/chat/completions", post(sse))
         .with_state(st.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -83,6 +89,28 @@ async fn health_and_models_read() {
     assert!(http.health().await.unwrap());
     let ids = http.list_models().await.unwrap();
     assert_eq!(ids, vec!["toy-model".to_string()]);
+}
+
+#[tokio::test]
+async fn collective_rpc_requests_weight_reload() {
+    let (addr, _) = spawn_mock().await;
+    let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), None);
+    http.collective_rpc().await.unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_reload_can_exceed_short_control_timeout() {
+    let app = axum::Router::new().route("/collective_rpc", post(|| async {
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        StatusCode::OK
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), None);
+    let result = http.collective_rpc().await;
+    server.abort();
+    result.expect("checkpoint reload must outlive the 30-second control timeout");
 }
 
 #[tokio::test]

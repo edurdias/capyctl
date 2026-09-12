@@ -12,6 +12,10 @@ use futures::StreamExt;
 /// Engine-control request timeout (versioned default; F1 design §5/§8).
 pub const ENGINE_CONTROL_TIMEOUT_SECS: u64 = 30;
 
+/// Reload stages checkpoint bytes again (46s for Qwen3-4B on Spark).
+/// Keep it bounded independently of the short sleep/wake controls.
+pub const WEIGHT_RELOAD_TIMEOUT_SECS: u64 = 120;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
     #[error("engine unreachable: {0}")]
@@ -140,7 +144,10 @@ impl EngineHttp {
     /// (vLLM security docs [S2]). Reachable only under the deep-park policy
     /// gate; the adapter invokes it exactly once per collective (SPEC §11).
     pub async fn collective_rpc(&self) -> Result<WakeOutcome, HttpError> {
-        let req = self.control(self.auth(self.client.post(self.url("/collective_rpc"))));
+        let req = self.auth(
+            self.client.post(self.url("/collective_rpc"))
+                .json(&serde_json::json!({"method": "reload_weights"})),
+        ).timeout(Duration::from_secs(WEIGHT_RELOAD_TIMEOUT_SECS));
         self.post_outcome(req, "collective_rpc")
             .await
             .map(|()| WakeOutcome::Applied)

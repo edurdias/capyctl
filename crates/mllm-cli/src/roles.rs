@@ -229,12 +229,12 @@ async fn start_standalone_inner(
             (
                 adapter.clone() as Arc<dyn mllm_adapters::traits::EngineAdapter>,
                 launcher,
-                // The live profile is keyed by BOTH the deployment kind the
-                // router resolves at dispatch ("model") and the public
-                // model id (the wired forwarder used by tests/the live tier)
-                // — two keys, same forwarder.
+                // Dispatch resolves by deployment kind; stock and sleep
+                // profiles share this adapter. Keep the model-id alias for
+                // direct adapter qualification as well.
                 HashMap::from([
                     ("model".to_string(), fwd.clone()),
+                    ("vllm-sleep".to_string(), fwd.clone()),
                     (p.model_id.clone(), fwd),
                 ]),
             )

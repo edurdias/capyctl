@@ -141,9 +141,15 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     }
     // User pass-through last (SPEC §8.2: preserve engine-native args).
     argv.extend(input.engine_args.iter().cloned());
+    // vLLM gates its HTTP sleep/wake/reload routes separately from the
+    // allocator flag. Explicitly disable them for stock profiles too, so
+    // an inherited development environment cannot bypass the host opt-in.
+    let dev_mode = input.sleep_flags.iter().any(|f| f == "--enable-sleep-mode");
     Ok(RenderedCommand {
         argv,
-        env: Default::default(),
+        env: [("VLLM_SERVER_DEV_MODE".into(), if dev_mode { "1" } else { "0" }.into())]
+            .into_iter()
+            .collect(),
     })
 }
 

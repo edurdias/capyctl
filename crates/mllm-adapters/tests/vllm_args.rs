@@ -131,10 +131,12 @@ fn sleep_flags_render_only_when_profile_gated_in() {
     gated.sleep_flags = vec!["--enable-sleep-mode".into()];
     let cmd = render_command(&gated).unwrap();
     assert!(cmd.argv.contains(&"--enable-sleep-mode".to_string()));
+    assert_eq!(cmd.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str), Some("1"));
 
     let ungated = base_input();
     let cmd2 = render_command(&ungated).unwrap();
     assert!(!cmd2.argv.contains(&"--enable-sleep-mode".to_string()));
+    assert_eq!(cmd2.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str), Some("0"));
 }
 
 #[test]

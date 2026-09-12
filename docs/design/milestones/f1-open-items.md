@@ -6,20 +6,13 @@ restart-only qualification PASSED on the DGX Spark.
 
 ## Open items (ordered by priority)
 
-### 1. Park/reload + switching live evidence — RESUME WHEN SPARK RETURNS
-The Spark (`user@host-b`) became unreachable (~04:00 EDT, ssh timeout,
-suspected reboot/network change) mid-qualification. Resumable state:
-- Everything is staged on the Spark (`~/mllm` built, `~/mllm-qual/live-run.sh`
-  ready, vLLM 0.29.0 + Qwen3-4B checkpoint installed).
-- **Before resuming, sync the merge**: `rsync -a --delete ... master → ~/mllm`
-  — the fix wave (334ebf8) landed after the last sync, and it fixes two
-  Critical defects (join lost-wake, per-member park state) that sit exactly on
-  the pending stages.
-- Stages: (a) restart-only switch A→B→A via the switch engine; (b) park/wake
-  ×3 under the opt-in with `--enable-sleep-mode`; (c) ambiguous-park failure
-  injection live; (d) T21 default-denial live check. Owner decision binding:
-  park/reload is core functionality — recipe revisions continue until clean.
-- Runbook: `docs/runbooks/spark-qualification-f1.md` §4 has the pending stages.
+### 1. Park/reload + switching live evidence — COMPLETE (2026-09-12)
+All four pending stages passed on `host-a` / `host-b`: stock A→B→A,
+three level-2 park/reload cycles with authenticated routed inference after
+every reload, real lost-ack park injection, and T21 denial before engine spawn.
+The recipe remains vLLM 0.29.0 + Qwen3-4B, with 16 GiB KV and 4096 context.
+Commands, results, failed probes, timings, and machine-local evidence pointers
+are recorded only in `docs/runbooks/spark-qualification-f1.md` §4.
 
 ### 2. Park-based switching needs per-deployment ports (F4)
 The live A→B→A alternation uses stop-based release because a parked process
@@ -33,6 +26,9 @@ park-keep-alive switching (the real product mode). Noted in switch.rs comments.
 - Engine log capture appends indefinitely (no rotation).
 - args.rs odd-tail engine_args pass through unvalidated; "boolean flag
   followed by a value" shapes need care.
+- Failed deployments have no Stop transition; live lost-ack qualification
+  cleans up its own verified engine group explicitly. Automatic recovery from
+  Failed remains unqualified.
 
 ### 4. Management surface (F2)
 CLI `deploy`/`status`/lifecycle dispatch are `not_implemented` — the live
@@ -70,6 +66,11 @@ when real topology lands.
    continue until validated — no downgrade, no deferral.
 
 ## Verification state
+
+Latest qualification fix: `cargo test --workspace` reports 179 passed (five
+live tests skip without the live environment); clippy is clean. The four named
+live stages for item 1 ran independently on the Sparks; see the runbook.
+Historical merge verification follows.
 
 - 172 tests passing (`cargo test --workspace`), clippy `--all-targets -D
   warnings` clean, Cargo.lock tracked.
