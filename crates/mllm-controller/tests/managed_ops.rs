@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mllm_adapters::traits::{
-    AdapterError, CancellationOutcome, EngineAdapter, Launcher, MemberRef, ParkLevel,
+    AdapterError, CancellationOutcome, EngineAdapter, MemberRef, ParkLevel,
     ParkOutcome, Phase, PlanInput, Readiness, ReloadOutcome, RenderedCommand, RequestRef,
     RestoreOutcome, WorkObservation,
 };
