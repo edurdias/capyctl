@@ -1,5 +1,6 @@
 pub mod fake;
 pub mod traits;
+pub mod vllm;
 
 pub use traits::*;
 
