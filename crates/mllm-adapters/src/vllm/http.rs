@@ -171,6 +171,9 @@ impl EngineHttp {
                             if payload == "[DONE]" {
                                 return Ok(StreamEnd::Completed);
                             }
+                            if std::env::var("MLLM_SSE_DEBUG").is_ok() {
+                                eprintln!("SSE-CHUNK: {payload}");
+                            }
                             on_chunk(&StreamChunk {
                                 text: payload.to_string(),
                                 done: false,
