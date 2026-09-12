@@ -2,9 +2,7 @@
 //! the router; the CLI deploy path submits + activates through the
 //! controller; status reads without activating.
 
-use std::sync::{Arc, Mutex};
 
-use mllm_adapters::fake::FakeEngine;
 use mllm_cli::roles;
 use mllm_controller::DeployRequest;
 
