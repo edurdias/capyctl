@@ -399,15 +399,13 @@ impl Controller {
             let store = self.store.lock().unwrap();
             store.set_suspended(deployment, true)?;
         }
-        // A suspended deployment rejects activation Start.
-        if action == LifecycleAction::Start {
+        // Explicit `start deployment` ENABLES the deployment (SPEC §6.3):
+        // it clears an administrative suspension. Auto-activation (the
+        // router's wake path) is the one that must NOT undo a stop — that
+        // path uses `auto_activate`, which rejects while suspended (T10).
+        if action == LifecycleAction::Start && !keep_on_demand_eligible {
             let store = self.store.lock().unwrap();
-            if store.is_suspended(deployment)? {
-                return Err(ControllerError::OperationFailed {
-                    op: "start".to_string(),
-                    code: "suspended".to_string(),
-                });
-            }
+            store.set_suspended(deployment, false)?;
         }
         // Preinitialize contract (F1 design §7 / SPEC §6.3): start →
         // validate → park, never displacing live work; requires a
@@ -980,6 +978,25 @@ impl Controller {
         // Arc<dyn EngineAdapter> without Any; the agent supplies the fake
         // handle separately. This helper exists for the embedded host.
         self.embedded_fake.clone()
+    }
+
+    /// Router-path auto-activation (T10): wakes an on-demand-eligible
+    /// deployment, but NEVER undoes an administrative stop — a suspended
+    /// deployment rejects activation here.
+    pub async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, ControllerError> {
+        // The guard never crosses an await (MutexGuard is not Send).
+        let suspended = {
+            let store = self.store.lock().unwrap();
+            store.is_suspended(deployment)?
+        };
+        if suspended {
+            return Err(ControllerError::OperationFailed {
+                op: "auto_activate".to_string(),
+                code: "suspended".to_string(),
+            });
+        }
+        self.request_transition_inner(deployment, LifecycleAction::Start, true)
+            .await
     }
 
     /// The live engine process PID for a deployment, if owned and running.

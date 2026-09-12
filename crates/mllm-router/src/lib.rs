@@ -96,6 +96,7 @@ async fn list_models(
 }
 
 /// `POST /v1/chat/completions` — authenticate → resolve → admit → dispatch.
+#[axum::debug_handler]
 async fn chat_completions(
     state: axum::extract::State<AppState>,
     headers: HeaderMap,

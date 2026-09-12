@@ -111,10 +111,16 @@ async fn administrative_stop_blocks_autoactivation() {
     let op2 = c.request_transition(&id, mllm_domain::LifecycleAction::Stop).await.unwrap();
     c.wait_terminal(&op2).await.unwrap();
 
-    // Administrative stop suspends: autoactivation is blocked (T10).
+    // Administrative stop suspends: AUTO-ACTIVATION is blocked (T10) —
+    // the router's wake path rejects; the explicit operator Start is the
+    // thing that re-enables (SPEC §6.3: start = enable + transition).
     assert!(store.lock().unwrap().is_suspended(&id).unwrap());
-    let res = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
-    assert!(res.is_err(), "suspended deployment rejects activation Start");
+    let res = c.auto_activate(&id).await;
+    assert!(res.is_err(), "suspended deployment rejects auto-activation");
+    // The explicit operator start re-enables:
+    let res2 = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
+    assert!(res2.is_ok(), "explicit start re-enables a suspended deployment");
+    c.wait_terminal(&res2.unwrap()).await.unwrap();
 }
 
 #[tokio::test]

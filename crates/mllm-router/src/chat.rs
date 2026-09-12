@@ -34,9 +34,11 @@ pub async fn resolve(
     // Join the deployment's single activation operation when not READY
     // (T15: simultaneous requests join one wake; no duplicate processes).
     if observed != mllm_domain::LifecycleState::Ready {
+        // Auto-activation: wakes on-demand deployments but never undoes an
+        // administrative stop (T10; SPEC §6.3).
         let op = deps
             .controller
-            .request_transition(&deployment_id, mllm_domain::LifecycleAction::Start)
+            .auto_activate(&deployment_id)
             .await
             .map_err(map_controller)?;
         deps.controller
