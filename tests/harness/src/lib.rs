@@ -77,6 +77,7 @@ fn probe_command() -> RenderedCommand {
 ///    handle it did not spawn or one that was terminated (PID-reuse
 ///    detection, design §8): spawn → terminate → respawn must leave the old
 ///    handle `StaleReused` (reuse) or `Gone` (fresh pid), never `Valid`.
+///
 /// How the adapter's deep-park policy gate is scoped (F1 design §7).
 ///
 /// `Level2Only`: only the experimental level-2 park is behind the gate
