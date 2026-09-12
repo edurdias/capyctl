@@ -11,7 +11,7 @@ use mllm_store::Store;
 
 fn controller(policy: ParkPolicy) -> (Arc<Controller>, Arc<Mutex<Store>>, Arc<mllm_adapters::fake::FakeEngine>) {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let fake = Arc::new(mllm_adapters::fake::FakeEngine::new());
+    let fake = Arc::new(mllm_adapters::fake::FakeEngine::new().with_policy(policy));
     let c = Arc::new(
         Controller::new_with_policy(
             store.clone(),
