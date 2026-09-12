@@ -235,6 +235,8 @@ pub struct Controller {
     /// Host deep-park policy (F1 design §7): the opt-in gates the
     /// experimental profile itself, not just park/reload operations.
     park_policy: mllm_adapters::fake::ParkPolicy,
+    /// The embedded fake engine handle (qualification/ambiguity injection).
+    embedded_fake: Option<Arc<mllm_adapters::fake::FakeEngine>>,
 }
 
 impl Controller {
@@ -260,7 +262,15 @@ impl Controller {
             host_id: EMBEDDED_HOST_ID.to_string(),
             handles: Arc::new(Mutex::new(HashMap::new())),
             park_policy,
+            embedded_fake: None,
         }
+    }
+
+    /// Attach the embedded fake engine handle (ambiguity injection for the
+    /// qualification suite).
+    pub fn with_embedded_fake(mut self, fake: Arc<mllm_adapters::fake::FakeEngine>) -> Self {
+        self.embedded_fake = Some(fake);
+        self
     }
 
     /// Submit a deployment transactionally: derive the idempotency key,
@@ -386,6 +396,43 @@ impl Controller {
                     code: "suspended".to_string(),
                 });
             }
+        }
+        // Preinitialize contract (F1 design §7 / SPEC §6.3): start →
+        // validate → park, never displacing live work; requires a
+        // QUALIFIED parking capability — restart-only deployments and
+        // policy-denied profiles fail clearly instead of claiming a
+        // prewarmed deployment.
+        if action == LifecycleAction::Preinitialize {
+            // Lock scoped: never held across the recursive transitions.
+            let (kind, observed) = {
+                let store = self.store.lock().unwrap();
+                store
+                    .get_deployment(deployment)?
+                    .map(|r| (r.kind, r.observed_state))
+                    .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?
+            };
+            let qualified = kind == "vllm-sleep"
+                && self.park_policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed;
+            if !qualified {
+                return Err(ControllerError::OperationFailed {
+                    op: "preinitialize".to_string(),
+                    code: "unsupported_parking".to_string(),
+                });
+            }
+            if observed != LifecycleState::Ready {
+                // Sequentially start, validate, then park (SPEC §6.3).
+                let start = Box::pin(
+                    self.request_transition_inner(deployment, LifecycleAction::Start, false),
+                )
+                .await?;
+                self.wait_terminal(&start).await?;
+            }
+            return Box::pin(self.request_transition_inner(
+                deployment,
+                LifecycleAction::Park,
+                false,
+            ))
+            .await;
         }
         // Profile-level development-mode gate (F1 design §7, T21): the
         // experimental vllm-sleep profile cannot launch in ANY mode without
@@ -901,6 +948,16 @@ impl Controller {
         self.adapter.observe_work(&member).await
     }
 
+    /// Test/qualification hook: mark the embedded fake engine's parks as
+    /// ambiguous (effect applied, ack lost). Only available when the
+    /// adapter is the fake; real adapters inject ambiguity at the engine.
+    pub fn fake_engine(&self) -> Option<Arc<mllm_adapters::fake::FakeEngine>> {
+        // Downcast through the shared adapter slot is not possible on
+        // Arc<dyn EngineAdapter> without Any; the agent supplies the fake
+        // handle separately. This helper exists for the embedded host.
+        self.embedded_fake.clone()
+    }
+
     /// The live engine process PID for a deployment, if owned and running.
     pub fn live_pid(&self, deployment: &str) -> Option<u32> {
         self.handles
@@ -1003,11 +1060,20 @@ mod tests {
 
     #[tokio::test]
     async fn preinitialize_is_policy_denied_under_default_gate() {
+        // F1 contract (design §7): preinitialize fails CLEARLY on restart-only
+        // deployments — an unsupported_parking error before any operation, so
+        // the deployment never enters FAILED and never claims a prewarm.
         let (c, _engine, _launcher) = controller(FakeEngine::new());
         let dep = c.submit_deploy(req("m1")).await.unwrap();
-        drive(&c, &dep, LifecycleAction::Preinitialize, Err(())).await;
+        let out = c.request_transition(&dep, LifecycleAction::Preinitialize).await;
+        match out {
+            Err(ControllerError::OperationFailed { code, .. }) => {
+                assert_eq!(code, "unsupported_parking");
+            }
+            other => panic!("expected unsupported_parking, got {other:?}"),
+        }
         let row = c.store.lock().unwrap().get_deployment(&dep).unwrap().unwrap();
-        assert_eq!(row.observed_state, LifecycleState::Failed);
+        assert_eq!(row.observed_state, LifecycleState::Stopped);
     }
 
     #[tokio::test]

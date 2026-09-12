@@ -92,6 +92,12 @@ impl FakeEngine {
         self
     }
 
+    /// Mark subsequent parks ambiguous: the effect applies but the ack is
+    /// lost (qualification/ambiguity injection).
+    pub fn set_ambiguous_park(&self) {
+        self.knobs.lock().unwrap().ambiguous_park = true;
+    }
+
     /// Sets the deep-park policy gate (default: [`ParkPolicy::Denied`]).
     pub fn with_policy(self, p: ParkPolicy) -> Self {
         self.knobs.lock().unwrap().policy = p;
