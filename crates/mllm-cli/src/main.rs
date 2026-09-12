@@ -49,7 +49,7 @@ fn run_standalone(format: OutputFormat) -> ExitCode {
                 message: format!("failed to start async runtime: {e}"),
             };
             output::print_error(&err, format);
-            return ExitCode::from(roles::NOT_IMPLEMENTED_EXIT.0 as u8);
+            return ExitCode::from(output::ExitCode::INTERNAL.0 as u8);
         }
     };
     match runtime.block_on(roles::start_standalone(&state_dir)) {
@@ -63,7 +63,11 @@ fn run_standalone(format: OutputFormat) -> ExitCode {
         Err(err) => {
             let err: StructuredError = err.into();
             output::print_error(&err, format);
-            ExitCode::from(output::ExitCode::INVALID_CONFIG.0 as u8)
+            if err.code == "internal" {
+                ExitCode::from(output::ExitCode::INTERNAL.0 as u8)
+            } else {
+                ExitCode::from(output::ExitCode::INVALID_CONFIG.0 as u8)
+            }
         }
     }
 }

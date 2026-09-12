@@ -10,6 +10,8 @@
 use std::sync::Arc;
 
 use mllm_adapters::fake::{FakeEngine, FakeLauncher, ParkPolicy};
+
+pub mod doctor;
 use mllm_adapters::{EngineAdapter, Launcher};
 
 /// An embedded, supervised host in F0: fake engine + fake launcher,

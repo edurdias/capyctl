@@ -44,6 +44,8 @@ fn terminate_reports_signal_when_grace_expires() {
         env: Default::default(),
     };
     let h = l.spawn(&cmd).unwrap();
+    // Let the shell install its TERM trap before we signal (race otherwise).
+    std::thread::sleep(Duration::from_millis(200));
     let rep = l.terminate(&h, Duration::from_millis(300)).unwrap();
     assert!(rep.killed, "escalated to SIGKILL after grace expiry");
     assert_eq!(rep.signal, Some(9), "SIGKILL");
