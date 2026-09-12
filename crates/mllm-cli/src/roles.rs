@@ -173,8 +173,13 @@ async fn start_standalone_inner(
                     p.model_id.clone(),
                 ],
                 // Development/sleep flags render only under the opt-in
-                // (profile-level gate; empty here keeps stock restart-only).
-                sleep_flags: Vec::new(),
+                // (profile-level gate, F1 design §7): the isolated
+                // experimental session boots with sleep mode enabled.
+                sleep_flags: if policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+                    vec!["--enable-sleep-mode".into()]
+                } else {
+                    Vec::new()
+                },
                 api_key: None,
             };
             let adapter = Arc::new(

@@ -104,11 +104,17 @@ fn live_restart_only_qualification() {
             .await
             .unwrap();
         app.controller.wait_terminal(&op).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid_before}")).exists(),
-            "engine process group terminated"
-        );
+        // Wait for the kernel to reap the group (a zombie still shows in
+        // /proc for a beat after SIGKILL — the reaper thread reaps).
+        let mut gone = false;
+        for _ in 0..30 {
+            if !std::path::Path::new(&format!("/proc/{pid_before}")).exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(gone, "engine process group terminated");
 
         // -- Re-deploy → READY again (restart-only cycle, T10 live) --
         let t1 = std::time::Instant::now();
@@ -190,25 +196,43 @@ async fn live_switch_and_park_reload() {
         std::time::Duration::from_secs(30),
     ));
 
-    // Deploy B first (stopped); A gets started directly.
+    // Restart-only alternation (T16 live): A and B are two deployments of
+    // the pinned checkpoint on the single engine port; the switch releases
+    // A by stop, then B spawns.
     let a = deploy_and_start(&app, &p.model_id).await;
     let b = app
         .controller
         .submit_deploy(req("qwen3-4b-alt", "qwen3-4b-alt"))
         .await
         .unwrap();
-    // Route collision: both route to different ids; the second profile's
-    // forwarder is the same adapter (same engine binary/port).
-    let _ = b;
 
     let gen_a1 = sw.switch_to(&a).await.unwrap();
     eprintln!("LIVE: A ready, generation {gen_a1}");
 
-    // Park → wake cycles under the opt-in (T20/T21 live, 3 clean cycles).
+    // A → B (T16 live): A released by stop, B reaches READY.
+    let gen_b = sw.switch_to(&b).await.unwrap();
+    eprintln!("LIVE: B ready after switch, generation {gen_b}", gen_b = gen_b);
+    let a_state = {
+        let store = app.controller.store_ref();
+        let s = s.lock().unwrap();
+        s.get_deployment(&a).unwrap().unwrap().observed_state
+    };
+    assert_eq!(a_state, LifecycleState::Stopped, "A released on switch");
+
+    // Park → wake cycles under the opt-in (T20 live, 3 clean cycles) —
+    // the sleep-enabled deployment S.
+    let s_dep = app
+        .controller
+        .submit_deploy(req("qwen3-4b-sleep", "qwen3-4b-sleep"))
+        .await
+        .unwrap();
+    // The sleep deployment S boots with --enable-sleep-mode (opt-in active).
+    // B currently holds the port: stop B first (switch-based release).
+    let _ = sw.switch_to(&s_dep).await.unwrap();
     for cycle in 1..=3 {
         let op = app
             .controller
-            .request_transition(&a, mllm_domain::LifecycleAction::Park)
+            .request_transition(&s_dep, mllm_domain::LifecycleAction::Park)
             .await
             .unwrap();
         let parked = app.controller.wait_terminal(&op).await.unwrap();
@@ -217,7 +241,7 @@ async fn live_switch_and_park_reload() {
 
         let op2 = app
             .controller
-            .request_transition(&a, mllm_domain::LifecycleAction::Start)
+            .request_transition(&s_dep, mllm_domain::LifecycleAction::Start)
             .await
             .unwrap();
         let ready = app.controller.wait_terminal(&op2).await.unwrap();
@@ -225,11 +249,9 @@ async fn live_switch_and_park_reload() {
         eprintln!("LIVE: cycle {cycle} park→wake clean");
     }
 
-    // Policy denial check (T21 live): the profile gate refuses launches
-    // when the opt-in is removed (controller-level; the engine was booted
-    // with the opt-in for this isolated session).
+    // Stale-generation dispatch rejection (T18 live).
     let denied = app
         .controller
-        .check_dispatch_generation(&a, 0);
+        .check_dispatch_generation(&s_dep, 0);
     assert!(denied.is_err(), "stale generation rejected (T18 live)");
 }
