@@ -50,9 +50,14 @@ async fn deploy_and_start(
 }
 
 fn model_ready() -> Option<(LiveVllmProfile, tokio::runtime::Runtime)> {
-    let p = live_env()?;
+    let p = live_profile()?;
     let rt = tokio::runtime::Runtime::new().unwrap();
     Some((p, rt))
+}
+
+/// Profile only (for tests that already run inside a tokio runtime).
+fn live_profile() -> Option<LiveVllmProfile> {
+    live_env()
 }
 
 #[test]
@@ -156,22 +161,9 @@ fn live_restart_only_qualification() {
 }
 
 #[tokio::test]
-async fn live_a_to_b_to_a_and_park_reload() {
-    let Some((p, _rt)) = model_ready() else {
-        eprintln!("live env not present; skipping");
-        return;
-    };
-    let _ = p;
-    // The A→B→A alternation and park/reload live cycles run in
-    // live_switch_and_park (single runtime, sequential stages).
-}
-
-// NOTE: tokio::test spawns its own runtime; the heavy live sequence is
-// consolidated into one test to avoid parallel engine loads on the single
-// GB10 device.
 #[tokio::test]
 async fn live_switch_and_park_reload() {
-    let Some((p, _)) = model_ready() else {
+    let Some(p) = live_profile() else {
         eprintln!("live env not present; skipping");
         return;
     };
