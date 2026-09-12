@@ -83,6 +83,7 @@ mod tests {
                 deployment_id: "d-1".into(),
                 member_id: "m-1".into(),
                 park_level: None,
+                engine_api_key: None,
             })
             .await
             .unwrap();

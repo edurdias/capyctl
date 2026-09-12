@@ -5,7 +5,7 @@
 //! reports a structured not-yet-implemented diagnostic.
 
 use std::convert::Infallible;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,6 +91,33 @@ pub async fn start_standalone_with_policy(
     start_standalone_inner(state_dir, policy).await
 }
 
+/// Live vLLM profile for the Spark qualification (F1 design §8): the
+/// standalone role drives the REAL vLLM adapter over the REAL exec
+/// launcher. F1 qualification wiring via documented env vars; F2 replaces
+/// this with the profile schema.
+#[derive(Debug, Clone)]
+pub struct LiveVllmProfile {
+    pub engine_bin: PathBuf,
+    pub model_path: String,
+    pub model_id: String,
+    pub port: u16,
+    pub fingerprint: String,
+}
+
+impl LiveVllmProfile {
+    /// Read from the qualification environment (documented in the runbook).
+    pub fn from_env() -> Option<Self> {
+        let engine_bin = std::env::var("MLLM_VLLM_BIN").ok()?;
+        Some(Self {
+            engine_bin: engine_bin.into(),
+            model_path: std::env::var("MLLM_MODEL_PATH").ok()?,
+            model_id: std::env::var("MLLM_MODEL_ID").ok()?,
+            port: std::env::var("MLLM_PORT").ok()?.parse().ok()?,
+            fingerprint: std::env::var("MLLM_ENGINE_FINGERPRINT").unwrap_or_else(|_| "live-capture".into()),
+        })
+    }
+}
+
 async fn start_standalone_inner(
     state_dir: &Path,
     policy: mllm_adapters::fake::ParkPolicy,
@@ -98,29 +125,78 @@ async fn start_standalone_inner(
     resolve_startup(ConfigKind::Standalone, None, state_dir)?;
     let db_path = state_dir.join("server").join("srv.sqlite3");
     let store = Rc::new(Store::open(&db_path)?);
-    // The controller gets its own connection: rusqlite connections are
-    // Send but not Sync, and spawned operation tasks need exclusive,
-    // lock-guarded access.
     let controller_store = Arc::new(Mutex::new(Store::open(&db_path)?));
-    let host = Host::new();
-    let fake = Arc::new(mllm_adapters::fake::FakeEngine::new());
-    let controller = Arc::new(
-        Controller::new_with_policy(controller_store.clone(), host.adapter(), host.launcher(), policy)
-            .with_embedded_fake(fake.clone()),
-    );
-    // The inference listener authenticates with the generated API key
-    // (SPEC §15.2: local-only listeners with authentication).
     let api_key = read_api_key(state_dir).unwrap_or_else(|| "mllm-local".to_string());
+
+    // Live profile: the REAL vLLM adapter + REAL exec launcher (F1 design
+    // §8; the profile carries the pinned build's fingerprint).
+    let (adapter, launcher, forwards): (
+        Arc<dyn mllm_adapters::traits::EngineAdapter>,
+        Arc<dyn mllm_adapters::traits::Launcher>,
+        HashMap<String, Arc<dyn mllm_adapters::traits::ChatForward>>,
+    ) = match LiveVllmProfile::from_env() {
+        Some(p) => {
+            let base: reqwest::Url = format!("http://127.0.0.1:{}", p.port)
+                .parse()
+                .map_err(|e| StartError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+            let launch = mllm_adapters::vllm::args::PlanInputVllm {
+                model_path: p.model_path.clone(),
+                port: p.port,
+                granted: Default::default(),
+                engine_args: vec!["--host".into(), "127.0.0.1".into()],
+                // Development/sleep flags render only under the opt-in
+                // (profile-level gate; empty here keeps stock restart-only).
+                sleep_flags: Vec::new(),
+                api_key: None,
+            };
+            let adapter = Arc::new(
+                mllm_adapters::vllm::VllmAdapter::new(
+                    base,
+                    None,
+                    p.fingerprint,
+                    policy,
+                    p.model_id.clone(),
+                )
+                .with_launch(launch),
+            );
+            let launcher: Arc<dyn mllm_adapters::traits::Launcher> =
+                Arc::new(mllm_launchers::ExecLauncher::new());
+            let fwd = adapter.clone() as Arc<dyn mllm_adapters::traits::ChatForward>;
+            (
+                adapter.clone() as Arc<dyn mllm_adapters::traits::EngineAdapter>,
+                launcher,
+                HashMap::from([(p.model_id.clone(), fwd)]),
+            )
+        }
+        None => {
+            let fake = Arc::new(mllm_adapters::fake::FakeEngine::new());
+            let host = Host::new();
+            let fwd = fake.clone() as Arc<dyn mllm_adapters::traits::ChatForward>;
+            (
+                host.adapter(),
+                host.launcher(),
+                HashMap::from([
+                    ("model".to_string(), fwd),
+                    (
+                        "attached".to_string(),
+                        Arc::new(mllm_router::chat::NoForward)
+                            as Arc<dyn mllm_adapters::traits::ChatForward>,
+                    ),
+                ]),
+            )
+        }
+    };
+
+    let controller = Arc::new(Controller::new_with_policy(
+        controller_store.clone(),
+        adapter,
+        launcher,
+        policy,
+    ));
     let deps = mllm_router::RouterDeps {
         store: controller_store.clone(),
         controller: controller.clone(),
-        forwards: HashMap::from([
-            ("model".to_string(), fake.clone() as Arc<dyn mllm_adapters::traits::ChatForward>),
-            (
-                "attached".to_string(),
-                Arc::new(mllm_router::chat::NoForward) as Arc<dyn mllm_adapters::traits::ChatForward>,
-            ),
-        ]),
+        forwards,
         limits: mllm_router::QueueLimits {
             max_requests_per_deployment: 32,
             max_buffered_bytes_total: 64 * 1024 * 1024,

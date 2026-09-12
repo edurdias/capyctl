@@ -38,6 +38,9 @@ pub struct PlanInput {
     pub deployment_id: String,
     pub member_id: String,
     pub park_level: Option<ParkLevel>,
+    /// Per-deployment engine credential, delivered via environment and
+    /// redacted from recorded artifacts (F1 design §4).
+    pub engine_api_key: Option<String>,
 }
 
 /// The concrete command a launcher can spawn.

@@ -668,6 +668,7 @@ impl ExecTask {
                         deployment_id: dep.to_string(),
                         member_id: format!("{dep}-head"),
                         park_level: None,
+                        engine_api_key: None, // F1 lab: engine on private loopback
                     })
                     .await
                     .map_err(|e| (is_uncertain(&e), adapter_code(&e)))

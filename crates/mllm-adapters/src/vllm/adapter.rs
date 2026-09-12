@@ -35,6 +35,9 @@ pub struct VllmAdapter {
     policy: ParkPolicy,
     model_id: String,
     parked: std::sync::atomic::AtomicBool,
+    /// Launch contract (F1 design §4): the concrete vLLM serve command
+    /// this adapter renders for managed launches.
+    launch: Option<crate::vllm::args::PlanInputVllm>,
 }
 
 impl VllmAdapter {
@@ -51,7 +54,15 @@ impl VllmAdapter {
             policy,
             model_id,
             parked: std::sync::atomic::AtomicBool::new(false),
+            launch: None,
         }
+    }
+
+    /// Attach the managed-launch contract (F1 design §4): the concrete
+    /// serve command this adapter renders in `render_plan`.
+    pub fn with_launch(mut self, launch: crate::vllm::args::PlanInputVllm) -> Self {
+        self.launch = Some(launch);
+        self
     }
 
     fn require_policy(&self, _what: &str) -> Result<(), AdapterError> {
@@ -108,10 +119,20 @@ impl EngineAdapter for VllmAdapter {
         })
     }
 
-    async fn render_plan(&self, _plan: &PlanInput) -> Result<RenderedCommand, AdapterError> {
-        // Full argument rendering is Task 4's contract (args.rs); the
-        // adapter-level operation exists so the trait is complete.
-        Err(AdapterError::UnsupportedCapability)
+    async fn render_plan(&self, plan: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        let Some(spec) = &self.launch else {
+            return Err(AdapterError::UnsupportedCapability);
+        };
+        let mut spec = spec.clone();
+        spec.api_key = None; // launch secret rides the env, not argv (redaction)
+        let mut cmd = crate::vllm::args::render_command(&spec)
+            .map_err(|e| AdapterError::Uncertain(format!("render: {e}")))?;
+        // The engine credential is delivered via environment (never argv),
+        // redacted from fingerprints and journals (SPEC §8.2/§13.3).
+        if let Some(key) = &plan.engine_api_key {
+            cmd.env.insert("MLLM_ENGINE_API_KEY".into(), key.clone());
+        }
+        Ok(cmd)
     }
 
     async fn check_readiness(&self, _member: &MemberRef) -> Result<Readiness, AdapterError> {

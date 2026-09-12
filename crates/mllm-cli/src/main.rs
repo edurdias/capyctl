@@ -52,14 +52,8 @@ fn run_standalone(format: OutputFormat) -> ExitCode {
             return ExitCode::from(output::ExitCode::INTERNAL.0 as u8);
         }
     };
-    match runtime.block_on(roles::start_standalone(&state_dir)) {
-        Ok(_app) => {
-            println!(
-                "standalone ready (state_dir {}; embedded host, no listeners in F0)",
-                state_dir.display()
-            );
-            ExitCode::SUCCESS
-        }
+    match runtime.block_on(serve_standalone(&state_dir)) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let err: StructuredError = err.into();
             output::print_error(&err, format);
@@ -70,6 +64,22 @@ fn run_standalone(format: OutputFormat) -> ExitCode {
             }
         }
     }
+}
+
+/// Boot the standalone graph and serve the inference listener
+/// (127.0.0.1:8443, SPEC §15.2) until the process is terminated.
+async fn serve_standalone(state_dir: &std::path::Path) -> Result<(), roles::StartError> {
+    let app = roles::start_standalone(state_dir).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8443")
+        .await
+        .map_err(roles::StartError::from)?;
+    println!(
+        "standalone ready (state_dir {}; inference listener 127.0.0.1:8443)",
+        state_dir.display()
+    );
+    axum::serve(listener, app.router())
+        .await
+        .map_err(roles::StartError::from)
 }
 
 /// F0 default state root: `$MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`,
