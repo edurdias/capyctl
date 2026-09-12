@@ -100,7 +100,11 @@ impl EngineAdapter for VllmAdapter {
         // so the local park tracking decides the phase.
         let serving = self.http.list_models().await.map_err(|e| {
             if matches!(e, HttpError::Unreachable(_)) {
-                AdapterError::Crash(Phase::Startup)
+                // The engine process is starting: its HTTP surface listens
+                // only after weights are staged (minutes on GB10). Startup
+                // non-listening is NOT a crash — the launcher owns crash
+                // detection via process exit; readiness polls continue.
+                AdapterError::Uncertain("engine not listening yet".into())
             } else {
                 Self::uncertain_http("inspect", e)
             }
@@ -141,13 +145,15 @@ impl EngineAdapter for VllmAdapter {
         if self.is_parked() {
             return Ok(Readiness::Initializing);
         }
-        let ids = self.http.list_models().await.map_err(|e| {
-            if matches!(e, HttpError::Unreachable(_)) {
-                AdapterError::Crash(Phase::Startup)
-            } else {
-                Self::uncertain_http("readiness", e)
+        let ids = match self.http.list_models().await {
+            Ok(ids) => ids,
+            Err(HttpError::Unreachable(_)) => {
+                // Not listening yet: Initializing (the readiness loop
+                // polls); crash detection is the launcher's job.
+                return Ok(Readiness::Initializing);
             }
-        })?;
+            Err(e) => return Err(Self::uncertain_http("readiness", e)),
+        };
         if ids.contains(&self.model_id) {
             Ok(Readiness::Ready)
         } else {
