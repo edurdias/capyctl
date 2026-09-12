@@ -162,7 +162,13 @@ impl EngineAdapter for VllmAdapter {
             cmd.env.insert("PATH".into(), format!("{extra}:{sys}"));
         }
         if let Some(log) = &spec.engine_log {
-            cmd.env.insert("MLLM_ENGINE_LOG".into(), log.clone());
+            // One log per deployment member: concurrent/repeat launches
+            // must not truncate each other's evidence, but a shared append
+            // target for the same member keeps the runbook readable.
+            cmd.env.insert(
+                "MLLM_ENGINE_LOG".into(),
+                format!("{log}.{}", plan.member_id),
+            );
         }
         Ok(cmd)
     }
