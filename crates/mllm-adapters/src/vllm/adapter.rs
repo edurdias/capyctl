@@ -253,11 +253,14 @@ impl EngineAdapter for VllmAdapter {
 impl crate::traits::ChatForward for VllmAdapter {
     async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError> {
         // Non-streaming: buffer the SSE stream until [DONE] and join the
-        // chunks into the engine's final JSON (F1 keeps one code path).
+        // chunks into the engine's final JSON (F1 keeps one code path —
+        // the internal request always streams, matching the SSE parser).
+        let mut req = body.clone();
+        req["stream"] = serde_json::Value::Bool(true);
         let mut text = String::new();
         let end = self
             .http
-            .chat_completion_stream(body, |c| text.push_str(&c.text))
+            .chat_completion_stream(&req, |c| text.push_str(&c.text))
             .await
             .map_err(|e| match e {
                 HttpError::Unreachable(_) => AdapterError::Crash(Phase::Startup),
