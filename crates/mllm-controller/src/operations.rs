@@ -762,6 +762,15 @@ impl ExecTask {
             }
             Step::Drain => match self.adapter.observe_work(&member).await {
                 Ok(WorkObservation::Idle) => Ok(()),
+                // Unknown in-flight state (vLLM exposes no per-request
+                // surface): the drain liveness policy (F1 design §5) —
+                // proceed with the residual uncertainty RECORDED in the
+                // release evidence; never silently treated as idle, never
+                // blocking forever on unprovable work.
+                Ok(WorkObservation::Unknown) => {
+                    self.journal(op, state, r#"{"event":"drained_unknown","residual":"engine work unprovable; stop proceeds with uncertainty recorded"}"#.to_string());
+                    Ok(())
+                }
                 Ok(other) => Err((false, format!("work_not_drained:{other:?}"))),
                 Err(e) => Err((is_uncertain(&e), adapter_code(&e))),
             },
