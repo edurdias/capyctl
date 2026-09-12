@@ -335,7 +335,7 @@ mod tests {
     #[async_trait::async_trait]
     impl EngineAdapter for FabricatedReadyAdapter {
         async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
-            Ok(EngineState { phase: Phase::Startup, retained_bytes: 0 })
+            Ok(EngineState { phase: Phase::Startup, retained_bytes: 0, build_fingerprint: None })
         }
         async fn render_plan(
             &self,

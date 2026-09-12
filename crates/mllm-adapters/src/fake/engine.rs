@@ -17,6 +17,10 @@ pub const LEVEL1_RETAINED_BYTES: i64 = 1024;
 /// Retained bytes after a level-2 park: weights and KV discarded, buffers kept.
 pub const BUFFER_RESIDUE: i64 = 256;
 
+/// Stable build fingerprint the fake reports through `EngineState`
+/// (parked-state observability contract, F1 design §3).
+pub const FAKE_BUILD_FINGERPRINT: &str = "fake-engine-1";
+
 /// The deep-park security gate: experimental level-2 operations are denied
 /// unless the host explicitly opts in (design §9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -117,7 +121,11 @@ fn park_retained_bytes(level: ParkLevel) -> i64 {
 impl EngineAdapter for FakeEngine {
     async fn inspect(&self, _member: &MemberRef) -> Result<EngineState, AdapterError> {
         let st = self.state.lock().unwrap();
-        Ok(EngineState { phase: st.phase, retained_bytes: st.retained_bytes })
+        Ok(EngineState {
+            phase: st.phase,
+            retained_bytes: st.retained_bytes,
+            build_fingerprint: Some(FAKE_BUILD_FINGERPRINT.into()),
+        })
     }
 
     async fn render_plan(&self, plan: &PlanInput) -> Result<RenderedCommand, AdapterError> {
@@ -151,6 +159,11 @@ impl EngineAdapter for FakeEngine {
         if knobs.fail_at == Some(Phase::Startup) {
             return Err(AdapterError::Crash(Phase::Startup));
         }
+        // A parked engine is not ready: parked-state observability (F1 design
+        // §3) forbids reading a parked member as Ready.
+        if self.state.lock().unwrap().phase == Phase::Parked {
+            return Ok(Readiness::Initializing);
+        }
         if let Some(delay) = knobs.startup_delay {
             if self.started_at.elapsed() < delay {
                 return Ok(Readiness::Initializing);
@@ -182,7 +195,7 @@ impl EngineAdapter for FakeEngine {
         let retained = park_retained_bytes(level);
         {
             let mut st = self.state.lock().unwrap();
-            st.phase = Phase::Parking;
+            st.phase = Phase::Parked;
             st.retained_bytes = retained;
         }
         if ambiguous {

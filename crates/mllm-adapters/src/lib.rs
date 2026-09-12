@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn payload_types_carry_the_fields_task_9_reads() {
-        let state = EngineState { phase: Phase::Ready, retained_bytes: 1024 };
+        let state = EngineState { phase: Phase::Ready, retained_bytes: 1024, build_fingerprint: None };
         assert_eq!(state.retained_bytes, 1024);
         assert_eq!(state.phase, Phase::Ready);
 

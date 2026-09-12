@@ -15,6 +15,10 @@ pub struct MemberRef {
 pub struct EngineState {
     pub phase: Phase,
     pub retained_bytes: i64,
+    /// Engine build fingerprint captured at qualification/launch; adapters
+    /// that cannot observe it report `None` (F1 design §3: parked-state
+    /// observability contract).
+    pub build_fingerprint: Option<String>,
 }
 
 /// The shared lifecycle phase of an engine member.
@@ -23,6 +27,7 @@ pub enum Phase {
     Startup,
     Ready,
     Parking,
+    Parked,
     Restore,
 }
 
