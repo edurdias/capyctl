@@ -35,9 +35,9 @@ Six slices in dependency order; each leaves a coherent tested product.
 
 | Slice | Deliverable | Tests |
 |---|---|---|
-| G1 — vLLM adapter + launch contract | Real `vllm` adapter over the OpenAI-compatible HTTP API; native-argument launch contract; Spark environment-contract doc; real `doctor host` fingerprinting | Adapter conformance on the fake + contract tests; T07, T12 |
-| G2 — Router | Real `mllm-router`: `/v1/models` + streaming/non-streaming `/v1/chat/completions`, admission, queue bounds, cancellation accounting | T17, T18, T19 (simulator) |
-| G3 — Durable operations on real adapters | start/park/stop/preinitialize/undeploy via controller + real launcher (process groups, signals, exit status); admin-stop vs idle-stop; generation machinery; reservation persistence | T10, T12; generation/reservation coverage |
+| G1 — vLLM adapter + launch contract | Real `vllm` adapter over the OpenAI-compatible HTTP API; native-argument launch contract; Spark environment-contract doc; real `doctor host` fingerprinting | Adapter conformance on the fake + contract tests; T07, T12, T14 (render-plan conflicts, fingerprint rules; live fingerprint evidence via the §8 sequence) |
+| G2 — Router | Real `mllm-router`: `/v1/models` + streaming/non-streaming `/v1/chat/completions`, admission, queue bounds, cancellation accounting | T17, T19 (simulator) |
+| G3 — Durable operations on real adapters | start/park/stop/preinitialize/undeploy via controller + real launcher (process groups, signals, exit status); admin-stop vs idle-stop; generation machinery; reservation persistence | T10, T12, T18 (late dispatch needs the generation machinery G3 delivers); generation/reservation coverage |
 | G4 — Attachment | `attach model` with ownership ≠ reachability | T11 |
 | G5 — Switching + fairness | A→B activation, one wake, bounded non-resetting window, drain → quiescence → release evidence; two profiles alternate | T15, T16, T17, T19 |
 | G6 — Experimental deep-park + Spark qualification | Policy gate end-to-end; isolated `vllm-sleep` profile; Spark environment contract, doctor capture, restart-only live qualification, then experimental park/reload | T20, T21; live-tier T16/T20/T21 evidence |
@@ -47,13 +47,22 @@ Six slices in dependency order; each leaves a coherent tested product.
 Implements the F0 `EngineAdapter` trait over vLLM's OpenAI-compatible HTTP API. All
 engine-specific endpoints and launch parameters stay inside the adapter (SPEC §9).
 
+**Parked-state observability (contract extension in G1):** in vLLM sleep mode the API
+server stays alive and `/v1/models` keeps listing the model — a parked engine is
+indistinguishable from Ready through those surfaces alone. G1 therefore extends the F0
+adapter contract: `Phase` gains a `Parked` variant, `EngineState` gains a
+`build_fingerprint` channel, and parked-vs-Ready is established by an engine-side signal
+when the pinned release exposes one (e.g. a sleep-state endpoint enabled with sleep
+mode), falling back to operation provenance from the store (the controller knows it
+issued the park). `/v1/models` alone never establishes Ready after a park.
+
 | Operation | Contract |
 |---|---|
 | `inspect` | Engine build fingerprint (from doctor capture), observed phase, advertised capabilities |
 | `render_plan` | Resolve native parameters: model path, port, device/memory settings from the granted budget (explicit units, SPEC §7.5); reject reserved-flag conflicts (T14) |
-| `check_readiness` | `/v1/models` returning the served model — liveness (`/health`) is explicitly not readiness (T07 principle) |
+| `check_readiness` | `/v1/models` returning the served model — liveness (`/health`) is explicitly not readiness (SPEC §6.1: liveness of an HTTP server is not model readiness) |
 | `prepare_park` | Quiescence: zero in-flight observed, no queued requests; reports only what it can prove |
-| `park` | `POST /sleep?level=1\|2` [S1] — level 1 retains a CPU weight backup, level 2 discards weights+KV; **reachable only under the host-policy gate** (§6) |
+| `park` | `POST /sleep?level=1\|2` [S1] — level 1 retains a CPU weight backup, level 2 discards weights+KV; **reachable only under the host-policy gate** (§7) |
 | `restore` | Wake allocations + `reload_weights` through the collective RPC, invoked once through the lead [S1]; waking allocations alone is not successful restoration — a generation check follows |
 | `reload_weights` | Collective control, gated identically |
 | `observe_work`/`cancel_work` | In-flight accounting via stream correlation; vLLM exposes no cancellation-ack API — the adapter reports `Uncertain` unless the stream closed cleanly |
@@ -99,6 +108,25 @@ host → reserve B's complete activation plan → launch/restore B → verify wh
 readiness → open B's admission gate → dispatch the queued requests in order. A drain
 timeout fails the switch by default; forced termination is separately authorized.
 
+**Drain liveness policy (for unverifiable cancellations):** a drain cannot block forever
+on work whose cancellation the adapter cannot prove. After a `cancel_work` with an
+`Uncertain` result, a bounded grace period runs (versioned default, set in the
+implementation plan); when it expires, the drain proceeds only on engine-side evidence —
+the adapter's own in-flight telemetry or stream-closure observation — and a best-effort
+abort is issued. Any residual uncertainty (work that may still be running) is recorded in
+the release evidence instead of blocking quiescence: the switch proceeds, but the
+park/stop of A is then treated as a best-effort release whose physical verification
+follows the F0 rules (uncertainty never becomes free capacity — the ledger keeps A's
+reservations until verified release or a stop with evidence). Quiescence blocks forever
+only on work the engine can still prove live, not on accounting uncertainty.
+
+**Switch-failure branch:** when the switch fails (drain timeout being the default
+cause), A's admission reopens with its window state preserved — the failed switch does
+not punish A — and B's queued requests receive a structured switch-failed error, with a
+bounded re-queue option that honors each request's remaining activation deadline. The
+deployment records a failed-switch event (feeding SPEC §17's failed-switches metric).
+Forced termination remains separately authorized and is never the default path.
+
 **Streaming accounting**: SSE events pass through with in-flight accounting. Client
 disconnect is not proof the engine stopped — conservative accounting until completion or
 confirmed cancellation. No fake tokens for waiting requests; no replay of partially
@@ -125,12 +153,24 @@ appropriate.
 - Direct external clients may bypass mllm's in-flight counts; no drain-based lifecycle
   operation on attached deployments without exclusive admission control (SPEC §5.2).
 
-## 7. Experimental deep-park gate (T20, T21)
+## 7. Deep-park gate (T20, T21)
 
-The `vllm-sleep` experimental profile requires `security.allow_development_engine_controls:
+mllm's purpose is running multiple models on shared hardware: models are loaded and
+parked/offloaded to disk, then loaded/activated on demand, using each engine's own
+capabilities — vLLM's sleep/awake path where available, full restart where not; SGLang
+the same. Park/reload is core F1 functionality. The security gate below exists because
+the vLLM path to it runs through development mode (an upstream security constraint), not
+because the feature is optional.
+
+The `vllm-sleep` profile requires `security.allow_development_engine_controls:
 true` in host policy — an explicit, documented opt-in. vLLM development mode is required
 for the sleep path to operate (owner-confirmed): the profile's launch contract includes
-the sleep-mode/development startup flags. Controls:
+the sleep-mode/development startup flags. **The opt-in gates the profile itself, not just
+the park/reload operations**: the dangerous surface exists from the moment a
+development-mode engine starts, so launching `vllm-sleep` in any mode — including
+restart-only — requires the opt-in. The §8 restart-only qualification baseline therefore
+alternates two restart-only profiles (stock + stock-alt); the `vllm-sleep` profile enters
+only at step 4 under the opt-in. Controls:
 
 - Default denial enforced at every layer: fake (F0), adapter, host policy, controller
   (T21). No public admin passthrough.
@@ -144,6 +184,16 @@ the sleep-mode/development startup flags. Controls:
   requalification (SPEC §13.2).
 - Qualification evidence is tiered: simulator (fake) first, live Spark second, never
   conflated (AGENT_HANDOFF).
+
+**Preinitialize on real adapters (G3):** `preinitialize deployment` sequentially starts,
+validates readiness, and parks — never displacing live user work. It requires a
+*qualified* parking capability, which on real vLLM exists only under the experimental
+opt-in after G6 qualification: when parking is unqualified or policy-denied,
+preinitialize fails clearly with an unsupported-capability-class error rather than
+claiming a prewarmed restart-only deployment (SPEC §6.3). `parking: auto` under default
+policy resolves to restart-only, so preinitialize fails for such deployments until their
+profile's parking capability is qualified. Until G6 lands, preinitialize is
+simulator-tier only.
 
 ## 8. Spark environment contract and qualification sequence
 
@@ -164,15 +214,30 @@ Qualification sequence, each step gated:
 2. `mllm doctor host` (now real in F1) captures build fingerprints and memory
    observations; the live recipe is frozen only from reported reality.
 3. **Restart-only live qualification first**: deploy → READY → serve → stop → re-deploy;
-   A→B→A switching across the two profiles (stock + experimental) on the Spark. This
-   alone satisfies "first working vLLM path."
-4. Experimental park/reload only under the opted-in isolated profile: park → wake →
-   generation check → repeat; measurements are end-to-end request-to-first-token and
-   memory behavior, not reload RPC duration (SPEC §17); page-cache conditions recorded.
+   A→B→A switching across the two profiles (stock + experimental) on the Spark; attach an
+   already-running stock-vLLM service and verify routing works while lifecycle commands
+   are rejected (T11 live); issue simultaneous first requests against a stopped
+   deployment and verify a single wake operation (T15 live). This alone satisfies
+   "first working vLLM path."
+4. **Park/reload under the opt-in profile** — park/reload is core F1 functionality, not
+   an optional experiment (owner decision: "the framework will have the park/reload
+   feature otherwise there is no reason to build this thing"). mllm's purpose is running
+   multiple models on shared hardware by loading them and parking/offloading them to
+   disk, then loading/activating on demand, using each engine's own capabilities: for
+   vLLM the sleep/awake path (level 2, weights restored from the checkpoint on wake);
+   full restart is the universal baseline used wherever an engine or profile lacks the
+   capability. The Spark sequence: park → wake → generation check → repeat until clean
+   cycles with recorded end-to-end request-to-first-token and memory behavior (SPEC §17;
+   page-cache conditions recorded). If the initial pinned build's sleep path misbehaves
+   on the Spark's unified-memory platform, the build/recipe is revised (adapter flags,
+   vLLM release, platform configuration) and validation retried — the milestone does not
+   downgrade away from the feature; restart-only remains the engine-capability fallback
+   in the product, never a substitute for the qualified path on engines that have one.
 5. Every live claim is tiered: simulator evidence vs live-Spark evidence never conflated.
 
 Exit gate (SPEC §18 F1): two profiles alternate safely on the Spark; experimental
-park/reload validated where allowed; failures reconcile — with T07, T10–T12, T14–T21
+park/reload working on the Spark via vLLM's sleep/awake path; failures reconcile — with
+T07, T10–T12, T14–T21
 green at the simulator tier and live-tier evidence for the Spark sequence.
 
 ## 9. Test map (F1)
