@@ -154,6 +154,11 @@ async fn start_standalone_inner(
                 // (activation peak stays well inside the managed limit).
                 granted: mllm_adapters::vllm::args::GrantedBudget {
                     kv_cache_bytes: Some(64 * 1024 * 1024 * 1024),
+                    // The utilization gate must pass when the OS has not yet
+                    // fully released the previous deployment's memory: the
+                    // explicit KV grant sizes the pool (vLLM 0.29 live
+                    // capture), so the utilization gate is set low.
+                    gpu_utilization_pct: Some(10),
                     ..Default::default()
                 },
                 engine_path_extra: p.engine_path_extra.clone().map(|p| p.to_string_lossy().to_string()),
