@@ -156,7 +156,7 @@ async fn start_standalone_inner(
                     kv_cache_bytes: Some(64 * 1024 * 1024 * 1024),
                     ..Default::default()
                 },
-                engine_path_extra: p.engine_path_extra.clone(),
+                engine_path_extra: p.engine_path_extra.clone().map(|p| p.to_string_lossy().to_string()),
                 engine_args: vec!["--host".into(), "127.0.0.1".into()],
                 // Development/sleep flags render only under the opt-in
                 // (profile-level gate; empty here keeps stock restart-only).
