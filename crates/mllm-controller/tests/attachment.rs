@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use mllm_controller::{Controller, DeployRequest};
+use mllm_controller::Controller;
 use mllm_store::Store;
 
 fn controller() -> (Arc<Controller>, Arc<Mutex<Store>>) {
@@ -18,14 +18,6 @@ fn controller() -> (Arc<Controller>, Arc<Mutex<Store>>) {
     (c, store)
 }
 
-fn req(name: &str) -> DeployRequest {
-    DeployRequest {
-        name: name.into(),
-        kind: "model".into(),
-        manifest: format!(r#"{{"kind":"model","name":"{name}"}}"#).into_bytes(),
-        route_model_id: Some(name.into()),
-    }
-}
 
 #[tokio::test]
 async fn attach_registers_route_and_rejects_lifecycle() {
