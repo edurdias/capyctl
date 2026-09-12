@@ -72,6 +72,7 @@ impl Launcher for ExecLauncher {
             .argv
             .split_first()
             .ok_or_else(|| LauncherError::SpawnFailed("empty argv".into()))?;
+        let mut command = Command::new(program);
         command.args(args);
         for (k, v) in &cmd.env {
             command.env(k, v);
