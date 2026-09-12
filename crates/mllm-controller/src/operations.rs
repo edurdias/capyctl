@@ -795,6 +795,19 @@ impl ExecTask {
                         self.journal(op, state, r#"{"event":"quiescent"}"#.to_string());
                         Ok(())
                     }
+                    // Unknown in-flight state (real engines expose no
+                    // per-request surface — vLLM's park never gets proof):
+                    // the drain liveness policy (design §5) applies here too
+                    // — proceed with the residual uncertainty RECORDED, not
+                    // a fabricated proof and not a permanent block.
+                    (Ok(WorkObservation::Unknown), Ok(_)) => {
+                        self.journal(
+                            op,
+                            state,
+                            r#"{"event":"quiesce_unknown","residual":"engine work unprovable; park proceeds with uncertainty recorded"}"#.to_string(),
+                        );
+                        Ok(())
+                    }
                     (Err(e), _) | (_, Err(e)) => {
                         Err((is_uncertain(&e), adapter_code(&e)))
                     }

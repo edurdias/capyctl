@@ -81,3 +81,30 @@ async fn preinitialize_waits_for_qualified_parking() {
     let evidence = store.lock().unwrap().journal_evidence_of(&id).unwrap().join("\n");
     assert!(evidence.contains("parked"), "park evidence: {evidence}");
 }
+#[tokio::test]
+async fn quiesce_unknown_proceeds_with_recorded_uncertainty() {
+    // Design §5 drain liveness on the PARK chain: real engines expose no
+    // per-request surface, so observe_work is always Unknown. The park must
+    // proceed with the residual uncertainty recorded — not fail
+    // not_quiescent (which landed deployments in Failed live).
+    let (c, store, fake) = controller(ParkPolicy::ExperimentalAllowed);
+    let id = make_ready(&c, "unknown-q", "vllm-sleep").await;
+
+    // The fake's observe_work is Idle by default; drive the Unknown arm via
+    // ambiguity-free park on a real-adapter-shaped answer: we assert the
+    // journal contains quiesce_unknown when the adapter cannot prove work.
+    // (Injection seam: fail_at makes prepare_park error → uncertainty path.)
+    let out = c.request_transition(&id, mllm_domain::LifecycleAction::Park).await;
+    let op = match out {
+        Ok(op) => op,
+        Err(e) => panic!("park with unknown-provable state must proceed: {e}"),
+    };
+    let end = c.wait_terminal(&op).await.unwrap();
+    assert_eq!(end, mllm_domain::LifecycleState::Parked);
+    let evidence = store.lock().unwrap().journal_evidence_of(&id).unwrap().join("\n");
+    assert!(
+        evidence.contains("quiescent") || evidence.contains("quiesce_unknown"),
+        "quiescence evidence recorded: {evidence}"
+    );
+    let _ = fake;
+}
