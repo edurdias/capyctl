@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use mllm_adapters::fake::FakeEngine;
 use mllm_controller::Controller;
@@ -37,7 +36,7 @@ async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
     (mllm_router::serve_router(deps, "127.0.0.1:0".parse().unwrap()), inflight, controller)
 }
 
-fn req(id: &str, name: &str) -> mllm_controller::DeployRequest {
+fn req(_id: &str, name: &str) -> mllm_controller::DeployRequest {
     mllm_controller::DeployRequest {
         name: name.into(),
         kind: "fake".into(),
@@ -52,7 +51,7 @@ async fn streaming_chat_returns_sse_events_in_order() {
     // router dispatches the READY deployment directly)
     let (router, _inflight, controller) = app_streaming().await;
     let id = controller
-        .submit_deploy(req("stream-m", "stream-m"))
+        .submit_deploy(req("s1", "stream-m"))
         .await
         .unwrap();
     let op = controller
