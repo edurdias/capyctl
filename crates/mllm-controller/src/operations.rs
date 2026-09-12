@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mllm_adapters::{
-    AdapterError, EngineAdapter, Launcher, LauncherError, MemberRef, OwnedHandle, ParkLevel,
-    PlanInput, Readiness, WorkObservation,
+    AdapterError, EngineAdapter, Launcher, LauncherError, MemberRef, OwnedHandle, PlanInput,
+    Readiness, WorkObservation,
 };
 use mllm_domain::{
     DeploymentId, LifecycleAction, LifecycleState, OperationId, OwnerAccountId,
