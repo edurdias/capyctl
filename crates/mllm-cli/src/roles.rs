@@ -163,7 +163,15 @@ async fn start_standalone_inner(
                         .to_string_lossy()
                         .to_string(),
                 ),
-                engine_args: vec!["--host".into(), "127.0.0.1".into()],
+                // The served model id must match the deployment's route id
+                // (readiness = /v1/models lists the served id); vLLM
+                // otherwise serves the checkpoint filesystem path.
+                engine_args: vec![
+                    "--host".into(),
+                    "127.0.0.1".into(),
+                    "--served-model-name".into(),
+                    p.model_id.clone(),
+                ],
                 // Development/sleep flags render only under the opt-in
                 // (profile-level gate; empty here keeps stock restart-only).
                 sleep_flags: Vec::new(),
