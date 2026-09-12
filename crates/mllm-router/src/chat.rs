@@ -3,9 +3,10 @@
 //! joins one activation operation when the deployment is not READY
 //! (simultaneous requests join one wake — T15).
 
+use async_trait::async_trait;
+
 use axum::http::StatusCode;
 use axum::Json;
-use mllm_domain::LifecycleState;
 
 use crate::RouterDeps;
 
@@ -32,7 +33,7 @@ pub async fn resolve(
 
     // Join the deployment's single activation operation when not READY
     // (T15: simultaneous requests join one wake; no duplicate processes).
-    if observed != LifecycleState::Ready {
+    if observed != mllm_domain::LifecycleState::Ready {
         let op = deps
             .controller
             .request_transition(&deployment_id, mllm_domain::LifecycleAction::Start)
@@ -43,6 +44,7 @@ pub async fn resolve(
             .await
             .map_err(map_controller)?;
     }
+
     Ok((deployment_id, kind))
 }
 
@@ -57,20 +59,13 @@ pub async fn dispatch(
     let (deployment_id, kind) = resolve(deps, model).await?;
 
     // Admission accounting: per-deployment in-flight bound (T19).
-    if deps.inflight.current(&deployment_id)
-        >= deps.limits.max_requests_per_deployment
-    {
+    if deps.inflight.current(&deployment_id) >= deps.limits.max_requests_per_deployment {
         return Err(err("queue_full", "deployment in-flight bound reached"));
     }
     let forward = deps
         .forwards
         .get(&kind)
-        .ok_or_else(|| {
-            err(
-                "unsupported",
-                &format!("no forwarder for profile {kind}"),
-            )
-        })?
+        .ok_or_else(|| err("unsupported", &format!("no forwarder for profile {kind}")))?
         .clone();
     let guard = deps.inflight.guard(&deployment_id);
     let resp = forward
@@ -78,7 +73,6 @@ pub async fn dispatch(
         .await
         .map_err(|e| err("engine_error", &format!("engine: {e:?}")))?;
     guard.release();
-    let _ = deployment_id;
     Ok(resp)
 }
 
@@ -104,5 +98,20 @@ fn map_controller(e: mllm_controller::ControllerError) -> (StatusCode, Json<serd
             err("unknown_model", &format!("deployment {d} vanished"))
         }
         other => err("activation_failed", &other.to_string()),
+    }
+}
+
+/// Placeholder forwarder for attached deployments: an attached service is
+/// routed through its endpoint URL at dispatch time (F3+ wiring); in F1 the
+/// attached chat path reports unsupported rather than improvising.
+pub struct NoForward;
+
+#[async_trait]
+impl mllm_adapters::traits::ChatForward for NoForward {
+    async fn forward_chat(
+        &self,
+        _body: &serde_json::Value,
+    ) -> Result<serde_json::Value, mllm_adapters::traits::AdapterError> {
+        Err(mllm_adapters::traits::AdapterError::UnsupportedCapability)
     }
 }

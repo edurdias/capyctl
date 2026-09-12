@@ -12,10 +12,16 @@ mllm-agent = { workspace = true }
 mllm-config = { workspace = true }
 mllm-controller = { workspace = true }
 mllm-store = { workspace = true }
+mllm-router = { path = "../mllm-router" }
+mllm-adapters = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = { workspace = true }
 mllm-domain = { workspace = true }
+
 
 [[bin]]
 name = "mllm"
