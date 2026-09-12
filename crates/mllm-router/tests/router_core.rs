@@ -3,7 +3,6 @@
 //! API-key; queue limits return structured errors.
 
 
-use axum::body::Body;
 use tower::ServiceExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,7 +13,6 @@ use mllm_router::{QueueLimits, RouterDeps};
 use mllm_store::Store;
 
 async fn app() -> (axum::Router, Arc<Mutex<Store>>, Arc<Controller>, mllm_store::Store) {
-    let store = Store::open_in_memory().unwrap();
     let shared = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let fake = Arc::new(FakeEngine::new());
     let adapter = fake.clone() as Arc<dyn mllm_adapters::ChatForward>;
