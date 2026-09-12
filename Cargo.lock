@@ -955,6 +955,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
+ "harness",
  "reqwest",
  "serde_json",
  "thiserror",

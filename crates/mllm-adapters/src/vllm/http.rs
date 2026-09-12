@@ -127,6 +127,16 @@ impl EngineHttp {
             .map(|()| WakeOutcome::Applied)
     }
 
+    /// `POST /collective_rpc` — the dangerous collective control surface
+    /// (vLLM security docs [S2]). Reachable only under the deep-park policy
+    /// gate; the adapter invokes it exactly once per collective (SPEC §11).
+    pub async fn collective_rpc(&self) -> Result<WakeOutcome, HttpError> {
+        let req = self.auth(self.client.post(self.url("/collective_rpc")));
+        self.post_outcome(req, "collective_rpc")
+            .await
+            .map(|()| WakeOutcome::Applied)
+    }
+
     /// Consume an SSE chat-completions stream, invoking `on_chunk` per data
     /// payload. Returns how the stream ended.
     pub async fn chat_completion_stream(

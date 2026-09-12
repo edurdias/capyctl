@@ -15,3 +15,5 @@ futures = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
+[dev-dependencies.harness]
+path = "../../tests/harness"
