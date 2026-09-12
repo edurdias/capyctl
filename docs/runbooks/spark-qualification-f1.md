@@ -69,6 +69,11 @@ pre-listen unreachability = Initializing (not crash), engine log capture.
 
 ## 4. Park/reload under the opt-in profile (T20, T21 live)
 
+The initial correctness results below used the default loader. A subsequent
+**host-a-only eager-loader qualification** reduced median wake-to-response to
+7.5s while preserving deep park, at about 8 GiB extra temporary loading memory.
+See [the matched measurements and limits](spark-deep-wake-optimization.md).
+
 **PASSED live (2026-09-12): three level-2 park/reload cycles with authenticated
 routed inference after every reload, stock switching, default denial, and
 ambiguous-park injection.**

@@ -206,11 +206,7 @@ async fn start_standalone_inner(
                 // Development/sleep flags render only under the opt-in
                 // (profile-level gate, F1 design §7): the isolated
                 // experimental session boots with sleep mode enabled.
-                sleep_flags: if policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
-                    vec!["--enable-sleep-mode".into()]
-                } else {
-                    Vec::new()
-                },
+                sleep_flags: live_vllm_sleep_flags(policy),
                 api_key: None,
             };
             let adapter = Arc::new(
@@ -280,6 +276,20 @@ async fn start_standalone_inner(
     Ok(App { controller, store, router, deps, api_key })
 }
 
+fn live_vllm_sleep_flags(policy: mllm_adapters::fake::ParkPolicy) -> Vec<String> {
+    if policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+        // The deep-park lab profile uses eager checkpoint loading to avoid
+        // mmap-backed tensor copies during weight restoration on Spark.
+        vec![
+            "--enable-sleep-mode".into(),
+            "--safetensors-load-strategy".into(),
+            "eager".into(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Read the generated API key from the protected credentials file (F0's
 /// fail-closed generation; the key is printed never, only used).
 fn read_api_key(state_dir: &Path) -> Option<String> {
@@ -291,4 +301,23 @@ fn read_api_key(state_dir: &Path) -> Option<String> {
 
 pub fn dispatch(command: &Command) -> Result<Infallible, StructuredError> {
     Err(StructuredError::not_yet_implemented(&command.label()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_vllm_sleep_flags;
+    use mllm_adapters::fake::ParkPolicy;
+
+    #[test]
+    fn deep_park_lab_profile_enables_eager_weight_loading() {
+        assert_eq!(
+            live_vllm_sleep_flags(ParkPolicy::ExperimentalAllowed),
+            ["--enable-sleep-mode", "--safetensors-load-strategy", "eager"],
+        );
+    }
+
+    #[test]
+    fn denied_profile_has_no_sleep_or_loader_override() {
+        assert!(live_vllm_sleep_flags(ParkPolicy::Denied).is_empty());
+    }
 }
