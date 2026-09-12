@@ -192,8 +192,16 @@ impl EngineHttp {
                         }
                     }
                 }
-                Some(Err(e)) => return Err(HttpError::Body(e.to_string())),
+                Some(Err(e)) => {
+                    if std::env::var("MLLM_SSE_DEBUG").is_ok() {
+                        eprintln!("SSE-ERR: {e}");
+                    }
+                    return Err(HttpError::Body(e.to_string()));
+                }
                 None => {
+                    if std::env::var("MLLM_SSE_DEBUG").is_ok() {
+                        eprintln!("SSE-END: buf_len={} frames_seen", buf.len());
+                    }
                     return Ok(StreamEnd::BackendClosed);
                 }
             }
