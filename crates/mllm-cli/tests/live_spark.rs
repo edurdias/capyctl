@@ -355,6 +355,7 @@ async fn live_park_reload() {
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let client = reqwest::Client::new();
     for cycle in 1..=3 {
+        let park_started = std::time::Instant::now();
         let op = app
             .controller
             .request_transition(&s_dep, mllm_domain::LifecycleAction::Park)
@@ -362,8 +363,10 @@ async fn live_park_reload() {
             .unwrap();
         let parked = app.controller.wait_terminal(&op).await.unwrap();
         assert_eq!(parked, LifecycleState::Parked, "cycle {cycle}: parked");
+        let park_seconds = park_started.elapsed().as_secs_f64();
         eprintln!("LIVE: cycle {cycle} parked");
 
+        let wake_started = std::time::Instant::now();
         let op2 = app
             .controller
             .request_transition(&s_dep, mllm_domain::LifecycleAction::Start)
@@ -371,6 +374,7 @@ async fn live_park_reload() {
             .unwrap();
         let ready = app.controller.wait_terminal(&op2).await.unwrap();
         assert_eq!(ready, LifecycleState::Ready, "cycle {cycle}: woke");
+        let ready_seconds = wake_started.elapsed().as_secs_f64();
         let response = client.post(format!("http://{router_addr}/v1/chat/completions"))
             .bearer_auth(app.api_key())
             .json(&serde_json::json!({
@@ -383,6 +387,12 @@ async fn live_park_reload() {
         assert!(status.is_success(), "cycle {cycle}: routed inference: {response}");
         let content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
         assert!(!content.is_empty(), "cycle {cycle}: restored weights produce tokens");
+        eprintln!("LIVE-METRIC: {}", serde_json::json!({
+            "cycle": cycle,
+            "park_seconds": park_seconds,
+            "wake_ready_seconds": ready_seconds,
+            "wake_response_seconds": wake_started.elapsed().as_secs_f64(),
+        }));
         eprintln!("LIVE: cycle {cycle} completion: {content}");
         eprintln!("LIVE: cycle {cycle} park→wake clean");
     }
