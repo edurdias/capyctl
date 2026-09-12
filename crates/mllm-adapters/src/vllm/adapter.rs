@@ -134,14 +134,14 @@ impl EngineAdapter for VllmAdapter {
         }
     }
 
-    async fn prepare_park(&self, member: &MemberRef) -> Result<crate::traits::Quiescence, AdapterError> {
+    async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
         // Quiescence = what the adapter can prove: no live work observed.
         match self.observe_work(member).await? {
-            WorkObservation::Idle => Ok(crate::traits::Quiescence { quiescent: true }),
+            WorkObservation::Idle => Ok(Quiescence { quiescent: true }),
             WorkObservation::Streaming { .. } => {
-                Ok(crate::traits::Quiescence { quiescent: false })
+                Ok(Quiescence { quiescent: false })
             }
-            WorkObservation::Unknown => Ok(crate::traits::Quiescence { quiescent: false }),
+            WorkObservation::Unknown => Ok(Quiescence { quiescent: false }),
         }
     }
 
