@@ -232,6 +232,9 @@ pub struct Controller {
     host_id: String,
     /// Live engine process handles per deployment (spawn/park/stop).
     handles: Arc<Mutex<HashMap<String, OwnedHandle>>>,
+    /// Host deep-park policy (F1 design §7): the opt-in gates the
+    /// experimental profile itself, not just park/reload operations.
+    park_policy: mllm_adapters::fake::ParkPolicy,
 }
 
 impl Controller {
@@ -240,6 +243,15 @@ impl Controller {
         adapter: Arc<dyn EngineAdapter>,
         launcher: Arc<dyn Launcher>,
     ) -> Self {
+        Self::new_with_policy(store, adapter, launcher, mllm_adapters::fake::ParkPolicy::Denied)
+    }
+
+    pub fn new_with_policy(
+        store: Arc<Mutex<Store>>,
+        adapter: Arc<dyn EngineAdapter>,
+        launcher: Arc<dyn Launcher>,
+        park_policy: mllm_adapters::fake::ParkPolicy,
+    ) -> Self {
         Self {
             store,
             adapter,
@@ -247,6 +259,7 @@ impl Controller {
             context_id: STANDALONE_CONTEXT_ID.to_string(),
             host_id: EMBEDDED_HOST_ID.to_string(),
             handles: Arc::new(Mutex::new(HashMap::new())),
+            park_policy,
         }
     }
 
@@ -371,6 +384,36 @@ impl Controller {
                 return Err(ControllerError::OperationFailed {
                     op: "start".to_string(),
                     code: "suspended".to_string(),
+                });
+            }
+        }
+        // Profile-level development-mode gate (F1 design §7, T21): the
+        // experimental vllm-sleep profile cannot launch in ANY mode without
+        // the host-policy opt-in — the dangerous surface exists from the
+        // moment a development-mode engine starts.
+        if action == LifecycleAction::Start {
+            let store = self.store.lock().unwrap();
+            let kind = store
+                .get_deployment(deployment)?
+                .map(|r| r.kind)
+                .unwrap_or_default();
+            if kind == "vllm-sleep" && self.park_policy != mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+                let op = OperationId(format!("op-{}", ulid::Ulid::new()));
+                store.record_operation(NewOperation {
+                    id: op.clone(),
+                    deployment_id: deployment.to_string(),
+                    kind: "policy_denied".to_string(),
+                    idempotency_key: None,
+                })?;
+                store.record_journal(
+                    Some(&self.host_id),
+                    Some(&op.0),
+                    Some("denied"),
+                    r#"{"event":"policy_denied","profile":"vllm-sleep","reason":"development-mode opt-in required"}"#,
+                )?;
+                return Err(ControllerError::OperationFailed {
+                    op: "start".to_string(),
+                    code: "policy_denied".to_string(),
                 });
             }
         }
