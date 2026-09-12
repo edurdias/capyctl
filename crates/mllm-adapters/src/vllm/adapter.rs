@@ -128,6 +128,7 @@ impl EngineAdapter for VllmAdapter {
             return Err(AdapterError::UnsupportedCapability);
         };
         let mut spec = spec.clone();
+        
         spec.api_key = None; // launch secret rides the env, not argv (redaction)
         let mut cmd = crate::vllm::args::render_command(&spec)
             .map_err(|e| AdapterError::Uncertain(format!("render: {e}")))?;
@@ -135,6 +136,12 @@ impl EngineAdapter for VllmAdapter {
         // redacted from fingerprints and journals (SPEC §8.2/§13.3).
         if let Some(key) = &plan.engine_api_key {
             cmd.env.insert("MLLM_ENGINE_API_KEY".into(), key.clone());
+        }
+        // The engine's runtime PATH carries its own venv bin (the JIT
+        // compile step needs the venv's tools, e.g. ninja).
+        if let Some(extra) = &spec.engine_path_extra {
+            let sys = std::env::var("PATH").unwrap_or_default();
+            cmd.env.insert("PATH".into(), format!("{extra}:{sys}"));
         }
         Ok(cmd)
     }

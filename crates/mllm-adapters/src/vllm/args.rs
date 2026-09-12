@@ -34,6 +34,9 @@ pub struct PlanInputVllm {
     /// Per-deployment engine API credential (mllm-controlled, never from
     /// user args); redacted in fingerprints (SPEC §8.2/§13.3).
     pub api_key: Option<String>,
+    /// Extra PATH entries for the engine's runtime environment (venv bin:
+    /// the JIT compile step needs the venv's tools, e.g. ninja).
+    pub engine_path_extra: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

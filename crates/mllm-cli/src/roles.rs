@@ -104,6 +104,9 @@ type AdapterParts = (
 #[derive(Debug, Clone)]
 pub struct LiveVllmProfile {
     pub engine_bin: PathBuf,
+    /// Extra PATH entries the engine needs at runtime (venv bin: e.g. the
+    /// JIT compile step needs the venv's `ninja`).
+    pub engine_path_extra: Option<PathBuf>,
     pub model_path: String,
     pub model_id: String,
     pub port: u16,
@@ -115,6 +118,7 @@ impl LiveVllmProfile {
     pub fn from_env() -> Option<Self> {
         let engine_bin = std::env::var("MLLM_VLLM_BIN").ok()?;
         Some(Self {
+            engine_path_extra: std::env::var("MLLM_ENGINE_PATH").ok().map(PathBuf::from),
             engine_bin: engine_bin.into(),
             model_path: std::env::var("MLLM_MODEL_PATH").ok()?,
             model_id: std::env::var("MLLM_MODEL_ID").ok()?,
@@ -152,6 +156,7 @@ async fn start_standalone_inner(
                     kv_cache_bytes: Some(64 * 1024 * 1024 * 1024),
                     ..Default::default()
                 },
+                engine_path_extra: p.engine_path_extra.clone(),
                 engine_args: vec!["--host".into(), "127.0.0.1".into()],
                 // Development/sleep flags render only under the opt-in
                 // (profile-level gate; empty here keeps stock restart-only).
