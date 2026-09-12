@@ -22,6 +22,7 @@ pub struct PlanInputVllm {
     /// The engine executable (profile-owned launch context, SPEC §8.1).
     pub engine_bin: String,
     pub model_path: String,
+    pub port: u16,
     pub granted: GrantedBudget,
     /// Engine-native ordinary arguments the operator passes through
     /// (SPEC §8.2: unknown ordinary args pass subject to policy).
