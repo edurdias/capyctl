@@ -139,11 +139,14 @@ fn live_restart_only_qualification() {
             }
         );
         let (h1, h2) = (r1.unwrap(), r2.unwrap());
-        // Concurrent dispatch joins ONE wake — wait: the raw controller
-        // path doesn't join; the switch engine does (T15 lives there). The
+        // Concurrent dispatch joins ONE wake — the raw controller path
+        // doesn't join; the switch engine does (T15 lives there). The
         // live tier verifies the switch engine path below.
         let _ = (h1, h2);
     });
+    // Spawned operation tasks hold engine processes; let them wind down
+    // before the runtime drops (the tokio shutdown panics otherwise).
+    rt.shutdown_timeout(std::time::Duration::from_secs(10));
 }
 
 #[tokio::test]

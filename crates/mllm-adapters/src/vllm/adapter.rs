@@ -267,14 +267,21 @@ impl crate::traits::ChatForward for VllmAdapter {
                 other => AdapterError::Uncertain(format!("chat: {other:?}")),
             })?;
         let _ = end;
-        let content: String = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v["choices"][0]["delta"]["content"]
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .unwrap_or(text);
+        // Join the per-chunk delta.content pieces (chunks are independent
+        // JSON objects; concatenation is not valid JSON).
+        let mut content = String::new();
+        for chunk in text.split("}{") {
+            let piece = if chunk.starts_with('{') {
+                format!("{chunk}}}")
+            } else {
+                format!("{}}}", chunk)
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&piece) {
+                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                    content.push_str(c);
+                }
+            }
+        }
         Ok(serde_json::json!({
             "model": body["model"],
             "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
