@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+
 use std::time::Duration;
 
 /// Identifies one member of a deployment to the engine adapter.
@@ -15,6 +16,10 @@ pub struct MemberRef {
 pub struct EngineState {
     pub phase: Phase,
     pub retained_bytes: i64,
+    /// Engine build fingerprint captured at qualification/launch; adapters
+    /// that cannot observe it report `None` (F1 design §3: parked-state
+    /// observability contract).
+    pub build_fingerprint: Option<String>,
 }
 
 /// The shared lifecycle phase of an engine member.
@@ -23,6 +28,7 @@ pub enum Phase {
     Startup,
     Ready,
     Parking,
+    Parked,
     Restore,
 }
 
@@ -32,6 +38,9 @@ pub struct PlanInput {
     pub deployment_id: String,
     pub member_id: String,
     pub park_level: Option<ParkLevel>,
+    /// Per-deployment engine credential, delivered via environment and
+    /// redacted from recorded artifacts (F1 design §4).
+    pub engine_api_key: Option<String>,
 }
 
 /// The concrete command a launcher can spawn.
@@ -180,4 +189,30 @@ pub trait Launcher: Send + Sync {
     /// Detects PID reuse by comparing the process's current start identity
     /// with the one recorded in the handle.
     fn verify_handle(&self, h: &OwnedHandle) -> HandleStatus;
+}
+
+/// How a forwarded stream ended (engine-neutral; mirrors SSE semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnded {
+    Completed,
+    BackendClosed,
+}
+
+/// Inference forwarding: how the router reaches a deployment's engine
+/// through its adapter (F1 design §5). Streaming chunk accounting lives in
+/// the router; forwarders return decoded data payloads.
+#[async_trait]
+pub trait ChatForward: Send + Sync {
+    /// Non-streaming chat completion: returns the engine's JSON response.
+    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError>;
+    /// Streaming chat completion: yields data payloads in order; the final
+    /// `[DONE]` marker is consumed by the forwarder.
+    async fn forward_chat_stream(
+        &self,
+        body: &serde_json::Value,
+        _on_chunk: &mut (dyn FnMut(String) + Send),
+    ) -> Result<StreamEnded, AdapterError> {
+        let _ = body;
+        Err(AdapterError::UnsupportedCapability)
+    }
 }

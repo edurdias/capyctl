@@ -14,3 +14,8 @@ mllm-adapters = { workspace = true }
 mllm-domain = { workspace = true }
 mllm-scheduler = { workspace = true }
 mllm-store = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+mllm-launchers = { path = "../mllm-launchers" }
+tempfile = { workspace = true }

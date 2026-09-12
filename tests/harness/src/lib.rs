@@ -77,16 +77,30 @@ fn probe_command() -> RenderedCommand {
 ///    handle it did not spawn or one that was terminated (PID-reuse
 ///    detection, design §8): spawn → terminate → respawn must leave the old
 ///    handle `StaleReused` (reuse) or `Gone` (fresh pid), never `Valid`.
+///
+/// How the adapter's deep-park policy gate is scoped (F1 design §7).
+///
+/// `Level2Only`: only the experimental level-2 park is behind the gate
+/// (the F0 fake's semantics; level-1 restart-level park is ungated).
+/// `ProfileGated`: the opt-in gates the whole profile — both sleep levels
+/// require it (real vLLM adapters: development mode is on from launch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkGateMode {
+    Level2Only,
+    ProfileGated,
+}
+
 pub async fn run_conformance(
     adapter: &dyn EngineAdapter,
     launcher: &dyn Launcher,
+    gate_mode: ParkGateMode,
 ) -> Vec<CheckResult> {
     let member = MemberRef { deployment_id: "conformance".into(), member_id: "probe".into() };
     let req = RequestRef { id: "conformance-probe".into() };
 
     vec![
         check_readiness_gating(adapter, &member).await,
-        check_park_policy_gate(adapter, &member).await,
+        check_park_policy_gate(adapter, &member, gate_mode).await,
         check_cancellation_uncertainty(adapter, &member, &req).await,
         check_handle_ownership(launcher),
     ]
@@ -169,10 +183,27 @@ async fn check_readiness_gating(adapter: &dyn EngineAdapter, member: &MemberRef)
     }
 }
 
-async fn check_park_policy_gate(adapter: &dyn EngineAdapter, member: &MemberRef) -> CheckResult {
-    // Invariant 1: level-1 park is not experimental — the gate must not apply.
+async fn check_park_policy_gate(
+    adapter: &dyn EngineAdapter,
+    member: &MemberRef,
+    mode: ParkGateMode,
+) -> CheckResult {
+    // Gate-mode invariant: under `Level2Only` the level-1 park must never be
+    // gated (restart-level park is not experimental); under `ProfileGated`
+    // the adapter gates the whole profile, so a level-1 `PolicyDenied` under
+    // a denied policy is the CORRECT outcome (F1 design §7: the opt-in
+    // gates the profile, not just the operations).
     let l1 = adapter.park(member, ParkLevel::One).await;
-    let l1_ok = !matches!(l1, Err(AdapterError::PolicyDenied));
+    let l1_ok = match mode {
+        ParkGateMode::Level2Only => !matches!(l1, Err(AdapterError::PolicyDenied)),
+        ParkGateMode::ProfileGated => matches!(
+            l1,
+            Ok(_)
+                | Err(AdapterError::PolicyDenied)
+                | Err(AdapterError::Uncertain(_))
+                | Err(AdapterError::UnsupportedCapability)
+        ),
+    };
 
     // Invariant 2: level-2 park is either gated, opted-in, uncertain, or
     // unsupported — but never an unqualified success on a *denied* policy
@@ -311,7 +342,7 @@ mod tests {
     async fn fake_engine_passes_full_conformance_suite() {
         let adapter = FakeEngine::new();
         let launcher = FakeLauncher::new();
-        let results = run_conformance(&adapter, &launcher).await;
+        let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
         assert_eq!(results.len(), 4);
         for r in &results {
             assert!(r.passed(), "check {} did not pass: {}", r.name, r.detail);
@@ -322,7 +353,7 @@ mod tests {
     async fn pid_reuse_launcher_exercises_reuse_detection() {
         let adapter = FakeEngine::new();
         let launcher = FakeLauncher::new().with_pid_reuse();
-        let results = run_conformance(&adapter, &launcher).await;
+        let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
         let ownership = results.iter().find(|r| r.name == "handle_ownership").unwrap();
         assert!(ownership.passed(), "{}", ownership.detail);
         assert!(ownership.detail.contains("StaleReused"), "{}", ownership.detail);
@@ -335,7 +366,7 @@ mod tests {
     #[async_trait::async_trait]
     impl EngineAdapter for FabricatedReadyAdapter {
         async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
-            Ok(EngineState { phase: Phase::Startup, retained_bytes: 0 })
+            Ok(EngineState { phase: Phase::Startup, retained_bytes: 0, build_fingerprint: None })
         }
         async fn render_plan(
             &self,
@@ -375,7 +406,7 @@ mod tests {
     async fn fabricated_ready_adapter_fails_readiness_gating() {
         let adapter = FabricatedReadyAdapter;
         let launcher = FakeLauncher::new();
-        let results = run_conformance(&adapter, &launcher).await;
+        let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
         let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
         assert_eq!(readiness.status, CheckStatus::Fail);
         assert!(readiness.detail.contains("fabricated"), "{}", readiness.detail);
@@ -428,7 +459,7 @@ mod tests {
     async fn uncertain_readiness_warns_not_fails() {
         let adapter = UnreachableAdapter;
         let launcher = FakeLauncher::new();
-        let results = run_conformance(&adapter, &launcher).await;
+        let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
         let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
         assert_eq!(readiness.status, CheckStatus::Warn);
         assert!(!readiness.passed());

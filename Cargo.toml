@@ -26,6 +26,9 @@ thiserror = "2"
 proptest = "1"
 tempfile = "3"
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+axum = { version = "0.8", features = ["macros"] }
+futures = "0.3"
 mllm-domain = { path = "crates/mllm-domain" }
 mllm-store = { path = "crates/mllm-store" }
 mllm-scheduler = { path = "crates/mllm-scheduler" }

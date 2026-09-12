@@ -51,3 +51,14 @@ fn output_format_flag_parsing() {
     assert_eq!(OutputFormat::from_flag("server.yaml"), None);
     assert_eq!(OutputFormat::default(), OutputFormat::Text);
 }
+#[test]
+fn internal_failures_exit_13_not_invalid_config() {
+    // F1 design §4: store/I-O/runtime-boot failures get a distinct internal
+    // code so scripts never mistake a broken state dir for bad config.
+    assert_eq!(ExitCode::INTERNAL.0, 13);
+    let internal = StructuredError { code: "internal", message: "store: sqlite".into() };
+    assert_eq!(internal.exit_code(), ExitCode(13));
+    let config = StructuredError { code: "invalid_config", message: "bad yaml".into() };
+    assert_eq!(config.exit_code(), ExitCode(2));
+    assert_ne!(internal.exit_code(), config.exit_code());
+}

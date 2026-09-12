@@ -20,6 +20,8 @@ impl ExitCode {
     pub const ACTIVATION_TIMEOUT: Self = Self(10);
     pub const TOPOLOGY_UNKNOWN: Self = Self(11);
     pub const NO_SAFE_ESTIMATE: Self = Self(12);
+    /// Store/I-O/runtime-boot failures: never masquerade as invalid config (F1 design §4).
+    pub const INTERNAL: Self = Self(13);
 }
 
 impl From<ExitCode> for u8 {
@@ -101,7 +103,19 @@ impl StructuredError {
     }
 
     pub fn exit_code(&self) -> ExitCode {
-        ExitCode::UNSUPPORTED
+        match self.code {
+            "internal" => ExitCode::INTERNAL,
+            "invalid_config" => ExitCode::INVALID_CONFIG,
+            "unauthorized" => ExitCode::UNAUTHORIZED,
+            "insufficient_resources" => ExitCode::INSUFFICIENT_RESOURCES,
+            "unreconciled" => ExitCode::UNRECONCILED,
+            "device_conflict" => ExitCode::DEVICE_CONFLICT,
+            "category_limit" => ExitCode::CATEGORY_LIMIT,
+            "activation_timeout" => ExitCode::ACTIVATION_TIMEOUT,
+            "topology_unknown" => ExitCode::TOPOLOGY_UNKNOWN,
+            "no_safe_estimate" => ExitCode::NO_SAFE_ESTIMATE,
+            _ => ExitCode::UNSUPPORTED,
+        }
     }
 
     pub fn to_json(&self) -> String {

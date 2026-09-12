@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 pub use deployments::{
-    AcceptDeployment, Accepted, DeploymentRow, NewOperation, OpState, OperationRow,
+    AcceptDeployment, Accepted, DeploymentRow, GenerationRow, NewOperation, OpState,
+    OperationRow, ReservationRow,
 };
  
 #[derive(Debug, thiserror::Error)]

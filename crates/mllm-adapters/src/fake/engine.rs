@@ -8,6 +8,7 @@
 use crate::traits::*;
 use async_trait::async_trait;
 use std::sync::Mutex;
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Resident bytes with everything loaded (weights + KV + buffers).
@@ -16,6 +17,10 @@ pub const FULL_RESIDENT_BYTES: i64 = 4096;
 pub const LEVEL1_RETAINED_BYTES: i64 = 1024;
 /// Retained bytes after a level-2 park: weights and KV discarded, buffers kept.
 pub const BUFFER_RESIDUE: i64 = 256;
+
+/// Stable build fingerprint the fake reports through `EngineState`
+/// (parked-state observability contract, F1 design §3).
+pub const FAKE_BUILD_FINGERPRINT: &str = "fake-engine-1";
 
 /// The deep-park security gate: experimental level-2 operations are denied
 /// unless the host explicitly opts in (design §9.1).
@@ -29,6 +34,7 @@ pub enum ParkPolicy {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct MemberState {
     phase: Phase,
     retained_bytes: i64,
@@ -43,11 +49,13 @@ struct Knobs {
     ambiguous_park: bool,
 }
 
-/// Deterministic single-member engine simulator.
+/// Deterministic engine simulator: one state per member (deployments on
+/// the same engine share the adapter but hold independent member states —
+/// A parked must not make B unready).
 #[derive(Debug)]
 pub struct FakeEngine {
     knobs: Mutex<Knobs>,
-    state: Mutex<MemberState>,
+    states: Mutex<HashMap<String, MemberState>>,
     started_at: std::time::Instant,
 }
 
@@ -60,11 +68,7 @@ impl FakeEngine {
                 fail_at: None,
                 ambiguous_park: false,
             }),
-            state: Mutex::new(MemberState {
-                phase: Phase::Startup,
-                retained_bytes: FULL_RESIDENT_BYTES,
-                reload_count: 0,
-            }),
+            states: Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
         }
     }
@@ -88,6 +92,12 @@ impl FakeEngine {
         self
     }
 
+    /// Mark subsequent parks ambiguous: the effect applies but the ack is
+    /// lost (qualification/ambiguity injection).
+    pub fn set_ambiguous_park(&self) {
+        self.knobs.lock().unwrap().ambiguous_park = true;
+    }
+
     /// Sets the deep-park policy gate (default: [`ParkPolicy::Denied`]).
     pub fn with_policy(self, p: ParkPolicy) -> Self {
         self.knobs.lock().unwrap().policy = p;
@@ -96,13 +106,45 @@ impl FakeEngine {
 
     /// How many times weights were reloaded (must be exactly once per reload).
     pub fn reload_weights_count(&self) -> u64 {
-        self.state.lock().unwrap().reload_count
+        self.states
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.reload_count)
+            .sum()
     }
 }
 
 impl Default for FakeEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl FakeEngine {
+    fn member(&self, m: &MemberRef) -> MemberState {
+        self.states
+            .lock()
+            .unwrap()
+            .entry(m.member_id.clone())
+            .or_insert_with(|| MemberState {
+                phase: Phase::Startup,
+                retained_bytes: FULL_RESIDENT_BYTES,
+                reload_count: 0,
+            })
+            .clone()
+    }
+
+    fn with_member<R>(&self, m: &MemberRef, f: impl FnOnce(&mut MemberState) -> R) -> R {
+        let mut guard = self.states.lock().unwrap();
+        let st = guard
+            .entry(m.member_id.clone())
+            .or_insert_with(|| MemberState {
+                phase: Phase::Startup,
+                retained_bytes: FULL_RESIDENT_BYTES,
+                reload_count: 0,
+            });
+        f(st)
     }
 }
 
@@ -115,9 +157,13 @@ fn park_retained_bytes(level: ParkLevel) -> i64 {
 
 #[async_trait]
 impl EngineAdapter for FakeEngine {
-    async fn inspect(&self, _member: &MemberRef) -> Result<EngineState, AdapterError> {
-        let st = self.state.lock().unwrap();
-        Ok(EngineState { phase: st.phase, retained_bytes: st.retained_bytes })
+    async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
+        let st = self.member(member);
+        Ok(EngineState {
+            phase: st.phase,
+            retained_bytes: st.retained_bytes,
+            build_fingerprint: Some(FAKE_BUILD_FINGERPRINT.into()),
+        })
     }
 
     async fn render_plan(&self, plan: &PlanInput) -> Result<RenderedCommand, AdapterError> {
@@ -151,12 +197,18 @@ impl EngineAdapter for FakeEngine {
         if knobs.fail_at == Some(Phase::Startup) {
             return Err(AdapterError::Crash(Phase::Startup));
         }
+        // A parked engine is not ready: parked-state observability (F1 design
+        // §3) forbids reading a parked member as Ready.
+        if self.member(_member).phase == Phase::Parked {
+            return Ok(Readiness::Initializing);
+        }
         if let Some(delay) = knobs.startup_delay {
             if self.started_at.elapsed() < delay {
                 return Ok(Readiness::Initializing);
             }
         }
-        self.state.lock().unwrap().phase = Phase::Ready;
+        let member = _member.clone();
+        self.with_member(&member, |st| st.phase = Phase::Ready);
         Ok(Readiness::Ready)
     }
 
@@ -181,9 +233,11 @@ impl EngineAdapter for FakeEngine {
         }
         let retained = park_retained_bytes(level);
         {
-            let mut st = self.state.lock().unwrap();
-            st.phase = Phase::Parking;
-            st.retained_bytes = retained;
+            let member = _member.clone();
+            self.with_member(&member, |st| {
+                st.phase = Phase::Parked;
+                st.retained_bytes = retained;
+            });
         }
         if ambiguous {
             // The effect was applied above, but the ack is lost: the caller
@@ -197,9 +251,11 @@ impl EngineAdapter for FakeEngine {
         if self.knobs.lock().unwrap().fail_at == Some(Phase::Restore) {
             return Err(AdapterError::Crash(Phase::Restore));
         }
-        let mut st = self.state.lock().unwrap();
-        st.phase = Phase::Ready;
-        st.retained_bytes = FULL_RESIDENT_BYTES;
+        let member = _member.clone();
+        self.with_member(&member, |st| {
+            st.phase = Phase::Ready;
+            st.retained_bytes = FULL_RESIDENT_BYTES;
+        });
         Ok(RestoreOutcome::Restored)
     }
 
@@ -214,9 +270,11 @@ impl EngineAdapter for FakeEngine {
             return Err(AdapterError::PolicyDenied);
         }
         drop(knobs);
-        let mut st = self.state.lock().unwrap();
-        st.reload_count += 1;
-        st.retained_bytes = FULL_RESIDENT_BYTES;
+        let member = _member.clone();
+        self.with_member(&member, |st| {
+            st.reload_count += 1;
+            st.retained_bytes = FULL_RESIDENT_BYTES;
+        });
         Ok(ReloadOutcome::Reloaded)
     }
 
@@ -238,3 +296,30 @@ impl EngineAdapter for FakeEngine {
         }
     }
 }
+
+#[async_trait]
+impl crate::traits::ChatForward for FakeEngine {
+    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError> {
+        let model = body["model"].as_str().unwrap_or("fake").to_string();
+        Ok(serde_json::json!({
+            "id": "fake-completion",
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
+        }))
+    }
+
+    async fn forward_chat_stream(
+        &self,
+        body: &serde_json::Value,
+        on_chunk: &mut (dyn FnMut(String) + Send),
+    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        let model = body["model"].as_str().unwrap_or("fake").to_string();
+        on_chunk(format!(
+            r#"{{"id":"fake-stream","model":"{model}","choices":[{{"delta":{{"content":"hel"}}}}]}}"#
+        ));
+        on_chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string());
+        Ok(crate::traits::StreamEnded::Completed)
+    }
+}
+
+

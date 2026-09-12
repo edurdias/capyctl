@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mllm_adapters::{
-    AdapterError, EngineAdapter, Launcher, LauncherError, MemberRef, OwnedHandle, ParkLevel,
-    PlanInput, Readiness, WorkObservation,
+    AdapterError, EngineAdapter, Launcher, LauncherError, MemberRef, OwnedHandle, PlanInput,
+    Readiness, WorkObservation,
 };
 use mllm_domain::{
     DeploymentId, LifecycleAction, LifecycleState, OperationId, OwnerAccountId,
@@ -46,6 +46,9 @@ use sha2::{Digest, Sha256};
 /// admission (F0 has no real adapters; real adapters source peaks from
 /// their recipes in F1).
 const F0_SYNTHETIC_ACTIVATION_PEAK: i64 = 4096;
+/// Attached deployments: conservative charge until observed otherwise.
+const ATTACHED_CONSERVATIVE_BYTES: i64 = 32 * 1024 * 1024 * 1024;
+const ATTACHED_KIND: &str = "attached";
 
 /// Synthetic host observation backing F0 admission (no topology
 /// discovery): 128 GiB of observed system memory, resolved by
@@ -60,7 +63,10 @@ pub const STANDALONE_CONTEXT_ID: &str = "standalone";
 pub const EMBEDDED_HOST_ID: &str = "embedded-local";
 
 /// How long an operation may run before `wait_terminal` gives up.
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded activation timeout: real engines take minutes to stage weights
+/// (vLLM on GB10: ~1-3 min cold); 10 minutes covers cold init while the
+/// bound keeps a wedged activation a timeout, not a hang (T20).
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
 /// Readiness-poll interval (fake readiness is immediate; real engines
 /// poll this often until their own deadline).
 const READINESS_POLL: Duration = Duration::from_millis(10);
@@ -74,6 +80,9 @@ pub struct DeployRequest {
     pub name: String,
     pub kind: String,
     pub manifest: Vec<u8>,
+    /// The public model id clients route to (F1: alias resolution, SPEC
+    /// §10). `None` = catalog-only deployment (no route).
+    pub route_model_id: Option<String>,
 }
 
 /// A handle to a long-running control-plane operation.
@@ -100,6 +109,8 @@ pub enum ControllerError {
     OperationFailed { op: String, code: String },
     #[error("operation did not reach a terminal state in time")]
     Timeout,
+    #[error("stale generation for deployment {0} (T18)")]
+    StaleGeneration(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -224,6 +235,19 @@ pub struct Controller {
     host_id: String,
     /// Live engine process handles per deployment (spawn/park/stop).
     handles: Arc<Mutex<HashMap<String, OwnedHandle>>>,
+    /// Host deep-park policy (F1 design §7): the opt-in gates the
+    /// experimental profile itself, not just park/reload operations.
+    park_policy: mllm_adapters::fake::ParkPolicy,
+    /// Park depth for managed parks: level 2 (deep) under the opt-in —
+    /// level 1 frees nothing on unified-memory hosts (design finding);
+    /// level 1 for restart-only hosts.
+    park_level: mllm_adapters::ParkLevel,
+    /// The embedded fake engine handle (qualification/ambiguity injection).
+    embedded_fake: Option<Arc<mllm_adapters::fake::FakeEngine>>,
+    /// Bound on how long `wait_terminal` waits for a terminal operation
+    /// state (`OPERATION_TIMEOUT` by default; shortened by tests to
+    /// exercise the timeout branch deterministically).
+    operation_timeout: Duration,
 }
 
 impl Controller {
@@ -232,6 +256,15 @@ impl Controller {
         adapter: Arc<dyn EngineAdapter>,
         launcher: Arc<dyn Launcher>,
     ) -> Self {
+        Self::new_with_policy(store, adapter, launcher, mllm_adapters::fake::ParkPolicy::Denied)
+    }
+
+    pub fn new_with_policy(
+        store: Arc<Mutex<Store>>,
+        adapter: Arc<dyn EngineAdapter>,
+        launcher: Arc<dyn Launcher>,
+        park_policy: mllm_adapters::fake::ParkPolicy,
+    ) -> Self {
         Self {
             store,
             adapter,
@@ -239,7 +272,30 @@ impl Controller {
             context_id: STANDALONE_CONTEXT_ID.to_string(),
             host_id: EMBEDDED_HOST_ID.to_string(),
             handles: Arc::new(Mutex::new(HashMap::new())),
+            park_policy,
+            park_level: if park_policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+                mllm_adapters::ParkLevel::Two
+            } else {
+                mllm_adapters::ParkLevel::One
+            },
+            embedded_fake: None,
+            operation_timeout: OPERATION_TIMEOUT,
         }
+    }
+
+    /// Test hook: bound the `wait_terminal` deadline (real engines take
+    /// minutes to stage weights; tests use a short bound to exercise the
+    /// timeout branch deterministically).
+    pub fn with_operation_timeout(mut self, d: Duration) -> Self {
+        self.operation_timeout = d;
+        self
+    }
+
+    /// Attach the embedded fake engine handle (ambiguity injection for the
+    /// qualification suite).
+    pub fn with_embedded_fake(mut self, fake: Arc<mllm_adapters::fake::FakeEngine>) -> Self {
+        self.embedded_fake = Some(fake);
+        self
     }
 
     /// Submit a deployment transactionally: derive the idempotency key,
@@ -258,7 +314,7 @@ impl Controller {
                 id,
                 name: req.name,
                 kind: req.kind,
-                route_model_id: None,
+                route_model_id: req.route_model_id.clone(),
                 desired_state: LifecycleState::Stopped,
                 schema_version: 1,
                 idempotency_key: key,
@@ -287,6 +343,26 @@ impl Controller {
             )?;
             accepted
         };
+        // Initial reservation intent persisted at acceptance (F1 G3: the
+        // resource ledger's owner rows are durable, not just in-memory).
+        {
+            let store = self.store.lock().unwrap();
+            let dep = accepted.deployment_id.to_string();
+            // Idempotent re-submission resolves to the ORIGINAL deployment,
+            // whose reservation intent already persisted — never insert a
+            // duplicate row.
+            if store.reservations_for_owner(&dep)?.is_empty() {
+                store
+                    .insert_reservation(&mllm_store::ReservationRow {
+                        owner_id: dep.clone(),
+                        domain_id: Some("system".into()),
+                        bytes: F0_SYNTHETIC_ACTIVATION_PEAK,
+                        phase: "activation".into(),
+                        exclusive_devices: vec![],
+                    })
+                    .map_err(ControllerError::from)?;
+            }
+        }
         Ok(accepted.deployment_id.to_string())
     }
 
@@ -300,13 +376,122 @@ impl Controller {
         deployment: &str,
         action: LifecycleAction,
     ) -> Result<OperationHandle, ControllerError> {
+        self.request_transition_inner(deployment, action, false).await
+    }
+
+    /// Idle eviction (T10): stop the engine but keep the deployment
+    /// on-demand eligible — the next inference request may activate it.
+    /// Administrative stop (LifecycleAction::Stop) suspends instead, and a
+    /// suspended deployment rejects activation.
+    pub async fn idle_stop(&self, deployment: &str) -> Result<OperationHandle, ControllerError> {
+        self.request_transition_inner(deployment, LifecycleAction::Stop, true)
+            .await
+    }
+
+    async fn request_transition_inner(
+        &self,
+        deployment: &str,
+        action: LifecycleAction,
+        keep_on_demand_eligible: bool,
+    ) -> Result<OperationHandle, ControllerError> {
         let observed = {
             let store = self.store.lock().unwrap();
             let row = store
                 .get_deployment(deployment)?
                 .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?;
+            if row.kind == ATTACHED_KIND {
+                // Ownership ≠ reachability (T11): attached services are for
+                // routing/observation only — no sleep/kill/restart rights.
+                return Err(ControllerError::OperationFailed {
+                    op: action.as_str().to_string(),
+                    code: "attached_no_lifecycle".to_string(),
+                });
+            }
             row.observed_state
         };
+        // Administrative stop marks the deployment suspended up front
+        // (T10): autoactivation must not undo the operator's explicit stop
+        // (SPEC §6.3: required explicit stop MUST NOT be undone by the
+        // next inference request).
+        if action == LifecycleAction::Stop && !keep_on_demand_eligible {
+            let store = self.store.lock().unwrap();
+            store.set_suspended(deployment, true)?;
+        }
+        // Explicit `start deployment` ENABLES the deployment (SPEC §6.3):
+        // it clears an administrative suspension. Auto-activation (the
+        // router's wake path) is the one that must NOT undo a stop — that
+        // path uses `auto_activate`, which rejects while suspended (T10).
+        if action == LifecycleAction::Start && !keep_on_demand_eligible {
+            let store = self.store.lock().unwrap();
+            store.set_suspended(deployment, false)?;
+        }
+        // Preinitialize contract (F1 design §7 / SPEC §6.3): start →
+        // validate → park, never displacing live work; requires a
+        // QUALIFIED parking capability — restart-only deployments and
+        // policy-denied profiles fail clearly instead of claiming a
+        // prewarmed deployment.
+        if action == LifecycleAction::Preinitialize {
+            // Lock scoped: never held across the recursive transitions.
+            let (kind, observed) = {
+                let store = self.store.lock().unwrap();
+                store
+                    .get_deployment(deployment)?
+                    .map(|r| (r.kind, r.observed_state))
+                    .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?
+            };
+            let qualified = kind == "vllm-sleep"
+                && self.park_policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed;
+            if !qualified {
+                return Err(ControllerError::OperationFailed {
+                    op: "preinitialize".to_string(),
+                    code: "unsupported_parking".to_string(),
+                });
+            }
+            if observed != LifecycleState::Ready {
+                // Sequentially start, validate, then park (SPEC §6.3).
+                let start = Box::pin(
+                    self.request_transition_inner(deployment, LifecycleAction::Start, false),
+                )
+                .await?;
+                self.wait_terminal(&start).await?;
+            }
+            return Box::pin(self.request_transition_inner(
+                deployment,
+                LifecycleAction::Park,
+                false,
+            ))
+            .await;
+        }
+        // Profile-level development-mode gate (F1 design §7, T21): the
+        // experimental vllm-sleep profile cannot launch in ANY mode without
+        // the host-policy opt-in — the dangerous surface exists from the
+        // moment a development-mode engine starts.
+        if action == LifecycleAction::Start {
+            let store = self.store.lock().unwrap();
+            let kind = store
+                .get_deployment(deployment)?
+                .map(|r| r.kind)
+                .unwrap_or_default();
+            if kind == "vllm-sleep" && self.park_policy != mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+                let op = OperationId(format!("op-{}", ulid::Ulid::new()));
+                store.record_operation(NewOperation {
+                    id: op.clone(),
+                    deployment_id: deployment.to_string(),
+                    kind: "policy_denied".to_string(),
+                    idempotency_key: None,
+                })?;
+                store.record_journal(
+                    Some(&self.host_id),
+                    Some(&op.0),
+                    Some("denied"),
+                    r#"{"event":"policy_denied","profile":"vllm-sleep","reason":"development-mode opt-in required"}"#,
+                )?;
+                return Err(ControllerError::OperationFailed {
+                    op: "start".to_string(),
+                    code: "policy_denied".to_string(),
+                });
+            }
+        }
         let chain = plan(observed, action).ok_or(ControllerError::IllegalTransition {
             from: observed,
             to: action_target(action),
@@ -329,6 +514,7 @@ impl Controller {
             launcher: self.launcher.clone(),
             handles: self.handles.clone(),
             host_id: self.host_id.clone(),
+            park_level: self.park_level,
         };
         let deployment = deployment.to_string();
         let op_for_task = op.clone();
@@ -344,12 +530,14 @@ impl Controller {
 
     /// Wait until the operation reaches a terminal state. `Ok` carries the
     /// deployment's final observed state; a failed operation is an error
-    /// carrying its stable error code.
+    /// carrying its stable error code. Read-only: the generation bump
+    /// belongs to the operation's completion path (one bump per operation
+    /// — awaiting twice never double-bumps).
     pub async fn wait_terminal(
         &self,
         handle: &OperationHandle,
     ) -> Result<LifecycleState, ControllerError> {
-        let deadline = Instant::now() + OPERATION_TIMEOUT;
+        let deadline = Instant::now() + self.operation_timeout;
         loop {
             let (state, error_code, observed) = {
                 let store = self.store.lock().unwrap();
@@ -365,7 +553,9 @@ impl Controller {
                 }
             };
             match (state, observed) {
-                (OpState::Succeeded, Some(observed)) => return Ok(observed),
+                (OpState::Succeeded, Some(observed)) => {
+                    return Ok(observed);
+                }
                 (OpState::Failed, _) => {
                     return Err(ControllerError::OperationFailed {
                         op: handle.operation_id.0.clone(),
@@ -374,11 +564,41 @@ impl Controller {
                 }
                 _ => {
                     if Instant::now() >= deadline {
+                        // Orphaned-children guard (design §5): the wedged
+                        // operation must not leave a live engine child
+                        // behind. Best-effort abort, then Timeout.
+                        self.abort_wedged_activation(handle);
                         return Err(ControllerError::Timeout);
                     }
                     tokio::time::sleep(READINESS_POLL).await;
                 }
             }
+        }
+    }
+
+    /// Best-effort abort for a wedged activation (design §5): terminate the
+    /// deployment's owned engine handle (if present) and reconcile the
+    /// observed state to FAILED via the same Reconciling → Failed path the
+    /// failure branch uses. The wedged task may still complete later — a
+    /// late completion re-lands legally through the transition table.
+    fn abort_wedged_activation(&self, handle: &OperationHandle) {
+        let owned = self.handles.lock().unwrap().remove(&handle.deployment_id);
+        {
+            let store = self.store.lock().unwrap();
+            if owned.is_some() {
+                let _ = store.record_journal(
+                    Some(&self.host_id),
+                    Some(&handle.operation_id.0),
+                    Some("failed"),
+                    r#"{"event":"timeout_terminated"}"#,
+                );
+            }
+            // The failure branch's reconcile path (Reconciling → Failed).
+            let _ = store.set_observed_state(&handle.deployment_id, LifecycleState::Reconciling);
+            let _ = store.set_observed_state(&handle.deployment_id, LifecycleState::Failed);
+        }
+        if let Some(h) = owned {
+            let _ = self.launcher.terminate(&h, TERMINATE_GRACE);
         }
     }
 }
@@ -399,6 +619,7 @@ struct ExecTask {
     launcher: Arc<dyn Launcher>,
     handles: Arc<Mutex<HashMap<String, OwnedHandle>>>,
     host_id: String,
+    park_level: mllm_adapters::ParkLevel,
 }
 
 impl ExecTask {
@@ -419,7 +640,9 @@ impl ExecTask {
     fn member(dep: &str) -> MemberRef {
         MemberRef {
             deployment_id: dep.to_string(),
-            member_id: "m-1".to_string(),
+            // Distinct member id per deployment: the engine adapter keys
+            // member state by this (A parked must not make B unready).
+            member_id: format!("{dep}-head"),
         }
     }
 
@@ -498,8 +721,9 @@ impl ExecTask {
                 self.adapter
                     .render_plan(&PlanInput {
                         deployment_id: dep.to_string(),
-                        member_id: "m-1".to_string(),
+                        member_id: format!("{dep}-head"),
                         park_level: None,
+                        engine_api_key: None, // F1 lab: engine on private loopback
                     })
                     .await
                     .map_err(|e| (is_uncertain(&e), adapter_code(&e)))
@@ -579,10 +803,19 @@ impl ExecTask {
             }
             Step::Drain => match self.adapter.observe_work(&member).await {
                 Ok(WorkObservation::Idle) => Ok(()),
+                // Unknown in-flight state (vLLM exposes no per-request
+                // surface): the drain liveness policy (F1 design §5) —
+                // proceed with the residual uncertainty RECORDED in the
+                // release evidence; never silently treated as idle, never
+                // blocking forever on unprovable work.
+                Ok(WorkObservation::Unknown) => {
+                    self.journal(op, state, r#"{"event":"drained_unknown","residual":"engine work unprovable; stop proceeds with uncertainty recorded"}"#.to_string());
+                    Ok(())
+                }
                 Ok(other) => Err((false, format!("work_not_drained:{other:?}"))),
                 Err(e) => Err((is_uncertain(&e), adapter_code(&e))),
             },
-            Step::Park => match self.adapter.park(&member, ParkLevel::One).await {
+            Step::Park => match self.adapter.park(&member, self.park_level).await {
                 Ok(outcome) => {
                     self.journal(op, state, format!(r#"{{"event":"parked","outcome":{outcome:?}}}"#));
                     Ok(())
@@ -606,7 +839,16 @@ impl ExecTask {
                         }
                         Err(e) => Err((false, spawn_code(&e))),
                     },
-                    None => Err((false, "no_live_handle".to_string())),
+                    None => {
+                        // No live handle means we own no process: nothing to
+                        // terminate, so the release is verified trivially
+                        // (the STOPPED semantic: "no owned engine workers
+                        // remain"). F3 adds restart-ownership reconciliation
+                        // so a handle lost across controller restarts is
+                        // recovered, not silently dropped.
+                        self.journal(op, state, r#"{"event":"no_live_handle","verified":"no owned handle"}"#.to_string());
+                        Ok(())
+                    }
                 }
             }
             Step::Confirm => Ok(()),
@@ -638,6 +880,9 @@ impl ExecTask {
         at_state: LifecycleState,
         outcome: Result<(), String>,
     ) {
+        if std::env::var("MLLM_DEBUG").is_ok() {
+            eprintln!("DEBUG op {} action {:?} outcome {:?}", op.0, action, outcome.as_ref().err());
+        }
         match outcome {
             Ok(()) => {
                 self.journal(
@@ -645,11 +890,27 @@ impl ExecTask {
                     at_state,
                     format!(r#"{{"event":"succeeded","action":"{}"}}"#, action.as_str()),
                 );
-                let _ = self.store.lock().unwrap().update_operation_state(
-                    &op.0,
-                    OpState::Succeeded,
-                    None,
-                );
+                // Completion path (F1 G3): the generation bump belongs HERE
+                // — part of journaling "succeeded" — and is idempotent per
+                // operation id: only a Pending/Running → Succeeded
+                // transition bumps, so a completed operation awaited twice
+                // (or awaited by a follower) never double-bumps.
+                {
+                    let store = self.store.lock().unwrap();
+                    let already_terminal = store
+                        .get_operation(&op.0)
+                        .ok()
+                        .flatten()
+                        .map(|row| matches!(row.state, OpState::Succeeded | OpState::Failed))
+                        .unwrap_or(true);
+                    if !already_terminal {
+                        let _ = store.update_operation_state(&op.0, OpState::Succeeded, None);
+                        // Every successful transition bumps the deployment
+                        // generation and records history — monotonic, never
+                        // reset.
+                        let _ = store.bump_generation(dep);
+                    }
+                }
             }
             Err(code) => {
                 // at_state → Reconciling → Failed (both legal pairs).
@@ -748,6 +1009,75 @@ fn spawn_code(err: &LauncherError) -> String {
     }
 }
 
+
+impl Controller {
+    /// The shared store handle (tests and the router read generations).
+    pub fn store_ref(&self) -> Arc<Mutex<Store>> {
+        self.store.clone()
+    }
+
+    /// The adapter's work observation for a deployment's member (the
+    /// switch engine's drain oracle).
+    pub async fn observe_adapter(
+        &self,
+        deployment: &str,
+    ) -> Result<mllm_adapters::traits::WorkObservation, mllm_adapters::traits::AdapterError> {
+        let member = mllm_adapters::traits::MemberRef {
+            deployment_id: deployment.to_string(),
+            member_id: format!("{deployment}-head"),
+        };
+        self.adapter.observe_work(&member).await
+    }
+
+    /// Test/qualification hook: mark the embedded fake engine's parks as
+    /// ambiguous (effect applied, ack lost). Only available when the
+    /// adapter is the fake; real adapters inject ambiguity at the engine.
+    pub fn fake_engine(&self) -> Option<Arc<mllm_adapters::fake::FakeEngine>> {
+        // Downcast through the shared adapter slot is not possible on
+        // Arc<dyn EngineAdapter> without Any; the agent supplies the fake
+        // handle separately. This helper exists for the embedded host.
+        self.embedded_fake.clone()
+    }
+
+    /// Router-path auto-activation (T10): wakes an on-demand-eligible
+    /// deployment, but NEVER undoes an administrative stop — a suspended
+    /// deployment rejects activation here.
+    pub async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, ControllerError> {
+        // The guard never crosses an await (MutexGuard is not Send).
+        let suspended = {
+            let store = self.store.lock().unwrap();
+            store.is_suspended(deployment)?
+        };
+        if suspended {
+            return Err(ControllerError::OperationFailed {
+                op: "auto_activate".to_string(),
+                code: "suspended".to_string(),
+            });
+        }
+        self.request_transition_inner(deployment, LifecycleAction::Start, true)
+            .await
+    }
+
+    /// The live engine process PID for a deployment, if owned and running.
+    pub fn live_pid(&self, deployment: &str) -> Option<u32> {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(deployment)
+            .map(|h| h.pid)
+    }
+
+    /// Stale-generation dispatch check (T18): a dispatch carrying an older
+    /// generation than the deployment's current one is rejected — the
+    /// ingress gate refuses late/stale dispatch after its gate closes.
+    pub fn check_dispatch_generation(&self, deployment: &str, observed: i64) -> Result<i64, ControllerError> {
+        let store = self.store.lock().unwrap();
+        store
+            .check_generation(deployment, observed)
+            .map_err(|_| ControllerError::StaleGeneration(deployment.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,8 +1097,62 @@ mod tests {
             name: name.to_string(),
             kind: "model".to_string(),
             manifest: format!(r#"{{"kind":"model","name":"{name}"}}"#).into_bytes(),
+            route_model_id: Some(name.to_string()),
         }
     }
+
+    /// An adapter whose readiness NEVER flips (Initializing forever): the
+    /// activation wedges — wait_terminal must abort the orphaned engine
+    /// child instead of leaving it live past the timeout.
+    struct NeverReadyAdapter;
+
+    #[async_trait::async_trait]
+    impl EngineAdapter for NeverReadyAdapter {
+        async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+            Ok(EngineState {
+                phase: Phase::Startup,
+                retained_bytes: 0,
+                build_fingerprint: Some("never-ready".into()),
+            })
+        }
+        async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+            Ok(RenderedCommand {
+                argv: vec!["sleep".into(), "60".into()],
+                env: Default::default(),
+            })
+        }
+        async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+            Ok(Readiness::Initializing)
+        }
+        async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+            Ok(WorkObservation::Unknown)
+        }
+        async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+            Err(AdapterError::Uncertain("never ready".into()))
+        }
+        async fn cancel_work(
+            &self,
+            _: &MemberRef,
+            _: &RequestRef,
+            _: bool,
+        ) -> Result<CancellationOutcome, AdapterError> {
+            Ok(CancellationOutcome::Uncertain)
+        }
+    }
+
+    use mllm_adapters::traits::{
+        CancellationOutcome, EngineState, ParkLevel, ParkOutcome, Quiescence,
+        ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
+    };
 
     async fn drive(
         c: &Controller,
@@ -829,11 +1213,20 @@ mod tests {
 
     #[tokio::test]
     async fn preinitialize_is_policy_denied_under_default_gate() {
+        // F1 contract (design §7): preinitialize fails CLEARLY on restart-only
+        // deployments — an unsupported_parking error before any operation, so
+        // the deployment never enters FAILED and never claims a prewarm.
         let (c, _engine, _launcher) = controller(FakeEngine::new());
         let dep = c.submit_deploy(req("m1")).await.unwrap();
-        drive(&c, &dep, LifecycleAction::Preinitialize, Err(())).await;
+        let out = c.request_transition(&dep, LifecycleAction::Preinitialize).await;
+        match out {
+            Err(ControllerError::OperationFailed { code, .. }) => {
+                assert_eq!(code, "unsupported_parking");
+            }
+            other => panic!("expected unsupported_parking, got {other:?}"),
+        }
         let row = c.store.lock().unwrap().get_deployment(&dep).unwrap().unwrap();
-        assert_eq!(row.observed_state, LifecycleState::Failed);
+        assert_eq!(row.observed_state, LifecycleState::Stopped);
     }
 
     #[tokio::test]
@@ -849,6 +1242,80 @@ mod tests {
         // No new operation was recorded for the illegal request.
         let after = c.store.lock().unwrap().latest_operation(&dep).unwrap().unwrap();
         assert_eq!(before.id, after.id);
+    }
+
+    #[tokio::test]
+    async fn wait_terminal_timeout_terminates_handle_and_fails_observed() {
+        // Orphaned-children guard (design §5): an activation wedged in
+        // Initializing-forever readiness → wait_terminal times out, the
+        // spawned engine handle is terminated (best-effort abort), and the
+        // observed state reconciles to FAILED (never a wedged Starting).
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let c = Controller::new_with_policy(
+            store,
+            Arc::new(NeverReadyAdapter),
+            Arc::new(FakeLauncher::new()),
+            mllm_adapters::fake::ParkPolicy::Denied,
+        )
+        .with_operation_timeout(Duration::from_millis(150));
+        let dep = c.submit_deploy(req("never-ready-m")).await.unwrap();
+        let op = c
+            .request_transition(&dep, LifecycleAction::Start)
+            .await
+            .unwrap();
+        assert!(matches!(c.wait_terminal(&op).await, Err(ControllerError::Timeout)));
+        assert!(c.live_pid(&dep).is_none(), "orphaned handle terminated on timeout");
+        let row = c
+            .store_ref()
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.observed_state, LifecycleState::Failed);
+        // The abort is journaled evidence (never a silent kill).
+        let evidence = c
+            .store_ref()
+            .lock()
+            .unwrap()
+            .journal_evidence_of(&dep)
+            .unwrap()
+            .join("\n");
+        assert!(evidence.contains("timeout_terminated"), "evidence: {evidence}");
+    }
+
+    #[tokio::test]
+    async fn generation_bumps_once_per_operation_not_per_wait() {
+        // The bump moved to the operation's completion path (idempotent per
+        // operation id): awaiting the same completed operation twice must
+        // never double-bump.
+        let (c, _engine, _launcher) = controller(FakeEngine::new());
+        let dep = c.submit_deploy(req("bump-once-m")).await.unwrap();
+        let store = c.store_ref();
+        let op = c
+            .request_transition(&dep, LifecycleAction::Start)
+            .await
+            .unwrap();
+        c.wait_terminal(&op).await.unwrap();
+        let gen_after_first = store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap()
+            .current_generation;
+        c.wait_terminal(&op).await.unwrap();
+        let gen_after_second = store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap()
+            .current_generation;
+        assert_eq!(
+            gen_after_first, gen_after_second,
+            "a completed operation awaited twice never double-bumps"
+        );
     }
 
     #[tokio::test]
@@ -919,5 +1386,73 @@ mod tests {
             first.deployment_id.to_string(),
             second.deployment_id.to_string()
         );
+    }
+}
+
+/// Attachment request (F1 design §6, SPEC §5.2): register an already-running
+/// service for routing and observation. Grants NO lifecycle permission.
+#[derive(Debug, Clone)]
+pub struct AttachRequest {
+    pub name: String,
+    pub endpoint: String,
+    pub route_model_id: Option<String>,
+    pub manifest: Vec<u8>,
+}
+
+pub struct AttachRequestTag;
+
+impl Controller {
+    /// Attach an already-running service: registration and observation
+    /// only — attaching grants no permission to sleep, kill, restart, or
+    /// evict (SPEC §5.2 / T11). Attached usage is charged conservatively
+    /// (never reclaimable without evidence) and restart guarantees are
+    /// marked unavailable without a configured supervisor integration.
+    pub async fn attach(&self, req: AttachRequest) -> Result<String, ControllerError> {
+        let id = DeploymentId::new();
+        let key = idempotency_key(&self.context_id, &req.name, &req.manifest);
+        let op = OperationId(format!("op-{}", ulid::Ulid::new()));
+        let accepted = {
+            let store = self.store.lock().unwrap();
+            let accepted = store.accept_deployment(AcceptDeployment {
+                id,
+                name: req.name,
+                kind: ATTACHED_KIND.to_string(),
+                route_model_id: req.route_model_id,
+                desired_state: LifecycleState::Ready,
+                schema_version: 1,
+                idempotency_key: key,
+                initial_operation_id: op,
+            })?;
+            let op = accepted.operation_id.clone();
+            store.update_operation_state(&op.0, OpState::Succeeded, None)?;
+            store.record_journal(
+                Some(&self.host_id),
+                Some(&op.0),
+                Some("attached"),
+                &format!(
+                    r#"{{"event":"attached","deployment":"{dep}","endpoint":"{ep}","supervisor":"none"}}"#,
+                    dep = accepted.deployment_id,
+                    ep = req.endpoint,
+                ),
+            )?;
+            accepted
+        };
+        let dep = accepted.deployment_id.to_string();
+        {
+            // Conservative usage: charged once, never reclaimable without
+            // verified evidence (SPEC §5.2: uncertain attached usage is not
+            // reclaimable capacity).
+            let store = self.store.lock().unwrap();
+            store
+                .insert_reservation(&mllm_store::ReservationRow {
+                    owner_id: dep.clone(),
+                    domain_id: Some("system".into()),
+                    bytes: ATTACHED_CONSERVATIVE_BYTES,
+                    phase: "ready".into(),
+                    exclusive_devices: vec![],
+                })
+                .map_err(ControllerError::from)?;
+        }
+        Ok(dep)
     }
 }
