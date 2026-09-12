@@ -13,6 +13,7 @@ pub const RESERVED_FLAGS: &[&str] = &[
     "--gpu-memory-utilization",
     "--swap-space",
     "--kv-cache-bytes",
+    "--kv-cache-memory",
     "--enable-sleep-mode",
     "--api-key",
 ];
@@ -93,7 +94,11 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         push(&mut argv, "--gpu-memory-utilization", format!("{}.{:02}", pct / 100, pct % 100));
     }
     if let Some(kv) = input.granted.kv_cache_bytes {
-        push(&mut argv, "--kv-cache-bytes", kv.to_string());
+        // vLLM 0.29 renders explicit KV bytes via `--kv-cache-memory` (the
+        // gpu-memory-utilization heuristic misbehaves on unified-memory
+        // hosts — live capture, Spark 2026-09-12). The granted budget maps
+        // to bytes with the unit explicit (SPEC §7.5).
+        push(&mut argv, "--kv-cache-memory", kv.to_string());
     }
     if let Some(swap) = input.granted.swap_space_bytes {
         // vLLM's --swap-space is expressed in GiB; convert from bytes with

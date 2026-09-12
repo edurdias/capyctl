@@ -145,7 +145,13 @@ async fn start_standalone_inner(
                 engine_bin: p.engine_bin.to_string_lossy().to_string(),
                 model_path: p.model_path.clone(),
                 port: p.port,
-                granted: Default::default(),
+                // Conservative KV grant for the unified-memory Spark: the
+                // ledger's deployment budget bounds the engine's KV pool
+                // (activation peak stays well inside the managed limit).
+                granted: mllm_adapters::vllm::args::GrantedBudget {
+                    kv_cache_bytes: Some(64 * 1024 * 1024 * 1024),
+                    ..Default::default()
+                },
                 engine_args: vec!["--host".into(), "127.0.0.1".into()],
                 // Development/sleep flags render only under the opt-in
                 // (profile-level gate; empty here keeps stock restart-only).
