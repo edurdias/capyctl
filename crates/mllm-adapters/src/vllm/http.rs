@@ -155,7 +155,10 @@ impl EngineHttp {
         loop {
             match stream.next().await {
                 Some(Ok(bytes)) => {
-                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                    // Normalize CRLF (uvicorn/Starlette SSE): frame parsing
+                    // is LF-based.
+                    let decoded = String::from_utf8_lossy(&bytes);
+                    buf.push_str(&decoded.replace('\r', ""));
                     // SSE frames are delimited by blank lines; data lines by
                     // `data: `. Parse complete frames out of the buffer.
                     while let Some(pos) = buf.find("\n\n") {
