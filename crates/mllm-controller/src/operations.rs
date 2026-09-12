@@ -978,20 +978,3 @@ mod tests {
         );
     }
 }
-
-impl Controller {
-    /// The shared store handle (tests and the router read generations).
-    pub fn store_ref(&self) -> Arc<Mutex<Store>> {
-        self.store.clone()
-    }
-
-    /// Stale-generation dispatch check (T18): a dispatch carrying an older
-    /// generation than the deployment's current one is rejected — the
-    /// ingress gate refuses late/stale dispatch after its gate closes.
-    pub fn check_dispatch_generation(&self, deployment: &str, observed: i64) -> Result<i64, ControllerError> {
-        let store = self.store.lock().unwrap();
-        store
-            .check_generation(deployment, observed)
-            .map_err(|_| ControllerError::StaleGeneration(deployment.to_string()))
-    }
-}
