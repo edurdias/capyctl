@@ -6,6 +6,7 @@
 pub mod admission;
 pub mod chat;
 pub mod stream;
+pub mod switch;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -604,6 +604,71 @@ impl crate::Store {
         Ok(v != 0)
     }
 
+    /// Operations of one kind for a deployment (asc order) — used by the
+    /// switching engine and tests (T15: exactly one wake).
+    pub fn operations_of_kind(
+        &self,
+        deployment_id: &str,
+        kind: &str,
+    ) -> Result<Vec<OperationRow>, StoreError> {
+        let conn = &self.conn;
+        let mut stmt = conn.prepare(
+            "SELECT id, deployment_id, kind, state, error_code, accepted_at, updated_at
+             FROM operations WHERE deployment_id = ?1 AND kind = ?2 ORDER BY accepted_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![deployment_id, kind], |row| {
+                Ok(OperationRow {
+                    id: row.get(0)?,
+                    deployment_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    state: OpState::parse(&row.get::<_, String>(3)?)
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                    error_code: row.get(4)?,
+                    accepted_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Journal evidence entries for a deployment (bounded, evidence only).
+    pub fn journal_evidence_of(&self, deployment_id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = &self.conn;
+        let mut stmt = conn.prepare(
+            "SELECT j.evidence FROM journal_entries j
+             JOIN operations o ON j.operation_id = o.id
+             WHERE o.deployment_id = ?1 ORDER BY j.id ASC",
+        )?;
+        let rows = stmt
+            .query_map([deployment_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deployments currently READY, excluding the named one — the pool
+    /// holders the switching engine must drain (F1 design §5).
+    pub fn ready_deployments_excluding(
+        &self,
+        exclude: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = &self.conn;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM deployments WHERE observed_state = 'ready' AND id != ?1",
+        )?;
+        let rows = stmt
+            .query_map([exclude], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Stale-generation check (T18): observed must be >= current.
     pub fn check_generation(&self, deployment_id: &str, observed: i64) -> Result<i64, StoreError> {
         let current: i64 = self

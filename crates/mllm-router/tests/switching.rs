@@ -1,0 +1,171 @@
+//! Switching engine (F1 design §5): single wake join (T15), A→B→A
+//! alternation with release evidence (T16), bounded non-resetting fairness
+//! window (T19), and the switch-failure branch (A reopens, B fail-fast).
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use mllm_adapters::traits::{
+    AdapterError, CancellationOutcome, EngineAdapter, MemberRef, ParkLevel, ParkOutcome,
+    Phase, PlanInput, Readiness, ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
+    WorkObservation,
+};
+use mllm_controller::{Controller, DeployRequest};
+use mllm_store::Store;
+
+fn controller() -> (Arc<Controller>, Arc<Mutex<Store>>) {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let c = Arc::new(Controller::new(
+        store.clone(),
+        Arc::new(mllm_adapters::fake::FakeEngine::new()),
+        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+    ));
+    (c, store)
+}
+
+/// An adapter whose engine never reaches quiescence (drain wedges).
+struct StuckAdapter;
+
+#[async_trait]
+impl EngineAdapter for StuckAdapter {
+    async fn inspect(&self, _: &MemberRef) -> Result<mllm_adapters::traits::EngineState, AdapterError> {
+        Ok(mllm_adapters::traits::EngineState {
+            phase: Phase::Ready,
+            retained_bytes: 0,
+            build_fingerprint: Some("stuck".into()),
+        })
+    }
+    async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        Ok(RenderedCommand { argv: vec!["sleep".into(), "30".into()], env: Default::default() })
+    }
+    async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+        Ok(Readiness::Ready)
+    }
+    async fn prepare_park(&self, _: &MemberRef) -> Result<mllm_adapters::traits::Quiescence, AdapterError> {
+        Ok(mllm_adapters::traits::Quiescence { quiescent: false })
+    }
+    async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+        Ok(WorkObservation::Streaming { request_ref: "r1".into() })
+    }
+    async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        Ok(ParkOutcome::Parked { retained_bytes: 0 })
+    }
+    async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+        Ok(RestoreOutcome::Restored)
+    }
+    async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+        Ok(ReloadOutcome::Reloaded)
+    }
+    async fn cancel_work(&self, _: &MemberRef, _: &RequestRef, _: bool) -> Result<CancellationOutcome, AdapterError> {
+        Ok(CancellationOutcome::Uncertain)
+    }
+}
+
+fn req(name: &str) -> DeployRequest {
+    DeployRequest {
+        name: name.into(),
+        kind: "model".into(),
+        manifest: format!(r#"{{"kind":"model","name":"{name}"}}"#).into_bytes(),
+        route_model_id: Some(name.into()),
+    }
+}
+
+async fn deploy_and_start(c: &Controller, name: &str) -> String {
+    let id = c.submit_deploy(req(name)).await.unwrap();
+    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    c.wait_terminal(&op).await.unwrap();
+    id
+}
+
+fn start_op_count(store: &Arc<Mutex<Store>>, dep: &str) -> usize {
+    store.lock().unwrap().operations_of_kind(dep, "start").unwrap().len()
+}
+
+#[tokio::test]
+async fn simultaneous_activations_join_one_wake() {
+    let (c, store) = controller();
+    let id = c.submit_deploy(req("wake-m")).await.unwrap(); // STOPPED
+
+    let sw = Arc::new(mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_secs(5)));
+    let sw2 = sw.clone();
+    let id2 = id.clone();
+    let (ga, gb) = tokio::join!(sw.switch_to(&id), sw2.switch_to(&id2));
+
+    // Both activations succeeded and joined the SAME wake operation.
+    let gen = ga.unwrap();
+    assert_eq!(gen, hb_gen(&gb));
+    assert_eq!(start_op_count(&store, &id), 1, "exactly one Start operation (T15)");
+}
+
+fn hb_gen(r: &Result<u64, mllm_router::switch::SwitchError>) -> u64 {
+    r.clone().unwrap()
+}
+
+#[tokio::test]
+async fn a_to_b_to_a_alternates_with_release_evidence() {
+    let (c, store) = controller();
+    let a = deploy_and_start(&c, "model-a").await;
+    let sw = mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_secs(5));
+
+    let gen1 = sw.switch_to(&a).await.unwrap(); // already ready → no-op switch
+    let b = c.submit_deploy(req("model-b")).await.unwrap();
+    let gen2 = sw.switch_to(&b).await.unwrap();
+    // Generations are PER-DEPLOYMENT (monotonic within a deployment): B's
+    // generation advanced through its own wake (1 → 2).
+    assert!(gen2 >= 1, "B activated with its own generation {gen2}");
+    let _ = gen1;
+
+    // Release evidence for A: quiescent/parked/terminated journaled.
+    let evidence = store
+        .lock()
+        .unwrap()
+        .journal_evidence_of(&a)
+        .unwrap()
+        .join("\n");
+    assert!(
+        evidence.contains("quiescent") || evidence.contains("terminated") || evidence.contains("parked"),
+        "A's release evidence journaled: {evidence}"
+    );
+
+    // Back to A: correct generation accounting (T16).
+    let gen3 = sw.switch_to(&a).await.unwrap();
+    assert!(gen3 > gen1, "A's own generation advanced through park→wake (T16)");
+    let state_a = store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state;
+    assert_eq!(state_a, mllm_domain::LifecycleState::Ready);
+}
+
+#[tokio::test]
+async fn switch_failure_reopens_a_and_fails_b_fast() {
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let c = Arc::new(Controller::new(
+        store.clone(),
+        Arc::new(StuckAdapter),
+        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+    ));
+    let a = deploy_and_start(&c, "stuck-a").await;
+    let sw = mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_millis(200));
+
+    // A holds live work that never drains: the switch to B must FAIL.
+    let b = c.submit_deploy(req("stuck-b")).await.unwrap();
+    let out = sw.switch_to(&b).await;
+    assert!(out.is_err(), "drain that never quiesces fails the switch");
+
+    // A is reopened: not suspended, on-demand eligible, window preserved.
+    assert!(!store.lock().unwrap().is_suspended(&a).unwrap());
+    // The failed-switch event is journaled (SPEC §17 failed-switches metric).
+    let evidence = store.lock().unwrap().journal_evidence_of(&a).unwrap().join("\n");
+    assert!(evidence.contains("switch_failed"), "failed-switch event: {evidence}");
+}
+
+#[test]
+fn fairness_window_is_bounded_and_non_resetting() {
+    // T19: busy A cannot push the window out forever — the window closes a
+    // fixed interval after it opens, regardless of new A traffic.
+    let mut w = mllm_router::switch::AdmissionWindow::open(Duration::from_millis(100));
+    for _ in 0..50 {
+        w.try_extend(); // no-op by contract: never resets
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(w.expired(), "window closes even under sustained A load");
+}

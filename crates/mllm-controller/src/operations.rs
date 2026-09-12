@@ -484,7 +484,9 @@ impl ExecTask {
     fn member(dep: &str) -> MemberRef {
         MemberRef {
             deployment_id: dep.to_string(),
-            member_id: "m-1".to_string(),
+            // Distinct member id per deployment: the engine adapter keys
+            // member state by this (A parked must not make B unready).
+            member_id: format!("{dep}-head"),
         }
     }
 
@@ -563,7 +565,7 @@ impl ExecTask {
                 self.adapter
                     .render_plan(&PlanInput {
                         deployment_id: dep.to_string(),
-                        member_id: "m-1".to_string(),
+                        member_id: format!("{dep}-head"),
                         park_level: None,
                     })
                     .await
@@ -712,6 +714,9 @@ impl ExecTask {
         at_state: LifecycleState,
         outcome: Result<(), String>,
     ) {
+        if std::env::var("MLLM_DEBUG").is_ok() {
+            eprintln!("DEBUG op {} action {:?} outcome {:?}", op.0, action, outcome.as_ref().err());
+        }
         match outcome {
             Ok(()) => {
                 self.journal(
@@ -827,6 +832,19 @@ impl Controller {
     /// The shared store handle (tests and the router read generations).
     pub fn store_ref(&self) -> Arc<Mutex<Store>> {
         self.store.clone()
+    }
+
+    /// The adapter's work observation for a deployment's member (the
+    /// switch engine's drain oracle).
+    pub async fn observe_adapter(
+        &self,
+        deployment: &str,
+    ) -> Result<mllm_adapters::traits::WorkObservation, mllm_adapters::traits::AdapterError> {
+        let member = mllm_adapters::traits::MemberRef {
+            deployment_id: deployment.to_string(),
+            member_id: format!("{deployment}-head"),
+        };
+        self.adapter.observe_work(&member).await
     }
 
     /// The live engine process PID for a deployment, if owned and running.
