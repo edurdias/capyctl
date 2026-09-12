@@ -579,6 +579,31 @@ impl crate::Store {
         Ok(rows)
     }
 
+    /// Administrative suspension flag (T10): admin stop sets it; idle
+    /// eviction leaves it clear.
+    pub fn set_suspended(&self, id: &str, suspended: bool) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE deployments SET suspended = ?2 WHERE id = ?1",
+            params![id, suspended as i64],
+        )?;
+        if updated == 0 {
+            return Err(invalid_column("deployments"));
+        }
+        Ok(())
+    }
+
+    pub fn is_suspended(&self, id: &str) -> Result<bool, StoreError> {
+        let v: i64 = self
+            .conn
+            .query_row(
+                "SELECT suspended FROM deployments WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)?;
+        Ok(v != 0)
+    }
+
     /// Stale-generation check (T18): observed must be >= current.
     pub fn check_generation(&self, deployment_id: &str, observed: i64) -> Result<i64, StoreError> {
         let current: i64 = self

@@ -1027,12 +1027,15 @@ dependencies = [
 name = "mllm-controller"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hex",
  "mllm-adapters",
  "mllm-domain",
+ "mllm-launchers",
  "mllm-scheduler",
  "mllm-store",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "ulid",

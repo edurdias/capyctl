@@ -320,6 +320,24 @@ impl Controller {
         deployment: &str,
         action: LifecycleAction,
     ) -> Result<OperationHandle, ControllerError> {
+        self.request_transition_inner(deployment, action, false).await
+    }
+
+    /// Idle eviction (T10): stop the engine but keep the deployment
+    /// on-demand eligible — the next inference request may activate it.
+    /// Administrative stop (LifecycleAction::Stop) suspends instead, and a
+    /// suspended deployment rejects activation.
+    pub async fn idle_stop(&self, deployment: &str) -> Result<OperationHandle, ControllerError> {
+        self.request_transition_inner(deployment, LifecycleAction::Stop, true)
+            .await
+    }
+
+    async fn request_transition_inner(
+        &self,
+        deployment: &str,
+        action: LifecycleAction,
+        keep_on_demand_eligible: bool,
+    ) -> Result<OperationHandle, ControllerError> {
         let observed = {
             let store = self.store.lock().unwrap();
             let row = store
@@ -327,6 +345,24 @@ impl Controller {
                 .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?;
             row.observed_state
         };
+        // Administrative stop marks the deployment suspended up front
+        // (T10): autoactivation must not undo the operator's explicit stop
+        // (SPEC §6.3: required explicit stop MUST NOT be undone by the
+        // next inference request).
+        if action == LifecycleAction::Stop && !keep_on_demand_eligible {
+            let store = self.store.lock().unwrap();
+            store.set_suspended(deployment, true)?;
+        }
+        // A suspended deployment rejects activation Start.
+        if action == LifecycleAction::Start {
+            let store = self.store.lock().unwrap();
+            if store.is_suspended(deployment)? {
+                return Err(ControllerError::OperationFailed {
+                    op: "start".to_string(),
+                    code: "suspended".to_string(),
+                });
+            }
+        }
         let chain = plan(observed, action).ok_or(ControllerError::IllegalTransition {
             from: observed,
             to: action_target(action),
@@ -791,6 +827,15 @@ impl Controller {
     /// The shared store handle (tests and the router read generations).
     pub fn store_ref(&self) -> Arc<Mutex<Store>> {
         self.store.clone()
+    }
+
+    /// The live engine process PID for a deployment, if owned and running.
+    pub fn live_pid(&self, deployment: &str) -> Option<u32> {
+        self.handles
+            .lock()
+            .unwrap()
+            .get(deployment)
+            .map(|h| h.pid)
     }
 
     /// Stale-generation dispatch check (T18): a dispatch carrying an older
