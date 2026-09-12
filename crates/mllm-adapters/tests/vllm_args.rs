@@ -19,6 +19,7 @@ fn base_input() -> PlanInputVllm {
         engine_args: vec!["--max-model-len".into(), "65536".into()],
         sleep_flags: vec![],
         engine_path_extra: None,
+        engine_log: None,
         api_key: None,
     }
 }
