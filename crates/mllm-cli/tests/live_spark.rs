@@ -62,7 +62,13 @@ fn live_restart_only_qualification() {
         return;
     };
     rt.block_on(async move {
-        let dir = tempfile::tempdir().unwrap();
+        // Kept on failure: the engine log inside is the evidence record.
+        let dir = tempfile::Builder::new()
+            .prefix("mllm-live")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        eprintln!("LIVE-DIR: {}", dir.path().display());
         let app = roles::start_standalone_with_policy(dir.path(), mllm_adapters::fake::ParkPolicy::Denied)
             .await
             .unwrap();
@@ -160,7 +166,12 @@ async fn live_switch_and_park_reload() {
         eprintln!("live env not present; skipping");
         return;
     };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("mllm-live")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    eprintln!("LIVE-DIR: {}", dir.path().display());
     // Experimental profile allowed for the isolated park/reload stage
     // (design §7: the opt-in gates the profile; recorded per run).
     let app = roles::start_standalone_with_policy(
