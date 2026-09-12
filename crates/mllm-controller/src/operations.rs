@@ -235,6 +235,10 @@ pub struct Controller {
     /// Host deep-park policy (F1 design §7): the opt-in gates the
     /// experimental profile itself, not just park/reload operations.
     park_policy: mllm_adapters::fake::ParkPolicy,
+    /// Park depth for managed parks: level 2 (deep) under the opt-in —
+    /// level 1 frees nothing on unified-memory hosts (design finding);
+    /// level 1 for restart-only hosts.
+    park_level: mllm_adapters::ParkLevel,
     /// The embedded fake engine handle (qualification/ambiguity injection).
     embedded_fake: Option<Arc<mllm_adapters::fake::FakeEngine>>,
 }
@@ -262,6 +266,11 @@ impl Controller {
             host_id: EMBEDDED_HOST_ID.to_string(),
             handles: Arc::new(Mutex::new(HashMap::new())),
             park_policy,
+            park_level: if park_policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+                mllm_adapters::ParkLevel::Two
+            } else {
+                mllm_adapters::ParkLevel::One
+            },
             embedded_fake: None,
         }
     }
@@ -486,6 +495,7 @@ impl Controller {
             launcher: self.launcher.clone(),
             handles: self.handles.clone(),
             host_id: self.host_id.clone(),
+            park_level: self.park_level,
         };
         let deployment = deployment.to_string();
         let op_for_task = op.clone();
@@ -565,6 +575,7 @@ struct ExecTask {
     launcher: Arc<dyn Launcher>,
     handles: Arc<Mutex<HashMap<String, OwnedHandle>>>,
     host_id: String,
+    park_level: mllm_adapters::ParkLevel,
 }
 
 impl ExecTask {
@@ -751,7 +762,7 @@ impl ExecTask {
                 Ok(other) => Err((false, format!("work_not_drained:{other:?}"))),
                 Err(e) => Err((is_uncertain(&e), adapter_code(&e))),
             },
-            Step::Park => match self.adapter.park(&member, ParkLevel::One).await {
+            Step::Park => match self.adapter.park(&member, self.park_level).await {
                 Ok(outcome) => {
                     self.journal(op, state, format!(r#"{{"event":"parked","outcome":{outcome:?}}}"#));
                     Ok(())
