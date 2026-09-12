@@ -150,6 +150,14 @@ impl EngineHttp {
         if !resp.status().is_success() {
             return Err(HttpError::UnexpectedStatus(resp.status().as_u16()));
         }
+        if std::env::var("MLLM_SSE_DEBUG").is_ok() {
+            eprintln!(
+                "SSE-RESP: status={} ct={:?} len={:?}",
+                resp.status(),
+                resp.headers().get("content-type"),
+                resp.content_length()
+            );
+        }
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         loop {
