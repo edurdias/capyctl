@@ -143,6 +143,9 @@ impl EngineAdapter for VllmAdapter {
             let sys = std::env::var("PATH").unwrap_or_default();
             cmd.env.insert("PATH".into(), format!("{extra}:{sys}"));
         }
+        if let Some(log) = &spec.engine_log {
+            cmd.env.insert("MLLM_ENGINE_LOG".into(), log.clone());
+        }
         Ok(cmd)
     }
 

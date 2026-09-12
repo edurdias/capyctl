@@ -37,6 +37,9 @@ pub struct PlanInputVllm {
     /// Extra PATH entries for the engine's runtime environment (venv bin:
     /// the JIT compile step needs the venv's tools, e.g. ninja).
     pub engine_path_extra: Option<String>,
+    /// Where the launcher writes the engine's stdout/stderr (diagnosability
+    /// + the runbook's evidence record).
+    pub engine_log: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,7 +72,9 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     // Validate granted budgets are finite and in range.
     if let Some(pct) = input.granted.gpu_utilization_pct {
         if pct == 0 || pct > 100 {
-            return Err(ArgsError::InvalidBudget(format!("gpu_utilization_pct {pct}")));
+            return Err(ArgsError::InvalidBudget(format!(
+                "gpu_utilization_pct {pct}"
+            )));
         }
     }
     for (name, bytes) in [
@@ -94,7 +99,11 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     }
     push(&mut argv, "--port", input.port.to_string());
     if let Some(pct) = input.granted.gpu_utilization_pct {
-        push(&mut argv, "--gpu-memory-utilization", format!("{}.{:02}", pct / 100, pct % 100));
+        push(
+            &mut argv,
+            "--gpu-memory-utilization",
+            format!("{}.{:02}", pct / 100, pct % 100),
+        );
     }
     if let Some(kv) = input.granted.kv_cache_bytes {
         // vLLM 0.29 renders explicit KV bytes via `--kv-cache-memory` (the
@@ -118,7 +127,10 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     }
     // User pass-through last (SPEC §8.2: preserve engine-native args).
     argv.extend(input.engine_args.iter().cloned());
-    Ok(RenderedCommand { argv, env: Default::default() })
+    Ok(RenderedCommand {
+        argv,
+        env: Default::default(),
+    })
 }
 
 /// Bytes → whole GiB (vLLM swap-space unit).

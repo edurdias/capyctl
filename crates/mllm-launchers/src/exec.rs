@@ -72,10 +72,21 @@ impl Launcher for ExecLauncher {
             .argv
             .split_first()
             .ok_or_else(|| LauncherError::SpawnFailed("empty argv".into()))?;
-        let mut command = Command::new(program);
-        command.args(args).stdout(Stdio::null()).stderr(Stdio::null());
+        command.args(args);
         for (k, v) in &cmd.env {
             command.env(k, v);
+        }
+        // Engine output lands in the deployment's engine log when one is
+        // requested (the runbook's evidence); otherwise discarded.
+        if let Some(log) = cmd.env.get("MLLM_ENGINE_LOG") {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .map_err(|e| LauncherError::SpawnFailed(format!("engine log {log}: {e}")))?;
+            command.stdout(Stdio::from(f.try_clone()?)).stderr(Stdio::from(f));
+        } else {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
         }
         // Own process group: termination targets the whole owned tree, and
         // the engine's own children belong to us (T12).
