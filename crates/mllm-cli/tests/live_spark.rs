@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use mllm_adapters::fake::ParkPolicy;
 use mllm_cli::roles::{self, LiveVllmProfile};
 use mllm_controller::DeployRequest;
 use mllm_domain::LifecycleState;
