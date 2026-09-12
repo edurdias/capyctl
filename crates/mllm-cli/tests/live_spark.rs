@@ -161,7 +161,6 @@ fn live_restart_only_qualification() {
 }
 
 #[tokio::test]
-#[tokio::test]
 async fn live_switch_and_park_reload() {
     let Some(p) = live_profile() else {
         eprintln!("live env not present; skipping");
