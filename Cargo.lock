@@ -1100,6 +1100,8 @@ version = "0.1.0"
 dependencies = [
  "mllm-domain",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "ulid",

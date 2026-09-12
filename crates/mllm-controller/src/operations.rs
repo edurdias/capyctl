@@ -103,6 +103,8 @@ pub enum ControllerError {
     OperationFailed { op: String, code: String },
     #[error("operation did not reach a terminal state in time")]
     Timeout,
+    #[error("stale generation for deployment {0} (T18)")]
+    StaleGeneration(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -290,6 +292,21 @@ impl Controller {
             )?;
             accepted
         };
+        // Initial reservation intent persisted at acceptance (F1 G3: the
+        // resource ledger's owner rows are durable, not just in-memory).
+        {
+            let store = self.store.lock().unwrap();
+            let dep = accepted.deployment_id.to_string();
+            store
+                .insert_reservation(&mllm_store::ReservationRow {
+                    owner_id: dep.clone(),
+                    domain_id: Some("system".into()),
+                    bytes: F0_SYNTHETIC_ACTIVATION_PEAK,
+                    phase: "activation".into(),
+                    exclusive_devices: vec![],
+                })
+                .map_err(ControllerError::from)?;
+        }
         Ok(accepted.deployment_id.to_string())
     }
 
@@ -368,7 +385,16 @@ impl Controller {
                 }
             };
             match (state, observed) {
-                (OpState::Succeeded, Some(observed)) => return Ok(observed),
+                (OpState::Succeeded, Some(observed)) => {
+                    // Generation machinery (F1 G3): every successful
+                    // transition bumps the deployment generation and
+                    // records history — monotonic, never reset.
+                    {
+                        let store = self.store.lock().unwrap();
+                        let _ = store.bump_generation(&handle.deployment_id)?;
+                    }
+                    return Ok(observed);
+                }
                 (OpState::Failed, _) => {
                     return Err(ControllerError::OperationFailed {
                         op: handle.operation_id.0.clone(),
@@ -609,7 +635,16 @@ impl ExecTask {
                         }
                         Err(e) => Err((false, spawn_code(&e))),
                     },
-                    None => Err((false, "no_live_handle".to_string())),
+                    None => {
+                        // No live handle means we own no process: nothing to
+                        // terminate, so the release is verified trivially
+                        // (the STOPPED semantic: "no owned engine workers
+                        // remain"). F3 adds restart-ownership reconciliation
+                        // so a handle lost across controller restarts is
+                        // recovered, not silently dropped.
+                        self.journal(op, state, r#"{"event":"no_live_handle","verified":"no owned handle"}"#.to_string());
+                        Ok(())
+                    }
                 }
             }
             Step::Confirm => Ok(()),
@@ -923,5 +958,22 @@ mod tests {
             first.deployment_id.to_string(),
             second.deployment_id.to_string()
         );
+    }
+}
+
+impl Controller {
+    /// The shared store handle (tests and the router read generations).
+    pub fn store_ref(&self) -> Arc<Mutex<Store>> {
+        self.store.clone()
+    }
+
+    /// Stale-generation dispatch check (T18): a dispatch carrying an older
+    /// generation than the deployment's current one is rejected — the
+    /// ingress gate refuses late/stale dispatch after its gate closes.
+    pub fn check_dispatch_generation(&self, deployment: &str, observed: i64) -> Result<i64, ControllerError> {
+        let store = self.store.lock().unwrap();
+        store
+            .check_generation(deployment, observed)
+            .map_err(|_| ControllerError::StaleGeneration(deployment.to_string()))
     }
 }

@@ -35,6 +35,24 @@ pub struct DeploymentRow {
     pub desired_state: LifecycleState,
     pub observed_state: LifecycleState,
     pub schema_version: i64,
+    pub current_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRow {
+    pub generation: i64,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationRow {
+    pub owner_id: String,
+    pub domain_id: Option<String>,
+    pub bytes: i64,
+    pub phase: String,
+    pub exclusive_devices: Vec<String>,
 }
 
 /// Request to record a new control-plane operation on a deployment.
@@ -104,6 +122,7 @@ type RawDeploymentRow = (
     Option<String>,
     String,
     String,
+    i64,
     i64,
 );
 
@@ -256,7 +275,7 @@ impl crate::Store {
             .conn
             .query_row(
                 "SELECT id, name, kind, route_model_id, desired_state, observed_state,
-                        schema_version
+                        schema_version, current_generation
                  FROM deployments WHERE id = ?1",
                 [id],
                 |row| {
@@ -268,12 +287,14 @@ impl crate::Store {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
             .optional()?;
         raw.map(
-            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version)| {
+            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version,
+              current_generation)| {
                 Ok(DeploymentRow {
                     id,
                     name,
@@ -282,6 +303,7 @@ impl crate::Store {
                     desired_state: lifecycle_from_str(&desired_state)?,
                     observed_state: lifecycle_from_str(&observed_state)?,
                     schema_version,
+                    current_generation,
                 })
             },
         )
@@ -476,7 +498,7 @@ impl crate::Store {
             .conn
             .query_row(
                 "SELECT id, name, kind, route_model_id, desired_state, observed_state,
-                        schema_version
+                        schema_version, current_generation
                  FROM deployments WHERE route_model_id = ?1 ORDER BY updated_at DESC LIMIT 1",
                 [route],
                 |row| {
@@ -488,12 +510,14 @@ impl crate::Store {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
             .optional()?;
         raw.map(
-            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version)| {
+            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version,
+              current_generation)| {
                 Ok(DeploymentRow {
                     id,
                     name,
@@ -502,10 +526,121 @@ impl crate::Store {
                     desired_state: lifecycle_from_str(&desired_state)?,
                     observed_state: lifecycle_from_str(&observed_state)?,
                     schema_version,
+                    current_generation,
                 })
             },
         )
         .transpose()
+    }
+
+    /// Monotonic generation bump: increments and records history (F1 G3).
+    /// Generations are never reset — a fresh controller continues from the
+    /// persisted value.
+    pub fn bump_generation(&self, deployment_id: &str) -> Result<i64, StoreError> {
+        let conn = &self.conn;
+        conn.execute(
+            "UPDATE deployments SET current_generation = current_generation + 1,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            [deployment_id],
+        )
+        .map_err(StoreError::from)?;
+        let gen: i64 = conn
+            .query_row(
+                "SELECT current_generation FROM deployments WHERE id = ?1",
+                [deployment_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)?;
+        conn.execute(
+            "INSERT INTO generation_history(deployment_id, generation) VALUES (?1, ?2)",
+            params![deployment_id, gen],
+        )
+        .map_err(StoreError::from)?;
+        Ok(gen)
+    }
+
+    /// Generation history for a deployment (asc order).
+    pub fn generation_history(&self, deployment_id: &str) -> Result<Vec<GenerationRow>, StoreError> {
+        let conn = &self.conn;
+        let mut stmt = conn.prepare(
+            "SELECT generation, started_at, ended_at, outcome FROM generation_history
+             WHERE deployment_id = ?1 ORDER BY generation ASC",
+        )?;
+        let rows = stmt
+            .query_map([deployment_id], |row| {
+                Ok(GenerationRow {
+                    generation: row.get(0)?,
+                    started_at: row.get(1)?,
+                    ended_at: row.get(2)?,
+                    outcome: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Stale-generation check (T18): observed must be >= current.
+    pub fn check_generation(&self, deployment_id: &str, observed: i64) -> Result<i64, StoreError> {
+        let current: i64 = self
+            .conn
+            .query_row(
+                "SELECT current_generation FROM deployments WHERE id = ?1",
+                [deployment_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)?;
+        if observed >= current {
+            Ok(current)
+        } else {
+            Err(StoreError::StaleGeneration)
+        }
+    }
+
+    /// Persist the initial reservation intent at acceptance: an owner
+    /// account (deployment allocation) plus its physical reservation.
+    pub fn insert_reservation(&self, row: &ReservationRow) -> Result<(), StoreError> {
+        let conn = &self.conn;
+        conn.execute(
+            "INSERT OR IGNORE INTO owners(id, kind, deployment_id) VALUES (?1, 'deployment_allocation', ?2)",
+            params![row.owner_id, row.owner_id],
+        )
+        .map_err(StoreError::from)?;
+        conn.execute(
+            "INSERT INTO reservations(owner_id, domain_id, bytes, phase, exclusive_devices)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                row.owner_id,
+                row.domain_id,
+                row.bytes,
+                row.phase,
+                serde_json::to_string(&row.exclusive_devices)
+                    .map_err(|e| StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?
+            ],
+        )
+        .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    pub fn reservations_for_owner(&self, owner_id: &str) -> Result<Vec<ReservationRow>, StoreError> {
+        let conn = &self.conn;
+        let mut stmt = conn.prepare(
+            "SELECT owner_id, domain_id, bytes, phase, exclusive_devices
+             FROM reservations WHERE owner_id = ?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt
+            .query_map([owner_id], |row| {
+                let devices: String = row.get(4)?;
+                Ok(ReservationRow {
+                    owner_id: row.get(0)?,
+                    domain_id: row.get(1)?,
+                    bytes: row.get(2)?,
+                    phase: row.get(3)?,
+                    exclusive_devices: serde_json::from_str(&devices)
+                        .unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 
