@@ -137,7 +137,7 @@ pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 - [ ] Export `pub mod dispatch;` from the store library and create `dispatch.rs`:
 
 ```rust
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Transaction, TransactionBehavior};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorSession {
@@ -165,16 +165,6 @@ pub enum DispatchError {
     Invalid,
 }
 
-fn check_session(conn: &Connection, session: &CoordinatorSession) -> Result<(), DispatchError> {
-    let current: (i64, String) = conn.query_row(
-        "SELECT epoch,session_id FROM coordinator_session WHERE singleton=1",
-        [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    if session.epoch <= 0 || session.id.is_empty() || current != (session.epoch, session.id.clone()) {
-        return Err(DispatchError::StaleSession);
-    }
-    Ok(())
-}
-
 impl crate::Store {
     pub fn begin_coordinator_session(&self) -> Result<CoordinatorSession, DispatchError> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -192,8 +182,8 @@ impl crate::Store {
 }
 ```
 
-- [ ] Run `cargo test -p mllm-store`. Expect PASS. Imports used by the next task may
-  warn at this intermediate step; final Clippy must be clean.
+- [ ] Run `cargo test -p mllm-store`. Expect PASS without warnings. Stage the
+  session-check helper and its imports with their first consumer in Task 2.
 - [ ] Commit only these files:
 
 ```bash
@@ -261,6 +251,18 @@ fn closure_sees_registered_work_and_rejects_later_dispatch() {
 - [ ] Append these definitions before any test modules in `dispatch.rs`:
 
 ```rust
+use rusqlite::{Connection, OptionalExtension};
+
+fn check_session(conn: &Connection, session: &CoordinatorSession) -> Result<(), DispatchError> {
+    let current: (i64, String) = conn.query_row(
+        "SELECT epoch,session_id FROM coordinator_session WHERE singleton=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if session.epoch <= 0 || session.id.is_empty() || current != (session.epoch, session.id.clone()) {
+        return Err(DispatchError::StaleSession);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DispatchRequest<'a> {
     pub deployment_id: &'a str,
