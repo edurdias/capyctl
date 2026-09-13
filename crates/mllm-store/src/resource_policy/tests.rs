@@ -450,7 +450,7 @@ fn corrupt_policy_and_receipt_metadata_fail_closed() {
         store.get_management_operation(&result.operation_id),
         Err(ResourcePolicyError::CorruptStoredPolicy)
     ));
-    store.conn.execute("UPDATE command_receipts SET response_json=json_set(response_json,'$.overcommit.domains.system.extra',1)", []).unwrap();
+    store.conn.execute("UPDATE command_receipts SET response_json=json_set(response_json,'$.overcommit.domains.system.managed_bytes',0,'$.overcommit.domains.system.host_kv_bytes',0,'$.overcommit.domains.system.parked_bytes',0,'$.overcommit.domains.system.extra',1)", []).unwrap();
     assert!(matches!(
         store.get_management_operation(&result.operation_id),
         Err(ResourcePolicyError::CorruptStoredPolicy)
@@ -459,6 +459,147 @@ fn corrupt_policy_and_receipt_metadata_fail_closed() {
     assert!(matches!(
         store.resource_policy("host-a"),
         Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+}
+
+#[test]
+fn receipt_epoch_above_sqlite_range_is_corrupt() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let controls = ResourceControls::from_host(&host());
+    let result = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "key",
+            &controls,
+            &observations(),
+            11_000,
+        )
+        .unwrap();
+    let too_large = (i64::MAX as u64) + 1;
+    let json: String = store
+        .conn
+        .query_row("SELECT response_json FROM command_receipts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value["epoch"] = serde_json::Value::Number(too_large.into());
+    store
+        .conn
+        .execute(
+            "UPDATE command_receipts SET response_json=?1",
+            [value.to_string()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+}
+
+#[test]
+fn stale_session_rejects_update_and_persisted_noop_import() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let stale = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&stale, &host(), &observations(), 11_000)
+        .unwrap();
+    let current = store.begin_coordinator_session().unwrap();
+    let controls = ResourceControls::from_host(&host());
+    assert!(matches!(
+        store.import_resource_policy(&stale, &host(), &observations(), 11_000),
+        Err(ResourcePolicyError::StaleSession)
+    ));
+    assert!(matches!(
+        store.update_resource_policy(
+            &stale,
+            "alice",
+            "host-a",
+            1,
+            "key",
+            &controls,
+            &observations(),
+            11_000
+        ),
+        Err(ResourcePolicyError::StaleSession)
+    ));
+    assert!(
+        !store
+            .import_resource_policy(&current, &host(), &observations(), 11_000)
+            .unwrap()
+            .changed
+    );
+}
+
+#[test]
+fn update_rejects_observation_stale_under_current_ttl_even_if_replacement_is_larger() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let mut controls = ResourceControls::from_host(&host());
+    controls.observation_ttl_ms = 10_000;
+    let stale = vec![MemoryObservation {
+        sampled_at_ms: 8_999,
+        ..observations()[0].clone()
+    }];
+    assert!(matches!(
+        store.update_resource_policy(
+            &session, "alice", "host-a", 1, "key", &controls, &stale, 11_000
+        ),
+        Err(ResourcePolicyError::Invalid)
+    ));
+    assert_eq!(
+        store.resource_policy("host-a").unwrap().unwrap().revision,
+        1
+    );
+}
+
+#[test]
+fn long_config_valid_domain_roundtrips_through_retry_and_operation_read() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let domain = "d".repeat(300);
+    let mut long_host = host();
+    let policy = long_host.domains.remove("system").unwrap();
+    long_host.domains.insert(domain.clone(), policy);
+    long_host.devices.get_mut("gpu0").unwrap().domain = domain.clone();
+    let observed = vec![MemoryObservation {
+        domain: domain.clone(),
+        ..observations()[0].clone()
+    }];
+    store
+        .import_resource_policy(&session, &long_host, &observed, 11_000)
+        .unwrap();
+    let controls = ResourceControls::from_host(&long_host);
+    let first = store
+        .update_resource_policy(
+            &session, "alice", "host-a", 1, "key", &controls, &observed, 11_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .update_resource_policy(
+                &session, "alice", "host-a", 1, "key", &controls, &observed, 11_000
+            )
+            .unwrap(),
+        first
+    );
+    assert!(matches!(
+        store
+            .get_management_operation(&first.operation_id)
+            .unwrap()
+            .unwrap()
+            .target,
+        ManagementOperationTarget::HostResourcePolicy { revision: 2, .. }
     ));
 }
 

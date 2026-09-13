@@ -751,9 +751,10 @@ fn decode_receipt(json: &str) -> Result<StoredReceipt, ResourcePolicyError> {
         || !valid_id(&value.operation_id)
         || value.revision <= 1
         || value.epoch == 0
+        || value.epoch > i64::MAX as u64
         || ulid::Ulid::from_string(&value.operation_id).is_err()
         || value.overcommit.domains.iter().any(|(domain, overcommit)| {
-            !valid_id(domain)
+            domain.is_empty()
                 || overcommit.managed_bytes < 0
                 || overcommit.host_kv_bytes < 0
                 || overcommit.parked_bytes < 0
