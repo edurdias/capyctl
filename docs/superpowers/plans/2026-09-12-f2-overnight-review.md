@@ -35,6 +35,16 @@ belong in the review findings and should be investigated before escalating here.
 - Cross-model review skipped the full bundle at its size cap. No peer review claimed.
 - Product implementation started with CPU-only domain contracts; live qualification
   has not started. Task reviews gate each subsequent implementation task.
+- F2A1 is implemented and reviewed through `5c2cbbe`: domain contracts, validation,
+  admission, epoch-bound proposals, sequence forecasts, property tests, ADR 0007.
+- All six task reviews completed. Broader review found no blocking kernel defect;
+  three hardening fixes landed and passed scoped re-review: API safety notes,
+  admission-level device/floor regressions, and coordinator diagnostic ownership.
+- Fresh root checks: 172 workspace tests excluding CLI plus 2 CLI library tests
+  pass; no failures or ignored tests. Scoped Clippy passes. CLI integration targets
+  remain excluded. These results do not qualify live engines.
+- Continue with F2A2a durable reservation transactions. No production database or
+  Spark runtime was accessed during kernel implementation.
 
 ## Execution decisions
 
@@ -48,3 +58,7 @@ belong in the review findings and should be investigated before escalating here.
   shared resource validation. Cost: maintaining public reexports, not a crate cycle.
 - Exclude unrelated CLI integration targets from tests and Clippy. Check CLI library
   and binary explicitly. Cost: those integration targets receive no overnight evidence.
+- Keep the admission commit's descriptive subject despite differing from the plan's
+  example wording. Cost: history wording differs; behavior and safety are unchanged.
+- Coordinator constructs contextual diagnostics; kernel keeps unit error variants.
+  Cost: richer shared diagnostic types may be needed during coordinator work.

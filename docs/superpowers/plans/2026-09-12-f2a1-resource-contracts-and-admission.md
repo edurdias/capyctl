@@ -1,5 +1,10 @@
 # F2A1 Resource Contracts and Admission Kernel Implementation Plan
 
+**Execution status:** CPU-only slice implemented and reviewed through `5c2cbbe`.
+Fresh verification: 174 tests pass across the workspace excluding CLI integration
+and the CLI library; scoped Clippy passes. This does not qualify live engines or
+close F2. Task instructions below remain the implementation contract.
+
 **Goal:** Build a deterministic, engine-neutral resource kernel that can prove whether a cold start, parking transition, or warm wake fits alongside retained deployments, and can produce a revision-bound reservation proposal.
 
 **Architecture:** Add typed physical-domain and phase-footprint contracts to the domain crate and pure admission/sequence evaluation to the scheduler crate. Keep physical observations separate from reservations. Return proposals bound to the input ledger epoch; the subsequent durable-coordination plan must commit them atomically before any engine action.
