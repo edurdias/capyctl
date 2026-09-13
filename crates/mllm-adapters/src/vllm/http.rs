@@ -140,6 +140,24 @@ impl EngineHttp {
             .map(|()| WakeOutcome::Applied)
     }
 
+    /// Invalidate prefix-cache metadata after destructive restoration.
+    /// HTTP success alone is insufficient: vLLM may acknowledge a refused
+    /// reset with `{"success": false}` when blocks are still in use.
+    pub async fn reset_prefix_cache(&self) -> Result<(), HttpError> {
+        let req = self.control(self.auth(self.client.post(self.url("/reset_prefix_cache"))));
+        let response = req.send().await.map_err(http_err("reset_prefix_cache"))?;
+        check_status(response.status())?;
+        if !response.status().is_success() {
+            return Err(HttpError::UnexpectedStatus(response.status().as_u16()));
+        }
+        let body: serde_json::Value = response.json().await
+            .map_err(|e| HttpError::Uncertain(format!("reset_prefix_cache acknowledgement: {e}")))?;
+        if body.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(HttpError::Uncertain("reset_prefix_cache was not confirmed".into()));
+        }
+        Ok(())
+    }
+
     /// `POST /collective_rpc` — the dangerous collective control surface
     /// (vLLM security docs [S2]). Reachable only under the deep-park policy
     /// gate; the adapter invokes it exactly once per collective (SPEC §11).

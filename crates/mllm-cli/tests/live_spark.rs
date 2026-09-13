@@ -342,18 +342,39 @@ async fn live_park_reload() {
         .controller
         .submit_deploy(DeployRequest {
             kind: "vllm-sleep".into(),
-            ..req("qwen3-4b-sleep", &p.model_id)
+            ..req("qualified-model-sleep", &p.model_id)
         })
         .await
         .unwrap();
+    let startup_started = std::time::Instant::now();
     let op = app.controller.request_transition(&s_dep, mllm_domain::LifecycleAction::Start).await.unwrap();
     assert_eq!(app.controller.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
+    let startup_ready_seconds = startup_started.elapsed().as_secs_f64();
     let _cleanup = LiveProcessCleanup::new(app.controller.live_pid(&s_dep).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let router_addr = listener.local_addr().unwrap();
     let router = app.router();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().unwrap();
+    let request = serde_json::json!({
+        "model": p.model_id,
+        "messages": [{"role": "user", "content": "Say 'live' and nothing else."}],
+        "max_tokens": 32,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": false},
+    });
+    let response = client.post(format!("http://{router_addr}/v1/chat/completions"))
+        .bearer_auth(app.api_key()).json(&request).send().await.unwrap();
+    let status = response.status();
+    let response: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "initial routed inference: {response}");
+    assert_eq!(response["choices"][0]["message"]["content"].as_str().unwrap_or("").trim(), "live",
+        "initial weights must produce the requested answer: {response}");
+    eprintln!("LIVE-STARTUP: {}", serde_json::json!({
+        "model": p.model_id,
+        "ready_seconds": startup_ready_seconds,
+        "response_seconds": startup_started.elapsed().as_secs_f64(),
+    }));
     for cycle in 1..=3 {
         let park_started = std::time::Instant::now();
         let op = app
@@ -377,16 +398,12 @@ async fn live_park_reload() {
         let ready_seconds = wake_started.elapsed().as_secs_f64();
         let response = client.post(format!("http://{router_addr}/v1/chat/completions"))
             .bearer_auth(app.api_key())
-            .json(&serde_json::json!({
-                "model": p.model_id,
-                "messages": [{"role": "user", "content": "Say 'live' and nothing else."}],
-                "max_tokens": 8
-            })).send().await.unwrap();
+            .json(&request).send().await.unwrap();
         let status = response.status();
         let response: serde_json::Value = response.json().await.unwrap();
         assert!(status.is_success(), "cycle {cycle}: routed inference: {response}");
         let content = response["choices"][0]["message"]["content"].as_str().unwrap_or("");
-        assert!(!content.is_empty(), "cycle {cycle}: restored weights produce tokens");
+        assert_eq!(content.trim(), "live", "cycle {cycle}: restored weights produce the requested answer");
         eprintln!("LIVE-METRIC: {}", serde_json::json!({
             "cycle": cycle,
             "park_seconds": park_seconds,
@@ -403,6 +420,63 @@ async fn live_park_reload() {
         .check_dispatch_generation(&s_dep, 0);
     assert!(denied.is_err(), "stale generation rejected (T18 live)");
     let op = app.controller.request_transition(&s_dep, mllm_domain::LifecycleAction::Stop).await.unwrap();
+    app.controller.wait_terminal(&op).await.unwrap();
+    server.abort();
+}
+
+/// Reuse distinct prefixes across destructive sleeps: one trivial prompt
+/// misses stale cached-block failures seen with concurrent post-wake traffic.
+#[tokio::test]
+async fn live_concurrent_park_reload() {
+    let Some(p) = live_profile() else { return; };
+    let dir = tempfile::Builder::new().prefix("mllm-concurrent").disable_cleanup(true).tempdir().unwrap();
+    eprintln!("LIVE-DIR: {}", dir.path().display());
+    let app = roles::start_standalone_with_policy(dir.path(),
+        mllm_adapters::fake::ParkPolicy::ExperimentalAllowed).await.unwrap();
+    let id = app.controller.submit_deploy(DeployRequest {
+        kind:"vllm-sleep".into(), ..req("concurrent-sleep", &p.model_id)
+    }).await.unwrap();
+    let op = app.controller.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    assert_eq!(app.controller.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
+    let pid = app.controller.live_pid(&id).unwrap();
+    let _cleanup = LiveProcessCleanup::new(pid);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/chat/completions",listener.local_addr().unwrap());
+    let router = app.router();
+    let server = tokio::spawn(async move { axum::serve(listener,router).await.unwrap() });
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(180)).build().unwrap();
+    for cycle in 0..=3 {
+        if cycle > 0 {
+            let op = app.controller.request_transition(&id,mllm_domain::LifecycleAction::Park).await.unwrap();
+            assert_eq!(app.controller.wait_terminal(&op).await.unwrap(),LifecycleState::Parked);
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let (client,url,key,model,barrier) = (client.clone(),url.clone(),app.api_key().to_owned(),p.model_id.clone(),barrier.clone());
+            tasks.spawn(async move {
+                let expected = format!("batch-{i}");
+                let request = serde_json::json!({"model":model,"messages":[{"role":"user","content":
+                    format!("Return exactly this text and nothing else: {expected}")}],
+                    "temperature":0,"max_tokens":16,"chat_template_kwargs":{"enable_thinking":false}});
+                barrier.wait().await;
+                let started = std::time::Instant::now();
+                let response = client.post(url).bearer_auth(key).json(&request).send().await.unwrap();
+                assert!(response.status().is_success());
+                let body:serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["model"],model);
+                assert_eq!(body["choices"][0]["message"]["content"].as_str().unwrap_or("").trim(),expected,
+                    "cycle {cycle}, request {i}: {body}");
+                started.elapsed().as_secs_f64()
+            });
+        }
+        let mut times = Vec::new();
+        while let Some(result) = tasks.join_next().await { times.push(result.unwrap()); }
+        assert_eq!(times.len(),8);
+        assert_eq!(app.controller.live_pid(&id),Some(pid),"wake reuses one engine");
+        eprintln!("LIVE-CONCURRENT: {}",serde_json::json!({"cycle":cycle,"correct":8,"seconds":times}));
+    }
+    let op = app.controller.request_transition(&id,mllm_domain::LifecycleAction::Stop).await.unwrap();
     app.controller.wait_terminal(&op).await.unwrap();
     server.abort();
 }

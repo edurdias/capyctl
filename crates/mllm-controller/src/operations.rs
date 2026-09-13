@@ -148,9 +148,17 @@ fn plan(from: LifecycleState, action: LifecycleAction) -> Option<Vec<(LifecycleS
         (Start, Stopped) => vec![
             (Starting, Step::Admit),
             (Starting, Step::Spawn),
-            (Ready, Step::Readiness),
+            (Starting, Step::Readiness),
+            (Ready, Step::Confirm),
         ],
-        (Start, Parked) => vec![(Waking, Step::Admit), (Ready, Step::Restore)],
+        // Each state is published BEFORE its work runs. Keep activation
+        // non-ready until all engine work completes, or concurrent routing
+        // can bypass the wake join and infer with unrestored weights.
+        (Start, Parked) => vec![
+            (Waking, Step::Admit),
+            (Waking, Step::Restore),
+            (Ready, Step::Confirm),
+        ],
         (Park, Ready) => vec![
             (Draining, Step::Quiesce),
             (Parking, Step::Park),
@@ -1196,6 +1204,68 @@ mod tests {
         drive(&c, &dep, LifecycleAction::Park, Ok(LifecycleState::Parked)).await;
         drive(&c, &dep, LifecycleAction::Start, Ok(LifecycleState::Ready)).await;
         drive(&c, &dep, LifecycleAction::Stop, Ok(LifecycleState::Stopped)).await;
+    }
+
+    struct GatedActivationAdapter {
+        inner: FakeEngine,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl EngineAdapter for GatedActivationAdapter {
+        async fn inspect(&self, m: &MemberRef) -> Result<EngineState, AdapterError> {
+            self.inner.inspect(m).await
+        }
+        async fn render_plan(&self, p: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+            self.inner.render_plan(p).await
+        }
+        async fn check_readiness(&self, m: &MemberRef) -> Result<Readiness, AdapterError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.check_readiness(m).await
+        }
+        async fn prepare_park(&self, m: &MemberRef) -> Result<Quiescence, AdapterError> {
+            self.inner.prepare_park(m).await
+        }
+        async fn observe_work(&self, m: &MemberRef) -> Result<WorkObservation, AdapterError> {
+            self.inner.observe_work(m).await
+        }
+        async fn park(&self, m: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+            self.inner.park(m, level).await
+        }
+        async fn restore(&self, m: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.restore(m).await
+        }
+        async fn reload_weights(&self, m: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+            self.inner.reload_weights(m).await
+        }
+        async fn cancel_work(&self, m: &MemberRef, r: &RequestRef, global: bool) -> Result<CancellationOutcome, AdapterError> {
+            self.inner.cancel_work(m, r, global).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_is_published_only_after_activation_work_completes() {
+        let adapter = Arc::new(GatedActivationAdapter {
+            inner: FakeEngine::new(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let c = Controller::new(store.clone(), adapter.clone(), Arc::new(FakeLauncher::new()));
+        let dep = c.submit_deploy(req("gated")).await.unwrap();
+        for expected in [LifecycleState::Starting, LifecycleState::Waking] {
+            let op = c.request_transition(&dep, LifecycleAction::Start).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), adapter.entered.notified()).await.unwrap();
+            let observed = store.lock().unwrap().get_deployment(&dep).unwrap().unwrap().observed_state;
+            adapter.release.notify_one();
+            assert_eq!(c.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
+            assert_eq!(observed, expected, "incomplete activation must not admit inference");
+            drive(&c, &dep, LifecycleAction::Park, Ok(LifecycleState::Parked)).await;
+        }
     }
 
     #[tokio::test]

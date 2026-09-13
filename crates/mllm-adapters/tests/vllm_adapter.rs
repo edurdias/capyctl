@@ -3,8 +3,8 @@
 //! deep-park policy gate, uncertainty semantics, and readiness rules.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::routing::{get, post};
@@ -20,6 +20,8 @@ struct MockState {
     sleep_hits: Arc<AtomicUsize>,
     wake_hits: Arc<AtomicUsize>,
     rpc_hits: Arc<AtomicUsize>,
+    reset_rejected: Arc<AtomicBool>,
+    restore_events: Arc<Mutex<Vec<&'static str>>>,
 }
 
 async fn models() -> Json<serde_json::Value> {
@@ -32,13 +34,20 @@ async fn do_sleep(State(st): State<MockState>) -> Json<serde_json::Value> {
 }
 
 async fn do_wake(State(st): State<MockState>) -> Json<serde_json::Value> {
+    st.restore_events.lock().unwrap().push("wake");
     st.wake_hits.fetch_add(1, Ordering::SeqCst);
     Json(serde_json::json!({"awake": true}))
 }
 
 async fn rpc(State(st): State<MockState>) -> Json<serde_json::Value> {
+    st.restore_events.lock().unwrap().push("reload");
     st.rpc_hits.fetch_add(1, Ordering::SeqCst);
     Json(serde_json::json!({"ok": true}))
+}
+
+async fn reset_cache(State(st): State<MockState>) -> Json<serde_json::Value> {
+    st.restore_events.lock().unwrap().push("reset_cache");
+    Json(serde_json::json!({"success": !st.reset_rejected.load(Ordering::SeqCst)}))
 }
 
 async fn spawn_mock() -> (SocketAddr, MockState) {
@@ -48,6 +57,7 @@ async fn spawn_mock() -> (SocketAddr, MockState) {
         .route("/sleep", post(do_sleep))
         .route("/wake_up", post(do_wake))
         .route("/collective_rpc", post(rpc))
+        .route("/reset_prefix_cache", post(reset_cache))
         .with_state(st.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -113,8 +123,20 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
     a.restore(&member()).await.unwrap();
     assert_eq!(st.wake_hits.load(Ordering::SeqCst), 1, "wake once");
     assert_eq!(st.rpc_hits.load(Ordering::SeqCst), 1, "collective once via lead");
+    assert_eq!(*st.restore_events.lock().unwrap(), ["wake", "reload", "reset_cache"]);
     let after = a.inspect(&member()).await.unwrap();
     assert!(matches!(after.phase, mllm_adapters::Phase::Ready));
+}
+
+#[tokio::test]
+async fn rejected_cache_reset_does_not_release_parked_readiness() {
+    let (addr, st) = spawn_mock().await;
+    let a = VllmAdapter::new(format!("http://{addr}").parse().unwrap(), None,
+        "vllm-test-1".into(), ParkPolicy::ExperimentalAllowed, "toy-model".into());
+    a.park(&member(), ParkLevel::Two).await.unwrap();
+    st.reset_rejected.store(true, Ordering::SeqCst);
+    assert!(a.restore(&member()).await.is_err(), "HTTP 200 with success=false is not restoration");
+    assert!(matches!(a.check_readiness(&member()).await.unwrap(), Readiness::Initializing));
 }
 
 #[tokio::test]

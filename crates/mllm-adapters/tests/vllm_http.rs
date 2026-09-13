@@ -99,6 +99,23 @@ async fn collective_rpc_requests_weight_reload() {
 }
 
 #[tokio::test]
+async fn prefix_reset_requires_explicit_boolean_success_and_authenticates() {
+    for (body, success) in [(r#"{"success":true}"#, true), (r#"{"success":false}"#, false),
+                            (r#"{"success":"true"}"#, false), ("{}", false), ("", false), ("not json", false)] {
+        let app = axum::Router::new().route("/reset_prefix_cache", post(move |headers: axum::http::HeaderMap| async move {
+            assert_eq!(headers.get("authorization").unwrap(), "Bearer test-secret");
+            body
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener,app).await.unwrap() });
+        let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), Some("test-secret".into()));
+        assert_eq!(http.reset_prefix_cache().await.is_ok(), success, "acknowledgement: {body:?}");
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn checkpoint_reload_can_exceed_short_control_timeout() {
     let app = axum::Router::new().route("/collective_rpc", post(|| async {
         tokio::time::sleep(std::time::Duration::from_secs(31)).await;

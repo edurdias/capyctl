@@ -235,6 +235,10 @@ impl EngineAdapter for VllmAdapter {
         // verifies readiness + generation.
         self.http.wake().await.map_err(|e| Self::uncertain_http("restore wake", e))?;
         self.reload_weights(member).await?;
+        // Discarded KV allocations must never be reused through stale prefix
+        // metadata. Require invalidation after reload, before releasing Ready.
+        self.http.reset_prefix_cache().await
+            .map_err(|e| Self::uncertain_http("restore cache reset", e))?;
         self.set_parked(member, false);
         Ok(RestoreOutcome::Restored)
     }
