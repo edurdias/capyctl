@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
+use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
@@ -106,5 +106,19 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM request_leases", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn v5_lifecycle_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        for table in ["runtime_bindings", "endpoint_leases", "lifecycle_runs",
+                      "lifecycle_claims", "lifecycle_steps", "lifecycle_evidence"] {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "{table}");
+        }
     }
 }

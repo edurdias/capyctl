@@ -124,6 +124,63 @@ CREATE TABLE request_leases(
 CREATE INDEX request_leases_deployment ON request_leases(deployment_id);
 "#;
 
+pub const SCHEMA_V5: &str = r#"
+CREATE TABLE runtime_bindings(
+  id TEXT PRIMARY KEY,
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  incarnation TEXT NOT NULL UNIQUE,
+  ownership TEXT NOT NULL CHECK(ownership IN ('managed','attached')),
+  binding_json TEXT NOT NULL,
+  identities_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('reserved','live','uncertain','released'))
+);
+CREATE UNIQUE INDEX one_retained_binding ON runtime_bindings(deployment_id)
+  WHERE state!='released';
+CREATE TABLE endpoint_leases(
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  PRIMARY KEY(host,port)
+);
+CREATE TABLE lifecycle_runs(
+  operation_id TEXT PRIMARY KEY REFERENCES operations(id),
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  generation INTEGER NOT NULL CHECK(generation>0),
+  session_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('activate','park','stop','prepare','reconcile')),
+  state TEXT NOT NULL CHECK(state IN ('queued','running','uncertain','succeeded','failed')),
+  deadline_ms INTEGER NOT NULL,
+  plan_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX one_activation ON lifecycle_runs(deployment_id,revision,generation)
+  WHERE action='activate' AND state IN ('queued','running','uncertain');
+CREATE TABLE lifecycle_claims(
+  deployment_id TEXT PRIMARY KEY REFERENCES deployments(id),
+  operation_id TEXT NOT NULL REFERENCES lifecycle_runs(operation_id),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  generation INTEGER NOT NULL CHECK(generation>0)
+);
+CREATE TABLE lifecycle_steps(
+  id TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL REFERENCES lifecycle_runs(operation_id),
+  ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  session_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('planned','armed','uncertain','completed','cancelled')),
+  step_json TEXT NOT NULL,
+  grant_id TEXT UNIQUE REFERENCES resource_grants(id),
+  UNIQUE(operation_id,ordinal)
+);
+CREATE TABLE lifecycle_evidence(
+  step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),
+  evidence_json TEXT NOT NULL,
+  committed_epoch INTEGER NOT NULL CHECK(committed_epoch>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
