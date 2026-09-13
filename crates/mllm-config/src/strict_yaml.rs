@@ -64,7 +64,7 @@ pub fn validate(text: &str, expected: ConfigKind) -> Result<(), ConfigError> {
 
 /// Build a `serde_json::Value` from the event stream, rejecting duplicate
 /// mapping keys as they are inserted.
-fn build_value(text: &str) -> Result<Value, ConfigError> {
+pub(crate) fn build_value(text: &str) -> Result<Value, ConfigError> {
     enum Frame {
         Map(Map<String, Value>),
         Seq(Vec<Value>),
@@ -100,6 +100,10 @@ fn build_value(text: &str) -> Result<Value, ConfigError> {
                     }
                 }
             };
+            if let Frame::Seq(seq) = parent {
+                seq.push(value);
+                return Ok(());
+            }
             let Some(key) = key else {
                 return Err(ConfigError::new(
                     ConfigErrorCode::SchemaVersion,
@@ -121,7 +125,7 @@ fn build_value(text: &str) -> Result<Value, ConfigError> {
                     }
                     map.insert(key, value);
                 }
-                Frame::Seq(seq) => seq.push(value),
+                Frame::Seq(_) => unreachable!("sequence parent handled above"),
             }
             Ok(())
         }
@@ -546,5 +550,25 @@ mod tests {
         let y = "schema_version: 1\nkind: server\nname: a\nlisteners: {}\n\
                  scheduler:\n  queue:\n    max_buffered_bytes_total: \"64MiB\"\n";
         assert!(validate(y, ConfigKind::Server).is_ok());
+    }
+
+    #[test]
+    fn event_builder_attaches_object_and_nested_array_elements() {
+        assert_eq!(
+            build_value("items:\n  - id: one\n  - id: two\n").unwrap(),
+            serde_json::json!({"items": [{"id":"one"},{"id":"two"}]})
+        );
+        assert_eq!(
+            build_value("items:\n  - - one\n    - two\n").unwrap(),
+            serde_json::json!({"items": [["one","two"]]})
+        );
+    }
+
+    #[test]
+    fn event_builder_rejects_duplicate_keys_inside_array_objects() {
+        assert_eq!(
+            build_value("items:\n  - id: one\n    id: two\n").unwrap_err().code,
+            ConfigErrorCode::DuplicateKey
+        );
     }
 }

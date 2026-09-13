@@ -1,5 +1,7 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
+pub mod candidate;
+
 use crate::engine_policy::{validate_profile_args, validate_profile_env};
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
@@ -422,21 +424,33 @@ struct RawQueue {
     request_deadline: Option<String>,
     admission_window: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProfile {
     engine: Engine,
     revision: u64,
     executable: String,
     build_fingerprint: String,
-    qualification_id: String,
+    #[serde(default)]
+    qualification_id: MissingAwareQualification,
     args: Vec<String>,
     launch_settings: RawLaunchSettings,
     env: BTreeMap<String, String>,
     security: Security,
     log_policy: RawLogPolicy,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Default)]
+enum MissingAwareQualification {
+    #[default]
+    Missing,
+    Present(Option<String>),
+}
+impl<'de> Deserialize<'de> for MissingAwareQualification {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<String>::deserialize(deserializer).map(Self::Present)
+    }
+}
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLogPolicy {
     max_file_bytes: String,
@@ -740,6 +754,17 @@ pub fn resolve_effective(
             "schema version 1 and matching kinds required",
         ));
     }
+    if h.runtime_profiles.values().any(|profile| {
+        matches!(
+            profile.qualification_id,
+            MissingAwareQualification::Missing
+        )
+    }) {
+        return Err(invalid(
+            "runtime_profiles.qualification_id",
+            "qualification reference is required for ordinary host resolution",
+        ));
+    }
     for (path, value) in [
         ("deployment.name", &d.name),
         ("model.path", &d.model.path),
@@ -776,8 +801,16 @@ pub fn resolve_effective(
     if !Path::new(&raw_profile.executable).is_absolute() {
         return Err(invalid("runtime_profiles.executable", "must be absolute"));
     }
+    let qualification_id = match &raw_profile.qualification_id {
+        MissingAwareQualification::Present(Some(value)) if !value.is_empty() => value,
+        _ => {
+            return Err(invalid(
+                "runtime_profiles.qualification_id",
+                "selected qualification reference must be nonempty",
+            ))
+        }
+    };
     if raw_profile.build_fingerprint.is_empty()
-        || raw_profile.qualification_id.is_empty()
         || matches!(raw_profile.engine, Engine::Vllm | Engine::Sglang)
             && raw_profile
                 .security
@@ -970,7 +1003,7 @@ pub fn resolve_effective(
         revision: raw_profile.revision,
         executable: raw_profile.executable.clone(),
         build_fingerprint: raw_profile.build_fingerprint.clone(),
-        qualification_id: raw_profile.qualification_id.clone(),
+        qualification_id: qualification_id.clone(),
         args: raw_profile.args.clone(),
         launch_settings,
         env: raw_profile.env.clone(),
