@@ -167,3 +167,7 @@ the work being executed. The owner will review consequential questions in the mo
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.
+- Qualification import keeps one local host identity per database. Foreign host rows
+  conflict; multiple rows fail as corrupt state. Cost: hostname changes require
+  reviewed migration. Earlier document review treated this restriction as optional;
+  implemented and reviewed code chose stricter behavior. Future readers preserve it.
