@@ -2,6 +2,55 @@ use super::*;
 use crate::candidate_creation::tests::{command, fixture, setup};
 use serde_json::{json, Value};
 const BODY: &str = r#"{"expected_revision":1,"action":"initialize","deadline_ms":400000}"#;
+#[test]
+fn initialize_preserves_reviewed_device_order_while_matching_canonical_ledger() {
+    let (mut manifest, mut host, mut policy) = fixture("fake");
+    manifest["effective_recipe"]["host_devices"]["gpu1"] =
+        manifest["effective_recipe"]["host_devices"]["gpu0"].clone();
+    host["resource_policy"]["devices"]["gpu1"] = host["resource_policy"]["devices"]["gpu0"].clone();
+    policy
+        .devices
+        .insert("gpu1".into(), policy.devices["gpu0"].clone());
+    let devices = json!([{"id":"gpu1","sharing":"shared"},{"id":"gpu0","sharing":"shared"}]);
+    manifest["effective_recipe"]["devices"] = devices.clone();
+    for phase in ["cold", "ready", "parking", "wake"] {
+        manifest["effective_recipe"]["resources"][phase]["devices"] = devices.clone();
+    }
+    let reviewed =
+        super::super::validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap();
+    policy
+        .qualification_policy
+        .as_mut()
+        .unwrap()
+        .allowed_manifest_digests = vec![reviewed.manifest_digest().into()];
+    let store = crate::Store::open_in_memory().unwrap();
+    let s = setup(&store, &policy);
+    let c = store
+        .create_candidate_run(&s, "owner", "create", &command(&manifest), &host, 1000)
+        .unwrap();
+    let r = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+        .unwrap();
+    assert!(matches!(
+        arm(&store, &s, r.step_id()),
+        Ok(ArmResult::New { .. })
+    ));
+    let context = store
+        .candidate_initialize_execution(&s, r.step_id())
+        .unwrap();
+    assert_eq!(context.completion_target.unwrap().devices.len(), 2);
+    assert_eq!(
+        store
+            .candidate_run_snapshot("owner", c.run_id())
+            .unwrap()
+            .unwrap()
+            .reviewed_manifest()
+            .effective_recipe()
+            .devices()[0]
+            .id,
+        "gpu1"
+    );
+}
 fn arm(
     store: &crate::Store,
     session: &CoordinatorSession,
@@ -519,6 +568,25 @@ fn initialize_execution_rejects_wrong_running_operation() {
     assert!(store
         .candidate_initialize_execution(&s, r.step_id())
         .is_err());
+}
+
+#[test]
+fn initialize_recorded_uncertainty_is_never_a_new_attempt() {
+    let (store, s, c) = created("fake");
+    let r = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+        .unwrap();
+    arm(&store, &s, r.step_id()).unwrap();
+    store.conn.execute_batch("UPDATE lifecycle_steps SET state='uncertain'; UPDATE lifecycle_runs SET state='uncertain'; UPDATE qualification_runs SET state='uncertain'; UPDATE operations SET state='failed' WHERE kind='candidate_initialize'; UPDATE host_qualification_policies SET policy_json=json_set(policy_json,'$.state.policy.allow_qualification_runs',json('false'));").unwrap();
+    let before = durable(&store);
+    assert_eq!(
+        arm(&store, &s, r.step_id()).unwrap(),
+        ArmResult::AlreadyRecorded
+    );
+    assert!(store
+        .candidate_initialize_execution(&s, r.step_id())
+        .is_err());
+    assert_eq!(durable(&store), before);
 }
 #[test]
 fn initialize_grant_context_and_identity_corruption_fails_closed() {

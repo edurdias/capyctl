@@ -211,6 +211,14 @@ impl crate::Store {
         if read.state != "armed" || read.run_state != "running" {
             return Err(LifecycleError::Conflict);
         }
+        let running: bool = tx.query_row(
+            "SELECT state='running' FROM operations WHERE id=?1",
+            [&read.planned.operation_id],
+            |r| r.get(0),
+        )?;
+        if !running || snapshot.state() != super::CandidateRunState::Running {
+            return Err(LifecycleError::Conflict);
+        }
         let e = read.execution.ok_or(LifecycleError::CorruptStoredData)?;
         let p = read.planned;
         let context = StepExecutionContext {
@@ -824,14 +832,6 @@ fn current(
     fences(tx, snapshot)?;
     claim(tx, &read.planned)?;
     if read.execution.is_some() {
-        let running: bool = tx.query_row(
-            "SELECT state='running' FROM operations WHERE id=?1",
-            [&read.planned.operation_id],
-            |r| r.get(0),
-        )?;
-        if !running || snapshot.state() != super::CandidateRunState::Running {
-            return Err(LifecycleError::Conflict);
-        }
         let uncertain:bool=tx.query_row("SELECT state='uncertain' FROM runtime_bindings WHERE id=?1 AND deployment_id=?2 AND incarnation=?3",params![read.planned.binding_id,read.planned.deployment_id,read.planned.incarnation],|r|r.get(0))?;
         if !uncertain {
             return Err(LifecycleError::Conflict);
@@ -999,7 +999,15 @@ fn read_step(
                 ResourceStoreError::Sql(e) => Error::Sql(e),
                 _ => Error::CorruptStoredData,
             })?;
-            if ledger.epoch < epoch || ledger.owners.get(&step.deployment_id) != Some(&cold) {
+            // Ledger serialization canonicalizes allocation/device order; reviewed recipe
+            // order is immutable but is not part of accounting identity.
+            if ledger.epoch < epoch
+                || ledger.owners.get(&step.deployment_id).is_none_or(|owner| {
+                    owner.phase != ResourcePhase::Cold
+                        || StoredTarget::from_footprint(owner)
+                            != StoredTarget::from_footprint(&cold)
+                })
+            {
                 return Err(Error::CorruptStoredData);
             }
         }
