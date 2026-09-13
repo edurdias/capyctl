@@ -8,6 +8,14 @@
 
 **Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3/5/6, Q7/Q8. Dependencies: [F2A2a store schema](2026-09-12-f2a2a-durable-reservation-transactions.md) and [F2A2b evidence contract](2026-09-12-f2a2b-runtime-evidence.md).
 
+## Execution status
+
+Implemented through `4de1a1e`. Four task reviews and whole-branch review approved.
+Fresh root verification: 203 CPU tests pass; scoped Clippy clean. Closure race passes
+20 repetitions. CLI integration targets excluded. No production cutover/live qualification.
+Task 3 formatter spill restored for tracked files; untracked-file uncertainty remains
+recorded in the overnight review, not counted as verified preservation.
+
 ## Global Constraints
 
 - “Dispatch atomically checks current generation and open admission while registering in-flight work, preventing races with admission closure.”

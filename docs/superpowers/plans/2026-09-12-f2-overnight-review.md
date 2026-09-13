@@ -63,6 +63,10 @@ the work being executed. The owner will review consequential questions in the mo
   reusable qualification identity, and verified external-accounting reconciliation.
   A3 policy/run/event foundations precede atomic arm implementation. No pending
   document decision; no runtime or hardware qualification implied.
+- F2A2c complete through `4de1a1e`: durable session fences, atomic dispatch gates,
+  retained uncertain requests, explicit original-generation completion. Four task
+  reviews and broader review approved. Fresh root checks: 203 CPU tests and scoped
+  Clippy pass; closure race20/20. Production router remains on F1 until joint cutover.
 
 ## Execution decisions
 

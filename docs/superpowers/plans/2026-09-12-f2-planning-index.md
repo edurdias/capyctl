@@ -11,7 +11,7 @@ This index tracks that planning work; it is not an implementation or qualificati
 | [F2A1](2026-09-12-f2a1-resource-contracts-and-admission.md) | Implemented; task and whole-branch review complete | Physical domains, phase footprints, sharing, forecasts, admission |
 | [F2A2a](2026-09-12-f2a2a-durable-reservation-transactions.md) | Implemented; task and whole-branch review complete | Durable resource increases, epochs, revision/generation fences |
 | [F2A2b](2026-09-12-f2a2b-runtime-evidence.md) | Implemented; task and whole-branch review complete | Host observations, qualified completion tokens and process identities |
-| [F2A2c](2026-09-12-f2a2c-durable-dispatch-ownership.md) | Written; examples checked | Coordinator sessions, durable request leases, atomic dispatch closure |
+| [F2A2c](2026-09-12-f2a2c-durable-dispatch-ownership.md) | Implemented; task and whole-branch review complete | Coordinator sessions, durable request leases, atomic dispatch closure |
 | [F2A2d coordinator integration](2026-09-12-f2a2d-coordinator-integration.md) | Written; integrated review corrected | Runtime/endpoint ownership, lifecycle steps, verified reductions, preparation, recovery, router cutover |
 | [F2A3 management/configuration](2026-09-12-f2a3-management-and-configuration.md) | Written; integrated review corrected | Strict effective schemas, authenticated API/CLI, revisions, snapshots/events, attachment |
 | [F2B SGLang](2026-09-12-f2b-sglang-adapter.md) | Written; integrated review corrected | Pinned adapter, readiness, qualified parking/restoration, cache/security contracts |
@@ -86,7 +86,8 @@ The owner authorized subsequent task-by-task implementation while away overnight
 Record consequential open questions for morning review; do not invent permission
 for hardware changes or unsafe qualification. The CPU-only admission kernel is
 complete, as are durable reservation transactions and runtime-evidence helpers.
-Durable dispatch comes next. Full checkpoint `60fd33a` passes 194 CPU tests and
-scoped Clippy; formatting fix `0f5a576` passes focused checks. No live gate is closed.
+Durable dispatch is also complete. Checkpoint `4de1a1e` passes 203 CPU tests and
+scoped Clippy. Coordinator integration comes next, interleaved with A3 foundations
+under the reviewed cross-plan execution order. No live gate is closed.
 
 Only host-a is in scope for future live qualification. Do not access host-b.
