@@ -4,7 +4,14 @@ Engine-neutral lifecycle and inference-routing controller: one endpoint, bring-y
 inference engines, explicit deployment ownership, safe model residency transitions, and
 aggregate resource control.
 
-**Status:** design phase — no runtime exists yet.
+**Status:** F0 foundation and the F1 vLLM path are implemented, with scoped
+live Spark evidence. The latest 4B routed concurrency test passed after a
+readiness-ordering fix. This is not general production qualification;
+management CLI wiring and real resource accounting remain incomplete.
+F2 (SGLang through the same contracts) is next.
+
+See [current gaps](docs/design/milestones/f1-open-items.md) and
+[model-size and concurrency evidence](docs/runbooks/spark-model-size-qualification.md).
 
 ## Documentation
 

@@ -1,5 +1,12 @@
 # mllm handoff package — revision 0.2
 
+**Repository status (2026-09-12):** the original design package below now sits
+alongside the F0/F1 implementation. For current status, read
+[`design/milestones/f1-open-items.md`](design/milestones/f1-open-items.md) and
+[`runbooks/spark-model-size-qualification.md`](runbooks/spark-model-size-qualification.md).
+F2 SGLang is the next milestone; the design-package revision is not a software
+release or a hardware qualification claim.
+
 Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning.
 
 ## Contents
@@ -19,6 +26,10 @@ Revision 0.2 supersedes `mllm-initial-design.md` revision 0.1 and incorporates t
 
 ## Verification boundary
 
-The package contains design documents and illustrative configuration only. No mllm source implementation, schemas, installed engines, secrets, model weights, or production-qualified recipes are included. YAML examples were parsed for syntax and checked for consistency with their copies in the specification; that is not validation against an implemented mllm schema or a live engine.
+The original package's checks covered design documents and illustrative
+configuration only. The repository now also contains implementation and tests;
+their evidence is reported separately in the runbooks. YAML syntax checks do
+not establish live-engine correctness, and installed engines, secrets and model
+weights are not part of this documentation package.
 
 Names, addresses, paths, byte budgets, and durations are examples. Source-backed upstream behavior is referenced inside the specification and still requires verification against the exact build selected for implementation.

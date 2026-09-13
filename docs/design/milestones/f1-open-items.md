@@ -1,5 +1,30 @@
 # F1 Merge — Open Items for Review (2026-09-12 night run)
 
+## Current closeout (2026-09-12)
+
+The merge record below is historical. Subsequent live 4B concurrency exposed a
+controller bug: Ready was published before activation work completed. The
+controller now retains Starting/Waking through readiness/restoration, and the
+vLLM adapter requires a confirmed post-reload cache reset. The reproduced
+workload passed 32/32 exact routed responses, including three eight-request
+automatic wake bursts, with one reload each and an unchanged engine PID.
+See [full comparison and limits](../../runbooks/spark-model-size-qualification.md#fix-and-routed-concurrency-retest).
+
+This does not qualify arbitrary concurrency, streaming after this fix, or
+14B/27B after this fix. The earlier 14B smoke run passed; 27B passed only under
+an explicitly relaxed diagnostic swap budget. Idle GPU utilization reporting
+remains unresolved. Inference during an explicit administrative start may
+return an activation error because that operation is outside the router join.
+
+Only host-a is currently authorized; the references to host-b below record
+earlier runs, not current permission. The next formal milestone is **F2 SGLang**
+per SPEC §18. Management/API wiring and real reservations below are carryovers
+to scope explicitly, not a replacement for that milestone's exit gate.
+
+The localhost interactive lab is temporary test tooling, not the management
+API. Its Rust harness and private helper scripts remain machine-local and are
+not included in the retained production-fix commit.
+
 **Merged:** `master` at `ef094c6` — F1 first vLLM path. 172 tests passing,
 clippy `--all-targets -D warnings` clean. Simulator tier fully green; live
 restart-only qualification PASSED on the DGX Spark.
@@ -12,7 +37,8 @@ three level-2 park/reload cycles with authenticated routed inference after
 every reload, real lost-ack park injection, and T21 denial before engine spawn.
 The recipe remains vLLM 0.29.0 + Qwen3-4B, with 16 GiB KV and 4096 context.
 Commands, results, failed probes, timings, and machine-local evidence pointers
-are recorded only in `docs/runbooks/spark-qualification-f1.md` §4.
+for those four stages are recorded in `docs/runbooks/spark-qualification-f1.md` §4.
+Later model-size and concurrency evidence is in the separate runbook linked above.
 
 ### 2. Park-based switching needs per-deployment ports (F4)
 The live A→B→A alternation uses stop-based release because a parked process

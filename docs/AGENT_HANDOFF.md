@@ -1,12 +1,19 @@
 # mllm — Coding-Agent Handoff
 
 **Specification:** `SPEC.md`, revision 0.2, September 10, 2026.  
-**Status:** Architecture and requirements, not existing implementation.  
+**Status:** F0/F1 implementation exists; F2 scoping is next.
 **Owner:** Eduardo Rodrigues Dias.
 
 ## Assignment
 
-Build mllm as a fresh, engine-neutral lifecycle and inference-routing controller. Use the accompanying specification as the source of truth. Read it before proposing a repository structure or implementing a single-engine shortcut. This handoff does not provide an existing repository, production deployment credentials, an inference runtime, or a qualified model recipe.
+Continue mllm as an engine-neutral lifecycle and inference-routing controller.
+Use the accompanying specification as the source of truth, and inspect the
+existing contracts before proposing new ones. Current implementation gaps are in
+`design/milestones/f1-open-items.md`; measured model-size and post-wake
+concurrency evidence is in `runbooks/spark-model-size-qualification.md`.
+This document does not supply credentials, installed runtimes, or authority to
+operate hardware. The current user has restricted hardware work to host-a;
+host-b is reserved for their use.
 
 The initial delivery order is foundation, a working vLLM path, then SGLang immediately next. Remote-host and multi-node contracts must be designed from the beginning and validated at their named milestones. Do not postpone SGLang behind a dashboard or general cluster scheduler.
 
@@ -26,7 +33,12 @@ mllm status deployment <deployment-id>
 
 These are required UX directions, not currently executable commands. `deploy` without `--wait` must return a durable deployment ID after persistence. `--wait` watches the same work; a CLI disconnect must not abandon it.
 
-## First deliverable
+## Original first-deliverable guidance (F0/F1 history)
+
+The foundation and vLLM plans below have already been executed. Do not restart
+them from scratch. The next milestone is F2's second engine adapter through the
+existing conformance suite. Management and resource-accounting carryovers need
+explicit scope during planning; they are not evidence of completed capabilities.
 
 Prepare an implementation plan with small, testable slices, mapped to R01–R14 and T01–T40 in the specification. Record brief architectural decisions for the proposed Rust implementation, embedded persistence, transport, schema, and numerical defaults. Exact choices not independently approved are explicitly marked as proposals in the spec; do not misrepresent them as established facts.
 
@@ -68,4 +80,6 @@ Measure end-to-end request-to-first-token and memory behavior, not just reload R
 
 At the end of each slice, provide the changed files, test evidence, remaining release gates, and the next bounded slice. Do not claim mllm, an engine build, or a hardware combination works because the YAML parsed or a mock passed. The examples in this package are schema sketches, not calibrated runtime recipes.
 
-The project is open source, but its exact license has not been selected. Obtain the owner's choice before publication rather than adding an assumed license grant.
+The owner selected Apache-2.0 in `design/adr/0006-license.md`. Publication remains
+separate from local work; the license file and packaging checks remain required
+before publication.
