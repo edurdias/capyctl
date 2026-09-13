@@ -52,6 +52,108 @@ impl ExecLauncher {
     fn recorded_identity(&self, pid: u32) -> Option<ProcessIdentity> {
         self.spawned.lock().unwrap().get(&pid).cloned()
     }
+
+    fn terminate_with_signal<F>(
+        &self,
+        h: &OwnedHandle,
+        grace: Duration,
+        signal_group: &F,
+    ) -> Result<ExitReport, LauncherError>
+    where
+        F: Fn(nix::unistd::Pid, nix::sys::signal::Signal) -> Result<(), nix::errno::Errno>,
+    {
+        // Never signal a process we do not own (SPEC §13.2).
+        match self.verify_handle(h) {
+            HandleStatus::Valid => {}
+            HandleStatus::Gone => return Ok(self.gone_report(h)),
+            HandleStatus::StaleReused => {
+                return Err(LauncherError::TerminateFailed(format!(
+                    "handle pid {} no longer owned (PID reuse detected); refusing to signal",
+                    h.pid
+                )));
+            }
+        }
+        let pgid = nix::unistd::Pid::from_raw(h.pid as i32);
+        match self.verify_handle(h) {
+            HandleStatus::Valid => {}
+            HandleStatus::Gone => return Ok(self.gone_report(h)),
+            HandleStatus::StaleReused => {
+                return Err(LauncherError::TerminateFailed(format!(
+                    "handle pid {} changed immediately before SIGTERM",
+                    h.pid
+                )));
+            }
+        }
+        if let Err(error) = signal_group(pgid, nix::sys::signal::Signal::SIGTERM) {
+            if error == nix::errno::Errno::ESRCH {
+                return Ok(self.gone_report(h));
+            }
+            return Err(LauncherError::TerminateFailed(error.to_string()));
+        }
+        let deadline = Instant::now() + grace;
+        loop {
+            if !pid_alive(h.pid) {
+                self.spawned.lock().unwrap().remove(&h.pid);
+                return Ok(ExitReport {
+                    pid: h.pid,
+                    exit_code: None,
+                    signal: Some(nix::sys::signal::Signal::SIGTERM as i32),
+                    killed: false,
+                });
+            }
+            if Instant::now() >= deadline {
+                match self.verify_handle(h) {
+                    HandleStatus::Valid => {}
+                    HandleStatus::Gone => {
+                        self.spawned.lock().unwrap().remove(&h.pid);
+                        return Ok(ExitReport {
+                            pid: h.pid,
+                            exit_code: None,
+                            signal: Some(nix::sys::signal::Signal::SIGTERM as i32),
+                            killed: false,
+                        });
+                    }
+                    HandleStatus::StaleReused => {
+                        return Err(LauncherError::TerminateFailed(format!(
+                            "handle pid {} changed immediately before SIGKILL",
+                            h.pid
+                        )));
+                    }
+                }
+                if let Err(error) = signal_group(pgid, nix::sys::signal::Signal::SIGKILL) {
+                    if error == nix::errno::Errno::ESRCH {
+                        return Ok(self.gone_report(h));
+                    }
+                    return Err(LauncherError::TerminateFailed(error.to_string()));
+                }
+                // Wait briefly for the kernel to reclaim the process.
+                for _ in 0..50 {
+                    if !pid_alive(h.pid) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                self.spawned.lock().unwrap().remove(&h.pid);
+                return Ok(ExitReport {
+                    pid: h.pid,
+                    exit_code: None,
+                    signal: Some(nix::sys::signal::Signal::SIGKILL as i32),
+                    killed: true,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn gone_report(&self, h: &OwnedHandle) -> ExitReport {
+        self.spawned.lock().unwrap().remove(&h.pid);
+        ExitReport {
+            pid: h.pid,
+            exit_code: None,
+            signal: None,
+            killed: false,
+        }
+    }
 }
 
 pub(crate) fn process_identity(pid: u32, role: &str) -> Option<ProcessIdentity> {
@@ -123,91 +225,7 @@ impl Launcher for ExecLauncher {
     }
 
     fn terminate(&self, h: &OwnedHandle, grace: Duration) -> Result<ExitReport, LauncherError> {
-        // Never signal a process we do not own (SPEC §13.2).
-        match self.verify_handle(h) {
-            HandleStatus::Valid => {}
-            HandleStatus::Gone => {
-                self.spawned.lock().unwrap().remove(&h.pid);
-                return Ok(ExitReport {
-                    pid: h.pid,
-                    exit_code: None,
-                    signal: None,
-                    killed: false,
-                });
-            }
-            HandleStatus::StaleReused => {
-                return Err(LauncherError::TerminateFailed(format!(
-                    "handle pid {} no longer owned (PID reuse detected); refusing to signal",
-                    h.pid
-                )));
-            }
-        }
-        let pgid = nix::unistd::Pid::from_raw(h.pid as i32);
-        match self.verify_handle(h) {
-            HandleStatus::Valid => {}
-            HandleStatus::Gone => {
-                self.spawned.lock().unwrap().remove(&h.pid);
-                return Ok(ExitReport {
-                    pid: h.pid,
-                    exit_code: None,
-                    signal: None,
-                    killed: false,
-                });
-            }
-            HandleStatus::StaleReused => return Err(LauncherError::TerminateFailed(format!(
-                "handle pid {} changed immediately before SIGTERM", h.pid
-            ))),
-        }
-        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM)
-            .map_err(|error| LauncherError::TerminateFailed(error.to_string()))?;
-        let deadline = Instant::now() + grace;
-        loop {
-            if !pid_alive(h.pid) {
-                self.spawned.lock().unwrap().remove(&h.pid);
-                return Ok(ExitReport {
-                    pid: h.pid,
-                    exit_code: None,
-                    signal: Some(nix::sys::signal::Signal::SIGTERM as i32),
-                    killed: false,
-                });
-            }
-            if Instant::now() >= deadline {
-                match self.verify_handle(h) {
-                    HandleStatus::Valid => {}
-                    HandleStatus::Gone => {
-                        self.spawned.lock().unwrap().remove(&h.pid);
-                        return Ok(ExitReport {
-                            pid: h.pid,
-                            exit_code: None,
-                            signal: Some(nix::sys::signal::Signal::SIGTERM as i32),
-                            killed: false,
-                        });
-                    }
-                    HandleStatus::StaleReused => {
-                        return Err(LauncherError::TerminateFailed(format!(
-                            "handle pid {} changed immediately before SIGKILL", h.pid
-                        )));
-                    }
-                }
-                nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
-                    .map_err(|error| LauncherError::TerminateFailed(error.to_string()))?;
-                // Wait briefly for the kernel to reclaim the process.
-                for _ in 0..50 {
-                    if !pid_alive(h.pid) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                self.spawned.lock().unwrap().remove(&h.pid);
-                return Ok(ExitReport {
-                    pid: h.pid,
-                    exit_code: None,
-                    signal: Some(nix::sys::signal::Signal::SIGKILL as i32),
-                    killed: true,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        self.terminate_with_signal(h, grace, &nix::sys::signal::killpg)
     }
 
     fn verify_handle(&self, h: &OwnedHandle) -> HandleStatus {
@@ -227,6 +245,137 @@ impl Launcher for ExecLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sleep_command() -> RenderedCommand {
+        RenderedCommand {
+            argv: vec!["sleep".into(), "30".into()],
+            env: Default::default(),
+        }
+    }
+
+    fn kill_test_group(handle: &OwnedHandle) {
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(handle.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sigterm_esrch_after_valid_verification_reports_gone() {
+        let launcher = ExecLauncher::new();
+        let handle = launcher.spawn(&sleep_command()).unwrap();
+        let signals = Mutex::new(Vec::new());
+
+        let report = launcher
+            .terminate_with_signal(&handle, Duration::from_secs(1), &|_, signal| {
+                signals.lock().unwrap().push(signal);
+                Err(nix::errno::Errno::ESRCH)
+            })
+            .unwrap();
+
+        assert_eq!(
+            signals.into_inner().unwrap(),
+            vec![nix::sys::signal::Signal::SIGTERM]
+        );
+        assert_eq!(
+            report,
+            ExitReport {
+                pid: handle.pid,
+                exit_code: None,
+                signal: None,
+                killed: false
+            }
+        );
+        assert!(launcher.recorded_identity(handle.pid).is_none());
+        kill_test_group(&handle);
+    }
+
+    #[test]
+    fn sigkill_esrch_after_valid_verification_reports_gone() {
+        let launcher = ExecLauncher::new();
+        let command = RenderedCommand {
+            argv: vec![
+                "sh".into(), "-c".into(),
+                "trap \"\" TERM; while :; do sleep 1; done".into(),
+            ],
+            env: Default::default(),
+        };
+        let handle = launcher.spawn(&command).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let signals = Mutex::new(Vec::new());
+
+        let report = launcher
+            .terminate_with_signal(&handle, Duration::from_millis(20), &|pid, signal| {
+                signals.lock().unwrap().push(signal);
+                if signal == nix::sys::signal::Signal::SIGKILL {
+                    Err(nix::errno::Errno::ESRCH)
+                } else {
+                    nix::sys::signal::killpg(pid, signal)
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            signals.into_inner().unwrap(),
+            vec![
+                nix::sys::signal::Signal::SIGTERM,
+                nix::sys::signal::Signal::SIGKILL
+            ]
+        );
+        assert_eq!(
+            report,
+            ExitReport {
+                pid: handle.pid,
+                exit_code: None,
+                signal: None,
+                killed: false
+            }
+        );
+        assert!(launcher.recorded_identity(handle.pid).is_none());
+        kill_test_group(&handle);
+    }
+
+    #[test]
+    fn non_esrch_signal_failure_remains_an_error() {
+        let launcher = ExecLauncher::new();
+        let handle = launcher.spawn(&sleep_command()).unwrap();
+
+        let result = launcher.terminate_with_signal(&handle, Duration::from_secs(1), &|_, _| {
+            Err(nix::errno::Errno::EPERM)
+        });
+
+        assert_eq!(
+            result,
+            Err(LauncherError::TerminateFailed(
+                "EPERM: Operation not permitted".into()
+            ))
+        );
+        kill_test_group(&handle);
+    }
+
+    #[test]
+    fn stale_identity_never_reaches_signal_boundary() {
+        let launcher = ExecLauncher::new();
+        let handle = launcher.spawn(&sleep_command()).unwrap();
+        launcher
+            .spawned
+            .lock()
+            .unwrap()
+            .get_mut(&handle.pid)
+            .unwrap()
+            .start_ticks += 1;
+        let signal_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = launcher.terminate_with_signal(&handle, Duration::from_secs(1), &|_, _| {
+            signal_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(LauncherError::TerminateFailed(_))));
+        assert_eq!(signal_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        kill_test_group(&handle);
+    }
 
     #[test]
     fn escalation_rechecks_identity_immediately_before_sigkill() {
