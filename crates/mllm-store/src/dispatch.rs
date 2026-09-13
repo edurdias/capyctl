@@ -105,6 +105,86 @@ impl DispatchTicket {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDispatch {
+    pub id: String,
+    pub revision: i64,
+    pub generation: i64,
+    pub session_id: String,
+    pub uncertain: bool,
+}
+
+fn settle_ticket(
+    conn: &Connection,
+    session: &CoordinatorSession,
+    ticket: &DispatchTicket,
+    complete: bool,
+) -> Result<bool, DispatchError> {
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    check_session(&transaction, session)?;
+    if ticket.session_id != session.id {
+        return Err(DispatchError::StaleSession);
+    }
+    let sql = if complete {
+        "DELETE FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3
+         AND generation=?4 AND session_id=?5"
+    } else {
+        "UPDATE request_leases SET disposition='uncertain' WHERE id=?1 AND deployment_id=?2
+         AND revision=?3 AND generation=?4 AND session_id=?5"
+    };
+    let changed = transaction.execute(
+        sql,
+        params![
+            ticket.id,
+            ticket.deployment_id,
+            ticket.revision,
+            ticket.generation,
+            ticket.session_id
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(changed == 1)
+}
+
+impl crate::Store {
+    pub fn pending_dispatches(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<PendingDispatch>, DispatchError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,revision,generation,session_id,disposition FROM request_leases
+             WHERE deployment_id=?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([deployment], |r| {
+            let disposition: String = r.get(4)?;
+            Ok(PendingDispatch {
+                id: r.get(0)?,
+                revision: r.get(1)?,
+                generation: r.get(2)?,
+                session_id: r.get(3)?,
+                uncertain: disposition != "inflight",
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn mark_dispatch_uncertain(
+        &self,
+        session: &CoordinatorSession,
+        ticket: &DispatchTicket,
+    ) -> Result<bool, DispatchError> {
+        settle_ticket(&self.conn, session, ticket, false)
+    }
+
+    pub fn finish_dispatch(
+        &self,
+        session: &CoordinatorSession,
+        ticket: &DispatchTicket,
+    ) -> Result<bool, DispatchError> {
+        settle_ticket(&self.conn, session, ticket, true)
+    }
+}
+
 fn outstanding(conn: &Connection, deployment: &str) -> Result<usize, DispatchError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1",
