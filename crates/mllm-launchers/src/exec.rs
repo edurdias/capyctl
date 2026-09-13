@@ -294,24 +294,16 @@ mod tests {
     #[test]
     fn sigkill_esrch_after_valid_verification_reports_gone() {
         let launcher = ExecLauncher::new();
-        let command = RenderedCommand {
-            argv: vec![
-                "sh".into(), "-c".into(),
-                "trap \"\" TERM; while :; do sleep 1; done".into(),
-            ],
-            env: Default::default(),
-        };
-        let handle = launcher.spawn(&command).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let handle = launcher.spawn(&sleep_command()).unwrap();
         let signals = Mutex::new(Vec::new());
 
         let report = launcher
-            .terminate_with_signal(&handle, Duration::from_millis(20), &|pid, signal| {
+            .terminate_with_signal(&handle, Duration::ZERO, &|_, signal| {
                 signals.lock().unwrap().push(signal);
                 if signal == nix::sys::signal::Signal::SIGKILL {
                     Err(nix::errno::Errno::ESRCH)
                 } else {
-                    nix::sys::signal::killpg(pid, signal)
+                    Ok(())
                 }
             })
             .unwrap();
@@ -380,26 +372,20 @@ mod tests {
     #[test]
     fn escalation_rechecks_identity_immediately_before_sigkill() {
         let launcher = ExecLauncher::new();
-        let command = RenderedCommand {
-            argv: vec![
-                "sh".into(), "-c".into(),
-                "trap \"\" TERM; while :; do sleep 1; done".into(),
-            ],
-            env: Default::default(),
-        };
-        let handle = launcher.spawn(&command).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(100));
+        let handle = launcher.spawn(&sleep_command()).unwrap();
+        let signals = Mutex::new(Vec::new());
+
+        let result = launcher.terminate_with_signal(&handle, Duration::ZERO, &|_, signal| {
+            signals.lock().unwrap().push(signal);
+            if signal == nix::sys::signal::Signal::SIGTERM {
                 launcher.spawned.lock().unwrap().get_mut(&handle.pid).unwrap().start_ticks += 1;
-            });
-            let result = launcher.terminate(&handle, Duration::from_millis(300));
-            assert!(matches!(result, Err(LauncherError::TerminateFailed(_))));
+            }
+            Ok(())
         });
+
+        assert!(matches!(result, Err(LauncherError::TerminateFailed(_))));
+        assert_eq!(signals.into_inner().unwrap(), vec![nix::sys::signal::Signal::SIGTERM]);
         assert!(pid_alive(handle.pid));
-        nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(handle.pid as i32), nix::sys::signal::Signal::SIGKILL,
-        ).unwrap();
+        kill_test_group(&handle);
     }
 }
