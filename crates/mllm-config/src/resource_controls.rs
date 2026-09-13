@@ -227,8 +227,20 @@ mod tests {
         let mut value = controls.clone();
         value.planner_max_states = 0;
         assert!(value.validate(&context).is_err());
-        let mut value = controls;
+        let mut value = controls.clone();
+        value.queue.max_pending_per_deployment = 0;
+        assert!(value.validate(&context).is_err());
+        let mut value = controls.clone();
         value.queue.max_pending_total = 0;
+        assert!(value.validate(&context).is_err());
+        let mut value = controls.clone();
+        value.queue.max_buffered_bytes_total = 0;
+        assert!(value.validate(&context).is_err());
+        let mut value = controls.clone();
+        value.queue.request_deadline_ms = 0;
+        assert!(value.validate(&context).is_err());
+        let mut value = controls;
+        value.queue.admission_window_ms = 0;
         assert!(value.validate(&context).is_err());
     }
 
@@ -288,6 +300,40 @@ mod tests {
             .device_sharing_overrides
             .insert("gpu0".into(), Sharing::Shared);
         assert!(value.validate(&context).is_err());
+    }
+
+    #[test]
+    fn structural_validation_rejects_context_domain_missing_from_controls() {
+        let (mut context, controls) = fixture();
+        context.domain_ids.insert("gpu-memory:0".into());
+        assert!(controls.validate(&context).is_err());
+    }
+
+    #[test]
+    fn structural_validation_rejects_control_domain_missing_from_context() {
+        let (context, mut controls) = fixture();
+        controls
+            .domains
+            .insert("gpu-memory:0".into(), controls.domains["system"].clone());
+        assert!(controls.validate(&context).is_err());
+    }
+
+    #[test]
+    fn structural_validation_rejects_context_device_missing_from_controls() {
+        let (mut context, controls) = fixture();
+        context
+            .device_domains
+            .insert("gpu1".into(), "system".into());
+        assert!(controls.validate(&context).is_err());
+    }
+
+    #[test]
+    fn structural_validation_rejects_control_device_missing_from_context() {
+        let (context, mut controls) = fixture();
+        controls
+            .device_sharing_overrides
+            .insert("gpu1".into(), Sharing::Exclusive);
+        assert!(controls.validate(&context).is_err());
     }
 
     #[test]

@@ -686,6 +686,27 @@ fn equivalent_resource_units_have_identical_normalized_controls() {
 }
 
 #[test]
+fn parsed_host_uses_shared_resource_validation_during_resolution() {
+    let (deployment, host) = fixture();
+    let host_text = serde_json::to_string(&host).unwrap();
+    let parsed = parse_strict(ConfigKind::Host, &host_text).unwrap();
+    let effective = resolve_effective(&deployment, &parsed).unwrap();
+    let controls = ResourceControls::from_host(&effective.host);
+    assert_eq!(controls.domains["unified"].managed_limit, 32_i64 << 30);
+
+    let mut invalid = host;
+    let unified = invalid["resource_policy"]["domains"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unified")
+        .unwrap();
+    invalid["resource_policy"]["domains"][""] = unified;
+    let invalid_text = serde_json::to_string(&invalid).unwrap();
+    let parsed_invalid = parse_strict(ConfigKind::Host, &invalid_text).unwrap();
+    assert!(resolve_effective(&deployment, &parsed_invalid).is_err());
+}
+
+#[test]
 fn binding_dimensions_change_binding_not_qualification_identity() {
     let (deployment, host) = fixture();
     let qualification = resolve_effective(&deployment, &host)
