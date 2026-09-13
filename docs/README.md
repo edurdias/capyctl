@@ -4,8 +4,10 @@
 alongside the F0/F1 implementation. For current status, read
 [`design/milestones/f1-open-items.md`](design/milestones/f1-open-items.md) and
 [`runbooks/spark-model-size-qualification.md`](runbooks/spark-model-size-qualification.md).
-F2 SGLang is the next milestone; the design-package revision is not a software
-release or a hardware qualification claim.
+F2 SGLang is the next milestone; its [consolidated design](design/milestones/f2-sglang-design.md)
+is pending final owner review. It includes shared single-host foundations, concurrent
+mixed-engine serving, mandatory warm parking, and API contracts for a future UI.
+The design-package revision is not a software release or a hardware qualification claim.
 
 Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning.
 
