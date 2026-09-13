@@ -26,8 +26,9 @@
     "runtime_profiles": {"local": {
       "engine": "vllm", "revision": 7, "executable": "/bin/true", "build_fingerprint": "vllm-build-1",
       "qualification_id": "qualification-evidence-17", "args": ["--max-model-len", "4096"],
+      "launch_settings": {"engine": "vllm", "tensor_parallel_size": 1, "pipeline_parallel_size": 1, "enable_sleep_mode": true, "kv_cache_dtype": "auto", "block_size_tokens": 16, "cpu_offload_bytes": "0B", "requested_budget": {"kv_cache_bytes": "4GiB", "swap_space_bytes": "0B", "gpu_utilization_pct": 75}},
       "env": {"RUST_LOG": "info"},
-      "security": {"experimental_controls": false, "credential_ref": "secret://engine-key"},
+      "security": {"experimental_controls": true, "credential_ref": "secret://engine-key"},
       "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3}
     }}
   }

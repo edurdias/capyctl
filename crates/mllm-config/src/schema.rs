@@ -171,6 +171,23 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("credential_ref", SCALAR),
         ("admin_credential_ref", SCALAR),
     ];
+    const REQUESTED_BUDGET: FieldSpec = FieldSpec::Struct(&[
+        ("kv_cache_bytes", BYTES),
+        ("swap_space_bytes", BYTES),
+        ("gpu_utilization_pct", SCALAR),
+        ("static_memory_fraction_bps", SCALAR),
+    ]);
+    const LAUNCH_SETTINGS: &[(&str, FieldSpec)] = &[
+        ("engine", SCALAR),
+        ("tensor_parallel_size", SCALAR),
+        ("pipeline_parallel_size", SCALAR),
+        ("enable_sleep_mode", SCALAR),
+        ("kv_cache_dtype", SCALAR),
+        ("block_size_tokens", SCALAR),
+        ("cpu_offload_bytes", BYTES),
+        ("recipe", SCALAR),
+        ("requested_budget", REQUESTED_BUDGET),
+    ];
     const PROFILE: FieldSpec = FieldSpec::Struct(&[
         ("engine", SCALAR),
         ("revision", SCALAR),
@@ -178,6 +195,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("build_fingerprint", SCALAR),
         ("qualification_id", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
+        ("launch_settings", FieldSpec::Struct(LAUNCH_SETTINGS)),
         ("env", FieldSpec::MapOf(&SCALAR)),
         ("security", FieldSpec::Struct(SECURITY)),
         (

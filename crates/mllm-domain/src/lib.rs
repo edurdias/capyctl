@@ -3,6 +3,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod resources;
 pub mod completion;
+pub mod launch;
 
 pub use error::TransitionError;
 pub use identity::{

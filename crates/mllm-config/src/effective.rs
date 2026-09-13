@@ -2,6 +2,10 @@
 
 use crate::engine_policy::{validate_profile_args, validate_profile_env};
 use crate::{ConfigError, ConfigErrorCode};
+use mllm_domain::launch::{
+    FakeLaunchSettings, ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget,
+    VllmLaunchSettings, VllmRequestedBudget,
+};
 use mllm_domain::resources as domain;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +15,15 @@ use std::path::Path;
 fn invalid(path: impl Into<String>, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
 }
+
+const DEFAULT_PENDING_PER_DEPLOYMENT: u32 = 64;
+const DEFAULT_PENDING_TOTAL: u32 = 256;
+const DEFAULT_QUEUED_BYTES: i64 = 64 << 20;
+const DEFAULT_REQUEST_DEADLINE_MS: i64 = 600_000;
+const DEFAULT_ADMISSION_WINDOW_MS: i64 = 2_000;
+const DEFAULT_OBSERVATION_TTL_MS: i64 = 2_000;
+const DEFAULT_PLANNER_STATES: u32 = 4_096;
+const DEFAULT_MAX_PARKED: u32 = 16;
 
 fn parse_decimal_unit(text: &str, units: &[(&str, i128)], path: &str) -> Result<i64, ConfigError> {
     let (number, multiplier) = units
@@ -182,6 +195,7 @@ pub struct RuntimeProfile {
     pub build_fingerprint: String,
     pub qualification_id: String,
     pub args: Vec<String>,
+    pub launch_settings: ProfileLaunchSettings,
     pub env: BTreeMap<String, String>,
     pub security: Security,
     pub log_policy: LogPolicy,
@@ -299,12 +313,12 @@ struct HostInput {
 struct RawHostPolicy {
     domains: BTreeMap<String, RawDomain>,
     devices: BTreeMap<String, DevicePolicy>,
-    max_parked: u32,
-    observation_ttl: String,
+    max_parked: Option<u32>,
+    observation_ttl: Option<String>,
     device_sharing: Sharing,
     endpoint_port_range: PortRange,
-    planner_max_states: u32,
-    queue: RawQueue,
+    planner_max_states: Option<u32>,
+    queue: Option<RawQueue>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,11 +331,11 @@ struct RawDomain {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawQueue {
-    max_pending_per_deployment: u32,
-    max_pending_total: u32,
-    max_buffered_bytes_total: String,
-    request_deadline: String,
-    admission_window: String,
+    max_pending_per_deployment: Option<u32>,
+    max_pending_total: Option<u32>,
+    max_buffered_bytes_total: Option<String>,
+    request_deadline: Option<String>,
+    admission_window: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -332,6 +346,7 @@ struct RawProfile {
     build_fingerprint: String,
     qualification_id: String,
     args: Vec<String>,
+    launch_settings: RawLaunchSettings,
     env: BTreeMap<String, String>,
     security: Security,
     log_policy: RawLogPolicy,
@@ -343,12 +358,180 @@ struct RawLogPolicy {
     retained_files: u32,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
+enum RawLaunchSettings {
+    Vllm {
+        tensor_parallel_size: u32,
+        pipeline_parallel_size: u32,
+        enable_sleep_mode: bool,
+        kv_cache_dtype: String,
+        block_size_tokens: u32,
+        cpu_offload_bytes: String,
+        requested_budget: RawVllmBudget,
+    },
+    Sglang {
+        recipe: String,
+        requested_budget: RawSglangBudget,
+    },
+    Fake,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVllmBudget {
+    kv_cache_bytes: String,
+    swap_space_bytes: String,
+    gpu_utilization_pct: u8,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSglangBudget {
+    kv_cache_bytes: String,
+    static_memory_fraction_bps: u16,
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,
     path: &str,
 ) -> Result<T, ConfigError> {
-    serde_json::from_value(value.clone())
-        .map_err(|e| ConfigError::new(ConfigErrorCode::SchemaVersion, path, e.to_string()))
+    serde_json::from_value(value.clone()).map_err(|e| {
+        let detail = e.to_string();
+        let code = if detail.starts_with("missing field") {
+            ConfigErrorCode::MissingRequired
+        } else if detail.starts_with("unknown field") {
+            ConfigErrorCode::UnknownField
+        } else {
+            ConfigErrorCode::UnsupportedCombination
+        };
+        let safe_detail = match code {
+            ConfigErrorCode::MissingRequired => "required typed field is missing",
+            ConfigErrorCode::UnknownField => "unknown typed field",
+            _ => "wrong type or invalid typed value",
+        };
+        ConfigError::new(code, path, safe_detail)
+    })
+}
+
+fn normalize_launch(
+    raw: RawLaunchSettings,
+    engine: Engine,
+    residency: Residency,
+) -> Result<ProfileLaunchSettings, ConfigError> {
+    let settings = match raw {
+        RawLaunchSettings::Vllm {
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            enable_sleep_mode,
+            kv_cache_dtype,
+            block_size_tokens,
+            cpu_offload_bytes,
+            requested_budget,
+        } => {
+            if engine != Engine::Vllm {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings.engine",
+                    "launch settings engine mismatch",
+                ));
+            }
+            let value = VllmLaunchSettings {
+                tensor_parallel_size,
+                pipeline_parallel_size,
+                enable_sleep_mode,
+                kv_cache_dtype,
+                block_size_tokens,
+                cpu_offload_bytes: parse_bytes(&cpu_offload_bytes)?,
+                requested_budget: VllmRequestedBudget {
+                    kv_cache_bytes: parse_bytes(&requested_budget.kv_cache_bytes)?,
+                    swap_space_bytes: parse_bytes(&requested_budget.swap_space_bytes)?,
+                    gpu_utilization_pct: requested_budget.gpu_utilization_pct,
+                },
+            };
+            if value.tensor_parallel_size == 0
+                || value.pipeline_parallel_size == 0
+                || value.block_size_tokens == 0
+                || value.kv_cache_dtype.is_empty()
+                || value.cpu_offload_bytes < 0
+                || value.requested_budget.kv_cache_bytes <= 0
+                || value.requested_budget.swap_space_bytes < 0
+                || !(1..=100).contains(&value.requested_budget.gpu_utilization_pct)
+            {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings",
+                    "invalid vLLM launch settings",
+                ));
+            }
+            if residency == Residency::Warm && !value.enable_sleep_mode {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings.enable_sleep_mode",
+                    "warm vLLM requires sleep mode",
+                ));
+            }
+            ProfileLaunchSettings::Vllm(value)
+        }
+        RawLaunchSettings::Sglang {
+            recipe,
+            requested_budget,
+        } => {
+            if engine != Engine::Sglang {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings.engine",
+                    "launch settings engine mismatch",
+                ));
+            }
+            const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+            if recipe != RECIPE {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings.recipe",
+                    "unsupported SGLang recipe",
+                ));
+            }
+            let budget = SglangRequestedBudget {
+                kv_cache_bytes: parse_bytes(&requested_budget.kv_cache_bytes)?,
+                static_memory_fraction_bps: requested_budget.static_memory_fraction_bps,
+            };
+            if budget.kv_cache_bytes <= 0
+                || !(1..=10_000).contains(&budget.static_memory_fraction_bps)
+            {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings.requested_budget",
+                    "invalid SGLang requested budget",
+                ));
+            }
+            ProfileLaunchSettings::Sglang(SglangLaunchSettings {
+                recipe,
+                tensor_parallel_size: 1,
+                data_parallel_size: 1,
+                tokenizer_workers: 1,
+                model_dtype: "bfloat16".into(),
+                context_tokens: 4096,
+                max_running_requests: 8,
+                max_total_tokens: 4096,
+                prefill_cuda_graphs: false,
+                decode_cuda_graphs: false,
+                memory_saver: true,
+                cpu_weight_backup: false,
+                speculative_decoding: false,
+                lora: false,
+                trust_remote_code: false,
+                disaggregation: false,
+                external_cache: false,
+                cpu_kv_offload: false,
+                native_grpc: false,
+                weight_restore: "disk_reload".into(),
+                requested_budget: budget,
+            })
+        }
+        RawLaunchSettings::Fake => {
+            if engine != Engine::Fake {
+                return Err(invalid(
+                    "runtime_profiles.launch_settings.engine",
+                    "launch settings engine mismatch",
+                ));
+            }
+            ProfileLaunchSettings::Fake(FakeLaunchSettings)
+        }
+    };
+    Ok(settings)
 }
 
 fn phase(
@@ -588,18 +771,67 @@ pub fn resolve_effective(
             }
         }
     }
+    let raw_queue = h.resource_policy.queue.unwrap_or(RawQueue {
+        max_pending_per_deployment: None,
+        max_pending_total: None,
+        max_buffered_bytes_total: None,
+        request_deadline: None,
+        admission_window: None,
+    });
     let queue = QueuePolicy {
-        max_pending_per_deployment: h.resource_policy.queue.max_pending_per_deployment,
-        max_pending_total: h.resource_policy.queue.max_pending_total,
-        max_buffered_bytes_total: parse_bytes(&h.resource_policy.queue.max_buffered_bytes_total)?,
-        request_deadline_ms: parse_duration_ms(&h.resource_policy.queue.request_deadline)?,
-        admission_window_ms: parse_duration_ms(&h.resource_policy.queue.admission_window)?,
+        max_pending_per_deployment: raw_queue
+            .max_pending_per_deployment
+            .unwrap_or(DEFAULT_PENDING_PER_DEPLOYMENT),
+        max_pending_total: raw_queue.max_pending_total.unwrap_or(DEFAULT_PENDING_TOTAL),
+        max_buffered_bytes_total: raw_queue
+            .max_buffered_bytes_total
+            .as_deref()
+            .map(parse_bytes)
+            .transpose()?
+            .unwrap_or(DEFAULT_QUEUED_BYTES),
+        request_deadline_ms: raw_queue
+            .request_deadline
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()?
+            .unwrap_or(DEFAULT_REQUEST_DEADLINE_MS),
+        admission_window_ms: raw_queue
+            .admission_window
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()?
+            .unwrap_or(DEFAULT_ADMISSION_WINDOW_MS),
     };
+    let max_parked = h.resource_policy.max_parked.unwrap_or(DEFAULT_MAX_PARKED);
+    let observation_ttl_ms = h
+        .resource_policy
+        .observation_ttl
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()?
+        .unwrap_or(DEFAULT_OBSERVATION_TTL_MS);
+    let planner_max_states = h
+        .resource_policy
+        .planner_max_states
+        .unwrap_or(DEFAULT_PLANNER_STATES);
     if queue.max_pending_per_deployment == 0
+        || queue.max_pending_per_deployment > 4_096
+        || queue.max_pending_total == 0
+        || queue.max_pending_total > 16_384
         || queue.max_pending_per_deployment > queue.max_pending_total
         || queue.max_buffered_bytes_total <= 0
-        || h.resource_policy.max_parked > 16
-        || h.resource_policy.planner_max_states == 0
+        || queue.max_buffered_bytes_total > (1_i64 << 30)
+        || queue.request_deadline_ms <= 0
+        || queue.request_deadline_ms > 3_600_000
+        || queue.admission_window_ms <= 0
+        || queue.admission_window_ms > 30_000
+        || queue.admission_window_ms > queue.request_deadline_ms
+        || max_parked > 16
+        || observation_ttl_ms <= 0
+        || observation_ttl_ms > 10_000
+        || planner_max_states == 0
+        || planner_max_states > 65_536
+        || h.resource_policy.endpoint_port_range.start == 0
         || h.resource_policy.endpoint_port_range.start > h.resource_policy.endpoint_port_range.end
     {
         return Err(invalid("resource_policy", "invalid bounded host policy"));
@@ -616,6 +848,22 @@ pub fn resolve_effective(
             "deployment deadline may only shorten host limit",
         ));
     }
+    let launch_settings = normalize_launch(
+        raw_profile.launch_settings.clone(),
+        raw_profile.engine,
+        d.residency,
+    )?;
+    let uses_experimental_controls = match &launch_settings {
+        ProfileLaunchSettings::Vllm(settings) => settings.enable_sleep_mode,
+        ProfileLaunchSettings::Sglang(settings) => settings.memory_saver,
+        ProfileLaunchSettings::Fake(_) => false,
+    };
+    if uses_experimental_controls && !raw_profile.security.experimental_controls {
+        return Err(invalid(
+            "runtime_profiles.security.experimental_controls",
+            "launch settings require explicit experimental controls policy",
+        ));
+    }
     let profile = RuntimeProfile {
         engine: raw_profile.engine,
         revision: raw_profile.revision,
@@ -623,6 +871,7 @@ pub fn resolve_effective(
         build_fingerprint: raw_profile.build_fingerprint.clone(),
         qualification_id: raw_profile.qualification_id.clone(),
         args: raw_profile.args.clone(),
+        launch_settings,
         env: raw_profile.env.clone(),
         security: raw_profile.security.clone(),
         log_policy: LogPolicy {
@@ -636,11 +885,11 @@ pub fn resolve_effective(
         environment_fingerprint: h.environment_fingerprint,
         domains,
         devices: h.resource_policy.devices,
-        max_parked: h.resource_policy.max_parked,
-        observation_ttl_ms: parse_duration_ms(&h.resource_policy.observation_ttl)?,
+        max_parked,
+        observation_ttl_ms,
         device_sharing: h.resource_policy.device_sharing,
         endpoint_port_range: h.resource_policy.endpoint_port_range,
-        planner_max_states: h.resource_policy.planner_max_states,
+        planner_max_states,
         queue,
     };
     #[derive(Serialize)]
@@ -658,6 +907,7 @@ pub fn resolve_effective(
         executable: &'a str,
         build_fingerprint: &'a str,
         args: &'a [String],
+        launch_settings: &'a ProfileLaunchSettings,
         env: &'a BTreeMap<String, String>,
         experimental_controls: bool,
         runtime_auth: bool,
@@ -680,6 +930,7 @@ pub fn resolve_effective(
         executable: &profile.executable,
         build_fingerprint: &profile.build_fingerprint,
         args: &profile.args,
+        launch_settings: &profile.launch_settings,
         env: &profile.env,
         experimental_controls: profile.security.experimental_controls,
         runtime_auth: profile.security.credential_ref.is_some(),
