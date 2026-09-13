@@ -27,6 +27,13 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Progress
 
+- Latest checkpoint: V6 management schema and V7 durable event foundation reviewed
+  through `bbf92cd`. Event replay enforces count, byte, age and payload bounds;
+  session reset appends atomically. Two fix rounds closed review findings.
+  Full CPU checks at `808a8ac`: 264 tests pass and scoped Clippy clean. Final
+  serializer adjustment: nine event tests and scoped store Clippy pass.
+  Full snapshots, SSE, remaining writer events and live qualification remain open.
+  Next implementation slice adds strict local qualification-policy input.
 - Resource, reservation, completion-evidence, and dispatch-ownership plans exist.
 - Coordinator integration draft now connects those primitives and production cutover.
 - Management/configuration, pinned SGLang integration, and numerical live
