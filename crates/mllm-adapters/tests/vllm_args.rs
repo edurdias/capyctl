@@ -31,7 +31,10 @@ fn budgets_render_with_explicit_units() {
     // mllm-controlled flags first:
     let port = argv.iter().position(|a| a == "--port").unwrap();
     assert_eq!(argv[port + 1], "8150");
-    let util = argv.iter().position(|a| a == "--gpu-memory-utilization").unwrap();
+    let util = argv
+        .iter()
+        .position(|a| a == "--gpu-memory-utilization")
+        .unwrap();
     assert_eq!(argv[util + 1], "0.75");
     let kv = argv.iter().position(|a| a == "--kv-cache-memory").unwrap();
     assert_eq!(argv[kv + 1], (16u64 * 1024 * 1024 * 1024).to_string());
@@ -49,6 +52,67 @@ fn reserved_flag_conflicts_fail() {
         render_command(&input),
         Err(ArgsError::ReservedConflict(f)) if f == "--port"
     ));
+}
+
+#[test]
+fn reserved_flags_are_normalized_and_equals_form_conflicts() {
+    for argument in [
+        "--HOST=127.0.0.1",
+        "--served_model_name=other",
+        "--tensor_parallel_size=2",
+        "--disable-log-requests",
+        "--api_key=secret",
+    ] {
+        let mut input = base_input();
+        input.engine_args = vec![argument.into()];
+        assert!(
+            matches!(render_command(&input), Err(ArgsError::ReservedConflict(_))),
+            "{argument}"
+        );
+    }
+}
+
+#[test]
+fn aliases_normalize_before_duplicate_detection() {
+    let mut input = base_input();
+    input.engine_args = vec![
+        "--max-model-len=4096".into(),
+        "--max_model_len".into(),
+        "8192".into(),
+    ];
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::DuplicateFlag(f)) if f == "--max-model-len"
+    ));
+}
+
+#[test]
+fn reserved_flag_cannot_hide_in_a_missing_ordinary_value() {
+    let mut input = base_input();
+    input.engine_args = vec!["--max-model-len".into(), "--port=9999".into()];
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::MissingValue(f)) if f == "--max-model-len"
+    ));
+}
+
+#[test]
+fn unreviewed_flags_are_not_arbitrary_passthrough() {
+    let mut input = base_input();
+    input.engine_args = vec!["--future-unsafe-flag".into()];
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::UnsupportedFlag(f)) if f == "--future-unsafe-flag"
+    ));
+}
+
+#[test]
+fn standalone_positionals_and_empty_values_are_rejected() {
+    let mut input = base_input();
+    input.engine_args = vec!["unreviewed-positional".into()];
+    assert!(matches!(render_command(&input), Err(ArgsError::UnexpectedArgument(_))));
+    input.engine_args = vec!["--max-model-len=".into()];
+    assert!(matches!(render_command(&input), Err(ArgsError::MissingValue(_))));
 }
 
 #[test]
@@ -83,15 +147,12 @@ fn odd_length_engine_args_parse_as_flag_value_pairs() {
     // (the old chunks(2) parse misread the odd tail as a flag).
     let mut input = base_input();
     input.engine_args = vec![
-        "--served-model-name".into(),
-        "toy-model".into(),
         "--max-model-len".into(),
         "65536".into(),
         "--trust-remote-code".into(),
     ];
     let cmd = render_command(&input).unwrap();
     let pos = |a: &str| cmd.argv.iter().position(|x| x == a).unwrap();
-    assert_eq!(cmd.argv[pos("--served-model-name") + 1], "toy-model");
     assert_eq!(cmd.argv[pos("--max-model-len") + 1], "65536");
     assert!(cmd.argv.contains(&"--trust-remote-code".to_string()));
 }
@@ -102,14 +163,14 @@ fn duplicate_ordinary_flag_is_duplicate_error_not_reserved() {
     // behavior misreported it as ReservedConflict.
     let mut input = base_input();
     input.engine_args = vec![
-        "--served-model-name".into(),
+        "--max-model-len".into(),
         "a".into(),
-        "--served-model-name".into(),
+        "--max-model-len".into(),
         "b".into(),
     ];
     assert!(matches!(
         render_command(&input),
-        Err(ArgsError::DuplicateFlag(f)) if f == "--served-model-name"
+        Err(ArgsError::DuplicateFlag(f)) if f == "--max-model-len"
     ));
 }
 
@@ -131,12 +192,18 @@ fn sleep_flags_render_only_when_profile_gated_in() {
     gated.sleep_flags = vec!["--enable-sleep-mode".into()];
     let cmd = render_command(&gated).unwrap();
     assert!(cmd.argv.contains(&"--enable-sleep-mode".to_string()));
-    assert_eq!(cmd.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str), Some("1"));
+    assert_eq!(
+        cmd.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str),
+        Some("1")
+    );
 
     let ungated = base_input();
     let cmd2 = render_command(&ungated).unwrap();
     assert!(!cmd2.argv.contains(&"--enable-sleep-mode".to_string()));
-    assert_eq!(cmd2.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str), Some("0"));
+    assert_eq!(
+        cmd2.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str),
+        Some("0")
+    );
 }
 
 #[test]

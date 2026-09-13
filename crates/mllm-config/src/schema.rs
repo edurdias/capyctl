@@ -56,8 +56,14 @@ pub enum FieldSpec {
     /// String scalar matching the size/duration unit regex
     /// `^(\d+(?:\.\d+)?)\s?(B|KiB|MiB|GiB|TiB|s|m|h|ms)$`.
     Unit,
+    /// String scalar carrying an exact byte quantity.
+    Bytes,
+    /// String scalar carrying an exact duration.
+    Duration,
     /// Closed map: only the listed fields allowed (unlisted -> UnknownField).
     Struct(&'static [(&'static str, FieldSpec)]),
+    /// Transitional F1/F2 field: legacy scalar or strict F2 mapping.
+    ScalarOrStruct(&'static [(&'static str, FieldSpec)]),
     /// Mapping whose keys are entry *names* (not mllm fields — e.g.
     /// `listeners` entries named `management`/`inference`); every value
     /// must match the given entry spec, so entries themselves stay
@@ -84,6 +90,8 @@ pub struct KindSchema {
 pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     const SCALAR: FieldSpec = FieldSpec::Scalar;
     const UNIT: FieldSpec = FieldSpec::Unit;
+    const BYTES: FieldSpec = FieldSpec::Bytes;
+    const DURATION: FieldSpec = FieldSpec::Duration;
 
     // Listener entry shape (per SPEC §16): each named listener carries
     // bind address + authentication mode; unknown entry fields rejected.
@@ -109,6 +117,74 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             ]),
         ),
     ];
+    const DEVICE: FieldSpec = FieldSpec::Struct(&[("id", SCALAR), ("sharing", SCALAR)]);
+    const ALLOCATION: FieldSpec = FieldSpec::Struct(&[
+        ("domain", SCALAR),
+        ("bytes", BYTES),
+        ("host_kv_bytes", BYTES),
+    ]);
+    const PHASE: FieldSpec = FieldSpec::Struct(&[
+        ("allocations", FieldSpec::Seq(&ALLOCATION)),
+        ("devices", FieldSpec::Seq(&DEVICE)),
+    ]);
+    const RECIPE: &[(&str, FieldSpec)] = &[
+        ("cold", PHASE),
+        ("ready", PHASE),
+        ("parking", PHASE),
+        ("parked", PHASE),
+        ("wake", PHASE),
+    ];
+    const MODEL: &[(&str, FieldSpec)] = &[
+        ("path", SCALAR),
+        ("content_fingerprint", SCALAR),
+        ("revision", SCALAR),
+    ];
+    const DOMAIN: FieldSpec = FieldSpec::Struct(&[
+        ("managed_limit", BYTES),
+        ("free_reserve", BYTES),
+        ("host_kv_limit", BYTES),
+        ("parked_limit", BYTES),
+    ]);
+    const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[("domain", SCALAR), ("sharing", SCALAR)]);
+    const QUEUE: &[(&str, FieldSpec)] = &[
+        ("max_pending_per_deployment", SCALAR),
+        ("max_pending_total", SCALAR),
+        ("max_buffered_bytes_total", BYTES),
+        ("request_deadline", DURATION),
+        ("admission_window", DURATION),
+    ];
+    const F2_RESOURCE_POLICY: &[(&str, FieldSpec)] = &[
+        ("domains", FieldSpec::MapOf(&DOMAIN)),
+        ("devices", FieldSpec::MapOf(&HOST_DEVICE)),
+        ("max_parked", SCALAR),
+        ("observation_ttl", DURATION),
+        ("device_sharing", SCALAR),
+        (
+            "endpoint_port_range",
+            FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
+        ),
+        ("planner_max_states", SCALAR),
+        ("queue", FieldSpec::Struct(QUEUE)),
+    ];
+    const SECURITY: &[(&str, FieldSpec)] = &[
+        ("experimental_controls", SCALAR),
+        ("credential_ref", SCALAR),
+        ("admin_credential_ref", SCALAR),
+    ];
+    const PROFILE: FieldSpec = FieldSpec::Struct(&[
+        ("engine", SCALAR),
+        ("revision", SCALAR),
+        ("executable", SCALAR),
+        ("build_fingerprint", SCALAR),
+        ("qualification_id", SCALAR),
+        ("args", FieldSpec::Seq(&SCALAR)),
+        ("env", FieldSpec::MapOf(&SCALAR)),
+        ("security", FieldSpec::Struct(SECURITY)),
+        (
+            "log_policy",
+            FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
+        ),
+    ]);
     // Standalone `server:`/`host:` blocks mirror the generated standalone
     // shape minus `kind` (the wrapper document already carries the kind).
     const STANDALONE_SERVER: &[(&str, FieldSpec)] = &[
@@ -145,6 +221,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("kind", SCALAR),
                 ("name", SCALAR),
                 ("listeners", LISTENERS),
+                ("hardware_fingerprint", SCALAR),
+                ("environment_fingerprint", SCALAR),
+                ("resource_policy", FieldSpec::Struct(F2_RESOURCE_POLICY)),
+                ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
             ],
         },
         ConfigKind::Deployment => &KindSchema {
@@ -153,10 +233,16 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
-                ("model", SCALAR),
-                // No F0 consumers yet; empty allowlists reject everything
-                // unknown inside these blocks.
-                ("resources", FieldSpec::Struct(NO_FIELDS)),
+                ("model", FieldSpec::ScalarOrStruct(MODEL)),
+                ("routes", FieldSpec::Seq(&SCALAR)),
+                ("runtime_profile", SCALAR),
+                ("runtime_profile_revision", SCALAR),
+                ("recipe", SCALAR),
+                ("residency", SCALAR),
+                ("recovery", SCALAR),
+                ("devices", FieldSpec::Seq(&DEVICE)),
+                ("resources", FieldSpec::Struct(RECIPE)),
+                ("request_deadline", DURATION),
                 ("env", FieldSpec::Struct(NO_FIELDS)),
             ],
         },

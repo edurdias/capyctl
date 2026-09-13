@@ -2,6 +2,7 @@
 //! normalized JSON view production.
 
 pub mod defaults;
+pub mod effective;
 pub mod error;
 pub mod schema;
 pub mod strict_yaml;

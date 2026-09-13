@@ -1,0 +1,16 @@
+schema_version: 1
+kind: deployment
+name: toy
+model:
+  path: /srv/models/toy
+  content_fingerprint: sha256:model
+  content_fingerprint: sha256:drift
+  revision: r1
+routes: [toy]
+runtime_profile: local
+runtime_profile_revision: 7
+recipe: standard
+residency: warm
+recovery: reconcile
+devices: []
+resources: {}

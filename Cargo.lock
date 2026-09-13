@@ -1034,10 +1034,13 @@ dependencies = [
 name = "mllm-config"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "mllm-domain",
  "regex",
  "saphyr-parser",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

@@ -27,6 +27,18 @@ fn unit_regex() -> &'static regex::Regex {
     })
 }
 
+fn byte_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^(\d+(?:\.\d+)?)(B|KiB|MiB|GiB|TiB)$").expect("byte regex")
+    })
+}
+
+fn duration_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^(\d+(?:\.\d+)?)(ms|s|m|h)$").expect("duration regex"))
+}
+
 /// Parse `text` strictly for `kind` and return the normalized JSON view.
 pub fn parse_strict(kind: ConfigKind, text: &str) -> Result<Value, ConfigError> {
     let root = build_value(text)?;
@@ -345,11 +357,40 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
             }
             Ok(())
         }
+        FieldSpec::Bytes | FieldSpec::Duration => {
+            let regex = if matches!(spec, FieldSpec::Bytes) {
+                byte_regex()
+            } else {
+                duration_regex()
+            };
+            let ok = value.as_str().is_some_and(|s| regex.is_match(s));
+            if !ok {
+                return Err(ConfigError::new(
+                    ConfigErrorCode::InvalidUnit,
+                    path,
+                    format!("invalid typed quantity `{value}`"),
+                ));
+            }
+            Ok(())
+        }
         FieldSpec::Struct(fields) => {
             let obj = value.as_object().ok_or_else(|| {
                 ConfigError::new(ConfigErrorCode::SchemaVersion, path, "expected a mapping")
             })?;
             check_object(obj, fields, path)
+        }
+        FieldSpec::ScalarOrStruct(fields) => {
+            if let Some(obj) = value.as_object() {
+                check_object(obj, fields, path)
+            } else if value.is_array() {
+                Err(ConfigError::new(
+                    ConfigErrorCode::SchemaVersion,
+                    path,
+                    "expected a scalar or mapping",
+                ))
+            } else {
+                Ok(())
+            }
         }
         FieldSpec::MapOf(entry) => {
             let obj = value.as_object().ok_or_else(|| {
