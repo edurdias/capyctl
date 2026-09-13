@@ -273,6 +273,11 @@ pub fn propose_phase(
     })
 }
 
+/// Applies a proposal to a pure hypothetical ledger state.
+///
+/// This helper performs no durable compare-and-swap, deployment fencing, physical
+/// release, or engine authorization. The coordinator must supply those checks before
+/// any real resource effect.
 pub fn apply_proposal_to_snapshot(
     snapshot: &LedgerSnapshot,
     proposal: &ReservationProposal,

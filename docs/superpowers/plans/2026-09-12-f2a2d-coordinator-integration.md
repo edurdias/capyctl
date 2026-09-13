@@ -464,8 +464,12 @@ UPDATE lifecycle_steps SET state='completed' WHERE id=?1 AND state='armed';
 **Files:** Controller `sequence.rs`, `tests/sequence.rs`.
 **Interfaces:** Pure planner consumes A1 `LedgerSnapshot`, `RecipeFootprints`,
 `AdmissionContext`, and `ForecastStep`; produces ordered `Vec<ForecastStep>`.
-`PlanError` contains `Invalid`, `NoSafeSequence`, and `SearchLimit` variants;
-capacity failures retain the owner/domain/required/available diagnostics from A1.
+`PlanError` contains `Invalid`, `NoSafeSequence`, and `SearchLimit` variants.
+The planner constructs contextual diagnostics from its known owner, recipe, limit,
+observation, failed step, and `ResourceError` inputs; `ResourceError` remains unchanged.
+Diagnostics distinguish observed values from forecasted or required bounds. A unit
+error does not justify naming a unique causal owner or domain. Diagnostic construction
+must not duplicate admission calculations or change admission denial decisions.
 
 - [ ] Add a pure helper and its test as the first RED/GREEN step:
 

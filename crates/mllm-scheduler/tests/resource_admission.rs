@@ -26,6 +26,129 @@ fn shared_claims_can_overlap() {
 }
 
 #[test]
+fn admission_enforces_device_claim_conflicts() {
+    let footprint = |owner_sharing| PhaseFootprint {
+        phase: ResourcePhase::Ready,
+        allocations: vec![Allocation {
+            domain: "system".into(),
+            bytes: 10,
+            host_kv_bytes: 0,
+        }],
+        devices: vec![DeviceClaim {
+            device: "gpu:0".into(),
+            sharing: owner_sharing,
+        }],
+    };
+    let observations = [MemoryObservation {
+        domain: "system".into(),
+        capacity_bytes: 100,
+        available_bytes: 90,
+        sampled_at_ms: 100,
+    }];
+    let limits = [MemoryLimit {
+        domain: "system".into(),
+        managed_bytes: 100,
+        free_reserve_bytes: 0,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    }];
+    let context = || AdmissionContext::new(&observations, &limits, 101, 60, 4);
+
+    let exclusive_snapshot = LedgerSnapshot {
+        epoch: 0,
+        owners: [("existing".into(), footprint(Sharing::Exclusive))].into(),
+    };
+    for candidate_sharing in [Sharing::Shared, Sharing::Exclusive] {
+        assert_eq!(
+            admit_phase(
+                &exclusive_snapshot,
+                "candidate",
+                &footprint(candidate_sharing),
+                context(),
+            ),
+            Err(ResourceError::DeviceConflict)
+        );
+    }
+
+    let shared_snapshot = LedgerSnapshot {
+        epoch: 0,
+        owners: [("existing".into(), footprint(Sharing::Shared))].into(),
+    };
+    assert_eq!(
+        admit_phase(
+            &shared_snapshot,
+            "candidate",
+            &footprint(Sharing::Shared),
+            context(),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn aggregate_resident_floors_cannot_exceed_observed_usage() {
+    let footprint = |bytes| PhaseFootprint {
+        phase: ResourcePhase::Ready,
+        allocations: vec![Allocation {
+            domain: "system".into(),
+            bytes,
+            host_kv_bytes: 0,
+        }],
+        devices: vec![],
+    };
+    let snapshot = LedgerSnapshot {
+        epoch: 0,
+        owners: [("a".into(), footprint(40)), ("b".into(), footprint(40))].into(),
+    };
+    let observations = [MemoryObservation {
+        domain: "system".into(),
+        capacity_bytes: 100,
+        available_bytes: 30,
+        sampled_at_ms: 100,
+    }];
+    let limits = [MemoryLimit {
+        domain: "system".into(),
+        managed_bytes: 100,
+        free_reserve_bytes: 0,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    }];
+    let floors = |a, b| {
+        [("a", a), ("b", b)].map(|(owner, bytes)| ResidentFloor {
+            owner: owner.into(),
+            domain: "system".into(),
+            bytes,
+            sampled_at_ms: 100,
+        })
+    };
+    let candidate = footprint(0);
+
+    let boundary = floors(35, 35);
+    assert_eq!(
+        admit_phase(
+            &snapshot,
+            "candidate",
+            &candidate,
+            AdmissionContext::new(&observations, &limits, 101, 60, 4)
+                .with_resident_floors(&boundary),
+        ),
+        Ok(())
+    );
+
+    let inconsistent = floors(36, 35);
+    assert_eq!(
+        admit_phase(
+            &snapshot,
+            "candidate",
+            &candidate,
+            AdmissionContext::new(&observations, &limits, 101, 60, 4)
+                .with_resident_floors(&inconsistent),
+        ),
+        Err(ResourceError::Invalid)
+    );
+}
+
+#[test]
 fn invalid_and_duplicate_allocations_are_rejected() {
     let a = Allocation {
         domain: "system".into(),

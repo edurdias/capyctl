@@ -29,6 +29,13 @@ pub struct MemoryObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Qualified lower-bound attribution of resident bytes to one owner and domain.
+///
+/// The attribution must come from the same coherent availability sample and current
+/// runtime identity as the corresponding [`MemoryObservation`]. It is neither a
+/// reservation nor credit inferred from a global availability delta. Use zero credit
+/// when qualified attribution is unavailable. Numeric validation of these fields
+/// cannot establish the attribution itself.
 pub struct ResidentFloor {
     pub owner: String,
     pub domain: String,

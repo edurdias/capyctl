@@ -14,6 +14,10 @@ pub struct SequenceFailure {
     pub reason: ResourceError,
 }
 
+/// Forecasts steps by copying inputs and updating synthetic accounting only.
+///
+/// Forecast state is not measured evidence and does not authorize engine actions.
+/// The coordinator must reobserve and revalidate resources before each real step.
 pub fn forecast_sequence(
     initial: &LedgerSnapshot,
     steps: &[ForecastStep],
