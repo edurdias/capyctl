@@ -68,6 +68,20 @@ pub(crate) enum EventMetadata {
         current_revision: i64,
         session_epoch: i64,
     },
+    #[serde(rename = "1")]
+    HostResourcePolicyBootstrapped {
+        revision: i64,
+        ledger_epoch: u64,
+        session_epoch: i64,
+    },
+    #[serde(rename = "1")]
+    HostResourcePolicyUpdated {
+        operation_id: String,
+        previous_revision: i64,
+        current_revision: i64,
+        ledger_epoch: u64,
+        session_epoch: i64,
+    },
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +96,8 @@ impl EventMetadata {
         match self {
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
             Self::HostQualificationPolicyChanged { .. } => "host_qualification_policy_changed",
+            Self::HostResourcePolicyBootstrapped { .. } => "host_resource_policy_bootstrapped",
+            Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
         }
     }
 
@@ -89,6 +105,8 @@ impl EventMetadata {
         match self {
             Self::CoordinatorSessionStarted { .. } => (None, None),
             Self::HostQualificationPolicyChanged { .. } => (None, None),
+            Self::HostResourcePolicyBootstrapped { .. } => (None, None),
+            Self::HostResourcePolicyUpdated { operation_id, .. } => (None, Some(operation_id)),
         }
     }
 }

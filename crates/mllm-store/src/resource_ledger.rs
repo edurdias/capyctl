@@ -135,7 +135,7 @@ fn ensure_increasing(old: Option<&PhaseFootprint>, next: &PhaseFootprint)
     }
 }
 
-fn read_snapshot(conn: &Connection) -> Result<LedgerSnapshot, ResourceStoreError> {
+pub(crate) fn read_snapshot(conn: &Connection) -> Result<LedgerSnapshot, ResourceStoreError> {
     let legacy: i64 = conn.query_row("SELECT COUNT(*) FROM reservations", [], |r| r.get(0))?;
     if legacy != 0 {
         return Err(ResourceStoreError::NeedsReconciliation);

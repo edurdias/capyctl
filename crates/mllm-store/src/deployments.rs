@@ -82,7 +82,7 @@ impl OpState {
         }
     }
 
-    fn parse(s: &str) -> Result<OpState, StoreError> {
+    pub(crate) fn parse(s: &str) -> Result<OpState, StoreError> {
         match s {
             "pending" => Ok(OpState::Pending),
             "running" => Ok(OpState::Running),
@@ -404,7 +404,7 @@ impl crate::Store {
             .conn
             .query_row(
                 "SELECT id, deployment_id, kind, state, error_code, accepted_at, updated_at
-                 FROM operations WHERE id = ?1",
+                 FROM operations WHERE id = ?1 AND deployment_id IS NOT NULL",
                 [id],
                 |row| {
                     Ok((
