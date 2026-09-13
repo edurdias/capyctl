@@ -61,17 +61,34 @@ pub(crate) enum EventWriteError {
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
     CoordinatorSessionStarted { session_epoch: i64 },
+    #[serde(rename = "1")]
+    HostQualificationPolicyChanged {
+        change_kind: HostQualificationPolicyChangeKind,
+        previous_revision: Option<i64>,
+        current_revision: i64,
+        session_epoch: i64,
+    },
+}
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostQualificationPolicyChangeKind {
+    Imported,
+    Updated,
+    Removed,
+    Readded,
 }
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
+            Self::HostQualificationPolicyChanged { .. } => "host_qualification_policy_changed",
         }
     }
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
             Self::CoordinatorSessionStarted { .. } => (None, None),
+            Self::HostQualificationPolicyChanged { .. } => (None, None),
         }
     }
 }

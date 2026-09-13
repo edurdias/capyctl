@@ -1130,6 +1130,7 @@ dependencies = [
 name = "mllm-store"
 version = "0.1.0"
 dependencies = [
+ "mllm-config",
  "mllm-domain",
  "mllm-scheduler",
  "rusqlite",
