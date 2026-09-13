@@ -3,7 +3,10 @@ use mllm_agent::memory::parse_meminfo;
 #[test]
 fn available_is_not_total() {
     let sample = parse_meminfo(
-        "MemTotal: 128 kB\nMemAvailable: 40 kB\nSwapTotal: 8 kB\nSwapFree: 6 kB\n", 100).unwrap();
+        "MemTotal: 128 kB\nMemAvailable: 40 kB\nSwapTotal: 8 kB\nSwapFree: 6 kB\n",
+        100,
+    )
+    .unwrap();
     assert_eq!(sample.memory.domain, "system");
     assert_eq!(sample.memory.capacity_bytes, 128 * 1024);
     assert_eq!(sample.memory.available_bytes, 40 * 1024);
@@ -25,7 +28,10 @@ fn bad_samples_fail_closed() {
         format!("{valid}MemTotal: 128 kB\n"),
         "x".repeat(65_537),
     ] {
-        assert!(parse_meminfo(&invalid, 100).is_err(), "accepted {invalid:?}");
+        assert!(
+            parse_meminfo(&invalid, 100).is_err(),
+            "accepted {invalid:?}"
+        );
     }
     assert!(parse_meminfo(valid, -1).is_err());
 }

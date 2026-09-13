@@ -18,10 +18,7 @@ pub enum MemoryReadError {
     Io(#[from] std::io::Error),
 }
 
-pub fn parse_meminfo(
-    input: &str,
-    sampled_at_ms: i64,
-) -> Result<HostMemorySample, MemoryReadError> {
+pub fn parse_meminfo(input: &str, sampled_at_ms: i64) -> Result<HostMemorySample, MemoryReadError> {
     if sampled_at_ms < 0 || input.len() > 65_536 {
         return Err(MemoryReadError::Invalid);
     }
