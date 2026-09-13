@@ -1,4 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ResourceError {
+    #[error("invalid resource contract")]
+    Invalid,
+    #[error("unknown physical domain")]
+    UnknownDomain,
+    #[error("stale resource observation")]
+    StaleObservation,
+    #[error("device assignment conflict")]
+    DeviceConflict,
+    #[error("insufficient resources")]
+    Insufficient,
+    #[error("resource category limit exceeded")]
+    CategoryLimit,
+    #[error("stale ledger epoch")]
+    StaleEpoch,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryObservation {
@@ -73,6 +93,88 @@ pub struct RecipeFootprints {
 pub struct LedgerSnapshot {
     pub epoch: u64,
     pub owners: BTreeMap<String, PhaseFootprint>,
+}
+
+pub fn validate_footprint(f: &PhaseFootprint) -> Result<(), ResourceError> {
+    let mut domains = BTreeSet::new();
+    let mut devices = BTreeSet::new();
+    if f.allocations.is_empty() {
+        return Err(ResourceError::Invalid);
+    }
+    for a in &f.allocations {
+        if a.domain.is_empty()
+            || !domains.insert(&a.domain)
+            || a.bytes < 0
+            || a.host_kv_bytes < 0
+            || a.host_kv_bytes > a.bytes
+        {
+            return Err(ResourceError::Invalid);
+        }
+    }
+    for d in &f.devices {
+        if d.device.is_empty() || !devices.insert(&d.device) {
+            return Err(ResourceError::Invalid);
+        }
+    }
+    if f.phase == ResourcePhase::Parked && !f.devices.is_empty() {
+        return Err(ResourceError::Invalid);
+    }
+    Ok(())
+}
+
+pub fn claims_conflict(a: &[DeviceClaim], b: &[DeviceClaim]) -> bool {
+    a.iter().any(|x| {
+        b.iter().any(|y| {
+            x.device == y.device
+                && (x.sharing == Sharing::Exclusive || y.sharing == Sharing::Exclusive)
+        })
+    })
+}
+
+pub fn validate_recipe(r: &RecipeFootprints) -> Result<(), ResourceError> {
+    for (f, expected) in [
+        (&r.cold, ResourcePhase::Cold),
+        (&r.ready, ResourcePhase::Ready),
+        (&r.parking, ResourcePhase::Parking),
+        (&r.parked, ResourcePhase::Parked),
+        (&r.wake, ResourcePhase::Wake),
+    ] {
+        validate_footprint(f)?;
+        if f.phase != expected {
+            return Err(ResourceError::Invalid);
+        }
+    }
+    let domain_set = |f: &PhaseFootprint| {
+        f.allocations
+            .iter()
+            .map(|a| a.domain.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let domains = domain_set(&r.ready);
+    for f in [&r.cold, &r.parking, &r.parked, &r.wake] {
+        if domain_set(f) != domains {
+            return Err(ResourceError::Invalid);
+        }
+    }
+    for (peak, base) in [
+        (&r.cold, &r.ready),
+        (&r.parking, &r.ready),
+        (&r.parking, &r.parked),
+        (&r.wake, &r.parked),
+        (&r.wake, &r.ready),
+    ] {
+        for b in &base.allocations {
+            let p = peak
+                .allocations
+                .iter()
+                .find(|p| p.domain == b.domain)
+                .ok_or(ResourceError::Invalid)?;
+            if p.bytes < b.bytes || p.host_kv_bytes < b.host_kv_bytes {
+                return Err(ResourceError::Invalid);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
