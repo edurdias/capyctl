@@ -27,6 +27,21 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Progress
 
+- Durable resource-policy store reviewed through `88c7f3f`: bootstrap, revisioned
+  updates, strict receipts, retained overcommit, atomic events and host-operation
+  lookup. Two fix rounds closed identity/receipt validation and failure-test gaps.
+  Fresh root check: 314 CPU tests and scoped Clippy pass, including 88 store tests.
+  Runtime update-versus-arm race remains
+  an explicit coordinator gate; these store tests do not replace it.
+- Resource-controls config dependency reviewed through `dbb4100`: immutable host
+  context, owned mutable controls, shared structural validation. Review gaps fixed
+  with boundary and real host-input tests; all 64 config tests and scoped Clippy
+  pass. Root baseline workspace suite also passes. Durable resource-policy store
+  implementation now reviewed above; atomic arm, production cutover and live tests remain open.
+- Candidate normalization contract reviewed by five local personas, one focused
+  interface check and three independent reviews. Two document corrections:
+  permit required parser object-array repair and remove full host-policy retention.
+  Candidate normalization itself creates no permission, grant or runtime effect.
 - Qualification importer reviewed through `b7109ca`: atomic session-fenced updates,
   revision tombstones, bounded strict reads, redacted events and retained accounting.
   Root checks: 287 CPU tests pass; scoped Clippy clean. Resource-policy contract
@@ -39,13 +54,13 @@ the work being executed. The owner will review consequential questions in the mo
   reviewed by five local personas, one focused check and three independent
   reviews. Removing policy retains a revoked revision tombstone; re-add requires
   the next revision. Existing runs, grants and original cleanup authority remain.
-- Latest checkpoint: V6 management schema and V7 durable event foundation reviewed
+- Earlier checkpoint: V6 management schema and V7 durable event foundation reviewed
   through `bbf92cd`. Event replay enforces count, byte, age and payload bounds;
   session reset appends atomically. Two fix rounds closed review findings.
   Full CPU checks at `808a8ac`: 264 tests pass and scoped Clippy clean. Final
   serializer adjustment: nine event tests and scoped store Clippy pass.
   Full snapshots, SSE, remaining writer events and live qualification remain open.
-  Next implementation slice adds strict local qualification-policy input.
+  Subsequent qualification-policy slices are recorded above.
 - Resource, reservation, completion-evidence, and dispatch-ownership plans exist.
 - Coordinator integration draft now connects those primitives and production cutover.
 - Management/configuration, pinned SGLang integration, and numerical live
@@ -171,3 +186,10 @@ the work being executed. The owner will review consequential questions in the mo
   conflict; multiple rows fail as corrupt state. Cost: hostname changes require
   reviewed migration. Earlier document review treated this restriction as optional;
   implemented and reviewed code chose stricter behavior. Future readers preserve it.
+- Candidate manifests use closed ordered recipe cases and per-case request budgets.
+  Cost: new case kinds need versioned extension; candidate dispatch must durably
+  enforce case bounds alongside lifetime counts before runtime effects.
+- Candidate config work includes narrow shared-parser array repair. Cost: parser
+  behavior changes need object/nested-array and duplicate-key regression coverage.
+- Candidate descriptors do not retain full host policy. Cost: store consumers
+  compare frozen recipe identity against separately persisted current policy.
