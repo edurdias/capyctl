@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7};
+use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
@@ -55,6 +55,24 @@ pub fn apply(conn: &Connection) -> Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v8_preserves_existing_database_and_adds_permanent_case_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(7).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_migrations(version) VALUES(?1)", [(index + 1) as i64]).unwrap();
+        }
+        conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('retained','retained','model','stopped',0,0,1,1); UPDATE resource_ledger_meta SET epoch=7;").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let retained:(String,i64)=conn.query_row("SELECT name,(SELECT epoch FROM resource_ledger_meta) FROM deployments WHERE id='retained'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(retained,("retained".into(),7));
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM qualification_case_actions",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,0);
+        let foreign_keys:i64=conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('qualification_case_actions') WHERE on_delete='NO ACTION'",[],|r|r.get(0)).unwrap();
+        assert_eq!(foreign_keys,3);
+    }
 
     #[test]
     fn migrations_apply_once_and_are_idempotent() {

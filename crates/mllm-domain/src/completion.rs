@@ -3,6 +3,25 @@ use std::collections::BTreeSet;
 use crate::resources::{validate_footprint, PhaseFootprint, ResourcePhase};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepExecutionContext {
+    pub token: TransitionToken,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub issued_at_ms: i64,
+    pub deadline_ms: i64,
+    pub identities: ExecutionIdentities,
+    pub completion_target: Option<PhaseFootprint>,
+    pub grant_id: Option<String>,
+    pub launch_settings: Option<crate::launch::ProfileLaunchSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionIdentities {
+    Retained(Vec<ProcessIdentity>),
+    OwnedLaunch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionToken {
     pub deployment_id: String,
     pub revision: i64,

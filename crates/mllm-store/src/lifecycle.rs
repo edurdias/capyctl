@@ -164,8 +164,44 @@ pub struct DeploymentFence {
     pub generation: i64,
 }
 
+pub(crate) fn insert_candidate_initialize_run(
+    tx: &Transaction<'_>, session: &CoordinatorSession, target: &DeploymentFence,
+    operation_id: &str, deadline_ms: i64,
+) -> Result<(), LifecycleError> {
+    fenced(tx, session, target)?;
+    let plan = bounded_json(&StoredPlan {
+        version: 1, steps: vec![PlanAction { deployment_id: target.deployment_id.clone(), action: RunAction::Activate }],
+        cleanup_target: None, handoffs: vec![],
+    })?;
+    tx.execute("INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) VALUES(?1,?2,?3,?4,?5,'activate','queued',?6,?7)",
+        params![operation_id,target.deployment_id,target.revision,target.generation,session.id(),deadline_ms,plan])?;
+    Ok(())
+}
+
+/// Only the immutable single-member candidate plan; caller fences current session separately.
+pub(crate) fn validate_candidate_initialize_run(
+    tx: &Transaction<'_>, target: &DeploymentFence, operation_id: &str,
+    session_id: &str, deadline_ms: i64,
+) -> Result<String, LifecycleError> {
+    let run = run_record(tx, operation_id)?;
+    if run.plan_json.len() > MAX_DTO_BYTES { return Err(LifecycleError::Invalid); }
+    let plan: StoredPlan = serde_json::from_str(&run.plan_json).map_err(|_| LifecycleError::Invalid)?;
+    let deadline: i64 = tx.query_row("SELECT deadline_ms FROM lifecycle_runs WHERE operation_id=?1", [operation_id], |r| r.get(0))?;
+    if run.target != *target || run.session_id != session_id || deadline != deadline_ms || run.action != "activate"
+        || !matches!(run.state.as_str(), "queued" | "running" | "uncertain" | "succeeded" | "failed")
+        || plan.version != 1 || plan.steps.len() != 1 || plan.steps[0].deployment_id != target.deployment_id
+        || plan.steps[0].action != RunAction::Activate || plan.cleanup_target.is_some() || !plan.handoffs.is_empty() {
+        return Err(LifecycleError::Invalid);
+    }
+    Ok(run.state)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
+    #[error("unsupported lifecycle step or backend validation")]
+    Unsupported,
+    #[error("corrupt stored lifecycle data")]
+    CorruptStoredData,
     #[error("store: {0}")]
     Sql(#[from] rusqlite::Error),
     #[error("stale coordinator or deployment fence")]
@@ -1092,7 +1128,7 @@ mod tests {
                 .query_row("SELECT state FROM lifecycle_steps", [], |r| r
                     .get::<_, String>(0))
                 .unwrap(),
-            "armed"
+            "uncertain"
         );
         assert_eq!(
             store

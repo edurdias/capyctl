@@ -250,6 +250,16 @@ CREATE TABLE qualification_evidence_refs(
 );
 "#;
 
+pub const SCHEMA_V8: &str = r#"
+CREATE TABLE qualification_case_actions(
+  run_id TEXT NOT NULL REFERENCES qualification_runs(id),
+  case_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+  step_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_steps(id),
+  PRIMARY KEY(run_id,case_id)
+);
+"#;
+
 pub const SCHEMA_V7: &str = r#"
 CREATE TABLE event_meta(
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),

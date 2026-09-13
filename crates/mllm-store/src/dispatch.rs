@@ -54,6 +54,8 @@ impl crate::Store {
         )?;
         transaction.execute("UPDATE deployments SET dispatch_enabled=0", [])?;
         transaction.execute("UPDATE request_leases SET disposition='uncertain'", [])?;
+        transaction.execute("UPDATE lifecycle_runs SET state='uncertain' WHERE operation_id IN (SELECT operation_id FROM lifecycle_steps WHERE state='armed') AND state IN ('queued','running')", [])?;
+        transaction.execute("UPDATE lifecycle_steps SET state='uncertain' WHERE state='armed'", [])?;
         crate::events::append_event(
             &transaction,
             &crate::events::EventMetadata::CoordinatorSessionStarted { session_epoch: epoch },

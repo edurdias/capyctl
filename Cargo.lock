@@ -991,6 +991,7 @@ dependencies = [
  "futures",
  "harness",
  "mllm-config",
+ "mllm-domain",
  "reqwest",
  "serde_json",
  "thiserror",

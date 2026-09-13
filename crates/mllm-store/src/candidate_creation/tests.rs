@@ -5,7 +5,7 @@ use mllm_domain::resources::MemoryObservation;
 use serde_json::{json, Value};
 use std::net::TcpListener;
 
-fn fixture(engine: &str) -> (Value, Value, HostPolicy) {
+pub(super) fn fixture(engine: &str) -> (Value, Value, HostPolicy) {
     let (candidate, ordinary) = match engine {
         "fake" => (
             include_str!("../../../mllm-config/tests/fixtures/candidate-fake.json"),
@@ -43,7 +43,7 @@ fn fixture(engine: &str) -> (Value, Value, HostPolicy) {
     (manifest, host, policy)
 }
 
-fn setup(store: &Store, policy: &HostPolicy) -> CoordinatorSession {
+pub(super) fn setup(store: &Store, policy: &HostPolicy) -> CoordinatorSession {
     let session = store.begin_coordinator_session().unwrap();
     let observations: Vec<_> = policy
         .domains
@@ -62,7 +62,7 @@ fn setup(store: &Store, policy: &HostPolicy) -> CoordinatorSession {
     session
 }
 
-fn command(manifest: &Value) -> String {
+pub(super) fn command(manifest: &Value) -> String {
     json!({"host_id":manifest["host"]["id"],"expected_host_revision":1,
         "recipe_digest":validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap().manifest_digest(),
         "manifest":manifest,"deadline_ms":500_000,"allow_owned_abort_cleanup":true}).to_string()

@@ -60,6 +60,26 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
+    CandidateInitializeArmed {
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        run_id: EventOperationId,
+        step_id: EventOperationId,
+        revision: i64,
+        generation: i64,
+        session_epoch: i64,
+    },
+    #[serde(rename = "1")]
+    CandidateInitializeAccepted {
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        run_id: EventOperationId,
+        step_id: EventOperationId,
+        revision: i64,
+        generation: i64,
+        session_epoch: i64,
+    },
+    #[serde(rename = "1")]
     CandidateRunAccepted {
         operation_id: EventOperationId,
         deployment_id: EventOperationId,
@@ -120,6 +140,8 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::CandidateInitializeArmed { .. } => "candidate_initialize_armed",
+            Self::CandidateInitializeAccepted { .. } => "candidate_initialize_accepted",
             Self::CandidateRunAccepted { .. } => "candidate_run_accepted",
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
             Self::HostQualificationPolicyChanged { .. } => "host_qualification_policy_changed",
@@ -130,6 +152,10 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
+            Self::CandidateInitializeArmed { operation_id, deployment_id, .. } =>
+                (Some(deployment_id.as_str()), Some(operation_id.as_str())),
+            Self::CandidateInitializeAccepted { operation_id, deployment_id, .. } =>
+                (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CandidateRunAccepted { operation_id, deployment_id, .. } =>
                 (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CoordinatorSessionStarted { .. } => (None, None),

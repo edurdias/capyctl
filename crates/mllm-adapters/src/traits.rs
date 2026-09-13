@@ -16,11 +16,8 @@ pub enum RuntimeAction {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeCommand {
-    pub step_id: String,
-    pub binding_id: String,
-    pub incarnation: String,
     pub action: RuntimeAction,
-    pub deadline_ms: i64,
+    pub context: mllm_domain::completion::StepExecutionContext,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
