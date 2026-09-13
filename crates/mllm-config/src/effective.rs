@@ -246,6 +246,57 @@ pub struct QualificationPolicy {
     pub max_output_tokens_per_request: u32,
 }
 
+impl QualificationPolicy {
+    /// Revalidates normalized policy data before a persistence boundary.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let encoding_len = serde_json::to_vec(self)
+            .map_err(|_| invalid("qualification_policy", "policy could not be encoded"))?
+            .len();
+        if encoding_len > 1 << 20
+            || self.revision <= 0
+            || self.allowed_manifest_digests.len() > 1_024
+            || self.max_cases == 0
+            || self.max_cases > 128
+            || self.max_requests == 0
+            || self.max_requests > 4_096
+            || self.max_input_tokens_per_request == 0
+            || self.max_input_tokens_per_request > 131_072
+            || self.max_output_tokens_per_request == 0
+            || self.max_output_tokens_per_request > 16_384
+            || !(1..=86_400_000).contains(&self.max_run_duration_ms)
+            || !(1..=3_600_000).contains(&self.max_cleanup_duration_ms)
+            || !(1..=(1 << 20)).contains(&self.max_request_body_bytes)
+        {
+            return Err(invalid(
+                "qualification_policy",
+                "qualification policy exceeds bounded positive limits",
+            ));
+        }
+        if self.allowed_manifest_digests.iter().any(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(invalid(
+                "qualification_policy.allowed_manifest_digests",
+                "manifest digest must be canonical lowercase SHA-256 hex",
+            ));
+        }
+        if self
+            .allowed_manifest_digests
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid(
+                "qualification_policy.allowed_manifest_digests",
+                "manifest digests must be sorted and distinct",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DomainPolicy {
     pub managed_limit: i64,
@@ -478,57 +529,11 @@ fn normalize_qualification_policy(
     let Some(mut raw) = raw else {
         return Ok(None);
     };
-    if raw.revision <= 0
-        || raw.allowed_manifest_digests.len() > 1_024
-        || raw.max_cases == 0
-        || raw.max_cases > 128
-        || raw.max_requests == 0
-        || raw.max_requests > 4_096
-        || raw.max_input_tokens_per_request == 0
-        || raw.max_input_tokens_per_request > 131_072
-        || raw.max_output_tokens_per_request == 0
-        || raw.max_output_tokens_per_request > 16_384
-    {
-        return Err(invalid(
-            "host.qualification_policy",
-            "qualification policy exceeds bounded positive limits",
-        ));
-    }
-    if raw.allowed_manifest_digests.iter().any(|digest| {
-        digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
-        return Err(invalid(
-            "host.qualification_policy.allowed_manifest_digests",
-            "manifest digest must be canonical lowercase SHA-256 hex",
-        ));
-    }
     raw.allowed_manifest_digests.sort();
-    if raw
-        .allowed_manifest_digests
-        .windows(2)
-        .any(|pair| pair[0] == pair[1])
-    {
-        return Err(invalid(
-            "host.qualification_policy.allowed_manifest_digests",
-            "manifest digests must be distinct",
-        ));
-    }
     let max_run_duration_ms = parse_duration_ms(&raw.max_run_duration)?;
     let max_cleanup_duration_ms = parse_duration_ms(&raw.max_cleanup_duration)?;
     let max_request_body_bytes = parse_bytes(&raw.max_request_body_bytes)?;
-    if !(1..=86_400_000).contains(&max_run_duration_ms)
-        || !(1..=3_600_000).contains(&max_cleanup_duration_ms)
-        || !(1..=(1 << 20)).contains(&max_request_body_bytes)
-    {
-        return Err(invalid(
-            "host.qualification_policy",
-            "qualification policy quantity exceeds bounded positive limits",
-        ));
-    }
-    Ok(Some(QualificationPolicy {
+    let policy = QualificationPolicy {
         revision: raw.revision,
         allow_qualification_runs: raw.allow_qualification_runs,
         allow_experimental_controls: raw.allow_experimental_controls,
@@ -540,7 +545,9 @@ fn normalize_qualification_policy(
         max_request_body_bytes,
         max_input_tokens_per_request: raw.max_input_tokens_per_request,
         max_output_tokens_per_request: raw.max_output_tokens_per_request,
-    }))
+    };
+    policy.validate()?;
+    Ok(Some(policy))
 }
 
 fn normalize_launch(

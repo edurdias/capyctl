@@ -216,6 +216,25 @@ fn qualification_policy_is_not_part_of_recipe_qualification_identity() {
 }
 
 #[test]
+fn normalized_policy_exposes_shared_fail_closed_validation() {
+    let (deployment, mut host) = fixture();
+    host["qualification_policy"] = qualification_policy();
+    let policy = resolve_effective(&deployment, &host)
+        .unwrap()
+        .host
+        .qualification_policy
+        .unwrap();
+    assert!(policy.validate().is_ok());
+
+    let mut stale_or_forged = policy.clone();
+    stale_or_forged.max_requests = 4097;
+    assert!(stale_or_forged.validate().is_err());
+    let mut noncanonical = policy;
+    noncanonical.allowed_manifest_digests.reverse();
+    assert!(noncanonical.validate().is_err());
+}
+
+#[test]
 fn strict_yaml_accepts_only_complete_qualification_policy_shape() {
     let yaml = "schema_version: 1\nkind: host\nname: h\nqualification_policy:\n  revision: 1\n  allow_qualification_runs: false\n  allow_experimental_controls: true\n  allowed_manifest_digests: []\n  max_run_duration: 24h\n  max_cleanup_duration: 60m\n  max_cases: 128\n  max_requests: 4096\n  max_request_body_bytes: 1024KiB\n  max_input_tokens_per_request: 131072\n  max_output_tokens_per_request: 16384\n";
     assert!(parse_strict(ConfigKind::Host, yaml).is_ok());
