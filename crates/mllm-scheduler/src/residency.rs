@@ -222,3 +222,71 @@ pub fn admit_phase(
     }
     Ok(())
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationProposal {
+    expected_epoch: u64,
+    owner: String,
+    replacement: PhaseFootprint,
+    valid_until_ms: i64,
+}
+
+impl ReservationProposal {
+    pub fn expected_epoch(&self) -> u64 {
+        self.expected_epoch
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn replacement(&self) -> &PhaseFootprint {
+        &self.replacement
+    }
+
+    pub fn valid_until_ms(&self) -> i64 {
+        self.valid_until_ms
+    }
+}
+
+pub fn propose_phase(
+    snapshot: &LedgerSnapshot,
+    owner: &str,
+    next: &PhaseFootprint,
+    context: AdmissionContext<'_>,
+) -> Result<ReservationProposal, ResourceError> {
+    admit_phase(snapshot, owner, next, context)?;
+    let earliest = context
+        .observations
+        .iter()
+        .map(|o| o.sampled_at_ms)
+        .min()
+        .ok_or(ResourceError::UnknownDomain)?;
+    let valid_until_ms = earliest
+        .checked_add(context.ttl_ms)
+        .ok_or(ResourceError::Invalid)?;
+    Ok(ReservationProposal {
+        expected_epoch: snapshot.epoch,
+        owner: owner.into(),
+        replacement: next.clone(),
+        valid_until_ms,
+    })
+}
+
+pub fn apply_proposal_to_snapshot(
+    snapshot: &LedgerSnapshot,
+    proposal: &ReservationProposal,
+    now_ms: i64,
+) -> Result<LedgerSnapshot, ResourceError> {
+    if snapshot.epoch != proposal.expected_epoch {
+        return Err(ResourceError::StaleEpoch);
+    }
+    if now_ms < 0 || now_ms > proposal.valid_until_ms {
+        return Err(ResourceError::StaleObservation);
+    }
+    let mut next = snapshot.clone();
+    next.epoch = next.epoch.checked_add(1).ok_or(ResourceError::Invalid)?;
+    next.owners
+        .insert(proposal.owner.clone(), proposal.replacement.clone());
+    Ok(next)
+}

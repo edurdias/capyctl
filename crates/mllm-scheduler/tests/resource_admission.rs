@@ -237,3 +237,56 @@ fn installed_capacity_is_not_available_memory() {
         Err(ResourceError::StaleObservation)
     );
 }
+
+#[test]
+fn two_proposals_cannot_spend_one_epoch() {
+    let snapshot = LedgerSnapshot {
+        epoch: 4,
+        owners: Default::default(),
+    };
+    let next = PhaseFootprint {
+        phase: ResourcePhase::Cold,
+        allocations: vec![Allocation {
+            domain: "system".into(),
+            bytes: 60,
+            host_kv_bytes: 0,
+        }],
+        devices: vec![],
+    };
+    let obs = [MemoryObservation {
+        domain: "system".into(),
+        capacity_bytes: 128,
+        available_bytes: 128,
+        sampled_at_ms: 100,
+    }];
+    let limits = [MemoryLimit {
+        domain: "system".into(),
+        managed_bytes: 96,
+        free_reserve_bytes: 12,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    }];
+    let a = propose_phase(
+        &snapshot,
+        "a",
+        &next,
+        AdmissionContext::new(&obs, &limits, 101, 60, 4),
+    )
+    .unwrap();
+    let b = propose_phase(
+        &snapshot,
+        "b",
+        &next,
+        AdmissionContext::new(&obs, &limits, 101, 60, 4),
+    )
+    .unwrap();
+    let updated = apply_proposal_to_snapshot(&snapshot, &a, 102).unwrap();
+    assert_eq!(
+        apply_proposal_to_snapshot(&updated, &b, 102),
+        Err(ResourceError::StaleEpoch)
+    );
+    assert_eq!(
+        apply_proposal_to_snapshot(&snapshot, &a, 161),
+        Err(ResourceError::StaleObservation)
+    );
+}
