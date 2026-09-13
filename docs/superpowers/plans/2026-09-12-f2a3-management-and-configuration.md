@@ -43,6 +43,7 @@ Unknown JSON fields are rejected on every command object. Max command body: 1 Mi
 | `POST /management/v1/preinitializations` | `members` ordered array of `{deployment_id,expected_revision,final_state}`, `deadline_ms`; idempotency key | 202 one sequence operation with per-member progress |
 | `POST /management/v1/attachments` | `name`, `route`, `endpoint`, `credential_ref`, `resource_bound`, `fingerprint`; idempotency key | 202 attached routing operation, never process adoption |
 | `POST /management/v1/attachments/{id}/detach` | `expected_revision`, `deadline_ms`; idempotency key | 202 route closure and mllm-work drain; no external engine control |
+| `POST /management/v1/attachments/{id}/reconcile` | `expected_revision`, `action` (`refresh`, `retire`, `reattach`), optional `resource_bound`, `deadline_ms`; idempotency key | 202 verified external-accounting operation; never engine control |
 | `PUT /management/v1/hosts/{id}/resource-policy` | `expected_revision`, strict `resource_policy`; idempotency key | 202 durable policy update operation and new policy revision |
 | `POST /management/v1/qualification-runs` | `host_id`, `expected_host_revision`, `recipe_digest`, `manifest`, `deadline_ms`, `allow_owned_abort_cleanup`; idempotency key | 202 scoped candidate run and operation IDs |
 | `POST /management/v1/qualification-runs/{id}/actions` | `expected_revision`, `action` (`initialize`, `park`, `restore`, `finish`, `abort`, `cleanup`), `deadline_ms`; idempotency key | 202 run-scoped operation; never ordinary warm authority |
@@ -159,6 +160,24 @@ Never call external drain, park, stop, restart, or cancellation endpoints. Manag
 deployment IDs return 409 `lifecycle_conflict`; stale revision returns 409
 `revision_conflict`; missing IDs return 404. Retry returns the original operation.
 
+External-accounting reconciliation uses a host-policy-approved read-only collector
+for the recorded external identity. Clients cannot submit evidence. Refresh may
+retain/increase a conservative bound; any reduction or retirement requires trusted
+collector proof covering the complete accounted external runtime and excluding a
+replacement under that identity. Endpoint silence, global free-memory changes, or
+an operator assertion alone are insufficient. Missing collector support returns
+`unsupported_capability`; uncertainty retains charge and endpoint ownership.
+Reattach reuses the existing external owner, immutable endpoint/credential/fingerprint,
+and charge; it does not allocate a duplicate owner. Require free original route,
+settled prior mllm leases, and freshly verified external identity before reopening.
+Changed external identity requires separate accounting, not overwriting retained
+ownership. Commit evidence, bound/endpoint changes, revision, operation, receipt,
+and event in one fenced transaction. No external control or process adoption.
+Test retire-with-proof, refusal without proof, reattach without duplicate charging,
+replacement identity, route conflict, and rollback. CLI exposes
+`reconcile attachment ID --action ACTION --expected-revision REV --wait` through
+this endpoint, with optional resource-bound file and normal idempotency handling.
+
 ## 2. Configuration contract
 
 Retain schema version 1 and strict duplicate/unknown-key rejection. Expand the
@@ -178,7 +197,15 @@ Profile fields: `engine` (`vllm`, `sglang`, `fake`), `revision`, absolute
 `executable`, exact `build_fingerprint`, `qualification_id`, approved `args`,
 allowlisted `env`, `security` (`experimental_controls` boolean and secret references),
 and `log_policy` (`max_file_bytes`, `retained_files`). Effective recipe fingerprints
-include hardware/environment and generated mllm-owned launch settings.
+include hardware/environment and generated mllm-owned behavioral launch settings.
+Qualification identity covers engine build, checkpoint, hardware/environment,
+device topology, parallelism, allocator/memory/KV settings, approved behavioral
+arguments, and security/logging policy. Binding identity separately covers endpoint,
+served-name value, credential reference, and incarnation. Do not hash secret values.
+Changing only binding-specific values preserves qualification; changing authentication
+mode or other behavioral/security settings invalidates affected evidence. Test candidate
+promotion, verified cleanup, and ordinary deployment on a different port/served name
+against the same qualification identity.
 
 Host fields extend current `resource_policy`: physical domains with explicit
 `managed_limit`, `free_reserve`, optional `host_kv_limit`, `parked_limit`;
@@ -198,6 +225,16 @@ For a fresh unconfigured host, derive the managed ceiling only after observing
 physical capacity. Default protected headroom is `max(16 GiB, ceil(capacity/5))`;
 managed limit is capacity minus that headroom. Display derivation as provenance.
 Unknown capacity leaves launches disabled. Unified CPU/GPU memory is one domain.
+
+## Execution order with coordinator integration
+
+Follow [A2d cross-plan execution order](2026-09-12-f2a2d-coordinator-integration.md#execution-order-across-a2d-and-a3).
+After A2d Tasks 1–3, implement configuration foundations, V6 policy/run persistence,
+and V7 event-writer foundations needed by atomic arm checks. Parent A3 tasks stay
+open until all acceptance tests and integration work pass. Emit events in the same
+transaction from each management writer's introduction. Complete remaining A3 work
+alongside A2d dependencies; perform production wiring once, jointly with A2d Task 10.
+No unvalidated constructor, temporary policy bypass, or second lifecycle authority.
 
 ## 3. Tasks
 
@@ -387,6 +424,15 @@ the router never parses a bearer secret from effective/public status data.
 - [ ] Attachment accepts only explicit local HTTP(S) endpoints allowed by host
   policy; deny redirects, credentials embedded in URLs, metadata addresses,
   arbitrary remote hosts, and path-based control tunneling. Probe only the
+  approved external endpoint with its host-configured attachment credential reference.
+  Bind each such reference to its permitted external endpoint identity; reject
+  management keys and managed-runtime credentials before any request. Normalize
+  resolved host/port and reject managed endpoint leases and managed reserved port
+  ranges, including aliases. Pin allowed resolved addresses for subsequent connections
+  so validation cannot drift through DNS changes. Validate attachment ownership
+  atomically with endpoint registration; no managed endpoint may later be leased
+  to an attachment. Test substitutions/aliases fail before probing or forwarding.
+  Probe only the
   inference identity under a fixed conservative bound. Attached resources stay
   charged; no launch/park/stop/restart ownership. Detach disables route and drains
   mllm work but never stops the external server or claims its memory was freed.

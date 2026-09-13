@@ -17,8 +17,13 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Open questions
 
-No owner-only decision has been identified yet. Technical feasibility questions
-belong in the review findings and should be investigated before escalating here.
+- Please check unrelated untracked `crates/mllm-cli/tests/live_interactive.rs` for
+  unwanted formatting. During dispatch Task 3, the implementer ran `cargo fmt -- <paths>`;
+  Cargo formatted the workspace instead of limiting scope. Tracked spill was
+  restored byte-exactly; root confirms no remaining unstaged Rust diff. No original
+  baseline exists for the untracked file, so no
+  restoration is attempted. It is not staged or executed. Root cannot certify its
+  contents unchanged after that command.
 
 ## Progress
 
@@ -52,9 +57,12 @@ belong in the review findings and should be investigated before escalating here.
   validator with full process/token/time/milestone checks. Task and broader reviews
   complete; formatting fix re-reviewed. Full checks at `60fd33a`: 194 CPU tests
   pass, scoped Clippy clean. Post-format memory tests and rustfmt check pass.
-- Coordinator staging analysis identifies A3 policy/run persistence as prerequisite
-  for arming effects; production cutover must join validated A3 composition.
-  Execution-order amendments still need final document review before A2d work.
+- Coordinator staging amendments reviewed: five local personas, three scoped local
+  checks, and three independent reviews complete. Five corrections:
+  staged joint cutover, claim handoff, attachment endpoint/credential isolation,
+  reusable qualification identity, and verified external-accounting reconciliation.
+  A3 policy/run/event foundations precede atomic arm implementation. No pending
+  document decision; no runtime or hardware qualification implied.
 
 ## Execution decisions
 

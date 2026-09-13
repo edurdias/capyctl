@@ -72,6 +72,53 @@ publish Ready or release capacity. Reconciliation then accounts for its result.
    Existing profile strings are not silently rewritten into model identities.
    A3 supplies explicit effective bindings and legacy reconciliation input.
 
+### Execution order across A2d and A3
+
+Task numbering groups responsibilities, not an instruction to finish A2d before
+starting A3. Use this dependency order; keep every partial task visibly incomplete:
+
+1. A2d Tasks 1–3. In Task 2, define `RuntimeError`, `RuntimeAction`, and
+   `RuntimeCommand` once in adapters `traits.rs`; controller re-exports them.
+   Task 7 still changes `EngineAdapter` and all consumers together. Task 2 also
+   starts store `lifecycle.rs` and its private tests: bind incarnation and endpoint
+   in one immediate transaction under current session and deployment fence.
+   Include store `lib.rs` and `dispatch.rs` in Task 2 scope. Task 3 extends this
+   module. No public unfenced binding writer or temporary release bypass.
+2. A3 Task 1 configuration foundations, then Task 2 V6 policy/run persistence
+   and Task 3 V7 event-schema/writer foundations, before completing A2d Task 4.
+   Preserve migration order V5, V6, V7. Management writers emit events in their
+   own transactions from introduction; no separate event commit. Finish remaining
+   A3 acceptance/snapshot work after coordinator interfaces exist. Partial slices
+   do not close their parent tasks.
+3. A2d Tasks 4–6 and preparatory slices of Tasks 7–9, plus Task 10 fake composition
+   and regression work. Stage persisted-command entry additively on the same
+   adapters-owned trait; test new coordinator/router internals through test-only
+   composition. Keep Tasks 7–9 open. Production consumer replacement, router
+   dependency replacement, and legacy-method removal belong to the joint switch.
+   Arm validates real
+   persisted policy and run authority in the same transaction as the grant.
+   Missing or mismatched authority denies effects. No allow-all policy, nonempty
+   qualification-token shortcut, or production compilation stub. Run update/arm
+   race tests once both writers exist before marking either acceptance complete.
+4. Finish A3 Tasks 1–5 and Task 6 logging/security foundations. Perform one joint
+   A2d Task 10/A3 Task 6 production switch: validated configuration, separate
+   credentials, policy enforcement, and new coordinator become active while F1
+   lifecycle authorities are retired. Before that switch, keep new composition
+   test-only. Until then retain only existing F1 production entry points; expose
+   no alternate activation authority. At the switch remove all old lifecycle
+   methods and consumers together, then close Tasks 7–10 and A3 Task 6.
+
+Task 2 ownership persistence stores credential references only. Reserve before
+spawn; identity updates require exact session, fence, and incarnation. Retain
+bindings/endpoints through ambiguous spawn or bind failure. Task 5 verified cleanup
+is the sole managed-runtime release path. Attached accounting uses A3's separate
+verified external-accounting reconciliation, never managed cleanup or engine control.
+Tests before Task 5 assert retention, not fixture cleanup
+through a production bypass.
+
+This sequencing adds no F2 scope or live authority. A2d is not complete until the
+joint production gate passes; A3 is not complete while any sliced task remains open.
+
 ## 2. File map
 
 | Files | Responsibility |
@@ -193,11 +240,13 @@ owned launch receipt, not learned by accepting whichever server answers the port
 
 ### Task 2: Establish lifetime controller and immutable runtime ownership
 
-**Files:** Launcher ownership files and controller runtime files in the map.
+**Files:** Launcher ownership, controller runtime, adapters shared declarations,
+and store lifecycle ownership files named in the cross-plan execution order.
 **Interfaces:** `ControllerLock::acquire(path: &Path) -> io::Result<ControllerLock>`;
 the guard owns the locked file for the entire worker lifetime. Runtime lookup is
 `binding(deployment_id: &str, revision: i64) -> Result<Arc<RuntimeBinding>, RuntimeError>`.
-`RuntimeError` variants are `Missing`, `StaleRevision`, `Unsupported`, `Uncertain(String)`.
+Adapters-owned `RuntimeError` variants are `Missing`, `StaleRevision`, `Unsupported`,
+`Uncertain(String)`; controller re-exports the same type.
 
 - [ ] Add this test to launcher `tests/ownership.rs`. Run
   `cargo test -p mllm-launchers --test ownership`; expect RED: missing exported type.
@@ -335,6 +384,20 @@ VALUES (?1,?2,?3,?4);
   operation atomically. It does not delete leases, old claims, bindings, or
   reservations. The worker reconciles a superseded armed command before cleanup.
   Implement suspend with the same immediate fence but without implicit cleanup.
+- [ ] Add fenced claim handoff for superseding stop/reconciliation. In one immediate
+  transaction validate current session, current member fences, predecessor operation,
+  and every affected retained claim. Transfer those claims to the new reconciliation
+  operation while recording predecessor claim/step links in versioned durable history.
+  Preserve old steps, grants, leases, bindings, and reservations; transfer is not release.
+  Normal claim acquisition still cannot steal claims. Old callbacks fail their original
+  fences. The owned worker cannot send new cleanup controls until the preceding owned
+  command task has ended; restart first requires the lifetime controller lock.
+  When observation cannot resolve an old effect, explicit Stop may proceed to cleanup
+  only with verified full owned process identities and its original cleanup authority.
+  Unknown ownership stays uncertain. Transfer of other sequence members grants only
+  reconciliation, not permission to stop them. Release claims only after verified
+  evidence settles their effects. Test stop-during-Restore and restart through this
+  handoff, including stale handoff, partial rollback, and uncertain-identity rejection.
 - [ ] Add opposing-sequence assertions: one claim transaction wins; the loser
   leaves zero partial claims. Verify stale sessions, stale revisions, and stop
   versus ready completion cannot mutate ownership. Run the store lifecycle suite
@@ -456,7 +519,9 @@ UPDATE lifecycle_steps SET state='completed' WHERE id=?1 AND state='armed';
   partial worker exit, and PID reuse cannot satisfy cleanup.
 - [ ] Keep claims while any step is armed/uncertain. Release claims only after
   completed effects or verified reconciliation; failed-but-uncertain is not a
-  resource-free terminal state. Run completion/cleanup/replay tests to GREEN.
+  resource-free terminal state. Task 3 fenced handoff transfers retained ownership
+  with predecessor history; it does not release claims or their resource charges.
+  Run completion/cleanup/replay tests to GREEN.
 - [ ] Commit: `git commit -m "feat: require qualified evidence for release and readiness"`.
 
 ### Task 6: Build fit-based sequences, including usable preinitialization
@@ -554,6 +619,9 @@ another deployment's endpoint through a global profile lookup.
   with the persisted-command contract; retain separately useful observation
   methods only with explicit evidence semantics. Compile all affected crates.
   Do not leave a public RuntimeDriver or an unfenced legacy lifecycle facade.
+  These removal/production-consumer requirements close at the joint cutover.
+  Preparatory work adds the command entry to the same trait without enabling
+  new production composition; keep this task open until legacy removal completes.
 
 - [ ] Add this send-decision helper and assertion before implementing the worker:
 
@@ -668,6 +736,8 @@ means the entire known incarnation is gone, not that its original API PID vanish
 authentication, not a profile-keyed forwarder map. Resolution returns a current
 `DeploymentFence`; binding lookup verifies that exact revision before forwarding.
 Use A2c `DispatchTicket` as the sole backend-work accounting authority.
+This is the final production interface. Prepare and test new routing internals
+before the joint switch; replace production dependencies and close this task there.
 
 - [ ] Introduce distinct backend and delivery results and test settlement first:
 
