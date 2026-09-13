@@ -61,24 +61,17 @@ pub(crate) enum EventWriteError {
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
     CoordinatorSessionStarted { session_epoch: i64 },
-    #[cfg(test)]
-    #[serde(rename = "test")]
-    PayloadBoundaryFixture { body: String },
 }
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
-            #[cfg(test)]
-            Self::PayloadBoundaryFixture { .. } => "payload_boundary_fixture",
         }
     }
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
             Self::CoordinatorSessionStarted { .. } => (None, None),
-            #[cfg(test)]
-            Self::PayloadBoundaryFixture { .. } => (None, None),
         }
     }
 }
@@ -94,14 +87,19 @@ fn append_event_at(
     event: &EventMetadata,
     at: i64,
 ) -> Result<i64, EventWriteError> {
-    let payload = serde_json::to_string(event)?;
-    if payload.len() > MAX_PAYLOAD {
-        return Err(EventWriteError::PayloadTooLarge);
-    }
+    let payload = serialize_bounded(event)?;
     let (deployment_id, operation_id) = event.identifiers();
     tx.execute("INSERT INTO management_events(recorded_at_ms,kind,deployment_id,operation_id,payload_json) VALUES(?1,?2,?3,?4,?5)", params![at,event.kind(),deployment_id,operation_id,payload])?;
     prune(tx, at)?;
     Ok(tx.last_insert_rowid())
+}
+
+fn serialize_bounded(value: &impl Serialize) -> Result<String, EventWriteError> {
+    let payload = serde_json::to_string(value)?;
+    if payload.len() > MAX_PAYLOAD {
+        return Err(EventWriteError::PayloadTooLarge);
+    }
+    Ok(payload)
 }
 fn prune(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
     let floor: Option<i64> = tx.query_row(
@@ -420,22 +418,25 @@ mod tests {
     }
     #[test]
     fn payload_limit_accepts_exact_bytes_and_rejects_one_more() {
-        let s = Store::open_in_memory().unwrap();
-        let tx = Transaction::new_unchecked(&s.conn, TransactionBehavior::Immediate).unwrap();
-        let overhead = serde_json::to_string(&EventMetadata::PayloadBoundaryFixture {
+        #[derive(Serialize)]
+        struct Fixture {
+            body: String,
+        }
+
+        let overhead = serde_json::to_string(&Fixture {
             body: String::new(),
         })
         .unwrap()
         .len();
-        let exact = EventMetadata::PayloadBoundaryFixture {
+        let exact = Fixture {
             body: "x".repeat(MAX_PAYLOAD - overhead),
         };
-        append_event_at(&tx, &exact, now_ms()).unwrap();
-        let oversized = EventMetadata::PayloadBoundaryFixture {
+        assert_eq!(serialize_bounded(&exact).unwrap().len(), MAX_PAYLOAD);
+        let oversized = Fixture {
             body: "x".repeat(MAX_PAYLOAD - overhead + 1),
         };
         assert!(matches!(
-            append_event_at(&tx, &oversized, now_ms()),
+            serialize_bounded(&oversized),
             Err(EventWriteError::PayloadTooLarge)
         ))
     }
