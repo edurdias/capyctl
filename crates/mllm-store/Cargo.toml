@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mllm-domain = { workspace = true }
+mllm-scheduler = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }

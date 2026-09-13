@@ -1122,6 +1122,7 @@ name = "mllm-store"
 version = "0.1.0"
 dependencies = [
  "mllm-domain",
+ "mllm-scheduler",
  "rusqlite",
  "serde",
  "serde_json",

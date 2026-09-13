@@ -4,6 +4,7 @@
 
 pub mod deployments;
 pub mod migrations;
+pub mod resource_ledger;
 pub mod schema;
 
 use std::fs;
