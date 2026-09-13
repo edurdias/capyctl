@@ -2,10 +2,26 @@ use mllm_config::effective::candidate::{
     validate_candidate_reviewed_snapshot as snapshot,
     validate_candidate_reviewed_snapshot_text as snapshot_text,
 };
+use mllm_config::effective::resolve_effective;
+use mllm_config::{parse_strict, ConfigKind};
 use serde_json::{json, Value};
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/candidate-fake.json")).unwrap()
+}
+
+fn assert_snapshot_rejects(value: &Value, label: &str) {
+    assert!(snapshot(value).is_err(), "value: {label}");
+    assert!(snapshot_text(&value.to_string()).is_err(), "text: {label}");
+}
+
+fn fixture_yaml(value: &Value) -> String {
+    value
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(key, value)| format!("{key}: {}\n", serde_json::to_string(value).unwrap()))
+        .collect()
 }
 
 #[test]
@@ -135,4 +151,108 @@ fn engine_specific_signed_bytes_and_engine_tags_are_intrinsic() {
     value["effective_recipe"]["resolved_profile"]["engine"] = "vllm".into();
     assert!(snapshot(&value).is_err());
     assert!(snapshot_text(&value.to_string()).is_err());
+}
+
+#[test]
+fn intrinsic_recipe_and_primitive_failures_reject_without_profile_equality() {
+    for (path, bad) in [
+        (
+            "/effective_recipe/resolved_profile/log_policy/max_file_bytes",
+            json!(9_223_372_036_854_775_808_u64),
+        ),
+        (
+            "/effective_recipe/resolved_profile/log_policy/max_file_bytes",
+            json!(1.5),
+        ),
+        ("/effective_recipe/runtime_profile", json!("x".repeat(257))),
+        ("/cases/2/corpus_digest", json!("A".repeat(64))),
+    ] {
+        let mut value = fixture();
+        *value.pointer_mut(path).unwrap() = bad;
+        assert_snapshot_rejects(&value, path);
+    }
+
+    let mut duplicate_device = fixture();
+    let claim = duplicate_device["effective_recipe"]["devices"][0].clone();
+    duplicate_device["effective_recipe"]["devices"]
+        .as_array_mut()
+        .unwrap()
+        .push(claim);
+    assert_snapshot_rejects(&duplicate_device, "duplicate selected device");
+
+    let mut phase_claim = fixture();
+    phase_claim["effective_recipe"]["resources"]["ready"]["devices"][0]["sharing"] =
+        "exclusive".into();
+    assert_snapshot_rejects(&phase_claim, "phase claim mismatch");
+
+    let mut transition = fixture();
+    transition["effective_recipe"]["resources"]["parked"]["allocations"][0]["bytes"] =
+        10_737_418_241_i64.into();
+    assert_snapshot_rejects(&transition, "malformed phase transition");
+
+    let mut unknown = fixture();
+    unknown["effective_recipe"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), json!(true));
+    assert_snapshot_rejects(&unknown, "unknown recipe field");
+}
+
+#[test]
+fn text_rejects_yaml_duplicates_documents_and_secret_diagnostics() {
+    let value = fixture();
+    let yaml = fixture_yaml(&value);
+    assert!(snapshot_text(&yaml).is_ok());
+
+    let duplicate_root = format!("schema_version: 1\n{yaml}");
+    assert!(snapshot_text(&duplicate_root).is_err());
+
+    let duplicate_sequence_key = yaml.replacen(
+        "\"count\":1",
+        "\"count\":1,\"count\":1",
+        1,
+    );
+    assert_ne!(duplicate_sequence_key, yaml);
+    assert!(snapshot_text(&duplicate_sequence_key).is_err());
+
+    let multiple = format!("{yaml}---\n{yaml}");
+    assert!(snapshot_text(&multiple).is_err());
+
+    let sentinel = "candidate-secret-sentinel";
+    let mut bad = value;
+    bad["effective_recipe"]["runtime_profile_revision"] = sentinel.into();
+    let value_error = snapshot(&bad).unwrap_err().to_string();
+    let text_error = snapshot_text(&bad.to_string()).unwrap_err().to_string();
+    assert!(!value_error.contains(sentinel));
+    assert!(!text_error.contains(sentinel));
+}
+
+#[test]
+fn signed_qualification_revision_rejects_preserved_large_unsigned_integer() {
+    let golden: Value =
+        serde_json::from_str(include_str!("fixtures/effective-vllm-golden.json")).unwrap();
+    let deployment = golden["input"]["deployment"].clone();
+    let mut host = golden["input"]["host"].clone();
+    host["qualification_policy"] = json!({
+        "revision": 1,
+        "allow_qualification_runs": false,
+        "allow_experimental_controls": true,
+        "allowed_manifest_digests": [],
+        "max_run_duration": "24h",
+        "max_cleanup_duration": "60m",
+        "max_cases": 128,
+        "max_requests": 4096,
+        "max_request_body_bytes": "1MiB",
+        "max_input_tokens_per_request": 131072,
+        "max_output_tokens_per_request": 16384
+    });
+    host["qualification_policy"]["revision"] = 9_223_372_036_854_775_808_u64.into();
+    let text = serde_json::to_string(&host).unwrap();
+    assert!(text.contains("9223372036854775808"));
+    let parsed = parse_strict(ConfigKind::Host, &text).unwrap();
+    assert_eq!(
+        parsed["qualification_policy"]["revision"].as_u64(),
+        Some(9_223_372_036_854_775_808)
+    );
+    assert!(resolve_effective(&deployment, &parsed).is_err());
 }
