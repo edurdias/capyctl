@@ -674,6 +674,60 @@ fn assert_candidate_rejects(candidate: &serde_json::Value, host: &serde_json::Va
     );
 }
 
+fn complete_warm_cases(positive_cycles: u32) -> Vec<serde_json::Value> {
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut cases = vec![
+        serde_json::json!({"id":"cold-0","kind":"cold_initialize","cycle":0,"count":1,"request_budget":0}),
+        serde_json::json!({"id":"ready-0","kind":"ready_probe","cycle":0,"count":1,"request_budget":1}),
+        serde_json::json!({"id":"marker-ns-0","kind":"marker_nonstreaming","cycle":0,"count":1,"request_budget":1,"corpus_digest":digest}),
+        serde_json::json!({"id":"marker-s-0","kind":"marker_streaming","cycle":0,"count":1,"request_budget":1,"corpus_digest":digest}),
+        serde_json::json!({"id":"security-0","kind":"security","cycle":0,"count":1,"request_budget":1}),
+    ];
+    for cycle in 1..=positive_cycles {
+        for (name, kind, budget, marker) in [
+            ("park", "park", 0, false),
+            ("restore", "restore", 0, false),
+            ("ready", "ready_probe", 1, false),
+            ("marker-ns", "marker_nonstreaming", 1, true),
+            ("marker-s", "marker_streaming", 1, true),
+        ] {
+            let mut case = serde_json::json!({
+                "id":format!("{name}-{cycle}"), "kind":kind, "cycle":cycle,
+                "count":1, "request_budget":budget
+            });
+            if marker {
+                case["corpus_digest"] = digest.into();
+            }
+            cases.push(case);
+        }
+    }
+    cases
+}
+
+fn reversed_key_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let fields = map.iter().rev().map(|(key, value)| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(key).unwrap(),
+                    reversed_key_json(value)
+                )
+            });
+            format!("{{{}}}", fields.collect::<Vec<_>>().join(","))
+        }
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(reversed_key_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        scalar => serde_json::to_string(scalar).unwrap(),
+    }
+}
+
 #[test]
 fn every_candidate_object_family_rejects_missing_unknown_null_and_wrong_types() {
     let families = [
@@ -799,12 +853,6 @@ fn case_contract_rejects_each_independent_invalid_condition() {
         assert_candidate_rejects(&candidate, &host, label);
     };
     reject("empty", &|c| c["cases"] = serde_json::json!([]));
-    reject("129", &|c| {
-        c["cases"] = serde_json::Value::Array(vec![c["cases"][0].clone(); 129])
-    });
-    reject("130", &|c| {
-        c["cases"] = serde_json::Value::Array(vec![c["cases"][0].clone(); 130])
-    });
     reject("duplicate id", &|c| {
         c["cases"][1]["id"] = c["cases"][0]["id"].clone()
     });
@@ -877,6 +925,35 @@ fn case_contract_rejects_each_independent_invalid_condition() {
 }
 
 #[test]
+fn case_count_cap_is_independent_of_suite_structure() {
+    let (mut candidate, host) = fixture();
+    candidate["limits"]["max_requests"] = 128.into();
+    candidate["cases"] = complete_warm_cases(24).into();
+    assert_eq!(candidate["cases"].as_array().unwrap().len(), 125);
+    assert!(normalize_candidate_manifest(&candidate, &host).is_ok());
+
+    let complete_130 = complete_warm_cases(25);
+    assert_eq!(complete_130.len(), 130);
+    for (label, cases) in [
+        (
+            "129 incomplete only after cap",
+            complete_130[..129].to_vec(),
+        ),
+        ("130 complete ordered suite", complete_130),
+    ] {
+        let mut oversized = candidate.clone();
+        oversized["cases"] = cases.into();
+        let error = normalize_candidate_manifest(&oversized, &host)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("case count must be 1..128"),
+            "{label}: {error}"
+        );
+    }
+}
+
+#[test]
 fn f2c_n5_fixture_has_30_cases_384_markers_and_explicit_probe_total() {
     let (_, _, host) = engine_fixture("vllm");
     let candidate: serde_json::Value =
@@ -911,9 +988,11 @@ fn canonical_reviewed_bytes_and_identity_matrix_are_literal() {
     let canonical = include_bytes!("fixtures/candidate-vllm-canonical.json");
     assert_eq!(original.reviewed_json(), &canonical[..canonical.len() - 1]);
 
-    let reordered: serde_json::Value =
-        serde_json::from_str(&serde_json::to_string(&candidate).unwrap()).unwrap();
-    let reordered = normalize_candidate_manifest(&reordered, &host).unwrap();
+    let ordinary_text = serde_json::to_string(&candidate).unwrap();
+    let reordered_text = reversed_key_json(&candidate);
+    assert_ne!(ordinary_text, reordered_text);
+    let reordered = normalize_candidate_manifest_text(&reordered_text, &host).unwrap();
+    assert_eq!(original.reviewed_json(), reordered.reviewed_json());
     assert_eq!(original.manifest_digest(), reordered.manifest_digest());
 
     for field in [
@@ -988,7 +1067,7 @@ fn canonical_reviewed_bytes_and_identity_matrix_are_literal() {
 #[test]
 fn every_limit_accepts_boundaries_and_rejects_outside_values() {
     for (field, minimum, maximum) in [
-        ("max_run_duration_ms", 300_000_i64, 86_400_000_i64),
+        ("max_run_duration_ms", 1_i64, 86_400_000_i64),
         ("max_cleanup_duration_ms", 1, 3_600_000),
         ("max_requests", 7, 4096),
         ("max_request_body_bytes", 1, 1_048_576),
@@ -998,6 +1077,9 @@ fn every_limit_accepts_boundaries_and_rejects_outside_values() {
         for value in [minimum, maximum] {
             let (mut candidate, host) = fixture();
             candidate["limits"][field] = value.into();
+            if field == "max_run_duration_ms" {
+                candidate["effective_recipe"]["request_deadline_ms"] = value.min(300_000).into();
+            }
             assert!(
                 normalize_candidate_manifest(&candidate, &host).is_ok(),
                 "{field} {value}"
@@ -1021,7 +1103,10 @@ fn size_caps_and_secret_errors_cover_all_four_budgets() {
     let mut oversized_value = candidate.clone();
     oversized_value["effective_recipe"]["resolved_profile"]["args"] =
         serde_json::json!(["x".repeat(1 << 20)]);
-    assert_candidate_rejects(&oversized_value, &host, "encoded Value cap");
+    let error = normalize_candidate_manifest(&oversized_value, &host)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("encoding exceeds 1MiB"), "{error}");
 
     let mut secret_host = host;
     let secret = format!("secret://{}", "z".repeat(1 << 20));
