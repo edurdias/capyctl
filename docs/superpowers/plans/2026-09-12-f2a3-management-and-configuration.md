@@ -264,6 +264,25 @@ SGLang requires distinct nonempty API/admin references; vLLM requires its runtim
 credential. Qualification fingerprints exclude reference values but include
 authentication structure and behavioral security policy.
 
+The remaining candidate-configuration slice adds optional host `qualification_policy`;
+absence disables qualification. A present block requires `revision`,
+`allow_qualification_runs`, `allow_experimental_controls`, `allowed_manifest_digests`,
+`max_run_duration`, `max_cleanup_duration`, `max_cases`, `max_requests`,
+`max_request_body_bytes`, `max_input_tokens_per_request`, and
+`max_output_tokens_per_request`. Use checked unit strings for time/bytes and
+positive bounded integers for revision/counts. Digests are distinct lowercase
+SHA-256 hex strings, normalized in sorted order; an empty allowlist denies all.
+Host identity and expected fingerprints come from the existing host fields.
+
+Implementation caps are 1 MiB policy encoding, 1024 digests, 24 h run duration,
+1 h cleanup duration, 128 cases, 4096 requests, 1 MiB request body,
+131072 input tokens and 16384 output tokens. These are host policy limits, not
+qualified engine capacities. Permissions are independent and never inferred from
+an allowlist. Current authorization is checked before effects; these permission
+values are not behavioral recipe identity. Resource-policy management cannot edit
+this local block. Startup imports initial revision 1; repeated identical current
+input is a no-op, changes require the next revision, and stale restoration fails.
+
 Generated endpoints, served names, credential references, and incarnations are
 not manifest overrides. A separate binding fingerprint consumes trusted runtime
 values. Pure default-policy derivation accepts observed capacity from its caller;
