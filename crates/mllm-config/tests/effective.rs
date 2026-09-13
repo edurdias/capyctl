@@ -2,6 +2,7 @@ use mllm_config::effective::{
     binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
     resolve_effective, Engine,
 };
+use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
 use mllm_domain::launch::ProfileLaunchSettings;
 
@@ -661,6 +662,23 @@ fn equivalent_byte_units_have_identical_qualification_identity() {
     equivalent["runtime_profiles"]["local"]["launch_settings"]["requested_budget"]
         ["kv_cache_bytes"] = "4096MiB".into();
     let normalized = resolve_effective(&deployment, &equivalent).unwrap();
+    assert_eq!(
+        original.qualification_fingerprint,
+        normalized.qualification_fingerprint
+    );
+}
+
+#[test]
+fn equivalent_resource_units_have_identical_normalized_controls() {
+    let (deployment, host) = fixture();
+    let original = resolve_effective(&deployment, &host).unwrap();
+    let mut equivalent = host;
+    equivalent["resource_policy"]["domains"]["unified"]["managed_limit"] = "32768MiB".into();
+    let normalized = resolve_effective(&deployment, &equivalent).unwrap();
+    assert_eq!(
+        ResourceControls::from_host(&original.host),
+        ResourceControls::from_host(&normalized.host)
+    );
     assert_eq!(
         original.qualification_fingerprint,
         normalized.qualification_fingerprint

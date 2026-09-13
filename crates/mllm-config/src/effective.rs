@@ -1,6 +1,7 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
 use crate::engine_policy::{validate_profile_args, validate_profile_env};
+use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
 use mllm_domain::launch::{
     FakeLaunchSettings, ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget,
@@ -846,32 +847,7 @@ pub fn resolve_effective(
             host_kv_limit: raw.host_kv_limit.as_deref().map(parse_bytes).transpose()?,
             parked_limit: raw.parked_limit.as_deref().map(parse_bytes).transpose()?,
         };
-        if value.managed_limit <= 0 || value.free_reserve < 0 {
-            return Err(invalid("resource_policy.domains", "invalid domain limits"));
-        }
         domains.insert(name, value);
-    }
-    if domains.is_empty() {
-        return Err(invalid(
-            "resource_policy.domains",
-            "at least one domain required",
-        ));
-    }
-    for (id, policy) in &h.resource_policy.devices {
-        if !domains.contains_key(&policy.domain) {
-            return Err(invalid(
-                format!("resource_policy.devices.{id}.domain"),
-                "unknown domain",
-            ));
-        }
-        if h.resource_policy.device_sharing == Sharing::Exclusive
-            && policy.sharing == Sharing::Shared
-        {
-            return Err(invalid(
-                format!("resource_policy.devices.{id}.sharing"),
-                "device policy cannot relax global exclusive policy",
-            ));
-        }
     }
     let selected: BTreeMap<_, _> = d
         .devices
@@ -961,28 +937,6 @@ pub fn resolve_effective(
         .resource_policy
         .planner_max_states
         .unwrap_or(DEFAULT_PLANNER_STATES);
-    if queue.max_pending_per_deployment == 0
-        || queue.max_pending_per_deployment > 4_096
-        || queue.max_pending_total == 0
-        || queue.max_pending_total > 16_384
-        || queue.max_pending_per_deployment > queue.max_pending_total
-        || queue.max_buffered_bytes_total <= 0
-        || queue.max_buffered_bytes_total > (1_i64 << 30)
-        || queue.request_deadline_ms <= 0
-        || queue.request_deadline_ms > 3_600_000
-        || queue.admission_window_ms <= 0
-        || queue.admission_window_ms > 30_000
-        || queue.admission_window_ms > queue.request_deadline_ms
-        || max_parked > 16
-        || observation_ttl_ms <= 0
-        || observation_ttl_ms > 10_000
-        || planner_max_states == 0
-        || planner_max_states > 65_536
-        || h.resource_policy.endpoint_port_range.start == 0
-        || h.resource_policy.endpoint_port_range.start > h.resource_policy.endpoint_port_range.end
-    {
-        return Err(invalid("resource_policy", "invalid bounded host policy"));
-    }
     let deadline = d
         .request_deadline
         .as_deref()
@@ -1041,6 +995,7 @@ pub fn resolve_effective(
         queue,
         qualification_policy,
     };
+    ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     #[derive(Serialize)]
     struct Qualification<'a> {
         model: &'a ModelIdentity,
