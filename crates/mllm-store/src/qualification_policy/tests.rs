@@ -252,6 +252,37 @@ fn invalid_constructed_input_and_unsorted_digests_are_rejected() {
 }
 
 #[test]
+fn configured_status_preserves_both_permissions_independently() {
+    for (qualification, experimental) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        let mut input = host(Some(1));
+        let policy = input.qualification_policy.as_mut().unwrap();
+        policy.allow_qualification_runs = qualification;
+        policy.allow_experimental_controls = experimental;
+        let result = store.import_qualification_policy(&session, &input).unwrap();
+        assert_eq!(result.state, QualificationPolicyState::Configured);
+        let stored: serde_json::Value = serde_json::from_str(&current(&store).1).unwrap();
+        assert_eq!(
+            stored["state"]["policy"]["allow_qualification_runs"],
+            qualification
+        );
+        assert_eq!(
+            stored["state"]["policy"]["allow_experimental_controls"],
+            experimental
+        );
+        assert!(
+            !store
+                .import_qualification_policy(&session, &input)
+                .unwrap()
+                .changed
+        );
+    }
+}
+
+#[test]
 fn stale_session_is_rejected_even_for_noop() {
     let store = Store::open_in_memory().unwrap();
     let stale = store.begin_coordinator_session().unwrap();
@@ -324,7 +355,13 @@ fn change_events_are_ordered_versioned_and_redacted() {
         .import_qualification_policy(&session, &host(Some(1)))
         .unwrap();
     store
+        .import_qualification_policy(&session, &host(Some(2)))
+        .unwrap();
+    store
         .import_qualification_policy(&session, &host(None))
+        .unwrap();
+    store
+        .import_qualification_policy(&session, &host(Some(3)))
         .unwrap();
     let events = store.events_after(None, 10).unwrap().events;
     assert_eq!(
@@ -333,7 +370,15 @@ fn change_events_are_ordered_versioned_and_redacted() {
     );
     assert_eq!(
         events[2].payload_json,
-        r#"{"version":"1","change_kind":"removed","previous_revision":1,"current_revision":1,"session_epoch":1}"#
+        r#"{"version":"1","change_kind":"updated","previous_revision":1,"current_revision":2,"session_epoch":1}"#
+    );
+    assert_eq!(
+        events[3].payload_json,
+        r#"{"version":"1","change_kind":"removed","previous_revision":2,"current_revision":2,"session_epoch":1}"#
+    );
+    assert_eq!(
+        events[4].payload_json,
+        r#"{"version":"1","change_kind":"readded","previous_revision":2,"current_revision":3,"session_epoch":1}"#
     );
     for event in &events[1..] {
         assert_eq!((&event.deployment_id, &event.operation_id), (&None, &None));
@@ -448,4 +493,46 @@ fn concurrent_same_base_updates_have_one_winner() {
     );
     let verify = Store::open(&path).unwrap();
     assert_eq!(current(&verify).0, 2);
+}
+
+#[test]
+fn concurrent_identical_successor_imports_are_mutation_then_unchanged_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite3");
+    let seed = Store::open(&path).unwrap();
+    let session = seed.begin_coordinator_session().unwrap();
+    seed.import_qualification_policy(&session, &host(Some(1)))
+        .unwrap();
+    drop(seed);
+    let stores = [Store::open(&path).unwrap(), Store::open(&path).unwrap()];
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = stores
+        .into_iter()
+        .map(|store| {
+            let barrier = Arc::clone(&barrier);
+            let session = session.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.import_qualification_policy(&session, &host(Some(2)))
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.changed).count(), 1);
+    assert_eq!(results.iter().filter(|result| !result.changed).count(), 1);
+    assert!(results.iter().all(|result| {
+        result.state == QualificationPolicyState::Configured && result.revision == Some(2)
+    }));
+    let verify = Store::open(&path).unwrap();
+    let policy_events = verify
+        .events_after(None, 10)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|event| event.kind == "host_qualification_policy_changed")
+        .count();
+    assert_eq!(policy_events, 2);
 }
