@@ -475,11 +475,22 @@ WHERE id=?1 AND state='planned' AND session_id=?3;
 -- Require exactly one changed row before committing the grant transaction.
 ```
 
-- [ ] Include runtime launch settings derived from the committed grant in the
-  frozen step; adapters cannot select larger KV allocations or a different recipe.
+- [ ] Include exact runtime launch settings authorized by the committed grant and
+  qualified recipe in the frozen step; adapters cannot select larger KV allocations
+  or a different recipe. A3's normalized owned settings include every allocator
+  request in qualification identity. Authorize those settings unchanged or deny;
+  changing a rendered value requires a new effective recipe and qualification.
+  Total phase allocations and host KV accounting do not uniquely determine backend
+  KV pools. Validate against qualified backend geometry and allocation evidence.
   Resource-neutral control substeps still require a unique persisted intent but
   do not mint a second resource grant. A Stop intent is armed under its explicit
   authorization without inventing a resource-increasing phase.
+- [ ] Persist a shared domain execution context with the complete TransitionToken,
+  binding ID/incarnation, issue/deadline times, identity scope, settled completion
+  target, grant reference and exact normalized launch settings. Expose a session-
+  fenced read of this context and persisted action. Loading/cloning context grants
+  no send permission; only `ArmResult::New` permits dispatch. Validate action/context
+  combinations. The completion target is settled Ready/Parked, not the temporary peak.
 - [ ] Test process exit immediately after commit and before send: restart marks
   the arm uncertain, retains its peak, and sends nothing automatically. Also test
   stale-session arm, stale ledger epoch, expired observation, altered binding,
@@ -511,6 +522,11 @@ runtime collectors; there is no management endpoint accepting this object.
   caller trying to select a smaller footprint: this API has no footprint argument.
   Compare a repeated completion to recorded canonical evidence and return success
   without incrementing the epoch again; mismatched replay is a conflict.
+- [ ] Cold Initialize completion requires the complete API/worker identity set
+  already associated durably with the exact owned binding incarnation. Construct
+  expected identities from that association, not from the incoming evidence alone.
+  A collector correlates observations with its supplied token; never rewrite a
+  mismatched returned token to make completion validate.
 
 ```sql
 UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1;
@@ -620,11 +636,8 @@ never choose victims or change reservations. Retain async-trait in adapters.
 pub enum RuntimeAction { Initialize, Drain, Park, Restore, Probe, Stop, Inspect }
 #[derive(Clone, Debug)]
 pub struct RuntimeCommand {
-    pub step_id: String,
-    pub binding_id: String,
-    pub incarnation: String,
     pub action: RuntimeAction,
-    pub deadline_ms: i64,
+    pub context: mllm_domain::execution::StepExecutionContext,
 }
 #[async_trait::async_trait]
 pub trait EngineAdapter: Send + Sync {
@@ -632,6 +645,24 @@ pub trait EngineAdapter: Send + Sync {
         -> Result<mllm_domain::completion::CompletionEvidence, RuntimeError>;
 }
 ```
+
+Introduce the shared context with Task 4's first persisted consumer. Domain
+`StepExecutionContext` contains the full existing `TransitionToken`, `binding_id`,
+`incarnation`, `issued_at_ms`, `deadline_ms`, `identities`, `completion_target`,
+`grant_id`, and optional `launch_settings: ProfileLaunchSettings` from domain's
+launch module. Identity scope is `Retained(Vec<ProcessIdentity>)` or `OwnedLaunch`;
+the latter is legal only for exact managed cold initialization. Launch settings
+are mandatory for initialization/allocation actions and frozen from the qualified
+recipe. Control-only and cleanup steps carry no invented allocation settings or
+Ready/Parked completion target. No second token or lifecycle trait.
+
+The immutable adapter construction context includes the binding's frozen engine,
+model, recipe, qualification, executable, endpoint and protected credential references.
+Before I/O, reject detectable command/context mismatches and unsupported actions.
+Never re-read a mutable profile to choose a retained runtime's endpoint or recipe.
+Store independently rechecks current session, claims and generations. Full token,
+settings and identity-scope round trips, wrong-token evidence, context replay,
+profile edits after binding creation and unknown cold identities require tests.
 
 Stop uses the launcher's cleanup collector, not this ready/park completion result.
 Drain/Inspect may return `Uncertain` until the recipe's collector can establish
