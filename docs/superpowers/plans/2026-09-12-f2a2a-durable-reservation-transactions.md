@@ -141,7 +141,8 @@ git commit -m "feat(store): add versioned resource ledger schema"
 **Interfaces:** Produces `ResourceStoreError` and
 `Store::resource_snapshot(&self) -> Result<LedgerSnapshot, ResourceStoreError>`.
 Consumes F2A1 `PhaseFootprint`, `LedgerSnapshot`, and `validate_footprint`.
-Private `encode`/`decode` preserve all allocations and sharing claims. Unknown storage
+Private `decode` preserves all allocations and sharing claims; Task 3 adds canonical
+encoding when the writer needs it. Unknown storage
 versions, phases, and malformed footprints fail closed.
 
 **Files:** Create `resource_ledger.rs` and `tests/resource_transactions.rs`; modify
@@ -170,8 +171,8 @@ fn new_store_has_empty_epoch_zero() {
 
 ```rust
 use mllm_domain::resources::*;
-use mllm_scheduler::residency::{admit_phase, validate_footprint, AdmissionContext, ResourceError};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use mllm_scheduler::residency::{validate_footprint, ResourceError};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -197,26 +198,6 @@ struct StoredFootprint {
     phase: String,
     allocations: Vec<(String, i64, i64)>,
     devices: Vec<(String, bool)>,
-}
-
-fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
-    validate_footprint(footprint)?;
-    let phase = match footprint.phase {
-        ResourcePhase::Cold => "cold",
-        ResourcePhase::Ready => "ready",
-        ResourcePhase::Parking => "parking",
-        ResourcePhase::Parked => "parked",
-        ResourcePhase::Wake => "wake",
-    };
-    let mut allocations: Vec<_> = footprint.allocations.iter()
-        .map(|a| (a.domain.clone(), a.bytes, a.host_kv_bytes)).collect();
-    let mut devices: Vec<_> = footprint.devices.iter()
-        .map(|d| (d.device.clone(), d.sharing == Sharing::Shared)).collect();
-    allocations.sort();
-    devices.sort();
-    Ok(serde_json::to_string(&StoredFootprint {
-        version: 1, phase: phase.into(), allocations, devices,
-    })?)
 }
 
 fn decode(json: &str) -> Result<PhaseFootprint, ResourceStoreError> {
@@ -272,8 +253,8 @@ impl crate::Store {
 }
 ```
 
-- [ ] Add these private tests at the bottom of the module. They also keep the
-  serializer exercised before the writer arrives in Task 3.
+- [ ] Add these private decoder tests at the bottom of the module. Task 3 adds
+  the encoder and round-trip test together, avoiding unused production helpers.
 
 ```rust
 #[cfg(test)]
@@ -281,12 +262,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stored_footprints_round_trip_and_fail_closed() {
+    fn stored_footprints_decode_and_fail_closed() {
         let footprint = PhaseFootprint { phase: ResourcePhase::Ready,
             allocations: vec![Allocation { domain: "system".into(), bytes: 64, host_kv_bytes: 8 }],
             devices: vec![DeviceClaim { device: "gpu0".into(), sharing: Sharing::Shared }] };
-        let json = encode(&footprint).unwrap();
-        assert_eq!(decode(&json).unwrap(), footprint);
+        let json = r#"{"version":1,"phase":"ready","allocations":[["system",64,8]],"devices":[["gpu0",true]]}"#;
+        assert_eq!(decode(json).unwrap(), footprint);
         assert!(decode(&json.replace("\"version\":1", "\"version\":2")).is_err());
         assert!(decode(&json.replace("\"ready\"", "\"unknown\"")).is_err());
         assert!(decode(&json.replace(",64,8", ",-1,8")).is_err());
@@ -295,8 +276,7 @@ mod tests {
 }
 ```
 
-- [ ] Run `cargo test -p mllm-store`. Expect PASS. Unused imports/helpers are temporary
-  until Task 3; the final gate requires warning-free code.
+- [ ] Run `cargo test -p mllm-store`. Expect PASS with warning-free code.
 - [ ] Commit only the four task files:
 
 ```bash
@@ -383,6 +363,29 @@ fn grants_are_atomic_and_retries_are_not_dispatch_authority() {
 - [ ] Insert this implementation before the test modules in `resource_ledger.rs`.
 
 ```rust
+use mllm_scheduler::residency::{admit_phase, AdmissionContext};
+use rusqlite::{params, OptionalExtension};
+
+fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
+    validate_footprint(footprint)?;
+    let phase = match footprint.phase {
+        ResourcePhase::Cold => "cold",
+        ResourcePhase::Ready => "ready",
+        ResourcePhase::Parking => "parking",
+        ResourcePhase::Parked => "parked",
+        ResourcePhase::Wake => "wake",
+    };
+    let mut allocations: Vec<_> = footprint.allocations.iter()
+        .map(|a| (a.domain.clone(), a.bytes, a.host_kv_bytes)).collect();
+    let mut devices: Vec<_> = footprint.devices.iter()
+        .map(|d| (d.device.clone(), d.sharing == Sharing::Shared)).collect();
+    allocations.sort();
+    devices.sort();
+    Ok(serde_json::to_string(&StoredFootprint {
+        version: 1, phase: phase.into(), allocations, devices,
+    })?)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantRequest {
     pub id: String,
@@ -487,6 +490,29 @@ impl crate::Store {
 
 - [ ] Run `cargo test -p mllm-store`. Expect PASS. Do not add automatic retries around
   `SQLITE_BUSY`: the coordinator must retry within its deadline using fresh state.
+- [ ] Add a private encoder round-trip regression alongside Task 2's decoder cases:
+
+```rust
+#[test]
+fn canonical_encoding_roundtrips_all_claims() {
+    let footprint = PhaseFootprint { phase: ResourcePhase::Ready, allocations: vec![
+        Allocation { domain: "gpu-memory:0".into(), bytes: 64, host_kv_bytes: 0 },
+        Allocation { domain: "system".into(), bytes: 32, host_kv_bytes: 8 },
+    ], devices: vec![
+        DeviceClaim { device: "gpu0".into(), sharing: Sharing::Shared },
+        DeviceClaim { device: "gpu1".into(), sharing: Sharing::Exclusive },
+    ] };
+    let encoded = encode(&footprint).unwrap();
+    assert_eq!(decode(&encoded).unwrap(), footprint);
+    let mut reordered = footprint;
+    reordered.allocations.reverse();
+    reordered.devices.reverse();
+    assert_eq!(encode(&reordered).unwrap(), encoded);
+}
+```
+
+  Compare canonical sorted allocations/claims and every byte/KV field. Reversing
+  input vector order must produce identical encoded bytes.
 - [ ] Commit only the task files:
 
 ```bash
@@ -683,9 +709,10 @@ done
   pass does not erase it. Thread order may vary; exactly one reservation commits.
 - [ ] Run `cargo test --workspace --exclude mllm-cli`,
   `cargo test -p mllm-cli --lib`, and
-  `cargo clippy --workspace --all-targets -- -D warnings`.
+  `cargo clippy --workspace --exclude mllm-cli --all-targets -- -D warnings`, and
+  `cargo clippy -p mllm-cli --lib --bin mllm -- -D warnings`.
   The explicit CLI exclusion avoids executing the unrelated live integration file;
-  Clippy compiles targets without running them. Run other named CLI CPU-only integration
+  Clippy excludes that target too. Run other named CLI CPU-only integration
   targets only after inspecting their current gates. No live target is authorized here.
 - [ ] Run `git diff --check`. Review changed files and confirm no controller, launcher,
   router, credentials, or production configuration changed.

@@ -43,8 +43,9 @@ belong in the review findings and should be investigated before escalating here.
 - Fresh root checks: 172 workspace tests excluding CLI plus 2 CLI library tests
   pass; no failures or ignored tests. Scoped Clippy passes. CLI integration targets
   remain excluded. These results do not qualify live engines.
-- Continue with F2A2a durable reservation transactions. No production database or
-  Spark runtime was accessed during kernel implementation.
+- F2A2a started: V3 schema and legacy-preservation migration test committed at
+  `e6d8d88`, with task review approved and 17 store tests passing. Snapshot reads
+  and atomic grant writes follow. No production database or Spark runtime accessed.
 
 ## Execution decisions
 
@@ -62,3 +63,6 @@ belong in the review findings and should be investigated before escalating here.
   example wording. Cost: history wording differs; behavior and safety are unchanged.
 - Coordinator constructs contextual diagnostics; kernel keeps unit error variants.
   Cost: richer shared diagnostic types may be needed during coordinator work.
+- Stage the private encoder with the grant writer, after decoder-only snapshot
+  reads. Cost: round-trip test moves one task later; malformed-data coverage stays
+  in the read task. Each intermediate task remains warning-free.
