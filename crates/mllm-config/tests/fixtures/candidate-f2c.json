@@ -1,0 +1,374 @@
+{
+  "schema_version": 1,
+  "kind": "candidate_recipe",
+  "host": {
+    "id": "lab",
+    "hardware_fingerprint": "hw-01",
+    "environment_fingerprint": "env-01"
+  },
+  "effective_recipe": {
+    "model": {
+      "content_fingerprint": "sha256:model",
+      "path": "/srv/models/toy",
+      "revision": "r1"
+    },
+    "recipe": "standard",
+    "residency": "warm",
+    "recovery": "reconcile",
+    "runtime_profile": "local",
+    "runtime_profile_revision": 7,
+    "resolved_profile": {
+      "engine": "vllm",
+      "revision": 7,
+      "executable": "/bin/true",
+      "build_fingerprint": "vllm-build-1",
+      "args": [
+        "--max-model-len",
+        "4096"
+      ],
+      "launch_settings": {
+        "block_size_tokens": 16,
+        "cpu_offload_bytes": 0,
+        "enable_sleep_mode": true,
+        "engine": "vllm",
+        "kv_cache_dtype": "auto",
+        "pipeline_parallel_size": 1,
+        "requested_budget": {
+          "gpu_utilization_pct": 75,
+          "kv_cache_bytes": 4294967296,
+          "swap_space_bytes": 0
+        },
+        "tensor_parallel_size": 1
+      },
+      "env": {
+        "RUST_LOG": "info"
+      },
+      "experimental_controls": true,
+      "runtime_auth": true,
+      "admin_auth": false,
+      "log_policy": {
+        "max_file_bytes": 16777216,
+        "retained_files": 3
+      }
+    },
+    "devices": [
+      {
+        "id": "gpu0",
+        "sharing": "shared"
+      }
+    ],
+    "resources": {
+      "cold": {
+        "allocations": [
+          {
+            "bytes": 10737418240,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      },
+      "parked": {
+        "allocations": [
+          {
+            "bytes": 2147483648,
+            "domain": "unified",
+            "host_kv_bytes": 0
+          }
+        ],
+        "devices": []
+      },
+      "parking": {
+        "allocations": [
+          {
+            "bytes": 9663676416,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      },
+      "ready": {
+        "allocations": [
+          {
+            "bytes": 8589934592,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      },
+      "wake": {
+        "allocations": [
+          {
+            "bytes": 10737418240,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      }
+    },
+    "host_devices": {
+      "gpu0": {
+        "domain": "unified",
+        "sharing": "shared"
+      }
+    },
+    "host_device_sharing": "shared",
+    "request_deadline_ms": 300000
+  },
+  "limits": {
+    "max_run_duration_ms": 86400000,
+    "max_cleanup_duration_ms": 3600000,
+    "max_requests": 409,
+    "max_request_body_bytes": 1048576,
+    "max_input_tokens_per_request": 131072,
+    "max_output_tokens_per_request": 16384
+  },
+  "evaluator_suite": "recipe_v1",
+  "cases": [
+    {
+      "id": "cold",
+      "kind": "cold_initialize",
+      "cycle": 0,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "ready-0",
+      "kind": "ready_probe",
+      "cycle": 0,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "marker-ns-0",
+      "kind": "marker_nonstreaming",
+      "cycle": 0,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "marker-s-0",
+      "kind": "marker_streaming",
+      "cycle": 0,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "security",
+      "kind": "security",
+      "cycle": 0,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "park-1",
+      "kind": "park",
+      "cycle": 1,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "restore-1",
+      "kind": "restore",
+      "cycle": 1,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "ready-1",
+      "kind": "ready_probe",
+      "cycle": 1,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "marker-ns-1",
+      "kind": "marker_nonstreaming",
+      "cycle": 1,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "marker-s-1",
+      "kind": "marker_streaming",
+      "cycle": 1,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "park-2",
+      "kind": "park",
+      "cycle": 2,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "restore-2",
+      "kind": "restore",
+      "cycle": 2,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "ready-2",
+      "kind": "ready_probe",
+      "cycle": 2,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "marker-ns-2",
+      "kind": "marker_nonstreaming",
+      "cycle": 2,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "marker-s-2",
+      "kind": "marker_streaming",
+      "cycle": 2,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "park-3",
+      "kind": "park",
+      "cycle": 3,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "restore-3",
+      "kind": "restore",
+      "cycle": 3,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "ready-3",
+      "kind": "ready_probe",
+      "cycle": 3,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "marker-ns-3",
+      "kind": "marker_nonstreaming",
+      "cycle": 3,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "marker-s-3",
+      "kind": "marker_streaming",
+      "cycle": 3,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "park-4",
+      "kind": "park",
+      "cycle": 4,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "restore-4",
+      "kind": "restore",
+      "cycle": 4,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "ready-4",
+      "kind": "ready_probe",
+      "cycle": 4,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "marker-ns-4",
+      "kind": "marker_nonstreaming",
+      "cycle": 4,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "marker-s-4",
+      "kind": "marker_streaming",
+      "cycle": 4,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "park-5",
+      "kind": "park",
+      "cycle": 5,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "restore-5",
+      "kind": "restore",
+      "cycle": 5,
+      "count": 1,
+      "request_budget": 0
+    },
+    {
+      "id": "ready-5",
+      "kind": "ready_probe",
+      "cycle": 5,
+      "count": 1,
+      "request_budget": 1
+    },
+    {
+      "id": "marker-ns-5",
+      "kind": "marker_nonstreaming",
+      "cycle": 5,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    {
+      "id": "marker-s-5",
+      "kind": "marker_streaming",
+      "cycle": 5,
+      "count": 32,
+      "request_budget": 32,
+      "corpus_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
+}

@@ -414,6 +414,23 @@ fn ordinary_routes_are_required_and_candidate_routes_are_forbidden() {
     assert!(normalize_candidate_manifest(&candidate, &host).is_ok());
     candidate["effective_recipe"]["routes"] = serde_json::json!(["toy"]);
     assert!(normalize_candidate_manifest(&candidate, &host).is_err());
+    for (path, field) in [
+        ("", "qualification_id"),
+        ("", "name"),
+        ("/host", "qualification_id"),
+        ("/effective_recipe", "qualification_id"),
+        ("/effective_recipe/resolved_profile", "qualification_id"),
+        ("/effective_recipe/resolved_profile", "routes"),
+    ] {
+        let (mut candidate, _, host) = engine_fixture("vllm");
+        candidate
+            .pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(field.into(), "candidate-looking".into());
+        assert_candidate_rejects(&candidate, &host, &format!("{path}/{field}"));
+    }
 }
 
 #[test]
@@ -647,5 +664,405 @@ fn profile_text_byte_boundaries_cover_args_and_environment() {
                 text.len()
             );
         }
+    }
+}
+
+fn assert_candidate_rejects(candidate: &serde_json::Value, host: &serde_json::Value, label: &str) {
+    assert!(
+        normalize_candidate_manifest(candidate, host).is_err(),
+        "{label}"
+    );
+}
+
+#[test]
+fn every_candidate_object_family_rejects_missing_unknown_null_and_wrong_types() {
+    let families = [
+        ("", "schema_version"),
+        ("/host", "id"),
+        ("/effective_recipe", "model"),
+        ("/effective_recipe/model", "path"),
+        ("/effective_recipe/resolved_profile", "engine"),
+        (
+            "/effective_recipe/resolved_profile/launch_settings",
+            "engine",
+        ),
+        (
+            "/effective_recipe/resolved_profile/launch_settings/requested_budget",
+            "kv_cache_bytes",
+        ),
+        (
+            "/effective_recipe/resolved_profile/log_policy",
+            "max_file_bytes",
+        ),
+        ("/effective_recipe/resources", "cold"),
+        ("/effective_recipe/resources/cold", "allocations"),
+        ("/effective_recipe/resources/cold/allocations/0", "domain"),
+        ("/effective_recipe/devices/0", "id"),
+        ("/effective_recipe/host_devices/gpu0", "domain"),
+        ("/limits", "max_requests"),
+        ("/cases/0", "id"),
+    ];
+    for (parent, field) in families {
+        let (candidate, host) = fixture();
+        for mode in ["missing", "unknown", "null", "wrong"] {
+            let mut changed = candidate.clone();
+            let object = changed
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            match mode {
+                "missing" => {
+                    object.remove(field);
+                }
+                "unknown" => {
+                    object.insert("unexpected".into(), serde_json::json!(1));
+                }
+                "null" => {
+                    object.insert(field.into(), serde_json::Value::Null);
+                }
+                "wrong" => {
+                    object.insert(field.into(), serde_json::json!({}));
+                }
+                _ => unreachable!(),
+            }
+            assert_candidate_rejects(&changed, &host, &format!("{parent}/{field} {mode}"));
+        }
+    }
+    for engine in ["sglang", "fake"] {
+        let (candidate, _, host) = engine_fixture(engine);
+        for mode in ["missing", "unknown", "null", "wrong"] {
+            let mut changed = candidate.clone();
+            let object = changed["effective_recipe"]["resolved_profile"]["launch_settings"]
+                .as_object_mut()
+                .unwrap();
+            match mode {
+                "missing" => {
+                    object.remove("engine");
+                }
+                "unknown" => {
+                    object.insert("unexpected".into(), 1.into());
+                }
+                "null" => {
+                    object.insert("engine".into(), serde_json::Value::Null);
+                }
+                "wrong" => {
+                    object.insert("engine".into(), serde_json::json!({}));
+                }
+                _ => unreachable!(),
+            }
+            assert_candidate_rejects(&changed, &host, &format!("{engine} launch {mode}"));
+        }
+    }
+}
+
+#[test]
+fn strict_text_parser_covers_json_yaml_duplicates_scalars_and_document_boundaries() {
+    let (candidate, host) = fixture();
+    let json = serde_json::to_string(&candidate).unwrap();
+    let nested_duplicate = json.replacen("\"host\":{", "\"host\":{\"id\":\"lab\",", 1);
+    let array_duplicate = json.replacen("\"id\":\"cold\"", "\"id\":\"cold\",\"id\":\"cold\"", 1);
+    for text in [
+        nested_duplicate,
+        array_duplicate,
+        format!("{json}{json}"),
+        format!("{json}\n---\n{json}"),
+    ] {
+        assert!(normalize_candidate_manifest_text(&text, &host).is_err());
+    }
+    let yaml = format!(
+        "schema_version: 1\nkind: candidate_recipe\nhost: {}\neffective_recipe: {}\nlimits: {}\nevaluator_suite: recipe_v1\ncases: {}\n",
+        candidate["host"], candidate["effective_recipe"], candidate["limits"], candidate["cases"]
+    );
+    assert!(normalize_candidate_manifest_text(&yaml, &host).is_ok());
+    let duplicate_yaml = yaml.replacen(
+        "kind: candidate_recipe",
+        "kind: candidate_recipe\nkind: candidate_recipe",
+        1,
+    );
+    assert!(normalize_candidate_manifest_text(&duplicate_yaml, &host).is_err());
+    for replacement in ["1.0", "4294967296", "-1"] {
+        let text = json.replacen("\"cycle\":0", &format!("\"cycle\":{replacement}"), 1);
+        assert!(
+            normalize_candidate_manifest_text(&text, &host).is_err(),
+            "{replacement}"
+        );
+    }
+}
+
+#[test]
+fn case_contract_rejects_each_independent_invalid_condition() {
+    let (base, host) = fixture();
+    let reject = |label: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut candidate = base.clone();
+        edit(&mut candidate);
+        assert_candidate_rejects(&candidate, &host, label);
+    };
+    reject("empty", &|c| c["cases"] = serde_json::json!([]));
+    reject("129", &|c| {
+        c["cases"] = serde_json::Value::Array(vec![c["cases"][0].clone(); 129])
+    });
+    reject("130", &|c| {
+        c["cases"] = serde_json::Value::Array(vec![c["cases"][0].clone(); 130])
+    });
+    reject("duplicate id", &|c| {
+        c["cases"][1]["id"] = c["cases"][0]["id"].clone()
+    });
+    reject("duplicate pair", &|c| {
+        c["cases"][1]["cycle"] = 0.into();
+        c["cases"][1]["kind"] = "cold_initialize".into();
+    });
+    reject("unknown suite", &|c| c["evaluator_suite"] = "other".into());
+    reject("unknown kind", &|c| c["cases"][0]["kind"] = "other".into());
+    reject("missing marker digest", &|c| {
+        c["cases"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("corpus_digest");
+    });
+    reject("forbidden corpus", &|c| {
+        c["cases"][0]["corpus_digest"] = "0".repeat(64).into()
+    });
+    reject("malformed digest", &|c| {
+        c["cases"][2]["corpus_digest"] = "A".repeat(64).into()
+    });
+    reject("wrong order", &|c| {
+        c["cases"].as_array_mut().unwrap().swap(1, 2)
+    });
+    reject("missing stage", &|c| {
+        c["cases"].as_array_mut().unwrap().remove(6);
+    });
+    reject("cycle gap", &|c| c["cases"][5]["cycle"] = 2.into());
+    reject("warm without restore", &|c| {
+        c["cases"][6]["kind"] = "park".into()
+    });
+    reject("restart warm cycle", &|c| {
+        c["effective_recipe"]["residency"] = "restart_only".into()
+    });
+    reject("lifecycle count", &|c| c["cases"][0]["count"] = 2.into());
+    reject("marker zero count", &|c| {
+        c["cases"][2]["count"] = 0.into();
+        c["cases"][2]["request_budget"] = 0.into();
+    });
+    reject("marker count over", &|c| {
+        c["cases"][2]["count"] = 4097.into();
+        c["cases"][2]["request_budget"] = 4097.into();
+    });
+    reject("corpus drift", &|c| {
+        c["cases"][3]["corpus_digest"] = "1".repeat(64).into()
+    });
+    reject("count drift", &|c| {
+        c["cases"][3]["count"] = 2.into();
+        c["cases"][3]["request_budget"] = 2.into();
+    });
+    reject("marker budget below count", &|c| {
+        c["cases"][2]["count"] = 2.into();
+        c["cases"][2]["request_budget"] = 1.into();
+    });
+    reject("absent probe budget", &|c| {
+        c["cases"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("request_budget");
+    });
+    reject("zero probe budget", &|c| {
+        c["cases"][1]["request_budget"] = 0.into()
+    });
+    reject("case budget over", &|c| {
+        c["cases"][0]["request_budget"] = 4097.into()
+    });
+    reject("total over max", &|c| {
+        c["limits"]["max_requests"] = 6.into()
+    });
+}
+
+#[test]
+fn f2c_n5_fixture_has_30_cases_384_markers_and_explicit_probe_total() {
+    let (_, _, host) = engine_fixture("vllm");
+    let candidate: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/candidate-f2c.json")).unwrap();
+    let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+    let marker_requests: u32 = normalized
+        .cases()
+        .iter()
+        .filter(|case| {
+            matches!(
+                case.kind(),
+                mllm_config::effective::candidate::CandidateCaseKind::MarkerNonstreaming
+                    | mllm_config::effective::candidate::CandidateCaseKind::MarkerStreaming
+            )
+        })
+        .map(|case| case.count())
+        .sum();
+    assert_eq!(normalized.cases().len(), 30);
+    assert_eq!(marker_requests, 384);
+    assert_eq!(normalized.total_case_request_budget(), 391);
+    assert_ne!(normalized.total_case_request_budget(), marker_requests);
+}
+
+#[test]
+fn canonical_reviewed_bytes_and_identity_matrix_are_literal() {
+    let (candidate, host) = fixture();
+    let original = normalize_candidate_manifest(&candidate, &host).unwrap();
+    assert_eq!(
+        original.manifest_digest(),
+        "f7fafaa108d062fb62417ccef59a1088a158a51890c8af1915e3b331dca1b0e9"
+    );
+    let canonical = include_bytes!("fixtures/candidate-vllm-canonical.json");
+    assert_eq!(original.reviewed_json(), &canonical[..canonical.len() - 1]);
+
+    let reordered: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&candidate).unwrap()).unwrap();
+    let reordered = normalize_candidate_manifest(&reordered, &host).unwrap();
+    assert_eq!(original.manifest_digest(), reordered.manifest_digest());
+
+    for field in [
+        "max_request_body_bytes",
+        "max_input_tokens_per_request",
+        "max_output_tokens_per_request",
+    ] {
+        let mut changed = candidate.clone();
+        let old = changed["limits"][field].as_u64().unwrap();
+        changed["limits"][field] = (old - 1).into();
+        let changed = normalize_candidate_manifest(&changed, &host).unwrap();
+        assert_ne!(
+            original.manifest_digest(),
+            changed.manifest_digest(),
+            "{field}"
+        );
+        assert_eq!(
+            original.recipe_fingerprint(),
+            changed.recipe_fingerprint(),
+            "{field}"
+        );
+    }
+    let mut renamed = candidate.clone();
+    let mut renamed_host = host.clone();
+    renamed_host["name"] = "lab-renamed".into();
+    renamed["host"]["id"] = "lab-renamed".into();
+    let renamed = normalize_candidate_manifest(&renamed, &renamed_host).unwrap();
+    assert_ne!(original.manifest_digest(), renamed.manifest_digest());
+    assert_eq!(original.recipe_fingerprint(), renamed.recipe_fingerprint());
+
+    let mut selector_candidate = candidate.clone();
+    let mut selector_host = host.clone();
+    let profile = selector_host["runtime_profiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("local")
+        .unwrap();
+    selector_host["runtime_profiles"]["renamed-profile"] = profile;
+    selector_candidate["effective_recipe"]["runtime_profile"] = "renamed-profile".into();
+    let renamed = normalize_candidate_manifest(&selector_candidate, &selector_host).unwrap();
+    assert_ne!(original.manifest_digest(), renamed.manifest_digest());
+    assert_eq!(original.recipe_fingerprint(), renamed.recipe_fingerprint());
+
+    let mut corpus = candidate.clone();
+    for index in [2, 3, 8, 9] {
+        corpus["cases"][index]["corpus_digest"] = "1".repeat(64).into();
+    }
+    let corpus = normalize_candidate_manifest(&corpus, &host).unwrap();
+    assert_ne!(original.manifest_digest(), corpus.manifest_digest());
+    assert_eq!(original.recipe_fingerprint(), corpus.recipe_fingerprint());
+
+    let mut args_candidate = candidate.clone();
+    let mut args_host = host.clone();
+    args_candidate["effective_recipe"]["resolved_profile"]["args"] =
+        serde_json::json!(["--dtype", "auto", "--max-model-len", "4096"]);
+    args_host["runtime_profiles"]["local"]["args"] =
+        serde_json::json!(["--dtype", "auto", "--max-model-len", "4096"]);
+    let args = normalize_candidate_manifest(&args_candidate, &args_host).unwrap();
+    assert_ne!(original.manifest_digest(), args.manifest_digest());
+    assert_ne!(original.recipe_fingerprint(), args.recipe_fingerprint());
+
+    let mut revision_candidate = candidate.clone();
+    let mut revision_host = host.clone();
+    revision_candidate["effective_recipe"]["runtime_profile_revision"] = 8.into();
+    revision_candidate["effective_recipe"]["resolved_profile"]["revision"] = 8.into();
+    revision_host["runtime_profiles"]["local"]["revision"] = 8.into();
+    let revision = normalize_candidate_manifest(&revision_candidate, &revision_host).unwrap();
+    assert_ne!(original.manifest_digest(), revision.manifest_digest());
+    assert_ne!(original.recipe_fingerprint(), revision.recipe_fingerprint());
+}
+
+#[test]
+fn every_limit_accepts_boundaries_and_rejects_outside_values() {
+    for (field, minimum, maximum) in [
+        ("max_run_duration_ms", 300_000_i64, 86_400_000_i64),
+        ("max_cleanup_duration_ms", 1, 3_600_000),
+        ("max_requests", 7, 4096),
+        ("max_request_body_bytes", 1, 1_048_576),
+        ("max_input_tokens_per_request", 1, 131_072),
+        ("max_output_tokens_per_request", 1, 16_384),
+    ] {
+        for value in [minimum, maximum] {
+            let (mut candidate, host) = fixture();
+            candidate["limits"][field] = value.into();
+            assert!(
+                normalize_candidate_manifest(&candidate, &host).is_ok(),
+                "{field} {value}"
+            );
+        }
+        for value in [0, maximum + 1] {
+            let (mut candidate, host) = fixture();
+            candidate["limits"][field] = value.into();
+            assert_candidate_rejects(&candidate, &host, &format!("{field} {value}"));
+        }
+    }
+}
+
+#[test]
+fn size_caps_and_secret_errors_cover_all_four_budgets() {
+    let (candidate, host) = fixture();
+    let oversized_text =
+        format!("{} ", serde_json::to_string(&candidate).unwrap()) + &" ".repeat(1 << 20);
+    assert!(normalize_candidate_manifest_text(&oversized_text, &host).is_err());
+
+    let mut oversized_value = candidate.clone();
+    oversized_value["effective_recipe"]["resolved_profile"]["args"] =
+        serde_json::json!(["x".repeat(1 << 20)]);
+    assert_candidate_rejects(&oversized_value, &host, "encoded Value cap");
+
+    let mut secret_host = host;
+    let secret = format!("secret://{}", "z".repeat(1 << 20));
+    secret_host["runtime_profiles"]["local"]["security"]["credential_ref"] = secret.clone().into();
+    let error = normalize_candidate_manifest(&candidate, &secret_host)
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains(&secret));
+    assert!(!error.contains("secret://"));
+}
+
+#[test]
+fn normalized_descriptor_cap_counts_full_escaped_json_envelope() {
+    let (candidate, host) = fixture();
+    let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+    let fixed = br#"{"version":1,"reviewed_manifest":"#.len()
+        + normalized.reviewed_json().len()
+        + br#","manifest_digest":""#.len()
+        + 64
+        + br#"","recipe_fingerprint":""#.len()
+        + 64
+        + br#"","credential_refs":{"runtime":""#.len()
+        + br#"","admin":null},"total_case_request_budget":7}"#.len();
+    let available = (1 << 20) - fixed;
+    let raw_quotes_at_exact_limit = available / 2;
+    let raw_ascii_at_exact_limit = available % 2;
+    assert_eq!(
+        fixed + raw_quotes_at_exact_limit * 2 + raw_ascii_at_exact_limit,
+        1 << 20
+    );
+
+    for (extra, valid) in [(0, true), (1, false)] {
+        let mut changed_host = host.clone();
+        let reference =
+            "\"".repeat(raw_quotes_at_exact_limit) + &"z".repeat(raw_ascii_at_exact_limit + extra);
+        changed_host["runtime_profiles"]["local"]["security"]["credential_ref"] = reference.into();
+        assert_eq!(
+            normalize_candidate_manifest(&candidate, &changed_host).is_ok(),
+            valid,
+            "descriptor bytes {}",
+            (1 << 20) + extra
+        );
     }
 }

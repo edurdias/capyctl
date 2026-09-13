@@ -348,6 +348,22 @@ struct Reviewed<'a> {
     cases: &'a [CandidateCase],
 }
 
+#[derive(Serialize)]
+struct DescriptorBudget<'a> {
+    version: u32,
+    reviewed_manifest: &'a Reviewed<'a>,
+    manifest_digest: &'a str,
+    recipe_fingerprint: &'a str,
+    credential_refs: DescriptorCredentialRefs<'a>,
+    total_case_request_budget: u32,
+}
+
+#[derive(Serialize)]
+struct DescriptorCredentialRefs<'a> {
+    runtime: Option<&'a str>,
+    admin: Option<&'a str>,
+}
+
 /// Normalize a pre-parsed candidate. Callers must use the text API when duplicate-key
 /// rejection is required because `serde_json::Value` cannot retain duplicate keys.
 pub fn normalize_candidate_manifest(
@@ -355,8 +371,25 @@ pub fn normalize_candidate_manifest(
     trusted_host: &Value,
 ) -> Result<NormalizedCandidateManifest, ConfigError> {
     check_size(value, "candidate")?;
+    reject_fake_launch_extras(value)?;
     let input: CandidateInput = decode(value, "candidate")?;
     normalize(input, trusted_host)
+}
+
+fn reject_fake_launch_extras(value: &Value) -> Result<(), ConfigError> {
+    let Some(launch) = value
+        .pointer("/effective_recipe/resolved_profile/launch_settings")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if launch.get("engine").and_then(Value::as_str) == Some("fake") && launch.len() != 1 {
+        return Err(invalid(
+            "effective_recipe.resolved_profile.launch_settings",
+            "unknown fake launch setting",
+        ));
+    }
+    Ok(())
 }
 
 pub fn normalize_candidate_manifest_text(
@@ -644,7 +677,7 @@ fn normalize(
         cases: &input.cases,
     };
     let reviewed_json = canonical_json(
-        &serde_json::to_value(reviewed)
+        &serde_json::to_value(&reviewed)
             .map_err(|_| invalid("candidate", "reviewed encoding failed"))?,
     )?;
     if reviewed_json.len() > MAX_ENCODED {
@@ -659,6 +692,23 @@ fn normalize(
         runtime: profile.security.credential_ref.clone(),
         admin: profile.security.admin_credential_ref.clone(),
     };
+    let descriptor = DescriptorBudget {
+        version: 1,
+        reviewed_manifest: &reviewed,
+        manifest_digest: &manifest_digest,
+        recipe_fingerprint: &recipe_fingerprint,
+        credential_refs: DescriptorCredentialRefs {
+            runtime: credential_refs.runtime(),
+            admin: credential_refs.admin(),
+        },
+        total_case_request_budget: total,
+    };
+    let descriptor_size = serde_json::to_vec(&descriptor)
+        .map_err(|_| invalid("candidate", "normalized descriptor encoding failed"))?
+        .len();
+    if descriptor_size > MAX_ENCODED {
+        return Err(invalid("candidate", "normalized descriptor exceeds 1MiB"));
+    }
     let mut effective_recipe = input.effective_recipe;
     effective_recipe.resolved_profile = expected;
     let output = NormalizedCandidateManifest {
@@ -672,16 +722,6 @@ fn normalize(
         credential_refs,
         total_case_request_budget: total,
     };
-    let descriptor = output.reviewed_json.len()
-        + output
-            .credential_refs
-            .runtime
-            .as_ref()
-            .map_or(0, String::len)
-        + output.credential_refs.admin.as_ref().map_or(0, String::len);
-    if descriptor > MAX_ENCODED {
-        return Err(invalid("candidate", "normalized descriptor exceeds 1MiB"));
-    }
     Ok(output)
 }
 
