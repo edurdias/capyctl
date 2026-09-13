@@ -195,6 +195,15 @@ fn lowering_limits_retains_all_owners_and_reports_each_overcommit_category() {
             [footprint],
         )
         .unwrap();
+    store.conn.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('owner-2','owner-2','model',NULL,'stopped',1,0,1,1)", []).unwrap();
+    let second = serde_json::json!({"version":1,"phase":"parked","allocations":[["system",10,5]],"devices":[]}).to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_owners(owner_id,footprint_json) VALUES('owner-2',?1)",
+            [second],
+        )
+        .unwrap();
     let mut controls = ResourceControls::from_host(&host());
     let domain = controls.domains.get_mut("system").unwrap();
     domain.managed_limit = 40;
@@ -216,12 +225,12 @@ fn lowering_limits_retains_all_owners_and_reports_each_overcommit_category() {
     assert_eq!(
         result.overcommit.domains["system"],
         DomainOvercommit {
-            managed_bytes: 20,
-            host_kv_bytes: 10,
-            parked_bytes: 30
+            managed_bytes: 30,
+            host_kv_bytes: 15,
+            parked_bytes: 40
         }
     );
-    assert_eq!(result.overcommit.parked_owners, 1);
+    assert_eq!(result.overcommit.parked_owners, 2);
     assert!(store
         .resource_snapshot()
         .unwrap()
@@ -271,6 +280,10 @@ fn failed_receipt_write_rolls_back_policy_epoch_operation_and_event() {
     store
         .import_resource_policy(&session, &host(), &observations(), 11_000)
         .unwrap();
+    let before_events: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM management_events", [], |r| r.get(0))
+        .unwrap();
     store.conn.execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON command_receipts BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
     let controls = ResourceControls::from_host(&host());
     assert!(matches!(
@@ -296,6 +309,22 @@ fn failed_receipt_write_rolls_back_policy_epoch_operation_and_event() {
         .query_row("SELECT COUNT(*) FROM operations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(operations, 0);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM command_receipts", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM management_events", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        before_events
+    );
 }
 
 #[test]
@@ -348,4 +377,269 @@ fn independent_connections_serialize_updates_from_one_revision() {
         2
     );
     assert_eq!(store.resource_snapshot().unwrap().epoch, 2);
+}
+
+#[test]
+fn bootstrap_rejects_host_rename_and_stale_session() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let stale = store.begin_coordinator_session().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    assert!(matches!(
+        store.import_resource_policy(&stale, &host(), &observations(), 11_000),
+        Err(ResourcePolicyError::StaleSession)
+    ));
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let mut renamed = host();
+    renamed.name = "host-b".into();
+    assert!(matches!(
+        store.import_resource_policy(&session, &renamed, &observations(), 11_000),
+        Err(ResourcePolicyError::RevisionConflict)
+    ));
+    let rows: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM host_resource_policies", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 1);
+    let mut changed_context = host();
+    changed_context.endpoint_port_range.end = 20_101;
+    assert!(matches!(
+        store.import_resource_policy(&session, &changed_context, &observations(), 11_000),
+        Err(ResourcePolicyError::RevisionConflict)
+    ));
+}
+
+#[test]
+fn corrupt_policy_and_receipt_metadata_fail_closed() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let controls = ResourceControls::from_host(&host());
+    let result = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "key",
+            &controls,
+            &observations(),
+            11_000,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute("UPDATE command_receipts SET command_scope='PUT /wrong'", [])
+        .unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+    store.conn.execute("UPDATE command_receipts SET command_scope='PUT /management/v1/hosts/\"host-a\"/resource-policy',response_json=json_set(response_json,'$.epoch',0)", []).unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+    store.conn.execute("UPDATE command_receipts SET response_json=json_set(response_json,'$.epoch',2,'$.overcommit.domains.system.managed_bytes',-1)", []).unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+    store.conn.execute("UPDATE command_receipts SET response_json=json_set(response_json,'$.overcommit.domains.system.extra',1)", []).unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+    store.conn.execute("UPDATE host_resource_policies SET policy_json=json_set(policy_json,'$.controls.queue.extra',1)", []).unwrap();
+    assert!(matches!(
+        store.resource_policy("host-a"),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+}
+
+#[test]
+fn host_operation_target_shape_must_match_kind_and_receipt_scope() {
+    let store = crate::Store::open_in_memory().unwrap();
+    store.conn.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('owner','owner','model',NULL,'stopped',1,0,1,1)", []).unwrap();
+    store.conn.execute("INSERT INTO operations(id,deployment_id,kind,state,error_code,idempotency_key) VALUES('bad','owner','host_resource_policy_update','succeeded',NULL,NULL)", []).unwrap();
+    assert!(matches!(
+        store.get_management_operation("bad"),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+}
+
+#[test]
+fn current_ttl_applies_before_new_ttl_and_historical_retry_survives_later_update() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let mut first_controls = ResourceControls::from_host(&host());
+    first_controls.observation_ttl_ms = 1;
+    let first = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "first",
+            &first_controls,
+            &observations(),
+            11_000,
+        )
+        .unwrap();
+    let mut second_controls = first_controls.clone();
+    second_controls.max_parked = 1;
+    let stale_observation = vec![MemoryObservation {
+        sampled_at_ms: 10_999,
+        ..observations()[0].clone()
+    }];
+    store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            2,
+            "second",
+            &second_controls,
+            &stale_observation,
+            11_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .update_resource_policy(
+                &session,
+                "alice",
+                "host-a",
+                1,
+                "first",
+                &first_controls,
+                &observations(),
+                11_000
+            )
+            .unwrap(),
+        first
+    );
+}
+
+#[test]
+fn revision_epoch_legacy_and_event_failures_roll_back() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    store.conn.execute("UPDATE host_resource_policies SET revision=?1,policy_json=json_set(policy_json,'$.revision',?1)", [i64::MAX]).unwrap();
+    let controls = ResourceControls::from_host(&host());
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "a",
+            "host-a",
+            i64::MAX,
+            "overflow",
+            &controls,
+            &observations(),
+            11_000
+        ),
+        Err(ResourcePolicyError::Invalid)
+    ));
+    store.conn.execute("UPDATE host_resource_policies SET revision=1,policy_json=json_set(policy_json,'$.revision',1)", []).unwrap();
+    store
+        .conn
+        .execute("UPDATE resource_ledger_meta SET epoch=?1", [i64::MAX])
+        .unwrap();
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "a",
+            "host-a",
+            1,
+            "epoch",
+            &controls,
+            &observations(),
+            11_000
+        ),
+        Err(ResourcePolicyError::Invalid)
+    ));
+    store
+        .conn
+        .execute("UPDATE resource_ledger_meta SET epoch=1", [])
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO owners(id,kind,deployment_id) VALUES('legacy','model',NULL)",
+            [],
+        )
+        .unwrap();
+    store.conn.execute("INSERT INTO reservations(owner_id,domain_id,bytes,phase,exclusive_devices) VALUES('legacy','system',1,'ready','[]')", []).unwrap();
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "a",
+            "host-a",
+            1,
+            "legacy",
+            &controls,
+            &observations(),
+            11_000
+        ),
+        Err(ResourcePolicyError::NeedsReconciliation)
+    ));
+    store.conn.execute("DELETE FROM reservations", []).unwrap();
+    store.conn.execute_batch("CREATE TRIGGER fail_policy_event BEFORE INSERT ON management_events WHEN NEW.kind='host_resource_policy_updated' BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    let before_events: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM management_events", [], |r| r.get(0))
+        .unwrap();
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "a",
+            "host-a",
+            1,
+            "event",
+            &controls,
+            &observations(),
+            11_000
+        ),
+        Err(ResourcePolicyError::Sql(_))
+    ));
+    assert_eq!(
+        store.resource_policy("host-a").unwrap().unwrap().revision,
+        1
+    );
+    assert_eq!(store.resource_snapshot().unwrap().epoch, 1);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM operations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM command_receipts", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM management_events", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        before_events
+    );
 }

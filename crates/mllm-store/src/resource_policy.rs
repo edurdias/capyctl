@@ -1,5 +1,5 @@
 use crate::dispatch::{check_session, CoordinatorSession, DispatchError};
-use crate::events::{append_event, EventMetadata, EventWriteError};
+use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteError};
 use crate::resource_ledger::{read_snapshot, ResourceStoreError};
 use crate::OpState;
 use mllm_config::effective::{DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing};
@@ -30,12 +30,14 @@ pub struct ResourcePolicyImport {
     pub changed: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainOvercommit {
     pub managed_bytes: i64,
     pub host_kv_bytes: i64,
     pub parked_bytes: i64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceOvercommit {
     pub domains: BTreeMap<String, DomainOvercommit>,
     pub parked_owners: u32,
@@ -150,6 +152,12 @@ struct HashInput<'a> {
 
 fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_IDENTIFIER_BYTES
+}
+fn update_scope(host_id: &str) -> Result<String, ResourcePolicyError> {
+    Ok(format!(
+        "PUT /management/v1/hosts/{}/resource-policy",
+        serde_json::to_string(host_id).map_err(|_| ResourcePolicyError::Invalid)?
+    ))
 }
 fn sharing(value: Sharing) -> String {
     match value {
@@ -480,6 +488,19 @@ impl crate::Store {
             .map_err(|_| ResourcePolicyError::Invalid)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(map_session)?;
+        let stored_hosts: Vec<String> = tx
+            .prepare("SELECT host_id FROM host_resource_policies ORDER BY host_id LIMIT 2")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if stored_hosts.len() > 1 {
+            return Err(ResourcePolicyError::CorruptStoredPolicy);
+        }
+        if stored_hosts
+            .first()
+            .is_some_and(|stored| stored != &context.host_id)
+        {
+            return Err(ResourcePolicyError::RevisionConflict);
+        }
         if let Some(current) = read_policy(&tx, &context.host_id)? {
             if current.context != context {
                 return Err(ResourcePolicyError::RevisionConflict);
@@ -558,10 +579,7 @@ impl crate::Store {
         {
             return Err(ResourcePolicyError::Invalid);
         }
-        let scope = format!(
-            "PUT /management/v1/hosts/{}/resource-policy",
-            serde_json::to_string(host_id).map_err(|_| ResourcePolicyError::Invalid)?
-        );
+        let scope = update_scope(host_id)?;
         let stored_controls = StoredControls::from_public(controls);
         let hash_json = serde_json::to_vec(&HashInput {
             version: 1,
@@ -610,7 +628,8 @@ impl crate::Store {
         let snapshot = read_snapshot(&tx).map_err(map_ledger)?;
         let report = overcommit(&snapshot, controls)?;
         let epoch = next_epoch(&tx)?;
-        let operation_id = ulid::Ulid::new().to_string();
+        let generated_operation_id = EventOperationId::generated(ulid::Ulid::new());
+        let operation_id = generated_operation_id.as_str().to_owned();
         let stored = StoredPolicy {
             version: 1,
             host_id: host_id.into(),
@@ -641,7 +660,7 @@ impl crate::Store {
         append_event(
             &tx,
             &EventMetadata::HostResourcePolicyUpdated {
-                operation_id: operation_id.clone(),
+                operation_id: generated_operation_id,
                 previous_revision: expected_revision,
                 current_revision: revision,
                 ledger_epoch: epoch,
@@ -681,18 +700,25 @@ impl crate::Store {
         };
         let state = OpState::parse(&state).map_err(|_| ResourcePolicyError::CorruptStoredPolicy)?;
         let target = if let Some(deployment_id) = deployment_id {
+            if kind == UPDATE_KIND {
+                return Err(ResourcePolicyError::CorruptStoredPolicy);
+            }
             ManagementOperationTarget::Deployment { deployment_id }
         } else if kind == UPDATE_KIND {
-            let receipts: Vec<String> = self
+            let receipts: Vec<(String, String)> = self
                 .conn
-                .prepare("SELECT response_json FROM command_receipts WHERE operation_id=?1")?
-                .query_map([&id], |r| r.get(0))?
+                .prepare("SELECT command_scope,response_json FROM command_receipts WHERE operation_id=?1")?
+                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
             if receipts.len() != 1 {
                 return Err(ResourcePolicyError::CorruptStoredPolicy);
             }
-            let receipt = decode_receipt(&receipts[0])?;
-            if receipt.operation_id != id || receipt.method != UPDATE_METHOD {
+            let (scope, json) = &receipts[0];
+            let receipt = decode_receipt(json)?;
+            if receipt.operation_id != id
+                || receipt.method != UPDATE_METHOD
+                || *scope != update_scope(&receipt.host_id)?
+            {
                 return Err(ResourcePolicyError::CorruptStoredPolicy);
             }
             ManagementOperationTarget::HostResourcePolicy {
@@ -724,6 +750,14 @@ fn decode_receipt(json: &str) -> Result<StoredReceipt, ResourcePolicyError> {
         || !valid_id(&value.host_id)
         || !valid_id(&value.operation_id)
         || value.revision <= 1
+        || value.epoch == 0
+        || ulid::Ulid::from_string(&value.operation_id).is_err()
+        || value.overcommit.domains.iter().any(|(domain, overcommit)| {
+            !valid_id(domain)
+                || overcommit.managed_bytes < 0
+                || overcommit.host_kv_bytes < 0
+                || overcommit.parked_bytes < 0
+        })
     {
         return Err(ResourcePolicyError::CorruptStoredPolicy);
     }

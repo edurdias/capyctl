@@ -76,12 +76,27 @@ pub(crate) enum EventMetadata {
     },
     #[serde(rename = "1")]
     HostResourcePolicyUpdated {
-        operation_id: String,
+        operation_id: EventOperationId,
         previous_revision: i64,
         current_revision: i64,
         ledger_epoch: u64,
         session_epoch: i64,
     },
+}
+#[derive(Clone)]
+pub(crate) struct EventOperationId(String);
+impl EventOperationId {
+    pub(crate) fn generated(value: ulid::Ulid) -> Self {
+        Self(value.to_string())
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl Serialize for EventOperationId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,7 +121,9 @@ impl EventMetadata {
             Self::CoordinatorSessionStarted { .. } => (None, None),
             Self::HostQualificationPolicyChanged { .. } => (None, None),
             Self::HostResourcePolicyBootstrapped { .. } => (None, None),
-            Self::HostResourcePolicyUpdated { operation_id, .. } => (None, Some(operation_id)),
+            Self::HostResourcePolicyUpdated { operation_id, .. } => {
+                (None, Some(operation_id.as_str()))
+            }
         }
     }
 }
