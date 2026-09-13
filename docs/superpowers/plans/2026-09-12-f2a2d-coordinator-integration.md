@@ -376,7 +376,9 @@ caller plan input never supplies evidence or creates stop permission.
 - [ ] Test that concurrent independent SQLite connections accepting activation
   for the same fence return one operation ID, with exactly one `joined == false`.
   Test that different deadlines do not extend an already accepted operation;
-  each caller still has its own shorter waiting deadline. Run
+  each caller still has its own shorter waiting deadline. Task3 proves the durable
+  deadline stays unchanged; Task9 proves caller timeouts through its real wait path.
+  Run
   `cargo test -p mllm-store lifecycle::tests::activation`; expect RED.
 - [ ] Implement each method with `TransactionBehavior::Immediate`. Check the
   current session and exact deployment fence before mutation. Acceptance rejects
@@ -804,7 +806,10 @@ fn backend_uncertainty_retains_request_ownership() {
   bypasses lifecycle serialization but not dispatch registration. Queue permits
   may use ordinary RAII; backend-work leases may not release through Drop.
   Client cancellation before dispatch releases only queue ownership.
-- [ ] Tests: two same-engine routes return distinct fake model sentinels; close
+- [ ] Add two callers joining the same accepted activation with different wait deadlines:
+  short caller times out, long caller continues, operation ID/deadline remain
+  unchanged, no duplicate backend send or cancellation of accepted work. Then test
+  two same-engine routes return distinct fake model sentinels; close
   versus dispatch has one legal winner; generation changes force re-resolution;
   100 ordered chunks through a 16-slot slow sink lose none; full sink either
   backpressures or fails honestly; premature backend end emits no `[DONE]` and

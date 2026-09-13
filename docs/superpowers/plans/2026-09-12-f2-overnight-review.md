@@ -75,6 +75,11 @@ the work being executed. The owner will review consequential questions in the mo
   checks: 217 non-CLI plus 2 CLI library tests pass; scoped Clippy clean.
   Fixed-port fixture minor carries to Task 3. Full worker collectors remain future
   adapter work; missing proof stays uncertain. No production cutover or live qualification.
+- F2A2d Task 3 complete at `fc7ff46`: joined activation, atomic all-member claims,
+  stop/suspend fences, and retained reconciliation handoff. Store tests: 46 pass;
+  scoped Clippy clean. Review approved after placing caller-timeout integration
+  proof in Task 9's real wait path. Dynamic port fixtures fixed. A3 foundations
+  now precede remaining coordinator arm/completion work.
 
 ## Execution decisions
 
@@ -107,6 +112,9 @@ the work being executed. The owner will review consequential questions in the mo
 - Handoff also fences other transferred members' generations and closes dispatch;
   claim transfer alone cannot invalidate same-session callbacks. Cost: temporary
   route unavailability until reconciliation, never permission to stop those models.
+- Test each caller's shorter wait deadline in Task 9's real router wait path, not
+  a synthetic store fixture. Task 3 tests unchanged durable operation deadline.
+  Cost: caller-timeout proof remains open until router integration; A2d cannot close without it.
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.
