@@ -250,6 +250,22 @@ CREATE TABLE qualification_evidence_refs(
 );
 "#;
 
+pub const SCHEMA_V7: &str = r#"
+CREATE TABLE event_meta(
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  incarnation TEXT NOT NULL,
+  retained_after INTEGER NOT NULL CHECK(retained_after>=0)
+);
+CREATE TABLE management_events(
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  recorded_at_ms INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  deployment_id TEXT,
+  operation_id TEXT,
+  payload_json TEXT NOT NULL
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

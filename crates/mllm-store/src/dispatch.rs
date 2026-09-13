@@ -54,6 +54,16 @@ impl crate::Store {
         )?;
         transaction.execute("UPDATE deployments SET dispatch_enabled=0", [])?;
         transaction.execute("UPDATE request_leases SET disposition='uncertain'", [])?;
+        crate::events::append_event(
+            &transaction,
+            &crate::events::EventMetadata::CoordinatorSessionStarted { session_epoch: epoch },
+            None,
+            None,
+        )
+        .map_err(|error| match error {
+            crate::events::EventWriteError::Sql(error) => DispatchError::Sql(error),
+            _ => DispatchError::Invalid,
+        })?;
         transaction.commit()?;
         Ok(session)
     }

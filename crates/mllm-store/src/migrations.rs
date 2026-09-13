@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
+use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
@@ -37,6 +37,12 @@ pub fn apply(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)?;
+        if version == 7 {
+            tx.execute(
+                "INSERT INTO event_meta(singleton,incarnation,retained_after) VALUES(1,?1,0)",
+                [ulid::Ulid::new().to_string()],
+            )?;
+        }
         tx.execute(
             "INSERT INTO schema_migrations(version) VALUES (?1)",
             [version],
@@ -143,5 +149,23 @@ mod tests {
             ).unwrap();
             assert_eq!(count, 1, "{table}");
         }
+    }
+
+    #[test]
+    fn v7_event_schema_initializes_one_stable_incarnation() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        let first: (i64, String, i64) = conn.query_row(
+            "SELECT COUNT(*),incarnation,retained_after FROM event_meta",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        apply(&conn).unwrap();
+        let second: (i64, String, i64) = conn.query_row(
+            "SELECT COUNT(*),incarnation,retained_after FROM event_meta",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(first, second);
+        assert_eq!((first.0, first.2), (1, 0));
+        assert_eq!(first.1.len(), 26);
     }
 }
