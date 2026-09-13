@@ -1,6 +1,7 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
 pub mod candidate;
+mod core;
 
 use crate::engine_policy::{validate_profile_args, validate_profile_env};
 use crate::resource_controls::{ResourceContext, ResourceControls};
@@ -687,49 +688,21 @@ fn normalize_launch(
     Ok(settings)
 }
 
-fn phase(
-    raw: RawPhase,
-    expected: domain::ResourcePhase,
-) -> Result<(PhaseFootprint, domain::PhaseFootprint), ConfigError> {
-    let allocations: Vec<Allocation> = raw
-        .allocations
-        .into_iter()
-        .map(|a| {
-            Ok(Allocation {
-                domain: a.domain,
-                bytes: parse_bytes(&a.bytes)?,
-                host_kv_bytes: parse_bytes(&a.host_kv_bytes)?,
-            })
-        })
-        .collect::<Result<_, ConfigError>>()?;
-    let public = PhaseFootprint {
-        allocations,
-        devices: raw.devices,
-    };
-    let internal = domain::PhaseFootprint {
-        phase: expected,
-        allocations: public
+fn phase(raw: RawPhase) -> Result<PhaseFootprint, ConfigError> {
+    Ok(PhaseFootprint {
+        allocations: raw
             .allocations
-            .iter()
-            .map(|a| domain::Allocation {
-                domain: a.domain.clone(),
-                bytes: a.bytes,
-                host_kv_bytes: a.host_kv_bytes,
+            .into_iter()
+            .map(|a| {
+                Ok(Allocation {
+                    domain: a.domain,
+                    bytes: parse_bytes(&a.bytes)?,
+                    host_kv_bytes: parse_bytes(&a.host_kv_bytes)?,
+                })
             })
-            .collect(),
-        devices: public
-            .devices
-            .iter()
-            .map(|d| domain::DeviceClaim {
-                device: d.id.clone(),
-                sharing: match d.sharing {
-                    Sharing::Shared => domain::Sharing::Shared,
-                    Sharing::Exclusive => domain::Sharing::Exclusive,
-                },
-            })
-            .collect(),
-    };
-    Ok((public, internal))
+            .collect::<Result<_, ConfigError>>()?,
+        devices: raw.devices,
+    })
 }
 
 pub fn resolve_effective(
@@ -747,17 +720,16 @@ pub fn resolve_effective(
     }
     let d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode(host, "host")?;
-    if d.schema_version != 1 || h.schema_version != 1 || d.kind != "deployment" || h.kind != "host"
-    {
+    if d.schema_version != 1 || d.kind != "deployment" {
         return Err(invalid(
             "schema_version",
-            "schema version 1 and matching kinds required",
+            "schema version 1 and deployment kind required",
         ));
     }
     if h.runtime_profiles.values().any(|profile| {
-        matches!(
+        !matches!(
             profile.qualification_id,
-            MissingAwareQualification::Missing
+            MissingAwareQualification::Present(Some(_))
         )
     }) {
         return Err(invalid(
@@ -765,22 +737,8 @@ pub fn resolve_effective(
             "qualification reference is required for ordinary host resolution",
         ));
     }
-    for (path, value) in [
-        ("deployment.name", &d.name),
-        ("model.path", &d.model.path),
-        ("model.content_fingerprint", &d.model.content_fingerprint),
-        ("model.revision", &d.model.revision),
-        ("recipe", &d.recipe),
-        ("host.name", &h.name),
-        ("hardware_fingerprint", &h.hardware_fingerprint),
-        ("environment_fingerprint", &h.environment_fingerprint),
-    ] {
-        if value.is_empty() {
-            return Err(invalid(path, "must not be empty"));
-        }
-    }
-    if !Path::new(&d.model.path).is_absolute() {
-        return Err(invalid("model.path", "must be absolute"));
+    if d.name.is_empty() {
+        return Err(invalid("deployment.name", "must not be empty"));
     }
     if d.routes.is_empty()
         || d.routes.iter().any(String::is_empty)
@@ -792,17 +750,8 @@ pub fn resolve_effective(
         .runtime_profiles
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
-    if raw_profile.revision != d.runtime_profile_revision {
-        return Err(invalid(
-            "runtime_profile_revision",
-            "profile revision mismatch",
-        ));
-    }
-    if !Path::new(&raw_profile.executable).is_absolute() {
-        return Err(invalid("runtime_profiles.executable", "must be absolute"));
-    }
     let qualification_id = match &raw_profile.qualification_id {
-        MissingAwareQualification::Present(Some(value)) if !value.is_empty() => value,
+        MissingAwareQualification::Present(Some(value)) if !value.is_empty() => value.clone(),
         _ => {
             return Err(invalid(
                 "runtime_profiles.qualification_id",
@@ -810,287 +759,53 @@ pub fn resolve_effective(
             ))
         }
     };
-    if raw_profile.build_fingerprint.is_empty()
-        || matches!(raw_profile.engine, Engine::Vllm | Engine::Sglang)
-            && raw_profile
-                .security
-                .credential_ref
-                .as_ref()
-                .is_none_or(String::is_empty)
-    {
-        return Err(invalid(
-            "runtime_profiles",
-            "fingerprints, qualification reference, and runtime credential reference are required",
-        ));
-    }
-    if raw_profile.engine == Engine::Sglang
-        && raw_profile
-            .security
-            .admin_credential_ref
-            .as_ref()
-            .is_none_or(String::is_empty)
-    {
-        return Err(invalid(
-            "runtime_profiles.security.admin_credential_ref",
-            "SGLang requires a distinct admin credential reference",
-        ));
-    }
-    if raw_profile.security.admin_credential_ref.is_some()
-        && raw_profile.security.admin_credential_ref.as_ref()
-            == raw_profile.security.credential_ref.as_ref()
-    {
-        return Err(invalid(
-            "runtime_profiles.security",
-            "runtime and admin credential references must differ",
-        ));
-    }
-    validate_profile_args(raw_profile.engine, &raw_profile.args)
-        .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
-    validate_profile_env(&raw_profile.env).map_err(|name| {
-        invalid(
-            format!("runtime_profiles.env.{name}"),
-            "environment name is not allowlisted",
-        )
-    })?;
-    let (cold, cold_i) = phase(d.resources.cold, domain::ResourcePhase::Cold)?;
-    let (ready, ready_i) = phase(d.resources.ready, domain::ResourcePhase::Ready)?;
-    let (parking, parking_i) = phase(d.resources.parking, domain::ResourcePhase::Parking)?;
-    let (parked, parked_i) = phase(d.resources.parked, domain::ResourcePhase::Parked)?;
-    let (wake, wake_i) = phase(d.resources.wake, domain::ResourcePhase::Wake)?;
-    domain::validate_recipe(&domain::RecipeFootprints {
-        cold: cold_i,
-        ready: ready_i,
-        parking: parking_i,
-        parked: parked_i,
-        wake: wake_i,
-    })
-    .map_err(|e| invalid("resources", e.to_string()))?;
-    let resources = RecipeFootprints {
-        cold,
-        ready,
-        parking,
-        parked,
-        wake,
-    };
-    let mut domains = BTreeMap::new();
-    for (name, raw) in h.resource_policy.domains {
-        let value = DomainPolicy {
-            managed_limit: parse_bytes(&raw.managed_limit)?,
-            free_reserve: parse_bytes(&raw.free_reserve)?,
-            host_kv_limit: raw.host_kv_limit.as_deref().map(parse_bytes).transpose()?,
-            parked_limit: raw.parked_limit.as_deref().map(parse_bytes).transpose()?,
-        };
-        domains.insert(name, value);
-    }
-    let selected: BTreeMap<_, _> = d
-        .devices
-        .iter()
-        .map(|x| (x.id.as_str(), x.sharing))
-        .collect();
-    if selected.len() != d.devices.len() {
-        return Err(invalid("devices", "device IDs must be unique"));
-    }
-    for claim in &d.devices {
-        let policy = h
-            .resource_policy
-            .devices
-            .get(&claim.id)
-            .ok_or_else(|| invalid("devices", format!("unknown device `{}`", claim.id)))?;
-        if h.resource_policy.device_sharing == Sharing::Exclusive
-            && claim.sharing == Sharing::Shared
-            || policy.sharing == Sharing::Exclusive && claim.sharing == Sharing::Shared
-        {
-            return Err(invalid("devices", "sharing claim exceeds policy"));
-        }
-    }
-    for p in [
-        &resources.cold,
-        &resources.ready,
-        &resources.parking,
-        &resources.parked,
-        &resources.wake,
-    ] {
-        for a in &p.allocations {
-            if !domains.contains_key(&a.domain) {
-                return Err(invalid(
-                    "resources.allocations.domain",
-                    format!("unknown domain `{}`", a.domain),
-                ));
-            }
-        }
-        for claim in &p.devices {
-            if selected.get(claim.id.as_str()) != Some(&claim.sharing) {
-                return Err(invalid(
-                    "resources.devices",
-                    "phase device claim must match selected deployment claim",
-                ));
-            }
-        }
-    }
-    let raw_queue = h.resource_policy.queue.unwrap_or(RawQueue {
-        max_pending_per_deployment: None,
-        max_pending_total: None,
-        max_buffered_bytes_total: None,
-        request_deadline: None,
-        admission_window: None,
-    });
-    let queue = QueuePolicy {
-        max_pending_per_deployment: raw_queue
-            .max_pending_per_deployment
-            .unwrap_or(DEFAULT_PENDING_PER_DEPLOYMENT),
-        max_pending_total: raw_queue.max_pending_total.unwrap_or(DEFAULT_PENDING_TOTAL),
-        max_buffered_bytes_total: raw_queue
-            .max_buffered_bytes_total
-            .as_deref()
-            .map(parse_bytes)
-            .transpose()?
-            .unwrap_or(DEFAULT_QUEUED_BYTES),
-        request_deadline_ms: raw_queue
+    let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
+    let host = core::normalize_host(h)?;
+    let recipe = core::NormalizedRecipe {
+        model: d.model,
+        recipe: d.recipe,
+        residency: d.residency,
+        recovery: d.recovery,
+        devices: d.devices,
+        resources: RecipeFootprints {
+            cold: phase(d.resources.cold)?,
+            ready: phase(d.resources.ready)?,
+            parking: phase(d.resources.parking)?,
+            parked: phase(d.resources.parked)?,
+            wake: phase(d.resources.wake)?,
+        },
+        request_deadline_ms: d
             .request_deadline
             .as_deref()
             .map(parse_duration_ms)
             .transpose()?
-            .unwrap_or(DEFAULT_REQUEST_DEADLINE_MS),
-        admission_window_ms: raw_queue
-            .admission_window
-            .as_deref()
-            .map(parse_duration_ms)
-            .transpose()?
-            .unwrap_or(DEFAULT_ADMISSION_WINDOW_MS),
+            .unwrap_or(host.queue.request_deadline_ms),
     };
-    let max_parked = h.resource_policy.max_parked.unwrap_or(DEFAULT_MAX_PARKED);
-    let observation_ttl_ms = h
-        .resource_policy
-        .observation_ttl
-        .as_deref()
-        .map(parse_duration_ms)
-        .transpose()?
-        .unwrap_or(DEFAULT_OBSERVATION_TTL_MS);
-    let planner_max_states = h
-        .resource_policy
-        .planner_max_states
-        .unwrap_or(DEFAULT_PLANNER_STATES);
-    let deadline = d
-        .request_deadline
-        .as_deref()
-        .map(parse_duration_ms)
-        .transpose()?
-        .unwrap_or(queue.request_deadline_ms);
-    if deadline <= 0 || deadline > queue.request_deadline_ms {
-        return Err(invalid(
-            "request_deadline",
-            "deployment deadline may only shorten host limit",
-        ));
-    }
-    let launch_settings = normalize_launch(
-        raw_profile.launch_settings.clone(),
-        raw_profile.engine,
-        d.residency,
-    )?;
-    let uses_experimental_controls = match &launch_settings {
-        ProfileLaunchSettings::Vllm(settings) => settings.enable_sleep_mode,
-        ProfileLaunchSettings::Sglang(settings) => settings.memory_saver,
-        ProfileLaunchSettings::Fake(_) => false,
-    };
-    if uses_experimental_controls && !raw_profile.security.experimental_controls {
-        return Err(invalid(
-            "runtime_profiles.security.experimental_controls",
-            "launch settings require explicit experimental controls policy",
-        ));
-    }
-    let profile = RuntimeProfile {
-        engine: raw_profile.engine,
-        revision: raw_profile.revision,
-        executable: raw_profile.executable.clone(),
-        build_fingerprint: raw_profile.build_fingerprint.clone(),
-        qualification_id: qualification_id.clone(),
-        args: raw_profile.args.clone(),
-        launch_settings,
-        env: raw_profile.env.clone(),
-        security: raw_profile.security.clone(),
-        log_policy: LogPolicy {
-            max_file_bytes: parse_bytes(&raw_profile.log_policy.max_file_bytes)?,
-            retained_files: raw_profile.log_policy.retained_files,
-        },
-    };
-    let qualification_policy = normalize_qualification_policy(h.qualification_policy)?;
-    let host = HostPolicy {
-        name: h.name,
-        hardware_fingerprint: h.hardware_fingerprint,
-        environment_fingerprint: h.environment_fingerprint,
-        domains,
-        devices: h.resource_policy.devices,
-        max_parked,
-        observation_ttl_ms,
-        device_sharing: h.resource_policy.device_sharing,
-        endpoint_port_range: h.resource_policy.endpoint_port_range,
-        planner_max_states,
-        queue,
-        qualification_policy,
-    };
-    ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
-    #[derive(Serialize)]
-    struct Qualification<'a> {
-        model: &'a ModelIdentity,
-        recipe: &'a str,
-        residency: Residency,
-        recovery: Recovery,
-        devices: &'a [DeviceClaim],
-        resources: &'a RecipeFootprints,
-        host_devices: &'a BTreeMap<String, DevicePolicy>,
-        device_sharing: Sharing,
-        engine: Engine,
-        revision: u64,
-        executable: &'a str,
-        build_fingerprint: &'a str,
-        args: &'a [String],
-        launch_settings: &'a ProfileLaunchSettings,
-        env: &'a BTreeMap<String, String>,
-        experimental_controls: bool,
-        runtime_auth: bool,
-        admin_auth: bool,
-        log_policy: &'a LogPolicy,
-        hardware_fingerprint: &'a str,
-        environment_fingerprint: &'a str,
-    }
-    let material = Qualification {
-        model: &d.model,
-        recipe: &d.recipe,
-        residency: d.residency,
-        recovery: d.recovery,
-        devices: &d.devices,
-        resources: &resources,
-        host_devices: &host.devices,
-        device_sharing: host.device_sharing,
-        engine: profile.engine,
-        revision: profile.revision,
-        executable: &profile.executable,
-        build_fingerprint: &profile.build_fingerprint,
-        args: &profile.args,
-        launch_settings: &profile.launch_settings,
-        env: &profile.env,
-        experimental_controls: profile.security.experimental_controls,
-        runtime_auth: profile.security.credential_ref.is_some(),
-        admin_auth: profile.security.admin_credential_ref.is_some(),
-        log_policy: &profile.log_policy,
-        hardware_fingerprint: &host.hardware_fingerprint,
-        environment_fingerprint: &host.environment_fingerprint,
-    };
-    let qualification_fingerprint = hex::encode(Sha256::digest(
-        serde_json::to_vec(&material).map_err(|e| invalid("fingerprint", e.to_string()))?,
-    ));
+    core::validate_recipe(&recipe, &host)?;
+    let qualification_fingerprint = core::qualification_fingerprint(&recipe, &profile, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,
         name: d.name,
-        model: d.model,
+        model: recipe.model,
         routes: d.routes,
-        recipe: d.recipe,
-        residency: d.residency,
-        recovery: d.recovery,
-        selected_devices: d.devices,
-        resources,
-        request_deadline_ms: deadline,
-        profile,
+        recipe: recipe.recipe,
+        residency: recipe.residency,
+        recovery: recipe.recovery,
+        selected_devices: recipe.devices,
+        resources: recipe.resources,
+        request_deadline_ms: recipe.request_deadline_ms,
+        profile: RuntimeProfile {
+            engine: profile.engine,
+            revision: profile.revision,
+            executable: profile.executable,
+            build_fingerprint: profile.build_fingerprint,
+            qualification_id,
+            args: profile.args,
+            launch_settings: profile.launch_settings,
+            env: profile.env,
+            security: profile.security,
+            log_policy: profile.log_policy,
+        },
         host,
         qualification_fingerprint,
     })

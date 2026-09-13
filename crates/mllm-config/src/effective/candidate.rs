@@ -408,9 +408,6 @@ fn normalize(
     ] {
         validate_text(v, p, 4096, true)?;
     }
-    if !Path::new(&recipe.model.path).is_absolute() {
-        return Err(invalid("effective_recipe.model.path", "must be absolute"));
-    }
     if recipe.runtime_profile_revision == 0 {
         return Err(invalid(
             "effective_recipe.runtime_profile_revision",
@@ -426,21 +423,17 @@ fn normalize(
                 "unknown runtime profile",
             )
         })?;
-    match &raw.qualification_id {
-        MissingAwareQualification::Missing | MissingAwareQualification::Present(Some(_)) => {}
-        MissingAwareQualification::Present(None) => {
-            return Err(invalid(
-                "runtime_profiles.qualification_id",
-                "present qualification reference must be a nonempty string",
-            ))
+    for profile in h.runtime_profiles.values() {
+        if !matches!(&profile.qualification_id, MissingAwareQualification::Present(Some(value)) if !value.is_empty())
+        {
+            // Missing is valid; a present reference must be a nonempty string.
+            if !matches!(profile.qualification_id, MissingAwareQualification::Missing) {
+                return Err(invalid(
+                    "runtime_profiles.qualification_id",
+                    "present qualification reference must be a nonempty string",
+                ));
+            }
         }
-    }
-    if matches!(&raw.qualification_id, MissingAwareQualification::Present(Some(value)) if value.is_empty())
-    {
-        return Err(invalid(
-            "runtime_profiles.qualification_id",
-            "present qualification reference must be a nonempty string",
-        ));
     }
     if raw.revision != recipe.runtime_profile_revision
         || recipe.resolved_profile.revision != raw.revision
@@ -450,7 +443,7 @@ fn normalize(
             "profile revision mismatch",
         ));
     }
-    let launch = normalize_launch(raw.launch_settings.clone(), raw.engine, recipe.residency)?;
+    let profile = core::normalize_profile(raw, recipe.runtime_profile_revision, recipe.residency)?;
     if raw
         .security
         .credential_ref
@@ -461,55 +454,36 @@ fn normalize(
             .admin_credential_ref
             .as_ref()
             .is_some_and(String::is_empty)
-        || matches!(raw.engine, Engine::Vllm | Engine::Sglang)
-            && raw.security.credential_ref.is_none()
-        || raw.engine == Engine::Sglang && raw.security.admin_credential_ref.is_none()
-        || raw.security.admin_credential_ref.is_some()
-            && raw.security.admin_credential_ref.as_ref() == raw.security.credential_ref.as_ref()
     {
         return Err(invalid(
             "runtime_profiles.security",
             "invalid credential reference structure",
         ));
     }
-    validate_profile_args(raw.engine, &raw.args)
-        .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
-    validate_profile_env(&raw.env).map_err(|_| {
-        invalid(
-            "runtime_profiles.env",
-            "environment name is not allowlisted",
-        )
-    })?;
     let expected = CandidateProfile {
-        engine: raw.engine,
-        revision: raw.revision,
-        executable: raw.executable.clone(),
-        build_fingerprint: raw.build_fingerprint.clone(),
-        args: raw.args.clone(),
+        engine: profile.engine,
+        revision: profile.revision,
+        executable: profile.executable.clone(),
+        build_fingerprint: profile.build_fingerprint.clone(),
+        args: profile.args.clone(),
         launch_settings: decode(
-            &serde_json::to_value(&launch)
+            &serde_json::to_value(&profile.launch_settings)
                 .map_err(|_| invalid("profile", "launch encoding failed"))?,
             "profile.launch_settings",
         )?,
-        env: raw.env.clone(),
-        experimental_controls: raw.security.experimental_controls,
-        runtime_auth: raw.security.credential_ref.is_some(),
-        admin_auth: raw.security.admin_credential_ref.is_some(),
+        env: profile.env.clone(),
+        experimental_controls: profile.security.experimental_controls,
+        runtime_auth: profile.security.credential_ref.is_some(),
+        admin_auth: profile.security.admin_credential_ref.is_some(),
         log_policy: CandidateLogPolicy {
-            max_file_bytes: parse_bytes(&raw.log_policy.max_file_bytes)?,
-            retained_files: raw.log_policy.retained_files,
+            max_file_bytes: profile.log_policy.max_file_bytes,
+            retained_files: profile.log_policy.retained_files,
         },
     };
     if recipe.resolved_profile != expected {
         return Err(invalid(
             "effective_recipe.resolved_profile",
             "profile projection mismatch",
-        ));
-    }
-    if !Path::new(&expected.executable).is_absolute() {
-        return Err(invalid(
-            "effective_recipe.resolved_profile.executable",
-            "must be absolute",
         ));
     }
     if recipe.host_devices != h.resource_policy.devices
@@ -520,19 +494,10 @@ fn normalize(
             "host topology projection mismatch",
         ));
     }
-    validate_recipe(recipe, &h)?;
-    let queue_deadline = h
-        .resource_policy
-        .queue
-        .as_ref()
-        .and_then(|q| q.request_deadline.as_deref())
-        .map(parse_duration_ms)
-        .transpose()?
-        .unwrap_or(DEFAULT_REQUEST_DEADLINE_MS);
-    if recipe.request_deadline_ms <= 0
-        || recipe.request_deadline_ms > queue_deadline
-        || recipe.request_deadline_ms > input.limits.max_run_duration_ms
-    {
+    let host = core::normalize_host(h)?;
+    let normalized_recipe = recipe.normalized();
+    core::validate_recipe(&normalized_recipe, &host)?;
+    if recipe.request_deadline_ms > input.limits.max_run_duration_ms {
         return Err(invalid(
             "effective_recipe.request_deadline_ms",
             "deadline exceeds manifest or host limit",
@@ -560,14 +525,16 @@ fn normalize(
     digest.update(DIGEST_DOMAIN);
     digest.update(&reviewed_json);
     let manifest_digest = hex::encode(digest.finalize());
-    let recipe_fingerprint = recipe_fingerprint(recipe, &expected, &input.host)?;
+    let recipe_fingerprint = core::qualification_fingerprint(&normalized_recipe, &profile, &host)?;
     let credential_refs = CandidateCredentialRefs {
-        runtime: raw.security.credential_ref.clone(),
-        admin: raw.security.admin_credential_ref.clone(),
+        runtime: profile.security.credential_ref.clone(),
+        admin: profile.security.admin_credential_ref.clone(),
     };
+    let mut effective_recipe = input.effective_recipe;
+    effective_recipe.resolved_profile = expected;
     let output = NormalizedCandidateManifest {
         host: input.host,
-        effective_recipe: input.effective_recipe,
+        effective_recipe,
         limits: input.limits,
         cases: input.cases,
         reviewed_json,
@@ -725,146 +692,36 @@ fn validate_cases(
     Ok(total)
 }
 
-fn validate_recipe(r: &CandidateRecipe, h: &HostInput) -> Result<(), ConfigError> {
-    let convert = |p: &CandidatePhase, phase| domain::PhaseFootprint {
-        phase,
-        allocations: p
-            .allocations
-            .iter()
-            .map(|a| domain::Allocation {
-                domain: a.domain.clone(),
-                bytes: a.bytes,
-                host_kv_bytes: a.host_kv_bytes,
-            })
-            .collect(),
-        devices: p
-            .devices
-            .iter()
-            .map(|d| domain::DeviceClaim {
-                device: d.id.clone(),
-                sharing: match d.sharing {
-                    Sharing::Shared => domain::Sharing::Shared,
-                    Sharing::Exclusive => domain::Sharing::Exclusive,
-                },
-            })
-            .collect(),
-    };
-    domain::validate_recipe(&domain::RecipeFootprints {
-        cold: convert(&r.resources.cold, domain::ResourcePhase::Cold),
-        ready: convert(&r.resources.ready, domain::ResourcePhase::Ready),
-        parking: convert(&r.resources.parking, domain::ResourcePhase::Parking),
-        parked: convert(&r.resources.parked, domain::ResourcePhase::Parked),
-        wake: convert(&r.resources.wake, domain::ResourcePhase::Wake),
-    })
-    .map_err(|e| invalid("effective_recipe.resources", e.to_string()))?;
-    let selected: BTreeMap<_, _> = r.devices.iter().map(|d| (&d.id, d.sharing)).collect();
-    if selected.len() != r.devices.len() {
-        return Err(invalid(
-            "effective_recipe.devices",
-            "device IDs must be unique",
-        ));
-    }
-    for d in &r.devices {
-        let p = h
-            .resource_policy
-            .devices
-            .get(&d.id)
-            .ok_or_else(|| invalid("effective_recipe.devices", "unknown device"))?;
-        if (h.resource_policy.device_sharing == Sharing::Exclusive
-            || p.sharing == Sharing::Exclusive)
-            && d.sharing == Sharing::Shared
-        {
-            return Err(invalid("effective_recipe.devices", "sharing exceeds host"));
+impl CandidateRecipe {
+    fn normalized(&self) -> core::NormalizedRecipe {
+        let phase = |p: &CandidatePhase| PhaseFootprint {
+            allocations: p
+                .allocations
+                .iter()
+                .map(|a| Allocation {
+                    domain: a.domain.clone(),
+                    bytes: a.bytes,
+                    host_kv_bytes: a.host_kv_bytes,
+                })
+                .collect(),
+            devices: p.devices.clone(),
+        };
+        core::NormalizedRecipe {
+            model: self.model.clone(),
+            recipe: self.recipe.clone(),
+            residency: self.residency,
+            recovery: self.recovery,
+            devices: self.devices.clone(),
+            resources: RecipeFootprints {
+                cold: phase(&self.resources.cold),
+                ready: phase(&self.resources.ready),
+                parking: phase(&self.resources.parking),
+                parked: phase(&self.resources.parked),
+                wake: phase(&self.resources.wake),
+            },
+            request_deadline_ms: self.request_deadline_ms,
         }
     }
-    for p in [
-        &r.resources.cold,
-        &r.resources.ready,
-        &r.resources.parking,
-        &r.resources.parked,
-        &r.resources.wake,
-    ] {
-        for a in &p.allocations {
-            if !h.resource_policy.domains.contains_key(&a.domain) {
-                return Err(invalid(
-                    "effective_recipe.resources.allocations.domain",
-                    "unknown domain",
-                ));
-            }
-            if a.bytes < 0 || a.host_kv_bytes < 0 {
-                return Err(invalid(
-                    "effective_recipe.resources.allocations",
-                    "negative bytes",
-                ));
-            }
-        }
-        for d in &p.devices {
-            if selected.get(&d.id) != Some(&d.sharing) {
-                return Err(invalid(
-                    "effective_recipe.resources.devices",
-                    "phase claim mismatch",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn recipe_fingerprint(
-    r: &CandidateRecipe,
-    p: &CandidateProfile,
-    h: &CandidateHost,
-) -> Result<String, ConfigError> {
-    #[derive(Serialize)]
-    struct Q<'a> {
-        model: &'a ModelIdentity,
-        recipe: &'a str,
-        residency: Residency,
-        recovery: Recovery,
-        devices: &'a [DeviceClaim],
-        resources: &'a CandidateResources,
-        host_devices: &'a BTreeMap<String, DevicePolicy>,
-        device_sharing: Sharing,
-        engine: Engine,
-        revision: u64,
-        executable: &'a str,
-        build_fingerprint: &'a str,
-        args: &'a [String],
-        launch_settings: &'a CandidateLaunch,
-        env: &'a BTreeMap<String, String>,
-        experimental_controls: bool,
-        runtime_auth: bool,
-        admin_auth: bool,
-        log_policy: &'a CandidateLogPolicy,
-        hardware_fingerprint: &'a str,
-        environment_fingerprint: &'a str,
-    }
-    let q = Q {
-        model: &r.model,
-        recipe: &r.recipe,
-        residency: r.residency,
-        recovery: r.recovery,
-        devices: &r.devices,
-        resources: &r.resources,
-        host_devices: &r.host_devices,
-        device_sharing: r.host_device_sharing,
-        engine: p.engine,
-        revision: p.revision,
-        executable: &p.executable,
-        build_fingerprint: &p.build_fingerprint,
-        args: &p.args,
-        launch_settings: &p.launch_settings,
-        env: &p.env,
-        experimental_controls: p.experimental_controls,
-        runtime_auth: p.runtime_auth,
-        admin_auth: p.admin_auth,
-        log_policy: &p.log_policy,
-        hardware_fingerprint: &h.hardware_fingerprint,
-        environment_fingerprint: &h.environment_fingerprint,
-    };
-    Ok(hex::encode(Sha256::digest(
-        serde_json::to_vec(&q).map_err(|_| invalid("fingerprint", "encoding failed"))?,
-    )))
 }
 
 fn canonical_json(value: &Value) -> Result<Vec<u8>, ConfigError> {

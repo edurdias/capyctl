@@ -12,6 +12,36 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
     (all["deployment"].clone(), all["host"].clone())
 }
 
+#[test]
+fn ordinary_engine_compatibility_goldens() {
+    for engine in ["vllm", "sglang", "fake"] {
+        let (deployment, mut host) = fixture();
+        let profile = &mut host["runtime_profiles"]["local"];
+        if engine != "vllm" {
+            profile["engine"] = engine.into();
+            profile["args"] = serde_json::json!([]);
+            profile["launch_settings"] = if engine == "sglang" {
+                profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+                serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}})
+            } else {
+                serde_json::json!({"engine":"fake"})
+            };
+        }
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let golden: serde_json::Value = serde_json::from_str(match engine {
+            "vllm" => include_str!("fixtures/effective-vllm-golden.json"),
+            "sglang" => include_str!("fixtures/effective-sglang-golden.json"),
+            _ => include_str!("fixtures/effective-fake-golden.json"),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(effective).unwrap(),
+            golden["effective"],
+            "{engine}"
+        );
+    }
+}
+
 fn qualification_policy() -> serde_json::Value {
     serde_json::json!({
         "revision": 1,

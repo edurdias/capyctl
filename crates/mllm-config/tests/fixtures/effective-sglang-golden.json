@@ -1,0 +1,346 @@
+{
+  "input": {
+    "deployment": {
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ],
+      "kind": "deployment",
+      "model": {
+        "content_fingerprint": "sha256:model",
+        "path": "/srv/models/toy",
+        "revision": "r1"
+      },
+      "name": "toy",
+      "recipe": "standard",
+      "recovery": "reconcile",
+      "request_deadline": "300s",
+      "residency": "warm",
+      "resources": {
+        "cold": {
+          "allocations": [
+            {
+              "bytes": "10GiB",
+              "domain": "unified",
+              "host_kv_bytes": "1GiB"
+            }
+          ],
+          "devices": [
+            {
+              "id": "gpu0",
+              "sharing": "shared"
+            }
+          ]
+        },
+        "parked": {
+          "allocations": [
+            {
+              "bytes": "2GiB",
+              "domain": "unified",
+              "host_kv_bytes": "0B"
+            }
+          ],
+          "devices": []
+        },
+        "parking": {
+          "allocations": [
+            {
+              "bytes": "9GiB",
+              "domain": "unified",
+              "host_kv_bytes": "1GiB"
+            }
+          ],
+          "devices": [
+            {
+              "id": "gpu0",
+              "sharing": "shared"
+            }
+          ]
+        },
+        "ready": {
+          "allocations": [
+            {
+              "bytes": "8GiB",
+              "domain": "unified",
+              "host_kv_bytes": "1GiB"
+            }
+          ],
+          "devices": [
+            {
+              "id": "gpu0",
+              "sharing": "shared"
+            }
+          ]
+        },
+        "wake": {
+          "allocations": [
+            {
+              "bytes": "10GiB",
+              "domain": "unified",
+              "host_kv_bytes": "1GiB"
+            }
+          ],
+          "devices": [
+            {
+              "id": "gpu0",
+              "sharing": "shared"
+            }
+          ]
+        }
+      },
+      "routes": [
+        "toy"
+      ],
+      "runtime_profile": "local",
+      "runtime_profile_revision": 7,
+      "schema_version": 1
+    },
+    "host": {
+      "environment_fingerprint": "env-01",
+      "hardware_fingerprint": "hw-01",
+      "kind": "host",
+      "name": "lab",
+      "resource_policy": {
+        "device_sharing": "shared",
+        "devices": {
+          "gpu0": {
+            "domain": "unified",
+            "sharing": "shared"
+          }
+        },
+        "domains": {
+          "unified": {
+            "free_reserve": "16GiB",
+            "host_kv_limit": "4GiB",
+            "managed_limit": "32GiB",
+            "parked_limit": "8GiB"
+          }
+        },
+        "endpoint_port_range": {
+          "end": 8199,
+          "start": 8100
+        },
+        "max_parked": 16,
+        "observation_ttl": "2s",
+        "planner_max_states": 4096,
+        "queue": {
+          "admission_window": "2s",
+          "max_buffered_bytes_total": "64MiB",
+          "max_pending_per_deployment": 64,
+          "max_pending_total": 256,
+          "request_deadline": "600s"
+        }
+      },
+      "runtime_profiles": {
+        "local": {
+          "args": [],
+          "build_fingerprint": "vllm-build-1",
+          "engine": "sglang",
+          "env": {
+            "RUST_LOG": "info"
+          },
+          "executable": "/bin/true",
+          "launch_settings": {
+            "engine": "sglang",
+            "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
+            "requested_budget": {
+              "kv_cache_bytes": "4GiB",
+              "static_memory_fraction_bps": 7500
+            }
+          },
+          "log_policy": {
+            "max_file_bytes": "16MiB",
+            "retained_files": 3
+          },
+          "qualification_id": "qualification-evidence-17",
+          "revision": 7,
+          "security": {
+            "admin_credential_ref": "secret://admin-key",
+            "credential_ref": "secret://engine-key",
+            "experimental_controls": true
+          }
+        }
+      },
+      "schema_version": 1
+    }
+  },
+  "effective": {
+    "host": {
+      "device_sharing": "shared",
+      "devices": {
+        "gpu0": {
+          "domain": "unified",
+          "sharing": "shared"
+        }
+      },
+      "domains": {
+        "unified": {
+          "free_reserve": 17179869184,
+          "host_kv_limit": 4294967296,
+          "managed_limit": 34359738368,
+          "parked_limit": 8589934592
+        }
+      },
+      "endpoint_port_range": {
+        "end": 8199,
+        "start": 8100
+      },
+      "environment_fingerprint": "env-01",
+      "hardware_fingerprint": "hw-01",
+      "max_parked": 16,
+      "name": "lab",
+      "observation_ttl_ms": 2000,
+      "planner_max_states": 4096,
+      "qualification_policy": null,
+      "queue": {
+        "admission_window_ms": 2000,
+        "max_buffered_bytes_total": 67108864,
+        "max_pending_per_deployment": 64,
+        "max_pending_total": 256,
+        "request_deadline_ms": 600000
+      }
+    },
+    "model": {
+      "content_fingerprint": "sha256:model",
+      "path": "/srv/models/toy",
+      "revision": "r1"
+    },
+    "name": "toy",
+    "profile": {
+      "args": [],
+      "build_fingerprint": "vllm-build-1",
+      "engine": "sglang",
+      "env": {
+        "RUST_LOG": "info"
+      },
+      "executable": "/bin/true",
+      "launch_settings": {
+        "context_tokens": 4096,
+        "cpu_kv_offload": false,
+        "cpu_weight_backup": false,
+        "data_parallel_size": 1,
+        "decode_cuda_graphs": false,
+        "disaggregation": false,
+        "engine": "sglang",
+        "external_cache": false,
+        "lora": false,
+        "max_running_requests": 8,
+        "max_total_tokens": 4096,
+        "memory_saver": true,
+        "model_dtype": "bfloat16",
+        "native_grpc": false,
+        "prefill_cuda_graphs": false,
+        "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
+        "requested_budget": {
+          "kv_cache_bytes": 4294967296,
+          "static_memory_fraction_bps": 7500
+        },
+        "speculative_decoding": false,
+        "tensor_parallel_size": 1,
+        "tokenizer_workers": 1,
+        "trust_remote_code": false,
+        "weight_restore": "disk_reload"
+      },
+      "log_policy": {
+        "max_file_bytes": 16777216,
+        "retained_files": 3
+      },
+      "qualification_id": "qualification-evidence-17",
+      "revision": 7,
+      "security": {
+        "admin_credential_ref": "secret://admin-key",
+        "credential_ref": "secret://engine-key",
+        "experimental_controls": true
+      }
+    },
+    "qualification_fingerprint": "b7863d64c7a21c4ed88c046154afdaa02f886e0ad723498ad58f267564913484",
+    "recipe": "standard",
+    "recovery": "reconcile",
+    "request_deadline_ms": 300000,
+    "residency": "warm",
+    "resources": {
+      "cold": {
+        "allocations": [
+          {
+            "bytes": 10737418240,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      },
+      "parked": {
+        "allocations": [
+          {
+            "bytes": 2147483648,
+            "domain": "unified",
+            "host_kv_bytes": 0
+          }
+        ],
+        "devices": []
+      },
+      "parking": {
+        "allocations": [
+          {
+            "bytes": 9663676416,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      },
+      "ready": {
+        "allocations": [
+          {
+            "bytes": 8589934592,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      },
+      "wake": {
+        "allocations": [
+          {
+            "bytes": 10737418240,
+            "domain": "unified",
+            "host_kv_bytes": 1073741824
+          }
+        ],
+        "devices": [
+          {
+            "id": "gpu0",
+            "sharing": "shared"
+          }
+        ]
+      }
+    },
+    "routes": [
+      "toy"
+    ],
+    "schema_version": 1,
+    "selected_devices": [
+      {
+        "id": "gpu0",
+        "sharing": "shared"
+      }
+    ]
+  }
+}

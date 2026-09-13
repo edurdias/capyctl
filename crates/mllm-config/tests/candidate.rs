@@ -179,3 +179,239 @@ fn host_and_profile_drift_are_rejected() {
     candidate["effective_recipe"]["resolved_profile"]["build_fingerprint"] = "wrong".into();
     assert!(normalize_candidate_manifest(&candidate, &host).is_err());
 }
+
+#[test]
+fn candidate_rejects_invalid_trusted_host_and_shared_profile_settings() {
+    for (path, value) in [
+        (
+            "/resource_policy/queue/max_pending_total",
+            serde_json::json!(0),
+        ),
+        (
+            "/resource_policy/endpoint_port_range/start",
+            serde_json::json!(0),
+        ),
+        (
+            "/runtime_profiles/local/security/experimental_controls",
+            serde_json::json!(false),
+        ),
+        (
+            "/runtime_profiles/local/build_fingerprint",
+            serde_json::json!(""),
+        ),
+    ] {
+        let (mut candidate, mut host) = fixture();
+        *host.pointer_mut(path).expect(path) = value.clone();
+        if path.ends_with("experimental_controls") {
+            candidate["effective_recipe"]["resolved_profile"]["experimental_controls"] = value;
+        } else if path.ends_with("build_fingerprint") {
+            candidate["effective_recipe"]["resolved_profile"]["build_fingerprint"] = value;
+        }
+        assert!(
+            normalize_candidate_manifest(&candidate, &host).is_err(),
+            "{path}"
+        );
+    }
+}
+
+fn engine_fixture(engine: &str) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let (candidate, ordinary) = match engine {
+        "vllm" => (
+            include_str!("fixtures/candidate-vllm.json"),
+            include_str!("fixtures/effective-vllm-golden.json"),
+        ),
+        "sglang" => (
+            include_str!("fixtures/candidate-sglang.json"),
+            include_str!("fixtures/effective-sglang-golden.json"),
+        ),
+        "fake" => (
+            include_str!("fixtures/candidate-fake.json"),
+            include_str!("fixtures/effective-fake-golden.json"),
+        ),
+        _ => unreachable!(),
+    };
+    let ordinary: serde_json::Value = serde_json::from_str(ordinary).unwrap();
+    (
+        serde_json::from_str(candidate).unwrap(),
+        ordinary["input"]["deployment"].clone(),
+        ordinary["input"]["host"].clone(),
+    )
+}
+
+#[test]
+fn all_engines_share_literal_recipe_fingerprints() {
+    for (engine, fingerprint) in [
+        (
+            "vllm",
+            "8fca6812174ea5c21d212fce2b2923a52e6fcdd7ea38aef251a0a7ebf751a1ef",
+        ),
+        (
+            "sglang",
+            "b7863d64c7a21c4ed88c046154afdaa02f886e0ad723498ad58f267564913484",
+        ),
+        (
+            "fake",
+            "faa5d521b8427650c9edaa0746590c69e79a9acf45af6943fc3a0e75eafebc9b",
+        ),
+    ] {
+        let (candidate, deployment, host) = engine_fixture(engine);
+        let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+        let ordinary = resolve_effective(&deployment, &host).unwrap();
+        assert_eq!(normalized.recipe_fingerprint(), fingerprint, "{engine}");
+        assert_eq!(
+            normalized.recipe_fingerprint(),
+            ordinary.qualification_fingerprint,
+            "{engine}"
+        );
+    }
+}
+
+#[test]
+fn qualification_reference_presence_is_wrapper_specific_on_all_profiles() {
+    for engine in ["vllm", "sglang", "fake"] {
+        for selected in [true, false] {
+            for (value, candidate_ok, ordinary_ok) in [
+                (None, true, false),
+                (Some(serde_json::json!("")), false, !selected),
+                (Some(serde_json::Value::Null), false, false),
+                (Some(serde_json::json!(17)), false, false),
+                (Some(serde_json::json!("candidate-looking")), true, true),
+            ] {
+                let (candidate, deployment, mut host) = engine_fixture(engine);
+                let name = if selected { "local" } else { "unselected" };
+                if !selected {
+                    host["runtime_profiles"][name] = host["runtime_profiles"]["local"].clone();
+                }
+                let profile = host["runtime_profiles"][name].as_object_mut().unwrap();
+                if let Some(value) = &value {
+                    profile.insert("qualification_id".into(), value.clone());
+                } else {
+                    profile.remove("qualification_id");
+                }
+                assert_eq!(
+                    normalize_candidate_manifest(&candidate, &host).is_ok(),
+                    candidate_ok,
+                    "candidate {engine} {name} {value:?}"
+                );
+                assert_eq!(
+                    resolve_effective(&deployment, &host).is_ok(),
+                    ordinary_ok,
+                    "ordinary {engine} {name} {value:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn both_paths_reject_shared_recipe_and_host_failures() {
+    for engine in ["vllm", "sglang", "fake"] {
+        for (path, value) in [
+            ("/model/path", serde_json::json!("relative")),
+            ("/devices/0/id", serde_json::json!("unknown")),
+            (
+                "/resources/ready/devices/0/sharing",
+                serde_json::json!("exclusive"),
+            ),
+            (
+                "/resources/ready/allocations/0/domain",
+                serde_json::json!("unknown"),
+            ),
+        ] {
+            let (mut candidate, mut deployment, host) = engine_fixture(engine);
+            *deployment.pointer_mut(path).unwrap() = value.clone();
+            *candidate["effective_recipe"].pointer_mut(path).unwrap() = value;
+            assert!(
+                resolve_effective(&deployment, &host).is_err(),
+                "ordinary {engine} {path}"
+            );
+            assert!(
+                normalize_candidate_manifest(&candidate, &host).is_err(),
+                "candidate {engine} {path}"
+            );
+        }
+        for (path, value) in [
+            (
+                "/resource_policy/queue/max_pending_total",
+                serde_json::json!(0),
+            ),
+            (
+                "/resource_policy/endpoint_port_range/start",
+                serde_json::json!(0),
+            ),
+            (
+                "/runtime_profiles/local/executable",
+                serde_json::json!("relative"),
+            ),
+            (
+                "/runtime_profiles/local/log_policy/max_file_bytes",
+                serde_json::json!("bad-unit"),
+            ),
+        ] {
+            let (candidate, deployment, mut host) = engine_fixture(engine);
+            *host.pointer_mut(path).unwrap() = value;
+            assert!(
+                resolve_effective(&deployment, &host).is_err(),
+                "ordinary {engine} {path}"
+            );
+            assert!(
+                normalize_candidate_manifest(&candidate, &host).is_err(),
+                "candidate {engine} {path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn optional_empty_credentials_preserve_ordinary_compatibility() {
+    for (engine, field) in [
+        ("vllm", "admin_credential_ref"),
+        ("fake", "credential_ref"),
+        ("fake", "admin_credential_ref"),
+    ] {
+        let (mut candidate, deployment, mut host) = engine_fixture(engine);
+        host["runtime_profiles"]["local"]["security"][field] = "".into();
+        let auth = if field == "credential_ref" {
+            "runtime_auth"
+        } else {
+            "admin_auth"
+        };
+        candidate["effective_recipe"]["resolved_profile"][auth] = true.into();
+        assert!(
+            resolve_effective(&deployment, &host).is_ok(),
+            "{engine} {field}"
+        );
+        assert!(
+            normalize_candidate_manifest(&candidate, &host).is_err(),
+            "{engine} {field}"
+        );
+    }
+}
+
+#[test]
+fn candidate_and_ordinary_share_profile_validation_before_projection_comparison() {
+    for engine in ["vllm", "sglang", "fake"] {
+        let (mut candidate, deployment, mut host) = engine_fixture(engine);
+        host["runtime_profiles"]["local"]["build_fingerprint"] = "".into();
+        candidate["effective_recipe"]["resolved_profile"]["build_fingerprint"] = "".into();
+        assert!(resolve_effective(&deployment, &host).is_err());
+        assert!(normalize_candidate_manifest(&candidate, &host).is_err());
+    }
+    for engine in ["vllm", "sglang"] {
+        let (mut candidate, deployment, mut host) = engine_fixture(engine);
+        host["runtime_profiles"]["local"]["security"]["experimental_controls"] = false.into();
+        candidate["effective_recipe"]["resolved_profile"]["experimental_controls"] = false.into();
+        assert!(resolve_effective(&deployment, &host).is_err());
+        assert!(normalize_candidate_manifest(&candidate, &host).is_err());
+    }
+}
+
+#[test]
+fn ordinary_routes_are_required_and_candidate_routes_are_forbidden() {
+    let (mut candidate, mut deployment, host) = engine_fixture("vllm");
+    deployment.as_object_mut().unwrap().remove("routes");
+    assert!(resolve_effective(&deployment, &host).is_err());
+    assert!(normalize_candidate_manifest(&candidate, &host).is_ok());
+    candidate["effective_recipe"]["routes"] = serde_json::json!(["toy"]);
+    assert!(normalize_candidate_manifest(&candidate, &host).is_err());
+}
