@@ -43,9 +43,11 @@ belong in the review findings and should be investigated before escalating here.
 - Fresh root checks: 172 workspace tests excluding CLI plus 2 CLI library tests
   pass; no failures or ignored tests. Scoped Clippy passes. CLI integration targets
   remain excluded. These results do not qualify live engines.
-- F2A2a started: V3 schema and legacy-preservation migration test committed at
-  `e6d8d88`, with task review approved and 17 store tests passing. Snapshot reads
-  and atomic grant writes follow. No production database or Spark runtime accessed.
+- F2A2a implementation through `fcf7cfb`: V3 migration, validated snapshots,
+  atomic increasing grants, fencing, rollback, replay, and contention tests.
+  Four task reviews and broader review approved. Fresh root checks:
+  184 workspace tests excluding CLI plus 2 CLI library tests pass. Scoped Clippy
+  clean. No production database or Spark runtime accessed.
 
 ## Execution decisions
 

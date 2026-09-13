@@ -8,6 +8,12 @@
 
 **Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3–6, Q2/Q6/Q8. Dependency: [F2A1 resource kernel](2026-09-12-f2a1-resource-contracts-and-admission.md).
 
+## Execution status
+
+Implemented through `fcf7cfb`. Four task reviews and whole-branch review approved.
+Fresh verification: 186 CPU tests pass; scoped Clippy clean. CLI integration targets
+excluded. No production database, runtime effects, or live qualification.
+
 ## Global Constraints
 
 - “Only host-a is authorized for subsequent live work.” This plan contains no live work.

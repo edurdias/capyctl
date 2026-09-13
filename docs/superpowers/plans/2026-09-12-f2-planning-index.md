@@ -9,7 +9,7 @@ This index tracks that planning work; it is not an implementation or qualificati
 | Slice | Planning status | Scope |
 |---|---|---|
 | [F2A1](2026-09-12-f2a1-resource-contracts-and-admission.md) | Implemented; task and whole-branch review complete | Physical domains, phase footprints, sharing, forecasts, admission |
-| [F2A2a](2026-09-12-f2a2a-durable-reservation-transactions.md) | Written; examples checked | Durable resource increases, epochs, revision/generation fences |
+| [F2A2a](2026-09-12-f2a2a-durable-reservation-transactions.md) | Implemented; task and whole-branch review complete | Durable resource increases, epochs, revision/generation fences |
 | [F2A2b](2026-09-12-f2a2b-runtime-evidence.md) | Written; examples checked | Host observations, qualified completion tokens and process identities |
 | [F2A2c](2026-09-12-f2a2c-durable-dispatch-ownership.md) | Written; examples checked | Coordinator sessions, durable request leases, atomic dispatch closure |
 | [F2A2d coordinator integration](2026-09-12-f2a2d-coordinator-integration.md) | Written; integrated review corrected | Runtime/endpoint ownership, lifecycle steps, verified reductions, preparation, recovery, router cutover |
@@ -85,7 +85,7 @@ it exceeded the peer tool's size cap; no independent peer result is claimed.
 The owner authorized subsequent task-by-task implementation while away overnight.
 Record consequential open questions for morning review; do not invent permission
 for hardware changes or unsafe qualification. The CPU-only admission kernel is
-complete; durable reservation transactions are next. Current kernel checkpoint
-`5c2cbbe` passes 174 CPU tests and scoped Clippy; no live gate is closed by that result.
+complete, as are durable reservation transactions. Runtime evidence comes next.
+Checkpoint `fcf7cfb` passes 186 CPU tests and scoped Clippy; no live gate is closed by that result.
 
 Only host-a is in scope for future live qualification. Do not access host-b.
