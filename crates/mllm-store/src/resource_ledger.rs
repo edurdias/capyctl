@@ -267,3 +267,87 @@ mod tests {
         assert_eq!(encode(&reordered).unwrap(), encoded);
     }
 }
+
+#[cfg(test)]
+mod transaction_fault_tests {
+    use super::*;
+
+    fn fixture() -> (crate::Store, GrantRequest) {
+        let store = crate::Store::open_in_memory().unwrap();
+        store.conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,
+          admission_enabled,suspended,current_generation,schema_version)
+          VALUES ('a','a','model','stopped',1,0,1,1);
+          INSERT INTO operations(id,deployment_id,kind,state) VALUES ('op-a','a','start','running');").unwrap();
+        let request = GrantRequest { id: "grant-a".into(), deployment_id: "a".into(),
+            operation_id: "op-a".into(), revision: 1, generation: 1, expected_epoch: 0,
+            next: PhaseFootprint { phase: ResourcePhase::Cold,
+                allocations: vec![Allocation { domain: "system".into(), bytes: 60, host_kv_bytes: 0 }],
+                devices: vec![] } };
+        (store, request)
+    }
+
+    #[test]
+    fn receipt_failure_rolls_back_owner_and_epoch() {
+        let (store, request) = fixture();
+        store.conn.execute_batch("CREATE TRIGGER reject_grant BEFORE INSERT ON resource_grants
+            BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;").unwrap();
+        let obs = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
+            available_bytes: 128, sampled_at_ms: 100 }];
+        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
+            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
+        let context = AdmissionContext::new(&obs, &limits, 101, 60, 4);
+        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Sql(_))));
+        assert_eq!(store.resource_snapshot().unwrap(), LedgerSnapshot { epoch: 0, owners: Default::default() });
+        store.conn.execute_batch("DROP TRIGGER reject_grant;").unwrap();
+        assert_eq!(store.reserve_increase(&request, context).unwrap(), GrantReceipt::New { epoch: 1 });
+    }
+
+    #[test]
+    fn legacy_reservations_are_not_silently_ignored() {
+        let (store, _) = fixture();
+        store.conn.execute_batch("INSERT INTO owners(id,kind,deployment_id) VALUES ('a','model','a');
+            INSERT INTO reservations(owner_id,domain_id,bytes,phase) VALUES ('a','system',60,'activation');").unwrap();
+        assert!(matches!(store.resource_snapshot(), Err(ResourceStoreError::NeedsReconciliation)));
+    }
+
+    #[test]
+    fn increasing_writer_cannot_release_memory_or_claims() {
+        let (_, request) = fixture();
+        let mut old = request.next;
+        old.phase = ResourcePhase::Ready;
+        old.devices.push(DeviceClaim { device: "gpu0".into(), sharing: Sharing::Shared });
+        let mut next = old.clone();
+        next.phase = ResourcePhase::Parking;
+        assert!(ensure_increasing(Some(&old), &next).is_ok());
+        next.allocations[0].bytes = 59;
+        assert!(ensure_increasing(Some(&old), &next).is_err());
+        next.allocations[0].bytes = 60;
+        next.devices.clear();
+        assert!(ensure_increasing(Some(&old), &next).is_err());
+        next.phase = ResourcePhase::Parked;
+        assert!(ensure_increasing(Some(&old), &next).is_err());
+    }
+
+    #[test]
+    fn changed_revision_terminal_operation_and_corrupt_ledger_block_grants() {
+        let (store, mut request) = fixture();
+        let obs = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
+            available_bytes: 128, sampled_at_ms: 100 }];
+        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
+            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
+        let context = AdmissionContext::new(&obs, &limits, 101, 60, 4);
+        store.conn.execute("UPDATE deployments SET revision=2 WHERE id='a'", []).unwrap();
+        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Conflict)));
+        request.revision = 2;
+        store.conn.execute("UPDATE operations SET state='failed' WHERE id='op-a'", []).unwrap();
+        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Conflict)));
+        store.conn.execute("UPDATE operations SET state='running' WHERE id='op-a'", []).unwrap();
+        store.conn.execute("INSERT INTO resource_owners(owner_id,footprint_json) VALUES ('a','{}')", []).unwrap();
+        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Json(_))));
+        let epoch: i64 = store.conn.query_row(
+            "SELECT epoch FROM resource_ledger_meta WHERE singleton=1", [], |r| r.get(0)).unwrap();
+        let receipts: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM resource_grants", [], |r| r.get(0)).unwrap();
+        assert_eq!((epoch, receipts), (0, 0));
+    }
+}
