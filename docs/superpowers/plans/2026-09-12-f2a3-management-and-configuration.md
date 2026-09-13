@@ -264,7 +264,7 @@ SGLang requires distinct nonempty API/admin references; vLLM requires its runtim
 credential. Qualification fingerprints exclude reference values but include
 authentication structure and behavioral security policy.
 
-The remaining candidate-configuration slice adds optional host `qualification_policy`;
+The reviewed configuration slice adds optional host `qualification_policy`;
 absence disables qualification. A present block requires `revision`,
 `allow_qualification_runs`, `allow_experimental_controls`, `allowed_manifest_digests`,
 `max_run_duration`, `max_cleanup_duration`, `max_cases`, `max_requests`,
@@ -282,6 +282,19 @@ an allowlist. Current authorization is checked before effects; these permission
 values are not behavioral recipe identity. Resource-policy management cannot edit
 this local block. Startup imports initial revision 1; repeated identical current
 input is a no-op, changes require the next revision, and stale restoration fails.
+
+The qualification revision tracks the highest explicitly imported local revision,
+not every database mutation. Initial absence leaves no row. Removing an imported
+block persists a `Removed` tombstone at its existing revision, preserving historical
+run references; repeated absence is a no-op. Re-adding requires the next revision,
+even when restoring identical content. Removal works at `i64::MAX`; revision
+advancement cannot overflow. Missing or removed policy grants no new effects;
+original bounded owned-cleanup authority remains separate. Import/read validation
+and its redacted event share one session-fenced immediate transaction.
+
+Public `expected_host_revision` refers to the host resource-policy revision.
+Local qualification revision and frozen `qualification_policy_revision` are separate;
+neither advances the other. Policy imports never release accounting or alter runs.
 
 Generated endpoints, served names, credential references, and incarnations are
 not manifest overrides. A separate binding fingerprint consumes trusted runtime

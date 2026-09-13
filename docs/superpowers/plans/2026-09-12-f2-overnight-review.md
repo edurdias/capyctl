@@ -27,6 +27,12 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Progress
 
+- Qualification-policy input reviewed through `cec820f`: strict optional policy,
+  independent permissions, canonical allowlist, shared validation, safe nested
+  errors. Root checks: 272 CPU tests pass; scoped Clippy clean. Importer contract
+  reviewed by five local personas, one focused check and three independent
+  reviews. Removing policy retains a revoked revision tombstone; re-add requires
+  the next revision. Existing runs, grants and original cleanup authority remain.
 - Latest checkpoint: V6 management schema and V7 durable event foundation reviewed
   through `bbf92cd`. Event replay enforces count, byte, age and payload bounds;
   session reset appends atomically. Two fix rounds closed review findings.
