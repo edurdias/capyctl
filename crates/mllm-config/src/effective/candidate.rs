@@ -20,6 +20,61 @@ pub struct NormalizedCandidateManifest {
     total_case_request_budget: u32,
 }
 
+/// Immutable, informational view of an intrinsically valid reviewed manifest.
+///
+/// Fields are private and cannot be used to construct deployment authority.
+///
+/// ```compile_fail
+/// # use mllm_config::effective::candidate::validate_candidate_reviewed_snapshot;
+/// # let value = serde_json::json!({});
+/// let snapshot = validate_candidate_reviewed_snapshot(&value).unwrap();
+/// let _ = snapshot.host;
+/// ```
+///
+/// ```compile_fail
+/// # use mllm_config::effective::candidate::{CandidateReviewedSnapshot, NormalizedCandidateManifest};
+/// fn authorize(snapshot: CandidateReviewedSnapshot) -> NormalizedCandidateManifest {
+///     snapshot.into()
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct CandidateReviewedSnapshot {
+    host: CandidateHost,
+    effective_recipe: CandidateRecipe,
+    limits: CandidateLimits,
+    cases: Vec<CandidateCase>,
+    reviewed_json: Vec<u8>,
+    manifest_digest: String,
+    total_case_request_budget: u32,
+}
+
+impl CandidateReviewedSnapshot {
+    pub fn host_id(&self) -> &str {
+        &self.host.id
+    }
+    pub fn host(&self) -> &CandidateHost {
+        &self.host
+    }
+    pub fn effective_recipe(&self) -> &CandidateRecipe {
+        &self.effective_recipe
+    }
+    pub fn limits(&self) -> &CandidateLimits {
+        &self.limits
+    }
+    pub fn cases(&self) -> &[CandidateCase] {
+        &self.cases
+    }
+    pub fn reviewed_json(&self) -> &[u8] {
+        &self.reviewed_json
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn total_case_request_budget(&self) -> u32 {
+        self.total_case_request_budget
+    }
+}
+
 impl NormalizedCandidateManifest {
     pub fn host_id(&self) -> &str {
         &self.host.id
@@ -370,10 +425,43 @@ pub fn normalize_candidate_manifest(
     value: &Value,
     trusted_host: &Value,
 ) -> Result<NormalizedCandidateManifest, ConfigError> {
+    let input = decode_candidate_input(value)?;
+    normalize(input, trusted_host)
+}
+
+fn decode_candidate_input(value: &Value) -> Result<CandidateInput, ConfigError> {
     check_size(value, "candidate")?;
     reject_fake_launch_extras(value)?;
-    let input: CandidateInput = decode(value, "candidate")?;
-    normalize(input, trusted_host)
+    decode(value, "candidate")
+}
+
+/// Validate an informational reviewed snapshot. Untrusted original input must first
+/// reject duplicate keys because `serde_json::Value` cannot retain them.
+pub fn validate_candidate_reviewed_snapshot(
+    value: &Value,
+) -> Result<CandidateReviewedSnapshot, ConfigError> {
+    let input = decode_candidate_input(value)?;
+    let total = validate_candidate_intrinsic(&input)?;
+    let (reviewed_json, manifest_digest) = encode_reviewed(&input)?;
+    Ok(CandidateReviewedSnapshot {
+        host: input.host,
+        effective_recipe: input.effective_recipe,
+        limits: input.limits,
+        cases: input.cases,
+        reviewed_json,
+        manifest_digest,
+        total_case_request_budget: total,
+    })
+}
+
+pub fn validate_candidate_reviewed_snapshot_text(
+    text: &str,
+) -> Result<CandidateReviewedSnapshot, ConfigError> {
+    if text.len() > MAX_ENCODED {
+        return Err(invalid("candidate", "input exceeds 1MiB"));
+    }
+    let value = crate::strict_yaml::build_value(text)?;
+    validate_candidate_reviewed_snapshot(&value)
 }
 
 fn reject_fake_launch_extras(value: &Value) -> Result<(), ConfigError> {
@@ -523,26 +611,7 @@ fn normalize(
     input: CandidateInput,
     trusted_host: &Value,
 ) -> Result<NormalizedCandidateManifest, ConfigError> {
-    if input.schema_version != 1
-        || input.kind != "candidate_recipe"
-        || input.evaluator_suite != "recipe_v1"
-    {
-        return Err(invalid(
-            "candidate",
-            "schema version 1, candidate kind, and recipe_v1 suite required",
-        ));
-    }
-    validate_selector(&input.host.id, "host.id")?;
-    validate_text(
-        &input.host.hardware_fingerprint,
-        "host.hardware_fingerprint",
-        4096,
-    )?;
-    validate_text(
-        &input.host.environment_fingerprint,
-        "host.environment_fingerprint",
-        4096,
-    )?;
+    let total = validate_candidate_intrinsic(&input)?;
     let h: HostInput = decode(trusted_host, "host")?;
     if h.schema_version != 1 || h.kind != "host" {
         return Err(invalid("host", "trusted host kind/version mismatch"));
@@ -557,25 +626,6 @@ fn normalize(
         ));
     }
     let recipe = &input.effective_recipe;
-    validate_candidate_primitives(recipe)?;
-    validate_selector(&recipe.runtime_profile, "effective_recipe.runtime_profile")?;
-    validate_text(&recipe.recipe, "effective_recipe.recipe", 4096)?;
-    for (p, v) in [
-        ("effective_recipe.model.path", &recipe.model.path),
-        (
-            "effective_recipe.model.content_fingerprint",
-            &recipe.model.content_fingerprint,
-        ),
-        ("effective_recipe.model.revision", &recipe.model.revision),
-    ] {
-        validate_text(v, p, 4096)?;
-    }
-    if recipe.runtime_profile_revision == 0 {
-        return Err(invalid(
-            "effective_recipe.runtime_profile_revision",
-            "must be positive",
-        ));
-    }
     let raw = h
         .runtime_profiles
         .get(&recipe.runtime_profile)
@@ -659,34 +709,8 @@ fn normalize(
     let host = core::normalize_host(h)?;
     let normalized_recipe = recipe.normalized();
     core::validate_recipe(&normalized_recipe, &host)?;
-    if recipe.request_deadline_ms > input.limits.max_run_duration_ms {
-        return Err(invalid(
-            "effective_recipe.request_deadline_ms",
-            "deadline exceeds manifest or host limit",
-        ));
-    }
-    validate_limits(&input.limits)?;
-    let total = validate_cases(&input.cases, recipe.residency, input.limits.max_requests)?;
-    let reviewed = Reviewed {
-        schema_version: 1,
-        kind: "candidate_recipe",
-        host: &input.host,
-        effective_recipe: recipe,
-        limits: &input.limits,
-        evaluator_suite: "recipe_v1",
-        cases: &input.cases,
-    };
-    let reviewed_json = canonical_json(
-        &serde_json::to_value(&reviewed)
-            .map_err(|_| invalid("candidate", "reviewed encoding failed"))?,
-    )?;
-    if reviewed_json.len() > MAX_ENCODED {
-        return Err(invalid("candidate", "reviewed encoding exceeds 1MiB"));
-    }
-    let mut digest = Sha256::new();
-    digest.update(DIGEST_DOMAIN);
-    digest.update(&reviewed_json);
-    let manifest_digest = hex::encode(digest.finalize());
+    let reviewed = reviewed(&input);
+    let (reviewed_json, manifest_digest) = encode_reviewed(&input)?;
     let recipe_fingerprint = core::qualification_fingerprint(&normalized_recipe, &profile, &host)?;
     let credential_refs = CandidateCredentialRefs {
         runtime: profile.security.credential_ref.clone(),
@@ -725,6 +749,101 @@ fn normalize(
     Ok(output)
 }
 
+fn reviewed(input: &CandidateInput) -> Reviewed<'_> {
+    Reviewed {
+        schema_version: 1,
+        kind: "candidate_recipe",
+        host: &input.host,
+        effective_recipe: &input.effective_recipe,
+        limits: &input.limits,
+        evaluator_suite: "recipe_v1",
+        cases: &input.cases,
+    }
+}
+
+fn encode_reviewed(input: &CandidateInput) -> Result<(Vec<u8>, String), ConfigError> {
+    let reviewed_json = canonical_json(
+        &serde_json::to_value(reviewed(input))
+            .map_err(|_| invalid("candidate", "reviewed encoding failed"))?,
+    )?;
+    if reviewed_json.len() > MAX_ENCODED {
+        return Err(invalid("candidate", "reviewed encoding exceeds 1MiB"));
+    }
+    let mut digest = Sha256::new();
+    digest.update(DIGEST_DOMAIN);
+    digest.update(&reviewed_json);
+    Ok((reviewed_json, hex::encode(digest.finalize())))
+}
+
+fn validate_candidate_intrinsic(input: &CandidateInput) -> Result<u32, ConfigError> {
+    if input.schema_version != 1
+        || input.kind != "candidate_recipe"
+        || input.evaluator_suite != "recipe_v1"
+    {
+        return Err(invalid(
+            "candidate",
+            "schema version 1, candidate kind, and recipe_v1 suite required",
+        ));
+    }
+    validate_selector(&input.host.id, "host.id")?;
+    validate_text(
+        &input.host.hardware_fingerprint,
+        "host.hardware_fingerprint",
+        4096,
+    )?;
+    validate_text(
+        &input.host.environment_fingerprint,
+        "host.environment_fingerprint",
+        4096,
+    )?;
+    let recipe = &input.effective_recipe;
+    validate_candidate_primitives(recipe)?;
+    validate_selector(&recipe.runtime_profile, "effective_recipe.runtime_profile")?;
+    validate_text(&recipe.recipe, "effective_recipe.recipe", 4096)?;
+    for (path, value) in [
+        ("effective_recipe.model.path", &recipe.model.path),
+        (
+            "effective_recipe.model.content_fingerprint",
+            &recipe.model.content_fingerprint,
+        ),
+        ("effective_recipe.model.revision", &recipe.model.revision),
+    ] {
+        validate_text(value, path, 4096)?;
+    }
+    if recipe.runtime_profile_revision == 0 || recipe.resolved_profile.revision == 0 {
+        return Err(invalid(
+            "effective_recipe.runtime_profile_revision",
+            "must be positive",
+        ));
+    }
+    if recipe.runtime_profile_revision != recipe.resolved_profile.revision {
+        return Err(invalid(
+            "effective_recipe.runtime_profile_revision",
+            "profile revision mismatch",
+        ));
+    }
+    let launch_engine = match recipe.resolved_profile.launch_settings {
+        CandidateLaunch::Vllm { .. } => Engine::Vllm,
+        CandidateLaunch::Sglang { .. } => Engine::Sglang,
+        CandidateLaunch::Fake => Engine::Fake,
+    };
+    if recipe.resolved_profile.engine != launch_engine {
+        return Err(invalid(
+            "effective_recipe.resolved_profile.launch_settings",
+            "engine mismatch",
+        ));
+    }
+    validate_limits(&input.limits)?;
+    if recipe.request_deadline_ms > input.limits.max_run_duration_ms {
+        return Err(invalid(
+            "effective_recipe.request_deadline_ms",
+            "deadline exceeds manifest limit",
+        ));
+    }
+    core::validate_recipe_intrinsic(&recipe.normalized())?;
+    validate_cases(&input.cases, recipe.residency, input.limits.max_requests)
+}
+
 fn validate_text(v: &str, path: &str, max: usize) -> Result<(), ConfigError> {
     if v.is_empty() || v.len() > max {
         Err(invalid(path, "invalid bounded text"))
@@ -760,18 +879,46 @@ fn validate_candidate_primitives(recipe: &CandidateRecipe) -> Result<(), ConfigE
         validate_selector(key, "effective_recipe.resolved_profile.env.key")?;
         validate_text(value, "effective_recipe.resolved_profile.env.value", 4096)?;
     }
+    if !Path::new(&p.executable).is_absolute() {
+        return Err(invalid(
+            "effective_recipe.resolved_profile.executable",
+            "must be absolute",
+        ));
+    }
+    nonnegative_bytes(
+        p.log_policy.max_file_bytes,
+        "effective_recipe.resolved_profile.log_policy.max_file_bytes",
+    )?;
     match &p.launch_settings {
-        CandidateLaunch::Vllm { kv_cache_dtype, .. } => {
+        CandidateLaunch::Vllm {
+            kv_cache_dtype,
+            cpu_offload_bytes,
+            requested_budget,
+            ..
+        } => {
             validate_text(
                 kv_cache_dtype,
                 "effective_recipe.resolved_profile.launch_settings.kv_cache_dtype",
                 4096,
+            )?;
+            nonnegative_bytes(
+                *cpu_offload_bytes,
+                "effective_recipe.resolved_profile.launch_settings.cpu_offload_bytes",
+            )?;
+            nonnegative_bytes(
+                requested_budget.kv_cache_bytes,
+                "effective_recipe.resolved_profile.launch_settings.requested_budget.kv_cache_bytes",
+            )?;
+            nonnegative_bytes(
+                requested_budget.swap_space_bytes,
+                "effective_recipe.resolved_profile.launch_settings.requested_budget.swap_space_bytes",
             )?;
         }
         CandidateLaunch::Sglang {
             recipe,
             model_dtype,
             weight_restore,
+            requested_budget,
             ..
         } => {
             for value in [recipe, model_dtype, weight_restore] {
@@ -781,6 +928,10 @@ fn validate_candidate_primitives(recipe: &CandidateRecipe) -> Result<(), ConfigE
                     4096,
                 )?;
             }
+            nonnegative_bytes(
+                requested_budget.kv_cache_bytes,
+                "effective_recipe.resolved_profile.launch_settings.requested_budget.kv_cache_bytes",
+            )?;
         }
         CandidateLaunch::Fake => {}
     }
@@ -803,12 +954,28 @@ fn validate_candidate_primitives(recipe: &CandidateRecipe) -> Result<(), ConfigE
                 &allocation.domain,
                 "effective_recipe.resources.allocations.domain",
             )?;
+            nonnegative_bytes(
+                allocation.bytes,
+                "effective_recipe.resources.allocations.bytes",
+            )?;
+            nonnegative_bytes(
+                allocation.host_kv_bytes,
+                "effective_recipe.resources.allocations.host_kv_bytes",
+            )?;
         }
         for device in &phase.devices {
             validate_selector(&device.id, "effective_recipe.resources.devices.id")?;
         }
     }
     Ok(())
+}
+
+fn nonnegative_bytes(value: i64, path: &str) -> Result<(), ConfigError> {
+    if value < 0 {
+        Err(invalid(path, "negative byte quantity"))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_limits(v: &CandidateLimits) -> Result<(), ConfigError> {

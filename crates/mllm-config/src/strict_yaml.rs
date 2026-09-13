@@ -235,6 +235,9 @@ fn scalar_value(scalar: &str, style: ScalarStyle) -> Value {
         if let Ok(i) = scalar.parse::<i64>() {
             return Value::Number(Number::from(i));
         }
+        if let Ok(i) = scalar.parse::<u64>() {
+            return Value::Number(Number::from(i));
+        }
         if let Ok(f) = scalar.parse::<f64>() {
             if f.is_finite() {
                 if let Some(n) = Number::from_f64(f) {
@@ -570,5 +573,27 @@ mod tests {
             build_value("items:\n  - id: one\n    id: two\n").unwrap_err().code,
             ConfigErrorCode::DuplicateKey
         );
+    }
+
+    #[test]
+    fn scalar_integer_domains_preserve_unsigned_values() {
+        assert_eq!(
+            scalar_value("9223372036854775808", ScalarStyle::Plain).as_u64(),
+            Some(9_223_372_036_854_775_808)
+        );
+        assert_eq!(
+            scalar_value("18446744073709551615", ScalarStyle::Plain).as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            scalar_value("18446744073709551616", ScalarStyle::Plain).as_u64(),
+            None
+        );
+        assert_eq!(scalar_value("-1", ScalarStyle::Plain).as_i64(), Some(-1));
+        assert_eq!(
+            scalar_value("42", ScalarStyle::DoubleQuoted),
+            Value::String("42".into())
+        );
+        assert!(scalar_value("1.5", ScalarStyle::Plain).as_f64().is_some());
     }
 }

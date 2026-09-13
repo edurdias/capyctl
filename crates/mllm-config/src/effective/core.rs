@@ -228,6 +228,42 @@ fn domain_phase(
 }
 
 pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result<(), ConfigError> {
+    validate_recipe_intrinsic(d)?;
+    let resources = &d.resources;
+    for claim in &d.devices {
+        let policy = host
+            .devices
+            .get(&claim.id)
+            .ok_or_else(|| invalid("devices", "unknown device"))?;
+        if host.device_sharing == Sharing::Exclusive && claim.sharing == Sharing::Shared
+            || policy.sharing == Sharing::Exclusive && claim.sharing == Sharing::Shared
+        {
+            return Err(invalid("devices", "sharing claim exceeds policy"));
+        }
+    }
+    for p in [
+        &resources.cold,
+        &resources.ready,
+        &resources.parking,
+        &resources.parked,
+        &resources.wake,
+    ] {
+        for a in &p.allocations {
+            if !host.domains.contains_key(&a.domain) {
+                return Err(invalid("resources.allocations.domain", "unknown domain"));
+            }
+        }
+    }
+    if d.request_deadline_ms > host.queue.request_deadline_ms {
+        return Err(invalid(
+            "request_deadline",
+            "deployment deadline may only shorten host limit",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), ConfigError> {
     for (path, value) in [
         ("model.path", &d.model.path),
         ("model.content_fingerprint", &d.model.content_fingerprint),
@@ -258,17 +294,6 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
     if selected.len() != d.devices.len() {
         return Err(invalid("devices", "device IDs must be unique"));
     }
-    for claim in &d.devices {
-        let policy = host
-            .devices
-            .get(&claim.id)
-            .ok_or_else(|| invalid("devices", "unknown device"))?;
-        if host.device_sharing == Sharing::Exclusive && claim.sharing == Sharing::Shared
-            || policy.sharing == Sharing::Exclusive && claim.sharing == Sharing::Shared
-        {
-            return Err(invalid("devices", "sharing claim exceeds policy"));
-        }
-    }
     for p in [
         &resources.cold,
         &resources.ready,
@@ -276,11 +301,6 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
         &resources.parked,
         &resources.wake,
     ] {
-        for a in &p.allocations {
-            if !host.domains.contains_key(&a.domain) {
-                return Err(invalid("resources.allocations.domain", "unknown domain"));
-            }
-        }
         for claim in &p.devices {
             if selected.get(claim.id.as_str()) != Some(&claim.sharing) {
                 return Err(invalid(
@@ -290,7 +310,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
             }
         }
     }
-    if d.request_deadline_ms <= 0 || d.request_deadline_ms > host.queue.request_deadline_ms {
+    if d.request_deadline_ms <= 0 {
         return Err(invalid(
             "request_deadline",
             "deployment deadline may only shorten host limit",

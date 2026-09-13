@@ -267,6 +267,55 @@ fn all_engines_share_literal_recipe_fingerprints() {
 }
 
 #[test]
+fn historical_snapshot_matches_normalization_without_rechecking_local_host() {
+    use mllm_config::effective::candidate::{
+        validate_candidate_reviewed_snapshot as snapshot,
+        validate_candidate_reviewed_snapshot_text as snapshot_text,
+    };
+    for engine in ["vllm", "sglang", "fake"] {
+        let (candidate, _, host) = engine_fixture(engine);
+        let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+        let frozen = snapshot(&candidate).unwrap();
+        assert_eq!(frozen.reviewed_json(), normalized.reviewed_json());
+        assert_eq!(frozen.manifest_digest(), normalized.manifest_digest());
+        assert_eq!(
+            frozen.total_case_request_budget(),
+            normalized.total_case_request_budget()
+        );
+        let read = || snapshot_text(std::str::from_utf8(frozen.reviewed_json()).unwrap()).unwrap();
+        let selector = candidate["effective_recipe"]["runtime_profile"].as_str().unwrap();
+
+        let mut edited = host.clone();
+        edited["runtime_profiles"][selector]["build_fingerprint"] = "edited-build".into();
+        assert!(normalize_candidate_manifest(&candidate, &edited).is_err());
+        assert_eq!(read().reviewed_json(), frozen.reviewed_json());
+
+        let mut removed = host.clone();
+        removed["runtime_profiles"].as_object_mut().unwrap().remove(selector);
+        assert!(normalize_candidate_manifest(&candidate, &removed).is_err());
+        assert_eq!(read().manifest_digest(), frozen.manifest_digest());
+
+        let mut tightened = host.clone();
+        assert!(tightened
+            .pointer("/resource_policy/queue/request_deadline")
+            .is_some());
+        tightened["resource_policy"]["queue"]["request_deadline"] = "3s".into();
+        assert!(normalize_candidate_manifest(&candidate, &tightened).is_err());
+        let mut fitting = candidate.clone();
+        fitting["effective_recipe"]["request_deadline_ms"] = 3000.into();
+        assert!(normalize_candidate_manifest(&fitting, &tightened).is_ok());
+        assert_eq!(read().reviewed_json(), frozen.reviewed_json());
+
+        let mut changed_manifest = candidate.clone();
+        changed_manifest["effective_recipe"]["resolved_profile"]["build_fingerprint"] =
+            "edited-build".into();
+        let changed = snapshot(&changed_manifest).unwrap();
+        assert_ne!(changed.manifest_digest(), frozen.manifest_digest());
+        assert!(normalize_candidate_manifest(&changed_manifest, &host).is_err());
+    }
+}
+
+#[test]
 fn qualification_reference_presence_is_wrapper_specific_on_all_profiles() {
     for engine in ["vllm", "sglang", "fake"] {
         for selected in [true, false] {
