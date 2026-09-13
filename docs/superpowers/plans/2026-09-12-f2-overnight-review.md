@@ -48,6 +48,13 @@ belong in the review findings and should be investigated before escalating here.
   Four task reviews and broader review approved. Fresh root checks:
   184 workspace tests excluding CLI plus 2 CLI library tests pass. Scoped Clippy
   clean. No production database or Spark runtime accessed.
+- F2A2b complete through `0f5a576`: bounded host-memory observer and completion
+  validator with full process/token/time/milestone checks. Task and broader reviews
+  complete; formatting fix re-reviewed. Full checks at `60fd33a`: 194 CPU tests
+  pass, scoped Clippy clean. Post-format memory tests and rustfmt check pass.
+- Coordinator staging analysis identifies A3 policy/run persistence as prerequisite
+  for arming effects; production cutover must join validated A3 composition.
+  Execution-order amendments still need final document review before A2d work.
 
 ## Execution decisions
 
@@ -68,3 +75,8 @@ belong in the review findings and should be investigated before escalating here.
 - Stage the private encoder with the grant writer, after decoder-only snapshot
   reads. Cost: round-trip test moves one task later; malformed-data coverage stays
   in the read task. Each intermediate task remains warning-free.
+- Stage dispatch session-check helper with first consumer. Cost: Task 2 owns code
+  previously shown in Task 1; final interface unchanged, intermediate warnings avoided.
+- Resolve completion negative-coverage finding in immediately following planned
+  boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
+  checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.

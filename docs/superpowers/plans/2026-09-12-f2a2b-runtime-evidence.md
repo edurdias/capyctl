@@ -8,6 +8,13 @@
 
 **Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3–6 and Q2/Q5/Q6/Q8/Q11. Dependencies: [F2A1](2026-09-12-f2a1-resource-contracts-and-admission.md) and [F2A2a](2026-09-12-f2a2a-durable-reservation-transactions.md).
 
+## Execution status
+
+Implemented through `0f5a576`. Task reviews, whole-branch review, and scoped fix
+review complete. Fresh full check at `60fd33a`: 194 CPU tests and scoped Clippy
+pass. Formatting-only fix then passes focused memory tests and direct rustfmt
+check. CLI integration targets excluded. No production cutover or live qualification.
+
 ## Global Constraints
 
 - “Only host-a is authorized for subsequent live work.” No live work occurs in this plan.
