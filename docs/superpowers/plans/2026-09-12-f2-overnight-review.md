@@ -91,6 +91,11 @@ the work being executed. The owner will review consequential questions in the mo
   previously shown in Task 1; final interface unchanged, intermediate warnings avoided.
 - Stage coordinator deployment fence and lifecycle error declarations with Task 2's
   first binding writer. Cost: declarations move earlier; Task 3 reuses exact contracts.
+- Stage V6 schema/read foundations before V7 events, then introduce policy/run writers
+  with atomic events. Cost: additional partial-task tracking, not an eventless bypass.
+- Stage durable gated-launch supervision beside legacy launcher compatibility.
+  Persist API identity before initialization; missing full worker proof stays uncertain.
+  Cost: temporary additive launcher API, removed as legacy authority at joint cutover.
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.

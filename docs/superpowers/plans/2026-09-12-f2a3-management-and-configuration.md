@@ -232,7 +232,10 @@ Follow [A2d cross-plan execution order](2026-09-12-f2a2d-coordinator-integration
 After A2d Tasks 1–3, implement configuration foundations, V6 policy/run persistence,
 and V7 event-writer foundations needed by atomic arm checks. Parent A3 tasks stay
 open until all acceptance tests and integration work pass. Emit events in the same
-transaction from each management writer's introduction. Complete remaining A3 work
+transaction from each management writer's introduction. Stage V6 schema/read
+foundations, then V7 schema and transaction-scoped event
+helpers, then V6 policy/run writers. No eventless management writer is introduced.
+Complete coordinator-dependent acceptance and snapshot work
 alongside A2d dependencies; perform production wiring once, jointly with A2d Task 10.
 No unvalidated constructor, temporary policy bypass, or second lifecycle authority.
 

@@ -312,6 +312,13 @@ impl ControllerLock {
   Compare identities immediately before signaling; do not signal a reused PID
   or infer whole-runtime exit from API-server exit. Where complete worker
   ownership cannot be established, return `Uncertain` and retain accounting.
+- [ ] Stage durable-launch supervision alongside legacy launcher compatibility.
+  Keep child gated before initialization until its actual API boot/start identity
+  is persisted under the existing incarnation and current session/deployment fence.
+  An API receipt is not full runtime proof; qualified worker enrollment requires
+  the trusted recipe collector. Missing collector support remains `Uncertain`.
+  Test gate association and ambiguous-spawn retention without retry. Concrete
+  engine collectors belong to adapter work. Retire legacy authority at joint cutover.
 - [ ] Add assertions for two same-engine deployments getting different bindings,
   endpoints, and credential references; parked lookup retains all three; wrong
   revision is rejected; attached binding refuses every lifecycle control.
