@@ -67,6 +67,14 @@ the work being executed. The owner will review consequential questions in the mo
   retained uncertain requests, explicit original-generation completion. Four task
   reviews and broader review approved. Fresh root checks: 203 CPU tests and scoped
   Clippy pass; closure race20/20. Production router remains on F1 until joint cutover.
+- F2A2d Tasks 1–2 complete through `ac62c1d`: V5 schema, lifetime lock, immutable
+  bindings, atomic endpoint leases, gated startup, durable process identity fences.
+  Review found unsafe implicit child cleanup, missing escalation identity recheck,
+  incomplete uncertainty/control guards, and EOF-as-acknowledgment behavior. One
+  fix wave and scoped re-review resolved all six blocking findings. Fresh root
+  checks: 217 non-CLI plus 2 CLI library tests pass; scoped Clippy clean.
+  Fixed-port fixture minor carries to Task 3. Full worker collectors remain future
+  adapter work; missing proof stays uncertain. No production cutover or live qualification.
 
 ## Execution decisions
 
