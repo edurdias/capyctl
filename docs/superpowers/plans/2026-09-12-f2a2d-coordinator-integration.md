@@ -362,7 +362,16 @@ claim_sequence(&self, session: &CoordinatorSession, operation_id: &str,
   members: &[DeploymentFence], plan_json: &str) -> Result<(), LifecycleError>
 fence_stop(&self, session: &CoordinatorSession, target: &DeploymentFence,
   deadline_ms: i64) -> Result<AcceptedRun, LifecycleError>
+fence_suspend(&self, session: &CoordinatorSession, target: &DeploymentFence,
+  deadline_ms: i64) -> Result<AcceptedRun, LifecycleError>
+handoff_claims(&self, session: &CoordinatorSession, successor_operation_id: &str,
+  predecessor_operation_id: &str, members: &[DeploymentFence])
+  -> Result<(), LifecycleError>
 ```
+
+Suspend records a Reconcile lifecycle action without cleanup authority. Handoff
+accepts an already accepted Stop/Reconcile successor and store-generated history;
+caller plan input never supplies evidence or creates stop permission.
 
 - [ ] Test that concurrent independent SQLite connections accepting activation
   for the same fence return one operation ID, with exactly one `joined == false`.
@@ -399,7 +408,12 @@ VALUES (?1,?2,?3,?4);
   operation while recording predecessor claim/step links in versioned durable history.
   Preserve old steps, grants, leases, bindings, and reservations; transfer is not release.
   Normal claim acquisition still cannot steal claims. Old callbacks fail their original
-  fences. The owned worker cannot send new cleanup controls until the preceding owned
+  fences. For same-session handoff, increment generation and close dispatch on each
+  transferred member still at its predecessor claim generation. Preserve other members'
+  desired/suspended state and all resources. Already-fenced stop targets do not bump
+  again. Record generation history and resulting fences; synchronize the successor's
+  target run fence without rewriting predecessor runs or evidence. The owned worker
+  cannot send new cleanup controls until the preceding owned
   command task has ended; restart first requires the lifetime controller lock.
   When observation cannot resolve an old effect, explicit Stop may proceed to cleanup
   only with verified full owned process identities and its original cleanup authority.

@@ -104,6 +104,9 @@ the work being executed. The owner will review consequential questions in the mo
 - Stage durable gated-launch supervision beside legacy launcher compatibility.
   Persist API identity before initialization; missing full worker proof stays uncertain.
   Cost: temporary additive launcher API, removed as legacy authority at joint cutover.
+- Handoff also fences other transferred members' generations and closes dispatch;
+  claim transfer alone cannot invalidate same-session callbacks. Cost: temporary
+  route unavailability until reconciliation, never permission to stop those models.
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.
