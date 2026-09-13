@@ -5,8 +5,16 @@ alongside the F0/F1 implementation. For current status, read
 [`design/milestones/f1-open-items.md`](design/milestones/f1-open-items.md) and
 [`runbooks/spark-model-size-qualification.md`](runbooks/spark-model-size-qualification.md).
 F2 SGLang is the next milestone; its [consolidated design](design/milestones/f2-sglang-design.md)
-is pending final owner review. It includes shared single-host foundations, concurrent
+is approved after document review. It includes shared single-host foundations, concurrent
 mixed-engine serving, mandatory warm parking, and API contracts for a future UI.
+The first implementation slice is the [F2A1 resource-contract and admission plan](superpowers/plans/2026-09-12-f2a1-resource-contracts-and-admission.md).
+The next slice is the [F2A2a durable reservation transaction plan](superpowers/plans/2026-09-12-f2a2a-durable-reservation-transactions.md).
+Runtime observation and completion checks are specified in the [F2A2b evidence plan](superpowers/plans/2026-09-12-f2a2b-runtime-evidence.md).
+Request ownership is specified in the [F2A2c dispatch plan](superpowers/plans/2026-09-12-f2a2c-durable-dispatch-ownership.md).
+The [F2A2d coordinator integration plan](superpowers/plans/2026-09-12-f2a2d-coordinator-integration.md) connects lifecycle, runtime ownership, and routing.
+The [F2 planning index](superpowers/plans/2026-09-12-f2-planning-index.md) tracks written slices and remaining integration work.
+All eight F2 plans are written; integrated document review fixes have landed.
+CPU-only implementation has started. Live mixed-engine qualification remains pending.
 The design-package revision is not a software release or a hardware qualification claim.
 
 Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning.

@@ -44,7 +44,12 @@ Commands, results, failed probes, timings, and machine-local evidence pointers
 for those four stages are recorded in `docs/runbooks/spark-qualification-f1.md` §4.
 Later model-size and concurrency evidence is in the separate runbook linked above.
 
-### 2. Park-based switching needs per-deployment ports (F4)
+### 2. Park-based switching needs per-deployment ports (rescheduled to F2)
+
+Owner-approved F2 scope brings port allocation forward for retained parked processes
+and concurrent mixed-engine serving. See [F2 design](f2-sglang-design.md). The F4
+references in the historical record below describe the earlier scheduling decision.
+
 The live A→B→A alternation uses stop-based release because a parked process
 holds the engine port. F4's per-deployment port allocation unlocks
 park-keep-alive switching (the real product mode). Noted in switch.rs comments.

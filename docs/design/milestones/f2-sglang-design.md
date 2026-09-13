@@ -1,7 +1,7 @@
 # F2 — Shared Single-Host Foundation and SGLang: Design
 
-**Status:** Design sections approved in conversation; consolidated document pending
-owner review. No implementation plan or F2 implementation is authorized by this file.
+**Status:** Approved by the owner after document review, September 12, 2026
+(America/New_York). Implementation planning may proceed; execution is a separate step.
 **Baseline:** `0efd718`, following the F1 mainline closeout.
 **Sources:** [product specification](../../SPEC.md),
 [F1 design](f1-vllm-path-design.md), [F1 carryovers](f1-open-items.md), and
@@ -73,8 +73,8 @@ These owner-approved F2 refinements tighten the earlier documents: SPEC §9.2's
 restart-only support is not sufficient for F2 closure; warm residency prohibits the
 generic idle-stop fallback unless explicitly relinquished; and F1's historical
 unknown-work drain allowance does not establish safe parking under this contract.
-After final document approval, synchronize these refinements into the product spec
-and mark historical carryovers as rescheduled, without rewriting old test evidence.
+These refinements are synchronized into the product spec. Historical carryovers are
+marked as rescheduled without rewriting old test evidence.
 
 An adapter-only fast follow was rejected because it would retain shared safety and
 management gaps. Reopening all of historical F1 was rejected in favor of completing
@@ -321,11 +321,11 @@ not qualify every model, engine version, or native engine feature.
 ## 9. Review and implementation boundary
 
 The owner approved the architecture, transition sequencing, retained-runtime guarantee,
-lifecycle/recovery behavior, management/observability, and future-UI API direction in
-conversation. The consolidated scope and acceptance matrix are presented here for
-final document review, not reported as implemented or live-qualified.
+lifecycle/recovery behavior, management/observability, future-UI API direction, and
+the consolidated document after review. Approval is not implementation or live evidence.
 
-After that review, write the implementation plan in the three stages from §1. It must
+Write implementation plans in the three stages from §1, splitting the shared foundation
+into bounded resource-contract, runtime-coordination, and management plans. They must
 map the gates to exact code and tests, select pinned runtime recipes and safe live
 guardrails, freeze public schemas, and preserve these lifecycle/resource invariants.
 No implementation starts merely because this design file exists.

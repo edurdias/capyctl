@@ -235,6 +235,14 @@ Use idempotency keys for retries and revision/generation preconditions for mutat
 
 The controller owns idle policy; agents must not independently race incoming dispatch with a local sleep timer. After a ready-idle timeout, attempt the selected automatic parking policy or stop under restart-only fallback. After a parked-idle timeout, stop the engine to reclaim its residual state. These idle transitions leave automatic activation enabled.
 
+F2 adds an explicit warm-residency commitment: retain initialized runtimes while
+parked, allowing weight rereads during wake. While that commitment is selected,
+neither idle expiry nor capacity reclamation may silently stop a retained runtime.
+An infeasible warm arrangement queues within its deadline or fails with a capacity
+diagnostic; stopping requires explicit policy that relinquishes warm residency or
+an authorized administrative/recovery action. Budget every cold, park, and wake
+transition, including already parked owners, before increasing resource use.
+
 Pre-initialize only an explicit selected set, sequentially under normal reservations: initialize, verify, park, then continue. Defer this work while it would displace active requests. A ready-idle timer does not reset a fairness window already opened for a waiting model.
 
 Enforce both the maximum parked count and aggregate residual budgets. Reclaim least-recently-used eligible parked groups first, coordinating any retained-cache owners separately. Keeping a deployment parked does not exempt it from host limits. An explicit pre-initialize command must fail rather than claim a restart-only deployment is prewarmed.
@@ -269,6 +277,12 @@ Track system/agent/router overhead and external workloads through the configured
 For each domain, require all retained owner reservations plus the candidate's activation reservation to fit the effective managed ceiling. Do not double count the candidate's own existing parked reservation when replacing it with an activation reservation; validate the transition's true peak. Other parked engines and shared services remain included.
 
 Use peak reservations conservatively. Sampled usage below the reservation does not authorize unsafe overcommit. Observed usage above a reservation triggers a blocked/degraded condition and recovery; it is not hidden by the ledger. Device exclusivity and aggregate budgets are separate constraints: disjoint GPU pools on one host still compete for host RAM and disk.
+
+F2 also supports explicitly shared GPU assignments: independently managed vLLM and
+SGLang deployments may serve concurrently on the same device when all assignments
+permit sharing and their transition/serving budgets fit. Exclusive assignments still
+conflict with any other owner's overlapping assignment. Capacity checks alone do not
+override exclusivity, and shared execution does not promise performance isolation.
 
 ### 7.4 Cache example and shared services
 
@@ -345,6 +359,15 @@ The vLLM adapter wraps this in mllm admission and resource checks. Waking alloca
 SGLang documents memory-saver startup support, release/resume APIs, no ongoing requests before release, and disk-based weight updates. Releasing KV invalidates live cache contents [S3]. Qualify its actual release, retained-copy, and restoration behavior rather than assigning vLLM level numbers to it.
 
 Use the same controller, launcher, resource contracts, queues, and conformance tests. SGLang is not postponed behind a dashboard, plugin marketplace, or a general cluster scheduler. Restart-only support is valid when deep parking is not qualified.
+
+Restart-only is not sufficient to close F2: the owner requires qualified parking and
+restoration for a selected recipe of each engine, sequential preinitialization,
+concurrent serving when capacity permits, and repeated pressure-driven warm switching.
+Per-deployment ports, credentials, resource accounting, and management API/CLI wiring
+are F2 prerequisites. Unknown work is not proof of safe quiescence for parking; an
+uncertain drain must reconcile or fail within its bound. The approved
+[F2 design](design/milestones/f2-sglang-design.md) defines these requirements and the
+snapshot/event contracts for a future UI; UI implementation remains later work.
 
 ### 9.3 Later backends
 
@@ -774,7 +797,7 @@ These are implementation slices, not dates or time estimates. Each slice must le
 |---|---|---|
 | F0 — Contracts and foundation | Action-first CLI skeleton; strict config/default behavior; durable objects; resource ledger; abstract host/adapter/launcher contracts; fake engines and transport. | State, allocation, idempotency, and bootstrap/default tests pass without GPUs. |
 | F1 — First vLLM path | Standalone/local managed launch and attachment; streaming router; durable deployment submission; restart-only switching; explicitly gated deep parking. | Two profiles alternate safely; experimental park/reload validated where allowed; failures reconcile. |
-| F2 — SGLang fast follow | Second adapter through the same contracts, with restart baseline and qualified parking/cache behavior. | vLLM -> SGLang -> vLLM passes the shared conformance suite. No parallel controller implementation. |
+| F2 — Shared single-host foundation and SGLang | Close relevant vLLM/shared gaps; add SGLang, mandatory qualified parking, retained-runtime preinitialization, fit-based coexistence, and API/CLI contracts usable by a future UI. | Concurrent vLLM/SGLang serving and pressure-driven vLLM -> SGLang -> vLLM warm switching pass shared contracts and selected-recipe live qualification. No parallel controller implementation or silent cold-stop fallback. |
 | F3 — Remote host operation | Real invitation enrollment, persisted identity, outbound control stream, private ingress, multi-host ownership and recovery. | CLI-to-server deployment on remote hosts; reconnect, revocation, stale-command and orphan tests. Transport scaffolding may be exercised earlier in F0. |
 | F4 — Distributed and cache qualification | Named two-Spark group recipes; per-host release evidence; private and shared-cache combinations as supported. | A -> B -> A under worker failure, retained caches, and aggregate pressure; quota and persistence tests. |
 | F5 — Broader packaging/backends | Supported service/container launchers, platform packages, compatible restart-only backends, selected API expansion. | Each advertised backend/platform has explicit supported tests and dependency documentation. |
@@ -850,7 +873,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
 
-The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a qualified experimental deep-park path where permitted, and repeated recovery tests. The second proof is mixed-engine switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
+The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a qualified experimental deep-park path where permitted, and repeated recovery tests. The second proof adds mixed-engine concurrent serving when capacity permits, sequential preinitialization, and pressure-driven warm switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
 
 ## 21. Revision history and source boundary
 
