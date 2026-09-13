@@ -11,6 +11,231 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
     (all["deployment"].clone(), all["host"].clone())
 }
 
+fn qualification_policy() -> serde_json::Value {
+    serde_json::json!({
+        "revision": 1,
+        "allow_qualification_runs": true,
+        "allow_experimental_controls": false,
+        "allowed_manifest_digests": [
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "max_run_duration": "24h",
+        "max_cleanup_duration": "1h",
+        "max_cases": 128,
+        "max_requests": 4096,
+        "max_request_body_bytes": "1MiB",
+        "max_input_tokens_per_request": 131072,
+        "max_output_tokens_per_request": 16384
+    })
+}
+
+#[test]
+fn qualification_policy_is_optional_and_normalized_without_authorizing_runs() {
+    let (deployment, host) = fixture();
+    let absent = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(absent.host.qualification_policy, None);
+
+    let mut host = host;
+    host["qualification_policy"] = qualification_policy();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let policy = effective.host.qualification_policy.unwrap();
+    assert_eq!(policy.revision, 1);
+    assert!(policy.allow_qualification_runs);
+    assert!(!policy.allow_experimental_controls);
+    assert_eq!(policy.max_run_duration_ms, 86_400_000);
+    assert_eq!(policy.max_cleanup_duration_ms, 3_600_000);
+    assert_eq!(policy.max_request_body_bytes, 1 << 20);
+    assert!(policy
+        .allowed_manifest_digests
+        .windows(2)
+        .all(|w| w[0] < w[1]));
+}
+
+#[test]
+fn qualification_permissions_are_independent_and_empty_allowlist_is_deny_all() {
+    for permissions in [(false, false), (false, true), (true, false), (true, true)] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy["allow_qualification_runs"] = permissions.0.into();
+        policy["allow_experimental_controls"] = permissions.1.into();
+        policy["allowed_manifest_digests"] = serde_json::json!([]);
+        host["qualification_policy"] = policy;
+        let normalized = resolve_effective(&deployment, &host)
+            .unwrap()
+            .host
+            .qualification_policy
+            .unwrap();
+        assert_eq!(normalized.allow_qualification_runs, permissions.0);
+        assert_eq!(normalized.allow_experimental_controls, permissions.1);
+        assert!(normalized.allowed_manifest_digests.is_empty());
+    }
+}
+
+#[test]
+fn qualification_policy_bounds_and_digest_rules_fail_closed() {
+    let digest = "0".repeat(64);
+    for (field, value) in [
+        ("revision", serde_json::json!(0)),
+        ("max_run_duration", serde_json::json!("86400001ms")),
+        ("max_cleanup_duration", serde_json::json!("3600001ms")),
+        ("max_cases", serde_json::json!(129)),
+        ("max_requests", serde_json::json!(4097)),
+        ("max_request_body_bytes", serde_json::json!("1048577B")),
+        ("max_input_tokens_per_request", serde_json::json!(131073)),
+        ("max_output_tokens_per_request", serde_json::json!(16385)),
+    ] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy[field] = value;
+        host["qualification_policy"] = policy;
+        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
+    }
+    for bad in [
+        "A".repeat(64),
+        "0".repeat(63),
+        format!("{}g", "0".repeat(63)),
+    ] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy["allowed_manifest_digests"] = serde_json::json!([bad]);
+        host["qualification_policy"] = policy;
+        assert!(resolve_effective(&deployment, &host).is_err());
+    }
+    for digests in [vec![digest.clone(), digest], vec!["0".repeat(64); 1025]] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy["allowed_manifest_digests"] = serde_json::json!(digests);
+        host["qualification_policy"] = policy;
+        assert!(resolve_effective(&deployment, &host).is_err());
+    }
+}
+
+#[test]
+fn qualification_policy_requires_complete_typed_bounded_input() {
+    for field in [
+        "revision",
+        "allow_qualification_runs",
+        "allow_experimental_controls",
+        "allowed_manifest_digests",
+        "max_run_duration",
+        "max_cleanup_duration",
+        "max_cases",
+        "max_requests",
+        "max_request_body_bytes",
+        "max_input_tokens_per_request",
+        "max_output_tokens_per_request",
+    ] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy.as_object_mut().unwrap().remove(field);
+        host["qualification_policy"] = policy;
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(
+            error.code,
+            ConfigErrorCode::MissingRequired,
+            "{field}: {error:?}"
+        );
+        assert!(error.path.ends_with(field), "{field}: {error:?}");
+    }
+    for (field, value) in [
+        ("revision", serde_json::json!("secret-value")),
+        ("max_cases", serde_json::json!(-1)),
+        ("max_requests", serde_json::json!(18446744073709551615u64)),
+    ] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy[field] = value;
+        host["qualification_policy"] = policy;
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(error.path.contains("qualification_policy"), "{error:?}");
+        assert!(!error.to_string().contains("secret-value"));
+    }
+    let (deployment, mut host) = fixture();
+    let mut policy = qualification_policy();
+    policy["unknown"] = serde_json::json!("secret-value");
+    host["qualification_policy"] = policy;
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert_eq!(error.code, ConfigErrorCode::UnknownField);
+    assert!(
+        error.path.ends_with("qualification_policy.unknown"),
+        "{error:?}"
+    );
+    assert!(!error.to_string().contains("secret-value"));
+}
+
+#[test]
+fn qualification_policy_rejects_zero_overflow_and_oversized_encoding() {
+    for field in [
+        "revision",
+        "max_cases",
+        "max_requests",
+        "max_input_tokens_per_request",
+        "max_output_tokens_per_request",
+    ] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy[field] = 0.into();
+        host["qualification_policy"] = policy;
+        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
+    }
+    for (field, value) in [
+        ("max_run_duration", "9223372036854775808ms"),
+        ("max_cleanup_duration", "9223372036854775808ms"),
+        ("max_request_body_bytes", "9223372036854775808B"),
+    ] {
+        let (deployment, mut host) = fixture();
+        let mut policy = qualification_policy();
+        policy[field] = value.into();
+        host["qualification_policy"] = policy;
+        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
+    }
+    let (deployment, mut host) = fixture();
+    let mut policy = qualification_policy();
+    policy["max_run_duration"] = format!("{}ms", "1".repeat(1 << 20)).into();
+    host["qualification_policy"] = policy;
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert!(error.to_string().contains("encoding exceeds 1MiB"));
+}
+
+#[test]
+fn qualification_policy_is_not_part_of_recipe_qualification_identity() {
+    let (deployment, host) = fixture();
+    let original = resolve_effective(&deployment, &host).unwrap();
+    let mut changed = host;
+    changed["qualification_policy"] = qualification_policy();
+    let changed = resolve_effective(&deployment, &changed).unwrap();
+    assert_eq!(
+        original.qualification_fingerprint,
+        changed.qualification_fingerprint
+    );
+    assert_ne!(
+        original.host.qualification_policy,
+        changed.host.qualification_policy
+    );
+}
+
+#[test]
+fn strict_yaml_accepts_only_complete_qualification_policy_shape() {
+    let yaml = "schema_version: 1\nkind: host\nname: h\nqualification_policy:\n  revision: 1\n  allow_qualification_runs: false\n  allow_experimental_controls: true\n  allowed_manifest_digests: []\n  max_run_duration: 24h\n  max_cleanup_duration: 60m\n  max_cases: 128\n  max_requests: 4096\n  max_request_body_bytes: 1024KiB\n  max_input_tokens_per_request: 131072\n  max_output_tokens_per_request: 16384\n";
+    assert!(parse_strict(ConfigKind::Host, yaml).is_ok());
+    assert_eq!(
+        parse_strict(ConfigKind::Host, &yaml.replace("  max_cases: 128\n", ""))
+            .unwrap_err()
+            .code,
+        ConfigErrorCode::MissingRequired
+    );
+    assert_eq!(
+        parse_strict(
+            ConfigKind::Host,
+            &yaml.replace("  max_cases: 128", "  surprise: 128")
+        )
+        .unwrap_err()
+        .code,
+        ConfigErrorCode::UnknownField
+    );
+}
+
 #[test]
 fn byte_parser_rejects_time_and_overflow() {
     assert_eq!(parse_bytes("1.5KiB").unwrap(), 1536);

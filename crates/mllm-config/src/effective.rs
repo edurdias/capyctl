@@ -228,6 +228,22 @@ pub struct HostPolicy {
     pub endpoint_port_range: PortRange,
     pub planner_max_states: u32,
     pub queue: QueuePolicy,
+    pub qualification_policy: Option<QualificationPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QualificationPolicy {
+    pub revision: i64,
+    pub allow_qualification_runs: bool,
+    pub allow_experimental_controls: bool,
+    pub allowed_manifest_digests: Vec<String>,
+    pub max_run_duration_ms: i64,
+    pub max_cleanup_duration_ms: i64,
+    pub max_cases: u32,
+    pub max_requests: u32,
+    pub max_request_body_bytes: i64,
+    pub max_input_tokens_per_request: u32,
+    pub max_output_tokens_per_request: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -307,6 +323,23 @@ struct HostInput {
     environment_fingerprint: String,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
+    qualification_policy: Option<RawQualificationPolicy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQualificationPolicy {
+    revision: i64,
+    allow_qualification_runs: bool,
+    allow_experimental_controls: bool,
+    allowed_manifest_digests: Vec<String>,
+    max_run_duration: String,
+    max_cleanup_duration: String,
+    max_cases: u32,
+    max_requests: u32,
+    max_request_body_bytes: String,
+    max_input_tokens_per_request: u32,
+    max_output_tokens_per_request: u32,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -394,8 +427,11 @@ fn decode<T: for<'de> Deserialize<'de>>(
     value: &serde_json::Value,
     path: &str,
 ) -> Result<T, ConfigError> {
-    serde_json::from_value(value.clone()).map_err(|e| {
-        let detail = e.to_string();
+    let encoded =
+        serde_json::to_vec(value).map_err(|_| invalid(path, "typed input could not be encoded"))?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&encoded);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|e| {
+        let detail = e.inner().to_string();
         let code = if detail.starts_with("missing field") {
             ConfigErrorCode::MissingRequired
         } else if detail.starts_with("unknown field") {
@@ -408,8 +444,103 @@ fn decode<T: for<'de> Deserialize<'de>>(
             ConfigErrorCode::UnknownField => "unknown typed field",
             _ => "wrong type or invalid typed value",
         };
-        ConfigError::new(code, path, safe_detail)
+        let mut nested = e.path().to_string();
+        if matches!(
+            code,
+            ConfigErrorCode::MissingRequired | ConfigErrorCode::UnknownField
+        ) {
+            if let Some(field) = detail.split('`').nth(1).filter(|field| {
+                !field.is_empty()
+                    && field
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            }) {
+                if !nested.ends_with(field) {
+                    if !nested.is_empty() {
+                        nested.push('.');
+                    }
+                    nested.push_str(field);
+                }
+            }
+        }
+        let error_path = if nested.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{path}.{nested}")
+        };
+        ConfigError::new(code, error_path, safe_detail)
     })
+}
+
+fn normalize_qualification_policy(
+    raw: Option<RawQualificationPolicy>,
+) -> Result<Option<QualificationPolicy>, ConfigError> {
+    let Some(mut raw) = raw else {
+        return Ok(None);
+    };
+    if raw.revision <= 0
+        || raw.allowed_manifest_digests.len() > 1_024
+        || raw.max_cases == 0
+        || raw.max_cases > 128
+        || raw.max_requests == 0
+        || raw.max_requests > 4_096
+        || raw.max_input_tokens_per_request == 0
+        || raw.max_input_tokens_per_request > 131_072
+        || raw.max_output_tokens_per_request == 0
+        || raw.max_output_tokens_per_request > 16_384
+    {
+        return Err(invalid(
+            "host.qualification_policy",
+            "qualification policy exceeds bounded positive limits",
+        ));
+    }
+    if raw.allowed_manifest_digests.iter().any(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(invalid(
+            "host.qualification_policy.allowed_manifest_digests",
+            "manifest digest must be canonical lowercase SHA-256 hex",
+        ));
+    }
+    raw.allowed_manifest_digests.sort();
+    if raw
+        .allowed_manifest_digests
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
+        return Err(invalid(
+            "host.qualification_policy.allowed_manifest_digests",
+            "manifest digests must be distinct",
+        ));
+    }
+    let max_run_duration_ms = parse_duration_ms(&raw.max_run_duration)?;
+    let max_cleanup_duration_ms = parse_duration_ms(&raw.max_cleanup_duration)?;
+    let max_request_body_bytes = parse_bytes(&raw.max_request_body_bytes)?;
+    if !(1..=86_400_000).contains(&max_run_duration_ms)
+        || !(1..=3_600_000).contains(&max_cleanup_duration_ms)
+        || !(1..=(1 << 20)).contains(&max_request_body_bytes)
+    {
+        return Err(invalid(
+            "host.qualification_policy",
+            "qualification policy quantity exceeds bounded positive limits",
+        ));
+    }
+    Ok(Some(QualificationPolicy {
+        revision: raw.revision,
+        allow_qualification_runs: raw.allow_qualification_runs,
+        allow_experimental_controls: raw.allow_experimental_controls,
+        allowed_manifest_digests: raw.allowed_manifest_digests,
+        max_run_duration_ms,
+        max_cleanup_duration_ms,
+        max_cases: raw.max_cases,
+        max_requests: raw.max_requests,
+        max_request_body_bytes,
+        max_input_tokens_per_request: raw.max_input_tokens_per_request,
+        max_output_tokens_per_request: raw.max_output_tokens_per_request,
+    }))
 }
 
 fn normalize_launch(
@@ -583,6 +714,15 @@ pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
 ) -> Result<EffectiveDeployment, ConfigError> {
+    if host
+        .get("qualification_policy")
+        .is_some_and(|policy| serde_json::to_vec(policy).is_ok_and(|bytes| bytes.len() > 1 << 20))
+    {
+        return Err(invalid(
+            "host.qualification_policy",
+            "qualification policy encoding exceeds 1MiB",
+        ));
+    }
     let d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode(host, "host")?;
     if d.schema_version != 1 || h.schema_version != 1 || d.kind != "deployment" || h.kind != "host"
@@ -879,6 +1019,7 @@ pub fn resolve_effective(
             retained_files: raw_profile.log_policy.retained_files,
         },
     };
+    let qualification_policy = normalize_qualification_policy(h.qualification_policy)?;
     let host = HostPolicy {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
@@ -891,6 +1032,7 @@ pub fn resolve_effective(
         endpoint_port_range: h.resource_policy.endpoint_port_range,
         planner_max_states,
         queue,
+        qualification_policy,
     };
     #[derive(Serialize)]
     struct Qualification<'a> {

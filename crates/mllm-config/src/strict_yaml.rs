@@ -379,6 +379,22 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
             })?;
             check_object(obj, fields, path)
         }
+        FieldSpec::RequiredStruct(fields) => {
+            let obj = value.as_object().ok_or_else(|| {
+                ConfigError::new(ConfigErrorCode::SchemaVersion, path, "expected a mapping")
+            })?;
+            check_object(obj, fields, path)?;
+            for (name, _) in *fields {
+                if !obj.contains_key(*name) {
+                    return Err(ConfigError::new(
+                        ConfigErrorCode::MissingRequired,
+                        join(path, name),
+                        "required nested field is missing",
+                    ));
+                }
+            }
+            Ok(())
+        }
         FieldSpec::ScalarOrStruct(fields) => {
             if let Some(obj) = value.as_object() {
                 check_object(obj, fields, path)
