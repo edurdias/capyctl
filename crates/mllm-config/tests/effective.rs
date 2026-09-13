@@ -75,6 +75,22 @@ fn qualification_permissions_are_independent_and_empty_allowlist_is_deny_all() {
 #[test]
 fn qualification_policy_bounds_and_digest_rules_fail_closed() {
     let digest = "0".repeat(64);
+    let (deployment, mut host) = fixture();
+    let mut exact_digest_limit = qualification_policy();
+    exact_digest_limit["allowed_manifest_digests"] = serde_json::json!((0..1024)
+        .map(|value| format!("{value:064x}"))
+        .collect::<Vec<_>>());
+    host["qualification_policy"] = exact_digest_limit;
+    assert_eq!(
+        resolve_effective(&deployment, &host)
+            .unwrap()
+            .host
+            .qualification_policy
+            .unwrap()
+            .allowed_manifest_digests
+            .len(),
+        1024
+    );
     for (field, value) in [
         ("revision", serde_json::json!(0)),
         ("max_run_duration", serde_json::json!("86400001ms")),
@@ -148,7 +164,7 @@ fn qualification_policy_requires_complete_typed_bounded_input() {
         policy[field] = value;
         host["qualification_policy"] = policy;
         let error = resolve_effective(&deployment, &host).unwrap_err();
-        assert!(error.path.contains("qualification_policy"), "{error:?}");
+        assert!(error.path.ends_with(field), "{error:?}");
         assert!(!error.to_string().contains("secret-value"));
     }
     let (deployment, mut host) = fixture();
@@ -180,6 +196,9 @@ fn qualification_policy_rejects_zero_overflow_and_oversized_encoding() {
         assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
     }
     for (field, value) in [
+        ("max_run_duration", "0ms"),
+        ("max_cleanup_duration", "0ms"),
+        ("max_request_body_bytes", "0B"),
         ("max_run_duration", "9223372036854775808ms"),
         ("max_cleanup_duration", "9223372036854775808ms"),
         ("max_request_body_bytes", "9223372036854775808B"),
