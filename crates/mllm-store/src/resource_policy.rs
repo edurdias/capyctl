@@ -381,6 +381,21 @@ fn read_policy(
     row.map(|(revision, json)| decode_policy(host, revision, &json))
         .transpose()
 }
+
+pub(crate) fn read_singleton_policy(
+    tx: &Transaction<'_>,
+    host: &str,
+) -> Result<Option<ResourcePolicySnapshot>, ResourcePolicyError> {
+    let stored_hosts: Vec<String> = tx
+        .prepare("SELECT host_id FROM host_resource_policies ORDER BY host_id LIMIT 2")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if stored_hosts.len() > 1 { return Err(ResourcePolicyError::CorruptStoredPolicy); }
+    if stored_hosts.first().is_some_and(|stored| stored != host) {
+        return Err(ResourcePolicyError::RevisionConflict);
+    }
+    read_policy(tx, host)
+}
 fn next_epoch(tx: &Transaction<'_>) -> Result<u64, ResourcePolicyError> {
     let epoch: i64 = tx.query_row(
         "SELECT epoch FROM resource_ledger_meta WHERE singleton=1",
@@ -488,20 +503,7 @@ impl crate::Store {
             .map_err(|_| ResourcePolicyError::Invalid)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(map_session)?;
-        let stored_hosts: Vec<String> = tx
-            .prepare("SELECT host_id FROM host_resource_policies ORDER BY host_id LIMIT 2")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        if stored_hosts.len() > 1 {
-            return Err(ResourcePolicyError::CorruptStoredPolicy);
-        }
-        if stored_hosts
-            .first()
-            .is_some_and(|stored| stored != &context.host_id)
-        {
-            return Err(ResourcePolicyError::RevisionConflict);
-        }
-        if let Some(current) = read_policy(&tx, &context.host_id)? {
+        if let Some(current) = read_singleton_policy(&tx, &context.host_id)? {
             if current.context != context {
                 return Err(ResourcePolicyError::RevisionConflict);
             }

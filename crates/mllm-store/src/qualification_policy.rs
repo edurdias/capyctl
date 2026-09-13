@@ -157,6 +157,39 @@ fn serialize(stored: &StoredPolicy) -> Result<String, QualificationImportError> 
     Ok(json)
 }
 
+pub(crate) struct CandidatePolicy {
+    pub(crate) revision: i64,
+    pub(crate) hardware_fingerprint: String,
+    pub(crate) environment_fingerprint: String,
+    pub(crate) policy: QualificationPolicy,
+}
+
+pub(crate) fn read_candidate_policy(
+    tx: &Transaction<'_>,
+    host_id: &str,
+) -> Result<Option<CandidatePolicy>, QualificationImportError> {
+    let Some(stored) = read_current(tx, host_id)? else { return Ok(None) };
+    let StoredState::Configured { hardware_fingerprint, environment_fingerprint, policy } = stored.state else { return Ok(None) };
+    Ok(Some(CandidatePolicy {
+        revision: stored.revision,
+        hardware_fingerprint,
+        environment_fingerprint,
+        policy: QualificationPolicy {
+            revision: stored.revision,
+            allow_qualification_runs: policy.allow_qualification_runs,
+            allow_experimental_controls: policy.allow_experimental_controls,
+            allowed_manifest_digests: policy.allowed_manifest_digests,
+            max_run_duration_ms: policy.max_run_duration_ms,
+            max_cleanup_duration_ms: policy.max_cleanup_duration_ms,
+            max_cases: policy.max_cases,
+            max_requests: policy.max_requests,
+            max_request_body_bytes: policy.max_request_body_bytes,
+            max_input_tokens_per_request: policy.max_input_tokens_per_request,
+            max_output_tokens_per_request: policy.max_output_tokens_per_request,
+        },
+    }))
+}
+
 fn map_session(error: DispatchError) -> QualificationImportError {
     match error {
         DispatchError::StaleSession => QualificationImportError::StaleSession,

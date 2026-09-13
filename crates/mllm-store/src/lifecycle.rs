@@ -217,6 +217,108 @@ struct BindingDto {
     payload: String,
 }
 
+pub(crate) enum DecodedBinding {
+    V1,
+    Candidate(crate::candidate_creation::CandidateBindingV2),
+}
+
+pub(crate) fn decode_binding(json: &str) -> Result<DecodedBinding, LifecycleError> {
+    if json.len() > MAX_DTO_BYTES { return Err(LifecycleError::Invalid); }
+    // Untagged decoding tries strict DTOs independently, preserving duplicate rejection.
+    if let Ok(binding) = serde_json::from_str::<BindingDto>(json) {
+        if binding.version == 1 { return Ok(DecodedBinding::V1); }
+    }
+    let candidate: crate::candidate_creation::CandidateBindingV2 =
+        serde_json::from_str(json).map_err(|_| LifecycleError::Invalid)?;
+    if candidate.version != 2 { return Err(LifecycleError::Invalid); }
+    Ok(DecodedBinding::Candidate(candidate))
+}
+
+pub(crate) struct PreparedBinding {
+    _listener: TcpListener,
+    id: String,
+    fence: DeploymentFence,
+    incarnation: String,
+    ownership: String,
+    host: String,
+    port: u16,
+    json: String,
+}
+
+impl PreparedBinding {
+    fn prepare_v1(request: &ReserveBinding) -> Result<Self, LifecycleError> {
+        if !valid_text(&request.id)
+            || !valid_text(&request.fence.deployment_id)
+            || request.fence.revision < 1 || request.fence.generation < 1
+            || !valid_text(&request.incarnation) || !valid_text(&request.qualification_id)
+            || !matches!(request.ownership.as_str(), "managed" | "attached")
+            || request.endpoint_host != "127.0.0.1" || request.endpoint_port == 0
+            || !valid_text(&request.credential_ref) || !valid_text(&request.binding_payload)
+        { return Err(LifecycleError::Invalid); }
+        let listener = TcpListener::bind((&*request.endpoint_host, request.endpoint_port))
+            .map_err(|_| LifecycleError::Conflict)?;
+        let json = serde_json::to_string(&BindingDto {
+            version: 1, qualification_id: request.qualification_id.clone(),
+            endpoint: format!("{}:{}", request.endpoint_host, request.endpoint_port),
+            credential_ref: request.credential_ref.clone(), payload: request.binding_payload.clone(),
+        }).map_err(|_| LifecycleError::Invalid)?;
+        if json.len() > MAX_DTO_BYTES { return Err(LifecycleError::Invalid); }
+        Ok(Self { _listener: listener, id: request.id.clone(), fence: request.fence.clone(),
+            incarnation: request.incarnation.clone(), ownership: request.ownership.clone(),
+            host: request.endpoint_host.clone(), port: request.endpoint_port, json })
+    }
+
+    pub(crate) fn prepare_candidate(
+        tx: &Transaction<'_>,
+        descriptor: &crate::candidate_creation::DescriptorV1,
+        run_id: &str,
+        id: &str,
+        incarnation: &str,
+        range: &mllm_config::effective::PortRange,
+    ) -> Result<Self, crate::candidate_creation::CandidateCreationError> {
+        use crate::candidate_creation::{CandidateBindingV2, CandidateCreationError};
+        for port in range.start..=range.end {
+            let leased: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM endpoint_leases WHERE host='127.0.0.1' AND port=?1)", [port], |r| r.get(0))?;
+            if leased { continue; }
+            let listener = match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => listener,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(_) => return Err(CandidateCreationError::EndpointUnavailable),
+            };
+            let json = serde_json::to_string(&CandidateBindingV2 {
+                version: 2, qualification_id: format!("candidate:{run_id}"),
+                endpoint: format!("127.0.0.1:{port}"), descriptor: descriptor.reference(),
+                auth: descriptor.credential_refs.clone(),
+            }).map_err(|_| CandidateCreationError::InvalidCommand)?;
+            if json.len() > MAX_DTO_BYTES { return Err(CandidateCreationError::InvalidCommand); }
+            return Ok(Self { _listener: listener, id: id.into(),
+                fence: DeploymentFence { deployment_id: descriptor.deployment_id.clone(), revision: descriptor.revision, generation: descriptor.generation },
+                incarnation: incarnation.into(), ownership: "managed".into(), host: "127.0.0.1".into(), port, json });
+        }
+        Err(CandidateCreationError::EndpointUnavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn port(&self) -> u16 { self.port }
+}
+
+pub(crate) fn insert_prepared_binding(
+    tx: &Transaction<'_>, session: &CoordinatorSession, prepared: &PreparedBinding,
+) -> Result<(), LifecycleError> {
+    crate::dispatch::check_session(tx, session).map_err(|error| match error {
+        crate::dispatch::DispatchError::Sql(error) => LifecycleError::Sql(error),
+        _ => LifecycleError::Stale,
+    })?;
+    let current: Option<(i64, i64)> = tx.query_row(
+        "SELECT revision,current_generation FROM deployments WHERE id=?1", [&prepared.fence.deployment_id],
+        |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if current != Some((prepared.fence.revision, prepared.fence.generation)) { return Err(LifecycleError::Stale); }
+    tx.execute("INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES(?1,?2,?3,?4,?5,?6,'[]','reserved')",
+        params![prepared.id, prepared.fence.deployment_id, prepared.fence.revision, prepared.incarnation, prepared.ownership, prepared.json])?;
+    tx.execute("INSERT INTO endpoint_leases(host,port,binding_id) VALUES(?1,?2,?3)", params![prepared.host,prepared.port,prepared.id])?;
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityDto {
@@ -550,56 +652,14 @@ impl crate::Store {
         session: &CoordinatorSession,
         request: &ReserveBinding,
     ) -> Result<(), LifecycleError> {
-        if !valid_text(&request.id)
-            || !valid_text(&request.fence.deployment_id)
-            || request.fence.revision < 1
-            || request.fence.generation < 1
-            || !valid_text(&request.incarnation)
-            || !valid_text(&request.qualification_id)
-            || !matches!(request.ownership.as_str(), "managed" | "attached")
-            || request.endpoint_host != "127.0.0.1"
-            || request.endpoint_port == 0
-            || !valid_text(&request.credential_ref)
-            || !valid_text(&request.binding_payload)
-        {
-            return Err(LifecycleError::Invalid);
-        }
-        let endpoint = format!("{}:{}", request.endpoint_host, request.endpoint_port);
-        let listener = TcpListener::bind((&*request.endpoint_host, request.endpoint_port))
-            .map_err(|_| LifecycleError::Conflict)?;
-        let dto = serde_json::to_string(&BindingDto {
-            version: 1,
-            qualification_id: request.qualification_id.clone(),
-            endpoint,
-            credential_ref: request.credential_ref.clone(),
-            payload: request.binding_payload.clone(),
-        })
-        .map_err(|_| LifecycleError::Invalid)?;
-        if dto.len() > MAX_DTO_BYTES {
-            return Err(LifecycleError::Invalid);
-        }
+        let prepared = PreparedBinding::prepare_v1(request)?;
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        fenced(&transaction, session, &request.fence)?;
-        transaction.execute(
-            "INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state)
-             VALUES (?1,?2,?3,?4,?5,?6,'[]','reserved')",
-            params![request.id, request.fence.deployment_id, request.fence.revision,
-                    request.incarnation, request.ownership, dto],
-        ).map_err(|error| match error {
-            rusqlite::Error::SqliteFailure(_, _) => LifecycleError::Conflict,
-            other => LifecycleError::Sql(other),
+        insert_prepared_binding(&transaction, session, &prepared).map_err(|error| match error {
+            LifecycleError::Sql(rusqlite::Error::SqliteFailure(_, _)) => LifecycleError::Conflict,
+            other => other,
         })?;
-        transaction
-            .execute(
-                "INSERT INTO endpoint_leases(host,port,binding_id) VALUES (?1,?2,?3)",
-                params![request.endpoint_host, request.endpoint_port, request.id],
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::SqliteFailure(_, _) => LifecycleError::Conflict,
-                other => LifecycleError::Sql(other),
-            })?;
         transaction.commit()?;
-        drop(listener);
+        drop(prepared);
         Ok(())
     }
 
@@ -671,6 +731,9 @@ impl crate::Store {
             return Ok(None);
         };
         if binding_json.len() > MAX_DTO_BYTES || identities_json.len() > MAX_DTO_BYTES {
+            return Err(LifecycleError::Invalid);
+        }
+        if !matches!(decode_binding(&binding_json)?, DecodedBinding::V1) {
             return Err(LifecycleError::Invalid);
         }
         let binding: BindingDto =

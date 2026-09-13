@@ -60,6 +60,17 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
+    CandidateRunAccepted {
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        run_id: EventOperationId,
+        revision: i64,
+        generation: i64,
+        resource_policy_revision: i64,
+        qualification_policy_revision: i64,
+        session_epoch: i64,
+    },
+    #[serde(rename = "1")]
     CoordinatorSessionStarted { session_epoch: i64 },
     #[serde(rename = "1")]
     HostQualificationPolicyChanged {
@@ -109,6 +120,7 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::CandidateRunAccepted { .. } => "candidate_run_accepted",
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
             Self::HostQualificationPolicyChanged { .. } => "host_qualification_policy_changed",
             Self::HostResourcePolicyBootstrapped { .. } => "host_resource_policy_bootstrapped",
@@ -118,6 +130,8 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
+            Self::CandidateRunAccepted { operation_id, deployment_id, .. } =>
+                (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CoordinatorSessionStarted { .. } => (None, None),
             Self::HostQualificationPolicyChanged { .. } => (None, None),
             Self::HostResourcePolicyBootstrapped { .. } => (None, None),
@@ -273,6 +287,29 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn candidate_acceptance_payload_is_bounded_and_maps_generated_identities() {
+        use super::*;
+        let operation = ulid::Ulid::new();
+        let deployment = ulid::Ulid::new();
+        let run = ulid::Ulid::new();
+        let event = EventMetadata::CandidateRunAccepted {
+            operation_id: EventOperationId::generated(operation),
+            deployment_id: EventOperationId::generated(deployment),
+            run_id: EventOperationId::generated(run),
+            revision: i64::MAX, generation: i64::MAX,
+            resource_policy_revision: i64::MAX, qualification_policy_revision: i64::MAX,
+            session_epoch: i64::MAX,
+        };
+        let json = serialize_bounded(&event).unwrap();
+        assert!(json.len() < 512);
+        assert_eq!(event.identifiers(), (Some(deployment.to_string().as_str()), Some(operation.to_string().as_str())));
+        let fields: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(fields.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            ["deployment_id","generation","operation_id","qualification_policy_revision","resource_policy_revision","revision","run_id","session_epoch","version"]);
+        assert_eq!(fields["run_id"],run.to_string());
+        assert_eq!(event.kind(),"candidate_run_accepted");
+    }
     use super::*;
     use crate::Store;
     fn seed(s: &Store, count: i64, bytes: usize, at: i64) {
