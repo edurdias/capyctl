@@ -1113,6 +1113,7 @@ name = "mllm-scheduler"
 version = "0.1.0"
 dependencies = [
  "mllm-domain",
+ "proptest",
  "thiserror",
 ]
 
