@@ -17,6 +17,11 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Open questions
 
+- Future run inference needs explicit case/corpus-item selection. Current route fields
+  name request/revision only. Working recommendation: trusted coordinator selects and
+  validates case/item, then freezes mapping in retry receipt; client never supplies
+  evidence or pass predicates. Alternative: explicit untrusted case selector with
+  trusted validation. No implementation decision taken yet; does not block creation.
 - Please check unrelated untracked `crates/mllm-cli/tests/live_interactive.rs` for
   unwanted formatting. During dispatch Task 3, the implementer ran `cargo fmt -- <paths>`;
   Cargo formatted the workspace instead of limiting scope. Tracked spill was
@@ -27,6 +32,23 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Progress
 
+- Latest verified checkpoint `5f803fb`: candidate creation store reviewed clean;
+  root390 CPU tests and scoped Clippy pass. Historical snapshot reviewed through
+  `59633e8`. One minor test risk retained: fixed port65535 can conflict with another
+  local listener. Next work: transaction-local reservation helper for atomic arm. No runtime
+  arm/dispatch integration, live qualification, F2 completion or merge claimed.
+- Candidate coverage reviewed through `6d8e89c`: canonical bytes/digest, strict
+  nested schema, budgets and F2C fixture (30 cases,384 markers,391 total requests).
+  Review fixed misleading count/order/minimum-boundary tests. Root `70e23ad` check:
+  347 CPU tests/Clippy pass. A later rerun exposed launcher termination race
+  (`ESRCH` after short-lived process exits). Repair reviewed through `2fd3d18`;
+  full CPU gate subsequently passes, including latest checkpoint above.
+- Candidate shared normalization reviewed through `8a4d039`. Both wrappers share
+  host/profile/recipe validation and unchanged recipe fingerprint projection.
+  Five review findings fixed: bounded cycle validation, typed views, null rejection,
+  text limits and UTF-8 selectors. Fresh checks: 339 CPU tests and scoped Clippy pass,
+  including 89 config tests. Exhaustive fixture/error coverage subsequently closed;
+  candidate acceptance subsequently completed. Runtime authority and live qualification remain open.
 - Durable resource-policy store reviewed through `88c7f3f`: bootstrap, revisioned
   updates, strict receipts, retained overcommit, atomic events and host-operation
   lookup. Two fix rounds closed identity/receipt validation and failure-test gaps.
@@ -193,3 +215,37 @@ the work being executed. The owner will review consequential questions in the mo
   behavior changes need object/nested-array and duplicate-key regression coverage.
 - Candidate descriptors do not retain full host policy. Cost: store consumers
   compare frozen recipe identity against separately persisted current policy.
+- Candidate descriptor cap counts complete encoded logical envelope, including
+  credential references and metadata, with reviewed manifest once. Not heap usage.
+  Cost: near-limit inputs passing old raw-length sum now reject; future persisted
+  DTO has separate 1 MiB cap. Canonical cap is dominated by encoded input cap here.
+- Snapshot document review complete: six local checks, three independent reviews. Three plan corrections applied; no pending owner decision.
+  Permit narrow unsigned parser repair for full u64 revisions. Cost: shared scalar
+  behavior changes above i64::MAX; signed/quoted/float/overflow tests required.
+  Tightened-host test uses valid 3s deadline and positive matching-candidate control.
+  Reuse existing exhaustive candidate matrix; add new snapshot-boundary coverage.
+- Launcher disappearance race fixed and independently reviewed through 2fd3d18.
+  Final CPU test and scoped Clippy command chain passed. ESRCH means already gone,
+  not proof all workers exited or permission to release stored resources.
+- Historical snapshot implemented at ad62126; root 363 CPU tests and scoped Clippy
+  passed. Independent review requested missing boundary tests; fixed in59633e8.
+  Parser-specific pre-fix RED was missed. Cost: weaker sensitivity evidence for
+  that parser change; final tests and independent review remain mandatory.
+- Candidate creation store brief prepared and reviewed. Choices
+  accepted: duplicate-safe internal JSON using RawValue, private V2 binding
+  with optional runtime/admin references, stable collection-scoped receipts, declared
+  run/cleanup maxima bounded by policy, first unleased bindable loopback port.
+  Costs: existing dependency feature, future strict decimal-string wire conversion,
+  typed V2 execution integration, versioned persisted conventions, conservative
+  rejection of oversized declarations and low-port preference. Store acceptance now
+  implemented; no execution readiness or permanent OS endpoint ownership claimed.
+- Snapshot dependency closed through 59633e8 after independent re-review; root366 CPU
+  tests and scoped Clippy pass. Candidate creation document review complete: five
+  local lenses, three independent reviews, no required correction or owner decision.
+  Future gates remain: accepted-only runs need verified cleanup before shared ports
+  can be reclaimed; management handlers must redact internal credential/env/args views.
+  These gates do not authorize automatic expiry cleanup or raw snapshot serialization.
+- Corrected creation plan vocabulary before first implementation commit: deployment
+  kind is `model`; runtime binding ownership is `managed`. Existing reservation code
+  requires `model`. Cost: acceptance/historical tests pin both fields distinctly;
+  no reservation exception or ordinary routing permission added.
