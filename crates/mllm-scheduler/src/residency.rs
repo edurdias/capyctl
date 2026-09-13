@@ -51,10 +51,8 @@ fn amount(f: &PhaseFootprint, domain: &str) -> (i64, i64) {
         .unwrap_or((0, 0))
 }
 
-pub fn admit_phase(
+fn validate_context(
     snapshot: &LedgerSnapshot,
-    owner: &str,
-    next: &PhaseFootprint,
     context: AdmissionContext<'_>,
 ) -> Result<(), ResourceError> {
     let AdmissionContext {
@@ -63,12 +61,11 @@ pub fn admit_phase(
         limits,
         now_ms,
         ttl_ms,
-        max_parked,
+        ..
     } = context;
-    if owner.is_empty() || ttl_ms <= 0 || now_ms < 0 || limits.is_empty() {
+    if ttl_ms <= 0 || now_ms < 0 || limits.is_empty() {
         return Err(ResourceError::Invalid);
     }
-    validate_footprint(next)?;
     for (id, f) in &snapshot.owners {
         if id.is_empty() {
             return Err(ResourceError::Invalid);
@@ -130,14 +127,73 @@ pub fn admit_phase(
             return Err(ResourceError::Invalid);
         }
     }
-    for f in snapshot.owners.values().chain(std::iter::once(next)) {
+    Ok(())
+}
+
+fn validate_domains<'a>(
+    footprints: impl Iterator<Item = &'a PhaseFootprint>,
+    limits: &[MemoryLimit],
+) -> Result<(), ResourceError> {
+    for f in footprints {
         if f.allocations
             .iter()
-            .any(|a| !known.contains(a.domain.as_str()))
+            .any(|a| !limits.iter().any(|l| l.domain == a.domain))
         {
             return Err(ResourceError::UnknownDomain);
         }
     }
+    Ok(())
+}
+
+fn validate_resident_total(
+    observation: &MemoryObservation,
+    floors: &[ResidentFloor],
+) -> Result<(), ResourceError> {
+    let total = floors
+        .iter()
+        .filter(|f| f.domain == observation.domain)
+        .try_fold(0, |sum, f| add(sum, f.bytes))?;
+    if total > observation.capacity_bytes - observation.available_bytes {
+        return Err(ResourceError::Invalid);
+    }
+    Ok(())
+}
+
+/// Validates unchanged evidence before a forecast can remove an owner or credit bytes.
+pub fn validate_admission_context(
+    snapshot: &LedgerSnapshot,
+    context: AdmissionContext<'_>,
+) -> Result<(), ResourceError> {
+    validate_context(snapshot, context)?;
+    validate_domains(snapshot.owners.values(), context.limits)?;
+    for observation in context.observations {
+        validate_resident_total(observation, context.resident_floors)?;
+    }
+    Ok(())
+}
+
+pub fn admit_phase(
+    snapshot: &LedgerSnapshot,
+    owner: &str,
+    next: &PhaseFootprint,
+    context: AdmissionContext<'_>,
+) -> Result<(), ResourceError> {
+    if owner.is_empty() || context.ttl_ms <= 0 || context.now_ms < 0 || context.limits.is_empty() {
+        return Err(ResourceError::Invalid);
+    }
+    validate_footprint(next)?;
+    validate_context(snapshot, context)?;
+    validate_domains(
+        snapshot.owners.values().chain(std::iter::once(next)),
+        context.limits,
+    )?;
+    let AdmissionContext {
+        observations,
+        resident_floors,
+        limits,
+        max_parked,
+        ..
+    } = context;
     let others = snapshot
         .owners
         .iter()
@@ -169,13 +225,7 @@ pub fn admit_phase(
                 .map(|f| f.bytes)
                 .unwrap_or(0)
         };
-        let resident_total = resident_floors
-            .iter()
-            .filter(|f| f.domain == l.domain)
-            .try_fold(0, |sum, f| add(sum, f.bytes))?;
-        if resident_total > o.capacity_bytes - o.available_bytes {
-            return Err(ResourceError::Invalid);
-        }
+        validate_resident_total(o, resident_floors)?;
         let mut remaining = candidate
             .checked_sub(floor(owner))
             .ok_or(ResourceError::Invalid)?
