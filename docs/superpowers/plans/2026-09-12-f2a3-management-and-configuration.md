@@ -226,6 +226,38 @@ physical capacity. Default protected headroom is `max(16 GiB, ceil(capacity/5))`
 managed limit is capacity minus that headroom. Display derivation as provenance.
 Unknown capacity leaves launches disabled. Unified CPU/GPU memory is one domain.
 
+### Nested configuration shapes
+
+`model` is `{path, content_fingerprint, revision}`; `recipe` is its explicit ID.
+Each of the five resource phases contains required `allocations` entries
+`{domain,bytes,host_kv_bytes}` and required `devices` entries `{id,sharing}`.
+Deployment-level devices select permitted claims; each phase is explicit rather
+than inheriting claims. Parked devices must be empty, as required by A1.
+
+Host supplies explicit `hardware_fingerprint` and `environment_fingerprint`.
+`resource_policy.domains` maps domain IDs to
+`{managed_limit,free_reserve,host_kv_limit?,parked_limit?}`.
+`resource_policy.devices` maps device IDs to `{domain,sharing}`; global
+`device_sharing` and each device's sharing policy use `shared` or `exclusive`.
+Shared policy permits exclusive requests too; exclusive policy rejects shared
+claims. Per-device policy cannot relax global policy.
+
+Resource policy also contains `max_parked`, `observation_ttl`, `planner_max_states`,
+`endpoint_port_range:{start,end}`, and `queue` with `max_pending_per_deployment`,
+`max_pending_total`, `max_buffered_bytes_total`, `request_deadline`, and
+`admission_window`. Deployment may specify a shorter top-level `request_deadline`.
+`runtime_profiles` is a named map. Profile security uses `experimental_controls`,
+runtime inference/API `credential_ref`, and optional `admin_credential_ref`.
+SGLang requires distinct nonempty API/admin references; vLLM requires its runtime
+credential. Qualification fingerprints exclude reference values but include
+authentication structure and behavioral security policy.
+
+Generated endpoints, served names, credential references, and incarnations are
+not manifest overrides. A separate binding fingerprint consumes trusted runtime
+values. Pure default-policy derivation accepts observed capacity from its caller;
+configuration assertions are never physical observation evidence. Effective
+configuration resolution supports vLLM, SGLang, and fake without launching them.
+
 ## Execution order with coordinator integration
 
 Follow [A2d cross-plan execution order](2026-09-12-f2a2d-coordinator-integration.md#execution-order-across-a2d-and-a3).

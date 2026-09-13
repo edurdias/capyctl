@@ -80,6 +80,10 @@ the work being executed. The owner will review consequential questions in the mo
   scoped Clippy clean. Review approved after placing caller-timeout integration
   proof in Task 9's real wait path. Dynamic port fixtures fixed. A3 foundations
   now precede remaining coordinator arm/completion work.
+- Configuration foundation liveness checkpoint: tests drafted, source not yet changed.
+  Agent temporarily added `serde_yaml`, triggering an unwanted Cargo fetch. Manifest
+  dependency removed; exact lockfile additions identified for removal. Resume uses
+  existing strict parser and offline Cargo. No engine installation or cache cleanup.
 
 ## Execution decisions
 
@@ -115,6 +119,10 @@ the work being executed. The owner will review consequential questions in the mo
 - Test each caller's shorter wait deadline in Task 9's real router wait path, not
   a synthetic store fixture. Task 3 tests unchanged durable operation deadline.
   Cost: caller-timeout proof remains open until router integration; A2d cannot close without it.
+- Freeze previously unspecified nested F2 config shapes in A3 plan. Each phase
+  supplies allocations/devices explicitly; generated binding identity stays separate.
+  SGLang requires separate API/admin references. Cost: schema spelling choices may
+  need later compatibility handling; no new control or qualification authority.
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.
