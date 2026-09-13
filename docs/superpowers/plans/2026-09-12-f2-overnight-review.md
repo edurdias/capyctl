@@ -80,10 +80,11 @@ the work being executed. The owner will review consequential questions in the mo
   scoped Clippy clean. Review approved after placing caller-timeout integration
   proof in Task 9's real wait path. Dynamic port fixtures fixed. A3 foundations
   now precede remaining coordinator arm/completion work.
-- Configuration foundation liveness checkpoint: tests drafted, source not yet changed.
-  Agent temporarily added `serde_yaml`, triggering an unwanted Cargo fetch. Manifest
-  dependency removed; exact lockfile additions identified for removal. Resume uses
-  existing strict parser and offline Cargo. No engine installation or cache cleanup.
+- Configuration foundations implemented through `2cfd778`; full scoped CPU tests and
+  Clippy pass. Review still blocks approval: explicit owned launch settings, policy
+  defaults/bounds, and identity regression tests need fixes. Parent A3 Task 1 remains open.
+  Temporary `serde_yaml` additions removed surgically before implementation; root
+  verified lockfile cleanup. Subsequent Cargo offline. No engine installation or cache cleanup.
 
 ## Execution decisions
 
@@ -123,6 +124,16 @@ the work being executed. The owner will review consequential questions in the mo
   supplies allocations/devices explicitly; generated binding identity stays separate.
   SGLang requires separate API/admin references. Cost: schema spelling choices may
   need later compatibility handling; no new control or qualification authority.
+- Define policy maxima separately from product defaults: 4096 pending/deployment,
+  16384 total, 1 GiB queued bodies, 1 h request deadline, 30 s admission window,
+  10 s observation TTL, 65536 planner states, 16 parked. Missing bounded fields use
+  documented defaults; capacity/credentials remain explicit. Cost: later operational
+  needs may require reviewed limit changes. No live performance promise.
+- Add required engine-tagged launch settings; hash explicit parallelism, allocator
+  requests and expanded SGLang recipe. Arm approves exact settings, never silently
+  changes a qualified allocation. Shared normalized types live in domain. Cost:
+  additional manifest fields and a domain serialization dependency; native support
+  and trusted qualification still require later adapter gates.
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.

@@ -196,7 +196,8 @@ identity with explicit content/revision fingerprint, not an arbitrary download U
 Profile fields: `engine` (`vllm`, `sglang`, `fake`), `revision`, absolute
 `executable`, exact `build_fingerprint`, `qualification_id`, approved `args`,
 allowlisted `env`, `security` (`experimental_controls` boolean and secret references),
-and `log_policy` (`max_file_bytes`, `retained_files`). Effective recipe fingerprints
+`log_policy` (`max_file_bytes`, `retained_files`), and required `launch_settings`.
+Effective recipe fingerprints
 include hardware/environment and generated mllm-owned behavioral launch settings.
 Qualification identity covers engine build, checkpoint, hardware/environment,
 device topology, parallelism, allocator/memory/KV settings, approved behavioral
@@ -220,6 +221,17 @@ body bytes, request waiting deadline 600 s, non-resetting admission window 2 s,
 observation TTL 2 s, 4096 planner states, max 16 parked runtimes. These are tunable
 bounded product defaults, not live performance promises. A deployment may select
 a shorter deadline, never silently exceed host safety limits.
+
+Resolver defaults apply when those bounded fields are omitted, including an omitted
+queue object. Enforced maxima are 4096 pending requests per deployment, 16384 total,
+1 GiB queued body bytes, a 1 h request deadline, a 30 s admission window, a 10 s
+observation TTL, 65536 planner states, and 16 parked runtimes. Values are positive
+except `max_parked`, which may be zero. Per-deployment pending count cannot exceed
+total pending count; admission window cannot exceed the host request deadline.
+Endpoint range starts above zero and ends at or above its start. Domains, devices,
+sharing policy, and endpoint range remain explicit; defaults never invent physical
+capacity or credentials. These configurable bounds are policy, not qualification
+evidence or guaranteed acceptable latency.
 
 For a fresh unconfigured host, derive the managed ceiling only after observing
 physical capacity. Default protected headroom is `max(16 GiB, ceil(capacity/5))`;
@@ -257,6 +269,43 @@ not manifest overrides. A separate binding fingerprint consumes trusted runtime
 values. Pure default-policy derivation accepts observed capacity from its caller;
 configuration assertions are never physical observation evidence. Effective
 configuration resolution supports vLLM, SGLang, and fake without launching them.
+
+### Owned launch settings
+
+Required `launch_settings` is an engine-tagged strict object matching profile engine.
+Normalized shared types live in domain; config owns raw unit parsing. Missing fields
+never select backend defaults. The object carries these fields:
+
+- vLLM: `engine:vllm`, `tensor_parallel_size`, `pipeline_parallel_size`,
+  `enable_sleep_mode`, `kv_cache_dtype`, `block_size_tokens`, `cpu_offload_bytes`,
+  `requested_budget:{kv_cache_bytes,swap_space_bytes,gpu_utilization_pct}`.
+- SGLang: `engine:sglang`,
+  `recipe:qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1`,
+  `requested_budget:{kv_cache_bytes,static_memory_fraction_bps}`.
+- Fake: `{engine:fake}` only.
+
+Raw bytes are unit strings, normalized to checked i64. Counts and KV bytes must be
+positive; swap/offload bytes may be zero. Utilization is integer 1–100; static-memory
+fraction is integer 1–10000 basis points. KV dtype is nonempty. The resolver checks
+structure, not actual qualified support for topology, dtype, block size or offload.
+Trusted qualification lookup checks exact build/checkpoint/recipe compatibility
+before effects. Warm vLLM requires sleep mode; experimental controls require explicit
+policy permission. Backend KV allocation is not copied from `host_kv_bytes` accounting.
+
+The SGLang recipe expands into explicit normalized settings included in its hash:
+TP 1, DP 1, tokenizer workers 1, model dtype bfloat16, context 4096, max running
+requests 8, total token cap 4096, prefill/decode CUDA graphs false, memory saver true,
+CPU weight backup false, speculation/LoRA/remote code/disaggregation/external cache/
+CPU KV offload/native gRPC false, and weight restore `disk_reload`. These names
+describe normalized settings, not native CLI spellings. Pin-compatible native
+rendering and effective KV geometry remain adapter/qualification obligations.
+
+Hash the expanded settings and every exact allocator request. Requests are not
+grants. Arm authorizes unchanged settings against the qualified recipe and committed
+grant. A calculation that would change a rendered allocator value requires a new
+effective recipe and qualification identity before effects; it cannot silently reuse
+evidence. Binding endpoint, served name, credential reference and incarnation remain
+outside qualification identity.
 
 ## Execution order with coordinator integration
 
