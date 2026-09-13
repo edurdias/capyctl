@@ -85,6 +85,26 @@ CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
 pub const SCHEMA_V2: &str =
     "ALTER TABLE deployments ADD COLUMN observed_state TEXT NOT NULL DEFAULT 'stopped';";
 
+pub const SCHEMA_V3: &str = r#"
+ALTER TABLE deployments ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1);
+CREATE TABLE resource_ledger_meta(
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    epoch INTEGER NOT NULL CHECK(epoch >= 0)
+);
+INSERT INTO resource_ledger_meta(singleton, epoch) VALUES (1, 0);
+CREATE TABLE resource_owners(
+    owner_id TEXT PRIMARY KEY REFERENCES deployments(id),
+    footprint_json TEXT NOT NULL
+);
+CREATE TABLE resource_grants(
+    id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL REFERENCES deployments(id),
+    operation_id TEXT NOT NULL REFERENCES operations(id),
+    request_json TEXT NOT NULL,
+    committed_epoch INTEGER NOT NULL UNIQUE CHECK(committed_epoch > 0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::{SCHEMA_V1, SCHEMA_V2};
+use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
@@ -64,5 +64,28 @@ mod tests {
             .unwrap();
         assert_eq!(max, MIGRATIONS.len() as i64);
         assert_eq!(count, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v3_upgrade_preserves_legacy_rows_and_sets_revision() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::schema::SCHEMA_V1).unwrap();
+        conn.execute_batch(crate::schema::SCHEMA_V2).unwrap();
+        conn.execute_batch("INSERT INTO schema_migrations VALUES (1), (2);
+            INSERT INTO deployments(id, name, kind, desired_state, admission_enabled,
+              suspended, current_generation, schema_version)
+            VALUES ('a', 'a', 'model', 'stopped', 1, 0, 1, 1);
+            INSERT INTO owners(id, kind, deployment_id) VALUES ('a', 'model', 'a');
+            INSERT INTO reservations(owner_id, domain_id, bytes, phase)
+            VALUES ('a', 'system', 64, 'activation');").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let revision: i64 = conn.query_row(
+            "SELECT revision FROM deployments WHERE id='a'", [], |r| r.get(0)).unwrap();
+        let bytes: i64 = conn.query_row(
+            "SELECT bytes FROM reservations WHERE owner_id='a'", [], |r| r.get(0)).unwrap();
+        let epoch: i64 = conn.query_row(
+            "SELECT epoch FROM resource_ledger_meta WHERE singleton=1", [], |r| r.get(0)).unwrap();
+        assert_eq!((revision, bytes, epoch), (1, 64, 0));
     }
 }
