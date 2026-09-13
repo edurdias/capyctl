@@ -57,8 +57,6 @@ impl crate::Store {
         crate::events::append_event(
             &transaction,
             &crate::events::EventMetadata::CoordinatorSessionStarted { session_epoch: epoch },
-            None,
-            None,
         )
         .map_err(|error| match error {
             crate::events::EventWriteError::Sql(error) => DispatchError::Sql(error),
