@@ -244,6 +244,23 @@ fn local_fake_candidate_composes_full_store_protocol_and_restart_inspection() {
             2300,
         )
         .unwrap();
+    // A second crash occurs before the inspection action arms. Its successor
+    // must retain inspection-only authority from the earlier termination.
+    let unarmed_inspection = recovery;
+    let next_session = store.begin_coordinator_session().unwrap();
+    let recovery = store
+        .accept_candidate_cleanup(
+            &next_session,
+            "owner",
+            created.run_id(),
+            "recover-again",
+            body,
+            2350,
+        )
+        .unwrap();
+    assert!(store
+        .candidate_cleanup_execution(&next_session, unarmed_inspection.step_id())
+        .is_err());
     assert!(matches!(
         store
             .arm_candidate_cleanup(&next_session, recovery.step_id(), 2400)

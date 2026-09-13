@@ -173,6 +173,16 @@ struct ReadCleanup {
     run_state: String,
     receipt: CandidateCleanupReceiptV1,
     initialize: ValidatedInitialize,
+    // Populated only after the complete bounded predecessor chain validates.
+    predecessor_operations: Vec<String>,
+}
+
+fn recovery_mode(previous: &CleanupMode, issued: Option<i64>) -> CleanupMode {
+    if *previous == CleanupMode::InspectOwnedGone || issued.is_some() {
+        CleanupMode::InspectOwnedGone
+    } else {
+        CleanupMode::TerminateOwned
+    }
 }
 fn target(run: &str) -> String {
     format!("/management/v1/qualification-runs/{run}/actions")
@@ -351,10 +361,11 @@ fn read_one(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleErro
         run_state,
         receipt,
         initialize: v,
+        predecessor_operations: Vec::new(),
     })
 }
 fn read(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleError> {
-    let result = read_one(tx, id)?;
+    let mut result = read_one(tx, id)?;
     let origin = &result.planned;
     let mut prior = origin.predecessor_cleanup_operation_id.clone();
     let mut child = origin.clone();
@@ -384,16 +395,12 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleError> {
             || p.session_id == child.session_id
             || p.generation >= child.generation
             || p.accepted_at_ms > child.accepted_at_ms
-            || child.mode
-                != if previous.issued.is_some() {
-                    CleanupMode::InspectOwnedGone
-                } else {
-                    CleanupMode::TerminateOwned
-                }
+            || child.mode != recovery_mode(&p.mode, previous.issued)
         {
             return Err(LifecycleError::CorruptStoredData);
         }
         prior = p.predecessor_cleanup_operation_id.clone();
+        result.predecessor_operations.push(operation);
         child = p;
     }
     if child.mode != CleanupMode::TerminateOwned
@@ -404,6 +411,9 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleError> {
             .is_some_and(|p| p != &result.initialize.context.token.operation_id)
     {
         return Err(LifecycleError::CorruptStoredData);
+    }
+    if let Some(initialize) = child.predecessor_operation_id {
+        result.predecessor_operations.push(initialize);
     }
     Ok(result)
 }
@@ -601,11 +611,7 @@ impl crate::Store {
                 return Err(LifecycleError::Conflict);
             }
             origin = p.cleanup_origin_ms;
-            mode = if previous.issued.is_some() {
-                CleanupMode::InspectOwnedGone
-            } else {
-                CleanupMode::TerminateOwned
-            };
+            mode = recovery_mode(&p.mode, previous.issued);
             prior_cleanup = Some(p.operation_id.clone());
         }
         let max = snapshot
@@ -890,30 +896,12 @@ impl crate::Store {
         // The immutable candidate lane has one binding, making deployment leases
         // across generations/sessions an exact incarnation scope.
         crate::dispatch::settle_verified_candidate_cleanup(&tx, &p.deployment_id, &p.binding_id)?;
-        let mut op = p.predecessor_operation_id.clone();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(previous) = op {
-            if visited.len() >= 64 || !visited.insert(previous.clone()) {
-                return Err(LifecycleError::CorruptStoredData);
-            }
-            let cleanup: Option<String> = tx
-                .query_row(
-                    "SELECT step_id FROM candidate_cleanup_actions WHERE operation_id=?1",
-                    [&previous],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            op = if let Some(step) = cleanup {
-                read(&tx, &step)?.planned.predecessor_operation_id
-            } else {
-                if previous != r.initialize.context.token.operation_id {
-                    return Err(LifecycleError::CorruptStoredData);
-                }
-                None
-            };
-            tx.execute("UPDATE lifecycle_steps SET state='cancelled' WHERE operation_id=?1 AND state IN ('planned','armed','uncertain')",[&previous])?;
-            tx.execute("UPDATE lifecycle_runs SET state='failed' WHERE operation_id=?1 AND state IN ('queued','running','uncertain')",[&previous])?;
-            tx.execute("UPDATE operations SET state='failed',error_code='resolved_by_owned_cleanup' WHERE id=?1 AND state IN ('pending','running')",[&previous])?;
+        // The entry reader already validated the whole chain in this transaction.
+        // Reuse its exact scope instead of rereading every remaining suffix.
+        for previous in &r.predecessor_operations {
+            tx.execute("UPDATE lifecycle_steps SET state='cancelled' WHERE operation_id=?1 AND state IN ('planned','armed','uncertain')",[previous])?;
+            tx.execute("UPDATE lifecycle_runs SET state='failed' WHERE operation_id=?1 AND state IN ('queued','running','uncertain')",[previous])?;
+            tx.execute("UPDATE operations SET state='failed',error_code='resolved_by_owned_cleanup' WHERE id=?1 AND state IN ('pending','running')",[previous])?;
         }
         let other:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE deployment_id=?1 AND id!=?2 AND state IN ('planned','armed','uncertain'))",params![p.deployment_id,id],|r|r.get(0))?;
         if other {

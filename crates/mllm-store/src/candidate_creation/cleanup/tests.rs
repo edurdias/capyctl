@@ -2,6 +2,113 @@ use super::*;
 use mllm_domain::completion::CleanupEvidence;
 
 #[test]
+fn unarmed_inspection_successor_retains_prior_termination_history() {
+    let (store, s, c) = created("fake");
+    let init = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "init", BODY, 1100)
+        .unwrap();
+    arm(&store, &s, init.step_id()).unwrap();
+    let context = store
+        .candidate_initialize_execution(&s, init.step_id())
+        .unwrap();
+    let owned = receipt(&context);
+    store
+        .record_owned_launch(&s, init.step_id(), &owned, 1250)
+        .unwrap();
+    let body = r#"{"expected_revision":1,"action":"cleanup","deadline_ms":12000}"#;
+    let first = store
+        .accept_candidate_cleanup(&s, "owner", c.run_id(), "cleanup-a", body, 2000)
+        .unwrap();
+    store
+        .arm_candidate_cleanup(&s, first.step_id(), 2100)
+        .unwrap();
+    let second_session = store.begin_coordinator_session().unwrap();
+    let second = store
+        .accept_candidate_cleanup(
+            &second_session,
+            "owner",
+            c.run_id(),
+            "cleanup-b",
+            body,
+            2300,
+        )
+        .unwrap();
+    let third_session = store.begin_coordinator_session().unwrap();
+    let third = store
+        .accept_candidate_cleanup(&third_session, "owner", c.run_id(), "cleanup-c", body, 2400)
+        .unwrap();
+    store
+        .arm_candidate_cleanup(&third_session, third.step_id(), 2500)
+        .unwrap();
+    let execution = store
+        .candidate_cleanup_execution(&third_session, third.step_id())
+        .unwrap();
+    assert_eq!(
+        execution.mode,
+        crate::candidate_creation::cleanup::CleanupMode::InspectOwnedGone
+    );
+    // The immutable reader must also reject a forged downgrade after acceptance.
+    let original: String = store
+        .conn
+        .query_row(
+            "SELECT step_json FROM lifecycle_steps WHERE id=?1",
+            [third.step_id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut downgraded: Value = serde_json::from_str(&original).unwrap();
+    downgraded["planned"]["mode"] = json!("terminate_owned");
+    store
+        .conn
+        .execute(
+            "UPDATE lifecycle_steps SET step_json=?1 WHERE id=?2",
+            params![downgraded.to_string(), third.step_id()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.candidate_cleanup_execution(&third_session, third.step_id()),
+        Err(LifecycleError::CorruptStoredData)
+    ));
+    store
+        .conn
+        .execute(
+            "UPDATE lifecycle_steps SET step_json=?1 WHERE id=?2",
+            params![original, third.step_id()],
+        )
+        .unwrap();
+    let evidence = CleanupEvidence {
+        binding_id: owned.binding_id,
+        incarnation: owned.incarnation,
+        identities: owned.identities,
+        observed_at_ms: 2600,
+        receipt: "all owned members gone".into(),
+    };
+    let ttl = store
+        .resource_policy("lab")
+        .unwrap()
+        .unwrap()
+        .controls
+        .observation_ttl_ms;
+    store
+        .complete_cleanup(&third_session, third.step_id(), &evidence, 2600, ttl)
+        .unwrap();
+    for step in [init.step_id(), first.step_id(), second.step_id()] {
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT state FROM lifecycle_steps WHERE id=?1",
+                    [step],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "cancelled"
+        );
+    }
+    assert!(store.resource_snapshot().unwrap().owners.is_empty());
+}
+
+#[test]
 fn cleanup_reader_rejects_corrupt_predecessor_claim_generation() {
     let (store, s, c) = created("fake");
     let r = store
