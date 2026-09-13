@@ -82,7 +82,9 @@ starting A3. Use this dependency order; keep every partial task visibly incomple
    Task 7 still changes `EngineAdapter` and all consumers together. Task 2 also
    starts store `lifecycle.rs` and its private tests: bind incarnation and endpoint
    in one immediate transaction under current session and deployment fence.
-   Include store `lib.rs` and `dispatch.rs` in Task 2 scope. Task 3 extends this
+   Include store `lib.rs` and `dispatch.rs` in Task 2 scope. Stage Task 3's exact
+   `DeploymentFence` and `LifecycleError` declarations with this first writer;
+   reuse them rather than introducing temporary parallel contracts. Task 3 extends this
    module. No public unfenced binding writer or temporary release bypass.
 2. A3 Task 1 configuration foundations, then Task 2 V6 policy/run persistence
    and Task 3 V7 event-schema/writer foundations, before completing A2d Task 4.
