@@ -4,45 +4,11 @@
 //! reserved and their values redacted in recorded fingerprints.
 
 use crate::traits::RenderedCommand;
+use mllm_config::engine_policy::{validate_profile_args, Engine, ProfileArgError};
 
 /// Flags mllm owns: user pass-through conflicts fail validation (T14) and
 /// the adapter renders them from granted budgets/contracts.
-pub const RESERVED_FLAGS: &[&str] = &[
-    "--host",
-    "--port",
-    "--model",
-    "--served-model-name",
-    "--device",
-    "--tensor-parallel-size",
-    "--pipeline-parallel-size",
-    "--gpu-memory-utilization",
-    "--cpu-offload-gb",
-    "--swap-space",
-    "--kv-cache-bytes",
-    "--kv-cache-memory",
-    "--kv-cache-memory-bytes",
-    "--kv-cache-dtype",
-    "--block-size",
-    "--enable-sleep-mode",
-    "--api-key",
-    "--disable-log-requests",
-    "--enable-log-requests",
-    "--disable-log-stats",
-    "--log-config-file",
-    "--uvicorn-log-level",
-    "--disable-uvicorn-access-log",
-];
-
-const APPROVED_FLAGS: &[&str] = &[
-    "--max-model-len",
-    "--trust-remote-code",
-    "--dtype",
-    "--enforce-eager",
-    "--max-num-seqs",
-    "--max-num-batched-tokens",
-    "--tokenizer-mode",
-];
-const APPROVED_BOOLEAN_FLAGS: &[&str] = &["--trust-remote-code", "--enforce-eager"];
+pub use mllm_config::engine_policy::VLLM_RESERVED_FLAGS as RESERVED_FLAGS;
 
 #[derive(Debug, Clone)]
 pub struct PlanInputVllm {
@@ -91,47 +57,15 @@ pub enum ArgsError {
 }
 
 pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsError> {
-    // Approved-argument validation parses flag/value pairs by position: an
-    // arg starting with `-` is a flag (the next position is its value); a
-    // bare positional (odd-length tail) is engine-native and passes through.
-    // Reserved flags conflict; duplicates of ordinary flags are declared
-    // errors, never misreported as reserved conflicts.
-    let mut seen = std::collections::BTreeSet::new();
-    let mut i = 0;
-    while i < input.engine_args.len() {
-        let arg = &input.engine_args[i];
-        if arg.starts_with('-') {
-            let raw_name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
-            let normalized = raw_name.to_ascii_lowercase().replace('_', "-");
-            if RESERVED_FLAGS.contains(&normalized.as_str()) {
-                return Err(ArgsError::ReservedConflict(normalized));
-            }
-            if !APPROVED_FLAGS.contains(&normalized.as_str()) {
-                return Err(ArgsError::UnsupportedFlag(normalized));
-            }
-            if !seen.insert(normalized.clone()) {
-                return Err(ArgsError::DuplicateFlag(normalized));
-            }
-            // The next position is this flag's value (skipped by the
-            // stride; a trailing flag with no value parses as boolean).
-            if arg.split_once('=').is_some_and(|(_, value)| value.is_empty()) {
-                return Err(ArgsError::MissingValue(normalized));
-            }
-            if arg.contains('=') || APPROVED_BOOLEAN_FLAGS.contains(&normalized.as_str()) {
-                i += 1;
-            } else if input
-                .engine_args
-                .get(i + 1)
-                .is_some_and(|v| !v.starts_with('-'))
-            {
-                i += 2;
-            } else {
-                return Err(ArgsError::MissingValue(normalized));
-            }
-        } else {
-            return Err(ArgsError::UnexpectedArgument(arg.clone()));
-        }
-    }
+    // The shared profile policy owns normalization, allowlisting, reserved
+    // conflicts, value shape, and duplicate detection.
+    validate_profile_args(Engine::Vllm, &input.engine_args).map_err(|error| match error {
+        ProfileArgError::Reserved(flag) => ArgsError::ReservedConflict(flag),
+        ProfileArgError::Duplicate(flag) => ArgsError::DuplicateFlag(flag),
+        ProfileArgError::Unsupported(flag) => ArgsError::UnsupportedFlag(flag),
+        ProfileArgError::MissingValue(flag) => ArgsError::MissingValue(flag),
+        ProfileArgError::UnexpectedArgument(argument) => ArgsError::UnexpectedArgument(argument),
+    })?;
     // Validate granted budgets are finite and in range.
     if let Some(pct) = input.granted.gpu_utilization_pct {
         if pct == 0 || pct > 100 {

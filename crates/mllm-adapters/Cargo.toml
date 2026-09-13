@@ -9,6 +9,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde_json = "1"
+mllm-config = { path = "../mllm-config" }
 futures = { workspace = true }
 
 [dev-dependencies]

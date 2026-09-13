@@ -24,7 +24,7 @@
       "queue": {"max_pending_per_deployment": 64, "max_pending_total": 256, "max_buffered_bytes_total": "64MiB", "request_deadline": "600s", "admission_window": "2s"}
     },
     "runtime_profiles": {"local": {
-      "engine": "fake", "revision": 7, "executable": "/bin/true", "build_fingerprint": "fake-build-1",
+      "engine": "vllm", "revision": 7, "executable": "/bin/true", "build_fingerprint": "vllm-build-1",
       "qualification_id": "qualification-evidence-17", "args": ["--max-model-len", "4096"],
       "env": {"RUST_LOG": "info"},
       "security": {"experimental_controls": false, "credential_ref": "secret://engine-key"},

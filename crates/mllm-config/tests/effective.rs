@@ -29,7 +29,7 @@ fn duration_parser_is_separate_and_checked() {
 fn resolves_complete_typed_configuration_without_claiming_qualification() {
     let (deployment, host) = fixture();
     let effective = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(effective.profile.engine, Engine::Fake);
+    assert_eq!(effective.profile.engine, Engine::Vllm);
     assert_eq!(
         effective.profile.qualification_id,
         "qualification-evidence-17"
@@ -96,9 +96,51 @@ fn unknown_capacity_disables_default_and_observation_derivation_has_provenance()
 fn sglang_requires_separate_admin_authority_reference() {
     let (deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["engine"] = "sglang".into();
+    host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
     assert!(resolve_effective(&deployment, &host).is_err());
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
     assert!(resolve_effective(&deployment, &host).is_ok());
+}
+
+#[test]
+fn resolver_rejects_owned_or_unapproved_profile_arguments() {
+    for argument in ["--api-key=secret-value", "--future-unsafe-flag"] {
+        let (deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["args"] = serde_json::json!([argument]);
+        assert!(resolve_effective(&deployment, &host).is_err(), "{argument}");
+    }
+}
+
+#[test]
+fn resolver_rejects_secret_device_and_unrecognized_environment_names() {
+    for name in ["HF_TOKEN", "LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "SURPRISE"] {
+        let (deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["env"] = serde_json::json!({name: "secret-value"});
+        assert!(resolve_effective(&deployment, &host).is_err(), "{name}");
+    }
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["env"] = serde_json::json!({"RUST_LOG": "warn"});
+    let changed = resolve_effective(&deployment, &host).unwrap();
+    let (deployment, host) = fixture();
+    let original = resolve_effective(&deployment, &host).unwrap();
+    assert_ne!(
+        changed.qualification_fingerprint,
+        original.qualification_fingerprint
+    );
+}
+
+#[test]
+fn engines_without_reviewed_argument_allowlists_accept_only_empty_args() {
+    for engine in ["sglang", "fake"] {
+        let (deployment, mut host) = fixture();
+        host["runtime_profiles"]["local"]["engine"] = engine.into();
+        host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--max-model-len", "4096"]);
+        if engine == "sglang" {
+            host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+                "secret://admin".into();
+        }
+        assert!(resolve_effective(&deployment, &host).is_err(), "{engine}");
+    }
 }
 
 #[test]

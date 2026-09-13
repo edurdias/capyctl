@@ -1,5 +1,6 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
+use crate::engine_policy::{validate_profile_args, validate_profile_env};
 use crate::{ConfigError, ConfigErrorCode};
 use mllm_domain::resources as domain;
 use serde::{Deserialize, Serialize};
@@ -96,13 +97,7 @@ pub fn parse_duration_ms(text: &str) -> Result<i64, ConfigError> {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Engine {
-    Vllm,
-    Sglang,
-    Fake,
-}
+pub use crate::engine_policy::Engine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -485,6 +480,14 @@ pub fn resolve_effective(
             "runtime and admin credential references must differ",
         ));
     }
+    validate_profile_args(raw_profile.engine, &raw_profile.args)
+        .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
+    validate_profile_env(&raw_profile.env).map_err(|name| {
+        invalid(
+            format!("runtime_profiles.env.{name}"),
+            "environment name is not allowlisted",
+        )
+    })?;
     let (cold, cold_i) = phase(d.resources.cold, domain::ResourcePhase::Cold)?;
     let (ready, ready_i) = phase(d.resources.ready, domain::ResourcePhase::Ready)?;
     let (parking, parking_i) = phase(d.resources.parking, domain::ResourcePhase::Parking)?;

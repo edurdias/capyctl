@@ -990,6 +990,7 @@ dependencies = [
  "axum",
  "futures",
  "harness",
+ "mllm-config",
  "reqwest",
  "serde_json",
  "thiserror",
