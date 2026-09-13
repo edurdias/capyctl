@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
+use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
@@ -87,5 +87,24 @@ mod tests {
         let epoch: i64 = conn.query_row(
             "SELECT epoch FROM resource_ledger_meta WHERE singleton=1", [], |r| r.get(0)).unwrap();
         assert_eq!((revision, bytes, epoch), (1, 64, 0));
+    }
+
+    #[test]
+    fn v4_dispatch_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let state: (i64, String) = conn
+            .query_row(
+                "SELECT epoch, session_id FROM coordinator_session WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (0, String::new()));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_leases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

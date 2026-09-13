@@ -3,6 +3,7 @@
 //! idempotency, and owner-only file permissions.
 
 pub mod deployments;
+pub mod dispatch;
 pub mod migrations;
 pub mod resource_ledger;
 pub mod schema;

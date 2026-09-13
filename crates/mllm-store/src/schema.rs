@@ -105,6 +105,25 @@ CREATE TABLE resource_grants(
 );
 "#;
 
+pub const SCHEMA_V4: &str = r#"
+ALTER TABLE deployments ADD COLUMN dispatch_enabled INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_enabled IN (0,1));
+CREATE TABLE coordinator_session(
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    epoch INTEGER NOT NULL CHECK(epoch>=0),
+    session_id TEXT NOT NULL
+);
+INSERT INTO coordinator_session(singleton,epoch,session_id) VALUES (1,0,'');
+CREATE TABLE request_leases(
+    id TEXT PRIMARY KEY,
+    deployment_id TEXT NOT NULL REFERENCES deployments(id),
+    revision INTEGER NOT NULL CHECK(revision>=1),
+    generation INTEGER NOT NULL CHECK(generation>=1),
+    session_id TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK(disposition IN ('inflight','uncertain'))
+);
+CREATE INDEX request_leases_deployment ON request_leases(deployment_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
