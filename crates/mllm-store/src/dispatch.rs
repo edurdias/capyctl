@@ -1,4 +1,4 @@
-use rusqlite::{params, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorSession {
@@ -58,3 +58,139 @@ impl crate::Store {
         Ok(session)
     }
 }
+
+fn check_session(conn: &Connection, session: &CoordinatorSession) -> Result<(), DispatchError> {
+    let current: (i64, String) = conn.query_row(
+        "SELECT epoch,session_id FROM coordinator_session WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if session.epoch <= 0 || session.id.is_empty() || current != (session.epoch, session.id.clone())
+    {
+        return Err(DispatchError::StaleSession);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchRequest<'a> {
+    pub deployment_id: &'a str,
+    pub revision: i64,
+    pub generation: i64,
+    pub max_per_deployment: usize,
+    pub max_total: usize,
+}
+
+#[must_use = "a dispatch ticket represents retained backend work"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchTicket {
+    id: String,
+    deployment_id: String,
+    revision: i64,
+    generation: i64,
+    session_id: String,
+}
+impl DispatchTicket {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+}
+
+fn outstanding(conn: &Connection, deployment: &str) -> Result<usize, DispatchError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM request_leases WHERE deployment_id=?1",
+        [deployment],
+        |r| r.get(0),
+    )?;
+    usize::try_from(count).map_err(|_| DispatchError::Invalid)
+}
+
+impl crate::Store {
+    pub fn grant_dispatch(
+        &self,
+        session: &CoordinatorSession,
+        request: DispatchRequest<'_>,
+    ) -> Result<DispatchTicket, DispatchError> {
+        if request.deployment_id.is_empty()
+            || request.revision < 1
+            || request.generation < 1
+            || request.max_per_deployment == 0
+            || request.max_total == 0
+        {
+            return Err(DispatchError::Invalid);
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&transaction, session)?;
+        let row: Option<(i64, i64, String, i64, i64)> = transaction
+            .query_row(
+                "SELECT revision,current_generation,observed_state,
+                CASE WHEN admission_enabled=1 AND dispatch_enabled=1 THEN 1 ELSE 0 END,suspended
+             FROM deployments WHERE id=?1",
+                [request.deployment_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((revision, generation, state, enabled, suspended)) = row else {
+            return Err(DispatchError::Conflict);
+        };
+        if revision != request.revision || generation != request.generation {
+            return Err(DispatchError::Conflict);
+        }
+        if state != "ready" || enabled != 1 || suspended != 0 {
+            return Err(DispatchError::Closed);
+        }
+        let total: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM request_leases", [], |r| r.get(0))?;
+        if outstanding(&transaction, request.deployment_id)? >= request.max_per_deployment
+            || usize::try_from(total).map_err(|_| DispatchError::Invalid)? >= request.max_total
+        {
+            return Err(DispatchError::Full);
+        }
+        let ticket = DispatchTicket {
+            id: ulid::Ulid::new().to_string(),
+            deployment_id: request.deployment_id.into(),
+            revision,
+            generation,
+            session_id: session.id.clone(),
+        };
+        transaction.execute("INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition)
+            VALUES (?1,?2,?3,?4,?5,'inflight')",
+            params![ticket.id, ticket.deployment_id, ticket.revision, ticket.generation, ticket.session_id])?;
+        transaction.commit()?;
+        Ok(ticket)
+    }
+
+    pub fn close_dispatch(
+        &self,
+        session: &CoordinatorSession,
+        deployment: &str,
+        revision: i64,
+        generation: i64,
+    ) -> Result<usize, DispatchError> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&transaction, session)?;
+        let changed = transaction.execute(
+            "UPDATE deployments SET dispatch_enabled=0
+            WHERE id=?1 AND revision=?2 AND current_generation=?3",
+            params![deployment, revision, generation],
+        )?;
+        if changed != 1 {
+            return Err(DispatchError::Conflict);
+        }
+        let count = outstanding(&transaction, deployment)?;
+        transaction.commit()?;
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests;
