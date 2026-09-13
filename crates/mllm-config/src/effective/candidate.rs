@@ -125,10 +125,24 @@ pub struct CandidateCase {
     cycle: u32,
     count: u32,
     request_budget: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_digest",
+        skip_serializing_if = "Option::is_none"
+    )]
     corpus_digest: Option<String>,
 }
+fn present_digest<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
 impl CandidateCase {
+    pub fn kind(&self) -> CandidateCaseKind {
+        self.kind
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -148,7 +162,7 @@ impl CandidateCase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum CandidateCaseKind {
+pub enum CandidateCaseKind {
     ColdInitialize,
     Park,
     Restore,
@@ -175,6 +189,22 @@ pub struct CandidateRecipe {
     request_deadline_ms: i64,
 }
 impl CandidateRecipe {
+    pub fn recipe(&self) -> &str {
+        &self.recipe
+    }
+    pub fn residency(&self) -> Residency {
+        self.residency
+    }
+    pub fn recovery(&self) -> Recovery {
+        self.recovery
+    }
+    pub fn host_devices(&self) -> &BTreeMap<String, DevicePolicy> {
+        &self.host_devices
+    }
+    pub fn host_device_sharing(&self) -> Sharing {
+        self.host_device_sharing
+    }
+
     pub fn model(&self) -> &ModelIdentity {
         &self.model
     }
@@ -216,14 +246,14 @@ pub struct CandidateProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidateLogPolicy {
+pub struct CandidateLogPolicy {
     max_file_bytes: i64,
     retained_files: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
-enum CandidateLaunch {
+pub enum CandidateLaunch {
     Vllm {
         tensor_parallel_size: u32,
         pipeline_parallel_size: u32,
@@ -260,14 +290,14 @@ enum CandidateLaunch {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidateVllmBudget {
+pub struct CandidateVllmBudget {
     kv_cache_bytes: i64,
     swap_space_bytes: i64,
     gpu_utilization_pct: u8,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidateSglangBudget {
+pub struct CandidateSglangBudget {
     kv_cache_bytes: i64,
     static_memory_fraction_bps: u16,
 }
@@ -283,13 +313,13 @@ pub struct CandidateResources {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidatePhase {
+pub struct CandidatePhase {
     allocations: Vec<CandidateAllocation>,
     devices: Vec<DeviceClaim>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidateAllocation {
+pub struct CandidateAllocation {
     domain: String,
     bytes: i64,
     host_kv_bytes: i64,
@@ -351,6 +381,111 @@ fn check_size(value: &Value, path: &str) -> Result<(), ConfigError> {
     }
 }
 
+impl CandidateProfile {
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+    pub fn build_fingerprint(&self) -> &str {
+        &self.build_fingerprint
+    }
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+    pub fn launch_settings(&self) -> &CandidateLaunch {
+        &self.launch_settings
+    }
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+    pub fn experimental_controls(&self) -> bool {
+        self.experimental_controls
+    }
+    pub fn runtime_auth(&self) -> bool {
+        self.runtime_auth
+    }
+    pub fn admin_auth(&self) -> bool {
+        self.admin_auth
+    }
+    pub fn log_policy(&self) -> &CandidateLogPolicy {
+        &self.log_policy
+    }
+}
+
+impl CandidateLogPolicy {
+    pub fn max_file_bytes(&self) -> i64 {
+        self.max_file_bytes
+    }
+    pub fn retained_files(&self) -> u32 {
+        self.retained_files
+    }
+}
+
+impl CandidateVllmBudget {
+    pub fn kv_cache_bytes(&self) -> i64 {
+        self.kv_cache_bytes
+    }
+    pub fn swap_space_bytes(&self) -> i64 {
+        self.swap_space_bytes
+    }
+    pub fn gpu_utilization_pct(&self) -> u8 {
+        self.gpu_utilization_pct
+    }
+}
+
+impl CandidateSglangBudget {
+    pub fn kv_cache_bytes(&self) -> i64 {
+        self.kv_cache_bytes
+    }
+    pub fn static_memory_fraction_bps(&self) -> u16 {
+        self.static_memory_fraction_bps
+    }
+}
+
+impl CandidateResources {
+    pub fn cold(&self) -> &CandidatePhase {
+        &self.cold
+    }
+    pub fn ready(&self) -> &CandidatePhase {
+        &self.ready
+    }
+    pub fn parking(&self) -> &CandidatePhase {
+        &self.parking
+    }
+    pub fn parked(&self) -> &CandidatePhase {
+        &self.parked
+    }
+    pub fn wake(&self) -> &CandidatePhase {
+        &self.wake
+    }
+}
+
+impl CandidatePhase {
+    pub fn allocations(&self) -> &[CandidateAllocation] {
+        &self.allocations
+    }
+    pub fn devices(&self) -> &[DeviceClaim] {
+        &self.devices
+    }
+}
+
+impl CandidateAllocation {
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+    pub fn bytes(&self) -> i64 {
+        self.bytes
+    }
+    pub fn host_kv_bytes(&self) -> i64 {
+        self.host_kv_bytes
+    }
+}
+
 fn normalize(
     input: CandidateInput,
     trusted_host: &Value,
@@ -364,18 +499,16 @@ fn normalize(
             "schema version 1, candidate kind, and recipe_v1 suite required",
         ));
     }
-    validate_text(&input.host.id, "host.id", 256, false)?;
+    validate_selector(&input.host.id, "host.id")?;
     validate_text(
         &input.host.hardware_fingerprint,
         "host.hardware_fingerprint",
         4096,
-        true,
     )?;
     validate_text(
         &input.host.environment_fingerprint,
         "host.environment_fingerprint",
         4096,
-        true,
     )?;
     let h: HostInput = decode(trusted_host, "host")?;
     if h.schema_version != 1 || h.kind != "host" {
@@ -391,13 +524,9 @@ fn normalize(
         ));
     }
     let recipe = &input.effective_recipe;
-    validate_text(
-        &recipe.runtime_profile,
-        "effective_recipe.runtime_profile",
-        256,
-        false,
-    )?;
-    validate_text(&recipe.recipe, "effective_recipe.recipe", 4096, true)?;
+    validate_candidate_primitives(recipe)?;
+    validate_selector(&recipe.runtime_profile, "effective_recipe.runtime_profile")?;
+    validate_text(&recipe.recipe, "effective_recipe.recipe", 4096)?;
     for (p, v) in [
         ("effective_recipe.model.path", &recipe.model.path),
         (
@@ -406,7 +535,7 @@ fn normalize(
         ),
         ("effective_recipe.model.revision", &recipe.model.revision),
     ] {
-        validate_text(v, p, 4096, true)?;
+        validate_text(v, p, 4096)?;
     }
     if recipe.runtime_profile_revision == 0 {
         return Err(invalid(
@@ -556,19 +685,92 @@ fn normalize(
     Ok(output)
 }
 
-fn validate_text(v: &str, path: &str, max: usize, any: bool) -> Result<(), ConfigError> {
-    if v.is_empty()
-        || v.len() > max
-        || (!any
-            && !v
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
-    {
-        Err(invalid(path, "invalid bounded identifier or text"))
+fn validate_text(v: &str, path: &str, max: usize) -> Result<(), ConfigError> {
+    if v.is_empty() || v.len() > max {
+        Err(invalid(path, "invalid bounded text"))
     } else {
         Ok(())
     }
 }
+
+fn validate_selector(v: &str, path: &str) -> Result<(), ConfigError> {
+    validate_text(v, path, 256)
+}
+
+fn validate_case_id(v: &str) -> Result<(), ConfigError> {
+    validate_text(v, "cases.id", 64)?;
+    if !v
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(invalid("cases.id", "invalid case identifier"));
+    }
+    Ok(())
+}
+
+fn validate_candidate_primitives(recipe: &CandidateRecipe) -> Result<(), ConfigError> {
+    let p = &recipe.resolved_profile;
+    for value in [&p.executable, &p.build_fingerprint] {
+        validate_text(value, "effective_recipe.resolved_profile", 4096)?;
+    }
+    for arg in &p.args {
+        validate_text(arg, "effective_recipe.resolved_profile.args", 4096)?;
+    }
+    for (key, value) in &p.env {
+        validate_selector(key, "effective_recipe.resolved_profile.env.key")?;
+        validate_text(value, "effective_recipe.resolved_profile.env.value", 4096)?;
+    }
+    match &p.launch_settings {
+        CandidateLaunch::Vllm { kv_cache_dtype, .. } => {
+            validate_text(
+                kv_cache_dtype,
+                "effective_recipe.resolved_profile.launch_settings.kv_cache_dtype",
+                4096,
+            )?;
+        }
+        CandidateLaunch::Sglang {
+            recipe,
+            model_dtype,
+            weight_restore,
+            ..
+        } => {
+            for value in [recipe, model_dtype, weight_restore] {
+                validate_text(
+                    value,
+                    "effective_recipe.resolved_profile.launch_settings",
+                    4096,
+                )?;
+            }
+        }
+        CandidateLaunch::Fake => {}
+    }
+    for (key, device) in &recipe.host_devices {
+        validate_selector(key, "effective_recipe.host_devices.key")?;
+        validate_selector(&device.domain, "effective_recipe.host_devices.domain")?;
+    }
+    for device in &recipe.devices {
+        validate_selector(&device.id, "effective_recipe.devices.id")?;
+    }
+    for phase in [
+        &recipe.resources.cold,
+        &recipe.resources.ready,
+        &recipe.resources.parking,
+        &recipe.resources.parked,
+        &recipe.resources.wake,
+    ] {
+        for allocation in &phase.allocations {
+            validate_selector(
+                &allocation.domain,
+                "effective_recipe.resources.allocations.domain",
+            )?;
+        }
+        for device in &phase.devices {
+            validate_selector(&device.id, "effective_recipe.resources.devices.id")?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_limits(v: &CandidateLimits) -> Result<(), ConfigError> {
     if !(1..=86_400_000).contains(&v.max_run_duration_ms)
         || !(1..=3_600_000).contains(&v.max_cleanup_duration_ms)
@@ -595,40 +797,38 @@ fn validate_cases(
     let mut pairs = BTreeSet::new();
     let mut total = 0u32;
     let mut marker: Option<(&str, u32)> = None;
-    let max_cycle = cases.iter().map(|c| c.cycle).max().unwrap_or(0);
-    if (residency == Residency::Warm && max_cycle == 0)
-        || (residency == Residency::RestartOnly && max_cycle != 0)
+    // Work depends only on the bounded case count, never on an untrusted cycle.
+    if !cases.len().is_multiple_of(5)
+        || (residency == Residency::Warm && cases.len() < 10)
+        || (residency == Residency::RestartOnly && cases.len() != 5)
     {
         return Err(invalid("cases", "residency cycle contract mismatch"));
     }
-    let mut expected = vec![
-        (0, CandidateCaseKind::ColdInitialize),
-        (0, CandidateCaseKind::ReadyProbe),
-        (0, CandidateCaseKind::MarkerNonstreaming),
-        (0, CandidateCaseKind::MarkerStreaming),
-        (0, CandidateCaseKind::Security),
-    ];
-    for cycle in 1..=max_cycle {
-        for kind in [
-            CandidateCaseKind::Park,
-            CandidateCaseKind::Restore,
-            CandidateCaseKind::ReadyProbe,
-            CandidateCaseKind::MarkerNonstreaming,
-            CandidateCaseKind::MarkerStreaming,
-        ] {
-            expected.push((cycle, kind));
+    for (index, case) in cases.iter().enumerate() {
+        let cycle = (index / 5) as u32;
+        let kinds = if cycle == 0 {
+            [
+                CandidateCaseKind::ColdInitialize,
+                CandidateCaseKind::ReadyProbe,
+                CandidateCaseKind::MarkerNonstreaming,
+                CandidateCaseKind::MarkerStreaming,
+                CandidateCaseKind::Security,
+            ]
+        } else {
+            [
+                CandidateCaseKind::Park,
+                CandidateCaseKind::Restore,
+                CandidateCaseKind::ReadyProbe,
+                CandidateCaseKind::MarkerNonstreaming,
+                CandidateCaseKind::MarkerStreaming,
+            ]
+        };
+        if (case.cycle, case.kind) != (cycle, kinds[index % 5]) {
+            return Err(invalid("cases", "ordered recipe_v1 suite mismatch"));
         }
     }
-    if cases.len() != expected.len()
-        || cases
-            .iter()
-            .zip(&expected)
-            .any(|(c, e)| (c.cycle, c.kind) != *e)
-    {
-        return Err(invalid("cases", "ordered recipe_v1 suite mismatch"));
-    }
     for c in cases {
-        validate_text(&c.id, "cases.id", 64, false)?;
+        validate_case_id(&c.id)?;
         if !ids.insert(&c.id) || !pairs.insert((c.cycle, c.kind)) {
             return Err(invalid("cases", "duplicate case id or cycle/kind"));
         }

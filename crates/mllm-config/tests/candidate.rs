@@ -415,3 +415,237 @@ fn ordinary_routes_are_required_and_candidate_routes_are_forbidden() {
     candidate["effective_recipe"]["routes"] = serde_json::json!(["toy"]);
     assert!(normalize_candidate_manifest(&candidate, &host).is_err());
 }
+
+#[test]
+fn non_marker_digest_field_is_forbidden_even_when_null() {
+    for index in [0, 1, 4, 5, 6, 7] {
+        let (mut candidate, host) = fixture();
+        candidate["cases"][index]["corpus_digest"] = serde_json::Value::Null;
+        let text = serde_json::to_string(&candidate).unwrap();
+        assert!(normalize_candidate_manifest_text(&text, &host).is_err());
+        assert!(
+            normalize_candidate_manifest(&candidate, &host).is_err(),
+            "case {index}"
+        );
+    }
+}
+
+#[test]
+fn equal_local_profile_text_still_obeys_candidate_bounds() {
+    for field in ["build_fingerprint", "executable"] {
+        let (mut candidate, deployment, mut host) = engine_fixture("fake");
+        let oversized = if field == "executable" {
+            format!("/{}", "x".repeat(4096))
+        } else {
+            "x".repeat(4097)
+        };
+        host["runtime_profiles"]["local"][field] = oversized.clone().into();
+        candidate["effective_recipe"]["resolved_profile"][field] = oversized.into();
+        assert!(resolve_effective(&deployment, &host).is_ok());
+        assert!(
+            normalize_candidate_manifest(&candidate, &host).is_err(),
+            "{field}"
+        );
+    }
+    let (mut candidate, deployment, mut host) = engine_fixture("fake");
+    host["runtime_profiles"]["local"]["env"]["RUST_LOG"] = "x".repeat(4097).into();
+    candidate["effective_recipe"]["resolved_profile"]["env"]["RUST_LOG"] = "x".repeat(4097).into();
+    assert!(resolve_effective(&deployment, &host).is_ok());
+    assert!(normalize_candidate_manifest(&candidate, &host).is_err());
+}
+
+#[test]
+fn selectors_accept_exact_utf8_local_keys_while_case_ids_stay_ascii() {
+    for selector in [
+        "local profile",
+        "profiles/local",
+        "配置",
+        "x",
+        &"é".repeat(128),
+    ] {
+        let (mut candidate, mut host) = fixture();
+        host["name"] = selector.into();
+        candidate["host"]["id"] = selector.into();
+        let profile = host["runtime_profiles"]
+            .as_object_mut()
+            .unwrap()
+            .remove("local")
+            .unwrap();
+        host["runtime_profiles"][selector] = profile;
+        candidate["effective_recipe"]["runtime_profile"] = selector.into();
+        assert!(
+            normalize_candidate_manifest(&candidate, &host).is_ok(),
+            "selector with {} bytes",
+            selector.len()
+        );
+    }
+    let (mut candidate, host) = fixture();
+    candidate["cases"][0]["id"] = "case/id".into();
+    assert!(normalize_candidate_manifest(&candidate, &host).is_err());
+}
+
+#[test]
+fn normalized_recipe_is_consumable_through_immutable_typed_views() {
+    use mllm_config::effective::{
+        candidate::{CandidateCaseKind, CandidateLaunch},
+        Engine, Recovery, Residency, Sharing,
+    };
+    let (candidate, host) = fixture();
+    let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+    let recipe = normalized.effective_recipe();
+    assert_eq!(recipe.recipe(), "standard");
+    assert_eq!(recipe.residency(), Residency::Warm);
+    assert_eq!(recipe.recovery(), Recovery::Reconcile);
+    assert_eq!(recipe.host_devices()["gpu0"].domain, "unified");
+    assert_eq!(recipe.host_device_sharing(), Sharing::Shared);
+    let profile = recipe.profile();
+    assert_eq!(profile.engine(), Engine::Vllm);
+    assert_eq!(profile.revision(), 7);
+    assert_eq!(profile.executable(), "/bin/true");
+    assert_eq!(profile.build_fingerprint(), "vllm-build-1");
+    assert_eq!(profile.args(), ["--max-model-len", "4096"]);
+    assert_eq!(profile.env()["RUST_LOG"], "info");
+    assert!(profile.experimental_controls());
+    assert!(profile.runtime_auth());
+    assert!(!profile.admin_auth());
+    assert_eq!(profile.log_policy().max_file_bytes(), 16777216);
+    assert_eq!(profile.log_policy().retained_files(), 3);
+    let CandidateLaunch::Vllm {
+        requested_budget, ..
+    } = profile.launch_settings()
+    else {
+        panic!("vllm")
+    };
+    assert_eq!(requested_budget.kv_cache_bytes(), 4294967296);
+    assert_eq!(requested_budget.swap_space_bytes(), 0);
+    assert_eq!(requested_budget.gpu_utilization_pct(), 75);
+    let resources = recipe.resources();
+    assert_eq!(resources.cold().allocations()[0].domain(), "unified");
+    assert_eq!(resources.cold().allocations()[0].bytes(), 10737418240);
+    assert_eq!(
+        resources.ready().allocations()[0].host_kv_bytes(),
+        1073741824
+    );
+    assert_eq!(resources.parking().devices()[0].id, "gpu0");
+    assert!(resources.parked().devices().is_empty());
+    assert_eq!(resources.wake().allocations()[0].bytes(), 10737418240);
+    assert_eq!(
+        normalized.cases()[0].kind(),
+        CandidateCaseKind::ColdInitialize
+    );
+    let (candidate, _, host) = engine_fixture("sglang");
+    let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+    let CandidateLaunch::Sglang {
+        requested_budget, ..
+    } = normalized.effective_recipe().profile().launch_settings()
+    else {
+        panic!("sglang")
+    };
+    assert_eq!(requested_budget.kv_cache_bytes(), 4294967296);
+    assert_eq!(requested_budget.static_memory_fraction_bps(), 7500);
+}
+
+#[test]
+fn supplied_cycle_values_cannot_expand_work_beyond_case_count() {
+    // Added only after the bounded-index implementation; never run OOM payloads
+    // against the previous max_cycle-driven allocation.
+    for cycle in [25, 128, 1000, u32::MAX - 1, u32::MAX] {
+        let (mut candidate, host) = fixture();
+        candidate["cases"][9]["cycle"] = cycle.into();
+        assert!(
+            normalize_candidate_manifest(&candidate, &host).is_err(),
+            "{cycle}"
+        );
+    }
+    let (mut candidate, host) = fixture();
+    let repeated = candidate["cases"].as_array().unwrap()[5..10].to_vec();
+    for cycle in 2..=24 {
+        for mut case in repeated.clone() {
+            case["id"] = format!("{}-{cycle}", case["id"].as_str().unwrap()).into();
+            case["cycle"] = cycle.into();
+            candidate["cases"].as_array_mut().unwrap().push(case);
+        }
+    }
+    candidate["limits"]["max_requests"] = 128.into();
+    let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
+    assert_eq!(normalized.cases().len(), 125);
+    assert_eq!(normalized.cases().last().unwrap().cycle(), 24);
+}
+
+fn rename_exact_key_and_value(value: &mut serde_json::Value, old: &str, new: &str) {
+    match value {
+        serde_json::Value::String(s) if s == old => *s = new.into(),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rename_exact_key_and_value(value, old, new);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(value) = map.remove(old) {
+                map.insert(new.into(), value);
+            }
+            for value in map.values_mut() {
+                rename_exact_key_and_value(value, old, new);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn topology_selectors_are_bounded_utf8_exact_keys() {
+    for old in ["gpu0", "unified"] {
+        for (selector, valid) in [
+            ("显卡 / local".to_string(), true),
+            ("é".repeat(128), true),
+            ("x".repeat(257), false),
+        ] {
+            let (mut candidate, mut deployment, mut host) = engine_fixture("vllm");
+            for value in [&mut candidate, &mut deployment, &mut host] {
+                rename_exact_key_and_value(value, old, &selector);
+            }
+            assert!(resolve_effective(&deployment, &host).is_ok());
+            assert_eq!(
+                normalize_candidate_manifest(&candidate, &host).is_ok(),
+                valid,
+                "{old} {} bytes",
+                selector.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn profile_text_byte_boundaries_cover_args_and_environment() {
+    for (text, valid) in [
+        ("é".repeat(2048), true),
+        ("x".repeat(4097), false),
+        (String::new(), false),
+    ] {
+        for field in ["build_fingerprint", "args", "env"] {
+            let (mut candidate, mut host) = fixture();
+            let local = &mut host["runtime_profiles"]["local"];
+            let asserted = &mut candidate["effective_recipe"]["resolved_profile"];
+            match field {
+                "args" => {
+                    local["args"][1] = text.clone().into();
+                    asserted["args"][1] = text.clone().into();
+                }
+                "env" => {
+                    local["env"]["RUST_LOG"] = text.clone().into();
+                    asserted["env"]["RUST_LOG"] = text.clone().into();
+                }
+                _ => {
+                    local[field] = text.clone().into();
+                    asserted[field] = text.clone().into();
+                }
+            }
+            assert_eq!(
+                normalize_candidate_manifest(&candidate, &host).is_ok(),
+                valid,
+                "{field} {} bytes",
+                text.len()
+            );
+        }
+    }
+}
