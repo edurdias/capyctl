@@ -78,14 +78,23 @@ fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
         ResourcePhase::Parked => "parked",
         ResourcePhase::Wake => "wake",
     };
-    let mut allocations: Vec<_> = footprint.allocations.iter()
-        .map(|a| (a.domain.clone(), a.bytes, a.host_kv_bytes)).collect();
-    let mut devices: Vec<_> = footprint.devices.iter()
-        .map(|d| (d.device.clone(), d.sharing == Sharing::Shared)).collect();
+    let mut allocations: Vec<_> = footprint
+        .allocations
+        .iter()
+        .map(|a| (a.domain.clone(), a.bytes, a.host_kv_bytes))
+        .collect();
+    let mut devices: Vec<_> = footprint
+        .devices
+        .iter()
+        .map(|d| (d.device.clone(), d.sharing == Sharing::Shared))
+        .collect();
     allocations.sort();
     devices.sort();
     Ok(serde_json::to_string(&StoredFootprint {
-        version: 1, phase: phase.into(), allocations, devices,
+        version: 1,
+        phase: phase.into(),
+        allocations,
+        devices,
     })?)
 }
 
@@ -106,28 +115,41 @@ pub enum GrantReceipt {
     Recorded { epoch: u64 },
 }
 
-fn ensure_increasing(old: Option<&PhaseFootprint>, next: &PhaseFootprint)
-    -> Result<(), ResourceStoreError> {
-    if !matches!(next.phase, ResourcePhase::Cold | ResourcePhase::Parking | ResourcePhase::Wake) {
+fn ensure_increasing(
+    old: Option<&PhaseFootprint>,
+    next: &PhaseFootprint,
+) -> Result<(), ResourceStoreError> {
+    if !matches!(
+        next.phase,
+        ResourcePhase::Cold | ResourcePhase::Parking | ResourcePhase::Wake
+    ) {
         return Err(ResourceStoreError::Conflict);
     }
     match old {
         None if next.phase != ResourcePhase::Cold => Err(ResourceStoreError::Conflict),
         Some(old) => {
-            if !matches!((old.phase, next.phase),
-                (ResourcePhase::Ready, ResourcePhase::Parking) |
-                (ResourcePhase::Parked, ResourcePhase::Wake)) {
+            if !matches!(
+                (old.phase, next.phase),
+                (ResourcePhase::Ready, ResourcePhase::Parking)
+                    | (ResourcePhase::Parked, ResourcePhase::Wake)
+            ) {
                 return Err(ResourceStoreError::Conflict);
             }
             for previous in &old.allocations {
-                let current = next.allocations.iter().find(|a| a.domain == previous.domain)
+                let current = next
+                    .allocations
+                    .iter()
+                    .find(|a| a.domain == previous.domain)
                     .ok_or(ResourceStoreError::Conflict)?;
-                if current.bytes < previous.bytes || current.host_kv_bytes < previous.host_kv_bytes {
+                if current.bytes < previous.bytes || current.host_kv_bytes < previous.host_kv_bytes
+                {
                     return Err(ResourceStoreError::Conflict);
                 }
             }
             for claim in &old.devices {
-                if !next.devices.contains(claim) { return Err(ResourceStoreError::Conflict); }
+                if !next.devices.contains(claim) {
+                    return Err(ResourceStoreError::Conflict);
+                }
             }
             Ok(())
         }
@@ -167,54 +189,115 @@ pub(crate) fn reserve_increase_in_transaction(
     request: &GrantRequest,
     context: AdmissionContext<'_>,
 ) -> Result<GrantReceipt, ResourceStoreError> {
-    if request.id.is_empty() || request.deployment_id.is_empty()
-        || request.operation_id.is_empty() || request.revision < 1 || request.generation < 1 {
+    if request.id.is_empty()
+        || request.deployment_id.is_empty()
+        || request.operation_id.is_empty()
+        || request.revision < 1
+        || request.generation < 1
+    {
         return Err(ResourceStoreError::Invalid);
     }
     let encoded = encode(&request.next)?;
     let identity = serde_json::to_string(&(
-        &request.deployment_id, &request.operation_id, request.revision,
-        request.generation, request.expected_epoch, &encoded,
+        &request.deployment_id,
+        &request.operation_id,
+        request.revision,
+        request.generation,
+        request.expected_epoch,
+        &encoded,
     ))?;
-    let prior: Option<(String, i64)> = transaction.query_row(
-        "SELECT request_json, committed_epoch FROM resource_grants WHERE id=?1",
-        [&request.id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let prior: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT request_json, committed_epoch FROM resource_grants WHERE id=?1",
+            [&request.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
     if let Some((previous, epoch)) = prior {
-        if previous != identity { return Err(ResourceStoreError::Conflict); }
+        if previous != identity {
+            return Err(ResourceStoreError::Conflict);
+        }
         let epoch = u64::try_from(epoch).map_err(|_| ResourceStoreError::Invalid)?;
         return Ok(GrantReceipt::Recorded { epoch });
     }
-    let state: Option<(i64, i64, String, String)> = transaction.query_row(
-        "SELECT d.revision, d.current_generation, d.kind, o.state
+    let state: Option<(i64, i64, String, String)> = transaction
+        .query_row(
+            "SELECT d.revision, d.current_generation, d.kind, o.state
          FROM deployments d JOIN operations o ON o.deployment_id=d.id
          WHERE d.id=?1 AND o.id=?2",
-        params![request.deployment_id, request.operation_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+            params![request.deployment_id, request.operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
     let Some((revision, generation, kind, operation_state)) = state else {
         return Err(ResourceStoreError::Conflict);
     };
-    if revision != request.revision || generation != request.generation || kind != "model"
-        || !matches!(operation_state.as_str(), "pending" | "running") {
+    if revision != request.revision
+        || generation != request.generation
+        || kind != "model"
+        || !matches!(operation_state.as_str(), "pending" | "running")
+    {
         return Err(ResourceStoreError::Conflict);
     }
     let snapshot = read_snapshot(transaction)?;
-    if snapshot.epoch != request.expected_epoch { return Err(ResourceStoreError::Conflict); }
+    if snapshot.epoch != request.expected_epoch {
+        return Err(ResourceStoreError::Conflict);
+    }
     ensure_increasing(snapshot.owners.get(&request.deployment_id), &request.next)?;
     admit_phase(&snapshot, &request.deployment_id, &request.next, context)?;
-    let epoch = i64::try_from(snapshot.epoch).ok().and_then(|e| e.checked_add(1))
+    let epoch = i64::try_from(snapshot.epoch)
+        .ok()
+        .and_then(|e| e.checked_add(1))
         .ok_or(ResourceStoreError::Invalid)?;
     transaction.execute(
         "INSERT INTO resource_owners(owner_id, footprint_json) VALUES (?1, ?2)
          ON CONFLICT(owner_id) DO UPDATE SET footprint_json=excluded.footprint_json",
-        params![request.deployment_id, encoded])?;
-    transaction.execute("UPDATE resource_ledger_meta SET epoch=?1 WHERE singleton=1", [epoch])?;
+        params![request.deployment_id, encoded],
+    )?;
+    transaction.execute(
+        "UPDATE resource_ledger_meta SET epoch=?1 WHERE singleton=1",
+        [epoch],
+    )?;
     transaction.execute(
         "INSERT INTO resource_grants(id, deployment_id, operation_id, request_json, committed_epoch)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![request.id, request.deployment_id, request.operation_id, identity, epoch])?;
-    Ok(GrantReceipt::New { epoch: epoch as u64 })
+    Ok(GrantReceipt::New {
+        epoch: epoch as u64,
+    })
 }
 
+pub(crate) fn advance_completion_epoch(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<u64, crate::lifecycle::LifecycleError> {
+    let epoch: i64 = tx.query_row(
+        "SELECT epoch FROM resource_ledger_meta WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let next = epoch
+        .checked_add(1)
+        .filter(|v| *v > 0)
+        .ok_or(crate::lifecycle::LifecycleError::CorruptStoredData)?;
+    tx.execute(
+        "UPDATE resource_ledger_meta SET epoch=?1 WHERE singleton=1",
+        [next],
+    )?;
+    Ok(next as u64)
+}
+pub(crate) fn release_verified_candidate_owner(
+    tx: &rusqlite::Transaction<'_>,
+    deployment: &str,
+) -> Result<(), crate::lifecycle::LifecycleError> {
+    if tx.execute(
+        "DELETE FROM resource_owners WHERE owner_id=?1",
+        [deployment],
+    )? != 1
+    {
+        return Err(crate::lifecycle::LifecycleError::CorruptStoredData);
+    }
+    Ok(())
+}
 impl crate::Store {
     pub fn resource_snapshot(&self) -> Result<LedgerSnapshot, ResourceStoreError> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
@@ -223,8 +306,11 @@ impl crate::Store {
         Ok(snapshot)
     }
 
-    pub fn reserve_increase(&self, request: &GrantRequest, context: AdmissionContext<'_>)
-        -> Result<GrantReceipt, ResourceStoreError> {
+    pub fn reserve_increase(
+        &self,
+        request: &GrantRequest,
+        context: AdmissionContext<'_>,
+    ) -> Result<GrantReceipt, ResourceStoreError> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let receipt = reserve_increase_in_transaction(&transaction, request, context)?;
         transaction.commit()?;
@@ -260,13 +346,31 @@ mod tests {
 
     #[test]
     fn canonical_encoding_roundtrips_all_claims() {
-        let footprint = PhaseFootprint { phase: ResourcePhase::Ready, allocations: vec![
-            Allocation { domain: "gpu-memory:0".into(), bytes: 64, host_kv_bytes: 0 },
-            Allocation { domain: "system".into(), bytes: 32, host_kv_bytes: 8 },
-        ], devices: vec![
-            DeviceClaim { device: "gpu0".into(), sharing: Sharing::Shared },
-            DeviceClaim { device: "gpu1".into(), sharing: Sharing::Exclusive },
-        ] };
+        let footprint = PhaseFootprint {
+            phase: ResourcePhase::Ready,
+            allocations: vec![
+                Allocation {
+                    domain: "gpu-memory:0".into(),
+                    bytes: 64,
+                    host_kv_bytes: 0,
+                },
+                Allocation {
+                    domain: "system".into(),
+                    bytes: 32,
+                    host_kv_bytes: 8,
+                },
+            ],
+            devices: vec![
+                DeviceClaim {
+                    device: "gpu0".into(),
+                    sharing: Sharing::Shared,
+                },
+                DeviceClaim {
+                    device: "gpu1".into(),
+                    sharing: Sharing::Exclusive,
+                },
+            ],
+        };
         let encoded = encode(&footprint).unwrap();
         assert_eq!(decode(&encoded).unwrap(), footprint);
         let mut reordered = footprint;
@@ -293,71 +397,139 @@ mod transaction_fault_tests {
           admission_enabled,suspended,current_generation,schema_version)
           VALUES ('a','a','model','stopped',1,0,1,1);
           INSERT INTO operations(id,deployment_id,kind,state) VALUES ('op-a','a','start','running');").unwrap();
-        let request = GrantRequest { id: "grant-a".into(), deployment_id: "a".into(),
-            operation_id: "op-a".into(), revision: 1, generation: 1, expected_epoch: 0,
-            next: PhaseFootprint { phase: ResourcePhase::Cold,
-                allocations: vec![Allocation { domain: "system".into(), bytes: 60, host_kv_bytes: 0 }],
-                devices: vec![] } };
+        let request = GrantRequest {
+            id: "grant-a".into(),
+            deployment_id: "a".into(),
+            operation_id: "op-a".into(),
+            revision: 1,
+            generation: 1,
+            expected_epoch: 0,
+            next: PhaseFootprint {
+                phase: ResourcePhase::Cold,
+                allocations: vec![Allocation {
+                    domain: "system".into(),
+                    bytes: 60,
+                    host_kv_bytes: 0,
+                }],
+                devices: vec![],
+            },
+        };
         (store, request)
     }
 
     #[test]
     fn receipt_failure_rolls_back_owner_and_epoch() {
         let (store, request) = fixture();
-        store.conn.execute_batch("CREATE TRIGGER reject_grant BEFORE INSERT ON resource_grants
-            BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;").unwrap();
-        let obs = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-            available_bytes: 128, sampled_at_ms: 100 }];
-        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_grant BEFORE INSERT ON resource_grants
+            BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;",
+            )
+            .unwrap();
+        let obs = [MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "system".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
         let context = AdmissionContext::new(&obs, &limits, 101, 60, 4);
-        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Sql(_))));
-        assert_eq!(store.resource_snapshot().unwrap(), LedgerSnapshot { epoch: 0, owners: Default::default() });
-        store.conn.execute_batch("DROP TRIGGER reject_grant;").unwrap();
-        assert_eq!(store.reserve_increase(&request, context).unwrap(), GrantReceipt::New { epoch: 1 });
+        assert!(matches!(
+            store.reserve_increase(&request, context),
+            Err(ResourceStoreError::Sql(_))
+        ));
+        assert_eq!(
+            store.resource_snapshot().unwrap(),
+            LedgerSnapshot {
+                epoch: 0,
+                owners: Default::default()
+            }
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_grant;")
+            .unwrap();
+        assert_eq!(
+            store.reserve_increase(&request, context).unwrap(),
+            GrantReceipt::New { epoch: 1 }
+        );
     }
 
     #[test]
     fn caller_rollback_reverts_transaction_local_reservation() {
         let (store, request) = fixture();
-        let observations = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-            available_bytes: 128, sampled_at_ms: 100 }];
-        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
-        let transaction = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+        let observations = [MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "system".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
+        let transaction =
+            Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
 
         assert_eq!(
             reserve_increase_in_transaction(
                 &transaction,
                 &request,
                 reservation_context(&observations, &limits),
-            ).unwrap(),
+            )
+            .unwrap(),
             GrantReceipt::New { epoch: 1 },
         );
         transaction.rollback().unwrap();
 
-        assert_eq!(store.resource_snapshot().unwrap(), LedgerSnapshot {
-            epoch: 0,
-            owners: Default::default(),
-        });
-        let grants: i64 = store.conn.query_row(
-            "SELECT COUNT(*) FROM resource_grants", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            store.resource_snapshot().unwrap(),
+            LedgerSnapshot {
+                epoch: 0,
+                owners: Default::default(),
+            }
+        );
+        let grants: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM resource_grants", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(grants, 0);
     }
 
     #[test]
     fn caller_sql_failure_then_drop_reverts_transaction_local_reservation() {
         let (store, request) = fixture();
-        let observations = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-            available_bytes: 128, sampled_at_ms: 100 }];
-        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
-        let transaction = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+        let observations = [MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "system".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
+        let transaction =
+            Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
         reserve_increase_in_transaction(
             &transaction,
             &request,
             reservation_context(&observations, &limits),
-        ).unwrap();
+        )
+        .unwrap();
 
         let failure = transaction.execute(
             "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version)
@@ -367,36 +539,55 @@ mod transaction_fault_tests {
         assert!(matches!(failure, Err(rusqlite::Error::SqliteFailure(_, _))));
         drop(transaction);
 
-        assert_eq!(store.resource_snapshot().unwrap(), LedgerSnapshot {
-            epoch: 0,
-            owners: Default::default(),
-        });
-        let grants: i64 = store.conn.query_row(
-            "SELECT COUNT(*) FROM resource_grants", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            store.resource_snapshot().unwrap(),
+            LedgerSnapshot {
+                epoch: 0,
+                owners: Default::default(),
+            }
+        );
+        let grants: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM resource_grants", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(grants, 0);
     }
 
     #[test]
     fn caller_commit_persists_transaction_local_reservation() {
         let (store, request) = fixture();
-        let observations = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-            available_bytes: 128, sampled_at_ms: 100 }];
-        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
-        let transaction = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+        let observations = [MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "system".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
+        let transaction =
+            Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
 
         let receipt = reserve_increase_in_transaction(
             &transaction,
             &request,
             reservation_context(&observations, &limits),
-        ).unwrap();
+        )
+        .unwrap();
         transaction.commit().unwrap();
 
         assert_eq!(receipt, GrantReceipt::New { epoch: 1 });
-        assert_eq!(store.resource_snapshot().unwrap(), LedgerSnapshot {
-            epoch: 1,
-            owners: [(request.deployment_id.clone(), request.next.clone())].into(),
-        });
+        assert_eq!(
+            store.resource_snapshot().unwrap(),
+            LedgerSnapshot {
+                epoch: 1,
+                owners: [(request.deployment_id.clone(), request.next.clone())].into(),
+            }
+        );
         let grant: (String, String, i64) = store.conn.query_row(
             "SELECT deployment_id, operation_id, committed_epoch FROM resource_grants WHERE id=?1",
             [&request.id],
@@ -408,20 +599,37 @@ mod transaction_fault_tests {
     #[test]
     fn caller_transaction_replay_is_recorded_and_changed_identity_conflicts() {
         let (store, request) = fixture();
-        let observations = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-            available_bytes: 128, sampled_at_ms: 100 }];
-        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
-        let transaction = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+        let observations = [MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "system".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
+        let transaction =
+            Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
         let context = || reservation_context(&observations, &limits);
 
-        assert_eq!(reserve_increase_in_transaction(&transaction, &request, context()).unwrap(),
-            GrantReceipt::New { epoch: 1 });
-        assert_eq!(reserve_increase_in_transaction(&transaction, &request, context()).unwrap(),
-            GrantReceipt::Recorded { epoch: 1 });
+        assert_eq!(
+            reserve_increase_in_transaction(&transaction, &request, context()).unwrap(),
+            GrantReceipt::New { epoch: 1 }
+        );
+        assert_eq!(
+            reserve_increase_in_transaction(&transaction, &request, context()).unwrap(),
+            GrantReceipt::Recorded { epoch: 1 }
+        );
         let snapshot = read_snapshot(&transaction).unwrap();
         assert_eq!(snapshot.epoch, 1);
-        assert_eq!(snapshot.owners.get(&request.deployment_id), Some(&request.next));
+        assert_eq!(
+            snapshot.owners.get(&request.deployment_id),
+            Some(&request.next)
+        );
 
         let mut changed = request.clone();
         changed.operation_id = "changed-operation".into();
@@ -436,7 +644,10 @@ mod transaction_fault_tests {
         let (store, _) = fixture();
         store.conn.execute_batch("INSERT INTO owners(id,kind,deployment_id) VALUES ('a','model','a');
             INSERT INTO reservations(owner_id,domain_id,bytes,phase) VALUES ('a','system',60,'activation');").unwrap();
-        assert!(matches!(store.resource_snapshot(), Err(ResourceStoreError::NeedsReconciliation)));
+        assert!(matches!(
+            store.resource_snapshot(),
+            Err(ResourceStoreError::NeedsReconciliation)
+        ));
     }
 
     #[test]
@@ -444,7 +655,10 @@ mod transaction_fault_tests {
         let (_, request) = fixture();
         let mut old = request.next;
         old.phase = ResourcePhase::Ready;
-        old.devices.push(DeviceClaim { device: "gpu0".into(), sharing: Sharing::Shared });
+        old.devices.push(DeviceClaim {
+            device: "gpu0".into(),
+            sharing: Sharing::Shared,
+        });
         let mut next = old.clone();
         next.phase = ResourcePhase::Parking;
         assert!(ensure_increasing(Some(&old), &next).is_ok());
@@ -460,23 +674,64 @@ mod transaction_fault_tests {
     #[test]
     fn changed_revision_terminal_operation_and_corrupt_ledger_block_grants() {
         let (store, mut request) = fixture();
-        let obs = [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-            available_bytes: 128, sampled_at_ms: 100 }];
-        let limits = [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-            free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }];
+        let obs = [MemoryObservation {
+            domain: "system".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "system".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
         let context = AdmissionContext::new(&obs, &limits, 101, 60, 4);
-        store.conn.execute("UPDATE deployments SET revision=2 WHERE id='a'", []).unwrap();
-        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Conflict)));
+        store
+            .conn
+            .execute("UPDATE deployments SET revision=2 WHERE id='a'", [])
+            .unwrap();
+        assert!(matches!(
+            store.reserve_increase(&request, context),
+            Err(ResourceStoreError::Conflict)
+        ));
         request.revision = 2;
-        store.conn.execute("UPDATE operations SET state='failed' WHERE id='op-a'", []).unwrap();
-        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Conflict)));
-        store.conn.execute("UPDATE operations SET state='running' WHERE id='op-a'", []).unwrap();
-        store.conn.execute("INSERT INTO resource_owners(owner_id,footprint_json) VALUES ('a','{}')", []).unwrap();
-        assert!(matches!(store.reserve_increase(&request, context), Err(ResourceStoreError::Json(_))));
-        let epoch: i64 = store.conn.query_row(
-            "SELECT epoch FROM resource_ledger_meta WHERE singleton=1", [], |r| r.get(0)).unwrap();
-        let receipts: i64 = store.conn.query_row(
-            "SELECT COUNT(*) FROM resource_grants", [], |r| r.get(0)).unwrap();
+        store
+            .conn
+            .execute("UPDATE operations SET state='failed' WHERE id='op-a'", [])
+            .unwrap();
+        assert!(matches!(
+            store.reserve_increase(&request, context),
+            Err(ResourceStoreError::Conflict)
+        ));
+        store
+            .conn
+            .execute("UPDATE operations SET state='running' WHERE id='op-a'", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO resource_owners(owner_id,footprint_json) VALUES ('a','{}')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.reserve_increase(&request, context),
+            Err(ResourceStoreError::Json(_))
+        ));
+        let epoch: i64 = store
+            .conn
+            .query_row(
+                "SELECT epoch FROM resource_ledger_meta WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let receipts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM resource_grants", [], |r| r.get(0))
+            .unwrap();
         assert_eq!((epoch, receipts), (0, 0));
     }
 }

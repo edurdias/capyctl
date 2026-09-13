@@ -250,6 +250,24 @@ CREATE TABLE qualification_evidence_refs(
 );
 "#;
 
+pub const SCHEMA_V9: &str = r#"
+CREATE TABLE owned_launch_associations(
+  step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),
+  binding_id TEXT NOT NULL UNIQUE REFERENCES runtime_bindings(id),
+  incarnation TEXT NOT NULL UNIQUE,
+  association_json TEXT NOT NULL CHECK(length(CAST(association_json AS BLOB)) <= 1048576)
+);
+CREATE TABLE candidate_cleanup_actions(
+  operation_id TEXT PRIMARY KEY REFERENCES lifecycle_runs(operation_id),
+  run_id TEXT NOT NULL REFERENCES qualification_runs(id),
+  step_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_steps(id),
+  predecessor_cleanup_operation_id TEXT UNIQUE REFERENCES candidate_cleanup_actions(operation_id),
+  CHECK(predecessor_cleanup_operation_id IS NULL OR predecessor_cleanup_operation_id != operation_id)
+);
+CREATE UNIQUE INDEX one_initial_candidate_cleanup ON candidate_cleanup_actions(run_id)
+  WHERE predecessor_cleanup_operation_id IS NULL;
+"#;
+
 pub const SCHEMA_V8: &str = r#"
 CREATE TABLE qualification_case_actions(
   run_id TEXT NOT NULL REFERENCES qualification_runs(id),

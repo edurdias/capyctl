@@ -3,6 +3,24 @@ use std::collections::BTreeSet;
 use crate::resources::{validate_footprint, PhaseFootprint, ResourcePhase};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedLaunchReceipt {
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<ProcessIdentity>,
+    pub observed_at_ms: i64,
+    pub receipt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupEvidence {
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<ProcessIdentity>,
+    pub observed_at_ms: i64,
+    pub receipt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepExecutionContext {
     pub token: TransitionToken,
     pub binding_id: String,

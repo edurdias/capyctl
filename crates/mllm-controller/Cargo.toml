@@ -17,5 +17,7 @@ mllm-store = { workspace = true }
 mllm-launchers = { path = "../mllm-launchers" }
 
 [dev-dependencies]
+mllm-config = { workspace = true }
+serde_json = "1"
 async-trait = { workspace = true }
 tempfile = { workspace = true }

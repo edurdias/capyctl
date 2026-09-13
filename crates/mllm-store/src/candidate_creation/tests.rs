@@ -1048,14 +1048,12 @@ fn candidate_creation_historical_terminal_state_does_not_recreate_acceptance() {
         .execute("UPDATE runtime_bindings SET state='released'", [])
         .unwrap();
     store.conn.execute("UPDATE qualification_runs SET cleanup_state='verified_gone',cleanup_step_id='cleanup-step'",[]).unwrap();
-    let snapshot = store
-        .candidate_run_snapshot("owner", receipt.run_id())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        snapshot.cleanup_state(),
-        CandidateCleanupState::VerifiedGone
-    );
+    // A bare completed row cannot establish verified disappearance. Real cleanup
+    // replay is exercised through the acceptance/arm/association protocol.
+    assert!(matches!(
+        store.candidate_run_snapshot("owner", receipt.run_id()),
+        Err(CandidateCreationError::CorruptStoredData)
+    ));
     assert_eq!(
         store
             .create_candidate_run(&session, "owner", "key", &body, &Value::Null, 0)

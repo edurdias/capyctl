@@ -808,6 +808,14 @@ fn load_execution_step(
     tx: &Transaction<'_>,
     id: &str,
 ) -> std::result::Result<(CandidateRunSnapshot, InitializeReceiptV1, ReadStep), LifecycleError> {
+    let result = load_execution_step_immutable(tx, id)?;
+    retained(tx, &result.0, &result.2)?;
+    Ok(result)
+}
+fn load_execution_step_immutable(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> std::result::Result<(CandidateRunSnapshot, InitializeReceiptV1, ReadStep), LifecycleError> {
     type ExecutionColumns = (String, String, String, String, String);
     let row:Option<ExecutionColumns>=tx.query_row("SELECT q.principal_id,a.run_id,c.response_json,c.request_hash,c.operation_id FROM lifecycle_steps s JOIN qualification_case_actions a ON a.step_id=s.id JOIN qualification_runs q ON q.id=a.run_id JOIN command_receipts c ON c.operation_id=a.operation_id WHERE s.id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let Some((principal, run, json, hash, operation)) = row else {
@@ -818,7 +826,84 @@ fn load_execution_step(
             LifecycleError::Unsupported
         });
     };
-    read_receipt(tx, &principal, &run, &json, &hash, &operation).map_err(Into::into)
+    read_receipt_immutable(tx, &principal, &run, &json, &hash, &operation).map_err(Into::into)
+}
+pub(crate) struct ValidatedInitialize {
+    pub snapshot: CandidateRunSnapshot,
+    pub context: StepExecutionContext,
+    pub session_id: String,
+    pub state: String,
+    pub run_state: String,
+}
+
+/// Immutable decoder only. Callers must separately validate retained accounting or
+/// the recorded verified-cleanup chain before accepting historical replay.
+pub(crate) fn validated_initialize(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> std::result::Result<ValidatedInitialize, LifecycleError> {
+    let (snapshot, _, read) = load_execution_step_immutable(tx, id)?;
+    let e = read.execution.ok_or(LifecycleError::Conflict)?;
+    let p = read.planned;
+    let context = StepExecutionContext {
+        token: TransitionToken {
+            deployment_id: p.deployment_id,
+            revision: p.revision,
+            generation: p.generation,
+            operation_id: p.operation_id,
+            step_id: p.step_id,
+            qualification_id: p.qualification_id,
+        },
+        binding_id: p.binding_id,
+        incarnation: p.incarnation,
+        issued_at_ms: e.issued_at_ms,
+        deadline_ms: p.deadline_ms,
+        identities: ExecutionIdentities::OwnedLaunch,
+        completion_target: Some(e.completion_target.to_footprint()?),
+        grant_id: Some(e.grant_id),
+        launch_settings: Some(launch_settings(
+            snapshot
+                .reviewed_manifest()
+                .effective_recipe()
+                .profile()
+                .launch_settings(),
+        )),
+    };
+    Ok(ValidatedInitialize {
+        snapshot,
+        context,
+        session_id: read.session_id,
+        state: read.state,
+        run_state: read.run_state,
+    })
+}
+pub(crate) fn validate_retained_initialize(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> std::result::Result<(), LifecycleError> {
+    let (snapshot, _, read) = load_execution_step_immutable(tx, id)?;
+    retained(tx, &snapshot, &read).map_err(Into::into)
+}
+pub(crate) fn validate_current_initialize(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    id: &str,
+) -> std::result::Result<(), LifecycleError> {
+    let (snapshot, _, read) = load_execution_step(tx, id)?;
+    current(tx, s, &snapshot, &read)?;
+    let running: bool = tx.query_row(
+        "SELECT state='running' FROM operations WHERE id=?1",
+        [&read.planned.operation_id],
+        |r| r.get(0),
+    )?;
+    if read.state != "armed"
+        || read.run_state != "running"
+        || !running
+        || snapshot.state() != super::CandidateRunState::Running
+    {
+        return Err(LifecycleError::Conflict);
+    }
+    Ok(())
 }
 fn current(
     tx: &Transaction<'_>,
@@ -1001,13 +1086,7 @@ fn read_step(
             })?;
             // Ledger serialization canonicalizes allocation/device order; reviewed recipe
             // order is immutable but is not part of accounting identity.
-            if ledger.epoch < epoch
-                || ledger.owners.get(&step.deployment_id).is_none_or(|owner| {
-                    owner.phase != ResourcePhase::Cold
-                        || StoredTarget::from_footprint(owner)
-                            != StoredTarget::from_footprint(&cold)
-                })
-            {
+            if ledger.epoch < epoch {
                 return Err(Error::CorruptStoredData);
             }
         }
@@ -1022,6 +1101,51 @@ fn read_step(
     })
 }
 fn read_receipt(
+    tx: &Transaction<'_>,
+    principal: &str,
+    run: &str,
+    json: &str,
+    column_hash: &str,
+    operation: &str,
+) -> Result<(CandidateRunSnapshot, InitializeReceiptV1, ReadStep)> {
+    let result = read_receipt_immutable(tx, principal, run, json, column_hash, operation)?;
+    if result.2.execution.is_some() {
+        let v = validated_initialize(tx, &result.2.planned.step_id).map_err(|e| match e {
+            LifecycleError::Sql(e) => Error::Sql(e),
+            _ => Error::CorruptStoredData,
+        })?;
+        crate::lifecycle::completion::accounting(tx, &v).map_err(|e| match e {
+            LifecycleError::Sql(e) => Error::Sql(e),
+            _ => Error::CorruptStoredData,
+        })?;
+    }
+    Ok(result)
+}
+fn retained(tx: &Transaction<'_>, snapshot: &CandidateRunSnapshot, read: &ReadStep) -> Result<()> {
+    if read.execution.is_some() {
+        let cold = footprint(
+            snapshot
+                .reviewed_manifest()
+                .effective_recipe()
+                .resources()
+                .cold(),
+            ResourcePhase::Cold,
+        )?;
+        let ledger =
+            crate::resource_ledger::read_snapshot(tx).map_err(|_| Error::CorruptStoredData)?;
+        if ledger
+            .owners
+            .get(&read.planned.deployment_id)
+            .is_none_or(|owner| {
+                StoredTarget::from_footprint(owner) != StoredTarget::from_footprint(&cold)
+            })
+        {
+            return Err(Error::CorruptStoredData);
+        }
+    }
+    Ok(())
+}
+fn read_receipt_immutable(
     tx: &Transaction<'_>,
     principal: &str,
     run: &str,

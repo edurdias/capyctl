@@ -1,5 +1,7 @@
 use std::net::TcpListener;
 
+pub(crate) mod completion;
+
 use mllm_domain::completion::ProcessIdentity;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -165,32 +167,143 @@ pub struct DeploymentFence {
 }
 
 pub(crate) fn insert_candidate_initialize_run(
-    tx: &Transaction<'_>, session: &CoordinatorSession, target: &DeploymentFence,
-    operation_id: &str, deadline_ms: i64,
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    target: &DeploymentFence,
+    operation_id: &str,
+    deadline_ms: i64,
 ) -> Result<(), LifecycleError> {
     fenced(tx, session, target)?;
     let plan = bounded_json(&StoredPlan {
-        version: 1, steps: vec![PlanAction { deployment_id: target.deployment_id.clone(), action: RunAction::Activate }],
-        cleanup_target: None, handoffs: vec![],
+        version: 1,
+        steps: vec![PlanAction {
+            deployment_id: target.deployment_id.clone(),
+            action: RunAction::Activate,
+        }],
+        cleanup_target: None,
+        handoffs: vec![],
     })?;
     tx.execute("INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) VALUES(?1,?2,?3,?4,?5,'activate','queued',?6,?7)",
         params![operation_id,target.deployment_id,target.revision,target.generation,session.id(),deadline_ms,plan])?;
     Ok(())
 }
 
+pub(crate) fn insert_candidate_cleanup_run(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    target: &DeploymentFence,
+    operation: &str,
+    deadline: i64,
+) -> Result<(), LifecycleError> {
+    fenced(tx, session, target)?;
+    let plan = bounded_json(&StoredPlan {
+        version: 1,
+        steps: vec![PlanAction {
+            deployment_id: target.deployment_id.clone(),
+            action: RunAction::Stop,
+        }],
+        cleanup_target: Some(target.deployment_id.clone()),
+        handoffs: vec![],
+    })?;
+    tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'candidate_cleanup','pending')",params![operation,target.deployment_id])?;
+    tx.execute("INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) VALUES(?1,?2,?3,?4,?5,'stop','queued',?6,?7)",params![operation,target.deployment_id,target.revision,target.generation,session.id(),deadline,plan])?;
+    Ok(())
+}
+
+pub(crate) fn validate_cleanup_run(
+    tx: &Transaction<'_>,
+    target: &DeploymentFence,
+    operation: &str,
+    session: &str,
+    deadline: i64,
+    predecessor: Option<&str>,
+) -> Result<String, LifecycleError> {
+    let run = run_record(tx, operation)?;
+    let plan: StoredPlan = completion::decode(&run.plan_json)?;
+    let bound: i64 = tx.query_row(
+        "SELECT deadline_ms FROM lifecycle_runs WHERE operation_id=?1",
+        [operation],
+        |r| r.get(0),
+    )?;
+    if run.target != *target
+        || run.session_id != session
+        || run.action != "stop"
+        || bound != deadline
+        || plan.version != 1
+        || plan.steps.len() != 1
+        || plan.steps[0].deployment_id != target.deployment_id
+        || plan.steps[0].action != RunAction::Stop
+        || plan.cleanup_target.as_deref() != Some(&target.deployment_id)
+        || plan.handoffs.len() != usize::from(predecessor.is_some())
+    {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    if let Some(id) = predecessor {
+        let h = &plan.handoffs[0];
+        let previous = run_record(tx, id)?;
+        if h.predecessor_operation_id != id
+            || h.claims.len() != 1
+            || h.claims[0].deployment_id != target.deployment_id
+            || h.claims[0].revision != target.revision
+            || h.claims[0].generation >= target.generation
+            || h.claims[0].generation != previous.target.generation
+            || previous.target.deployment_id != target.deployment_id
+            || previous.target.revision != target.revision
+            || h.claims[0].current_generation != target.generation
+            || h.steps.len() != 1
+        {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        let (dep, op): (String, String) = tx.query_row(
+            "SELECT deployment_id,operation_id FROM lifecycle_steps WHERE id=?1",
+            [&h.steps[0].id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if dep != target.deployment_id
+            || dep != h.steps[0].deployment_id
+            || op != id
+            || !matches!(h.steps[0].state.as_str(), "planned" | "armed" | "uncertain")
+        {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+    }
+    Ok(run.state)
+}
+
 /// Only the immutable single-member candidate plan; caller fences current session separately.
 pub(crate) fn validate_candidate_initialize_run(
-    tx: &Transaction<'_>, target: &DeploymentFence, operation_id: &str,
-    session_id: &str, deadline_ms: i64,
+    tx: &Transaction<'_>,
+    target: &DeploymentFence,
+    operation_id: &str,
+    session_id: &str,
+    deadline_ms: i64,
 ) -> Result<String, LifecycleError> {
     let run = run_record(tx, operation_id)?;
-    if run.plan_json.len() > MAX_DTO_BYTES { return Err(LifecycleError::Invalid); }
-    let plan: StoredPlan = serde_json::from_str(&run.plan_json).map_err(|_| LifecycleError::Invalid)?;
-    let deadline: i64 = tx.query_row("SELECT deadline_ms FROM lifecycle_runs WHERE operation_id=?1", [operation_id], |r| r.get(0))?;
-    if run.target != *target || run.session_id != session_id || deadline != deadline_ms || run.action != "activate"
-        || !matches!(run.state.as_str(), "queued" | "running" | "uncertain" | "succeeded" | "failed")
-        || plan.version != 1 || plan.steps.len() != 1 || plan.steps[0].deployment_id != target.deployment_id
-        || plan.steps[0].action != RunAction::Activate || plan.cleanup_target.is_some() || !plan.handoffs.is_empty() {
+    if run.plan_json.len() > MAX_DTO_BYTES {
+        return Err(LifecycleError::Invalid);
+    }
+    let plan: StoredPlan =
+        serde_json::from_str(&run.plan_json).map_err(|_| LifecycleError::Invalid)?;
+    let deadline: i64 = tx.query_row(
+        "SELECT deadline_ms FROM lifecycle_runs WHERE operation_id=?1",
+        [operation_id],
+        |r| r.get(0),
+    )?;
+    if run.target != *target
+        || run.session_id != session_id
+        || deadline != deadline_ms
+        || run.action != "activate"
+        || !matches!(
+            run.state.as_str(),
+            "queued" | "running" | "uncertain" | "succeeded" | "failed"
+        )
+        || plan.version != 1
+        || plan.steps.len() != 1
+        || plan.steps[0].deployment_id != target.deployment_id
+        || plan.steps[0].action != RunAction::Activate
+        || plan.cleanup_target.is_some()
+        || !plan.handoffs.is_empty()
+    {
         return Err(LifecycleError::Invalid);
     }
     Ok(run.state)
@@ -259,14 +372,20 @@ pub(crate) enum DecodedBinding {
 }
 
 pub(crate) fn decode_binding(json: &str) -> Result<DecodedBinding, LifecycleError> {
-    if json.len() > MAX_DTO_BYTES { return Err(LifecycleError::Invalid); }
+    if json.len() > MAX_DTO_BYTES {
+        return Err(LifecycleError::Invalid);
+    }
     // Untagged decoding tries strict DTOs independently, preserving duplicate rejection.
     if let Ok(binding) = serde_json::from_str::<BindingDto>(json) {
-        if binding.version == 1 { return Ok(DecodedBinding::V1); }
+        if binding.version == 1 {
+            return Ok(DecodedBinding::V1);
+        }
     }
     let candidate: crate::candidate_creation::CandidateBindingV2 =
         serde_json::from_str(json).map_err(|_| LifecycleError::Invalid)?;
-    if candidate.version != 2 { return Err(LifecycleError::Invalid); }
+    if candidate.version != 2 {
+        return Err(LifecycleError::Invalid);
+    }
     Ok(DecodedBinding::Candidate(candidate))
 }
 
@@ -285,23 +404,41 @@ impl PreparedBinding {
     fn prepare_v1(request: &ReserveBinding) -> Result<Self, LifecycleError> {
         if !valid_text(&request.id)
             || !valid_text(&request.fence.deployment_id)
-            || request.fence.revision < 1 || request.fence.generation < 1
-            || !valid_text(&request.incarnation) || !valid_text(&request.qualification_id)
+            || request.fence.revision < 1
+            || request.fence.generation < 1
+            || !valid_text(&request.incarnation)
+            || !valid_text(&request.qualification_id)
             || !matches!(request.ownership.as_str(), "managed" | "attached")
-            || request.endpoint_host != "127.0.0.1" || request.endpoint_port == 0
-            || !valid_text(&request.credential_ref) || !valid_text(&request.binding_payload)
-        { return Err(LifecycleError::Invalid); }
+            || request.endpoint_host != "127.0.0.1"
+            || request.endpoint_port == 0
+            || !valid_text(&request.credential_ref)
+            || !valid_text(&request.binding_payload)
+        {
+            return Err(LifecycleError::Invalid);
+        }
         let listener = TcpListener::bind((&*request.endpoint_host, request.endpoint_port))
             .map_err(|_| LifecycleError::Conflict)?;
         let json = serde_json::to_string(&BindingDto {
-            version: 1, qualification_id: request.qualification_id.clone(),
+            version: 1,
+            qualification_id: request.qualification_id.clone(),
             endpoint: format!("{}:{}", request.endpoint_host, request.endpoint_port),
-            credential_ref: request.credential_ref.clone(), payload: request.binding_payload.clone(),
-        }).map_err(|_| LifecycleError::Invalid)?;
-        if json.len() > MAX_DTO_BYTES { return Err(LifecycleError::Invalid); }
-        Ok(Self { _listener: listener, id: request.id.clone(), fence: request.fence.clone(),
-            incarnation: request.incarnation.clone(), ownership: request.ownership.clone(),
-            host: request.endpoint_host.clone(), port: request.endpoint_port, json })
+            credential_ref: request.credential_ref.clone(),
+            payload: request.binding_payload.clone(),
+        })
+        .map_err(|_| LifecycleError::Invalid)?;
+        if json.len() > MAX_DTO_BYTES {
+            return Err(LifecycleError::Invalid);
+        }
+        Ok(Self {
+            _listener: listener,
+            id: request.id.clone(),
+            fence: request.fence.clone(),
+            incarnation: request.incarnation.clone(),
+            ownership: request.ownership.clone(),
+            host: request.endpoint_host.clone(),
+            port: request.endpoint_port,
+            json,
+        })
     }
 
     pub(crate) fn prepare_candidate(
@@ -314,50 +451,85 @@ impl PreparedBinding {
     ) -> Result<Self, crate::candidate_creation::CandidateCreationError> {
         use crate::candidate_creation::{CandidateBindingV2, CandidateCreationError};
         for port in range.start..=range.end {
-            let leased: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM endpoint_leases WHERE host='127.0.0.1' AND port=?1)", [port], |r| r.get(0))?;
-            if leased { continue; }
+            let leased: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM endpoint_leases WHERE host='127.0.0.1' AND port=?1)",
+                [port],
+                |r| r.get(0),
+            )?;
+            if leased {
+                continue;
+            }
             let listener = match TcpListener::bind(("127.0.0.1", port)) {
                 Ok(listener) => listener,
                 Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
                 Err(_) => return Err(CandidateCreationError::EndpointUnavailable),
             };
             let json = serde_json::to_string(&CandidateBindingV2 {
-                version: 2, qualification_id: format!("candidate:{run_id}"),
-                endpoint: format!("127.0.0.1:{port}"), descriptor: descriptor.reference(),
+                version: 2,
+                qualification_id: format!("candidate:{run_id}"),
+                endpoint: format!("127.0.0.1:{port}"),
+                descriptor: descriptor.reference(),
                 auth: descriptor.credential_refs.clone(),
-            }).map_err(|_| CandidateCreationError::InvalidCommand)?;
-            if json.len() > MAX_DTO_BYTES { return Err(CandidateCreationError::InvalidCommand); }
-            return Ok(Self { _listener: listener, id: id.into(),
-                fence: DeploymentFence { deployment_id: descriptor.deployment_id.clone(), revision: descriptor.revision, generation: descriptor.generation },
-                incarnation: incarnation.into(), ownership: "managed".into(), host: "127.0.0.1".into(), port, json });
+            })
+            .map_err(|_| CandidateCreationError::InvalidCommand)?;
+            if json.len() > MAX_DTO_BYTES {
+                return Err(CandidateCreationError::InvalidCommand);
+            }
+            return Ok(Self {
+                _listener: listener,
+                id: id.into(),
+                fence: DeploymentFence {
+                    deployment_id: descriptor.deployment_id.clone(),
+                    revision: descriptor.revision,
+                    generation: descriptor.generation,
+                },
+                incarnation: incarnation.into(),
+                ownership: "managed".into(),
+                host: "127.0.0.1".into(),
+                port,
+                json,
+            });
         }
         Err(CandidateCreationError::EndpointUnavailable)
     }
 
     #[cfg(test)]
-    pub(crate) fn port(&self) -> u16 { self.port }
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 pub(crate) fn insert_prepared_binding(
-    tx: &Transaction<'_>, session: &CoordinatorSession, prepared: &PreparedBinding,
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    prepared: &PreparedBinding,
 ) -> Result<(), LifecycleError> {
     crate::dispatch::check_session(tx, session).map_err(|error| match error {
         crate::dispatch::DispatchError::Sql(error) => LifecycleError::Sql(error),
         _ => LifecycleError::Stale,
     })?;
-    let current: Option<(i64, i64)> = tx.query_row(
-        "SELECT revision,current_generation FROM deployments WHERE id=?1", [&prepared.fence.deployment_id],
-        |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if current != Some((prepared.fence.revision, prepared.fence.generation)) { return Err(LifecycleError::Stale); }
+    let current: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT revision,current_generation FROM deployments WHERE id=?1",
+            [&prepared.fence.deployment_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if current != Some((prepared.fence.revision, prepared.fence.generation)) {
+        return Err(LifecycleError::Stale);
+    }
     tx.execute("INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES(?1,?2,?3,?4,?5,?6,'[]','reserved')",
         params![prepared.id, prepared.fence.deployment_id, prepared.fence.revision, prepared.incarnation, prepared.ownership, prepared.json])?;
-    tx.execute("INSERT INTO endpoint_leases(host,port,binding_id) VALUES(?1,?2,?3)", params![prepared.host,prepared.port,prepared.id])?;
+    tx.execute(
+        "INSERT INTO endpoint_leases(host,port,binding_id) VALUES(?1,?2,?3)",
+        params![prepared.host, prepared.port, prepared.id],
+    )?;
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IdentityDto {
+pub(crate) struct IdentityDto {
     role: String,
     pid: u32,
     boot_id: String,
@@ -483,7 +655,25 @@ impl crate::Store {
         suspend: bool,
     ) -> Result<AcceptedRun, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        fenced(&tx, session, target)?;
+        let next = Self::fence_lifecycle_in_transaction(&tx, session, target, suspend)?;
+        let run = insert_run(
+            &tx,
+            session,
+            &next,
+            deadline_ms,
+            if suspend { "reconcile" } else { "stop" },
+        )?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub(crate) fn fence_lifecycle_in_transaction(
+        tx: &Transaction<'_>,
+        session: &CoordinatorSession,
+        target: &DeploymentFence,
+        suspend: bool,
+    ) -> Result<DeploymentFence, LifecycleError> {
+        fenced(tx, session, target)?;
         let generation = target
             .generation
             .checked_add(1)
@@ -502,15 +692,7 @@ impl crate::Store {
             generation,
             ..target.clone()
         };
-        let run = insert_run(
-            &tx,
-            session,
-            &next,
-            deadline_ms,
-            if suspend { "reconcile" } else { "stop" },
-        )?;
-        tx.commit()?;
-        Ok(run)
+        Ok(next)
     }
 
     /// Transfers reconciliation responsibility, preserving predecessor rows and effects.
@@ -523,22 +705,40 @@ impl crate::Store {
         predecessor_operation_id: &str,
         members: &[DeploymentFence],
     ) -> Result<(), LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::handoff_claims_in_transaction(
+            &tx,
+            session,
+            successor_operation_id,
+            predecessor_operation_id,
+            members,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn handoff_claims_in_transaction(
+        tx: &Transaction<'_>,
+        session: &CoordinatorSession,
+        successor_operation_id: &str,
+        predecessor_operation_id: &str,
+        members: &[DeploymentFence],
+    ) -> Result<(), LifecycleError> {
         if successor_operation_id == predecessor_operation_id {
             return Err(LifecycleError::Invalid);
         }
         let members = sorted_members(members)?;
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let successor = current_run(&tx, session, successor_operation_id)?;
+        let successor = current_run(tx, session, successor_operation_id)?;
         if !matches!(successor.action.as_str(), "stop" | "reconcile") {
             return Err(LifecycleError::Conflict);
         }
         for member in &members {
-            fenced(&tx, session, member)?;
+            fenced(tx, session, member)?;
         }
         if !members.contains(&successor.target) {
             return Err(LifecycleError::Conflict);
         }
-        let predecessor = run_record(&tx, predecessor_operation_id)?;
+        let predecessor = run_record(tx, predecessor_operation_id)?;
         if !matches!(
             predecessor.state.as_str(),
             "queued" | "running" | "uncertain"
@@ -599,7 +799,6 @@ impl crate::Store {
             "UPDATE lifecycle_runs SET plan_json=?1 WHERE operation_id=?2",
             params![json, successor_operation_id],
         )?;
-        tx.commit()?;
         Ok(())
     }
     /// Joins retained work without extending its deadline or granting dispatch authority.
@@ -726,6 +925,40 @@ impl crate::Store {
         }
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         fenced(&transaction, session, fence)?;
+        let row:Option<(String,String,String)>=transaction.query_row("SELECT ownership,binding_json,identities_json FROM runtime_bindings WHERE id=?1 AND deployment_id=?2 AND revision=?3 AND state!='released'",params![binding_id,fence.deployment_id,fence.revision],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let (ownership, binding, existing) = row.ok_or(LifecycleError::Conflict)?;
+        if ownership != "managed" {
+            return Err(LifecycleError::Conflict);
+        }
+        decode_binding(&binding).map_err(|_| LifecycleError::CorruptStoredData)?;
+        if existing.len() > MAX_DTO_BYTES {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        let members: Vec<IdentityDto> =
+            serde_json::from_str(&existing).map_err(|_| LifecycleError::CorruptStoredData)?;
+        let mut roles = std::collections::BTreeSet::new();
+        let mut processes = std::collections::BTreeSet::new();
+        if members.iter().any(|m| {
+            m.role.trim().is_empty()
+                || m.pid == 0
+                || m.start_ticks == 0
+                || m.boot_id.trim().is_empty()
+                || m.boot_id != members[0].boot_id
+                || !roles.insert(&m.role)
+                || !processes.insert(m.pid)
+        }) {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        if !members.is_empty() {
+            if !members.iter().any(|m| m.role == "api") {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            return if members.contains(&dto[0]) {
+                Ok(())
+            } else {
+                Err(LifecycleError::Conflict)
+            };
+        }
         let changed = transaction.execute(
             "UPDATE runtime_bindings SET identities_json=?1,state='uncertain'
              WHERE id=?2 AND deployment_id=?3 AND revision=?4 AND state!='released'",
@@ -1421,6 +1654,26 @@ mod tests {
         let retained = store.runtime_binding(&deployment).unwrap().unwrap();
         assert_eq!(retained.state, "uncertain");
         assert_eq!(retained.identities.len(), 1);
+        let api = retained.identities[0].clone();
+        let mut changed_api = api.clone();
+        changed_api.start_ticks += 1;
+        assert!(matches!(
+            store.record_api_identity(&session, &fence, "binding-uncertain", &changed_api),
+            Err(LifecycleError::Conflict)
+        ));
+        store.conn.execute("UPDATE runtime_bindings SET identities_json='[{\"role\":\"api\",\"pid\":42,\"boot_id\":\"boot\",\"start_ticks\":7},{\"role\":\"worker-0\",\"pid\":43,\"boot_id\":\"boot\",\"start_ticks\":8}]' WHERE id='binding-uncertain'",[]).unwrap();
+        store
+            .record_api_identity(&session, &fence, "binding-uncertain", &api)
+            .unwrap();
+        assert_eq!(
+            store
+                .runtime_binding(&deployment)
+                .unwrap()
+                .unwrap()
+                .identities
+                .len(),
+            2
+        );
         let leases: i64 = store
             .conn
             .query_row(

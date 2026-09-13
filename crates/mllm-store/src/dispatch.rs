@@ -55,10 +55,15 @@ impl crate::Store {
         transaction.execute("UPDATE deployments SET dispatch_enabled=0", [])?;
         transaction.execute("UPDATE request_leases SET disposition='uncertain'", [])?;
         transaction.execute("UPDATE lifecycle_runs SET state='uncertain' WHERE operation_id IN (SELECT operation_id FROM lifecycle_steps WHERE state='armed') AND state IN ('queued','running')", [])?;
-        transaction.execute("UPDATE lifecycle_steps SET state='uncertain' WHERE state='armed'", [])?;
+        transaction.execute(
+            "UPDATE lifecycle_steps SET state='uncertain' WHERE state='armed'",
+            [],
+        )?;
         crate::events::append_event(
             &transaction,
-            &crate::events::EventMetadata::CoordinatorSessionStarted { session_epoch: epoch },
+            &crate::events::EventMetadata::CoordinatorSessionStarted {
+                session_epoch: epoch,
+            },
         )
         .map_err(|error| match error {
             crate::events::EventWriteError::Sql(error) => DispatchError::Sql(error),
@@ -82,6 +87,23 @@ pub(crate) fn check_session(
     {
         return Err(DispatchError::StaleSession);
     }
+    Ok(())
+}
+
+/// Verified disappearance may settle old sessions only for the single-binding candidate lane.
+pub(crate) fn settle_verified_candidate_cleanup(
+    tx: &rusqlite::Transaction<'_>,
+    deployment: &str,
+    binding: &str,
+) -> Result<(), crate::lifecycle::LifecycleError> {
+    let exact:bool=tx.query_row("SELECT COUNT(*)=1 AND COALESCE(SUM(id=?2),0)=1 FROM runtime_bindings WHERE deployment_id=?1",params![deployment,binding],|r|r.get(0))?;
+    if !exact {
+        return Err(crate::lifecycle::LifecycleError::Conflict);
+    }
+    tx.execute(
+        "DELETE FROM request_leases WHERE deployment_id=?1",
+        [deployment],
+    )?;
     Ok(())
 }
 

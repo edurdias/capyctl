@@ -1,4 +1,5 @@
 //! Durable candidate acceptance and informational historical reads. No execution authority.
+pub mod cleanup;
 pub mod initialize;
 use crate::dispatch::{check_session, CoordinatorSession, DispatchError};
 use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteError};
@@ -679,6 +680,19 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         let snapshot = read_snapshot(&tx, principal_id, run_id)?;
+        if let Some(snapshot) = &snapshot {
+            if snapshot.cleanup_state() == CandidateCleanupState::VerifiedGone {
+                let id:String=tx.query_row("SELECT step_id FROM owned_launch_associations WHERE binding_id=?1 AND incarnation=?2",params![snapshot.receipt().binding_id(),snapshot.receipt().incarnation()],|r|r.get(0)).optional()?.ok_or(CandidateCreationError::CorruptStoredData)?;
+                let validate = || -> std::result::Result<(), LifecycleError> {
+                    let v = initialize::validated_initialize(&tx, &id)?;
+                    cleanup::validate_gone_history(&tx, &v)
+                };
+                validate().map_err(|e| match e {
+                    LifecycleError::Sql(e) => CandidateCreationError::Sql(e),
+                    _ => CandidateCreationError::CorruptStoredData,
+                })?;
+            }
+        }
         tx.commit()?;
         Ok(snapshot)
     }

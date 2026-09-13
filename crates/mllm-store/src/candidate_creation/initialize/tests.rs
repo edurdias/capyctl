@@ -2,6 +2,8 @@ use super::*;
 use crate::candidate_creation::tests::{command, fixture, setup};
 use serde_json::{json, Value};
 const BODY: &str = r#"{"expected_revision":1,"action":"initialize","deadline_ms":400000}"#;
+#[path = "../../lifecycle/completion/tests.rs"]
+mod completion_tests;
 #[test]
 fn initialize_preserves_reviewed_device_order_while_matching_canonical_ledger() {
     let (mut manifest, mut host, mut policy) = fixture("fake");
@@ -219,6 +221,11 @@ fn durable(store: &crate::Store) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         "lifecycle_claims",
         "lifecycle_steps",
         "qualification_case_actions",
+        "owned_launch_associations",
+        "candidate_cleanup_actions",
+        "lifecycle_evidence",
+        "request_leases",
+        "generation_history",
         "command_receipts",
         "management_events",
         "qualification_runs",
