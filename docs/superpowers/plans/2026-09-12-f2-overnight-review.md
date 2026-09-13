@@ -80,9 +80,10 @@ the work being executed. The owner will review consequential questions in the mo
   scoped Clippy clean. Review approved after placing caller-timeout integration
   proof in Task 9's real wait path. Dynamic port fixtures fixed. A3 foundations
   now precede remaining coordinator arm/completion work.
-- Configuration foundations implemented through `2cfd778`; full scoped CPU tests and
-  Clippy pass. Review still blocks approval: explicit owned launch settings, policy
-  defaults/bounds, and identity regression tests need fixes. Parent A3 Task 1 remains open.
+- Configuration foundations complete through `b46b9b7`; 253 scoped CPU tests pass,
+  Clippy clean. Review confirms owned launch settings, policy defaults/bounds and
+  identity regressions. Minor field-path diagnostic improvement deferred to next
+  config touch. Parent A3 Task 1 remains open for authority/production integration.
   Temporary `serde_yaml` additions removed surgically before implementation; root
   verified lockfile cleanup. Subsequent Cargo offline. No engine installation or cache cleanup.
 
@@ -134,6 +135,16 @@ the work being executed. The owner will review consequential questions in the mo
   changes a qualified allocation. Shared normalized types live in domain. Cost:
   additional manifest fields and a domain serialization dependency; native support
   and trusted qualification still require later adapter gates.
+- Extend unimplemented V6 with qualification policy/catalog/evidence tables and
+  exact run binding, lifetime request count, and verified-cleanup status. Cost:
+  three added tables and corresponding bounded writer tests; no applied migration
+  rewritten. Resource-policy API cannot edit qualification permissions.
+- New contract doc-review completed with five local personas, two focused local
+  checks, and three independent reviews. Clarified optional
+  completion targets for control/cleanup steps. No owner-only decisions.
+  Initial SGLang schema accepts the reviewed Qwen3-4B recipe only; further recipes
+  need schema/catalog extension and separate qualification. Loopback listener
+  attestation remains potential defense-in-depth work, not a claimed guarantee.
 - Resolve completion negative-coverage finding in immediately following planned
   boundary-test task, including extra PID/invalid-target cases. Cost: intermediate
   checkpoint had happy-path-only coverage; all rejection tests now reviewed and passing.

@@ -486,8 +486,10 @@ WHERE id=?1 AND state='planned' AND session_id=?3;
   do not mint a second resource grant. A Stop intent is armed under its explicit
   authorization without inventing a resource-increasing phase.
 - [ ] Persist a shared domain execution context with the complete TransitionToken,
-  binding ID/incarnation, issue/deadline times, identity scope, settled completion
-  target, grant reference and exact normalized launch settings. Expose a session-
+  binding ID/incarnation, issue/deadline times, identity scope, optional settled
+  completion target, grant reference and exact normalized launch settings. The
+  target is Ready/Parked only for actions settling those states; it is absent for
+  control-only and cleanup steps. Expose a session-
   fenced read of this context and persisted action. Loading/cloning context grants
   no send permission; only `ArmResult::New` permits dispatch. Validate action/context
   combinations. The completion target is settled Ready/Parked, not the temporary peak.

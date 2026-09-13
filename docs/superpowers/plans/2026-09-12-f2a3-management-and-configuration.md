@@ -404,18 +404,86 @@ CREATE TABLE host_resource_policies(
   revision INTEGER NOT NULL CHECK(revision>0),
   policy_json TEXT NOT NULL
 );
+CREATE TABLE host_qualification_policies(
+  host_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  policy_json TEXT NOT NULL
+);
 CREATE TABLE qualification_runs(
   id TEXT PRIMARY KEY,
-  host_id TEXT NOT NULL,
+  host_id TEXT NOT NULL REFERENCES host_qualification_policies(host_id),
   deployment_id TEXT NOT NULL REFERENCES deployments(id),
   revision INTEGER NOT NULL CHECK(revision>0),
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  incarnation TEXT NOT NULL,
+  operation_id TEXT NOT NULL REFERENCES operations(id),
   principal_id TEXT NOT NULL,
   recipe_digest TEXT NOT NULL,
   authorization_json TEXT NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('accepted','running','passed','failed','uncertain')),
-  deadline_ms INTEGER NOT NULL
+  state TEXT NOT NULL CHECK(state IN
+    ('accepted','running','passed','failed','uncertain','aborted','expired')),
+  deadline_ms INTEGER NOT NULL,
+  requests_used INTEGER NOT NULL DEFAULT 0 CHECK(requests_used>=0),
+  cleanup_state TEXT NOT NULL DEFAULT 'retained'
+    CHECK(cleanup_state IN ('retained','verified_gone')),
+  cleanup_step_id TEXT REFERENCES lifecycle_steps(id),
+  CHECK((cleanup_state='retained' AND cleanup_step_id IS NULL) OR
+        (cleanup_state='verified_gone' AND cleanup_step_id IS NOT NULL))
+);
+CREATE TABLE qualifications(
+  id TEXT PRIMARY KEY,
+  source_run_id TEXT NOT NULL UNIQUE REFERENCES qualification_runs(id),
+  recipe_fingerprint TEXT NOT NULL,
+  record_json TEXT NOT NULL
+);
+CREATE INDEX qualifications_recipe ON qualifications(recipe_fingerprint);
+CREATE TABLE qualification_evidence_refs(
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES qualification_runs(id),
+  case_id TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  UNIQUE(run_id,case_id,evidence_digest)
 );
 ```
+
+Qualification persistence closes the authority contract before arm integration:
+
+- Keep existing token strings, with strict `qualified:<id>` and `candidate:<id>`
+  references decoded privately by store. Parsing is not authority; lookup and
+  exact scope checks occur inside arm/completion/dispatch transactions.
+- Import host qualification policy only through trusted startup composition from
+  strict local configuration. Resource-policy API cannot edit permissions, engine
+  pins, identity or allowlists. Missing policy disables qualification. Identical
+  imports are no-ops; changed imports require checked revision advancement.
+- Private versioned DTOs freeze host identity/fingerprints, separate qualification
+  and experimental permissions, reviewed manifest digest allowlist, and run/case/
+  request/body/token/cleanup bounds. Authorization binds principal, exact run,
+  deployment/revision, binding/incarnation, recipe, conservative phases and policy
+  revision. Current policy permission/allowlist is rechecked before new effects;
+  revocation retains accounting and original bounded cleanup authority.
+- Bound each authority/catalog JSON record to 1 MiB, cases to 128, evidence
+  references to 4096. These are implementation caps, not workload defaults.
+  Decode rejects unknown fields, overflow and column/JSON disagreement. Persist
+  exact effective descriptor or immutable revision reference, not only its digest.
+- Candidate creation allocates fresh owned deployment/binding and persists scope,
+  operation and idempotency receipt atomically, without ordinary routes. Each
+  accepted action freezes exact run/principal/action/fences/recipe/deadline in its
+  operation/step payload. Repeated keys never resend armed work.
+- Candidate inference increments lifetime `requests_used` in the same transaction
+  as its dispatch lease, after scope/bounds checks. Settling a lease does not reset
+  lifetime allowance. Retry receipts prevent double counting or automatic resend.
+- Only trusted collectors record evidence references with exact scope, collector
+  revision, observation time, result, artifact identity and digest. A client path
+  or digest is not evidence. Finish loads persisted evidence and evaluates required
+  coverage, exact descriptor and resulting safe bounds. Missing trusted evaluator
+  returns unsupported. Passing inserts immutable catalog row and marks run passed
+  atomically; repeated finish returns the same record, never replaces it.
+- Passing does not mutate retained binding, shrink candidate accounting or open
+  ordinary routing. Ordinary use also requires source run `verified_gone` and a
+  fresh exact-qualified binding. The existing A2d verified cleanup transaction
+  updates candidate cleanup status atomically with release; no second cleanup
+  authority. Failure/abort/expiry remain distinct from cleanup status.
 
 - [ ] Canonicalize effective semantic input before SHA-256 hashing. Same principal,
   scope, key, and body returns the original operation; altered body conflicts.
