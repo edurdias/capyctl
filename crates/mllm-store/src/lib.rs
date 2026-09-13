@@ -4,6 +4,7 @@
 
 pub mod deployments;
 pub mod dispatch;
+pub mod lifecycle;
 pub mod migrations;
 pub mod resource_ledger;
 pub mod schema;

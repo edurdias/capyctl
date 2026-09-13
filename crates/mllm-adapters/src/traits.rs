@@ -3,6 +3,38 @@ use std::collections::BTreeMap;
 
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeAction {
+    Initialize,
+    Drain,
+    Park,
+    Restore,
+    Probe,
+    Stop,
+    Inspect,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeCommand {
+    pub step_id: String,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub action: RuntimeAction,
+    pub deadline_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("runtime binding is missing")]
+    Missing,
+    #[error("runtime binding revision is stale")]
+    StaleRevision,
+    #[error("runtime operation is unsupported")]
+    Unsupported,
+    #[error("runtime ownership is uncertain: {0}")]
+    Uncertain(String),
+}
+
 /// Identifies one member of a deployment to the engine adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberRef {

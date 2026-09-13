@@ -59,7 +59,10 @@ impl crate::Store {
     }
 }
 
-fn check_session(conn: &Connection, session: &CoordinatorSession) -> Result<(), DispatchError> {
+pub(crate) fn check_session(
+    conn: &Connection,
+    session: &CoordinatorSession,
+) -> Result<(), DispatchError> {
     let current: (i64, String) = conn.query_row(
         "SELECT epoch,session_id FROM coordinator_session WHERE singleton=1",
         [],

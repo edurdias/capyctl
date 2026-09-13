@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use mllm_adapters::traits::{
     ExitReport, HandleStatus, Launcher, LauncherError, OwnedHandle, RenderedCommand,
 };
+use mllm_domain::completion::ProcessIdentity;
 
 /// Spawns real OS processes in their own process group. Termination targets
 /// the whole owned group (SIGTERM → grace → SIGKILL). Handle verification
@@ -17,8 +18,7 @@ use mllm_adapters::traits::{
 /// name, never adopt whatever occupies a port.
 pub struct ExecLauncher {
     /// pid → /proc starttime captured at spawn time.
-    spawned: Mutex<std::collections::HashMap<u32, String>>,
-    identity_counter: std::sync::atomic::AtomicU64,
+    spawned: Mutex<std::collections::HashMap<u32, ProcessIdentity>>,
 }
 
 impl Default for ExecLauncher {
@@ -46,23 +46,26 @@ impl ExecLauncher {
     pub fn new() -> Self {
         Self {
             spawned: Mutex::new(Default::default()),
-            identity_counter: std::sync::atomic::AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0) as u64,
-            ),
         }
     }
 
-    fn next_identity(&self) -> u64 {
-        self.identity_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn recorded_starttime(&self, pid: u32) -> Option<String> {
+    fn recorded_identity(&self, pid: u32) -> Option<ProcessIdentity> {
         self.spawned.lock().unwrap().get(&pid).cloned()
     }
+}
+
+pub(crate) fn process_identity(pid: u32, role: &str) -> Option<ProcessIdentity> {
+    let start_ticks = proc_starttime(pid)?.parse().ok()?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = boot_id.trim().to_owned();
+    Some(ProcessIdentity { role: role.into(), pid, boot_id, start_ticks })
+}
+
+pub(crate) fn legacy_identity(identity: &ProcessIdentity) -> u128 {
+    let boot = identity.boot_id.replace('-', "");
+    u128::from_str_radix(&boot, 16).unwrap_or(0)
+        ^ (u128::from(identity.start_ticks) << 32)
+        ^ u128::from(identity.pid)
 }
 
 impl Launcher for ExecLauncher {
@@ -111,12 +114,12 @@ impl Launcher for ExecLauncher {
         });
         // Capture the boot-unique starttime immediately; a process that
         // exited before we read it shows up Gone at verify (correct).
-        let starttime = proc_starttime(pid);
-        if let Some(st) = &starttime {
-            self.spawned.lock().unwrap().insert(pid, st.clone());
+        let process_identity = process_identity(pid, "api");
+        if let Some(identity) = &process_identity {
+            self.spawned.lock().unwrap().insert(pid, identity.clone());
         }
-        let identity = self.next_identity();
-        Ok(OwnedHandle { pid, start_identity: identity.into() })
+        let start_identity = process_identity.as_ref().map(legacy_identity).unwrap_or(0);
+        Ok(OwnedHandle { pid, start_identity })
     }
 
     fn terminate(&self, h: &OwnedHandle, grace: Duration) -> Result<ExitReport, LauncherError> {
@@ -177,9 +180,10 @@ impl Launcher for ExecLauncher {
         let Some(current) = proc_starttime(h.pid) else {
             return HandleStatus::Gone;
         };
-        match self.recorded_starttime(h.pid) {
+        match self.recorded_identity(h.pid) {
             // We spawned it and the starttime matches: still ours.
-            Some(recorded) if recorded == current => HandleStatus::Valid,
+            Some(recorded) if recorded.start_ticks.to_string() == current
+                && legacy_identity(&recorded) == h.start_identity => HandleStatus::Valid,
             // PID exists but we never spawned it, or it was replaced: reuse.
             _ => HandleStatus::StaleReused,
         }

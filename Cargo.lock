@@ -1074,7 +1074,9 @@ name = "mllm-launchers"
 version = "0.1.0"
 dependencies = [
  "mllm-adapters",
+ "mllm-domain",
  "nix",
+ "tempfile",
  "thiserror",
 ]
 
