@@ -15,13 +15,64 @@ the work being executed. The owner will review consequential questions in the mo
 - The owner requested compressed communication overnight; durable technical
   documents retain precise terminology and explicit safety conditions.
 
-## Open questions
+## Morning continuation decisions
 
+The owner returned and asked to continue after the three recommendations were
+presented. Proceed with permanent case/action ownership, frozen deployment-scope
+`expected_revision`, and coordinator-selected qualification cases and inputs.
+Review the concrete implementation brief before code changes. These decisions do
+not authorize additional runtime effects or live work.
+
+The owner subsequently authorized merging completed and tested work. Local merges
+into `main` may proceed after independent code review and fresh verification of the
+complete merge scope. No push or PR publication was requested. Partial internal
+foundations do not establish that F2 runtime integration or live qualification is done.
+
+The owner changed review cadence: test and review at the end of each module, not
+with detailed reviews per task. This overrides SDD's per-task reviewer dispatches.
+Keep focused tests/TDD during implementation; group related tasks into cohesive
+modules and run a consolidated independent review plus verification at each module
+boundary. Do not relabel every small task as a module. Candidate Initialize
+acceptance, planned steps and atomic arming form the next initialization module.
+Document review remains a planning gate, not a repeated gate for each small task.
+
+- Ruling: bind each accepted Initialize action permanently to the sole frozen cold
+  case — prevent a new idempotency key from creating another attempt — cancellation
+  or uncertain execution requires reconciliation/cleanup rather than an automatic
+  replacement; a fresh run may be needed even if no process actually started.
+- Ruling: keep `expected_revision` as immutable deployment/recipe scope — matches
+  persisted run revision and existing creation receipt — this is not a progress CAS;
+  mutable eligibility needs transactional state, claims and case ownership checks.
+- Ruling: coordinator selects and validates frozen cases and inference corpus items
+  — client requests cannot supply trusted evidence — explicit client case selection
+  would require a later API change if operators need that control.
+
+## Decision details and remaining integration work
+
+- Candidate action contract needs frozen case mapping before implementation.
+  Existing `recipe_v1` allows exactly one `cold_initialize`, cycle 0, count 1;
+  later cycles allow park/restore, not another cold start. Recommendation: bind
+  Initialize permanently to that case; uncertain attempts never create replacement
+  permission. Action receipt and planned step need a distinct pending operation;
+  succeeded creation operation cannot authorize execution.
+  Architecture proposal recommends unique `(run_id, case_id)` action association;
+  existing idempotency keys alone cannot prevent another key consuming the same case.
+  Permanent ownership/no-refund direction is accepted above; exact schema remains
+  subject to the implementation brief and document review.
+- Candidate action `expected_revision` needs explicit meaning. Current run revision
+  names frozen deployment revision, not mutable action progress. Recommendation:
+  preserve that meaning; serialize action eligibility with state, claims and durable
+  case ownership. A separate progress CAS would require an explicit schema/API change.
+  Implementation follows the reviewed acceptance/planned-step brief.
+- Atomic arm must compose with existing spawn ownership. `arm_runtime_spawn`
+  currently consumes binding state `reserved` into `uncertain` in its own transaction.
+  New arm cannot consume that state twice. Planned steps have no grant or issue time;
+  only committed arm supplies those fields. Define joint transition before dispatch.
 - Future run inference needs explicit case/corpus-item selection. Current route fields
   name request/revision only. Working recommendation: trusted coordinator selects and
   validates case/item, then freezes mapping in retry receipt; client never supplies
-  evidence or pass predicates. Alternative: explicit untrusted case selector with
-  trusted validation. No implementation decision taken yet; does not block creation.
+  evidence or pass predicates. Coordinator selection is accepted above; exact
+  corpus/evaluator integration remains outside the Initialize-only slice.
 - Please check unrelated untracked `crates/mllm-cli/tests/live_interactive.rs` for
   unwanted formatting. During dispatch Task 3, the implementer ran `cargo fmt -- <paths>`;
   Cargo formatted the workspace instead of limiting scope. Tracked spill was
@@ -32,13 +83,31 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Progress
 
-- Latest verified checkpoint `5f803fb`: candidate creation store reviewed clean;
-  root390 CPU tests and scoped Clippy pass. Historical snapshot reviewed through
-  `59633e8`. One minor test risk retained: fixed port65535 can conflict with another
-  local listener. Next work: transaction-local reservation helper for atomic arm. No runtime
+- Candidate initialization module is implemented through `a5e17bd`: acceptance,
+  permanent case ownership, planned-step reads, Fake atomic arm and restart fencing.
+  Five local document reviewers and three independent reviews completed;
+  one correction aligned the intermediate checkpoint with module-end review.
+  Fresh root module gate: 416 CPU tests pass, both scoped Clippy commands pass with
+  warnings denied, and `git diff --check` passes. The unrelated CLI integration test
+  remains excluded. Consolidated independent module review passed with no critical
+  or important findings. Local integration is authorized; F2 remains open.
+  Minor follow-up: strengthen the V7-to-V8 migration fixture to preserve a known
+  event incarnation, exercise enabled foreign-key enforcement, retain revision and
+  generation, and assert all eight migration stamps. The additive SQL was reviewed
+  as correct; the gap is regression coverage rather than a known migration defect.
+  One earlier endpoint-allocation fixture failure passed unchanged in isolation and
+  did not recur in the fresh gate. Its cause remains unproven, not reported fixed.
+  Native allocator validation remains an explicit F2 dependency; Fake-only arm tests
+  cannot qualify vLLM or SGLang. Pinned-source investigation is documented; native
+  launch validation and trusted preflight remain implementation work.
+- Earlier verified checkpoint `7030923`: transaction-local reservation helper reviewed
+  clean; root 394 CPU tests and scoped Clippy pass. Candidate creation store reviewed
+  through `5f803fb`; historical snapshot reviewed through
+  `59633e8`. One minor test risk retained: fixed port 65535 can conflict with another
+  local listener. Next work: frozen-step/execution-context prerequisite planning. No runtime
   arm/dispatch integration, live qualification, F2 completion or merge claimed.
 - Candidate coverage reviewed through `6d8e89c`: canonical bytes/digest, strict
-  nested schema, budgets and F2C fixture (30 cases,384 markers,391 total requests).
+  nested schema, budgets and F2C fixture (30 cases, 384 markers, 391 total requests).
   Review fixed misleading count/order/minimum-boundary tests. Root `70e23ad` check:
   347 CPU tests/Clippy pass. A later rerun exposed launcher termination race
   (`ESRCH` after short-lived process exits). Repair reviewed through `2fd3d18`;
@@ -228,7 +297,7 @@ the work being executed. The owner will review consequential questions in the mo
   Final CPU test and scoped Clippy command chain passed. ESRCH means already gone,
   not proof all workers exited or permission to release stored resources.
 - Historical snapshot implemented at ad62126; root 363 CPU tests and scoped Clippy
-  passed. Independent review requested missing boundary tests; fixed in59633e8.
+  passed. Independent review requested missing boundary tests; fixed in `59633e8`.
   Parser-specific pre-fix RED was missed. Cost: weaker sensitivity evidence for
   that parser change; final tests and independent review remain mandatory.
 - Candidate creation store brief prepared and reviewed. Choices
@@ -239,7 +308,7 @@ the work being executed. The owner will review consequential questions in the mo
   typed V2 execution integration, versioned persisted conventions, conservative
   rejection of oversized declarations and low-port preference. Store acceptance now
   implemented; no execution readiness or permanent OS endpoint ownership claimed.
-- Snapshot dependency closed through 59633e8 after independent re-review; root366 CPU
+- Snapshot dependency closed through 59633e8 after independent re-review; root 366 CPU
   tests and scoped Clippy pass. Candidate creation document review complete: five
   local lenses, three independent reviews, no required correction or owner decision.
   Future gates remain: accepted-only runs need verified cleanup before shared ports

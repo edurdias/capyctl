@@ -482,6 +482,18 @@ WHERE id=?1 AND state='planned' AND session_id=?3;
   changing a rendered value requires a new effective recipe and qualification.
   Total phase allocations and host KV accounting do not uniquely determine backend
   KV pools. Validate against qualified backend geometry and allocation evidence.
+  Candidate bootstrap instead uses reviewed pinned allocator semantics and defensible
+  conservative estimates; it does not require prior Qualified evidence or a
+  mathematical whole-process cap. F2C's initial 48 GiB qualification grants remain
+  unproven until measured. Check weights, explicit KV controls, fixed settings and
+  loading strategy before launch; reject `estimate_unbounded`, retain pressure guards,
+  and never treat an accounting reservation as an OS-enforced memory limit.
+  At the pinned vLLM build, explicit KV bytes override utilization-based sizing but
+  profiling/compilation still consumes non-KV memory
+  ([GPU worker](https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/worker/gpu_worker.py#L482)).
+  SGLang token limits require effective KV dtype, geometry, page and metadata sizing,
+  not a BF16-weight assumption
+  ([pool sizing](https://github.com/sgl-project/sglang/blob/fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1/python/sglang/srt/model_executor/pool_configurator.py#L238)).
   Resource-neutral control substeps still require a unique persisted intent but
   do not mint a second resource grant. A Stop intent is armed under its explicit
   authorization without inventing a resource-increasing phase.
@@ -639,7 +651,7 @@ pub enum RuntimeAction { Initialize, Drain, Park, Restore, Probe, Stop, Inspect 
 #[derive(Clone, Debug)]
 pub struct RuntimeCommand {
     pub action: RuntimeAction,
-    pub context: mllm_domain::execution::StepExecutionContext,
+    pub context: mllm_domain::completion::StepExecutionContext,
 }
 #[async_trait::async_trait]
 pub trait EngineAdapter: Send + Sync {
