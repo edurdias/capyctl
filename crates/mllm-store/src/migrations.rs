@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5};
+use crate::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
-pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+pub const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6];
 
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
@@ -118,6 +118,29 @@ mod tests {
             let count: i64 = conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "{table}");
+        }
+    }
+
+    #[test]
+    fn v6_management_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        for table in [
+            "deployment_routes",
+            "command_receipts",
+            "effective_revisions",
+            "host_resource_policies",
+            "host_qualification_policies",
+            "qualification_runs",
+            "qualifications",
+            "qualification_evidence_refs",
+        ] {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table], |row| row.get(0),
+            ).unwrap();
             assert_eq!(count, 1, "{table}");
         }
     }

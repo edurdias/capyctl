@@ -181,6 +181,75 @@ CREATE TABLE lifecycle_evidence(
 );
 "#;
 
+pub const SCHEMA_V6: &str = r#"
+CREATE TABLE deployment_routes(
+  route TEXT PRIMARY KEY,
+  deployment_id TEXT NOT NULL REFERENCES deployments(id)
+);
+CREATE TABLE command_receipts(
+  principal_id TEXT NOT NULL,
+  command_scope TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  operation_id TEXT NOT NULL REFERENCES operations(id),
+  response_json TEXT NOT NULL,
+  PRIMARY KEY(principal_id,command_scope,idempotency_key)
+);
+CREATE TABLE effective_revisions(
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  effective_json TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  PRIMARY KEY(deployment_id,revision)
+);
+CREATE TABLE host_resource_policies(
+  host_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  policy_json TEXT NOT NULL
+);
+CREATE TABLE host_qualification_policies(
+  host_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  policy_json TEXT NOT NULL
+);
+CREATE TABLE qualification_runs(
+  id TEXT PRIMARY KEY,
+  host_id TEXT NOT NULL REFERENCES host_qualification_policies(host_id),
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  incarnation TEXT NOT NULL,
+  operation_id TEXT NOT NULL REFERENCES operations(id),
+  principal_id TEXT NOT NULL,
+  recipe_digest TEXT NOT NULL,
+  authorization_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN
+    ('accepted','running','passed','failed','uncertain','aborted','expired')),
+  deadline_ms INTEGER NOT NULL,
+  requests_used INTEGER NOT NULL DEFAULT 0 CHECK(requests_used>=0),
+  cleanup_state TEXT NOT NULL DEFAULT 'retained'
+    CHECK(cleanup_state IN ('retained','verified_gone')),
+  cleanup_step_id TEXT REFERENCES lifecycle_steps(id),
+  CHECK((cleanup_state='retained' AND cleanup_step_id IS NULL) OR
+        (cleanup_state='verified_gone' AND cleanup_step_id IS NOT NULL))
+);
+CREATE TABLE qualifications(
+  id TEXT PRIMARY KEY,
+  source_run_id TEXT NOT NULL UNIQUE REFERENCES qualification_runs(id),
+  recipe_fingerprint TEXT NOT NULL,
+  record_json TEXT NOT NULL
+);
+CREATE INDEX qualifications_recipe ON qualifications(recipe_fingerprint);
+CREATE TABLE qualification_evidence_refs(
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES qualification_runs(id),
+  case_id TEXT NOT NULL,
+  evidence_digest TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  UNIQUE(run_id,case_id,evidence_digest)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
