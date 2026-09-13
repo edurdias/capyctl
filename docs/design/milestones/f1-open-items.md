@@ -2,6 +2,10 @@
 
 ## Current closeout (2026-09-12)
 
+**F1 closed by owner direction for mainline integration.** F2 SGLang is the
+active next milestone. Closure accepts the bounded F1 evidence below; it does
+not erase the listed carryovers or broaden live qualification claims.
+
 The merge record below is historical. Subsequent live 4B concurrency exposed a
 controller bug: Ready was published before activation work completed. The
 controller now retains Starting/Waking through readiness/restoration, and the
