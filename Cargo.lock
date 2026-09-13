@@ -1002,6 +1002,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "mllm-adapters",
+ "mllm-domain",
  "mllm-scheduler",
  "sha2",
  "thiserror",
