@@ -143,7 +143,23 @@ impl Launcher for ExecLauncher {
             }
         }
         let pgid = nix::unistd::Pid::from_raw(h.pid as i32);
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
+        match self.verify_handle(h) {
+            HandleStatus::Valid => {}
+            HandleStatus::Gone => {
+                self.spawned.lock().unwrap().remove(&h.pid);
+                return Ok(ExitReport {
+                    pid: h.pid,
+                    exit_code: None,
+                    signal: None,
+                    killed: false,
+                });
+            }
+            HandleStatus::StaleReused => return Err(LauncherError::TerminateFailed(format!(
+                "handle pid {} changed immediately before SIGTERM", h.pid
+            ))),
+        }
+        nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM)
+            .map_err(|error| LauncherError::TerminateFailed(error.to_string()))?;
         let deadline = Instant::now() + grace;
         loop {
             if !pid_alive(h.pid) {
@@ -156,7 +172,25 @@ impl Launcher for ExecLauncher {
                 });
             }
             if Instant::now() >= deadline {
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                match self.verify_handle(h) {
+                    HandleStatus::Valid => {}
+                    HandleStatus::Gone => {
+                        self.spawned.lock().unwrap().remove(&h.pid);
+                        return Ok(ExitReport {
+                            pid: h.pid,
+                            exit_code: None,
+                            signal: Some(nix::sys::signal::Signal::SIGTERM as i32),
+                            killed: false,
+                        });
+                    }
+                    HandleStatus::StaleReused => {
+                        return Err(LauncherError::TerminateFailed(format!(
+                            "handle pid {} changed immediately before SIGKILL", h.pid
+                        )));
+                    }
+                }
+                nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL)
+                    .map_err(|error| LauncherError::TerminateFailed(error.to_string()))?;
                 // Wait briefly for the kernel to reclaim the process.
                 for _ in 0..50 {
                     if !pid_alive(h.pid) {
@@ -187,5 +221,36 @@ impl Launcher for ExecLauncher {
             // PID exists but we never spawned it, or it was replaced: reuse.
             _ => HandleStatus::StaleReused,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escalation_rechecks_identity_immediately_before_sigkill() {
+        let launcher = ExecLauncher::new();
+        let command = RenderedCommand {
+            argv: vec![
+                "sh".into(), "-c".into(),
+                "trap \"\" TERM; while :; do sleep 1; done".into(),
+            ],
+            env: Default::default(),
+        };
+        let handle = launcher.spawn(&command).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                launcher.spawned.lock().unwrap().get_mut(&handle.pid).unwrap().start_ticks += 1;
+            });
+            let result = launcher.terminate(&handle, Duration::from_millis(300));
+            assert!(matches!(result, Err(LauncherError::TerminateFailed(_))));
+        });
+        assert!(pid_alive(handle.pid));
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(handle.pid as i32), nix::sys::signal::Signal::SIGKILL,
+        ).unwrap();
     }
 }

@@ -1,10 +1,16 @@
 use std::sync::Arc;
 
 use mllm_adapters::fake::FakeEngine;
+use mllm_adapters::traits::RenderedCommand;
 use mllm_controller::{
-    RuntimeAction, RuntimeBinding, RuntimeBindings, RuntimeError, RuntimeOwnership,
+    DurableRuntimeSupervisor, RuntimeAction, RuntimeBinding, RuntimeBindings, RuntimeError,
+    RuntimeOwnership,
 };
 use mllm_domain::resources::{Allocation, PhaseFootprint, RecipeFootprints, ResourcePhase};
+use mllm_domain::{DeploymentId, LifecycleState, OperationId};
+use mllm_launchers::DurableSpawnOutcome;
+use mllm_store::lifecycle::{DeploymentFence, ReserveBinding};
+use mllm_store::{AcceptDeployment, Store};
 
 fn footprint(phase: ResourcePhase) -> PhaseFootprint {
     PhaseFootprint {
@@ -16,6 +22,73 @@ fn footprint(phase: ResourcePhase) -> PhaseFootprint {
         }],
         devices: vec![],
     }
+}
+
+#[test]
+fn durable_spawn_attempt_survives_supervisor_recreation() {
+    let store = Store::open_in_memory().unwrap();
+    let deployment = DeploymentId::new();
+    store
+        .accept_deployment(AcceptDeployment {
+            id: deployment,
+            name: "durable-supervisor".into(),
+            kind: "model".into(),
+            route_model_id: None,
+            desired_state: LifecycleState::Stopped,
+            schema_version: 1,
+            idempotency_key: "durable-supervisor".into(),
+            initial_operation_id: OperationId("durable-supervisor-operation".into()),
+        })
+        .unwrap();
+    let deployment_id = deployment.to_string();
+    let fence = DeploymentFence {
+        deployment_id: deployment_id.clone(),
+        revision: 1,
+        generation: 1,
+    };
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .reserve_runtime_binding(
+            &session,
+            &ReserveBinding {
+                id: "durable-binding".into(),
+                fence: fence.clone(),
+                incarnation: "durable-incarnation".into(),
+                qualification_id: "qualification".into(),
+                ownership: "managed".into(),
+                endpoint_host: "127.0.0.1".into(),
+                endpoint_port: 31011,
+                credential_ref: "credential-reference".into(),
+                binding_payload: "recipe-reference".into(),
+            },
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("initialized");
+    let command = RenderedCommand {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'", marker.display()),
+        ],
+        env: Default::default(),
+    };
+    let first = DurableRuntimeSupervisor::new(&store, &session)
+        .spawn(&fence, "durable-binding", &command)
+        .unwrap();
+    assert!(matches!(
+        first,
+        DurableSpawnOutcome::Uncertain {
+            initialization_acknowledged: true,
+            ..
+        }
+    ));
+    let second =
+        DurableRuntimeSupervisor::new(&store, &session).spawn(&fence, "durable-binding", &command);
+    assert!(matches!(second, Err(RuntimeError::Uncertain(_))));
+    let retained = store.runtime_binding(&deployment_id).unwrap().unwrap();
+    assert_eq!(retained.state, "uncertain");
+    assert_eq!(retained.endpoint, "127.0.0.1:31011");
 }
 
 fn recipe() -> RecipeFootprints {
@@ -86,16 +159,12 @@ fn retained_binding_is_immutable_and_attached_control_is_unsupported() {
         RuntimeAction::Park,
         RuntimeAction::Restore,
         RuntimeAction::Stop,
+        RuntimeAction::Probe,
+        RuntimeAction::Inspect,
     ] {
         assert!(matches!(
             bindings.control("deployment-attached", 1, action),
             Err(RuntimeError::Unsupported)
         ));
     }
-    assert!(bindings
-        .control("deployment-attached", 1, RuntimeAction::Probe)
-        .is_ok());
-    assert!(bindings
-        .control("deployment-attached", 1, RuntimeAction::Inspect)
-        .is_ok());
 }

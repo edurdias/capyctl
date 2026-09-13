@@ -182,33 +182,27 @@ impl crate::Store {
         Ok(())
     }
 
-    pub fn record_runtime_identities(
+    /// Records API membership only; it never establishes complete worker ownership.
+    pub fn record_api_identity(
         &self,
         session: &CoordinatorSession,
         fence: &DeploymentFence,
         binding_id: &str,
-        identities: &[ProcessIdentity],
-        complete_role_set: bool,
+        identity: &ProcessIdentity,
     ) -> Result<(), LifecycleError> {
-        if identities.is_empty()
-            || identities.iter().any(|identity| {
-                identity.role.is_empty()
-                    || identity.pid == 0
-                    || identity.boot_id.is_empty()
-                    || identity.start_ticks == 0
-            })
+        if identity.role != "api"
+            || identity.pid == 0
+            || identity.boot_id.is_empty()
+            || identity.start_ticks == 0
         {
             return Err(LifecycleError::Invalid);
         }
-        let dto: Vec<_> = identities
-            .iter()
-            .map(|identity| IdentityDto {
-                role: identity.role.clone(),
-                pid: identity.pid,
-                boot_id: identity.boot_id.clone(),
-                start_ticks: identity.start_ticks,
-            })
-            .collect();
+        let dto = [IdentityDto {
+            role: identity.role.clone(),
+            pid: identity.pid,
+            boot_id: identity.boot_id.clone(),
+            start_ticks: identity.start_ticks,
+        }];
         let json = serde_json::to_string(&dto).map_err(|_| LifecycleError::Invalid)?;
         if json.len() > MAX_DTO_BYTES {
             return Err(LifecycleError::Invalid);
@@ -216,19 +210,9 @@ impl crate::Store {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         fenced(&transaction, session, fence)?;
         let changed = transaction.execute(
-            "UPDATE runtime_bindings SET identities_json=?1,state=?2
-             WHERE id=?3 AND deployment_id=?4 AND revision=?5 AND state!='released'",
-            params![
-                json,
-                if complete_role_set {
-                    "live"
-                } else {
-                    "uncertain"
-                },
-                binding_id,
-                fence.deployment_id,
-                fence.revision
-            ],
+            "UPDATE runtime_bindings SET identities_json=?1,state='uncertain'
+             WHERE id=?2 AND deployment_id=?3 AND revision=?4 AND state!='released'",
+            params![json, binding_id, fence.deployment_id, fence.revision],
         )?;
         if changed != 1 {
             return Err(LifecycleError::Conflict);
@@ -359,5 +343,94 @@ mod tests {
         stale.fence.revision = 2;
         assert!(store.reserve_runtime_binding(&session, &stale).is_err());
         assert_eq!(store.runtime_binding(&deployment_a).unwrap().unwrap(), a);
+    }
+
+    #[test]
+    fn incomplete_identity_and_consumed_spawn_attempt_retain_accounting() {
+        let store = Store::open_in_memory().unwrap();
+        let deployment = accepted(&store, "uncertain-runtime");
+        let session = store.begin_coordinator_session().unwrap();
+        let fence = DeploymentFence {
+            deployment_id: deployment.clone(),
+            revision: 1,
+            generation: 1,
+        };
+        store
+            .reserve_runtime_binding(
+                &session,
+                &ReserveBinding {
+                    id: "binding-uncertain".into(),
+                    fence: fence.clone(),
+                    incarnation: "incarnation-uncertain".into(),
+                    qualification_id: "qualified".into(),
+                    ownership: "managed".into(),
+                    endpoint_host: "127.0.0.1".into(),
+                    endpoint_port: 31012,
+                    credential_ref: "credential-reference".into(),
+                    binding_payload: "recipe-reference".into(),
+                },
+            )
+            .unwrap();
+        store
+            .arm_runtime_spawn(
+                &session,
+                &fence,
+                "binding-uncertain",
+                "incarnation-uncertain",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.arm_runtime_spawn(
+                &session,
+                &fence,
+                "binding-uncertain",
+                "incarnation-uncertain",
+            ),
+            Err(LifecycleError::Conflict)
+        ));
+        store
+            .record_api_identity(
+                &session,
+                &fence,
+                "binding-uncertain",
+                &ProcessIdentity {
+                    role: "api".into(),
+                    pid: 42,
+                    boot_id: "boot".into(),
+                    start_ticks: 7,
+                },
+            )
+            .unwrap();
+        let retained = store.runtime_binding(&deployment).unwrap().unwrap();
+        assert_eq!(retained.state, "uncertain");
+        assert_eq!(retained.identities.len(), 1);
+        let leases: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM endpoint_leases WHERE binding_id='binding-uncertain'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leases, 1);
+
+        let _new_session = store.begin_coordinator_session().unwrap();
+        assert!(matches!(
+            store.record_api_identity(
+                &session,
+                &fence,
+                "binding-uncertain",
+                &ProcessIdentity {
+                    role: "api".into(),
+                    pid: 43,
+                    boot_id: "boot".into(),
+                    start_ticks: 8,
+                },
+            ),
+            Err(LifecycleError::Stale)
+        ));
+        let still_retained = store.runtime_binding(&deployment).unwrap().unwrap();
+        assert_eq!(still_retained.endpoint, "127.0.0.1:31012");
+        assert_eq!(still_retained.state, "uncertain");
     }
 }

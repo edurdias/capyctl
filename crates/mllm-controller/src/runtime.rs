@@ -75,12 +75,10 @@ impl RuntimeBindings {
         &self,
         deployment_id: &str,
         revision: i64,
-        action: RuntimeAction,
+        _action: RuntimeAction,
     ) -> Result<(), RuntimeError> {
         let binding = self.binding(deployment_id, revision)?;
-        if binding.ownership == RuntimeOwnership::Attached
-            && !matches!(action, RuntimeAction::Probe | RuntimeAction::Inspect)
-        {
+        if binding.ownership == RuntimeOwnership::Attached {
             return Err(RuntimeError::Unsupported);
         }
         Ok(())
@@ -148,13 +146,7 @@ struct StoreAssociation<'a> {
 impl LaunchAssociation for StoreAssociation<'_> {
     fn persist_api_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
         self.store
-            .record_runtime_identities(
-                self.session,
-                self.fence,
-                self.binding_id,
-                std::slice::from_ref(identity),
-                false,
-            )
+            .record_api_identity(self.session, self.fence, self.binding_id, identity)
             .map_err(|error| AssociationError::Uncertain(error.to_string()))
     }
 }
