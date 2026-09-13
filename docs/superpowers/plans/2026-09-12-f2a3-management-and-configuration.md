@@ -151,6 +151,21 @@ Revalidate every pending step against the latest revision. Never stop engines or
 claim memory release as a side effect of changing a ceiling. Restoring a previous
 policy also requires the latest revision; stale restoration fails with 409.
 
+The local resource block bootstraps an empty database at revision1. Later startup
+validates immutable host/domain/device/port context and uses persisted controls;
+it must not undo accepted management changes from an older local file. Resource
+updates affect numeric controls and sharing restrictions, not domain/device
+membership, device mappings, ports, identity or qualification policy. Persist
+immutable context and controls as separate fields in the bounded existing policy
+JSON. Unknown physical capacity cannot authorize initial policy or launch.
+
+Host policy updates finish synchronously in their transaction but retain a durable
+succeeded operation. Its deployment target is null. Existing command receipt scope
+and bounded response metadata supply durable host target provenance; generic
+operation reads validate that association, and deployment-only reads exclude null
+targets. Do not invent a deployment or rely on prunable events for target identity.
+Actual update-versus-arm race proof remains a joint A3Task2/A2dTask4 completion gate.
+
 Detach atomically checks attachment revision, closes its route and new dispatch,
 and fences generation. Wait for confirmed terminal mllm work only. Timeout or
 unknown work leaves the operation failed/uncertain and leases retained. Successful

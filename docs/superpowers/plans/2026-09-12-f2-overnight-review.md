@@ -27,6 +27,12 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Progress
 
+- Qualification importer reviewed through `b7109ca`: atomic session-fenced updates,
+  revision tombstones, bounded strict reads, redacted events and retained accounting.
+  Root checks: 287 CPU tests pass; scoped Clippy clean. Resource-policy contract
+  reviewed by five local personas and three independent reviews. Local
+  resource config bootstraps the database; accepted DB controls subsequently win.
+  Domain/device/port changes need separate migration, not resource-limit updates.
 - Qualification-policy input reviewed through `cec820f`: strict optional policy,
   independent permissions, canonical allowlist, shared validation, safe nested
   errors. Root checks: 272 CPU tests pass; scoped Clippy clean. Importer contract
