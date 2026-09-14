@@ -44,6 +44,17 @@ impl crate::Store {
         if let Some(anchor) = existing {
             let p = plan_for_step(&tx, &anchor)?;
             validate_plan(&tx, &p)?;
+            let parent_state: String = tx.query_row(
+                "SELECT state FROM lifecycle_steps WHERE id=?1",
+                [&p.scope.parent_step_id],
+                |r| r.get(0),
+            )?;
+            if matches!(parent_state.as_str(), "uncertain" | "cancelled") {
+                return Ok(CandidateSecurityDispatch::AlreadyRecorded {
+                    operation_id: p.scope.operation_id,
+                    complete: false,
+                });
+            }
             for (index, effect) in p.effects.iter().enumerate() {
                 let state: String = tx.query_row(
                     "SELECT state FROM lifecycle_steps WHERE id=?1",
@@ -274,8 +285,7 @@ fn accept_scope(run: &str) -> String {
     format!("INTERNAL qualification Security {run}")
 }
 fn source(tx: &Transaction<'_>, run: &str) -> Result<CandidateActionPlanV3, LifecycleError> {
-    let anchor:String=tx.query_row("SELECT a.step_id FROM qualification_case_actions a JOIN lifecycle_runs r ON r.operation_id=a.operation_id WHERE a.run_id=?1 AND r.action='activate' ORDER BY a.rowid LIMIT 1",[run],|r|r.get(0))?;
-    let p = plan_for_step(tx, &anchor)?;
+    let p = warm::cold(tx, run)?;
     validate_plan_inner(tx, &p, false)?;
     if p.action != Action::Initialize {
         return Err(LifecycleError::CorruptStoredData);
@@ -940,6 +950,11 @@ pub(in super::super) fn validate(
         |r| r.get(0),
     )?;
     let cleanup_resolved = handoff.is_some() && actual_run == "failed";
+    let session_changed: bool = tx.query_row(
+        "SELECT session_id<>?1 FROM coordinator_session WHERE singleton=1",
+        [&s.session_id],
+        |r| r.get(0),
+    )?;
     if let Some(history) = &handoff {
         if !matches!(actual_run.as_str(), "uncertain" | "failed") || history.len() != rows.len() {
             return Err(bad());
@@ -965,6 +980,9 @@ pub(in super::super) fn validate(
             row.5 = original.clone();
         }
     }
+    // A later session cannot rewrite the original state frozen by an earlier
+    // cleanup handoff. Distinguish that history from actual rollover uncertainty.
+    let rollover = session_changed && (handoff.is_none() || rows[0].5 == "uncertain");
     let mut all = true;
     let mut failed = false;
     let mut previous_epoch = epoch;
@@ -1118,11 +1136,11 @@ pub(in super::super) fn validate(
                 failed = true;
             }
         } else {
-            if row.5 != "armed" {
+            if row.5 != "armed" && !(row.5 == "uncertain" && session_changed) {
                 return Err(bad());
             }
             if let Some(attempt) = &attempt {
-                let inflight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases l JOIN operations o ON o.id=?1 WHERE l.id=?2 AND l.deployment_id=?3 AND l.revision=?4 AND l.generation=?5 AND l.session_id=?6 AND l.disposition='inflight' AND o.state='running')",params![attempt.request_operation_id,attempt.lease_id,s.deployment_id,s.revision,s.generation,s.session_id],|r|r.get(0))?;
+                let inflight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases l JOIN operations o ON o.id=?1 WHERE l.id=?2 AND l.deployment_id=?3 AND l.revision=?4 AND l.generation=?5 AND l.session_id=?6 AND l.disposition=?7 AND o.state='running')",params![attempt.request_operation_id,attempt.lease_id,s.deployment_id,s.revision,s.generation,s.session_id,if row.5=="uncertain" {"uncertain"} else {"inflight"}],|r|r.get(0))?;
                 let resolved: bool = cleanup_resolved && tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND state='failed' AND error_code='resolved_by_owned_cleanup') AND NOT EXISTS(SELECT 1 FROM request_leases WHERE id=?2)", params![attempt.request_operation_id,attempt.lease_id], |r| r.get(0))?;
                 if !inflight && !resolved {
                     return Err(bad());
@@ -1154,7 +1172,7 @@ pub(in super::super) fn validate(
             "uncertain"
         } else if all {
             "succeeded"
-        } else if failed {
+        } else if failed || rollover {
             "uncertain"
         } else {
             "running"
@@ -1170,7 +1188,7 @@ pub(in super::super) fn validate(
         || rows[0].5
             != if all {
                 "completed"
-            } else if failed {
+            } else if failed || rollover {
                 "uncertain"
             } else {
                 "armed"

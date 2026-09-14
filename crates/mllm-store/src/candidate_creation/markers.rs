@@ -77,6 +77,17 @@ impl crate::Store {
         let supplied = request(body)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
+        let snapshot = super::super::super::read_snapshot(&tx, principal, run)
+            .map_err(creation_error)?
+            .ok_or(LifecycleError::Conflict)?;
+        if body.len() as i64
+            > snapshot
+                .reviewed_manifest()
+                .limits()
+                .max_request_body_bytes()
+        {
+            return Err(LifecycleError::Invalid);
+        }
         // Resolve the original command before selecting the next case or ordinal.
         let prior: Option<String> = tx.query_row("SELECT operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3", params![principal,command_scope(run),key], |r|r.get(0)).optional()?;
         if let Some(operation) = prior {

@@ -8,11 +8,380 @@ use mllm_domain::completion::{CompletionEvidence, Milestone, OwnedLaunchReceipt}
 use mllm_domain::resources::{MemoryLimit, MemoryObservation, ResourcePhase};
 use mllm_scheduler::residency::AdmissionContext;
 use mllm_store::candidate_creation::progression::CandidateDispatchResult;
-use mllm_store::{Store, candidate_creation::initialize::ArmResult};
-use serde_json::{Value, json};
+use mllm_store::{candidate_creation::initialize::ArmResult, Store};
+use serde_json::{json, Value};
 
 fn marker_body(f: &Fixture, marker: &str, stream: bool) -> String {
     json!({"model":format!("candidate-{}", f.created.deployment_id()),"messages":[{"role":"user","content":format!("Repeat exactly: {marker}")}],"temperature":0,"max_tokens":16,"stream":stream}).to_string()
+}
+
+// Semantic equality does not authorize extra wire bytes beyond the run bound.
+#[tokio::test]
+async fn public_marker_dispatch_enforces_actual_frozen_body_size() {
+    let f = fixture_custom(9663676416, 10737418240, |v| {
+        v["limits"]["max_request_body_bytes"] = json!(256);
+        v["limits"]["max_input_tokens_per_request"] = json!(29);
+        v["limits"]["max_output_tokens_per_request"] = json!(16);
+    });
+    let fake = FakeEngine::for_qualification();
+    f.ready(&fake).await;
+    let body = marker_body(&f, "MLLM_ALPHA_71", false);
+    assert!(body.len() < 256);
+    let oversized = format!("{}{}", body, " ".repeat(257 - body.len()));
+    let before = f.counts();
+    assert!(matches!(
+        f.store.grant_candidate_inference(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "marker",
+            &oversized,
+            f.admission()
+        ),
+        Err(mllm_store::lifecycle::LifecycleError::Invalid)
+    ));
+    assert_eq!(f.counts(), before);
+    assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 1);
+    assert!(matches!(
+        f.store
+            .grant_candidate_inference(
+                &f.session,
+                "owner",
+                f.created.run_id(),
+                "marker",
+                &body,
+                f.admission()
+            )
+            .unwrap(),
+        CandidateDispatchResult::New(_)
+    ));
+    assert!(f
+        .store
+        .grant_candidate_inference(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "marker",
+            &oversized,
+            f.admission()
+        )
+        .is_err());
+}
+
+// Corruption must return an error, never abort the coordinator. The disposable
+// child confines the pre-fix stack overflow and keeps the regression observable.
+#[tokio::test]
+async fn corrupt_warm_predecessor_self_and_cross_links_are_bounded() {
+    const CHILD: &str = "MLLM_TEST_CORRUPT_WARM_LINK";
+    let Ok(kind) = std::env::var(CHILD) else {
+        for kind in ["self", "cross", "marker"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "corrupt_warm_predecessor_self_and_cross_links_are_bounded",
+                    "--nocapture",
+                ])
+                .env(CHILD, kind)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{kind}: child {:?}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let f = if kind == "marker" {
+        fixture_custom(9663676416, 10737418240, |v| {
+            let mut extra = v["cases"].as_array().unwrap()[5..].to_vec();
+            for case in &mut extra {
+                case["cycle"] = json!(2);
+                case["id"] = json!(case["id"].as_str().unwrap().replace("-1", "-2"));
+            }
+            v["cases"].as_array_mut().unwrap().extend(extra);
+            v["limits"]["max_requests"] = json!(17);
+        })
+    } else {
+        fixture()
+    };
+    let fake = FakeEngine::for_qualification();
+    // All link targets originate in actual writers and real Fake execution.
+    if kind == "marker" {
+        f.completed_suite(&fake).await;
+    } else {
+        let collector = f.secured(&fake).await;
+        let park = f
+            .store
+            .accept_candidate_action(
+                &f.session,
+                "owner",
+                f.created.run_id(),
+                "park",
+                r#"{"expected_revision":1,"action":"park","deadline_ms":400000}"#,
+                1200,
+            )
+            .unwrap();
+        if kind == "cross" {
+            for (child, action) in park
+                .effect_ids()
+                .iter()
+                .zip([RuntimeAction::Drain, RuntimeAction::Park])
+            {
+                assert!(matches!(
+                    f.store
+                        .arm_candidate_effect(&f.session, child, f.admission())
+                        .unwrap(),
+                    ArmResult::New { .. }
+                ));
+                let (_, context) = f
+                    .store
+                    .candidate_effect_execution(&f.session, child)
+                    .unwrap();
+                let o = fake
+                    .execute_persisted(&RuntimeCommand { action, context })
+                    .await
+                    .unwrap();
+                f.store
+                    .record_candidate_effect(&f.session, &collector, child, &o, 1300)
+                    .unwrap();
+            }
+            let context = f
+                .store
+                .candidate_parked_status_execution(&f.session, park.step_id(), 1200)
+                .unwrap();
+            let o = mllm_controller::qualification::collect_parked_status(&fake, &context).unwrap();
+            f.store
+                .record_candidate_parked_status(&f.session, &collector, &o, 1300)
+                .unwrap();
+            f.store
+                .accept_candidate_action(
+                    &f.session,
+                    "owner",
+                    f.created.run_id(),
+                    "restore",
+                    r#"{"expected_revision":1,"action":"restore","deadline_ms":400000}"#,
+                    1200,
+                )
+                .unwrap();
+        }
+    }
+    if kind == "marker" {
+        let body = r#"{"expected_revision":1,"action":"park","deadline_ms":400000}"#;
+        let park = f
+            .store
+            .accept_candidate_action(
+                &f.session,
+                "owner",
+                f.created.run_id(),
+                "park-2",
+                body,
+                1400,
+            )
+            .unwrap();
+        f.sql.execute("UPDATE qualification_ready_probes SET parent_step_id=?1 WHERE case_id='ready_probe-1'",[park.step_id()]).unwrap();
+        assert!(matches!(
+            f.store.accept_candidate_action(
+                &f.session,
+                "owner",
+                f.created.run_id(),
+                "park-2",
+                body,
+                999999
+            ),
+            Err(mllm_store::lifecycle::LifecycleError::CorruptStoredData)
+        ));
+        return;
+    }
+    let target = if kind == "self" {
+        "park-1"
+    } else {
+        "restore-1"
+    };
+    let (operation, anchor): (String, String) = f
+        .sql
+        .query_row(
+            "SELECT operation_id,step_id FROM qualification_case_actions WHERE case_id=?1",
+            [target],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    f.sql
+        .execute(
+            "DELETE FROM qualification_case_actions WHERE case_id=?1",
+            [target],
+        )
+        .unwrap();
+    f.sql.execute("UPDATE qualification_case_actions SET operation_id=?1,step_id=?2 WHERE case_id='security-0'",rusqlite::params![operation,anchor]).unwrap();
+    let result = f.store.accept_candidate_action(
+        &f.session,
+        "owner",
+        f.created.run_id(),
+        "park",
+        r#"{"expected_revision":1,"action":"park","deadline_ms":400000}"#,
+        999999,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(mllm_store::lifecycle::LifecycleError::CorruptStoredData)
+        ),
+        "{result:?}"
+    );
+}
+
+// Catches rejecting session-induced uncertainty as corrupt evidence, including
+// a parent restarted between checks while its next child remains planned.
+#[tokio::test]
+async fn security_crash_after_each_arm_and_between_checks_remains_cleanup_recoverable() {
+    use mllm_store::candidate_creation::progression::CandidateSecurityDispatch;
+    for (stop, expected_spend, uncertain_leases, restart) in [
+        (0, 5, 0, true),
+        (1, 5, 0, true),
+        (2, 6, 1, true),
+        (3, 6, 0, true),
+        (4, 7, 1, true),
+        (0, 5, 0, false),
+    ] {
+        let f = fixture();
+        let fake = FakeEngine::for_qualification();
+        let collector = f.baseline(&fake).await;
+        for check in 0..=stop / 2 {
+            let record = check * 2 < stop;
+            match f
+                .store
+                .advance_candidate_security(&f.session, &collector, f.admission())
+                .unwrap()
+            {
+                CandidateSecurityDispatch::NewControl(d) => {
+                    let o = mllm_controller::qualification::collect_security_control(&fake, *d)
+                        .await
+                        .unwrap();
+                    if record {
+                        f.store
+                            .record_candidate_security_control(&f.session, &collector, &o, 1300)
+                            .unwrap();
+                    }
+                }
+                CandidateSecurityDispatch::NewRequest(d) => {
+                    let o = mllm_controller::qualification::collect_probe(&fake, *d)
+                        .await
+                        .unwrap();
+                    if record {
+                        f.store
+                            .record_candidate_result(&f.session, &collector, &o, 1300)
+                            .unwrap();
+                    }
+                }
+                _ => panic!("missing original check {check}"),
+            }
+        }
+        let envelopes:Vec<(String,String)>=f.sql.prepare("SELECT id,step_json FROM lifecycle_steps WHERE operation_id IN (SELECT operation_id FROM lifecycle_runs WHERE action='prepare') ORDER BY ordinal").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        let sends = fake.qualification_activity().unwrap();
+        let next = if restart {
+            f.store.begin_coordinator_session().unwrap()
+        } else {
+            f.session.clone()
+        };
+        assert_eq!(
+            f.scalar(
+                "SELECT COUNT(*) FROM lifecycle_runs WHERE action='prepare' AND state='uncertain'"
+            ),
+            i64::from(restart)
+        );
+        assert_eq!(
+            f.scalar("SELECT COUNT(*) FROM request_leases WHERE disposition='uncertain'"),
+            uncertain_leases
+        );
+        for (id, raw) in envelopes {
+            let current: String = f
+                .sql
+                .query_row(
+                    "SELECT step_json FROM lifecycle_steps WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(current, raw);
+        }
+        assert!(
+            matches!(
+                f.store
+                    .advance_candidate_security(&next, &collector, f.admission())
+                    .unwrap(),
+                CandidateSecurityDispatch::AlreadyRecorded {
+                    complete: false,
+                    ..
+                }
+            ),
+            "stop {stop}"
+        );
+        let cleanup = f
+            .store
+            .accept_candidate_cleanup(
+                &next,
+                "owner",
+                f.created.run_id(),
+                "cleanup",
+                r#"{"expected_revision":1,"action":"cleanup","deadline_ms":60000}"#,
+                1400,
+            )
+            .unwrap();
+        assert!(matches!(
+            f.store
+                .arm_candidate_cleanup(&next, cleanup.step_id(), 1450)
+                .unwrap(),
+            ArmResult::New { .. }
+        ));
+        let context = f
+            .store
+            .candidate_cleanup_execution(&next, cleanup.step_id())
+            .unwrap();
+        let gone = mllm_controller::qualification::collect_cleanup(&fake, &context, 1500).unwrap();
+        f.store
+            .complete_cleanup(&next, cleanup.step_id(), &gone, 1550, f.ttl)
+            .unwrap();
+        let last = f.store.begin_coordinator_session().unwrap();
+        assert!(matches!(
+            f.store
+                .advance_candidate_security(&last, &collector, f.admission())
+                .unwrap(),
+            CandidateSecurityDispatch::AlreadyRecorded {
+                complete: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            f.scalar("SELECT requests_used FROM qualification_runs"),
+            expected_spend
+        );
+        assert_eq!(
+            f.scalar("SELECT COUNT(*) FROM qualification_request_attempts"),
+            expected_spend
+        );
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 0);
+        assert_eq!(
+            f.scalar("SELECT COUNT(*) FROM operations WHERE state='running'"),
+            0
+        );
+        assert!(f.store.resource_snapshot().unwrap().owners.is_empty());
+        assert_eq!(
+            fake.qualification_activity().unwrap(),
+            (sends.0, sends.1 + 1, sends.2)
+        );
+        assert!(f
+            .store
+            .finish_candidate_run(
+                &last,
+                "owner",
+                f.created.run_id(),
+                "finish",
+                r#"{"expected_revision":1,"action":"finish"}"#,
+                1600
+            )
+            .is_err());
+    }
 }
 
 #[tokio::test]
@@ -109,18 +478,17 @@ async fn uncertain_security_and_marker_cleanup_keep_failed_samples_replayable() 
         );
         assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 0);
         assert!(f.store.resource_snapshot().unwrap().owners.is_empty());
-        assert!(
-            f.store
-                .finish_candidate_run(
-                    &next,
-                    "owner",
-                    f.created.run_id(),
-                    "finish",
-                    r#"{"expected_revision":1,"action":"finish"}"#,
-                    1600
-                )
-                .is_err()
-        );
+        assert!(f
+            .store
+            .finish_candidate_run(
+                &next,
+                "owner",
+                f.created.run_id(),
+                "finish",
+                r#"{"expected_revision":1,"action":"finish"}"#,
+                1600
+            )
+            .is_err());
     }
 }
 
@@ -189,11 +557,10 @@ async fn v3_ready_candidate_accepts_real_bounded_cleanup() {
     let counts = f.counts();
     let epoch = f.store.resource_snapshot().unwrap().epoch;
     f.sql.execute_batch("CREATE TRIGGER fail_cleanup_event BEFORE INSERT ON management_events WHEN NEW.kind='candidate_cleanup_completed' BEGIN SELECT RAISE(ABORT,'cleanup rollback'); END").unwrap();
-    assert!(
-        f.store
-            .complete_cleanup(&next, successor.step_id(), &gone, 1750, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_cleanup(&next, successor.step_id(), &gone, 1750, f.ttl)
+        .is_err());
     assert_eq!(f.counts(), counts);
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     f.sql
@@ -220,46 +587,43 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
     let f = fixture();
     let fake = FakeEngine::for_qualification();
     let finish = r#"{"expected_revision":1,"action":"finish"}"#;
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "finish",
-                finish,
-                1400
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "finish",
+            finish,
+            1400
+        )
+        .is_err());
     let (collector, requests, statuses) = f.completed_suite(&fake).await;
     let before = f.store.resource_snapshot().unwrap();
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "premature-time",
-                finish,
-                1199
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "premature-time",
+            finish,
+            1199
+        )
+        .is_err());
     let before_counts = f.counts();
     f.sql.execute_batch("CREATE TRIGGER reject_finish_event BEFORE INSERT ON management_events WHEN NEW.kind='candidate_qualification_finished' BEGIN SELECT RAISE(ABORT,'finish rollback'); END").unwrap();
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "finish",
-                finish,
-                1400
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "finish",
+            finish,
+            1400
+        )
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, before.epoch);
     assert_eq!(f.counts(), before_counts);
     f.sql
@@ -280,18 +644,17 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
             [status_raw.replacen('{', "{\"version\":3,", 1)],
         )
         .unwrap();
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "finish",
-                finish,
-                1400
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "finish",
+            finish,
+            1400
+        )
+        .is_err());
     f.sql
         .execute(
             "UPDATE qualification_parked_status SET evidence_json=?1",
@@ -358,16 +721,10 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(fake.qualification_activity().unwrap(), (12, 7, 10));
     let (fence, binding) = f.fresh_binding(&receipt);
-    assert!(
-        f.store
-            .resolve_ordinary_qualification(
-                &f.session,
-                receipt.qualification_id(),
-                &fence,
-                &binding
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .resolve_ordinary_qualification(&f.session, receipt.qualification_id(), &fence, &binding)
+        .is_err());
     let cleanup = f
         .store
         .accept_candidate_cleanup(
@@ -459,11 +816,10 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
             .unwrap(),
         CandidateDispatchResult::AlreadyRecorded { .. }
     ));
-    assert!(
-        f.store
-            .read_qualification(&f.session, receipt.qualification_id())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .read_qualification(&f.session, receipt.qualification_id())
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     // Mutations are faults in the real persisted output, restored from its exact
     // original bytes between checks. They are never qualifying setup fixtures.
@@ -479,11 +835,10 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
         f.sql
             .execute("UPDATE qualifications SET record_json=?1", [bad])
             .unwrap();
-        assert!(
-            f.store
-                .read_qualification(&session, receipt.qualification_id())
-                .is_err()
-        );
+        assert!(f
+            .store
+            .read_qualification(&session, receipt.qualification_id())
+            .is_err());
     }
     f.sql
         .execute("UPDATE qualifications SET record_json=?1", [catalog_raw])
@@ -519,16 +874,10 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
                 rusqlite::params![outer.to_string(), binding],
             )
             .unwrap();
-        assert!(
-            f.store
-                .resolve_ordinary_qualification(
-                    &session,
-                    receipt.qualification_id(),
-                    &fence,
-                    &binding
-                )
-                .is_err()
-        );
+        assert!(f
+            .store
+            .resolve_ordinary_qualification(&session, receipt.qualification_id(), &fence, &binding)
+            .is_err());
     }
     f.sql
         .execute(
@@ -550,11 +899,10 @@ async fn catalog_finish_requires_entire_suite_and_retains_accounting() {
             [cleanup.step_id()],
         )
         .unwrap();
-    assert!(
-        f.store
-            .read_qualification(&session, receipt.qualification_id())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .read_qualification(&session, receipt.qualification_id())
+        .is_err());
     f.sql
         .execute(
             "UPDATE lifecycle_evidence SET evidence_json=?1 WHERE step_id=?2",
@@ -580,18 +928,17 @@ async fn catalog_can_finish_completed_sources_after_restart() {
     assert_eq!(receipt.source_run_id(), f.created.run_id());
     assert_eq!(fake.qualification_activity().unwrap(), (12, 7, 10));
     assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 12);
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "finish",
-                finish,
-                1400
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "finish",
+            finish,
+            1400
+        )
+        .is_err());
     f.sql.execute("DELETE FROM qualification_evidence_refs WHERE id=(SELECT id FROM qualification_evidence_refs LIMIT 1)",[]).unwrap();
     assert!(matches!(
         reopened.read_qualification(&next, receipt.qualification_id()),
@@ -667,18 +1014,17 @@ async fn warm_lost_reply_cleanup_preserves_cancelled_history() {
             .unwrap(),
         ArmResult::AlreadyRecorded
     ));
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &next,
-                "owner",
-                f.created.run_id(),
-                "finish",
-                r#"{"expected_revision":1,"action":"finish"}"#,
-                1600
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &next,
+            "owner",
+            f.created.run_id(),
+            "finish",
+            r#"{"expected_revision":1,"action":"finish"}"#,
+            1600
+        )
+        .is_err());
     assert_eq!(f.scalar("SELECT COUNT(*) FROM qualifications"), 0);
     f.store
         .complete_cleanup(&next, cleanup.step_id(), &gone, 999999, f.ttl)
@@ -800,18 +1146,17 @@ async fn uncertain_wake_probe_cleanup_settles_work_without_refunding_or_promotin
         CandidateDispatchResult::AlreadyRecorded { .. }
     ));
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
-    assert!(
-        f.store
-            .finish_candidate_run(
-                &next,
-                "owner",
-                f.created.run_id(),
-                "finish",
-                r#"{"expected_revision":1,"action":"finish"}"#,
-                1600
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .finish_candidate_run(
+            &next,
+            "owner",
+            f.created.run_id(),
+            "finish",
+            r#"{"expected_revision":1,"action":"finish"}"#,
+            1600
+        )
+        .is_err());
 }
 
 // Catches missing warm progression, hidden compound wake effects and duplicate spends.
@@ -830,30 +1175,27 @@ async fn parking_peak_is_reserved_before_send_and_late_arm_failure_rolls_back() 
     for o in &mut pressure {
         o.available_bytes = 0;
     }
-    assert!(
-        f.store
-            .arm_candidate_effect(
-                &f.session,
-                &receipt.effect_ids()[0],
-                AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked)
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_effect(
+            &f.session,
+            &receipt.effect_ids()[0],
+            AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked)
+        )
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     f.sql.execute_batch("CREATE TRIGGER fail_warm_arm BEFORE UPDATE OF step_json ON lifecycle_steps WHEN OLD.ordinal=1 BEGIN SELECT RAISE(ABORT,'warm rollback'); END").unwrap();
-    assert!(
-        f.store
-            .arm_candidate_effect(&f.session, &receipt.effect_ids()[0], f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_effect(&f.session, &receipt.effect_ids()[0], f.admission())
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM resource_grants"), 2);
     f.sql.execute_batch("DROP TRIGGER fail_warm_arm").unwrap();
-    assert!(
-        f.store
-            .arm_candidate_effect(&f.session, &receipt.effect_ids()[1], f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_effect(&f.session, &receipt.effect_ids()[1], f.admission())
+        .is_err());
     assert!(matches!(
         f.store
             .arm_candidate_effect(&f.session, &receipt.effect_ids()[0], f.admission())
@@ -873,14 +1215,13 @@ async fn parking_peak_is_reserved_before_send_and_late_arm_failure_rolls_back() 
     if let mllm_domain::completion::ExecutionIdentities::Retained(ref mut ids) = wrong.identities {
         ids[0].pid += 1;
     }
-    assert!(
-        fake.execute_persisted(&RuntimeCommand {
+    assert!(fake
+        .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Drain,
             context: wrong
         })
         .await
-        .is_err()
-    );
+        .is_err());
     let o = fake
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Drain,
@@ -931,15 +1272,14 @@ async fn parking_peak_is_reserved_before_send_and_late_arm_failure_rolls_back() 
         )
         .unwrap();
     let epoch = f.store.resource_snapshot().unwrap().epoch;
-    assert!(
-        f.store
-            .arm_candidate_effect(
-                &f.session,
-                &wake.effect_ids()[0],
-                AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked)
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_effect(
+            &f.session,
+            &wake.effect_ids()[0],
+            AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked)
+        )
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     for (i, action) in [
         RuntimeAction::Restore,
@@ -976,15 +1316,14 @@ async fn parking_peak_is_reserved_before_send_and_late_arm_failure_rolls_back() 
             0
         );
     }
-    assert!(
-        f.store
-            .arm_candidate_probe(
-                &f.session,
-                wake.step_id(),
-                AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked)
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_probe(
+            &f.session,
+            wake.step_id(),
+            AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked)
+        )
+        .is_err());
     assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 7);
     let CandidateDispatchResult::New(d) = f
         .store
@@ -1000,11 +1339,10 @@ async fn parking_peak_is_reserved_before_send_and_late_arm_failure_rolls_back() 
         .record_candidate_result(&f.session, &collector, &o, 1300)
         .unwrap();
     let next = f.store.begin_coordinator_session().unwrap();
-    assert!(
-        f.store
-            .arm_candidate_effect(&f.session, &receipt.effect_ids()[0], f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_effect(&f.session, &receipt.effect_ids()[0], f.admission())
+        .is_err());
     assert!(matches!(
         f.store
             .arm_candidate_effect(&next, &receipt.effect_ids()[0], f.admission())
@@ -1088,46 +1426,41 @@ async fn warm_cycle_preserves_membership_and_accounts_all_twelve_requests() {
             let status =
                 mllm_controller::qualification::collect_parked_status(&fake, &context).unwrap();
             assert_eq!(fake.qualification_activity().unwrap(), activity);
-            assert!(
-                f.store
-                    .accept_candidate_action(
-                        &f.session,
-                        "owner",
-                        f.created.run_id(),
-                        "early-restore",
-                        r#"{"expected_revision":1,"action":"restore","deadline_ms":400000}"#,
-                        1200
-                    )
-                    .is_err()
-            );
+            assert!(f
+                .store
+                .accept_candidate_action(
+                    &f.session,
+                    "owner",
+                    f.created.run_id(),
+                    "early-restore",
+                    r#"{"expected_revision":1,"action":"restore","deadline_ms":400000}"#,
+                    1200
+                )
+                .is_err());
             let mut bad = status.clone();
             bad.allocations = true;
-            assert!(
-                f.store
-                    .record_candidate_parked_status(&f.session, &collector, &bad, 1300)
-                    .is_err()
-            );
+            assert!(f
+                .store
+                .record_candidate_parked_status(&f.session, &collector, &bad, 1300)
+                .is_err());
             let mut bad = status.clone();
             bad.identities.push(bad.identities[0].clone());
-            assert!(
-                f.store
-                    .record_candidate_parked_status(&f.session, &collector, &bad, 1300)
-                    .is_err()
-            );
+            assert!(f
+                .store
+                .record_candidate_parked_status(&f.session, &collector, &bad, 1300)
+                .is_err());
             let mut bad = status.clone();
             bad.activity_after.1 += 1;
-            assert!(
-                f.store
-                    .record_candidate_parked_status(&f.session, &collector, &bad, 1300)
-                    .is_err()
-            );
+            assert!(f
+                .store
+                .record_candidate_parked_status(&f.session, &collector, &bad, 1300)
+                .is_err());
             let epoch = f.store.resource_snapshot().unwrap().epoch;
             f.sql.execute_batch("CREATE TRIGGER fail_park_complete BEFORE DELETE ON lifecycle_claims BEGIN SELECT RAISE(ABORT,'park rollback'); END").unwrap();
-            assert!(
-                f.store
-                    .record_candidate_parked_status(&f.session, &collector, &status, 1300)
-                    .is_err()
-            );
+            assert!(f
+                .store
+                .record_candidate_parked_status(&f.session, &collector, &status, 1300)
+                .is_err());
             assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
             assert_eq!(
                 f.scalar("SELECT COUNT(*) FROM qualification_parked_status"),
@@ -1260,18 +1593,17 @@ async fn warm_cycle_preserves_membership_and_accounts_all_twelve_requests() {
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(fake.qualification_activity().unwrap(), (12, 7, 10));
     f.sql.execute("UPDATE lifecycle_steps SET ordinal=99 WHERE id=(SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id WHERE r.action='activate' AND s.ordinal=3 LIMIT 1)",[]).unwrap();
-    assert!(
-        f.store
-            .accept_candidate_action(
-                &session,
-                "owner",
-                f.created.run_id(),
-                "restore",
-                r#"{"expected_revision":1,"action":"restore","deadline_ms":400000}"#,
-                999999
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_candidate_action(
+            &session,
+            "owner",
+            f.created.run_id(),
+            "restore",
+            r#"{"expected_revision":1,"action":"restore","deadline_ms":400000}"#,
+            999999
+        )
+        .is_err());
 }
 
 #[tokio::test]
@@ -1340,17 +1672,15 @@ async fn every_warm_child_lost_reply_is_never_retried_after_restart() {
                             .unwrap(),
                         ArmResult::AlreadyRecorded
                     ));
-                    assert!(
-                        f.store
-                            .arm_candidate_probe(&f.session, p.step_id(), f.admission())
-                            .is_err()
-                    );
+                    assert!(f
+                        .store
+                        .arm_candidate_probe(&f.session, p.step_id(), f.admission())
+                        .is_err());
                     if let Some(next) = p.effect_ids().get(i + 1) {
-                        assert!(
-                            f.store
-                                .arm_candidate_effect(&f.session, next, f.admission())
-                                .is_err()
-                        );
+                        assert!(f
+                            .store
+                            .arm_candidate_effect(&f.session, next, f.admission())
+                            .is_err());
                     }
                     let session = f.store.begin_coordinator_session().unwrap();
                     assert!(matches!(
@@ -1372,11 +1702,10 @@ async fn every_warm_child_lost_reply_is_never_retried_after_restart() {
                 }
                 let mut wrong = o.clone();
                 wrong.token.step_id = p.step_id().into();
-                assert!(
-                    f.store
-                        .record_candidate_effect(&f.session, &collector, child, &wrong, 1300)
-                        .is_err()
-                );
+                assert!(f
+                    .store
+                    .record_candidate_effect(&f.session, &collector, child, &wrong, 1300)
+                    .is_err());
                 f.store
                     .record_candidate_effect(&f.session, &collector, child, &o, 1300)
                     .unwrap();
@@ -1420,11 +1749,10 @@ async fn unknown_request_lease_blocks_park_and_stays_reserved() {
         )
         .unwrap();
     let retained = f.store.resource_snapshot().unwrap();
-    assert!(
-        f.store
-            .arm_candidate_effect(&f.session, &p.effect_ids()[0], f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_effect(&f.session, &p.effect_ids()[0], f.admission())
+        .is_err());
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM request_leases WHERE disposition='uncertain'"),
         1
@@ -1455,18 +1783,17 @@ async fn marker_templates_reject_overrides_and_duplicate_fields_before_spend() {
         invalid.push(v.to_string());
     }
     for text in invalid {
-        assert!(
-            f.store
-                .grant_candidate_inference(
-                    &f.session,
-                    "owner",
-                    f.created.run_id(),
-                    "invalid",
-                    &text,
-                    f.admission()
-                )
-                .is_err()
-        );
+        assert!(f
+            .store
+            .grant_candidate_inference(
+                &f.session,
+                "owner",
+                f.created.run_id(),
+                "invalid",
+                &text,
+                f.admission()
+            )
+            .is_err());
     }
     assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 1);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 0);
@@ -1479,18 +1806,17 @@ async fn marker_transactions_roll_back_spend_and_late_coverage_failure() {
     let collector = f.ready(&fake).await;
     let body = marker_body(&f, "MLLM_ALPHA_71", false);
     f.sql.execute_batch("CREATE TRIGGER reject_marker_spend BEFORE UPDATE OF requests_used ON qualification_runs BEGIN SELECT RAISE(ABORT,'test spending rollback'); END").unwrap();
-    assert!(
-        f.store
-            .grant_candidate_inference(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "marker",
-                &body,
-                f.admission()
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .grant_candidate_inference(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "marker",
+            &body,
+            f.admission()
+        )
+        .is_err());
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM qualification_request_attempts"),
         1
@@ -1522,11 +1848,10 @@ async fn marker_transactions_roll_back_spend_and_late_coverage_failure() {
         .unwrap();
     let epoch = f.store.resource_snapshot().unwrap().epoch;
     f.sql.execute_batch("CREATE TRIGGER reject_marker_coverage BEFORE INSERT ON qualification_evidence_refs BEGIN SELECT RAISE(ABORT,'test result rollback'); END").unwrap();
-    assert!(
-        f.store
-            .record_candidate_result(&f.session, &collector, &result, 1300)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .record_candidate_result(&f.session, &collector, &result, 1300)
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM qualification_request_results"),
@@ -1613,18 +1938,17 @@ async fn failed_marker_never_replaced_and_stream_corruption_never_advances() {
             f.scalar("SELECT COUNT(*) FROM request_leases"),
             i64::from(uncertain)
         );
-        assert!(
-            f.store
-                .grant_candidate_inference(
-                    &f.session,
-                    "owner",
-                    f.created.run_id(),
-                    "replacement",
-                    &body,
-                    f.admission()
-                )
-                .is_err()
-        );
+        assert!(f
+            .store
+            .grant_candidate_inference(
+                &f.session,
+                "owner",
+                f.created.run_id(),
+                "replacement",
+                &body,
+                f.admission()
+            )
+            .is_err());
         let epoch = f.store.resource_snapshot().unwrap().epoch;
         let next = f.store.begin_coordinator_session().unwrap();
         assert!(matches!(
@@ -1808,11 +2132,10 @@ async fn security_requires_all_fixed_rejections_and_spends_only_two_requests() {
     assert_eq!(f.scalar("SELECT COUNT(*) FROM deployments WHERE desired_state='stopped' AND observed_state='ready' AND admission_enabled=0 AND dispatch_enabled=0"),1);
     let epoch = f.store.resource_snapshot().unwrap().epoch;
     let newer = f.store.begin_coordinator_session().unwrap();
-    assert!(
-        f.store
-            .advance_candidate_security(&f.session, &collector, f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .advance_candidate_security(&f.session, &collector, f.admission())
+        .is_err());
     assert!(matches!(
         f.store
             .advance_candidate_security(
@@ -1859,11 +2182,10 @@ async fn security_history_rejects_a_missing_inflight_lease() {
         panic!()
     };
     f.sql.execute("DELETE FROM request_leases", []).unwrap();
-    assert!(
-        f.store
-            .advance_candidate_security(&f.session, &collector, f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .advance_candidate_security(&f.session, &collector, f.admission())
+        .is_err());
 }
 
 #[tokio::test]
@@ -1885,11 +2207,10 @@ async fn security_new_result_cannot_advance_a_terminal_run() {
     f.sql
         .execute("UPDATE qualification_runs SET state='aborted'", [])
         .unwrap();
-    assert!(
-        f.store
-            .record_candidate_security_control(&f.session, &collector, &o, 1300)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .record_candidate_security_control(&f.session, &collector, &o, 1300)
+        .is_err());
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM qualification_evidence_refs"),
         6
@@ -1983,11 +2304,10 @@ async fn security_acceptance_spending_and_completion_are_atomic() {
     let collector = f.baseline(&fake).await;
     let epoch = f.store.resource_snapshot().unwrap().epoch;
     f.sql.execute_batch("CREATE TRIGGER reject_security_accept BEFORE INSERT ON command_receipts WHEN NEW.command_scope LIKE 'INTERNAL qualification Security%' BEGIN SELECT RAISE(ABORT,'security acceptance rollback'); END").unwrap();
-    assert!(
-        f.store
-            .advance_candidate_security(&f.session, &collector, f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .advance_candidate_security(&f.session, &collector, f.admission())
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM resource_grants"), 1);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM lifecycle_claims"), 0);
@@ -2012,11 +2332,10 @@ async fn security_acceptance_spending_and_completion_are_atomic() {
         .record_candidate_security_control(&f.session, &collector, &observation, 1300)
         .unwrap();
     f.sql.execute_batch("CREATE TRIGGER reject_security_spend BEFORE UPDATE OF requests_used ON qualification_runs BEGIN SELECT RAISE(ABORT,'security spending rollback'); END").unwrap();
-    assert!(
-        f.store
-            .advance_candidate_security(&f.session, &collector, f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .advance_candidate_security(&f.session, &collector, f.admission())
+        .is_err());
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM operations WHERE kind='candidate_security_v3'"),
         0
@@ -2040,11 +2359,10 @@ async fn security_acceptance_spending_and_completion_are_atomic() {
         if index == 1 {
             let epoch = f.store.resource_snapshot().unwrap().epoch;
             f.sql.execute_batch("CREATE TRIGGER reject_security_complete BEFORE DELETE ON lifecycle_claims BEGIN SELECT RAISE(ABORT,'security completion rollback'); END").unwrap();
-            assert!(
-                f.store
-                    .record_candidate_result(&f.session, &collector, &o, 1300)
-                    .is_err()
-            );
+            assert!(f
+                .store
+                .record_candidate_result(&f.session, &collector, &o, 1300)
+                .is_err());
             assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
             assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 1);
             assert_eq!(
@@ -2069,18 +2387,17 @@ async fn replay_rejects_corrupt_prior_spending_even_when_replaying_another_item(
     f.baseline(&fake).await;
     // Corrupt an earlier item's duplicated columns, leaving the replayed last item intact.
     f.sql.execute("UPDATE qualification_request_attempts SET item_ordinal=17 WHERE request_operation_id=(SELECT id FROM operations WHERE kind='candidate_marker_v3' ORDER BY rowid LIMIT 1)",[]).unwrap();
-    assert!(
-        f.store
-            .grant_candidate_inference(
-                &f.session,
-                "owner",
-                f.created.run_id(),
-                "baseline-3",
-                &marker_body(&f, "MLLM_BETA_29", true),
-                f.admission()
-            )
-            .is_err()
-    );
+    assert!(f
+        .store
+        .grant_candidate_inference(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "baseline-3",
+            &marker_body(&f, "MLLM_BETA_29", true),
+            f.admission()
+        )
+        .is_err());
 }
 
 #[tokio::test]
@@ -2093,11 +2410,10 @@ async fn probe_rechecks_physical_pressure_before_spending() {
         o.available_bytes = 0;
     }
     let admission = AdmissionContext::new(&pressure, &f.limits, 1200, f.ttl, f.max_parked);
-    assert!(
-        f.store
-            .arm_candidate_probe(&f.session, f.init.step_id(), admission)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_probe(&f.session, f.init.step_id(), admission)
+        .is_err());
     assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 0);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 0);
     assert!(matches!(
@@ -2124,11 +2440,10 @@ async fn unknown_extra_work_blocks_joint_ready_completion() {
         .await
         .unwrap();
     f.sql.execute_batch("INSERT INTO request_leases SELECT id || '-unknown',deployment_id,revision,generation,session_id,'uncertain' FROM request_leases").unwrap();
-    assert!(
-        f.store
-            .record_candidate_result(&f.session, &collector, &result, 1300)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .record_candidate_result(&f.session, &collector, &result, 1300)
+        .is_err());
     assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 2);
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM qualification_evidence_refs"),
@@ -2149,11 +2464,12 @@ async fn collector_rejects_a_fake_runtime_without_the_retained_owned_membership(
     else {
         panic!()
     };
-    assert!(
-        mllm_controller::qualification::collect_probe(&FakeEngine::for_qualification(), *probe)
-            .await
-            .is_err()
-    );
+    assert!(mllm_controller::qualification::collect_probe(
+        &FakeEngine::for_qualification(),
+        *probe
+    )
+    .await
+    .is_err());
     assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 1);
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM qualification_evidence_refs"),
@@ -2168,21 +2484,19 @@ async fn child_crash_and_wrong_result_tokens_cannot_complete_or_resend() {
         .arm_candidate_effect(&f.session, &f.init.effect_ids()[0], f.admission())
         .unwrap();
     let next = f.store.begin_coordinator_session().unwrap();
-    assert!(
-        f.store
-            .candidate_effect_execution(&next, &f.init.effect_ids()[0])
-            .is_err()
-    );
+    assert!(f
+        .store
+        .candidate_effect_execution(&next, &f.init.effect_ids()[0])
+        .is_err());
     assert!(!matches!(
         f.store
             .arm_candidate_effect(&next, &f.init.effect_ids()[0], f.admission()),
         Ok(ArmResult::New { .. })
     ));
-    assert!(
-        f.store
-            .arm_candidate_probe(&next, f.init.step_id(), f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_probe(&next, f.init.step_id(), f.admission())
+        .is_err());
     assert_eq!(f.scalar("SELECT COUNT(*) FROM lifecycle_claims"), 1);
     assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 0);
     let f = fixture();
@@ -2213,11 +2527,10 @@ async fn child_crash_and_wrong_result_tokens_cannot_complete_or_resend() {
                     }
             }
         }
-        assert!(
-            f.store
-                .record_candidate_result(&f.session, &collector, &wrong, 1300)
-                .is_err()
-        );
+        assert!(f
+            .store
+            .record_candidate_result(&f.session, &collector, &wrong, 1300)
+            .is_err());
     }
     assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 1);
     f.store
@@ -2229,11 +2542,10 @@ async fn child_crash_and_wrong_result_tokens_cannot_complete_or_resend() {
         .record_candidate_result(&f.session, &collector, &reordered, 999999)
         .unwrap();
     reordered.receipt.push_str(" altered");
-    assert!(
-        f.store
-            .record_candidate_result(&f.session, &collector, &reordered, 999999)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .record_candidate_result(&f.session, &collector, &reordered, 999999)
+        .is_err());
 }
 
 #[tokio::test]
@@ -2298,11 +2610,10 @@ async fn probe_arm_and_joint_completion_roll_back_all_related_writes() {
     let collector = f.initialized(&fake).await;
     let before = f.store.resource_snapshot().unwrap();
     f.sql.execute_batch("CREATE TRIGGER reject_spend BEFORE UPDATE OF requests_used ON qualification_runs BEGIN SELECT RAISE(ABORT,'injected spend failure'); END;").unwrap();
-    assert!(
-        f.store
-            .arm_candidate_probe(&f.session, f.init.step_id(), f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_probe(&f.session, f.init.step_id(), f.admission())
+        .is_err());
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM qualification_request_attempts"),
         0
@@ -2330,11 +2641,10 @@ async fn probe_arm_and_joint_completion_roll_back_all_related_writes() {
         .unwrap();
     let events = f.scalar("SELECT COUNT(*) FROM management_events");
     f.sql.execute_batch("CREATE TRIGGER reject_coverage BEFORE INSERT ON qualification_evidence_refs BEGIN SELECT RAISE(ABORT,'injected coverage failure'); END;").unwrap();
-    assert!(
-        f.store
-            .record_candidate_result(&f.session, &collector, &result, 1300)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .record_candidate_result(&f.session, &collector, &result, 1300)
+        .is_err());
     assert_eq!(f.scalar("SELECT COUNT(*) FROM lifecycle_evidence"), 1);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 1);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM lifecycle_claims"), 1);
@@ -2385,11 +2695,10 @@ async fn missing_probe_mapping_cannot_hide_a_spent_attempt_or_issue_another_tick
     f.sql
         .execute_batch("UPDATE qualification_request_attempts SET item_ordinal=1")
         .unwrap();
-    assert!(
-        f.store
-            .arm_candidate_probe(&f.session, f.init.step_id(), f.admission())
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_candidate_probe(&f.session, f.init.step_id(), f.admission())
+        .is_err());
     assert_eq!(f.scalar("SELECT requests_used FROM qualification_runs"), 1);
 }
 
@@ -2776,6 +3085,9 @@ fn fixture() -> Fixture {
     fixture_peaks(9663676416, 10737418240)
 }
 fn fixture_peaks(parking: i64, wake: i64) -> Fixture {
+    fixture_custom(parking, wake, |_| {})
+}
+fn fixture_custom(parking: i64, wake: i64, edit: impl FnOnce(&mut Value)) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("qualification.db");
     let store = Store::open(&path).unwrap();
@@ -2793,6 +3105,7 @@ fn fixture_peaks(parking: i64, wake: i64) -> Fixture {
     manifest["effective_recipe"]["resources"]["parking"]["allocations"][0]["bytes"] =
         json!(parking);
     manifest["effective_recipe"]["resources"]["wake"]["allocations"][0]["bytes"] = json!(wake);
+    edit(&mut manifest);
     let reviewed = validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap();
     let mut host = ordinary["input"]["host"].clone();
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
@@ -2864,22 +3177,18 @@ async fn initialized_child_associates_on_anchor_without_ready_or_probe_bypass() 
     let f = fixture();
     let (store, session, created, init) = (&f.store, f.session.clone(), &f.created, &f.init);
     let admission = || f.admission();
-    assert!(
-        store
-            .arm_candidate_effect(&session, init.step_id(), admission())
-            .is_err()
-    );
+    assert!(store
+        .arm_candidate_effect(&session, init.step_id(), admission())
+        .is_err());
     assert!(matches!(
         store
             .arm_candidate_effect(&session, &init.effect_ids()[0], admission())
             .unwrap(),
         ArmResult::New { .. }
     ));
-    assert!(
-        store
-            .candidate_effect_execution(&session, init.step_id())
-            .is_err()
-    );
+    assert!(store
+        .candidate_effect_execution(&session, init.step_id())
+        .is_err());
     let (_, context) = store
         .candidate_effect_execution(&session, &init.effect_ids()[0])
         .unwrap();
@@ -2898,11 +3207,9 @@ async fn initialized_child_associates_on_anchor_without_ready_or_probe_bypass() 
         observed_at_ms: observed.observed_at_ms,
         receipt: observed.receipt.clone(),
     };
-    assert!(
-        store
-            .record_owned_launch(&session, &init.effect_ids()[0], &launch, 1250)
-            .is_err()
-    );
+    assert!(store
+        .record_owned_launch(&session, &init.effect_ids()[0], &launch, 1250)
+        .is_err());
     store
         .record_owned_launch(&session, init.step_id(), &launch, 1250)
         .unwrap();
@@ -2926,11 +3233,9 @@ async fn initialized_child_associates_on_anchor_without_ready_or_probe_bypass() 
             Milestone::ModelUsable,
         ],
     };
-    assert!(
-        store
-            .complete_step(&session, init.step_id(), &fabricated, 1300, f.ttl)
-            .is_err()
-    );
+    assert!(store
+        .complete_step(&session, init.step_id(), &fabricated, 1300, f.ttl)
+        .is_err());
     assert_eq!(
         store.resource_snapshot().unwrap().owners[created.deployment_id()].phase,
         ResourcePhase::Cold
@@ -2998,11 +3303,9 @@ async fn initialized_child_associates_on_anchor_without_ready_or_probe_bypass() 
     assert_eq!(f.scalar("SELECT COUNT(*) FROM resource_owners"), 1);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM deployments WHERE desired_state='stopped' AND observed_state='ready' AND admission_enabled=0 AND dispatch_enabled=0"),1);
     let newer = store.begin_coordinator_session().unwrap();
-    assert!(
-        store
-            .record_candidate_result(&session, &collector, &result, 999999)
-            .is_err()
-    );
+    assert!(store
+        .record_candidate_result(&session, &collector, &result, 999999)
+        .is_err());
     store
         .record_candidate_result(&newer, &collector, &result, 999999)
         .unwrap();

@@ -4,6 +4,32 @@ use mllm_domain::completion::{ExecutionIdentities, Milestone, StepExecutionConte
 use mllm_domain::resources::{PhaseFootprint, ResourcePhase};
 use mllm_scheduler::residency::AdmissionContext;
 
+// Validation is synchronous and transaction-local. Track active warm ancestors,
+// not successful results: repeated sequential reads still validate every source.
+thread_local! {
+    static ACTIVE_PREDECESSORS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+struct PredecessorVisit;
+impl PredecessorVisit {
+    fn enter(operation: &str) -> Result<Self, LifecycleError> {
+        ACTIVE_PREDECESSORS.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.len() >= 128 || active.iter().any(|id| id == operation) {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            active.push(operation.into());
+            Ok(Self)
+        })
+    }
+}
+impl Drop for PredecessorVisit {
+    fn drop(&mut self) {
+        ACTIVE_PREDECESSORS.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
+
 pub(super) fn facts(effect: PersistedEffectKind) -> Result<Vec<Fact>, LifecycleError> {
     Ok(match effect {
         PersistedEffectKind::Initialize => vec![
@@ -75,9 +101,16 @@ pub(super) fn cold(
     tx: &Transaction<'_>,
     run: &str,
 ) -> Result<CandidateActionPlanV3, LifecycleError> {
-    let anchor:String=tx.query_row("SELECT a.step_id FROM qualification_case_actions a JOIN lifecycle_runs r ON r.operation_id=a.operation_id WHERE a.run_id=?1 AND r.action='activate' ORDER BY a.rowid LIMIT 1",[run],|r|r.get(0))?;
+    let (anchor,operation,case):(String,String,String)=tx.query_row("SELECT a.step_id,a.operation_id,a.case_id FROM qualification_case_actions a JOIN lifecycle_runs r ON r.operation_id=a.operation_id WHERE a.run_id=?1 AND r.action='activate' ORDER BY a.rowid LIMIT 1",[run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let p = plan_for_step(tx, &anchor)?;
-    if p.action != Action::Initialize {
+    if p.action != Action::Initialize
+        || p.case_kind != CandidateCaseKind::ColdInitialize
+        || p.cycle != 0
+        || p.case_id != case
+        || p.scope.run_id != run
+        || p.scope.parent_step_id != anchor
+        || p.scope.operation_id != operation
+    {
         return Err(LifecycleError::CorruptStoredData);
     }
     Ok(p)
@@ -224,6 +257,7 @@ fn next_reservation(
     Ok(retained)
 }
 pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(), LifecycleError> {
+    let _visit = PredecessorVisit::enter(&p.scope.operation_id)?;
     let snapshot = super::super::read_snapshot(tx, &p.scope.principal, &p.scope.run_id)
         .map_err(creation_error)?
         .ok_or(LifecycleError::Conflict)?;
@@ -236,12 +270,25 @@ pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(
         .get(index.checked_sub(1).ok_or(LifecycleError::Conflict)?)
         .ok_or(LifecycleError::Conflict)?;
     if p.action == Action::Park && previous.kind() == CandidateCaseKind::MarkerStreaming {
+        let source_index = index
+            .checked_sub(4)
+            .ok_or(LifecycleError::CorruptStoredData)?;
+        let ready_case = &cases[index - 3];
+        if cases[source_index].kind() != CandidateCaseKind::Restore
+            || ready_case.kind() != CandidateCaseKind::ReadyProbe
+            || ready_case.cycle() + 1 != p.cycle
+        {
+            return Err(LifecycleError::CorruptStoredData);
+        }
         let anchor: String = tx.query_row(
             "SELECT parent_step_id FROM qualification_ready_probes WHERE run_id=?1 AND case_id=?2",
             params![p.scope.run_id, cases[index - 3].id()],
             |r| r.get(0),
         )?;
-        let ready = plan_for_step(tx, &anchor)?;
+        let ready = exact_predecessor(tx, p, &cases[source_index], &anchor)?;
+        if ready.ready_probe_case.as_deref() != Some(ready_case.id()) {
+            return Err(LifecycleError::CorruptStoredData);
+        }
         return inference::markers::baseline(tx, &ready);
     }
     let anchor: String = tx.query_row(
@@ -249,7 +296,13 @@ pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(
         params![p.scope.run_id, previous.id()],
         |r| r.get(0),
     )?;
-    let previous = plan_for_step(tx, &anchor)?;
+    if !matches!(
+        (p.action, previous.kind()),
+        (Action::Restore, CandidateCaseKind::Park) | (Action::Park, CandidateCaseKind::Security)
+    ) {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    let previous = exact_predecessor(tx, p, previous, &anchor)?;
     validate_plan_inner(tx, &previous, false)?;
     let state: String = tx.query_row(
         "SELECT state FROM lifecycle_steps WHERE id=?1",
@@ -263,6 +316,39 @@ pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(
         return Err(LifecycleError::Conflict);
     }
     Ok(())
+}
+
+// This edge is checked before recursion. The caller selects an exact strictly
+// earlier manifest index, so a linked FK alone cannot redefine ancestry.
+fn exact_predecessor(
+    tx: &Transaction<'_>,
+    p: &CandidateActionPlanV3,
+    case: &mllm_config::effective::candidate::CandidateCase,
+    anchor: &str,
+) -> Result<CandidateActionPlanV3, LifecycleError> {
+    let previous = plan_for_step(tx, anchor)?;
+    let action = match case.kind() {
+        CandidateCaseKind::Security => Action::Security,
+        CandidateCaseKind::Park => Action::Park,
+        CandidateCaseKind::Restore => Action::Restore,
+        _ => return Err(LifecycleError::CorruptStoredData),
+    };
+    let mut expected = p.scope.clone();
+    expected.operation_id = previous.scope.operation_id.clone();
+    expected.parent_step_id = anchor.into();
+    let linked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM qualification_case_actions a JOIN lifecycle_steps s ON s.id=a.step_id WHERE a.run_id=?1 AND a.case_id=?2 AND a.operation_id=?3 AND a.step_id=?4 AND s.operation_id=a.operation_id AND s.ordinal=0)",params![p.scope.run_id,case.id(),previous.scope.operation_id,anchor],|r|r.get(0))?;
+    if previous.scope != expected
+        || previous.scope.operation_id == p.scope.operation_id
+        || previous.case_id != case.id()
+        || previous.case_kind != case.kind()
+        || previous.cycle != case.cycle()
+        || previous.action != action
+        || previous.accepted_at_ms > p.accepted_at_ms
+        || !linked
+    {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    Ok(previous)
 }
 #[allow(clippy::too_many_arguments)]
 pub(super) fn accept(

@@ -9,6 +9,16 @@ use sha2::{Digest, Sha256};
 /// Exact UTF-8 bytes hashed by the installed Fake program; no trailing newline.
 pub const CORPUS: &str = r#"[{"prompt":"Repeat exactly: MLLM_ALPHA_71","expected":"MLLM_ALPHA_71"},{"prompt":"Repeat exactly: MLLM_BETA_29","expected":"MLLM_BETA_29"}]"#;
 pub const PROGRAM_REVISION: &str = "qualification-fake-v1";
+const REQUEST_OUTPUT_TOKENS: u32 = 16;
+const READY_PROMPT: &str = "Repeat exactly: MLLM_READY_13";
+
+fn fixed_request(deployment: &str, content: &str, stream: bool) -> String {
+    serde_json::json!({"model":format!("candidate-{deployment}"),"messages":[{"role":"user","content":content}],"temperature":0,"max_tokens":REQUEST_OUTPUT_TOKENS,"stream":stream}).to_string()
+}
+
+pub(crate) fn ready_request(deployment: &str) -> String {
+    fixed_request(deployment, READY_PROMPT, false)
+}
 
 /// Constructed only after the store validates committed source records. It is
 /// deliberately neither deserializable nor an externally supplied pass predicate.
@@ -106,7 +116,11 @@ impl QualificationProgram {
         stream: bool,
     ) -> Result<String, LifecycleError> {
         let expected = Self::marker(ordinal)?;
-        Ok(serde_json::json!({"model":format!("candidate-{deployment}"),"messages":[{"role":"user","content":format!("Repeat exactly: {expected}")}],"temperature":0,"max_tokens":16,"stream":stream}).to_string())
+        Ok(fixed_request(
+            deployment,
+            &format!("Repeat exactly: {expected}"),
+            stream,
+        ))
     }
     pub(crate) fn marker(ordinal: u32) -> Result<&'static str, LifecycleError> {
         match ordinal {
@@ -159,6 +173,25 @@ impl QualificationProgram {
             || required_references > 4096
         {
             return Err(LifecycleError::Unsupported);
+        }
+        // Fake input accounting is one token per UTF-8 byte of the sole user
+        // message's content, with no framing tokens. These fixed ASCII prompts
+        // are not native tokenizer measurements. Candidate IDs are 26-byte ULIDs.
+        // Security's generation-capable requests use the same Ready template.
+        for content in [
+            READY_PROMPT.to_owned(),
+            format!("Repeat exactly: {}", Self::marker(0)?),
+            format!("Repeat exactly: {}", Self::marker(1)?),
+        ] {
+            for stream in [false, true] {
+                let body = fixed_request("00000000000000000000000000", &content, stream);
+                if body.len() as i64 > snapshot.limits().max_request_body_bytes()
+                    || content.len() > snapshot.limits().max_input_tokens_per_request() as usize
+                    || REQUEST_OUTPUT_TOKENS > snapshot.limits().max_output_tokens_per_request()
+                {
+                    return Err(LifecycleError::Unsupported);
+                }
+            }
         }
         Ok(Self {
             required_requests,
@@ -252,7 +285,7 @@ fn response_digest(value: &impl serde::Serialize) -> Result<String, LifecycleErr
 mod tests {
     use super::*;
     use mllm_config::effective::candidate::validate_candidate_reviewed_snapshot_text;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     fn manifest() -> Value {
         let mut v: Value = serde_json::from_str(include_str!(
@@ -283,6 +316,27 @@ mod tests {
         let snapshot = validate_candidate_reviewed_snapshot_text(&manifest().to_string()).unwrap();
         let program = QualificationProgram::resolve(&snapshot).unwrap();
         assert_eq!(program.required_requests(), 12);
+    }
+
+    // Catches allowing a fixed request to exceed frozen authority before launch.
+    #[test]
+    fn fixed_requests_must_fit_body_input_and_output_limits() {
+        for field in [
+            "max_request_body_bytes",
+            "max_input_tokens_per_request",
+            "max_output_tokens_per_request",
+        ] {
+            let mut value = manifest();
+            value["limits"][field] = json!(1);
+            let snapshot = validate_candidate_reviewed_snapshot_text(&value.to_string()).unwrap();
+            assert!(
+                matches!(
+                    QualificationProgram::resolve(&snapshot),
+                    Err(LifecycleError::Unsupported)
+                ),
+                "{field}"
+            );
+        }
     }
 
     // Catches omitted deferred checks, refunded spending, reordered cases and

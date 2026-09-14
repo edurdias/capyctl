@@ -1,11 +1,11 @@
 //! Version-three candidate action plans. Historical V1/V2 are never upgraded.
 use crate::dispatch::CoordinatorSession;
-use crate::lifecycle::LifecycleError;
 use crate::lifecycle::completion::{check_session, decode, encode};
+use crate::lifecycle::LifecycleError;
 use crate::qualification::recipe_v1::QualificationProgram;
 use crate::qualification_policy::read_candidate_policy;
 use mllm_config::effective::candidate::{CandidateCaseKind, CandidatePhase};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[path = "../qualification/catalog.rs"]
@@ -917,10 +917,10 @@ fn anchor_context(
 ) -> Result<super::initialize::ValidatedInitialize, LifecycleError> {
     use mllm_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
     let p = plan_for_step(tx, id)?;
-    validate_plan_inner(tx, &p, check_accounting)?;
     if p.scope.parent_step_id != id {
-        return Err(LifecycleError::Conflict);
+        return Err(LifecycleError::CorruptStoredData);
     }
+    validate_plan_inner(tx, &p, check_accounting)?;
     let (state, raw): (String, String) = tx.query_row(
         "SELECT state,step_json FROM lifecycle_steps WHERE id=?1",
         [id],
@@ -1408,15 +1408,25 @@ mod tests {
         CoordinatorSession,
         super::super::CandidateCreationReceipt,
     ) {
+        created_with(|_| {})
+    }
+    fn created_with(
+        edit: impl FnOnce(&mut Value),
+    ) -> (
+        crate::Store,
+        CoordinatorSession,
+        super::super::CandidateCreationReceipt,
+    ) {
         let (_, mut host, mut policy) = fixture("fake");
         host["runtime_profiles"]["local"]["build_fingerprint"] =
             serde_json::json!("qualification-fake-v1");
         host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
             serde_json::json!("secret://admin-key");
-        let manifest: Value = serde_json::from_str(include_str!(
+        let mut manifest: Value = serde_json::from_str(include_str!(
             "../../../mllm-config/tests/fixtures/candidate-fake-qualification.json"
         ))
         .unwrap();
+        edit(&mut manifest);
         let reviewed = validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap();
         policy
             .qualification_policy
@@ -1436,6 +1446,33 @@ mod tests {
             )
             .unwrap();
         (store, session, created)
+    }
+    #[test]
+    fn frozen_request_limits_reject_initialize_before_any_effect_or_spending() {
+        for field in [
+            "max_request_body_bytes",
+            "max_input_tokens_per_request",
+            "max_output_tokens_per_request",
+        ] {
+            let (store, session, created) =
+                created_with(|v| v["limits"][field] = serde_json::json!(1));
+            assert!(
+                matches!(
+                    store.accept_candidate_action(
+                        &session,
+                        "owner",
+                        created.run_id(),
+                        "initialize",
+                        r#"{"expected_revision":1,"action":"initialize","deadline_ms":400000}"#,
+                        1100
+                    ),
+                    Err(LifecycleError::Unsupported)
+                ),
+                "{field}"
+            );
+            let counts:(i64,i64,i64)=store.conn.query_row("SELECT (SELECT COUNT(*) FROM lifecycle_steps),(SELECT COUNT(*) FROM qualification_request_attempts),requests_used FROM qualification_runs",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(counts, (0, 0, 0));
+        }
     }
     #[test]
     fn v3_initialize_freezes_two_children_and_reserves_linked_probe_without_spending() {
@@ -1594,21 +1631,15 @@ mod tests {
         assert_eq!(execution.token.step_id, *child);
         assert_eq!(execution.binding_id, created.binding_id());
         assert_eq!(execution.completion_target, None);
-        assert!(
-            store
-                .candidate_effect_execution(&session, accepted.step_id())
-                .is_err()
-        );
-        assert!(
-            store
-                .arm_candidate_effect(&session, &accepted.effect_ids()[1], context())
-                .is_err()
-        );
-        assert!(
-            store
-                .arm_candidate_effect(&session, accepted.step_id(), context())
-                .is_err()
-        );
+        assert!(store
+            .candidate_effect_execution(&session, accepted.step_id())
+            .is_err());
+        assert!(store
+            .arm_candidate_effect(&session, &accepted.effect_ids()[1], context())
+            .is_err());
+        assert!(store
+            .arm_candidate_effect(&session, accepted.step_id(), context())
+            .is_err());
     }
 
     #[test]

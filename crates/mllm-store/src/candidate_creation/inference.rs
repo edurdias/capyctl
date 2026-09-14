@@ -592,7 +592,7 @@ fn verify_aggregate(
     ttl: i64,
 ) -> Result<(), LifecycleError> {
     use mllm_domain::completion::{
-        CompletionEvidence, CompletionExpectation, Milestone, verify_completion,
+        verify_completion, CompletionEvidence, CompletionExpectation, Milestone,
     };
     let evidence = CompletionEvidence {
         token: v.context.token.clone(),
@@ -832,9 +832,9 @@ struct RequestAttemptV3 {
     deadline_ms: i64,
 }
 fn probe_request(p: &CandidateActionPlanV3) -> Result<String, LifecycleError> {
-    encode(
-        &serde_json::json!({"model":format!("candidate-{}",p.scope.deployment_id),"messages":[{"role":"user","content":"Repeat exactly: MLLM_READY_13"}],"temperature":0,"max_tokens":16,"stream":false}),
-    )
+    Ok(crate::qualification::recipe_v1::ready_request(
+        &p.scope.deployment_id,
+    ))
 }
 pub(super) fn spending(
     tx: &Transaction<'_>,
