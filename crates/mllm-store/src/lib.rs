@@ -9,6 +9,7 @@ pub mod events;
 pub mod lifecycle;
 pub mod migrations;
 pub mod qualification_policy;
+pub mod qualification;
 pub mod resource_ledger;
 pub mod resource_policy;
 pub mod schema;

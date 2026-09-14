@@ -9,13 +9,13 @@ use mllm_domain::completion::{
 use mllm_domain::resources::{MemoryLimit, MemoryObservation, ResourcePhase};
 use mllm_scheduler::residency::AdmissionContext;
 use mllm_store::{
+    Store,
     candidate_creation::{
         cleanup::{CleanupExecutionContext, CleanupMode},
         initialize::ArmResult,
     },
-    Store,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct OwnedFake {
     members: Vec<(ProcessIdentity, bool)>,
@@ -219,6 +219,17 @@ fn local_fake_candidate_composes_full_store_protocol_and_restart_inspection() {
         ResourcePhase::Cold
     );
     let body = r#"{"expected_revision":1,"action":"cleanup","deadline_ms":12000}"#;
+    assert!(matches!(
+        store.finish_candidate_run(
+            &session,
+            "owner",
+            created.run_id(),
+            "finish",
+            r#"{"expected_revision":1,"action":"finish"}"#,
+            1400
+        ),
+        Err(mllm_store::lifecycle::LifecycleError::Unsupported)
+    ));
     let cleanup = store
         .accept_candidate_cleanup(&session, "owner", created.run_id(), "cleanup", body, 2000)
         .unwrap();
@@ -258,9 +269,11 @@ fn local_fake_candidate_composes_full_store_protocol_and_restart_inspection() {
             2350,
         )
         .unwrap();
-    assert!(store
-        .candidate_cleanup_execution(&next_session, unarmed_inspection.step_id())
-        .is_err());
+    assert!(
+        store
+            .candidate_cleanup_execution(&next_session, unarmed_inspection.step_id())
+            .is_err()
+    );
     assert!(matches!(
         store
             .arm_candidate_cleanup(&next_session, recovery.step_id(), 2400)

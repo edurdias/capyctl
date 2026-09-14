@@ -9,6 +9,8 @@ pub enum RuntimeAction {
     Drain,
     Park,
     Restore,
+    ReloadWeights,
+    InvalidateCache,
     Probe,
     Stop,
     Inspect,
@@ -160,6 +162,11 @@ pub enum AdapterError {
 /// success is only ever reported when the adapter knows it happened.
 #[async_trait]
 pub trait EngineAdapter: Send + Sync {
+    /// One persisted child effect only. Implementations must not hide legacy
+    /// compound Restore/reload/probe behavior behind this entry point.
+    async fn execute_persisted(&self, _command: &RuntimeCommand) -> Result<mllm_domain::qualification::EffectObservation,RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError>;
     async fn render_plan(&self, plan: &PlanInput) -> Result<RenderedCommand, AdapterError>;
     async fn check_readiness(&self, member: &MemberRef) -> Result<Readiness, AdapterError>;

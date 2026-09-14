@@ -7,8 +7,8 @@
 
 use crate::traits::*;
 use async_trait::async_trait;
-use std::sync::Mutex;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Resident bytes with everything loaded (weights + KV + buffers).
@@ -33,8 +33,7 @@ pub enum ParkPolicy {
     ExperimentalAllowed,
 }
 
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct MemberState {
     phase: Phase,
     retained_bytes: i64,
@@ -54,6 +53,7 @@ struct Knobs {
 /// A parked must not make B unready).
 #[derive(Debug)]
 pub struct FakeEngine {
+    qualification: Mutex<Option<super::qualification::QualificationState>>,
     knobs: Mutex<Knobs>,
     states: Mutex<HashMap<String, MemberState>>,
     started_at: std::time::Instant,
@@ -62,6 +62,7 @@ pub struct FakeEngine {
 impl FakeEngine {
     pub fn new() -> Self {
         Self {
+            qualification: Mutex::new(None),
             knobs: Mutex::new(Knobs {
                 policy: ParkPolicy::default(),
                 startup_delay: None,
@@ -71,6 +72,102 @@ impl FakeEngine {
             states: Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// Opt in to the separate persisted qualification state machine.
+    pub fn for_qualification() -> Self {
+        let engine = Self::new();
+        *engine.qualification.lock().unwrap() =
+            Some(super::qualification::QualificationState::default());
+        engine
+    }
+
+    /// Fault injection for the opt-in qualification runtime.
+    pub fn with_qualification_fault(self, fault: super::QualificationFault) -> Self {
+        if let Some(state) = self.qualification.lock().unwrap().as_mut() {
+            state.fault = Some(fault);
+        }
+        self
+    }
+
+    /// Read-only collector check against actual opt-in Fake membership.
+    pub fn qualification_members(
+        &self,
+        context: &mllm_domain::completion::StepExecutionContext,
+    ) -> Result<Vec<mllm_domain::completion::ProcessIdentity>, RuntimeError> {
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or(RuntimeError::Unsupported)?
+            .members(context)
+    }
+    /// Executes one authorized Fake cleanup or inspects already terminated owned members.
+    pub fn qualification_cleanup(
+        &self,
+        binding: &str,
+        incarnation: &str,
+        identities: &[mllm_domain::completion::ProcessIdentity],
+        terminate: bool,
+        observed_at_ms: i64,
+    ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or(RuntimeError::Unsupported)?
+            .cleanup(binding, incarnation, identities, terminate, observed_at_ms)
+    }
+    pub fn qualification_security_control(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<mllm_domain::qualification::CandidateSecurityControlObservation, RuntimeError> {
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or(RuntimeError::Unsupported)?
+            .security_control(command)
+    }
+    pub fn qualification_parked_status(
+        &self,
+        context: &mllm_domain::completion::StepExecutionContext,
+    ) -> Result<mllm_domain::qualification::CandidateParkedStatusObservation, RuntimeError> {
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or(RuntimeError::Unsupported)?
+            .parked_status(context)
+    }
+    /// Read-only opt-in Fake activity: inference sends, control sends, work started.
+    pub fn qualification_activity(&self) -> Result<(u64, u64, u64), RuntimeError> {
+        Ok(self
+            .qualification
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or(RuntimeError::Unsupported)?
+            .activity())
+    }
+    pub fn qualification_security_request(
+        &self,
+        context: &mllm_domain::completion::StepExecutionContext,
+        endpoint: mllm_domain::qualification::CandidateSecurityEndpoint,
+        body: &serde_json::Value,
+    ) -> Result<
+        (
+            mllm_domain::qualification::CandidateTerminal,
+            mllm_domain::qualification::CandidateResponseObservation,
+        ),
+        RuntimeError,
+    > {
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or(RuntimeError::Unsupported)?
+            .security_request(context, endpoint, body)
     }
 
     pub fn with_startup_delay(self, d: Duration) -> Self {
@@ -157,6 +254,17 @@ fn park_retained_bytes(level: ParkLevel) -> i64 {
 
 #[async_trait]
 impl EngineAdapter for FakeEngine {
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<mllm_domain::qualification::EffectObservation, RuntimeError> {
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or(RuntimeError::Unsupported)?
+            .execute(command)
+    }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
         let st = self.member(member);
         Ok(EngineState {
@@ -219,7 +327,11 @@ impl EngineAdapter for FakeEngine {
         Ok(Quiescence { quiescent: true })
     }
 
-    async fn park(&self, _member: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+    async fn park(
+        &self,
+        _member: &MemberRef,
+        level: ParkLevel,
+    ) -> Result<ParkOutcome, AdapterError> {
         let (policy, ambiguous, fail_at) = {
             let knobs = self.knobs.lock().unwrap();
             (knobs.policy, knobs.ambiguous_park, knobs.fail_at)
@@ -244,7 +356,9 @@ impl EngineAdapter for FakeEngine {
             // must reconcile; the adapter never fabricates a success.
             return Err(AdapterError::Uncertain("park applied, ack lost".into()));
         }
-        Ok(ParkOutcome::Parked { retained_bytes: retained })
+        Ok(ParkOutcome::Parked {
+            retained_bytes: retained,
+        })
     }
 
     async fn restore(&self, _member: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
@@ -299,7 +413,13 @@ impl EngineAdapter for FakeEngine {
 
 #[async_trait]
 impl crate::traits::ChatForward for FakeEngine {
-    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError> {
+    async fn forward_chat(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        if let Some(state) = self.qualification.lock().unwrap().as_mut() {
+            return state.forward(body);
+        }
         let model = body["model"].as_str().unwrap_or("fake").to_string();
         Ok(serde_json::json!({
             "id": "fake-completion",
@@ -313,6 +433,9 @@ impl crate::traits::ChatForward for FakeEngine {
         body: &serde_json::Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        if let Some(state) = self.qualification.lock().unwrap().as_mut() {
+            return state.stream(body, on_chunk);
+        }
         let model = body["model"].as_str().unwrap_or("fake").to_string();
         on_chunk(format!(
             r#"{{"id":"fake-stream","model":"{model}","choices":[{{"delta":{{"content":"hel"}}}}]}}"#
@@ -321,5 +444,3 @@ impl crate::traits::ChatForward for FakeEngine {
         Ok(crate::traits::StreamEnded::Completed)
     }
 }
-
-

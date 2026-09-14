@@ -1,4 +1,4 @@
-use rusqlite::{params, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use serde::Serialize;
 
 const MAX_EVENTS: i64 = 100_000;
@@ -128,8 +128,10 @@ pub(crate) struct EventOperationId(String);
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CandidateLifecycleTransition {
+    QualificationFinished,
     OwnedLaunchAssociated,
     ReadyCompleted,
+    ParkCompleted,
     CleanupAccepted,
     CleanupArmed,
     CleanupCompleted,
@@ -137,8 +139,10 @@ pub(crate) enum CandidateLifecycleTransition {
 impl CandidateLifecycleTransition {
     fn kind(&self) -> &'static str {
         match self {
+            Self::QualificationFinished => "candidate_qualification_finished",
             Self::OwnedLaunchAssociated => "candidate_owned_launch_associated",
             Self::ReadyCompleted => "candidate_ready_completed",
+            Self::ParkCompleted => "candidate_park_completed",
             Self::CleanupAccepted => "candidate_cleanup_accepted",
             Self::CleanupArmed => "candidate_cleanup_armed",
             Self::CleanupCompleted => "candidate_cleanup_completed",

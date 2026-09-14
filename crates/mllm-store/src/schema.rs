@@ -250,6 +250,47 @@ CREATE TABLE qualification_evidence_refs(
 );
 "#;
 
+pub const SCHEMA_V10: &str = r#"
+CREATE TABLE qualification_ready_probes(
+  run_id TEXT NOT NULL REFERENCES qualification_runs(id),
+  case_id TEXT NOT NULL,
+  parent_operation_id TEXT NOT NULL REFERENCES lifecycle_runs(operation_id),
+  parent_step_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_steps(id),
+  probe_step_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_steps(id),
+  linkage_json TEXT NOT NULL CHECK(length(CAST(linkage_json AS BLOB)) <= 1048576),
+  PRIMARY KEY(run_id,case_id),
+  CHECK(parent_step_id != probe_step_id)
+);
+CREATE TABLE qualification_request_attempts(
+  run_id TEXT NOT NULL REFERENCES qualification_runs(id),
+  case_id TEXT NOT NULL,
+  item_ordinal INTEGER NOT NULL CHECK(item_ordinal BETWEEN 0 AND 4095),
+  subcheck_id TEXT NOT NULL,
+  request_operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+  lease_id TEXT NOT NULL UNIQUE,
+  principal_id TEXT NOT NULL,
+  command_scope TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  parent_operation_id TEXT REFERENCES operations(id),
+  child_step_id TEXT UNIQUE REFERENCES lifecycle_steps(id),
+  receipt_json TEXT NOT NULL CHECK(length(CAST(receipt_json AS BLOB)) <= 1048576),
+  PRIMARY KEY(run_id,case_id,item_ordinal,subcheck_id),
+  FOREIGN KEY(principal_id,command_scope,idempotency_key) REFERENCES command_receipts(principal_id,command_scope,idempotency_key),
+  CHECK((parent_operation_id IS NULL) = (child_step_id IS NULL)),
+  CHECK(request_operation_id != parent_operation_id)
+);
+CREATE TABLE qualification_request_results(
+  request_operation_id TEXT PRIMARY KEY REFERENCES qualification_request_attempts(request_operation_id),
+  evidence_json TEXT NOT NULL CHECK(length(CAST(evidence_json AS BLOB)) <= 1048576),
+  committed_epoch INTEGER NOT NULL
+);
+CREATE TABLE qualification_parked_status(
+  parent_step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),
+  evidence_json TEXT NOT NULL CHECK(length(CAST(evidence_json AS BLOB)) <= 1048576),
+  committed_epoch INTEGER NOT NULL
+);
+"#;
+
 pub const SCHEMA_V9: &str = r#"
 CREATE TABLE owned_launch_associations(
   step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),

@@ -1,15 +1,15 @@
 use super::initialize::ArmResult;
-use super::initialize::{validated_initialize, ValidatedInitialize};
+use super::initialize::{ValidatedInitialize, validated_initialize};
 use crate::dispatch::CoordinatorSession;
 use crate::events::CandidateLifecycleTransition;
 use crate::lifecycle::completion::{
     accounting, association, canonical_members, check_session, decode, encode, event, fresh,
     identity_dtos, isolated, members, nonempty_receipt, policy_ttl,
 };
-use crate::lifecycle::{insert_candidate_cleanup_run, validate_cleanup_run, IdentityDto};
 use crate::lifecycle::{DeploymentFence, LifecycleError};
+use crate::lifecycle::{IdentityDto, insert_candidate_cleanup_run, validate_cleanup_run};
 use mllm_domain::completion::{CleanupEvidence, ProcessIdentity};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -403,16 +403,12 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleError> {
         result.predecessor_operations.push(operation);
         child = p;
     }
-    if child.mode != CleanupMode::TerminateOwned
-        || child.accepted_at_ms != child.cleanup_origin_ms
-        || child
-            .predecessor_operation_id
-            .as_ref()
-            .is_some_and(|p| p != &result.initialize.context.token.operation_id)
+    if child.mode != CleanupMode::TerminateOwned || child.accepted_at_ms != child.cleanup_origin_ms
     {
         return Err(LifecycleError::CorruptStoredData);
     }
     if let Some(initialize) = child.predecessor_operation_id {
+        super::progression::validate_cleanup_predecessor(tx, &result.initialize, &initialize)?;
         result.predecessor_operations.push(initialize);
     }
     Ok(result)
@@ -651,11 +647,13 @@ impl crate::Store {
         if prior_cleanup
             .as_ref()
             .is_some_and(|p| predecessor.as_ref() != Some(p))
-            || predecessor.as_ref().is_some_and(|p| {
-                Some(p) != prior_cleanup.as_ref() && p != &v.context.token.operation_id
-            })
         {
             return Err(LifecycleError::Conflict);
+        }
+        if let Some(previous) = &predecessor {
+            if Some(previous) != prior_cleanup.as_ref() {
+                super::progression::validate_cleanup_predecessor(&tx, &v, previous)?;
+            }
         }
         if predecessor.is_none() && v.state != "completed" {
             return Err(LifecycleError::Conflict);
@@ -896,6 +894,7 @@ impl crate::Store {
         // The immutable candidate lane has one binding, making deployment leases
         // across generations/sessions an exact incarnation scope.
         crate::dispatch::settle_verified_candidate_cleanup(&tx, &p.deployment_id, &p.binding_id)?;
+        tx.execute("UPDATE operations SET state='failed',error_code='resolved_by_owned_cleanup' WHERE state='running' AND id IN (SELECT request_operation_id FROM qualification_request_attempts WHERE run_id=?1)",[&p.run_id])?;
         // The entry reader already validated the whole chain in this transaction.
         // Reuse its exact scope instead of rereading every remaining suffix.
         for previous in &r.predecessor_operations {

@@ -4,13 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9,
+    SCHEMA_V9, SCHEMA_V10,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9,
+    SCHEMA_V9, SCHEMA_V10,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -90,7 +90,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(stamps, (1..=9).collect::<Vec<_>>());
+        assert_eq!(stamps, (1..=10).collect::<Vec<_>>());
         assert!(conn
             .execute(
                 "INSERT INTO owned_launch_associations VALUES('missing','missing','missing','{}')",

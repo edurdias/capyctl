@@ -28,7 +28,7 @@ struct StoredFootprint {
     devices: Vec<(String, bool)>,
 }
 
-fn decode(json: &str) -> Result<PhaseFootprint, ResourceStoreError> {
+pub(crate) fn decode(json: &str) -> Result<PhaseFootprint, ResourceStoreError> {
     let stored: StoredFootprint = serde_json::from_str(json)?;
     if stored.version != 1 {
         return Err(ResourceStoreError::Invalid);
@@ -189,6 +189,41 @@ pub(crate) fn reserve_increase_in_transaction(
     request: &GrantRequest,
     context: AdmissionContext<'_>,
 ) -> Result<GrantReceipt, ResourceStoreError> {
+    reserve_in_transaction(transaction, request, context, GrantTransition::Increase)
+}
+
+/// V3 candidate actions retain or increase their conservative reservation.
+/// Ordinary lifecycle phase transitions stay unchanged.
+pub(crate) fn reserve_retained_candidate_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &GrantRequest,
+    context: AdmissionContext<'_>,
+) -> Result<GrantReceipt, ResourceStoreError> {
+    let allowed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id JOIN lifecycle_claims c ON c.operation_id=o.id JOIN deployments d ON d.id=o.deployment_id JOIN qualification_runs q ON q.deployment_id=d.id WHERE r.operation_id=?1 AND r.action IN ('prepare','park','activate') AND r.state='queued' AND o.kind='candidate_action_v3' AND c.deployment_id=d.id AND c.revision=d.revision AND c.generation=d.current_generation AND d.id=?2 AND d.desired_state='stopped' AND d.admission_enabled=0 AND d.dispatch_enabled=0 AND q.state='running')",
+        params![request.operation_id, request.deployment_id], |r|r.get(0),
+    )?;
+    if !allowed {
+        return Err(ResourceStoreError::Conflict);
+    }
+    reserve_in_transaction(
+        transaction,
+        request,
+        context,
+        GrantTransition::RetainedCandidate,
+    )
+}
+
+enum GrantTransition {
+    Increase,
+    RetainedCandidate,
+}
+fn reserve_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &GrantRequest,
+    context: AdmissionContext<'_>,
+    transition: GrantTransition,
+) -> Result<GrantReceipt, ResourceStoreError> {
     if request.id.is_empty()
         || request.deployment_id.is_empty()
         || request.operation_id.is_empty()
@@ -243,7 +278,33 @@ pub(crate) fn reserve_increase_in_transaction(
     if snapshot.epoch != request.expected_epoch {
         return Err(ResourceStoreError::Conflict);
     }
-    ensure_increasing(snapshot.owners.get(&request.deployment_id), &request.next)?;
+    match transition {
+        GrantTransition::Increase => {
+            ensure_increasing(snapshot.owners.get(&request.deployment_id), &request.next)?
+        }
+        GrantTransition::RetainedCandidate
+            if snapshot
+                .owners
+                .get(&request.deployment_id)
+                .is_some_and(|old| {
+                    old.phase == request.next.phase
+                        && old.allocations.iter().all(|a| {
+                            request.next.allocations.iter().any(|b| {
+                                b.domain == a.domain
+                                    && b.bytes >= a.bytes
+                                    && b.host_kv_bytes >= a.host_kv_bytes
+                            })
+                        })
+                        && old.devices.iter().all(|a| {
+                            request.next.devices.iter().any(|b| {
+                                b.device == a.device
+                                    && (b.sharing == a.sharing
+                                        || b.sharing == mllm_domain::resources::Sharing::Exclusive)
+                            })
+                        })
+                }) => {}
+        GrantTransition::RetainedCandidate => return Err(ResourceStoreError::Conflict),
+    }
     admit_phase(&snapshot, &request.deployment_id, &request.next, context)?;
     let epoch = i64::try_from(snapshot.epoch)
         .ok()

@@ -3,15 +3,15 @@ use super::{
     CandidateCreationError, CandidateReviewedSnapshot, CandidateRunSnapshot, DescriptorRefV1,
     MAX_BYTES,
 };
-use crate::dispatch::{check_session, CoordinatorSession, DispatchError};
-use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteError};
+use crate::dispatch::{CoordinatorSession, DispatchError, check_session};
+use crate::events::{EventMetadata, EventOperationId, EventWriteError, append_event};
 use crate::lifecycle::{
-    insert_candidate_initialize_run, validate_candidate_initialize_run, DeploymentFence,
-    LifecycleError,
+    DeploymentFence, LifecycleError, insert_candidate_initialize_run,
+    validate_candidate_initialize_run,
 };
 use crate::qualification_policy::read_candidate_policy;
-use crate::resource_ledger::{reserve_increase_in_transaction, GrantRequest, ResourceStoreError};
-use crate::resource_policy::{read_singleton_policy, ResourcePolicySnapshot};
+use crate::resource_ledger::{GrantRequest, ResourceStoreError, reserve_increase_in_transaction};
+use crate::resource_policy::{ResourcePolicySnapshot, read_singleton_policy};
 use mllm_config::effective::candidate::CandidateCaseKind;
 use mllm_config::effective::candidate::{CandidateLaunch, CandidatePhase};
 use mllm_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
@@ -19,7 +19,7 @@ use mllm_domain::resources::{
     Allocation, DeviceClaim, MemoryLimit, PhaseFootprint, ResourcePhase, Sharing,
 };
 use mllm_scheduler::residency::AdmissionContext;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -506,7 +506,10 @@ fn selected(snapshot: &CandidateRunSnapshot) -> Result<&str> {
     }
     Ok(case.id())
 }
-fn policy(tx: &Transaction<'_>, snapshot: &CandidateRunSnapshot) -> Result<ResourcePolicySnapshot> {
+pub(super) fn policy(
+    tx: &Transaction<'_>,
+    snapshot: &CandidateRunSnapshot,
+) -> Result<ResourcePolicySnapshot> {
     let r = snapshot.receipt();
     let resource = read_singleton_policy(tx, r.host_id())
         .map_err(super::map_resource)?
@@ -553,7 +556,11 @@ fn fences(tx: &Transaction<'_>, snapshot: &CandidateRunSnapshot) -> Result<()> {
     }
     Ok(())
 }
-fn eligible(tx: &Transaction<'_>, snapshot: &CandidateRunSnapshot, fresh: bool) -> Result<()> {
+pub(super) fn eligible(
+    tx: &Transaction<'_>,
+    snapshot: &CandidateRunSnapshot,
+    fresh: bool,
+) -> Result<()> {
     fences(tx, snapshot)?;
     let r = snapshot.receipt();
     if snapshot.state() != super::CandidateRunState::Accepted
@@ -702,7 +709,7 @@ impl StoredTarget {
         Ok(f)
     }
 }
-fn footprint(p: &CandidatePhase, phase: ResourcePhase) -> Result<PhaseFootprint> {
+pub(super) fn footprint(p: &CandidatePhase, phase: ResourcePhase) -> Result<PhaseFootprint> {
     let f = PhaseFootprint {
         phase,
         allocations: p
@@ -842,6 +849,9 @@ pub(crate) fn validated_initialize(
     tx: &Transaction<'_>,
     id: &str,
 ) -> std::result::Result<ValidatedInitialize, LifecycleError> {
+    if super::progression::is_v3(tx, id)? {
+        return super::progression::immutable_initialize_anchor(tx, id);
+    }
     let (snapshot, _, read) = load_execution_step_immutable(tx, id)?;
     let e = read.execution.ok_or(LifecycleError::Conflict)?;
     let p = read.planned;
@@ -881,6 +891,13 @@ pub(crate) fn validate_retained_initialize(
     tx: &Transaction<'_>,
     id: &str,
 ) -> std::result::Result<(), LifecycleError> {
+    if super::progression::is_v3(tx, id)? {
+        let released: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.id=?1 AND b.state='released')", [id], |r| r.get(0))?;
+        if released {
+            return Err(LifecycleError::Conflict);
+        }
+        return super::progression::validated_anchor(tx, id).map(|_| ());
+    }
     let (snapshot, _, read) = load_execution_step_immutable(tx, id)?;
     retained(tx, &snapshot, &read).map_err(Into::into)
 }

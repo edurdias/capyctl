@@ -233,6 +233,9 @@ pub(crate) fn accounting(
     )?;
     if state == "released" {
         crate::candidate_creation::cleanup::validate_gone_history(tx, v)
+    } else if crate::candidate_creation::progression::is_v3(tx, &v.context.token.step_id)? {
+        crate::candidate_creation::progression::validated_anchor(tx, &v.context.token.step_id)
+            .map(|_| ())
     } else {
         validate_retained_initialize(tx, &v.context.token.step_id)
     }
@@ -385,7 +388,12 @@ impl crate::Store {
     ) -> Result<(), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let v = validated_initialize(&tx, id)?;
+        let v3 = crate::candidate_creation::progression::is_v3(&tx, id)?;
+        let v = if v3 {
+            crate::candidate_creation::progression::validated_anchor(&tx, id)?
+        } else {
+            validated_initialize(&tx, id)?
+        };
         let supplied = association_value(&v, r)?;
         accounting(&tx, &v)?;
         if let Some(old) = association(&tx, &v)? {
@@ -395,7 +403,11 @@ impl crate::Store {
                 Err(LifecycleError::Conflict)
             };
         }
-        validate_current_initialize(&tx, s, id)?;
+        if v3 {
+            crate::candidate_creation::progression::current_anchor(&tx, s, id)?;
+        } else {
+            validate_current_initialize(&tx, s, id)?;
+        }
         isolated(&tx, &v.context.token.deployment_id)?;
         fresh(
             v.context.issued_at_ms,

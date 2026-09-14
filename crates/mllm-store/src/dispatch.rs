@@ -126,6 +126,9 @@ pub struct DispatchTicket {
     session_id: String,
 }
 impl DispatchTicket {
+    pub(crate) fn candidate(id: String, deployment_id: String, revision: i64, generation: i64, session_id: String) -> Self {
+        Self { id, deployment_id, revision, generation, session_id }
+    }
     pub fn id(&self) -> &str {
         &self.id
     }

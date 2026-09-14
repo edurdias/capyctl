@@ -3,7 +3,7 @@ use std::net::TcpListener;
 pub(crate) mod completion;
 
 use mllm_domain::completion::ProcessIdentity;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch::CoordinatorSession;
@@ -241,6 +241,11 @@ pub(crate) fn validate_cleanup_run(
     if let Some(id) = predecessor {
         let h = &plan.handoffs[0];
         let previous = run_record(tx, id)?;
+        let v3: bool = tx.query_row(
+            "SELECT kind='candidate_action_v3' FROM operations WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
         if h.predecessor_operation_id != id
             || h.claims.len() != 1
             || h.claims[0].deployment_id != target.deployment_id
@@ -250,24 +255,69 @@ pub(crate) fn validate_cleanup_run(
             || previous.target.deployment_id != target.deployment_id
             || previous.target.revision != target.revision
             || h.claims[0].current_generation != target.generation
-            || h.steps.len() != 1
+            || (!v3 && h.steps.len() != 1)
+            || (v3 && !(3..=5).contains(&h.steps.len()))
         {
             return Err(LifecycleError::CorruptStoredData);
         }
-        let (dep, op): (String, String) = tx.query_row(
-            "SELECT deployment_id,operation_id FROM lifecycle_steps WHERE id=?1",
-            [&h.steps[0].id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if dep != target.deployment_id
-            || dep != h.steps[0].deployment_id
-            || op != id
-            || !matches!(h.steps[0].state.as_str(), "planned" | "armed" | "uncertain")
-        {
+        let rows:Vec<(String,String)>=tx.prepare("SELECT id,deployment_id FROM lifecycle_steps WHERE operation_id=?1 ORDER BY ordinal")?.query_map([id],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+        if rows.len() != h.steps.len() {
             return Err(LifecycleError::CorruptStoredData);
+        }
+        for ((step, dep), history) in rows.iter().zip(&h.steps) {
+            if step != &history.id
+                || dep != &target.deployment_id
+                || dep != &history.deployment_id
+                || !(matches!(history.state.as_str(), "planned" | "armed" | "uncertain")
+                    || (v3 && history.state == "completed"))
+            {
+                return Err(LifecycleError::CorruptStoredData);
+            }
         }
     }
     Ok(run.state)
+}
+
+/// Original ordered step states from the actual first cleanup handoff. The V3
+/// reader uses them only to validate historical envelopes, never to restore SQL
+/// state or infer that a cancelled effect succeeded.
+pub(crate) fn candidate_handoff_states(
+    tx: &Transaction<'_>,
+    run: &str,
+    predecessor: &str,
+) -> Result<Option<Vec<(String, String)>>, LifecycleError> {
+    let operation:Option<String>=tx.query_row("SELECT operation_id FROM candidate_cleanup_actions WHERE run_id=?1 AND predecessor_cleanup_operation_id IS NULL",[run],|r|r.get(0)).optional()?;
+    let Some(operation) = operation else {
+        return Ok(None);
+    };
+    let r = run_record(tx, &operation)?;
+    let p: StoredPlan = completion::decode(&r.plan_json)?;
+    if p.handoffs.len() != 1 || p.handoffs[0].predecessor_operation_id != predecessor {
+        return Ok(None);
+    }
+    let deadline = tx.query_row(
+        "SELECT deadline_ms FROM lifecycle_runs WHERE operation_id=?1",
+        [&operation],
+        |r| r.get(0),
+    )?;
+    validate_cleanup_run(
+        tx,
+        &r.target,
+        &operation,
+        &r.session_id,
+        deadline,
+        Some(predecessor),
+    )?;
+    Ok(Some(
+        p.handoffs
+            .into_iter()
+            .next()
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|s| (s.id, s.state))
+            .collect(),
+    ))
 }
 
 /// Only the immutable single-member candidate plan; caller fences current session separately.
@@ -358,12 +408,12 @@ pub struct StoredRuntimeBinding {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BindingDto {
-    version: u32,
-    qualification_id: String,
-    endpoint: String,
-    credential_ref: String,
-    payload: String,
+pub(crate) struct BindingDto {
+    pub(crate) version: u32,
+    pub(crate) qualification_id: String,
+    pub(crate) endpoint: String,
+    pub(crate) credential_ref: String,
+    pub(crate) payload: String,
 }
 
 pub(crate) enum DecodedBinding {

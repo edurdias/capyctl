@@ -1,6 +1,7 @@
 //! Durable candidate acceptance and informational historical reads. No execution authority.
 pub mod cleanup;
 pub mod initialize;
+pub mod progression;
 use crate::dispatch::{check_session, CoordinatorSession, DispatchError};
 use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteError};
 use crate::lifecycle::{

@@ -5,6 +5,7 @@
 pub mod operations;
 pub mod runtime;
 pub mod sequence;
+pub mod qualification;
 
 pub use mllm_domain::LifecycleAction;
 pub use mllm_domain::completion;
