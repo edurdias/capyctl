@@ -17,6 +17,12 @@ the work being executed. The owner will review consequential questions in the mo
 
 ## Morning continuation decisions
 
+On 2026-09-14 the owner explicitly approved an isolated SGLang environment on
+host-a and a reviewed memory-saver observation patch if required. Existing
+engine environments and drivers remain out of scope; no reboot is authorized.
+The first setup preflight stopped at a Tailscale SSH authentication check before
+remote commands ran. No environment was created by that attempt.
+
 The owner returned and asked to continue after the three recommendations were
 presented. Proceed with permanent case/action ownership, frozen deployment-scope
 `expected_revision`, and coordinator-selected qualification cases and inputs.
@@ -83,6 +89,72 @@ Document review remains a planning gate, not a repeated gate for each small task
 
 ## Progress
 
+- The approved isolated SGLang environment now exists on host-a at
+  `$HOME/mllm-sglang-f2-venv`. The binary-only, hash-locked installation
+  contains SGLang 0.5.16, Torch 2.11.0 and the unmodified memory saver 0.0.9.post1;
+  all 206 installed artifact hashes match the resolution report. `pip check`
+  passes and system site packages are disabled. The directory occupies 12 GB
+  including its private download cache. An isolated, offline import check with
+  GPUs hidden passed: Torch 2.11.0+cu130, SGLang 0.5.16, CUDA uninitialized.
+  No server/model launch, GPU qualification, observation patch or driver change
+  was performed. Runtime
+  and JIT compatibility remain untested; dependency resolution includes newer
+  CUDA compiler components and must not be mistaken for qualified compatibility.
+
+- Qualification implementation is complete through `37fade7` and cleared for
+  local integration. The actual Fake flow completes 12 requests and 17 evidence references,
+  writes an immutable catalog, performs verified owned cleanup, and resolves a
+  fresh compatible managed binding without granting dispatch authority. Warm
+  transitions preserve the incarnation/endpoint and retain conservative increases.
+  Failed/lost-reply cleanup preserves request spending and unsuccessful history.
+  The consolidated review found three blocking issues: unfinished Security history
+  after session rollover, unenforced frozen request limits, and cyclic predecessor
+  corruption. Fix `3209cb5` passed fresh root verification of 507 tests and both
+  scoped Clippy gates. Scoped re-review cleared request limits and cyclic history.
+  Fix `37fade7` resolves the remaining pending-cleanup restart ordering for both
+  Security inference subchecks, including inspection-only recovery after termination.
+  Fresh root verification passed 509 tests and both canonical Clippy gates; the
+  second scoped re-review found no remaining blocker or new breakage. Repeated
+  valid-history CPU cost remains a nonblocking follow-up for this Fake module and
+  an explicit measurement gate before production coordinator cutover. Native
+  qualification, ordinary execution, secure management/CLI, router carryovers and
+  full F2 remain open. No native runtime qualification follows from these CPU tests.
+- Subsequent native preparation used read-only file checks on host-a and
+  local static inspection of a published ARM64 memory-saver artifact. No engine
+  imports, GPU commands, launches, installs, driver changes or reboot occurred.
+  The existing Qwen3-4B checkpoint and vLLM metadata were located; artifact
+  provenance, complete launch settings and native allocation evidence remain
+  qualification prerequisites. No access to host-b occurred.
+
+- Candidate ownership/completion/cleanup module merged locally into `main` at
+  `9c7feb7`. The consolidated review found a repeated-restart recovery defect:
+  an unarmed inspection successor could restore termination authority. The fix
+  preserves inspection-only recovery across the complete chain; a three-session
+  regression proves one termination send. Scoped re-review passed. Fresh fix and
+  post-merge gates each passed 465 CPU tests and scoped Clippy with warnings denied.
+  Cleanup settlement also reuses one validated chain instead of repeated reads.
+  This completes the candidate protocol, not ordinary lifecycle or native recovery.
+- Qualification progression is the next cohesive module: accounted probes, marker
+  cases, security checks, warm cycles, trusted evaluation, immutable Fake catalog,
+  and verified-cleanup eligibility. Five local document lenses and three independent
+ reviews completed, plus one limited local interface check. One family-label
+  correction was applied. The new candidate-action version preserves legacy history;
+  one accounted ReadyProbe supplies lifecycle and qualification readiness together.
+  Native qualification and full F2 remain open. No Spark access or installs occurred.
+
+- Fit-based planner module merged locally into `main` at `8c355c0`. One consolidated
+  module review found no critical, important, or minor issues. Fresh pre-merge and
+  post-merge gates each passed 443 CPU tests; scoped Clippy passed with warnings
+  denied. Activation/preparation share complete-prefix forecasting, bounded
+  deterministic search, qualified parking and conditional verified cleanup. These
+  are pure forecasts, not engine effects. Full F2 and the F1 carryovers remain open.
+  The next cohesive module implements candidate ownership association, completion,
+  cleanup authority, historical replay and verified release. Native execution and
+  ordinary coordinator/router/API/CLI cutover remain subsequent required work.
+- Owner reconfirmed completing full F2 functionality and the relevant F1 carryovers.
+  Current production audit still finds synthetic activation accounting, missing
+  engine credentials, append-only logs, readiness error fallbacks and ignored stream
+  send failures. These are mandatory joint-cutover work, not deferred beyond F2.
 - Candidate initialization module is implemented through `a5e17bd`: acceptance,
   permanent case ownership, planned-step reads, Fake atomic arm and restart fencing.
   Five local document reviewers and three independent reviews completed;
