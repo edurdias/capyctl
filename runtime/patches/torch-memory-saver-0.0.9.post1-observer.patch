@@ -1,0 +1,256 @@
+--- a/csrc/core.h
++++ b/csrc/core.h
+@@ -6,6 +6,8 @@
+ #include <string>
+ #include "utils.h"
+ #include "macro.h"
++#include "snapshot.h"
++#include <atomic>
+
+ #if defined(USE_ROCM)
+ #include "hardware_amd_support.h"
+@@ -47,12 +49,28 @@
+     void pause(const std::string& tag);
+     void resume(const std::string& tag);
+
++    uint32_t snapshot(TmsSnapshotRecordV1* records, uint32_t capacity, uint32_t* count);
++
+ private:
+     TorchMemorySaver();
+     ~TorchMemorySaver() = default;
+     TorchMemorySaver(const TorchMemorySaver&) = delete;
+     TorchMemorySaver& operator=(const TorchMemorySaver&) = delete;
+
++    // These fields observe transitions; they do not decide allocation policy.
++    class MutationGuard {
++    public:
++        explicit MutationGuard(TorchMemorySaver& saver);
++        ~MutationGuard() noexcept;
++        MutationGuard(const MutationGuard&) = delete;
++        MutationGuard& operator=(const MutationGuard&) = delete;
++    private:
++        TorchMemorySaver& saver_;
++        int exceptions_;
++        bool counted_ = false;
++    };
++    uint64_t mutations_in_flight_ = 0;
++    std::atomic<bool> observation_invalid_{false};
+     std::mutex allocator_metadata_mutex_;
+     std::unordered_map<void*, AllocationMetadata> allocation_metadata_;
+ };
+\ No newline at end of file
+--- a/csrc/core.cpp
++++ b/csrc/core.cpp
+@@ -2,11 +2,44 @@
+ #include "utils.h"
+ #include "macro.h"
+ #include "api_forwarder.h"
++#include <cstring>
++#include <limits>
++#include <exception>
+
+ #if defined(USE_ROCM)
+ #include "hardware_amd_support.h"
+ #endif
+
++TorchMemorySaver::MutationGuard::MutationGuard(TorchMemorySaver& saver)
++    : saver_(saver), exceptions_(std::uncaught_exceptions()) {
++    try {
++        const std::lock_guard<std::mutex> lock(saver_.allocator_metadata_mutex_);
++        if (saver_.mutations_in_flight_ == std::numeric_limits<uint64_t>::max()) {
++            saver_.observation_invalid_ = true;
++        } else {
++            ++saver_.mutations_in_flight_;
++            counted_ = true;
++        }
++    } catch (...) {
++        saver_.observation_invalid_ = true;
++        throw;
++    }
++}
++
++TorchMemorySaver::MutationGuard::~MutationGuard() noexcept {
++    try {
++        const std::lock_guard<std::mutex> lock(saver_.allocator_metadata_mutex_);
++        if (std::uncaught_exceptions() > exceptions_) saver_.observation_invalid_ = true;
++        if (counted_) {
++            if (saver_.mutations_in_flight_ == 0) saver_.observation_invalid_ = true;
++            else --saver_.mutations_in_flight_;
++        }
++    } catch (...) {
++        // A failed bookkeeping lock must not make later snapshots look complete.
++        saver_.observation_invalid_ = true;
++    }
++}
++
+ TorchMemorySaver::TorchMemorySaver() {}
+
+ TorchMemorySaver &TorchMemorySaver::instance() {
+@@ -19,6 +52,7 @@
+     return ROCmHIPImplementation::rocm_malloc(ptr, device, size, tag, enable_cpu_backup, allocation_metadata_, allocator_metadata_mutex_);
+
+ #elif defined(USE_CUDA)
++    MutationGuard mutation(*this);
+     CUmemGenericAllocationHandle allocHandle;
+     CUDAUtils::cu_mem_create(&allocHandle, size, device);
+     CURESULT_CHECK(cuMemAddressReserve((CUdeviceptr *) ptr, size, 0, 0, 0));
+@@ -27,10 +61,11 @@
+
+     {
+         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+-        allocation_metadata_.emplace(
++        const auto inserted = allocation_metadata_.emplace(
+             *ptr,
+             AllocationMetadata{size, device, tag, AllocationState::ACTIVE, enable_cpu_backup, nullptr, allocHandle}
+         );
++        if (!inserted.second) observation_invalid_ = true;
+     }
+
+ #ifdef TMS_DEBUG_LOG
+@@ -51,11 +86,14 @@
+     return ROCmHIPImplementation::rocm_free(ptr, allocation_metadata_, allocator_metadata_mutex_);
+
+ #elif defined(USE_CUDA)
++    MutationGuard mutation(*this);
+     AllocationMetadata metadata;
+     {
+         const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
+         if (allocation_metadata_.count(ptr) == 0) {
+-            return APIForwarder::call_real_cuda_free(ptr);
++            const auto result = APIForwarder::call_real_cuda_free(ptr);
++            if (result != cudaSuccess) observation_invalid_ = true;
++            return result;
+         }
+
+         metadata = allocation_metadata_[ptr];
+@@ -89,6 +127,7 @@
+     ROCmHIPImplementation::rocm_pause(tag, allocation_metadata_, allocator_metadata_mutex_);
+
+ #elif defined(USE_CUDA)
++    MutationGuard mutation(*this);
+     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
+
+     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+@@ -139,6 +178,7 @@
+     ROCmHIPImplementation::rocm_resume(tag, allocation_metadata_, allocator_metadata_mutex_);
+
+ #elif defined(USE_CUDA)
++    MutationGuard mutation(*this);
+     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
+
+     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+@@ -186,4 +226,47 @@
+ #else
+     #error "USE_PLATFORM is not set"
+ #endif
+-}
+\ No newline at end of file
++}
++
++uint32_t TorchMemorySaver::snapshot(TmsSnapshotRecordV1* records, uint32_t capacity, uint32_t* count) {
++#if defined(USE_ROCM)
++    return TMS_SNAPSHOT_UNSUPPORTED;
++#else
++    std::unique_lock<std::mutex> lock(allocator_metadata_mutex_, std::try_to_lock);
++    if (!lock.owns_lock()) return TMS_SNAPSHOT_BUSY;
++    if (observation_invalid_) return TMS_SNAPSHOT_INVALID;
++    if (mutations_in_flight_ != 0) return TMS_SNAPSHOT_BUSY;
++    if (allocation_metadata_.size() > capacity) return TMS_SNAPSHOT_OVERFLOW;
++
++    // Validate the entire map before exposing any record to the caller.
++    for (const auto& item : allocation_metadata_) {
++        const auto address = reinterpret_cast<uintptr_t>(item.first);
++        const auto& metadata = item.second;
++        if (address == 0 || metadata.size == 0 ||
++            metadata.size > std::numeric_limits<uint64_t>::max() - address ||
++            metadata.device < 0 || metadata.tag.size() > 63 ||
++            metadata.tag.find('\0') != std::string::npos ||
++            (metadata.state != AllocationState::ACTIVE && metadata.state != AllocationState::PAUSED) ||
++            (!metadata.enable_cpu_backup && metadata.cpu_backup != nullptr) ||
++            (metadata.enable_cpu_backup && metadata.state == AllocationState::PAUSED && metadata.cpu_backup == nullptr)) {
++            return TMS_SNAPSHOT_INVALID;
++        }
++    }
++    uint32_t index = 0;
++    for (const auto& item : allocation_metadata_) {
++        const auto& metadata = item.second;
++        TmsSnapshotRecordV1 record{};
++        record.address = reinterpret_cast<uintptr_t>(item.first);
++        record.size_bytes = metadata.size;
++        record.backup_bytes = metadata.cpu_backup != nullptr ? metadata.size : 0;
++        record.device = metadata.device;
++        record.state = metadata.state == AllocationState::ACTIVE ? 1 : 2;
++        record.backup_enabled = metadata.enable_cpu_backup ? 1 : 0;
++        record.tag_length = static_cast<uint32_t>(metadata.tag.size());
++        std::memcpy(record.tag, metadata.tag.data(), metadata.tag.size());
++        records[index++] = record;
++    }
++    *count = index;
++    return TMS_SNAPSHOT_OK;
++#endif
++}
+--- a/csrc/entrypoint.cpp
++++ b/csrc/entrypoint.cpp
+@@ -119,4 +119,21 @@
+     std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+     TorchMemorySaver::instance().resume(tag_str);
+ }
+-}
+\ No newline at end of file
++}
++
++extern "C" uint32_t tms_snapshot_v1(
++    uint32_t abi_version, uint32_t record_size,
++    TmsSnapshotRecordV1* records, uint32_t capacity, uint32_t* count) noexcept {
++    if (count == nullptr) return TMS_SNAPSHOT_INVALID;
++    *count = 0;
++    if (abi_version != 1 || record_size != sizeof(TmsSnapshotRecordV1) ||
++        records == nullptr || capacity == 0 || capacity > 4096) {
++        return TMS_SNAPSHOT_INVALID;
++    }
++    try {
++        return TorchMemorySaver::instance().snapshot(records, capacity, count);
++    } catch (...) {
++        *count = 0;
++        return TMS_SNAPSHOT_INTERNAL;
++    }
++}
+--- /dev/null
++++ b/csrc/snapshot.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <type_traits>
++
++// Read-only CUDA allocation-map ABI; addresses are private to this process.
++enum TmsSnapshotStatus : uint32_t {
++    TMS_SNAPSHOT_OK = 0, TMS_SNAPSHOT_BUSY = 1,
++    TMS_SNAPSHOT_INVALID = 2, TMS_SNAPSHOT_OVERFLOW = 3,
++    TMS_SNAPSHOT_UNSUPPORTED = 4, TMS_SNAPSHOT_INTERNAL = 5
++};
++struct TmsSnapshotRecordV1 {
++    uint64_t address;
++    uint64_t size_bytes;
++    uint64_t backup_bytes;
++    int32_t device;
++    uint32_t state;
++    uint32_t backup_enabled;
++    uint32_t tag_length;
++    char tag[64];
++};
++static_assert(sizeof(void*) == 8, "snapshot ABI requires 64-bit pointers");
++static_assert(std::is_standard_layout<TmsSnapshotRecordV1>::value);
++static_assert(sizeof(TmsSnapshotRecordV1) == 104);
++static_assert(offsetof(TmsSnapshotRecordV1, address) == 0);
++static_assert(offsetof(TmsSnapshotRecordV1, size_bytes) == 8);
++static_assert(offsetof(TmsSnapshotRecordV1, backup_bytes) == 16);
++static_assert(offsetof(TmsSnapshotRecordV1, device) == 24);
++static_assert(offsetof(TmsSnapshotRecordV1, state) == 28);
++static_assert(offsetof(TmsSnapshotRecordV1, backup_enabled) == 32);
++static_assert(offsetof(TmsSnapshotRecordV1, tag_length) == 36);
++static_assert(offsetof(TmsSnapshotRecordV1, tag) == 40);
++
++extern "C" uint32_t tms_snapshot_v1(
++    uint32_t abi_version, uint32_t record_size,
++    TmsSnapshotRecordV1* records, uint32_t capacity, uint32_t* count) noexcept;
