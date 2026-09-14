@@ -89,6 +89,25 @@ Document review remains a planning gate, not a repeated gate for each small task
 
 ## Progress
 
+- The bounded memory-saver observer prerequisite is implemented at `782a3f4`.
+  It adds a minimal patch against the pinned 0.0.9.post1 source, coherent in-flight
+  mutation observation, and a strict same-loaded-library Python reader. CPU tests
+  compile the real patched allocator with driver stubs; deterministic tests first
+  reproduced the map-before-insertion and erase-before-unmap races, then passed
+  with mutation bookkeeping. One consolidated independent module review passed
+  specification and quality with no findings. Fresh root verification passed
+  27 observer tests and 509 existing Rust tests, plus both canonical Clippy gates
+  with warnings denied. The reviewed tree is
+  `c9bfdbfa2e465658a91b24e8fec1e0fc0a6539a1`. See the
+  [observer plan](2026-09-14-f2b-memory-saver-observer.md) and
+  [patch provenance and limitations](../../../runtime/patches/README.md).
+  This module performs no installation or Spark operation. Protected scheduler
+  integration, actual loaded-library identity, reviewed isolated CUDA build,
+  native allocation/lifecycle qualification and full F2 remain open. The observer
+  cannot acknowledge parking, release reservations, or establish whole-process
+  residency. The owner-requested module-level review kept all three related
+  checkpoints together; focused TDD and one full review covered the combined diff.
+
 - The approved isolated SGLang environment now exists on host-a at
   `$HOME/mllm-sglang-f2-venv`. The binary-only, hash-locked installation
   contains SGLang 0.5.16, Torch 2.11.0 and the unmodified memory saver 0.0.9.post1;
