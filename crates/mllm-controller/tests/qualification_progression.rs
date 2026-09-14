@@ -234,6 +234,231 @@ async fn corrupt_warm_predecessor_self_and_cross_links_are_bounded() {
 // Catches rejecting session-induced uncertainty as corrupt evidence, including
 // a parent restarted between checks while its next child remains planned.
 #[tokio::test]
+async fn security_cleanup_accepted_before_restart_keeps_current_uncertain_lease() {
+    for subcheck in [1, 2] {
+        security_cleanup_handoff_restart(subcheck, false).await;
+    }
+}
+
+#[tokio::test]
+async fn security_cleanup_executed_before_restart_recovers_by_inspection_only() {
+    for subcheck in [1, 2] {
+        security_cleanup_handoff_restart(subcheck, true).await;
+    }
+}
+
+// Catches choosing the current lease disposition from the handoff's historical
+// armed envelope instead of the independently persisted session rollover.
+async fn security_cleanup_handoff_restart(subcheck: usize, execute_cleanup: bool) {
+    use mllm_store::candidate_creation::{
+        cleanup::CleanupMode, progression::CandidateSecurityDispatch,
+    };
+    let f = fixture();
+    let fake = FakeEngine::for_qualification();
+    let collector = f.baseline(&fake).await;
+    for current in 0..=subcheck {
+        match f
+            .store
+            .advance_candidate_security(&f.session, &collector, f.admission())
+            .unwrap()
+        {
+            CandidateSecurityDispatch::NewControl(d) => {
+                let o = mllm_controller::qualification::collect_security_control(&fake, *d)
+                    .await
+                    .unwrap();
+                f.store
+                    .record_candidate_security_control(&f.session, &collector, &o, 1300)
+                    .unwrap();
+            }
+            CandidateSecurityDispatch::NewRequest(d) => {
+                let o = mllm_controller::qualification::collect_probe(&fake, *d)
+                    .await
+                    .unwrap();
+                if current < subcheck {
+                    f.store
+                        .record_candidate_result(&f.session, &collector, &o, 1300)
+                        .unwrap();
+                }
+                // The selected real request executes, but its reply is lost.
+            }
+            _ => panic!("missing original Security subcheck {current}"),
+        }
+    }
+    let expected_spend = if subcheck == 1 { 6 } else { 7 };
+    assert_eq!(
+        f.scalar("SELECT requests_used FROM qualification_runs"),
+        expected_spend
+    );
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM request_leases WHERE disposition='inflight'"),
+        1
+    );
+    let envelopes:Vec<(String,String)>=f.sql.prepare("SELECT id,step_json FROM lifecycle_steps WHERE operation_id IN (SELECT operation_id FROM lifecycle_runs WHERE action='prepare') ORDER BY ordinal").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    let body = r#"{"expected_revision":1,"action":"cleanup","deadline_ms":60000}"#;
+    let first = f
+        .store
+        .accept_candidate_cleanup(
+            &f.session,
+            "owner",
+            f.created.run_id(),
+            "cleanup",
+            body,
+            1400,
+        )
+        .unwrap();
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM request_leases WHERE disposition='inflight'"),
+        1
+    );
+    let first_plan: String = f
+        .sql
+        .query_row(
+            "SELECT plan_json FROM lifecycle_runs WHERE operation_id=?1",
+            [first.operation_id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let sends = fake.qualification_activity().unwrap();
+    if execute_cleanup {
+        assert!(matches!(
+            f.store
+                .arm_candidate_cleanup(&f.session, first.step_id(), 1450)
+                .unwrap(),
+            ArmResult::New { .. }
+        ));
+        let context = f
+            .store
+            .candidate_cleanup_execution(&f.session, first.step_id())
+            .unwrap();
+        assert_eq!(context.mode, CleanupMode::TerminateOwned);
+        let _lost = mllm_controller::qualification::collect_cleanup(&fake, &context, 1500).unwrap();
+    }
+    // Crash after cleanup acceptance (or physical termination), before completion.
+    let next = f.store.begin_coordinator_session().unwrap();
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM request_leases WHERE disposition='uncertain'"),
+        1
+    );
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM request_leases WHERE disposition='inflight'"),
+        0
+    );
+    assert_eq!(
+        f.store
+            .accept_candidate_cleanup(&next, "owner", f.created.run_id(), "cleanup", body, 1600)
+            .unwrap(),
+        first
+    );
+    assert!(matches!(
+        f.store
+            .advance_candidate_security(&next, &collector, f.admission())
+            .unwrap(),
+        CandidateSecurityDispatch::AlreadyRecorded {
+            complete: false,
+            ..
+        }
+    ));
+    let successor = f
+        .store
+        .accept_candidate_cleanup(&next, "owner", f.created.run_id(), "recovery", body, 1600)
+        .unwrap();
+    assert_eq!(successor.deadline_ms(), 60000);
+    assert!(matches!(
+        f.store
+            .arm_candidate_cleanup(&next, successor.step_id(), 1650)
+            .unwrap(),
+        ArmResult::New { .. }
+    ));
+    let context = f
+        .store
+        .candidate_cleanup_execution(&next, successor.step_id())
+        .unwrap();
+    assert_eq!(
+        context.mode,
+        if execute_cleanup {
+            CleanupMode::InspectOwnedGone
+        } else {
+            CleanupMode::TerminateOwned
+        }
+    );
+    let gone = mllm_controller::qualification::collect_cleanup(&fake, &context, 1700).unwrap();
+    assert_eq!(
+        fake.qualification_activity().unwrap(),
+        (sends.0, sends.1 + 1, sends.2)
+    );
+    f.store
+        .complete_cleanup(&next, successor.step_id(), &gone, 1750, f.ttl)
+        .unwrap();
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM qualification_runs WHERE cleanup_state='verified_gone'"),
+        1
+    );
+    assert_eq!(f.scalar("SELECT COUNT(*) FROM request_leases"), 0);
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM operations WHERE state='running'"),
+        0
+    );
+    assert_eq!(
+        f.scalar("SELECT requests_used FROM qualification_runs"),
+        expected_spend
+    );
+    assert_eq!(
+        f.scalar("SELECT COUNT(*) FROM qualification_request_attempts"),
+        expected_spend
+    );
+    assert!(f.store.resource_snapshot().unwrap().owners.is_empty());
+    let last = f.store.begin_coordinator_session().unwrap();
+    let counts = f.counts();
+    let epoch = f.store.resource_snapshot().unwrap().epoch;
+    for (key, want) in [("cleanup", &first), ("recovery", &successor)] {
+        assert_eq!(
+            &f.store
+                .accept_candidate_cleanup(&last, "owner", f.created.run_id(), key, body, 999999)
+                .unwrap(),
+            want
+        );
+    }
+    f.store
+        .complete_cleanup(&last, successor.step_id(), &gone, 999999, f.ttl)
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .advance_candidate_security(&last, &collector, f.admission())
+            .unwrap(),
+        CandidateSecurityDispatch::AlreadyRecorded {
+            complete: false,
+            ..
+        }
+    ));
+    assert_eq!(f.counts(), counts);
+    assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
+    assert_eq!(
+        fake.qualification_activity().unwrap(),
+        (sends.0, sends.1 + 1, sends.2)
+    );
+    for (id, want) in envelopes {
+        let actual: String = f
+            .sql
+            .query_row(
+                "SELECT step_json FROM lifecycle_steps WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(actual, want);
+    }
+    let actual: String = f
+        .sql
+        .query_row(
+            "SELECT plan_json FROM lifecycle_runs WHERE operation_id=?1",
+            [first.operation_id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actual, first_plan);
+}
+
+#[tokio::test]
 async fn security_crash_after_each_arm_and_between_checks_remains_cleanup_recoverable() {
     use mllm_store::candidate_creation::progression::CandidateSecurityDispatch;
     for (stop, expected_spend, uncertain_leases, restart) in [

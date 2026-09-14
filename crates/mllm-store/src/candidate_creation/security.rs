@@ -1140,7 +1140,9 @@ pub(in super::super) fn validate(
                 return Err(bad());
             }
             if let Some(attempt) = &attempt {
-                let inflight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases l JOIN operations o ON o.id=?1 WHERE l.id=?2 AND l.deployment_id=?3 AND l.revision=?4 AND l.generation=?5 AND l.session_id=?6 AND l.disposition=?7 AND o.state='running')",params![attempt.request_operation_id,attempt.lease_id,s.deployment_id,s.revision,s.generation,s.session_id,if row.5=="uncertain" {"uncertain"} else {"inflight"}],|r|r.get(0))?;
+                // Rollover changes the live lease even when an earlier cleanup
+                // handoff froze an armed child. That envelope remains historical.
+                let inflight:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases l JOIN operations o ON o.id=?1 WHERE l.id=?2 AND l.deployment_id=?3 AND l.revision=?4 AND l.generation=?5 AND l.session_id=?6 AND l.disposition=?7 AND o.state='running')",params![attempt.request_operation_id,attempt.lease_id,s.deployment_id,s.revision,s.generation,s.session_id,if session_changed {"uncertain"} else {"inflight"}],|r|r.get(0))?;
                 let resolved: bool = cleanup_resolved && tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND state='failed' AND error_code='resolved_by_owned_cleanup') AND NOT EXISTS(SELECT 1 FROM request_leases WHERE id=?2)", params![attempt.request_operation_id,attempt.lease_id], |r| r.get(0))?;
                 if !inflight && !resolved {
                     return Err(bad());
