@@ -60,6 +60,14 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
+    ManagedConfigurationAccepted {
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        revision: i64,
+        generation: i64,
+        session_epoch: i64,
+    },
+    #[serde(rename = "1")]
     CandidateLifecycleRecorded {
         transition: CandidateLifecycleTransition,
         operation_id: EventOperationId,
@@ -173,6 +181,7 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
             Self::CandidateLifecycleRecorded { transition, .. } => transition.kind(),
             Self::CandidateInitializeArmed { .. } => "candidate_initialize_armed",
             Self::CandidateInitializeAccepted { .. } => "candidate_initialize_accepted",
@@ -186,6 +195,7 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
+            Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CandidateLifecycleRecorded {
                 operation_id,
                 deployment_id,

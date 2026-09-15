@@ -7,6 +7,7 @@ pub mod deployments;
 pub mod dispatch;
 pub mod events;
 pub mod lifecycle;
+pub mod managed_configuration;
 pub mod migrations;
 pub mod qualification_policy;
 pub mod qualification;
