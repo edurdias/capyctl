@@ -30,6 +30,7 @@ not per task. Focused TDD and integration verification continue throughout.
 - `c0a07dd`: bounded metadata-only request journals.
 - `e11c3de`: private descriptor-relative artifact storage with a shared byte cap.
 - `861a3ad`: bounded collected JSON marker response validation.
+- `eb8e572`: bounded streamed marker data-event validation.
 
 Expired, never-armed ordinary Fake Initialize requests now terminalize atomically.
 The worker proves absence of execution, grants, ownership and runtime identities
@@ -56,7 +57,10 @@ They validate the served model, one choice, exact ordered content and natural st
 streaming also requires one terminal event. Malformed envelopes and alternative
 output fail closed without response text in diagnostics. Streaming checks accept
 already-decoded data events, not raw SSE bytes, and reject usage-only events.
-Transport framing/completion and binding provenance remain runner obligations.
+A bounded LF/CRLF framing helper now feeds those events across arbitrary network
+byte splits, including split UTF-8. It supports comments and multiline data but
+rejects other SSE fields, lone CR and incomplete frames. HTTP status/content type,
+clean transport completion and binding provenance remain runner obligations.
 
 Owned Fake candidate Initialize and its mandatory Ready probe pass root integration.
 Authenticated run-scoped submission returns the original durable acceptance
@@ -121,8 +125,8 @@ Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The harness passes all 64 tests and all-target Clippy, including six exact-marker,
-seven collected JSON, eight streamed-data, five timing, seven journal and nine
+The harness passes all 69 tests and all-target Clippy, including six exact-marker,
+seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
 protected-storage tests.
 None is native qualification evidence.
 
