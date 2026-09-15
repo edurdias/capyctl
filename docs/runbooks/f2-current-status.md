@@ -131,7 +131,7 @@ reruns and subsequent bounded full core runs. No timeout or evidence-freshness
 limit was changed.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
-and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
+and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
 The harness passes all 69 tests and all-target Clippy, including six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine

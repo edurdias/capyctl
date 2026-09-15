@@ -88,7 +88,11 @@ def enforce_closed_plugins():
     paths and prevent mutations between this observation and all native imports.
     No caller-supplied inventory or configurable allowlist can weaken this policy.
     """
-    if any(name == "sglang" or name.startswith("sglang.") for name in sys.modules):
+    # Native dependencies can execute effects before SGLang itself is imported.
+    # Refuse a late guard; inspecting module names imports none of these packages.
+    native_roots = ("sglang", "torch", "transformers", "torch_memory_saver")
+    if any(name == root or name.startswith(root + ".")
+           for name in sys.modules for root in native_roots):
         raise StartupGuardError("native_already_imported") from None
     if any(os.environ.get(name) for name in ("SGLANG_PLUGINS", "SGLANG_PLATFORM")):
         raise StartupGuardError("external_plugin_selection") from None

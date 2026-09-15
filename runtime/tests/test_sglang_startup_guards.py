@@ -133,6 +133,24 @@ class StartupGuardsTests(unittest.TestCase):
         ''')
         self.assertEqual(child.returncode, 0, child.stderr)
 
+    def test_prior_dependency_import_is_too_late_without_loading_native_code(self):
+        # Module sentinels exercise the guard without importing engine packages.
+        # Accepting Torch before this guard would miss earlier native effects.
+        for name in ("torch", "torch.cuda", "transformers", "transformers.models",
+                     "torch_memory_saver", "torch_memory_saver.hooks"):
+            with self.subTest(name=name):
+                child = self.child(f'''
+                    from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError
+                    sys.modules[{name!r}] = object()
+                    try:
+                        enforce_closed_plugins()
+                    except StartupGuardError as error:
+                        assert str(error) == "native_already_imported"
+                    else:
+                        raise AssertionError("late dependency accepted")
+                ''')
+                self.assertEqual(child.returncode, 0, child.stderr)
+
     def test_empty_inventory_allows_preimport_check_without_importing_native(self):
         child = self.child('''
             from runtime.sglang_startup_guards import enforce_closed_plugins

@@ -183,6 +183,14 @@ call `site.main()` to recover those paths. An empty inventory under `-S` is not
 installed-package attestation. That composition is still open, and both native
 entrypoint denials remain closed.
 
+The preimport guard now also rejects already-loaded Torch, Transformers and
+torch-memory-saver modules, including their submodules. Checking only SGLang
+missed dependencies that could have executed native effects earlier. Six sentinel
+cases failed before the change and pass afterward without importing any native
+package. All 14 startup-guard tests and the full 218-test local runtime suite pass.
+The isolated Spark helper has not been updated with this change. Package-path
+attestation and native startup composition remain open.
+
 ### Source contract
 
 The local `runtime/sglang_source_preflight.py` now verifies ten selected source
