@@ -66,6 +66,10 @@ The F2C phase-margin calculation now uses checked integer arithmetic for
 `peak + max(2 GiB, ceil(peak/4))`. It rejects overflow instead of saturating or
 wrapping. This numerical helper does not establish attribution, qualify a recipe
 or reduce any reservation; missing attribution keeps the conservative grant.
+Its pressure-case helper selects the smallest whole-GiB ceiling covering every
+supplied intermediate charged demand while denying direct wake. It rejects an
+empty or unsafe interval. Actual qualified attribution, complete ledger totals
+and planner feasibility remain caller obligations, not numerical assumptions.
 
 Owned Fake candidate Initialize and its mandatory Ready probe pass root integration.
 Authenticated run-scoped submission returns the original durable acceptance
@@ -149,6 +153,8 @@ Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
 The harness passes all 71 tests and all-target Clippy, including two phase-margin, six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
 protected-storage tests.
+Three additional pressure-ceiling tests pass with isolated source/test Clippy;
+the preceding full Cargo harness count does not include those three tests.
 None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
