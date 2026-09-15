@@ -9,6 +9,7 @@
 
 pub mod f2_pressure;
 pub mod f2_monitor;
+pub mod f2_metrics;
 
 use mllm_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
