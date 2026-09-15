@@ -52,6 +52,16 @@ pub struct ActionReceipt {
     pub joined: bool,
 }
 pub trait ActionSource: Send + Sync + 'static {
+    fn initialize_candidate(
+        &self,
+        run: &str,
+        key: &str,
+        expected_revision: i64,
+        deadline_ms: i64,
+    ) -> Result<
+        mllm_store::candidate_creation::progression::CandidateActionReceipt,
+        ConfigurationFailure,
+    >;
     fn accept_action(
         &self,
         deployment: &str,
@@ -81,6 +91,26 @@ impl OwnedActionSource {
     }
 }
 impl ActionSource for OwnedActionSource {
+    fn initialize_candidate(
+        &self,
+        run: &str,
+        key: &str,
+        expected_revision: i64,
+        deadline_ms: i64,
+    ) -> Result<
+        mllm_store::candidate_creation::progression::CandidateActionReceipt,
+        ConfigurationFailure,
+    > {
+        self.commands
+            .initialize_candidate(
+                self.configuration.principal(),
+                run,
+                expected_revision,
+                key,
+                deadline_ms,
+            )
+            .map_err(command_failure)
+    }
     fn accept_action(
         &self,
         deployment: &str,
@@ -128,6 +158,93 @@ impl ActionSource for OwnedActionSource {
             _ => Err(ConfigurationFailure::Unsupported),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateCommand {
+    expected_revision: i64,
+    action: CandidateAction,
+    deadline_ms: i64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CandidateAction {
+    Initialize,
+    Park,
+    Restore,
+    Finish,
+    Abort,
+    Cleanup,
+}
+
+pub(crate) async fn accept_candidate(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    match accept_candidate_inner(state, request).await {
+        Ok((run, receipt)) => (StatusCode::ACCEPTED, Json(serde_json::json!({"api_version":"1","qualification_run_id":run,"operation_id":receipt.operation_id(),"step_id":receipt.step_id(),"deployment_id":receipt.deployment_id(),"revision":receipt.revision().to_string(),"joined":false}))).into_response(),
+        Err(error) => error.response(),
+    }
+}
+async fn accept_candidate_inner(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<
+    (
+        String,
+        mllm_store::candidate_creation::progression::CandidateActionReceipt,
+    ),
+    ConfigurationFailure,
+> {
+    use ConfigurationFailure::*;
+    let run = request
+        .uri()
+        .path()
+        .strip_prefix("/management/v1/qualification-runs/")
+        .and_then(|s| s.strip_suffix("/actions"))
+        .ok_or(InvalidRequest)?;
+    if !run
+        .parse::<ulid::Ulid>()
+        .is_ok_and(|id| id.to_string() == run)
+    {
+        return Err(InvalidRequest);
+    }
+    let run = run.to_owned();
+    let (key, body, permit) = configuration::read_command(&state, request).await?;
+    let command: CandidateCommand = serde_json::from_slice(&body).map_err(|_| InvalidRequest)?;
+    if command.expected_revision < 1 || command.deadline_ms < 1 {
+        return Err(InvalidRequest);
+    }
+    if !matches!(command.action, CandidateAction::Initialize) {
+        return Err(Unsupported);
+    }
+    let source = state.actions.clone().ok_or(Unsupported)?;
+    let target = run.clone();
+    let receipt = configuration::accept_blocking(permit, move || {
+        source.initialize_candidate(
+            &target,
+            &key,
+            command.expected_revision,
+            command.deadline_ms,
+        )
+    })
+    .await?;
+    if receipt.revision() < 1
+        || ![
+            receipt.operation_id(),
+            receipt.step_id(),
+            receipt.deployment_id(),
+        ]
+        .iter()
+        .all(|id| {
+            id.parse::<ulid::Ulid>()
+                .is_ok_and(|parsed| parsed.to_string() == *id)
+        })
+    {
+        return Err(Internal);
+    }
+    Ok((run, receipt))
 }
 fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
     use ConfigurationFailure as F;

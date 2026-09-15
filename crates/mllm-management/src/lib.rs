@@ -212,8 +212,8 @@ pub fn candidate_acceptance_router<
     )
 }
 
-/// Compose Start/Stop explicitly with the same owned snapshot, configuration and
-/// candidate authority. The service must retain OwnedCoordinator outside this router.
+/// Compose Start/Stop and candidate Initialize with the same owned snapshot,
+/// configuration and candidate authority. Retain OwnedCoordinator outside this router.
 pub fn lifecycle_router(
     credentials: ManagementCredentials,
     source: Arc<actions::OwnedActionSource>,
@@ -239,10 +239,15 @@ pub fn lifecycle_router(
 fn routes(state: Arc<AppState>, include_events: bool) -> Router {
     let router = Router::new().route("/management/v1/snapshot", get(snapshot).head(method_denied));
     let router = if state.actions.is_some() {
-        router.route(
-            "/management/v1/deployments/{id}/actions",
-            axum::routing::post(actions::accept),
-        )
+        router
+            .route(
+                "/management/v1/deployments/{id}/actions",
+                axum::routing::post(actions::accept),
+            )
+            .route(
+                "/management/v1/qualification-runs/{id}/actions",
+                axum::routing::post(actions::accept_candidate),
+            )
     } else {
         router
     };

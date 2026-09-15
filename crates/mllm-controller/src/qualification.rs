@@ -77,6 +77,17 @@ pub async fn collect_probe(
     engine: &mllm_adapters::fake::FakeEngine,
     dispatch: CandidateProbeDispatch,
 ) -> Result<CandidateRequestObservation, mllm_store::lifecycle::LifecycleError> {
+    let fixture_time = dispatch.context().issued_at_ms;
+    collect_probe_with_clock(engine, dispatch, &|| Ok(fixture_time)).await
+}
+
+/// Service collection samples the trusted clock only after terminal observation.
+/// A failed clock leaves the durable probe lease unsettled; no time is invented.
+pub async fn collect_probe_with_clock(
+    engine: &mllm_adapters::fake::FakeEngine,
+    dispatch: CandidateProbeDispatch,
+    clock: &(dyn Fn() -> Result<i64, mllm_store::lifecycle::LifecycleError> + Send + Sync),
+) -> Result<CandidateRequestObservation, mllm_store::lifecycle::LifecycleError> {
     use mllm_store::lifecycle::LifecycleError;
     let identities = engine
         .qualification_members(dispatch.context())
@@ -164,7 +175,7 @@ pub async fn collect_probe(
         binding_id: c.binding_id.clone(),
         incarnation: c.incarnation.clone(),
         identities,
-        observed_at_ms: c.issued_at_ms,
+        observed_at_ms: clock()?,
         receipt: format!(
             "qualification-fake-v1:request:{}",
             dispatch.request_operation_id()

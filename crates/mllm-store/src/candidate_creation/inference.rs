@@ -42,6 +42,43 @@ impl CandidateProbeDispatch {
     }
 }
 impl crate::Store {
+    /// Observation only: validates the original durable probe and full context
+    /// after arm. The caller still requires its own New arm result to send.
+    pub fn revalidate_candidate_probe_send(
+        &self,
+        session: &CoordinatorSession,
+        dispatch: &CandidateProbeDispatch,
+        now: i64,
+    ) -> Result<i64, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let p = plan_for_step(&tx, &dispatch.context.token.step_id)?;
+        let ttl = worker::probe_policy(&tx, session, &p, now)?;
+        current_anchor(&tx, session, &p.scope.parent_step_id)?;
+        let a = attempt(&tx, &p)?.ok_or(LifecycleError::Conflict)?;
+        let v = validated_anchor(&tx, &p.scope.parent_step_id)?;
+        let owned = warm::owned(&tx, &p)?;
+        let mut expected = v.context;
+        expected.token = child_token(&p, &a.child_step_id);
+        expected.issued_at_ms = a.issued_at_ms;
+        expected.identities = mllm_domain::completion::ExecutionIdentities::Retained(
+            crate::lifecycle::completion::members(&owned.identities)?,
+        );
+        expected.completion_target = None;
+        expected.launch_settings = None;
+        let lease: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3 AND generation=?4 AND session_id=?5 AND disposition='inflight')",
+            params![a.lease_id,p.scope.deployment_id,p.scope.revision,p.scope.generation,session.id()], |r| r.get(0),
+        )?;
+        if dispatch.context != expected || dispatch.ticket.id() != a.lease_id
+            || dispatch.request_operation_id != a.request_operation_id
+            || dispatch.request != probe_request(&p)? || dispatch.security_endpoint.is_some()
+            || now < a.issued_at_ms || now >= a.deadline_ms || !lease
+            || probe_evidence(&tx, &p)?.is_some() {
+            return Err(LifecycleError::Stale);
+        }
+        Ok(ttl)
+    }
+
     pub fn record_candidate_result(
         &self,
         session: &CoordinatorSession,

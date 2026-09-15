@@ -21,6 +21,9 @@ mod worker_store;
 #[path = "qualification_support/owned_worker.rs"]
 mod owned_worker;
 
+#[path = "qualification_support/candidate_worker.rs"]
+mod candidate_worker;
+
 #[path = "qualification_support/fixture.rs"]
 mod fixture_support;
 use fixture_support::*;

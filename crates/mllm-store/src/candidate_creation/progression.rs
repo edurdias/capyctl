@@ -16,6 +16,8 @@ mod inference;
 mod warm;
 #[path = "read_validation.rs"]
 mod read_validation;
+#[path = "worker.rs"]
+pub mod worker;
 use read_validation::ReadValidation;
 pub use catalog::QualificationReceipt;
 pub use inference::{
@@ -192,6 +194,8 @@ fn creation_error(e: super::CandidateCreationError) -> LifecycleError {
 }
 fn receipt(plan: &CandidateActionPlanV3) -> CandidateActionReceipt {
     CandidateActionReceipt {
+        deployment_id: plan.scope.deployment_id.clone(),
+        revision: plan.scope.revision,
         operation_id: plan.scope.operation_id.clone(),
         step_id: plan.scope.parent_step_id.clone(),
         effects: plan.effects.iter().map(|e| e.step_id.clone()).collect(),
@@ -200,11 +204,19 @@ fn receipt(plan: &CandidateActionPlanV3) -> CandidateActionReceipt {
 
 #[derive(Clone, Debug)]
 pub struct CandidateActionReceipt {
+    deployment_id: String,
+    revision: i64,
     operation_id: String,
     step_id: String,
     effects: Vec<String>,
 }
 impl CandidateActionReceipt {
+    pub fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }

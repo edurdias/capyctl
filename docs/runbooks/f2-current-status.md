@@ -48,7 +48,15 @@ exclusive mode-0700 run directories and mode-0600 fixed files relative to a trus
 parent descriptor. Writers share an at-most100-MiB payload cap and stop on failure;
 partial evidence is retained. Each file requires explicit sync. These helpers do
 not validate a run manifest, prove route identity, authorize effects or complete
-the API-driven runner. Candidate Initialize integration is in progress.
+the API-driven runner.
+
+Owned Fake candidate Initialize and its mandatory Ready probe pass root integration.
+Authenticated run-scoped submission returns the original durable acceptance
+envelope. The same retained instance executes each separately armed child; trusted
+terminal clocks, policy/session checks and durable leases govern completion.
+Caller loss cannot cancel or replay accepted work. Uncertainty retains accounting;
+ordinary gates stay closed and no qualification is issued. Public candidate
+inference and the remaining actions are still open.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -82,9 +90,11 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 2. Complete owned candidate execution and API actions/inference, durable router
    accounting, management read models/policy/attachments/listener, and CLI cutover.
    Retire legacy authority only at the joint integration gate.
-3. Complete guarded native startup composition: explicit child descriptor transfer, complete process
-   enrollment, installed-source/device/allocator verification, scheduler observer
-   attachment, and protected authentication/control composition.
+3. Complete guarded native startup composition: explicit child descriptor transfer,
+   complete process enrollment, installed-source/device/allocator verification,
+   scheduler observer attachment, and protected authentication/control composition.
+   The closed native qualification program and both engines' persisted adapters
+   also remain required; the current qualification program supports Fake only.
 4. Complete the API-driven F2C runner, protected manifest/artifacts, trusted host
    inventory, pressure-abort wiring, correctness corpus and scenario reports.
 5. Run the consolidated review, fix required findings, satisfy remaining F1/M1
@@ -93,11 +103,12 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Full core root verification for the explicit unarmed Stop slice: Store 202,
-controller 187 and management 52 tests pass (441 distinct tests), plus three-crate
-all-target Clippy. Two existing caller-timeout tests failed during the worker's
-concurrent fixture runs, then passed unchanged both in isolated reruns and this
-bounded full core run. No timeout or evidence-freshness limit was changed.
+Full core root verification for the candidate Initialize slice: Store 202,
+controller 199 and management 57 tests pass (458 distinct tests), plus three-crate
+all-target Clippy. Two existing caller-timeout tests failed during the earlier
+unarmed Stop worker's concurrent fixture runs, then passed unchanged in isolated
+reruns and subsequent bounded full core runs. No timeout or evidence-freshness
+limit was changed.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
