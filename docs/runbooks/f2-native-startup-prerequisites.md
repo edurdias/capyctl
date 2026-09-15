@@ -19,9 +19,9 @@ findings. This does not complete F2B or qualify a native engine.
   inherited CUDA namespace. Provision/freeze that mapping against policy and
   establish the namespace before native imports; a logical selector is not a
   CUDA index or observed UUID by itself.
-- Install the wrapper and its local helpers under a protected absolute service path.
-  The current checkout has group-writable ancestors and cannot be that installation.
-  Bind installed source and helper identities to the reviewed runtime recipe.
+- The committed wrapper and local helpers are installed at the protected versioned
+  path recorded below. Bind their identities and installed engine sources to the
+  reviewed runtime recipe before use; installation alone grants no launch authority.
 - Startup output containment and closed external-plugin checks are implemented
   and tested in CPU subprocesses. They still need composition before imports in
   the API and spawned interpreters. Source preflight now covers both pinned
@@ -44,6 +44,28 @@ Existing authorization covers the isolated SGLang environment and reviewed obser
 patch on host-a. Existing environments and drivers remain outside that change.
 
 ## Pinned source inspection
+
+### Installed read-only preflight — September 15, 2026
+
+On the authorized host host-a, `git archive bf4b209 runtime` was extracted
+into a new mode-0700 directory, `$HOME/mllm-sglang-f2-runtime-bf4b209`.
+The install refused an existing destination. No existing engine environment,
+checkpoint, driver, or service was modified.
+
+Using the isolated SGLang environment's Python with `-I -B`, the committed
+helpers verified all nine selected installed sources and all ten checkpoint
+artifacts (398 tensors, 8,044,936,192 payload bytes). External-plugin metadata
+checks passed. The fixed proc/sysfs collector observed one physical GPU;
+the boot-scoped inventory digest was
+`2124d5550ed2316a62493cd335399bea795ffa074e07207c8b1d2f3a729387dd`.
+An explicit module check confirmed no `sglang`, `torch`, or `transformers`
+imports. There was no ServerArgs construction, native startup, or model load.
+
+This is read-only prerequisite evidence, not device-policy provisioning,
+whole-package attestation, live qualification, or durable launch authority.
+The native entrypoint remains closed.
+
+### Source contract
 
 The local `runtime/sglang_source_preflight.py` now verifies nine selected source
 files and revalidates retained identities without importing the engine. Its
