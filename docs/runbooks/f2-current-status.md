@@ -153,10 +153,11 @@ the agent cannot certify or restore it. It remains excluded from reading,
 editing, formatting, tests and staging. The separately modified SDD Task 2 report
 also remains excluded and untouched by this continuation.
 
-Pending access check: a read-only SSH connection to host-a timed out on port22
-at approximately 2026-09-15 11:56 UTC. No remote command executed. One timeout
-does not establish a lasting outage; local implementation continues. Recheck
-reachability before live work and request owner help only if access remains unavailable.
+Owner access item: read-only SSH connections to host-a timed out on port22
+at approximately 2026-09-15 11:56 and 12:30 UTC. No remote command executed in
+either attempt. Access remains unavailable from this session; restore reachability
+before native qualification. These observations do not identify the network or
+host cause. Local implementation continues without remote effects.
 
 No new approval is required for the current bounded implementation. Only
 host-a is authorized. The approved isolated SGLang environment and reviewed
