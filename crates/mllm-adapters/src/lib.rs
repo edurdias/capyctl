@@ -1,4 +1,5 @@
 pub mod fake;
+pub mod sglang;
 pub mod traits;
 pub mod vllm;
 
