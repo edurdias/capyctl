@@ -43,9 +43,12 @@ findings. This does not complete F2B or qualify a native engine.
   these checks do not prove allocator routing or whole-process residency.
   The process-local scheduler bridge now observes after the original
   `process_input_requests` returns, with one retained request and bounded deadlines.
-  Its thirteen CPU tests pass. This is not a GPU synchronization point; authenticated
-  transport, actual startup attachment, complete enrollment, and durable consumption
-  still remain open.
+  Its thirteen CPU tests pass. The accepted-connection Unix transport now checks
+  exact controller/scheduler process identities and kernel peer credentials, with
+  1-KiB requests, 64-KiB responses, one active request, and a two-second socket
+  deadline. Its twenty-one CPU tests pass. This is not a GPU synchronization point;
+  listener provisioning, startup attachment, complete enrollment, and durable
+  consumption remain open. No transport result grants lifecycle authority.
 - Typed single-effect controls are implemented in `6c78908`, with deterministic
   tests only; production observations and coordinator persistence remain open.
   Complete forwarding, coordinator/API/CLI integration, and F2C
@@ -90,7 +93,7 @@ The observer binary patch is still not built/installed, and no model was loaded.
 
 The local `runtime/sglang_source_preflight.py` now verifies nine selected source
 files and revalidates retained identities without importing the engine. Its
-synthetic CPU tests and the 179-test committed runtime suite pass. Production installed
+synthetic CPU tests and the full 200-test runtime suite pass. Production installed
 root selection and consumption by the guarded startup still remain open; selected
 files do not attest the complete import graph or compiled package.
 
