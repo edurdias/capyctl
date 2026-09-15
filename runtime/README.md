@@ -2,11 +2,11 @@
 
 ## Selected SGLang source preflight
 
-`sglang_source_preflight.verify_sglang_sources(root)` checks seven fixed Python
+`sglang_source_preflight.verify_sglang_sources(root)` checks nine fixed Python
 sources under the installed `sglang/srt` directory against commit
 `fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`. The inventory covers server arguments,
 authentication, the saver adapter, scheduler, weight updater, engine startup, and
-HTTP startup. `revalidate_sglang_sources(previous)` repeats the checks and rejects
+HTTP startup, plugin loader, and platform selector. `revalidate_sglang_sources(previous)` repeats the checks and rejects
 even byte-identical inode replacement. Roots stay out of observation repr; errors
 are closed categories. No engine module is imported.
 
@@ -15,7 +15,7 @@ group/world write permission. Symlinks and nonregular sources are rejected;
 individual files are bounded to 16 MiB. Tests use private temporary directories
 beneath the service home because `/tmp` is not a protected installation ancestor.
 
-These seven files are not the complete Python import graph or compiled runtime.
+These nine files are not the complete Python import graph or compiled runtime.
 The check neither attests the whole installed wheel nor proves the effective
 ServerArgs mapping, physical GPU identity, real saver, worker enrollment, or live
 compatibility. Native startup remains closed; production composition must select
@@ -24,6 +24,27 @@ alongside the remaining gates. Same-service-user mutation after observation is
 outside its guarantee.
 
 ## Checkpoint preflight
+
+## Native startup output and external plugins
+
+`sglang_startup_guards` supplies narrow preimport helpers for a fresh, isolated
+service-owned child only. `contain_startup_output()` permanently redirects stdout
+and stderr to `/dev/null`, including C output and descendants. It is not a
+context manager and must never run in the controlling service process. Report
+only fixed exit/status categories externally; native output is discarded.
+
+`enforce_closed_plugins()` rejects already imported SGLang modules, nonempty
+plugin/platform environment selectors, and installed entry points in either
+SGLang plugin group without loading their targets. Run it before imports in
+every spawned Python interpreter under trusted immutable package/metadata/search
+paths. An empty `SGLANG_PLUGINS` selector is not an upstream disable switch.
+
+These helpers do not block explicitly opened file/network/terminal logs, attest
+all imported code, or authorize native startup. No native entrypoint is enabled
+by their presence. Effective recipe checks, physical placement, worker enrollment,
+and actual saver/allocation evidence remain independent obligations.
+
+## Checkpoint verification
 
 This module performs a bounded observation of one fixed checkpoint contract. It
 does not qualify an engine or authorize a launch.

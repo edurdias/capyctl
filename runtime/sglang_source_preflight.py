@@ -26,6 +26,8 @@ _SOURCES = (
     ("managers/scheduler_components/weight_updater.py", "60cc68d85a9399be91c681db68c3a57a4697354912483e3c7e61127caa7bc977"),
     ("entrypoints/engine.py", "3fc01012d5e06050767573a31ea6a5b07447e88136d23cb7fd8454743dac1db4"),
     ("entrypoints/http_server.py", "5cdce94aaf3a446ac43e5a8e46961cbafdca9de7f0234404d285ed47ef5274d6"),
+    ("plugins/__init__.py", "3a975a73f1a7887e68c81ea7a2530250597ac8ae978efc0b0f70f038a99a3164"),
+    ("platforms/__init__.py", "09592f9fc6d7c83625e40167b4b02d843decdac9359362782b440c43b80baca3"),
 )
 _CODES = frozenset(("invalid_root", "unsupported_platform", "unsafe_file",
                     "artifact_missing", "artifact_changed", "artifact_mismatch", "io_error"))
@@ -93,7 +95,7 @@ def _observe_sources(root, inventory):
 
 
 def verify_sglang_sources(root):
-    """Observe the fixed seven-file inventory beneath an installed sglang/srt root."""
+    """Observe the fixed nine-file inventory beneath an installed sglang/srt root."""
     return _observe_sources(root, _SOURCES)
 
 

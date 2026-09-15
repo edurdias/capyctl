@@ -43,8 +43,10 @@ class SourceTests(unittest.TestCase):
             observed.source_revision = "main"
 
     def test_compiled_inventory_is_closed_and_well_formed(self):
-        self.assertEqual(len(source._SOURCES), 7)
-        self.assertEqual(len({name for name, _ in source._SOURCES}), 7)
+        self.assertEqual(len(source._SOURCES), 9)
+        self.assertEqual(len({name for name, _ in source._SOURCES}), 9)
+        self.assertIn("plugins/__init__.py", dict(source._SOURCES))
+        self.assertIn("platforms/__init__.py", dict(source._SOURCES))
         for name, digest in source._SOURCES:
             self.assertFalse(name.startswith("/"))
             self.assertNotIn("..", name.split("/"))

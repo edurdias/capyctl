@@ -18,6 +18,11 @@ findings. This does not complete F2B or qualify a native engine.
 - Install the wrapper and its local helpers under a protected absolute service path.
   The current checkout has group-writable ancestors and cannot be that installation.
   Bind installed source and helper identities to the reviewed runtime recipe.
+- Startup output containment and closed external-plugin checks are implemented
+  and tested in CPU subprocesses. They still need composition before imports in
+  the API and spawned interpreters. Source preflight now covers both pinned
+  plugin/platform initializers. Trusted package metadata/search paths and disabled
+  alternate native logging channels remain required; these helpers are not a sandbox.
 - Wire the production clock, checkpoint preflight, and credential resolver into
   `NativeCandidateService`; the current interface alone is not production composition.
 - Guard the actual memory-saver implementation, collect complete worker identities,
@@ -33,9 +38,9 @@ patch on host-a. Existing environments and drivers remain outside that change.
 
 ## Pinned source inspection
 
-The local `runtime/sglang_source_preflight.py` now verifies seven selected source
+The local `runtime/sglang_source_preflight.py` now verifies nine selected source
 files and revalidates retained identities without importing the engine. Its
-synthetic CPU tests and the full 111-test runtime suite pass. Production installed
+synthetic CPU tests and the full 130-test runtime suite pass. Production installed
 root selection and consumption by the guarded startup still remain open; selected
 files do not attest the complete import graph or compiled package.
 
