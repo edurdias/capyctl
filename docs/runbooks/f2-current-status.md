@@ -102,7 +102,17 @@ and the required Ready probe. Post-wake inference uses the validated Restore
 anchor without replaying baseline Security. Full conservative grants remain
 retained and ordinary gates remain closed. Each child requires a new durable arm;
 current policy, leases, pressure and final clock/shutdown fences govern sending.
-Finish, Abort, Cleanup and public operation-result reads remain separate work.
+Abort, Cleanup and public operation-result reads remain separate work.
+
+The owned candidate Finish service now uses an explicitly versioned deadline-bound
+catalog/receipt record while preserving legacy V3 history. It reuses the exact
+complete Fake suite evaluator, atomically records qualification and checks clocks
+after evaluation and immediately before commit. Expiry or regression rolls back
+all writes. Exact-key retries preserve the original operation; a new service key
+after completion conflicts. Current-session completion can validate immutable
+older-session evidence without reconstructing a runtime. All candidate accounting
+and identities remain retained; ordinary use still requires verified cleanup and
+a fresh independent binding. This does not qualify a native recipe.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -149,8 +159,8 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Full core root verification for the candidate Park/Restore slice: Store 202,
-controller 227 and management 61 tests pass (490 distinct tests). Two existing
+Full core root verification for the candidate Finish slice: Store 202,
+controller 230 and management 62 tests pass (494 distinct tests). Two existing
 caller-timeout tests failed during the earlier
 unarmed Stop worker's concurrent fixture runs, then passed unchanged in isolated
 reruns and subsequent bounded full core runs. No timeout or evidence-freshness

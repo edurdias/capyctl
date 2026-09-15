@@ -12,6 +12,51 @@ pub(super) use security::drive_security;
 mod warm;
 pub(super) use warm::drive_warm;
 
+impl CoordinatorCommands {
+    /// Finish is an atomic Store command, with no runtime callback or new driver.
+    /// The permit stays owned while waiting for the Store and through commit,
+    /// including when the HTTP acceptance observer has disconnected.
+    pub fn finish_candidate(
+        &self, principal: &str, run: &str, expected_revision: i64, key: &str, deadline_ms: i64,
+    ) -> Result<mllm_store::qualification::QualificationReceipt, CoordinatorCommandError> {
+        let _permit = self.shared.observers.clone().try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        let store_error = |error: LifecycleError| {
+            if matches!(error, LifecycleError::Sql(_) | LifecycleError::CorruptStoredData) {
+                self.shared.fail_locked(&owner, error.to_string());
+            }
+            CoordinatorCommandError::Lifecycle(error)
+        };
+        let text = serde_json::json!({"expected_revision":expected_revision,"action":"finish","deadline_ms":deadline_ms}).to_string();
+        if let Some(receipt) = owner.store().candidate_finish_command_receipt(
+            owner.session(), principal, run, key, &text,
+        ).map_err(store_error)? {
+            return Ok(receipt);
+        }
+        if !self.shared.accepting.load(Ordering::Acquire) {
+            return Err(CoordinatorError::Stopped("worker is not admitting Finish".into()).into());
+        }
+        let snapshot = owner.store().candidate_run_snapshot(principal, run)
+            .map_err(|error| store_error(mllm_store::candidate_creation::initialize::CandidateInitializeError::from(error).into()))?
+            .ok_or(LifecycleError::NotFound)?;
+        if snapshot.receipt().revision() != expected_revision {
+            return Err(LifecycleError::RevisionConflict.into());
+        }
+        owner.store().finish_candidate_run_command_with_clock(
+            owner.session(), principal, run, key, &text, || {
+                (self.shared.clock)().map_err(|error| {
+                    self.shared.fail_locked(&owner, error.to_string());
+                    LifecycleError::Stale
+                })
+            },
+        ).map_err(store_error)
+    }
+}
+
 pub(super) struct InferenceCommand {
     pub(super) work: CandidateInferenceWork,
     pub(super) expected_revision: i64,

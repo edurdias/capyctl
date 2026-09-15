@@ -46,8 +46,18 @@ impl LoopbackApp {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Deliberately abandon HTTP observers blocked on Store acceptance.
 async fn candidate_warm_http_preserves_owner_and_accounts_twelve_requests() {
-    let (dir, owner, worker, run, app) = setup();
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(1200));
+    let clock_samples = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let read_clock = clock.clone();
+    let samples = clock_samples.clone();
+    let (dir, owner, worker, run, app) = setup_service_clock(Arc::new(move || {
+        let now = read_clock.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(if std::thread::current().name() == Some("finish-clock-command")
+            && samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 { 400000 } else { now })
+    }));
+    let management_app = app.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -56,7 +66,7 @@ async fn candidate_warm_http_preserves_owner_and_accounts_twelve_requests() {
     });
     let app = LoopbackApp(address);
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
-    for action in ["park", "restore"] {
+    for action in ["park", "restore", "finish"] {
         let response = app.clone().oneshot(request(&run, &format!("before-init-{action}"), json!({"expected_revision":1,"action":action,"deadline_ms":400000}))).await.unwrap();
         assert_eq!(response.status(), 409, "warm action before Initialize");
     }
@@ -117,13 +127,65 @@ async fn candidate_warm_http_preserves_owner_and_accounts_twelve_requests() {
             }
         }
     }
+    clock.store(1400, std::sync::atomic::Ordering::SeqCst);
+    let finish_body = json!({"expected_revision":1,"action":"finish","deadline_ms":400000});
+    let commands = worker.commands();
+    let clock_run = run.clone();
+    let expired_during_evaluation = std::thread::Builder::new().name("finish-clock-command".into())
+        .spawn(move || commands.finish_candidate("owner", &clock_run, 1, "terminal-clock", 400000))
+        .unwrap().join().unwrap();
+    assert!(expired_during_evaluation.is_err(), "completion must sample its clock after evaluation");
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualifications", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    clock.store(1500, std::sync::atomic::Ordering::SeqCst);
+    let guard = owner.lock().unwrap();
+    let first = tokio::spawn(management_app.clone().oneshot(request(&run, "finish", finish_body.clone())));
+    let second = tokio::spawn(management_app.clone().oneshot(request(&run, "finish", finish_body.clone())));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first.abort(); second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    let full = management_app.clone().oneshot(request(&run, "capacity", finish_body.clone())).await.unwrap();
+    assert_eq!(full.status(), 429);
+    assert_eq!(value(full).await["error"]["code"], "queue_full");
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualifications", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    drop(guard);
+    let finish = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response = app.clone().oneshot(request(&run, "finish", finish_body.clone())).await.unwrap();
+            if response.status() == 202 { break value(response).await; }
+            assert_eq!(response.status(), 429, "Finish: {}", value(response).await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(finish["qualification_run_id"], run);
+    assert_eq!(finish["deployment_id"], init["deployment_id"]);
+    assert_eq!(finish["revision"], "1");
+    assert!(finish.get("step_id").is_none(), "Finish has no runtime step");
+    let original: String = sql.query_row("SELECT record_json FROM qualifications", [], |r| r.get(0)).unwrap();
+    let record: Value = serde_json::from_str(&original).unwrap();
+    assert_eq!(record["version"], 4);
+    assert_eq!(record["command_deadline_ms"], 400000);
+    assert_eq!(record["operation_id"], finish["operation_id"]);
+    assert_eq!(sql.query_row("SELECT response_json FROM command_receipts WHERE idempotency_key='finish'", [], |r| r.get::<_, String>(0)).unwrap(), original);
+    for (key, body) in [
+        ("finish", json!({"expected_revision":1,"action":"finish","deadline_ms":399999})),
+        ("finish", json!({"expected_revision":1,"action":"park","deadline_ms":400000})),
+        ("init", finish_body.clone()),
+        ("another-finish", finish_body.clone()),
+    ] {
+        assert_eq!(app.clone().oneshot(request(&run, key, body)).await.unwrap().status(), 409);
+    }
     worker.shutdown().await.unwrap();
+    clock.store(600000, std::sync::atomic::Ordering::SeqCst);
+    let retry = app.clone().oneshot(request(&run, "finish", finish_body)).await.unwrap();
+    assert_eq!(retry.status(), 202);
+    assert_eq!(value(retry).await, finish);
     assert_eq!(sql.query_row("SELECT count(*) FROM qualification_request_attempts", [], |r| r.get::<_, i64>(0)).unwrap(), 12);
     assert_eq!(sql.query_row("SELECT count(*) FROM request_leases", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     assert_eq!(sql.query_row("SELECT count(*) FROM qualification_parked_status", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     assert_eq!(sql.query_row("SELECT association_json FROM owned_launch_associations", [], |r| r.get::<_, String>(0)).unwrap(), identities);
     assert_eq!(sql.query_row("SELECT admission_enabled+dispatch_enabled FROM deployments", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    assert_eq!(sql.query_row("SELECT count(*) FROM qualifications", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualifications", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     assert_eq!(sql.query_row("SELECT count(*) FROM lifecycle_runs WHERE json_extract(plan_json,'$.action')='security'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     for (key, body, accepted) in history {
         let response = app.clone().oneshot(request(&run, &key, body)).await.unwrap();
@@ -155,11 +217,29 @@ fn setup() -> (
     String,
     axum::Router,
 ) {
+    setup_clock(Arc::new(std::sync::atomic::AtomicI64::new(1200)))
+}
+fn setup_clock(clock: Arc<std::sync::atomic::AtomicI64>) -> (
+    tempfile::TempDir,
+    Arc<Mutex<OwnedCoordinatorState>>,
+    OwnedCoordinator,
+    String,
+    axum::Router,
+) {
+    setup_service_clock(Arc::new(move || Ok(clock.load(std::sync::atomic::Ordering::SeqCst))))
+}
+fn setup_service_clock(clock: mllm_controller::coordinator::ServiceClock) -> (
+    tempfile::TempDir,
+    Arc<Mutex<OwnedCoordinatorState>>,
+    OwnedCoordinator,
+    String,
+    axum::Router,
+) {
     let (dir, owner, run, observations, host) = candidate_fixture::fixture();
     let worker = OwnedCoordinator::spawn_fake(
         owner.clone(),
         Arc::new(Observations(observations)),
-        Arc::new(|| Ok(1200)),
+        clock,
         CoordinatorOptions::default(),
     )
     .unwrap();
@@ -191,6 +271,40 @@ fn inference_request(run: &str, key: &str, body: Value) -> Request<Body> {
         .parse()
         .unwrap();
     req
+}
+
+#[tokio::test]
+async fn candidate_finish_http_rejects_invalid_scope_credentials_and_envelopes_without_mutation() {
+    let (dir, _owner, worker, run, app) = setup();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let count = || sql.query_row("SELECT count(*) FROM operations", [], |r| r.get::<_, i64>(0)).unwrap();
+    let before = count();
+    let body = json!({"expected_revision":1,"action":"finish","deadline_ms":400000});
+    for credential in [INFERENCE, "wrong"] {
+        let mut denied = request(&run, "finish", body.clone());
+        denied.headers_mut().insert("authorization", format!("Bearer {credential}").parse().unwrap());
+        assert_eq!(app.clone().oneshot(denied).await.unwrap().status(), 401);
+    }
+    for changed in [
+        json!({"expected_revision":1,"action":"finish"}),
+        json!({"expected_revision":1,"action":"finish","deadline_ms":null}),
+        json!({"expected_revision":1,"action":"finish","deadline_ms":0}),
+        json!({"expected_revision":1,"action":"finish","deadline_ms":400000,"evidence":{"passed":true}}),
+    ] {
+        assert_eq!(app.clone().oneshot(request(&run, "finish", changed)).await.unwrap().status(), 400);
+    }
+    let mut duplicate = request(&run, "finish", body.clone());
+    *duplicate.body_mut() = Body::from(body.to_string().replacen('{', "{\"deadline_ms\":400000,", 1));
+    assert_eq!(app.clone().oneshot(duplicate).await.unwrap().status(), 400);
+    let mut missing_key = request(&run, "finish", body.clone());
+    missing_key.headers_mut().remove("idempotency-key");
+    assert_eq!(app.clone().oneshot(missing_key).await.unwrap().status(), 400);
+    assert_eq!(app.clone().oneshot(request(&ulid::Ulid::new().to_string(), "finish", body.clone())).await.unwrap().status(), 404);
+    assert_eq!(app.clone().oneshot(request(&run, "finish", body)).await.unwrap().status(), 409);
+    assert_eq!(count(), before);
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualifications", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(sql.query_row("SELECT count(*) FROM owned_launch_associations", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    worker.shutdown().await.unwrap();
 }
 
 #[tokio::test]

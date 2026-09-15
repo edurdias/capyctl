@@ -6,9 +6,18 @@ use mllm_config::effective::candidate::{CandidateHost, CandidateRecipe, Candidat
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QualificationReceipt {
-    record: CatalogV3,
+    record: CatalogRecord,
 }
 impl QualificationReceipt {
+    pub fn operation_id(&self) -> &str {
+        &self.record.operation_id
+    }
+    pub fn deployment_id(&self) -> &str {
+        &self.record.source.deployment_id
+    }
+    pub fn revision(&self) -> i64 {
+        self.record.source.revision
+    }
     pub fn qualification_id(&self) -> &str {
         &self.record.id
     }
@@ -40,7 +49,7 @@ struct QualifiedBindingV3 {
     host: CandidateHost,
     recipe: CandidateRecipe,
 }
-fn binding_descriptor(c: &CatalogV3) -> QualifiedBindingV3 {
+fn binding_descriptor(c: &CatalogRecord) -> QualifiedBindingV3 {
     QualifiedBindingV3 {
         version: 3,
         kind: CatalogKind::FakeQualification,
@@ -57,7 +66,7 @@ enum CatalogKind {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CatalogV3 {
+struct CatalogRecord {
     version: u8,
     kind: CatalogKind,
     id: String,
@@ -75,6 +84,13 @@ struct CatalogV3 {
     requests_used: u32,
     finished_at_ms: i64,
     committed_epoch: u64,
+    // V4 service commands carry their deadline in the same atomic raw record.
+    // Absent for legacy V3: serialization preserves its exact bytes and hash.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_deadline")]
+    command_deadline_ms: Option<i64>,
+}
+fn present_deadline<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    i64::deserialize(d).map(Some)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,9 +110,36 @@ struct FinishCommand {
 enum FinishAction {
     Finish,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceFinishCommand {
+    expected_revision: i64,
+    action: FinishAction,
+    deadline_ms: i64,
+}
+fn service_hash(principal: &str, run: &str, command: &ServiceFinishCommand) -> Result<String, LifecycleError> {
+    inference::digest(&(4_u8, principal, command_scope(run), command))
+}
+fn service_command(principal: &str, run: &str, key: &str, text: &str) -> Result<ServiceFinishCommand, LifecycleError> {
+    if text.len() > 1048576 || !super::super::valid_id(principal)
+        || !super::super::valid_id(key) || !super::super::ulid(run) {
+        return Err(LifecycleError::Invalid);
+    }
+    let command: ServiceFinishCommand = serde_json::from_str(text).map_err(|_| LifecycleError::Invalid)?;
+    if command.expected_revision < 1 || command.deadline_ms < 1 {
+        return Err(LifecycleError::Invalid);
+    }
+    Ok(command)
+}
 
 fn command_scope(run: &str) -> String {
     format!("POST /management/v1/qualification-runs/{run}/actions")
+}
+// Inspect borrowed SQLite text before allocating historical command/catalog data.
+fn bounded_text(row: &rusqlite::Row<'_>, index: usize, limit: usize) -> rusqlite::Result<String> {
+    let value = row.get_ref(index)?.as_str().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if value.len() > limit { return Err(rusqlite::Error::InvalidQuery); }
+    Ok(value.to_owned())
 }
 fn request_hash(principal: &str, run: &str, revision: i64) -> Result<String, LifecycleError> {
     inference::digest(&(
@@ -239,19 +282,19 @@ fn source_bounds(tx: &Transaction<'_>, run: &str) -> Result<(u64, i64), Lifecycl
     Ok(tx.query_row("SELECT MAX(epoch),MAX(observed) FROM (SELECT e.committed_epoch epoch,json_extract(e.evidence_json,'$.observed_at_ms') observed FROM lifecycle_evidence e JOIN lifecycle_steps s ON s.id=e.step_id JOIN qualification_case_actions a ON a.operation_id=s.operation_id WHERE a.run_id=?1 UNION ALL SELECT e.committed_epoch,json_extract(e.evidence_json,'$.observed_at_ms') FROM qualification_request_results e JOIN qualification_request_attempts a ON a.request_operation_id=e.request_operation_id WHERE a.run_id=?1 UNION ALL SELECT e.committed_epoch,json_extract(e.evidence_json,'$.observed_at_ms') FROM qualification_parked_status e JOIN qualification_case_actions a ON a.step_id=e.parent_step_id WHERE a.run_id=?1)",[run],|r|Ok((r.get(0)?,r.get(1)?)))?)
 }
 
-fn read(tx: &Transaction<'_>, id: &str) -> Result<Option<CatalogV3>, LifecycleError> {
+fn read(tx: &Transaction<'_>, id: &str) -> Result<Option<CatalogRecord>, LifecycleError> {
     let row: Option<(String, String, String)> = tx
         .query_row(
             "SELECT source_run_id,recipe_fingerprint,record_json FROM qualifications WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((bounded_text(r, 0, 26)?, bounded_text(r, 1, 256)?, bounded_text(r, 2, 1048576)?)),
         )
         .optional()?;
     let Some((run, fingerprint, raw)) = row else {
         return Ok(None);
     };
-    let c: CatalogV3 = decode(&raw)?;
-    if c.version != 3
+    let c: CatalogRecord = decode(&raw)?;
+    if !matches!((c.version, c.command_deadline_ms), (3, None) | (4, Some(1..)))
         || c.id != id
         || !super::super::ulid(id)
         || c.source.run_id != run
@@ -276,7 +319,14 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<Option<CatalogV3>, LifecycleEr
         || c.requests_used != snapshot.requests_used()
         || c.finished_at_ms < p.accepted_at_ms
         || c.finished_at_ms >= snapshot.receipt().deadline_ms()
-        || c.request_hash != request_hash(&c.source.principal, &run, c.source.revision)?
+        || c.request_hash != match c.command_deadline_ms {
+            None => request_hash(&c.source.principal, &run, c.source.revision)?,
+            Some(deadline_ms) => service_hash(&c.source.principal, &run, &ServiceFinishCommand {
+                expected_revision: c.source.revision, action: FinishAction::Finish, deadline_ms,
+            })?,
+        }
+        || c.command_deadline_ms.is_some_and(|deadline| c.finished_at_ms >= deadline
+            || deadline > snapshot.receipt().deadline_ms())
         || snapshot.state() != super::super::CandidateRunState::Passed
         || c.evidence != suite(tx, &p)?
     {
@@ -284,11 +334,13 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<Option<CatalogV3>, LifecycleEr
     }
     let ledger = crate::resource_ledger::read_snapshot(tx).map_err(resource_error)?;
     let (max_source_epoch, last_observed) = source_bounds(tx, &run)?;
-    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind='candidate_finish_v3' AND state='succeeded' AND idempotency_key IS NULL AND error_code IS NULL) AND EXISTS(SELECT 1 FROM command_receipts WHERE operation_id=?1 AND principal_id=?3 AND command_scope=?4 AND idempotency_key=?5 AND request_hash=?6 AND response_json=?7)",params![c.operation_id,c.source.deployment_id,c.source.principal,command_scope(&run),c.idempotency_key,c.request_hash,raw],|r|r.get(0))?;
+    let kind = if c.version == 3 { "candidate_finish_v3" } else { "candidate_finish_v4" };
+    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind=?8 AND state='succeeded' AND idempotency_key IS NULL AND error_code IS NULL) AND EXISTS(SELECT 1 FROM command_receipts WHERE operation_id=?1 AND principal_id=?3 AND command_scope=?4 AND idempotency_key=?5 AND request_hash=?6 AND response_json=?7)",params![c.operation_id,c.source.deployment_id,c.source.principal,command_scope(&run),c.idempotency_key,c.request_hash,raw,kind],|r|r.get(0))?;
     if !valid
         || c.committed_epoch <= max_source_epoch
         || c.committed_epoch > ledger.epoch
         || c.finished_at_ms < last_observed
+        || (c.version == 4 && c.finished_at_ms == last_observed)
     {
         return Err(LifecycleError::CorruptStoredData);
     }
@@ -320,6 +372,45 @@ pub(crate) fn qualified_effective(
 }
 
 impl crate::Store {
+    /// Exact public Finish retry, independent of current admission and expiry.
+    /// No receipt means no accepted service command, even if a catalog exists.
+    pub fn candidate_finish_command_receipt(
+        &self, session: &CoordinatorSession, principal: &str, run: &str, key: &str, text: &str,
+    ) -> Result<Option<QualificationReceipt>, LifecycleError> {
+        let command = service_command(principal, run, key, text)?;
+        let hash = service_hash(principal, run, &command)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        let old: Option<(String, String)> = tx.query_row(
+            "SELECT request_hash,operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",
+            params![principal, command_scope(run), key], |r| Ok((bounded_text(r, 0, 256)?, bounded_text(r, 1, 26)?)),
+        ).optional()?;
+        let Some((old_hash, operation)) = old else { return Ok(None); };
+        if old_hash != hash { return Err(LifecycleError::Conflict); }
+        let id: String = tx.query_row("SELECT id FROM qualifications WHERE source_run_id=?1", [run], |r| bounded_text(r, 0, 26))
+            .optional()?.ok_or(LifecycleError::CorruptStoredData)?;
+        let record = read(&tx, &id)?.ok_or(LifecycleError::CorruptStoredData)?;
+        if record.version != 4 || record.operation_id != operation || record.idempotency_key != key
+            || record.request_hash != hash { return Err(LifecycleError::CorruptStoredData); }
+        Ok(Some(QualificationReceipt { record }))
+    }
+    /// Deadline-bound public command. Different keys after completion conflict;
+    /// legacy V3's catalog-only new-key observation is deliberately separate.
+    pub fn finish_candidate_run_command(
+        &self, session: &CoordinatorSession, principal: &str, run: &str, key: &str, text: &str, now: i64,
+    ) -> Result<QualificationReceipt, LifecycleError> {
+        self.finish_candidate_run_command_with_clock(session, principal, run, key, text, || Ok(now))
+    }
+    /// Service completion samples time inside its transaction, after evaluating
+    /// all sources and again immediately before commit. Exact retries need no clock.
+    pub fn finish_candidate_run_command_with_clock(
+        &self, session: &CoordinatorSession, principal: &str, run: &str, key: &str, text: &str,
+        clock: impl FnMut() -> Result<i64, LifecycleError>,
+    ) -> Result<QualificationReceipt, LifecycleError> {
+        let command = service_command(principal, run, key, text)?;
+        self.finish_candidate_run_inner(session, principal, run, key, command.expected_revision,
+            service_hash(principal, run, &command)?, Some(command.deadline_ms), clock)
+    }
     /// Read-only Fake eligibility for an actual fresh managed binding. A successful
     /// resolution does not open gates, allocate resources, arm steps or dispatch work.
     pub fn resolve_ordinary_qualification(
@@ -399,8 +490,6 @@ impl crate::Store {
         text: &str,
         now: i64,
     ) -> Result<QualificationReceipt, LifecycleError> {
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        check_session(&tx, session)?;
         if text.len() > 1048576
             || !super::super::valid_id(principal)
             || !super::super::valid_id(key)
@@ -411,26 +500,43 @@ impl crate::Store {
         let command: FinishCommand =
             serde_json::from_str(text).map_err(|_| LifecycleError::Invalid)?;
         let hash = request_hash(principal, run, command.expected_revision)?;
-        let old: Option<(String,String)> = tx.query_row("SELECT request_hash,operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",params![principal,command_scope(run),key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        self.finish_candidate_run_inner(session, principal, run, key, command.expected_revision, hash, None, || Ok(now))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn finish_candidate_run_inner(
+        &self, session: &CoordinatorSession, principal: &str, run: &str, key: &str,
+        expected_revision: i64, hash: String, command_deadline_ms: Option<i64>,
+        mut clock: impl FnMut() -> Result<i64, LifecycleError>,
+    ) -> Result<QualificationReceipt, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, session)?;
+        let old: Option<(String,String)> = tx.query_row("SELECT request_hash,operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",params![principal,command_scope(run),key],|r|Ok((bounded_text(r,0,256)?,bounded_text(r,1,26)?))).optional()?;
         if old.as_ref().is_some_and(|(h, _)| h != &hash) {
             return Err(LifecycleError::Conflict);
         }
         let snapshot = super::super::read_snapshot(&tx, principal, run)
             .map_err(creation_error)?
             .ok_or(LifecycleError::Conflict)?;
-        if command.expected_revision != snapshot.receipt().revision() {
+        if expected_revision != snapshot.receipt().revision() {
             return Err(LifecycleError::Stale);
         }
         let existing: Option<String> = tx
             .query_row(
                 "SELECT id FROM qualifications WHERE source_run_id=?1",
                 [run],
-                |r| r.get(0),
+                |r| bounded_text(r, 0, 26),
             )
             .optional()?;
         if let Some(id) = existing {
+            if command_deadline_ms.is_some() && old.is_none() {
+                return Err(LifecycleError::Conflict);
+            }
             let record = read(&tx, &id)?.ok_or(LifecycleError::CorruptStoredData)?;
             if old.is_some_and(|(_, op)| op != record.operation_id) {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            if command_deadline_ms.is_some() && (record.version != 4
+                || record.idempotency_key != key || record.request_hash != hash) {
                 return Err(LifecycleError::CorruptStoredData);
             }
             return Ok(QualificationReceipt { record });
@@ -438,6 +544,7 @@ impl crate::Store {
         if old.is_some() {
             return Err(LifecycleError::CorruptStoredData);
         }
+        let admitted_at = clock()?;
         QualificationProgram::resolve(snapshot.reviewed_manifest())?;
         let anchor: Option<String> = tx
             .query_row(
@@ -453,24 +560,41 @@ impl crate::Store {
         let p = plan_for_step(&tx, &anchor)?;
         if snapshot.state() != super::super::CandidateRunState::Running
             || snapshot.cleanup_state() != super::super::CandidateCleanupState::Retained
-            || now < p.accepted_at_ms
-            || now >= snapshot.receipt().deadline_ms()
+            || admitted_at < p.accepted_at_ms
+            || admitted_at >= snapshot.receipt().deadline_ms()
+            || command_deadline_ms.is_some_and(|deadline| admitted_at >= deadline
+                || deadline > snapshot.receipt().deadline_ms())
         {
             return Err(LifecycleError::Stale);
         }
-        super::super::initialize::policy(&tx, &snapshot)?;
+        let resource = super::super::initialize::policy(&tx, &snapshot)?;
+        if command_deadline_ms.is_some() {
+            let qualification = read_candidate_policy(&tx, &p.scope.host)
+                .map_err(super::super::map_qualification).map_err(creation_error)?
+                .ok_or(LifecycleError::Conflict)?;
+            if resource.revision != p.scope.resource_policy_revision
+                || qualification.revision != p.scope.qualification_policy_revision {
+                return Err(LifecycleError::Stale);
+            }
+        }
         let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND desired_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0) AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1)",params![p.scope.deployment_id,p.scope.revision,p.scope.generation],|r|r.get(0))?;
         if !current {
             return Err(LifecycleError::Stale);
         }
         crate::lifecycle::completion::isolated(&tx, &p.scope.deployment_id)?;
         let evidence = suite(&tx, &p)?;
-        if now < source_bounds(&tx, run)?.1 {
+        let now = if command_deadline_ms.is_some() { clock()? } else { admitted_at };
+        if now < admitted_at || now >= snapshot.receipt().deadline_ms()
+            || command_deadline_ms.is_some_and(|deadline| now >= deadline) {
+            return Err(LifecycleError::Stale);
+        }
+        let last_observed = source_bounds(&tx, run)?.1;
+        if now < last_observed || (command_deadline_ms.is_some() && now == last_observed) {
             return Err(LifecycleError::Invalid);
         }
         let epoch = crate::resource_ledger::advance_completion_epoch(&tx)?;
-        let record = CatalogV3 {
-            version: 3,
+        let record = CatalogRecord {
+            version: if command_deadline_ms.is_some() { 4 } else { 3 },
             kind: CatalogKind::FakeQualification,
             id: ulid::Ulid::new().to_string(),
             source: p.scope.clone(),
@@ -491,9 +615,11 @@ impl crate::Store {
             requests_used: snapshot.requests_used(),
             finished_at_ms: now,
             committed_epoch: epoch,
+            command_deadline_ms,
         };
         let raw = encode(&record)?;
-        tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'candidate_finish_v3','succeeded')",params![record.operation_id,p.scope.deployment_id])?;
+        let kind = if record.version == 3 { "candidate_finish_v3" } else { "candidate_finish_v4" };
+        tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,?3,'succeeded')",params![record.operation_id,p.scope.deployment_id,kind])?;
         tx.execute(
             "INSERT INTO qualifications VALUES(?1,?2,?3,?4)",
             params![
@@ -528,6 +654,13 @@ impl crate::Store {
             Some(epoch),
         )?;
         read(&tx, &record.id)?.ok_or(LifecycleError::CorruptStoredData)?;
+        if let Some(deadline) = command_deadline_ms {
+            let committing_at = clock()?;
+            if committing_at < now || committing_at >= deadline
+                || committing_at >= snapshot.receipt().deadline_ms() {
+                return Err(LifecycleError::Stale);
+            }
+        }
         tx.commit()?;
         Ok(QualificationReceipt { record })
     }

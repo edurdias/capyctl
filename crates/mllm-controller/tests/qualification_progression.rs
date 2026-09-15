@@ -30,6 +30,9 @@ mod warm_owned;
 #[path = "qualification_support/security_owned.rs"]
 mod security_owned;
 
+#[path = "qualification_support/finish_service.rs"]
+mod finish_service;
+
 #[path = "qualification_support/fixture.rs"]
 mod fixture_support;
 use fixture_support::*;

@@ -33,7 +33,7 @@ or inference request is created. Exact-key retries return the original receipt,
 including after qualification policy revocation; a new key uses current policy.
 A receipt grants no new execution authority.
 
-`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore and
+`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore/Finish and
 candidate corpus inference. Its `OwnedActionSource` must share the exact configuration
 source's owned Store and coordinator session. The service retains the
 `OwnedCoordinator` outside the router; constructing a router does not start a
@@ -66,13 +66,26 @@ and the required Ready probe before post-wake corpus inference. Each effect is
 armed independently. Shutdown rechecks under the owned Store lock prevent a new
 arm after admission closes. Full candidate ownership remains retained throughout.
 
+Candidate Finish uses `action:"finish"` with the same strict revision/deadline/key
+envelope. Its V4 catalog and command receipt share one atomic record containing
+the deadline; legacy V3 records retain their original serialization and hash.
+The existing exact suite evaluator validates every required source before the
+transaction records qualification. Service clocks are sampled after evaluation
+and immediately before commit; expiry or regression rolls back completion.
+Finish returns the original operation envelope without a runtime step. Exact
+same-key retries survive expiry, policy closure and current-session replacement;
+a different service key after completion conflicts. Completed immutable evidence
+from an older session remains eligible for validation by a current coordinator.
+Finish neither releases resources nor adopts the candidate into ordinary routing.
+Verified cleanup and a fresh qualified binding remain required for ordinary use.
+
 Inference returns the original HTTP202 operation acceptance envelope, not a
 completion or response body. A bounded owned queue retains accepted work after
 caller loss. Only a New durable grant may send; retries never replay uncertain
 backend inference. The Fake program uses exactly `MLLM_ALPHA_71` and `MLLM_BETA_29`
 in nonstreaming and streaming modes with max_tokens16. These are not the separate
 native F2C corpus or qualification counts. Full candidate grants remain unchanged,
-ordinary gates stay closed, and no promotion occurs. Public result reads and
+ordinary gates stay closed, and inference itself cannot promote. Public result reads and
 remaining candidate actions are still separate integration requirements.
 
 All mutation routes share two in-flight command permits. Command bodies are
@@ -82,8 +95,8 @@ its permit early. Retry an uncertain submission with the original key. Read/SSE
 capacity is separately bounded. Responses disable caching and never expose raw
 Store/provider diagnostics.
 
-Verified at the owned Park/Restore slice: all 61 management tests pass; the
-complete Store/controller/management run passes 490 distinct tests, with
+Verified at the owned Finish slice: all 62 management tests pass; the
+complete Store/controller/management run passes 494 distinct tests, with
 all-target Clippy passing. Tests cover
 real owned Store acceptance for Fake, vLLM and SGLang manifests without engine
 execution, historical replay, revocation, malformed input, endpoint exhaustion,

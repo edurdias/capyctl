@@ -52,6 +52,9 @@ pub struct ActionReceipt {
     pub joined: bool,
 }
 pub trait ActionSource: Send + Sync + 'static {
+    fn finish_candidate(
+        &self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64,
+    ) -> Result<mllm_store::qualification::QualificationReceipt, ConfigurationFailure>;
     fn warm_candidate(
         &self,
         run: &str,
@@ -109,6 +112,12 @@ impl OwnedActionSource {
     }
 }
 impl ActionSource for OwnedActionSource {
+    fn finish_candidate(
+        &self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64,
+    ) -> Result<mllm_store::qualification::QualificationReceipt, ConfigurationFailure> {
+        self.commands.finish_candidate(self.configuration.principal(), run, expected_revision, key, deadline_ms)
+            .map_err(command_failure)
+    }
     fn warm_candidate(
         &self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64, restore: bool,
     ) -> Result<mllm_store::candidate_creation::progression::CandidateActionReceipt, ConfigurationFailure> {
@@ -294,20 +303,14 @@ pub(crate) async fn accept_candidate(
     request: Request,
 ) -> Response {
     match accept_candidate_inner(state, request).await {
-        Ok((run, receipt)) => (StatusCode::ACCEPTED, Json(serde_json::json!({"api_version":"1","qualification_run_id":run,"operation_id":receipt.operation_id(),"step_id":receipt.step_id(),"deployment_id":receipt.deployment_id(),"revision":receipt.revision().to_string(),"joined":false}))).into_response(),
+        Ok(receipt) => (StatusCode::ACCEPTED, Json(receipt)).into_response(),
         Err(error) => error.response(),
     }
 }
 async fn accept_candidate_inner(
     state: Arc<AppState>,
     request: Request,
-) -> Result<
-    (
-        String,
-        mllm_store::candidate_creation::progression::CandidateActionReceipt,
-    ),
-    ConfigurationFailure,
-> {
+) -> Result<serde_json::Value, ConfigurationFailure> {
     use ConfigurationFailure::*;
     let run = request
         .uri()
@@ -327,11 +330,23 @@ async fn accept_candidate_inner(
     if command.expected_revision < 1 || command.deadline_ms < 1 {
         return Err(InvalidRequest);
     }
-    if !matches!(command.action, CandidateAction::Initialize | CandidateAction::Park | CandidateAction::Restore) {
+    if !matches!(command.action, CandidateAction::Initialize | CandidateAction::Park | CandidateAction::Restore | CandidateAction::Finish) {
         return Err(Unsupported);
     }
     let source = state.actions.clone().ok_or(Unsupported)?;
     let target = run.clone();
+    if matches!(command.action, CandidateAction::Finish) {
+        let receipt = configuration::accept_blocking(permit, move || {
+            source.finish_candidate(&target, &key, command.expected_revision, command.deadline_ms)
+        }).await?;
+        if receipt.revision() < 1 || receipt.source_run_id() != run
+            || ![receipt.operation_id(), receipt.deployment_id()].iter().all(|id| {
+                id.parse::<ulid::Ulid>().is_ok_and(|parsed| parsed.to_string() == *id)
+            }) {
+            return Err(Internal);
+        }
+        return Ok(serde_json::json!({"api_version":"1","qualification_run_id":run,"operation_id":receipt.operation_id(),"deployment_id":receipt.deployment_id(),"revision":receipt.revision().to_string(),"joined":false}));
+    }
     let receipt = configuration::accept_blocking(permit, move || {
         if matches!(command.action, CandidateAction::Park | CandidateAction::Restore) {
             source.warm_candidate(&target, &key, command.expected_revision, command.deadline_ms, matches!(command.action, CandidateAction::Restore))
@@ -357,7 +372,7 @@ async fn accept_candidate_inner(
     {
         return Err(Internal);
     }
-    Ok((run, receipt))
+    Ok(serde_json::json!({"api_version":"1","qualification_run_id":run,"operation_id":receipt.operation_id(),"step_id":receipt.step_id(),"deployment_id":receipt.deployment_id(),"revision":receipt.revision().to_string(),"joined":false}))
 }
 fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
     use ConfigurationFailure as F;
