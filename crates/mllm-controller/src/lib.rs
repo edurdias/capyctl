@@ -3,6 +3,7 @@
 //! and evidence-only journaling (design §5).
 
 pub mod operations;
+pub mod ownership;
 pub mod runtime;
 pub mod sequence;
 pub mod qualification;
@@ -10,5 +11,6 @@ pub mod qualification;
 pub use mllm_domain::LifecycleAction;
 pub use mllm_domain::completion;
 pub use operations::{AttachRequest, Controller, ControllerError, DeployRequest, OperationHandle};
+pub use ownership::{OwnedCoordinatorState, OwnedStateError};
 pub use runtime::{DurableRuntimeSupervisor, RuntimeBinding, RuntimeBindings, RuntimeOwnership};
 pub use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
