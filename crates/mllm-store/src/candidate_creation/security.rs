@@ -880,10 +880,13 @@ pub(in super::super) fn validate(
     tx: &Transaction<'_>,
     p: &CandidateActionPlanV3,
 ) -> Result<(), LifecycleError> {
+    validate_read(tx,p,&ReadValidation::new(tx))
+}
+pub(in super::super) fn validate_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
     let bad = || LifecycleError::CorruptStoredData;
     let cold = source(tx, &p.scope.run_id)?;
-    markers::baseline(tx, &cold)?;
-    let v = immutable_anchor(tx, &cold.scope.parent_step_id)?;
+    markers::baseline_read(tx, &cold,read)?;
+    let v = anchor_context_read(tx, &cold.scope.parent_step_id,false,read)?;
     let mut expected = cold.scope.clone();
     expected.operation_id = p.scope.operation_id.clone();
     expected.parent_step_id = p.scope.parent_step_id.clone();

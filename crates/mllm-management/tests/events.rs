@@ -1,6 +1,6 @@
 use axum::{body::Body, http::Request};
 use futures::StreamExt;
-use mllm_management::{read_only_router, ManagementCredentials, StoreSnapshotSource};
+use mllm_management::{ManagementCredentials, StoreSnapshotSource, read_only_router};
 use mllm_store::Store;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -63,14 +63,15 @@ fn request(uri: &str) -> axum::http::request::Builder {
 }
 
 use mllm_management::{
+    SnapshotSource, SnapshotUnavailable,
     events::{EventSource, EventStreamOptions},
-    read_only_router_with_event_options, SnapshotSource, SnapshotUnavailable,
+    read_only_router_with_event_options,
 };
 use mllm_store::events::{EventCursor, EventPage, EventReadError, ManagementEvent};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -326,9 +327,11 @@ async fn slow_clients_disconnect_without_success_or_unsent_cursor_and_release_ca
         .unwrap();
     assert_eq!(second.status(), 200);
     let mut body = response.into_body().into_data_stream();
-    assert!(next(&mut body)
-        .await
-        .contains(&format!("id: {INCARNATION}:1")));
+    assert!(
+        next(&mut body)
+            .await
+            .contains(&format!("id: {INCARNATION}:1"))
+    );
     assert!(body.next().await.is_none());
 }
 
@@ -432,8 +435,8 @@ async fn dropped_streams_do_not_cancel_accepted_reads_or_release_global_worker_p
     struct Release(Arc<(Mutex<bool>, Condvar)>);
     impl Drop for Release {
         fn drop(&mut self) {
-            *self.0 .0.lock().unwrap() = true;
-            self.0 .1.notify_all();
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
         }
     }
     let release_on_exit = Release(release);
@@ -507,8 +510,8 @@ async fn cancelled_preflight_retains_workers_and_sanitizes_provider_failure() {
     struct Release(Arc<(Mutex<bool>, Condvar)>);
     impl Drop for Release {
         fn drop(&mut self) {
-            *self.0 .0.lock().unwrap() = true;
-            self.0 .1.notify_all();
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
         }
     }
     let release_on_exit = Release(release);
@@ -573,6 +576,7 @@ async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
             "owned_launch_associated",
         ),
         ("qualified_ready_committed", "ready"),
+        ("qualified_initialize_uncertain", "uncertain"),
     ] {
         for corruption in 0..3 {
             let source = fake(move |_, _| {
@@ -633,20 +637,62 @@ async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
 #[tokio::test]
 async fn every_supported_kind_projects_only_known_fields_and_wide_integer_strings() {
     let cases = [
-        ("managed_configuration_accepted", "operation_id,deployment_id,revision,generation,session_epoch"),
-        ("candidate_initialize_armed", "operation_id,deployment_id,run_id,step_id,revision,generation,session_epoch"),
-        ("candidate_initialize_accepted", "operation_id,deployment_id,run_id,step_id,revision,generation,session_epoch"),
-        ("candidate_run_accepted", "operation_id,deployment_id,run_id,revision,generation,resource_policy_revision,qualification_policy_revision,session_epoch"),
-        ("host_resource_policy_bootstrapped", "revision,ledger_epoch,session_epoch"),
-        ("host_resource_policy_updated", "operation_id,previous_revision,current_revision,ledger_epoch,session_epoch"),
-        ("host_qualification_policy_changed", "change_kind,previous_revision,current_revision,session_epoch"),
-        ("candidate_qualification_finished", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
-        ("candidate_owned_launch_associated", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
-        ("candidate_ready_completed", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
-        ("candidate_park_completed", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
-        ("candidate_cleanup_accepted", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
-        ("candidate_cleanup_armed", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
-        ("candidate_cleanup_completed", "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch"),
+        (
+            "managed_configuration_accepted",
+            "operation_id,deployment_id,revision,generation,session_epoch",
+        ),
+        (
+            "candidate_initialize_armed",
+            "operation_id,deployment_id,run_id,step_id,revision,generation,session_epoch",
+        ),
+        (
+            "candidate_initialize_accepted",
+            "operation_id,deployment_id,run_id,step_id,revision,generation,session_epoch",
+        ),
+        (
+            "candidate_run_accepted",
+            "operation_id,deployment_id,run_id,revision,generation,resource_policy_revision,qualification_policy_revision,session_epoch",
+        ),
+        (
+            "host_resource_policy_bootstrapped",
+            "revision,ledger_epoch,session_epoch",
+        ),
+        (
+            "host_resource_policy_updated",
+            "operation_id,previous_revision,current_revision,ledger_epoch,session_epoch",
+        ),
+        (
+            "host_qualification_policy_changed",
+            "change_kind,previous_revision,current_revision,session_epoch",
+        ),
+        (
+            "candidate_qualification_finished",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
+        (
+            "candidate_owned_launch_associated",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
+        (
+            "candidate_ready_completed",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
+        (
+            "candidate_park_completed",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
+        (
+            "candidate_cleanup_accepted",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
+        (
+            "candidate_cleanup_armed",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
+        (
+            "candidate_cleanup_completed",
+            "transition,operation_id,deployment_id,step_id,session_epoch,committed_epoch",
+        ),
     ];
     for (kind, fields) in cases {
         let source = fake(move |_, _| {

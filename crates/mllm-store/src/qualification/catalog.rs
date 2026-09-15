@@ -3,6 +3,7 @@ use super::*;
 use crate::qualification::recipe_v1::{PROGRAM_REVISION, SuiteCaseEvidence, evaluate_suite};
 use mllm_config::effective::candidate::{CandidateHost, CandidateRecipe, CandidateResources};
 
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QualificationReceipt {
     record: CatalogV3,
@@ -115,7 +116,8 @@ fn suite(
     tx: &Transaction<'_>,
     p: &CandidateActionPlanV3,
 ) -> Result<Vec<CatalogReference>, LifecycleError> {
-    validate_plan(tx, p)?;
+    let read=ReadValidation::new(tx);
+    validate_plan_read(tx, p,true,&read)?;
     let snapshot = super::super::read_snapshot(tx, &p.scope.principal, &p.scope.run_id)
         .map_err(creation_error)?
         .ok_or(LifecycleError::CorruptStoredData)?;
@@ -163,7 +165,7 @@ fn suite(
                 return Err(LifecycleError::Unsupported);
             }
             let action = plan_for_step(tx, &anchor)?;
-            validate_plan(tx, &action)?;
+            validate_plan_read(tx, &action,true,&read)?;
             let complete: bool = tx.query_row(
                 "SELECT state='completed' FROM lifecycle_steps WHERE id=?1",
                 [&anchor],
@@ -176,7 +178,7 @@ fn suite(
                 case.kind(),
                 CandidateCaseKind::ColdInitialize | CandidateCaseKind::Restore
             ) {
-                inference::markers::baseline(tx, &action)?;
+                inference::markers::baseline_read(tx, &action,&read)?;
             }
         }
         let mut statement = tx.prepare("SELECT id,case_id,evidence_digest,metadata_json FROM qualification_evidence_refs WHERE run_id=?1 AND case_id=?2 ORDER BY evidence_digest")?;
@@ -291,6 +293,30 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<Option<CatalogV3>, LifecycleEr
         return Err(LifecycleError::CorruptStoredData);
     }
     Ok(Some(c))
+}
+
+/// Transaction-scoped catalog authority for an independently validated managed revision.
+pub(crate) fn qualified_effective(
+    tx: &Transaction<'_>,
+    effective: &mllm_config::effective::EffectiveDeployment,
+    deployment: &str,
+) -> Result<QualificationReceipt, LifecycleError> {
+    if effective.profile.engine != mllm_config::effective::Engine::Fake {
+        return Err(LifecycleError::Unsupported);
+    }
+    let id = effective.profile.qualification_id.strip_prefix("qualified:").filter(|id| super::super::ulid(id)).ok_or(LifecycleError::Invalid)?;
+    let record = read(tx, id)?.ok_or(LifecycleError::Conflict)?;
+    if record.source.deployment_id == deployment
+        || record.source.descriptor.recipe_fingerprint != effective.qualification_fingerprint
+        || record.host.id() != effective.host.name
+        || record.host.hardware_fingerprint() != effective.host.hardware_fingerprint
+        || record.host.environment_fingerprint() != effective.host.environment_fingerprint
+    {
+        return Err(LifecycleError::Conflict);
+    }
+    let anchor = immutable_initialize_anchor(tx, &record.source.parent_step_id)?;
+    super::super::cleanup::validate_gone_history(tx, &anchor)?;
+    Ok(QualificationReceipt { record })
 }
 
 impl crate::Store {

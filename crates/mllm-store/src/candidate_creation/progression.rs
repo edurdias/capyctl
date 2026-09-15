@@ -9,11 +9,14 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[path = "../qualification/catalog.rs"]
-mod catalog;
+pub(crate) mod catalog;
 #[path = "inference.rs"]
 mod inference;
 #[path = "warm.rs"]
 mod warm;
+#[path = "read_validation.rs"]
+mod read_validation;
+use read_validation::ReadValidation;
 pub use catalog::QualificationReceipt;
 pub use inference::{
     CandidateDispatchResult, CandidateProbeDispatch, CandidateSecurityControlDispatch,
@@ -915,12 +918,18 @@ fn anchor_context(
     id: &str,
     check_accounting: bool,
 ) -> Result<super::initialize::ValidatedInitialize, LifecycleError> {
+    anchor_context_read(tx,id,check_accounting,&ReadValidation::new(tx))
+}
+
+fn anchor_context_read(
+    tx:&Transaction<'_>,id:&str,check_accounting:bool,read:&ReadValidation<'_, '_>,
+) -> Result<super::initialize::ValidatedInitialize,LifecycleError> {
     use mllm_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
     let p = plan_for_step(tx, id)?;
     if p.scope.parent_step_id != id {
         return Err(LifecycleError::CorruptStoredData);
     }
-    validate_plan_inner(tx, &p, check_accounting)?;
+    validate_plan_read(tx, &p, check_accounting,read)?;
     let (state, raw): (String, String) = tx.query_row(
         "SELECT state,step_json FROM lifecycle_steps WHERE id=?1",
         [id],
@@ -1010,10 +1019,7 @@ fn validate_plan(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(), 
     validate_plan_inner(tx, p, true)
 }
 
-fn validate_accounting(
-    tx: &Transaction<'_>,
-    p: &CandidateActionPlanV3,
-) -> Result<(), LifecycleError> {
+fn validate_accounting_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
     let ledger = crate::resource_ledger::read_snapshot(tx).map_err(resource_error)?;
     if let Some(owner) = ledger.owners.get(&p.scope.deployment_id) {
         if owner != &warm::reservation_at(tx, p, ledger.epoch)? {
@@ -1026,8 +1032,12 @@ fn validate_accounting(
         Ok(())
     } else {
         let cold = warm::cold(tx, &p.scope.run_id)?;
-        let v = immutable_initialize_anchor(tx, &cold.scope.parent_step_id)?;
-        super::cleanup::validate_gone_history(tx, &v)
+        // Every caller resolves the exact cold source again. Only the successful
+        // gone-history proof for that entire immutable plan may be shared.
+        read.prove(tx,encode(&("released_accounting",&cold))?,|| {
+            let v = anchor_context_read(tx, &cold.scope.parent_step_id,false,read)?;
+            super::cleanup::validate_gone_history(tx, &v)
+        })
     }
 }
 
@@ -1036,10 +1046,18 @@ fn validate_plan_inner(
     p: &CandidateActionPlanV3,
     check_accounting: bool,
 ) -> Result<(), LifecycleError> {
+    validate_plan_read(tx,p,check_accounting,&ReadValidation::new(tx))
+}
+
+fn validate_plan_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,check_accounting:bool,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
+    read.prove(tx,encode(&("plan",p,check_accounting))?,|| validate_plan_body(tx,p,check_accounting,read))
+}
+
+fn validate_plan_body(tx:&Transaction<'_>,p:&CandidateActionPlanV3,check_accounting:bool,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
     if p.action == Action::Security {
-        inference::security::validate(tx, p)?;
+        inference::security::validate_read(tx, p,read)?;
         return if check_accounting {
-            validate_accounting(tx, p)
+            validate_accounting_read(tx, p,read)
         } else {
             Ok(())
         };
@@ -1106,7 +1124,7 @@ fn validate_plan_inner(
     }
     warm::validate_specs(p)?;
     if p.action != Action::Initialize {
-        warm::prior(tx, p)?;
+        warm::prior_read(tx, p,read)?;
     }
     let mut row: (String,String,i64,i64,String,String,i64,String) = tx.query_row("SELECT deployment_id,session_id,revision,generation,action,state,deadline_ms,plan_json FROM lifecycle_runs WHERE operation_id=?1",[&s.operation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
     let handoff = crate::lifecycle::candidate_handoff_states(tx, &s.run_id, &s.operation_id)?;
@@ -1299,7 +1317,7 @@ fn validate_plan_inner(
                     return Err(bad());
                 }
                 if check_accounting {
-                    validate_accounting(tx, p)?;
+                    validate_accounting_read(tx, p,read)?;
                 }
                 execution = Some(anchor);
             }
@@ -1371,7 +1389,7 @@ fn validate_plan_inner(
         )?;
     }
     if handoff.is_some() && check_accounting {
-        validate_accounting(tx, p)?;
+        validate_accounting_read(tx, p,read)?;
     }
     let associated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM qualification_case_actions WHERE run_id=?1 AND case_id=?2 AND operation_id=?3 AND step_id=?4)",params![s.run_id,p.case_id,s.operation_id,s.parent_step_id],|r|r.get(0))?;
     if !associated {

@@ -88,7 +88,7 @@ Transport buffering and shutdown remain the listener owner's responsibility.
 
 Existing event coverage includes managed configuration acceptance, candidate run
 acceptance, initialize arm/accept, selected qualification/launch/ready/park/cleanup
-transitions, qualified initialization acceptance/arm/owned launch/Ready commit,
+transitions, qualified initialization acceptance/arm/owned launch/Ready commit/uncertainty,
 coordinator session start and host resource/qualification policy
 changes. This is not a complete lifecycle audit stream: full visible-transaction
 writer coverage remains parent Task 3 work. The transport does not fill those gaps.

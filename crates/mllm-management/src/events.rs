@@ -1,9 +1,9 @@
 //! Bounded durable replay; event notifications are not required for continuity.
-use crate::{error, AppState, StoreSnapshotSource};
+use crate::{AppState, StoreSnapshotSource, error};
 use axum::{
     extract::{Request, State},
     http::StatusCode,
-    response::{sse::Event, IntoResponse, Response, Sse},
+    response::{IntoResponse, Response, Sse, sse::Event},
 };
 use mllm_store::events::{EventPage, EventReadError, ManagementEvent};
 use serde_json::{Map, Value};
@@ -428,7 +428,8 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         | "qualified_initialize_accepted"
         | "qualified_initialize_armed"
         | "qualified_owned_launch_associated"
-        | "qualified_ready_committed" => &[
+        | "qualified_ready_committed"
+        | "qualified_initialize_uncertain" => &[
             "transition",
             "operation_id",
             "deployment_id",
@@ -446,6 +447,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         "qualified_initialize_armed" => Some("armed"),
         "qualified_owned_launch_associated" => Some("owned_launch_associated"),
         "qualified_ready_committed" => Some("ready"),
+        "qualified_initialize_uncertain" => Some("uncertain"),
         _ => None,
     };
     if let Some(transition) = qualified_transition {

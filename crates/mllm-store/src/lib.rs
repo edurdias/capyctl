@@ -11,6 +11,7 @@ pub mod managed_configuration;
 pub mod migrations;
 pub mod qualification_policy;
 pub mod qualification;
+pub mod ordinary_lifecycle;
 pub mod resource_ledger;
 pub mod resource_policy;
 pub mod schema;

@@ -34,7 +34,13 @@ pub(in super::super) fn baseline(
     tx: &Transaction<'_>,
     p: &CandidateActionPlanV3,
 ) -> Result<(), LifecycleError> {
-    let v = immutable_anchor(tx, &p.scope.parent_step_id)?;
+    baseline_read(tx,p,&ReadValidation::new(tx))
+}
+pub(in super::super) fn baseline_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
+    read.prove(tx,encode(&("baseline",p))?,|| baseline_body(tx,p,read))
+}
+fn baseline_body(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
+    let v = anchor_context_read(tx, &p.scope.parent_step_id,false,read)?;
     if v.state != "completed" {
         return Err(LifecycleError::Conflict);
     }
@@ -50,7 +56,7 @@ pub(in super::super) fn baseline(
         for item in 0..case.count() {
             let op:Option<String>=tx.query_row("SELECT request_operation_id FROM qualification_request_attempts WHERE run_id=?1 AND case_id=?2 AND item_ordinal=?3 AND subcheck_id=''",params![p.scope.run_id,case.id(),item],|r|r.get(0)).optional()?;
             let (_, a) = load_attempt(tx, &op.ok_or(LifecycleError::Conflict)?)?;
-            if !result(tx, p, &a)?.is_some_and(|e| e.passes()) {
+            if !result_read(tx, p, &a,read)?.is_some_and(|e| e.passes()) {
                 return Err(LifecycleError::Conflict);
             }
         }
@@ -395,6 +401,9 @@ fn result(
     p: &CandidateActionPlanV3,
     a: &RequestAttemptV3,
 ) -> Result<Option<MarkerEvidence>, LifecycleError> {
+    result_read(tx,p,a,&ReadValidation::new(tx))
+}
+fn result_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,a:&RequestAttemptV3,read:&ReadValidation<'_, '_>)->Result<Option<MarkerEvidence>,LifecycleError> {
     let row:Option<(String,u64)>=tx.query_row("SELECT evidence_json,committed_epoch FROM qualification_request_results WHERE request_operation_id=?1",[&a.request_operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((raw, epoch)) = row else {
         return Ok(None);
@@ -410,7 +419,7 @@ fn result(
         [&a.request_operation_id],
         |r| r.get(0),
     )?;
-    let owned = warm::owned(tx, p)?;
+    let owned = warm::owned_read(tx, p,read)?;
     let cleanup_resolved = e.terminal == Terminal::Uncertain && !lease && state == "failed";
     if cleanup_resolved {
         let cold = warm::cold(tx, &p.scope.run_id)?;

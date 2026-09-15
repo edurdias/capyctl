@@ -11,6 +11,12 @@ use mllm_store::candidate_creation::progression::CandidateDispatchResult;
 use mllm_store::{candidate_creation::initialize::ArmResult, Store};
 use serde_json::{json, Value};
 
+#[path = "qualification_support/ordinary_initialize.rs"]
+mod ordinary_initialize;
+
+#[path = "qualification_support/worker_store.rs"]
+mod worker_store;
+
 fn marker_body(f: &Fixture, marker: &str, stream: bool) -> String {
     json!({"model":format!("candidate-{}", f.created.deployment_id()),"messages":[{"role":"user","content":format!("Repeat exactly: {marker}")}],"temperature":0,"max_tokens":16,"stream":stream}).to_string()
 }

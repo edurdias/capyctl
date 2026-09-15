@@ -69,7 +69,7 @@ pub(crate) fn decode(json: &str) -> Result<PhaseFootprint, ResourceStoreError> {
     Ok(footprint)
 }
 
-fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
+pub(crate) fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
     validate_footprint(footprint)?;
     let phase = match footprint.phase {
         ResourcePhase::Cold => "cold",

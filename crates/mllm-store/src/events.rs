@@ -60,6 +60,15 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
+    QualifiedLifecycleRecorded {
+        transition: QualifiedLifecycleTransition,
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        step_id: EventOperationId,
+        session_epoch: i64,
+        committed_epoch: Option<u64>,
+    },
+    #[serde(rename = "1")]
     ManagedConfigurationAccepted {
         operation_id: EventOperationId,
         deployment_id: EventOperationId,
@@ -131,6 +140,16 @@ pub(crate) enum EventMetadata {
         session_epoch: i64,
     },
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QualifiedLifecycleTransition {
+    Accepted,
+    Armed,
+    OwnedLaunchAssociated,
+    Ready,
+    Uncertain,
+}
 #[derive(Clone)]
 pub(crate) struct EventOperationId(String);
 #[derive(Serialize)]
@@ -181,6 +200,13 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::QualifiedLifecycleRecorded { transition, .. } => match transition {
+                QualifiedLifecycleTransition::Accepted => "qualified_initialize_accepted",
+                QualifiedLifecycleTransition::Armed => "qualified_initialize_armed",
+                QualifiedLifecycleTransition::OwnedLaunchAssociated => "qualified_owned_launch_associated",
+                QualifiedLifecycleTransition::Ready => "qualified_ready_committed",
+                QualifiedLifecycleTransition::Uncertain => "qualified_initialize_uncertain",
+            },
             Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
             Self::CandidateLifecycleRecorded { transition, .. } => transition.kind(),
             Self::CandidateInitializeArmed { .. } => "candidate_initialize_armed",
@@ -195,6 +221,7 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
+            Self::QualifiedLifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CandidateLifecycleRecorded {
                 operation_id,

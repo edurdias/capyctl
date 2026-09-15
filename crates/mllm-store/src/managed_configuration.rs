@@ -299,6 +299,42 @@ fn ensure_routes(tx: &Transaction<'_>, name: &str, routes: &[String], own: &str)
     Ok(())
 }
 
+/// Link a frozen revision to its actual acceptance receipt without re-resolving
+/// mutable profiles. Ordinary lifecycle authority must validate all settings,
+/// including fields deliberately excluded from qualification identity.
+pub(crate) fn validate_revision_history(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    revision: i64,
+    effective_json: &str,
+) -> Result<()> {
+    let mut statement=tx.prepare("SELECT c.response_json,c.request_hash,c.command_scope,c.operation_id,o.kind FROM command_receipts c JOIN operations o ON o.id=c.operation_id WHERE o.deployment_id=?1 AND o.kind IN ('managed_configuration_create','managed_configuration_replace') AND o.state='succeeded' AND o.error_code IS NULL AND COALESCE(json_extract(c.response_json,'$.receipt.revision'),json_extract(c.response_json,'$.revision'))=?2")?;
+    let rows=statement.query_map(params![deployment,revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let [(body,hash,scope,operation,kind)]=rows.as_slice() else { return Err(ManagedConfigurationError::CorruptStoredData); };
+    if body.len()>MAX_BYTES || effective_json.len()>MAX_BYTES { return Err(ManagedConfigurationError::CorruptStoredData); }
+    let envelope:Value=serde_json::from_str(body).map_err(|_|ManagedConfigurationError::CorruptStoredData)?;
+    let (receipt,command_fingerprint)=if envelope["version"]==2 {
+        let stored:StoredReceiptV2=serde_json::from_str(body).map_err(|_|ManagedConfigurationError::CorruptStoredData)?;
+        (stored.receipt,Some(stored.command_fingerprint))
+    } else {
+        (serde_json::from_str::<ManagedConfigurationReceipt>(body).map_err(|_|ManagedConfigurationError::CorruptStoredData)?,None)
+    };
+    let create=kind=="managed_configuration_create";
+    let expected_scope=if create { "POST /management/v1/deployments/stopped".into() } else { format!("PUT /management/v1/deployments/{deployment}/stopped-configuration") };
+    if receipt.version!=1 || receipt.deployment_id!=deployment || receipt.revision!=revision || receipt.operation_id!=*operation || receipt.generation<1 || receipt.accepted_at_ms<0 || receipt.resource_policy_revision<1 || *scope!=expected_scope || (create && revision!=1) || (!create && revision<=1) || command_fingerprint.as_ref().is_some_and(|fingerprint| fingerprint.len()!=64 || !fingerprint.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))) {
+        return Err(ManagedConfigurationError::CorruptStoredData);
+    }
+    let effective:Value=serde_json::from_str(effective_json).map_err(|_|ManagedConfigurationError::CorruptStoredData)?;
+    let mut input=json!({"version":1,"scope":scope,"expected_revision":if create {None} else {Some(revision-1)},"effective":effective});
+    if let Some(fingerprint)=command_fingerprint {
+        input["version"]=json!(2);
+        input["command_fingerprint"]=json!(fingerprint);
+    }
+    let computed=format!("{:x}",Sha256::digest(serde_json::to_vec(&input).map_err(|_|ManagedConfigurationError::CorruptStoredData)?));
+    if computed!=*hash { return Err(ManagedConfigurationError::CorruptStoredData); }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay(
     tx: &Transaction<'_>,

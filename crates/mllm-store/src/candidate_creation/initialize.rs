@@ -154,6 +154,11 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         session(&tx, s)?;
+        if crate::ordinary_lifecycle::is_ordinary(&tx, id)? {
+            let result = crate::ordinary_lifecycle::arm(&tx, s, id, context)?;
+            tx.commit()?;
+            return Ok(result);
+        }
         let (snapshot, _, read) = load_execution_step(&tx, id)?;
         current(&tx, s, &snapshot, &read)?;
         if matches!(read.state.as_str(), "armed" | "uncertain") && read.execution.is_some() {

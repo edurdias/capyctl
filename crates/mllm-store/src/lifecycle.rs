@@ -451,7 +451,7 @@ pub(crate) struct PreparedBinding {
 }
 
 impl PreparedBinding {
-    fn prepare_v1(request: &ReserveBinding) -> Result<Self, LifecycleError> {
+    pub(crate) fn prepare_v1(request: &ReserveBinding) -> Result<Self, LifecycleError> {
         if !valid_text(&request.id)
             || !valid_text(&request.fence.deployment_id)
             || request.fence.revision < 1

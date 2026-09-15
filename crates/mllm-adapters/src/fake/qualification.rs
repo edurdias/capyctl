@@ -379,7 +379,14 @@ impl QualificationState {
         command: &RuntimeCommand,
     ) -> Result<EffectObservation, RuntimeError> {
         let c = &command.context;
-        if c.completion_target.is_some() || c.grant_id.is_none() || c.issued_at_ms >= c.deadline_ms
+        // Ordinary cold initialization explicitly includes a model-usability
+        // probe. Candidate child effects retain their separate probe protocol.
+        // This dispatch shape recognizes scope; catalog authority stays in Store.
+        let ordinary = command.action == RuntimeAction::Initialize
+            && c.token.qualification_id.strip_prefix("qualified:").is_some_and(|id| id.len()==26 && id.as_bytes()[0]<=b'7' && id.bytes().all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b)))
+            && matches!(c.identities, mllm_domain::completion::ExecutionIdentities::OwnedLaunch)
+            && c.completion_target.as_ref().is_some_and(|p| p.phase == mllm_domain::resources::ResourcePhase::Ready && mllm_domain::resources::validate_footprint(p).is_ok());
+        if (c.completion_target.is_some() && !ordinary) || c.grant_id.is_none() || c.issued_at_ms >= c.deadline_ms
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -397,7 +404,7 @@ impl QualificationState {
         } else if command.action != RuntimeAction::Initialize {
             return Err(RuntimeError::Missing);
         }
-        let facts = match command.action {
+        let mut facts = match command.action {
             RuntimeAction::Initialize if self.binding.is_none() => {
                 if !matches!(
                     c.launch_settings,
@@ -458,6 +465,15 @@ impl QualificationState {
             }
             _ => return Err(RuntimeError::Unsupported),
         };
+        if ordinary {
+            let model = format!("candidate-{}", c.token.deployment_id);
+            let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: MLLM_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
+            let result = self.forward(&body).map_err(|_| RuntimeError::Uncertain("ordinary Fake readiness probe failed".into()))?;
+            if result["model"] != model || result["choices"][0]["message"]["content"] != "MLLM_READY_13" || result["choices"][0]["finish_reason"] != "stop" {
+                return Err(RuntimeError::Uncertain("ordinary Fake readiness probe failed".into()));
+            }
+            facts.push(Milestone::ModelUsable);
+        }
         Ok(EffectObservation {
             token: c.token.clone(),
             binding_id: c.binding_id.clone(),
@@ -505,6 +521,29 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn qualified_initialize_proves_ready_with_real_fake_probe() {
+        use mllm_domain::resources::{Allocation, PhaseFootprint, ResourcePhase};
+        let mut c = command(RuntimeAction::Initialize, "ordinary");
+        c.context.token.qualification_id = "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+        c.context.completion_target = Some(PhaseFootprint { phase: ResourcePhase::Ready, allocations: vec![Allocation { domain:"unified".into(),bytes:8,host_kv_bytes:1 }], devices:vec![] });
+        let mut state = QualificationState::default();
+        let result = state.execute(&c).unwrap();
+        assert_eq!(result.facts, vec![Milestone::AllocationsRestored, Milestone::WeightsUsable, Milestone::CacheValid, Milestone::ModelUsable]);
+        assert_eq!(state.activity(), (1,1,1));
+        assert!(state.execute(&c).is_err());
+        for fault in [QualificationFault::WrongProbeOutput, QualificationFault::LostProbeReply, QualificationFault::FailedProbe, QualificationFault::MissingProbeFinish] {
+            let mut state = QualificationState { fault:Some(fault),..Default::default() };
+            assert!(state.execute(&c).is_err());
+            assert!(state.allocations);
+            assert!(state.alive);
+        }
+        for id in ["candidate:run", "qualified:ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAI"] {
+            c.context.token.qualification_id=id.into();
+            assert!(QualificationState::default().execute(&c).is_err());
+        }
+    }
+
     #[test]
     fn persisted_fake_restore_does_not_reload_invalidate_or_probe() {
         let mut state = QualificationState::default();

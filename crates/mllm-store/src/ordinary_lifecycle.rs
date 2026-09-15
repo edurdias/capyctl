@@ -1,0 +1,786 @@
+//! Qualified Fake cold initialization from a frozen managed configuration.
+pub mod worker;
+use crate::candidate_creation::initialize::ArmResult;
+use crate::candidate_creation::progression::catalog::qualified_effective;
+use crate::lifecycle::completion::{
+    canonical_members, check_session, completion_value, decode, encode, fresh, identity_dtos,
+    members,
+};
+use crate::resource_ledger::{self, GrantRequest, reserve_increase_in_transaction};
+use crate::resource_policy::{ResourcePolicySnapshot, read_singleton_policy};
+use crate::{
+    dispatch::CoordinatorSession,
+    lifecycle::{
+        BindingDto, DeploymentFence, IdentityDto, LifecycleError, PreparedBinding, ReserveBinding,
+        insert_prepared_binding,
+    },
+};
+use mllm_config::effective::{EffectiveDeployment, decode_effective_snapshot};
+use mllm_config::resource_controls::ResourceContext;
+use mllm_domain::completion::{
+    CompletionEvidence, CompletionExpectation, ExecutionIdentities, OwnedLaunchReceipt,
+    StepExecutionContext, TransitionToken, verify_completion,
+};
+use mllm_domain::resources::{
+    Allocation, DeviceClaim, MemoryLimit, PhaseFootprint, ResourcePhase, Sharing,
+};
+use mllm_scheduler::residency::AdmissionContext;
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    version: u8,
+    kind: Kind,
+    operation_id: String,
+    step_id: String,
+    deployment_id: String,
+    revision: i64,
+    generation: i64,
+    session_id: String,
+    binding_id: String,
+    incarnation: String,
+    binding_json: String,
+    effective_json: String,
+    accepted_at_ms: i64,
+    deadline_ms: i64,
+    execution: Option<Execution>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Kind {
+    QualifiedInitialize,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Execution {
+    issued_at_ms: i64,
+    grant_id: String,
+    expected_epoch: u64,
+    policy_revision: i64,
+}
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Association {
+    version: u8,
+    kind: String,
+    step_id: String,
+    session_id: String,
+    binding_id: String,
+    incarnation: String,
+    identities: Vec<IdentityDto>,
+    observed_at_ms: i64,
+    receipt: String,
+}
+
+fn resource(error: impl std::fmt::Display) -> LifecycleError {
+    LifecycleError::Rejected(error.to_string())
+}
+fn one(n: usize) -> Result<(), LifecycleError> {
+    if n == 1 {
+        Ok(())
+    } else {
+        Err(LifecycleError::Conflict)
+    }
+}
+impl Plan {
+    fn fence(&self) -> DeploymentFence {
+        DeploymentFence {
+            deployment_id: self.deployment_id.clone(),
+            revision: self.revision,
+            generation: self.generation,
+        }
+    }
+    fn context(
+        &self,
+        effective: &EffectiveDeployment,
+    ) -> Result<StepExecutionContext, LifecycleError> {
+        let execution = self.execution.as_ref().ok_or(LifecycleError::Conflict)?;
+        Ok(StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: self.deployment_id.clone(),
+                revision: self.revision,
+                generation: self.generation,
+                operation_id: self.operation_id.clone(),
+                step_id: self.step_id.clone(),
+                qualification_id: effective.profile.qualification_id.clone(),
+            },
+            binding_id: self.binding_id.clone(),
+            incarnation: self.incarnation.clone(),
+            issued_at_ms: execution.issued_at_ms,
+            deadline_ms: self.deadline_ms,
+            identities: ExecutionIdentities::OwnedLaunch,
+            completion_target: Some(phase(&effective.resources.ready, ResourcePhase::Ready)),
+            grant_id: Some(execution.grant_id.clone()),
+            launch_settings: Some(effective.profile.launch_settings.clone()),
+        })
+    }
+}
+fn phase(p: &mllm_config::effective::PhaseFootprint, phase: ResourcePhase) -> PhaseFootprint {
+    PhaseFootprint {
+        phase,
+        allocations: p
+            .allocations
+            .iter()
+            .map(|a| Allocation {
+                domain: a.domain.clone(),
+                bytes: a.bytes,
+                host_kv_bytes: a.host_kv_bytes,
+            })
+            .collect(),
+        devices: p
+            .devices
+            .iter()
+            .map(|d| DeviceClaim {
+                device: d.id.clone(),
+                sharing: if d.sharing == mllm_config::effective::Sharing::Shared {
+                    Sharing::Shared
+                } else {
+                    Sharing::Exclusive
+                },
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn is_ordinary(tx: &Transaction<'_>, id: &str) -> Result<bool, LifecycleError> {
+    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='qualified_initialize')", [id], |r| r.get(0))?)
+}
+
+fn effective(
+    tx: &Transaction<'_>,
+    fence: &DeploymentFence,
+) -> Result<(String, EffectiveDeployment), LifecycleError> {
+    let row: Option<(String,String)> = tx.query_row("SELECT effective_json,fingerprint FROM effective_revisions WHERE deployment_id=?1 AND revision=?2", params![fence.deployment_id, fence.revision], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (raw, fingerprint) = row.ok_or(LifecycleError::Conflict)?;
+    crate::managed_configuration::validate_revision_history(
+        tx,
+        &fence.deployment_id,
+        fence.revision,
+        &raw,
+    )
+    .map_err(|_| LifecycleError::CorruptStoredData)?;
+    let effective =
+        decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+    let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='managed_configuration_create' AND state='succeeded') AND NOT EXISTS(SELECT 1 FROM qualification_runs WHERE deployment_id=?1)", [&fence.deployment_id], |r| r.get(0))?;
+    if !managed || fingerprint != effective.qualification_fingerprint {
+        return Err(LifecycleError::Conflict);
+    }
+    let consistent: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND name=?3 AND route_model_id IS NULL)",
+        params![fence.deployment_id,fence.revision,effective.name],|r|r.get(0),
+    )?;
+    let mut routes =
+        tx.prepare("SELECT route FROM deployment_routes WHERE deployment_id=?1 ORDER BY route")?;
+    let routes = routes
+        .query_map([&fence.deployment_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !consistent || routes != effective.routes {
+        return Err(LifecycleError::Conflict);
+    }
+    Ok((raw, effective))
+}
+
+fn policy(
+    tx: &Transaction<'_>,
+    effective: &EffectiveDeployment,
+) -> Result<ResourcePolicySnapshot, LifecycleError> {
+    let policy = read_singleton_policy(tx, &effective.host.name)
+        .map_err(resource)?
+        .ok_or(LifecycleError::Conflict)?;
+    if policy.context != ResourceContext::from_host(&effective.host) {
+        return Err(LifecycleError::Conflict);
+    }
+    policy
+        .controls
+        .validate(&policy.context)
+        .map_err(resource)?;
+    for selected in &effective.selected_devices {
+        let sharing = policy
+            .controls
+            .device_sharing_overrides
+            .get(&selected.id)
+            .ok_or(LifecycleError::Conflict)?;
+        if selected.sharing == mllm_config::effective::Sharing::Shared
+            && (*sharing != selected.sharing || policy.controls.device_sharing != selected.sharing)
+        {
+            return Err(LifecycleError::Conflict);
+        }
+    }
+    Ok(policy)
+}
+
+fn current(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    p: &Plan,
+    completed: bool,
+) -> Result<(), LifecycleError> {
+    check_session(tx, s)?;
+    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='ready' AND suspended=0 AND admission_enabled=1)", params![p.deployment_id,p.revision,p.generation], |r|r.get(0))?;
+    let claims: bool = tx.query_row("SELECT COUNT(*)=1 AND COALESCE(SUM(deployment_id=?2 AND revision=?3 AND generation=?4),0)=1 FROM lifecycle_claims WHERE operation_id=?1",params![p.operation_id,p.deployment_id,p.revision,p.generation],|r|r.get(0))?;
+    if !valid || p.session_id != s.id() || (!completed && !claims) {
+        return Err(LifecycleError::Stale);
+    }
+    Ok(())
+}
+
+fn load(
+    tx: &Transaction<'_>,
+    id: &str,
+) -> Result<(Plan, EffectiveDeployment, String), LifecycleError> {
+    if !is_ordinary(tx, id)? {
+        return Err(LifecycleError::Unsupported);
+    }
+    let (raw, state): (String, String) = tx.query_row(
+        "SELECT step_json,state FROM lifecycle_steps WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let p: Plan = decode(&raw)?;
+    if p.version != 1
+        || p.step_id != id
+        || p.accepted_at_ms < 0
+        || p.deadline_ms <= p.accepted_at_ms
+    {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    for id in [
+        &p.operation_id,
+        &p.step_id,
+        &p.deployment_id,
+        &p.binding_id,
+        &p.incarnation,
+        &p.session_id,
+    ] {
+        if ulid::Ulid::from_string(id).is_err() {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+    }
+    let (effective_json, e) = effective(tx, &p.fence())?;
+    if effective_json != p.effective_json {
+        return Err(LifecycleError::Conflict);
+    }
+    let catalog = qualified_effective(tx, &e, &p.deployment_id)?;
+    let binding: BindingDto = decode(&p.binding_json)?;
+    if binding.version != 1
+        || binding.qualification_id != catalog.qualification_id()
+        || binding.payload != catalog.binding_payload()?
+        || binding.credential_ref
+            != e.profile
+                .security
+                .credential_ref
+                .clone()
+                .ok_or(LifecycleError::Conflict)?
+    {
+        return Err(LifecycleError::Conflict);
+    }
+    let endpoint: std::net::SocketAddr = binding
+        .endpoint
+        .parse()
+        .map_err(|_| LifecycleError::CorruptStoredData)?;
+    if endpoint.ip() != std::net::Ipv4Addr::LOCALHOST
+        || !(e.host.endpoint_port_range.start..=e.host.endpoint_port_range.end)
+            .contains(&endpoint.port())
+    {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    let run = crate::lifecycle::validate_candidate_initialize_run(
+        tx,
+        &p.fence(),
+        &p.operation_id,
+        &p.session_id,
+        p.deadline_ms,
+    )?;
+    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND operation_id=?2 AND deployment_id=?3 AND binding_id=?4 AND session_id=?5 AND ordinal=0) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8 AND state=?9) AND EXISTS(SELECT 1 FROM endpoint_leases WHERE binding_id=?4 AND host='127.0.0.1' AND port=?10) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND (SELECT COUNT(*) FROM endpoint_leases WHERE binding_id=?4)=1 AND (SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?3 AND state!='released')=1",params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,if state=="planned" {"reserved"} else if state=="completed" {"live"} else {"uncertain"},endpoint.port()],|r|r.get(0))?;
+    let expected_operation = match state.as_str() {
+        "planned" if run == "queued" => "pending",
+        "armed" if run == "running" => "running",
+        "uncertain" if run == "uncertain" => "running",
+        "completed" if run == "succeeded" => "succeeded",
+        _ => return Err(LifecycleError::Conflict),
+    };
+    let operation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind='qualified_initialize' AND state=?3 AND error_code IS NULL)",params![p.operation_id,p.deployment_id,expected_operation],|r|r.get(0))?;
+    if !valid || !operation {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
+    match &p.execution {
+        None if state == "planned" => {
+            let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?2 AND grant_id IS NOT NULL)",params![p.operation_id,id],|r|r.get(0))?;
+            if effects || ledger.owners.contains_key(&p.deployment_id) {
+                return Err(LifecycleError::Conflict);
+            }
+        }
+        Some(execution) if state != "planned" => {
+            if execution.issued_at_ms < p.accepted_at_ms
+                || execution.issued_at_ms >= p.deadline_ms
+                || execution.policy_revision < 1
+            {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            let frozen = resource_ledger::encode(&phase(&e.resources.cold, ResourcePhase::Cold))
+                .map_err(resource)?;
+            let identity = encode(&(
+                &p.deployment_id,
+                &p.operation_id,
+                p.revision,
+                p.generation,
+                execution.expected_epoch,
+                &frozen,
+            ))?;
+            let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE id=?1 AND deployment_id=?2 AND operation_id=?3 AND request_json=?4 AND committed_epoch=?5) AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?6 AND grant_id=?1) AND (SELECT COUNT(*) FROM resource_grants WHERE operation_id=?3)=1", params![execution.grant_id,p.deployment_id,p.operation_id,identity,execution.expected_epoch.checked_add(1).ok_or(LifecycleError::CorruptStoredData)?,id],|r|r.get(0))?;
+            let expected = if state == "completed" {
+                phase(&e.resources.ready, ResourcePhase::Ready)
+            } else {
+                phase(&e.resources.cold, ResourcePhase::Cold)
+            };
+            if !exact
+                || ledger.epoch <= execution.expected_epoch
+                || ledger.owners.get(&p.deployment_id) != Some(&expected)
+            {
+                return Err(LifecycleError::Conflict);
+            }
+        }
+        _ => return Err(LifecycleError::CorruptStoredData),
+    }
+    Ok((p, e, state))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedStart {
+    pub operation_id: String,
+    pub step_id: String,
+    pub binding_id: String,
+    pub joined: bool,
+}
+
+impl crate::Store {
+    /// Clock-aware administrative start; only an actual Qualified Fake catalog
+    /// and its verified source cleanup authorize a fresh managed binding.
+    pub fn accept_qualified_start(
+        &self,
+        s: &CoordinatorSession,
+        f: &DeploymentFence,
+        now: i64,
+        deadline: i64,
+    ) -> Result<QualifiedStart, LifecycleError> {
+        if now < 0 || deadline <= now {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, s)?;
+        let existing: Option<String> = tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=?1 AND r.revision=?2 AND r.generation=?3 AND r.state IN ('queued','running','uncertain') AND o.kind='qualified_initialize'",params![f.deployment_id,f.revision,f.generation],|r|r.get(0)).optional()?;
+        if let Some(id) = existing {
+            let (p, _, _) = load(&tx, &id)?;
+            current(&tx, s, &p, false)?;
+            return Ok(QualifiedStart {
+                operation_id: p.operation_id,
+                step_id: p.step_id,
+                binding_id: p.binding_id,
+                joined: true,
+            });
+        }
+        let (raw, e) = effective(&tx, f)?;
+        let catalog = qualified_effective(&tx, &e, &f.deployment_id)?;
+        policy(&tx, &e)?;
+        if deadline
+            .checked_sub(now)
+            .is_none_or(|duration| duration > e.request_deadline_ms)
+        {
+            return Err(LifecycleError::Invalid);
+        }
+        let stopped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND name=?4 AND kind='model' AND desired_state='stopped' AND observed_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0 AND suspended=0) AND NOT EXISTS(SELECT 1 FROM runtime_bindings WHERE deployment_id=?1 AND state!='released') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1) AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1) AND NOT EXISTS(SELECT 1 FROM resource_owners WHERE owner_id=?1) AND NOT EXISTS(SELECT 1 FROM lifecycle_runs WHERE deployment_id=?1 AND state NOT IN ('succeeded','failed'))", params![f.deployment_id,f.revision,f.generation,e.name],|r|r.get(0))?;
+        if !stopped {
+            return Err(LifecycleError::Conflict);
+        }
+        let operation_id = ulid::Ulid::new().to_string();
+        let step_id = ulid::Ulid::new().to_string();
+        let binding_id = ulid::Ulid::new().to_string();
+        let incarnation = ulid::Ulid::new().to_string();
+        let credential_ref = e
+            .profile
+            .security
+            .credential_ref
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(LifecycleError::Conflict)?;
+        let payload = catalog.binding_payload()?;
+        let mut reserved = None;
+        for port in e.host.endpoint_port_range.start..=e.host.endpoint_port_range.end {
+            let leased: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM endpoint_leases WHERE host='127.0.0.1' AND port=?1)",
+                [port],
+                |r| r.get(0),
+            )?;
+            if leased {
+                continue;
+            }
+            let request = ReserveBinding {
+                id: binding_id.clone(),
+                fence: f.clone(),
+                incarnation: incarnation.clone(),
+                qualification_id: catalog.qualification_id().into(),
+                ownership: "managed".into(),
+                endpoint_host: "127.0.0.1".into(),
+                endpoint_port: port,
+                credential_ref: credential_ref.clone(),
+                binding_payload: payload.clone(),
+            };
+            match PreparedBinding::prepare_v1(&request) {
+                Ok(binding) => {
+                    insert_prepared_binding(&tx, s, &binding)?;
+                    reserved = Some(binding);
+                    break;
+                }
+                Err(LifecycleError::Conflict) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let _reservation = reserved.ok_or(LifecycleError::Conflict)?;
+        let binding_json = tx.query_row(
+            "SELECT binding_json FROM runtime_bindings WHERE id=?1",
+            [&binding_id],
+            |r| r.get(0),
+        )?;
+        let p = Plan {
+            version: 1,
+            kind: Kind::QualifiedInitialize,
+            operation_id: operation_id.clone(),
+            step_id: step_id.clone(),
+            deployment_id: f.deployment_id.clone(),
+            revision: f.revision,
+            generation: f.generation,
+            session_id: s.id().into(),
+            binding_id: binding_id.clone(),
+            incarnation,
+            binding_json,
+            effective_json: raw,
+            accepted_at_ms: now,
+            deadline_ms: deadline,
+            execution: None,
+        };
+        tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'qualified_initialize','pending')",params![operation_id,f.deployment_id])?;
+        crate::lifecycle::insert_candidate_initialize_run(&tx, s, f, &operation_id, deadline)?;
+        tx.execute("INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) VALUES(?1,?2,?3,?4)",params![f.deployment_id,operation_id,f.revision,f.generation])?;
+        tx.execute("INSERT INTO lifecycle_steps(id,operation_id,ordinal,deployment_id,binding_id,session_id,state,step_json) VALUES(?1,?2,0,?3,?4,?5,'planned',?6)",params![step_id,operation_id,f.deployment_id,binding_id,s.id(),encode(&p)?])?;
+        tx.execute(
+            "UPDATE deployments SET desired_state='ready',admission_enabled=1 WHERE id=?1",
+            [&f.deployment_id],
+        )?;
+        event(&tx, s, &p, Transition::Accepted, None)?;
+        tx.commit()?;
+        Ok(QualifiedStart {
+            operation_id,
+            step_id,
+            binding_id,
+            joined: false,
+        })
+    }
+    /// Reading or cloning context never authorizes replay; only ArmResult::New does.
+    pub fn qualified_initialize_execution(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+    ) -> Result<StepExecutionContext, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let (p, e, state) = load(&tx, id)?;
+        current(&tx, s, &p, state == "completed")?;
+        p.context(&e)
+    }
+}
+
+pub(crate) fn arm(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    id: &str,
+    context: AdmissionContext<'_>,
+) -> Result<ArmResult, LifecycleError> {
+    let (mut p, e, state) = load(tx, id)?;
+    current(tx, s, &p, false)?;
+    if matches!(state.as_str(), "armed" | "uncertain") {
+        return Ok(ArmResult::AlreadyRecorded);
+    }
+    if state != "planned"
+        || context.now_ms < p.accepted_at_ms
+        || context.now_ms >= p.deadline_ms
+        || !context.resident_floors.is_empty()
+    {
+        return Err(LifecycleError::Conflict);
+    }
+    let policy = policy(tx, &e)?;
+    let limits: Vec<_> = policy
+        .controls
+        .domains
+        .iter()
+        .map(|(id, d)| MemoryLimit {
+            domain: id.clone(),
+            managed_bytes: d.managed_limit,
+            free_reserve_bytes: d.free_reserve,
+            host_kv_bytes: d.host_kv_limit,
+            parked_bytes: d.parked_limit,
+        })
+        .collect();
+    let mut supplied = context.limits.to_vec();
+    supplied.sort_by(|a, b| a.domain.cmp(&b.domain));
+    if supplied != limits
+        || context.ttl_ms != policy.controls.observation_ttl_ms
+        || context.max_parked != policy.controls.max_parked as usize
+    {
+        return Err(LifecycleError::Conflict);
+    }
+    let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
+    let execution = Execution {
+        issued_at_ms: context.now_ms,
+        grant_id: ulid::Ulid::new().to_string(),
+        expected_epoch: ledger.epoch,
+        policy_revision: policy.revision,
+    };
+    reserve_increase_in_transaction(
+        tx,
+        &GrantRequest {
+            id: execution.grant_id.clone(),
+            deployment_id: p.deployment_id.clone(),
+            operation_id: p.operation_id.clone(),
+            revision: p.revision,
+            generation: p.generation,
+            expected_epoch: ledger.epoch,
+            next: phase(&e.resources.cold, ResourcePhase::Cold),
+        },
+        context,
+    )
+    .map_err(resource)?;
+    one(tx.execute(
+        "UPDATE runtime_bindings SET state='uncertain' WHERE id=?1 AND state='reserved'",
+        [&p.binding_id],
+    )?)?;
+    one(tx.execute(
+        "UPDATE operations SET state='running' WHERE id=?1 AND state='pending'",
+        [&p.operation_id],
+    )?)?;
+    one(tx.execute("UPDATE lifecycle_runs SET state='running' WHERE operation_id=?1 AND session_id=?2 AND state='queued'",params![p.operation_id,s.id()])?)?;
+    p.execution = Some(execution);
+    one(tx.execute("UPDATE lifecycle_steps SET state='armed',step_json=?2,grant_id=?3 WHERE id=?1 AND session_id=?4 AND state='planned' AND grant_id IS NULL",params![id,encode(&p)?,p.execution.as_ref().unwrap().grant_id,s.id()])?)?;
+    event(tx, s, &p, Transition::Armed, None)?;
+    Ok(ArmResult::New { step_id: id.into() })
+}
+
+fn association(tx: &Transaction<'_>, p: &Plan) -> Result<Option<Association>, LifecycleError> {
+    let raw: Option<String> = tx.query_row("SELECT association_json FROM owned_launch_associations WHERE step_id=?1 AND binding_id=?2 AND incarnation=?3",params![p.step_id,p.binding_id,p.incarnation],|r|r.get(0)).optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let a: Association = decode(&raw)?;
+    let stored: String = tx.query_row(
+        "SELECT identities_json FROM runtime_bindings WHERE id=?1",
+        [&p.binding_id],
+        |r| r.get(0),
+    )?;
+    let identities: Vec<IdentityDto> = decode(&stored)?;
+    if a.version != 1
+        || a.kind != "qualified_owned_launch"
+        || a.step_id != p.step_id
+        || a.session_id != p.session_id
+        || a.binding_id != p.binding_id
+        || a.incarnation != p.incarnation
+        || identities != a.identities
+    {
+        return Err(LifecycleError::Conflict);
+    }
+    canonical_members(&members(&a.identities)?)?;
+    crate::lifecycle::completion::nonempty_receipt(&a.receipt)?;
+    Ok(Some(a))
+}
+
+pub(crate) fn record_launch(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    id: &str,
+    r: &OwnedLaunchReceipt,
+    now: i64,
+) -> Result<(), LifecycleError> {
+    let (p, e, state) = load(tx, id)?;
+    current(tx, s, &p, state == "completed")?;
+    let context = p.context(&e)?;
+    crate::lifecycle::completion::nonempty_receipt(&r.receipt)?;
+    if r.binding_id != p.binding_id || r.incarnation != p.incarnation {
+        return Err(LifecycleError::Conflict);
+    }
+    let supplied = Association {
+        version: 1,
+        kind: "qualified_owned_launch".into(),
+        step_id: id.into(),
+        session_id: s.id().into(),
+        binding_id: r.binding_id.clone(),
+        incarnation: r.incarnation.clone(),
+        identities: identity_dtos(&canonical_members(&r.identities)?),
+        observed_at_ms: r.observed_at_ms,
+        receipt: r.receipt.clone(),
+    };
+    if let Some(old) = association(tx, &p)? {
+        return if old == supplied {
+            Ok(())
+        } else {
+            Err(LifecycleError::Conflict)
+        };
+    }
+    if state != "armed" {
+        return Err(LifecycleError::Conflict);
+    }
+    fresh(
+        context.issued_at_ms,
+        context.deadline_ms,
+        r.observed_at_ms,
+        now,
+        policy(tx, &e)?.controls.observation_ttl_ms,
+    )?;
+    let empty: bool = tx.query_row(
+        "SELECT identities_json='[]' FROM runtime_bindings WHERE id=?1",
+        [&p.binding_id],
+        |r| r.get(0),
+    )?;
+    if !empty {
+        return Err(LifecycleError::Conflict);
+    }
+    tx.execute("INSERT INTO owned_launch_associations(step_id,binding_id,incarnation,association_json) VALUES(?1,?2,?3,?4)",params![id,p.binding_id,p.incarnation,encode(&supplied)?])?;
+    tx.execute(
+        "UPDATE runtime_bindings SET identities_json=?2 WHERE id=?1",
+        params![p.binding_id, encode(&supplied.identities)?],
+    )?;
+    event(tx, s, &p, Transition::OwnedLaunchAssociated, None)
+}
+
+pub(crate) fn complete(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    id: &str,
+    evidence: &CompletionEvidence,
+    now: i64,
+    ttl: i64,
+) -> Result<(), LifecycleError> {
+    let (p, e, state) = load(tx, id)?;
+    current(tx, s, &p, state == "completed")?;
+    let association = association(tx, &p)?.ok_or(LifecycleError::Conflict)?;
+    let supplied = encode(&completion_value(evidence)?)?;
+    let prior: Option<(String, u64)> = tx
+        .query_row(
+            "SELECT evidence_json,committed_epoch FROM lifecycle_evidence WHERE step_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((old, epoch)) = prior {
+        let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
+        if state != "completed"
+            || old != supplied
+            || epoch > ledger.epoch
+            || epoch
+                <= p.execution
+                    .as_ref()
+                    .ok_or(LifecycleError::Conflict)?
+                    .expected_epoch
+                    + 1
+        {
+            return Err(LifecycleError::Conflict);
+        }
+        return Ok(());
+    }
+    if state != "armed" {
+        return Err(LifecycleError::Conflict);
+    }
+    let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE deployment_id=?1 AND id!=?2 AND state IN ('armed','uncertain'))",params![p.deployment_id,id],|r|r.get(0))?;
+    if pending {
+        return Err(LifecycleError::Conflict);
+    }
+    let policy = policy(tx, &e)?;
+    if ttl != policy.controls.observation_ttl_ms {
+        return Err(LifecycleError::Invalid);
+    }
+    let context = p.context(&e)?;
+    fresh(
+        context.issued_at_ms,
+        context.deadline_ms,
+        association.observed_at_ms,
+        now,
+        ttl,
+    )?;
+    verify_completion(
+        &CompletionExpectation {
+            token: context.token,
+            identities: members(&association.identities)?,
+            target: context.completion_target.ok_or(LifecycleError::Conflict)?,
+            issued_at_ms: context.issued_at_ms,
+            deadline_ms: context.deadline_ms,
+        },
+        evidence,
+        now,
+        ttl,
+    )
+    .map_err(resource)?;
+    let epoch = resource_ledger::advance_completion_epoch(tx)?;
+    one(tx.execute(
+        "UPDATE resource_owners SET footprint_json=?2 WHERE owner_id=?1",
+        params![
+            p.deployment_id,
+            resource_ledger::encode(&phase(&e.resources.ready, ResourcePhase::Ready))
+                .map_err(resource)?
+        ],
+    )?)?;
+    one(tx.execute(
+        "UPDATE runtime_bindings SET state='live' WHERE id=?1 AND state='uncertain'",
+        [&p.binding_id],
+    )?)?;
+    one(tx.execute("UPDATE deployments SET observed_state='ready',dispatch_enabled=1 WHERE id=?1 AND revision=?2 AND current_generation=?3 AND desired_state='ready' AND suspended=0",params![p.deployment_id,p.revision,p.generation])?)?;
+    one(tx.execute(
+        "UPDATE lifecycle_steps SET state='completed' WHERE id=?1 AND state='armed'",
+        [id],
+    )?)?;
+    one(tx.execute(
+        "UPDATE lifecycle_runs SET state='succeeded' WHERE operation_id=?1 AND state='running'",
+        [&p.operation_id],
+    )?)?;
+    one(tx.execute(
+        "UPDATE operations SET state='succeeded' WHERE id=?1 AND state='running'",
+        [&p.operation_id],
+    )?)?;
+    tx.execute(
+        "INSERT INTO lifecycle_evidence(step_id,evidence_json,committed_epoch) VALUES(?1,?2,?3)",
+        params![id, supplied, epoch],
+    )?;
+    one(tx.execute(
+        "DELETE FROM lifecycle_claims WHERE operation_id=?1",
+        [&p.operation_id],
+    )?)?;
+    event(tx, s, &p, Transition::Ready, Some(epoch))
+}
+
+use crate::events::QualifiedLifecycleTransition as Transition;
+fn event(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    p: &Plan,
+    transition: Transition,
+    epoch: Option<u64>,
+) -> Result<(), LifecycleError> {
+    use crate::events::{EventMetadata, EventOperationId, append_event};
+    let id = |s: &str| {
+        s.parse()
+            .map(EventOperationId::generated)
+            .map_err(|_| LifecycleError::CorruptStoredData)
+    };
+    append_event(
+        tx,
+        &EventMetadata::QualifiedLifecycleRecorded {
+            transition,
+            operation_id: id(&p.operation_id)?,
+            deployment_id: id(&p.deployment_id)?,
+            step_id: id(&p.step_id)?,
+            session_epoch: s.epoch(),
+            committed_epoch: epoch,
+        },
+    )
+    .map(|_| ())
+    .map_err(resource)
+}

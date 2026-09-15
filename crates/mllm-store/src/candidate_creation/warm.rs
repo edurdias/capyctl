@@ -119,12 +119,16 @@ pub(super) fn owned(
     tx: &Transaction<'_>,
     p: &CandidateActionPlanV3,
 ) -> Result<crate::lifecycle::completion::OwnedLaunchAssociationV1, LifecycleError> {
+    owned_read(tx,p,&ReadValidation::new(tx))
+}
+
+pub(super) fn owned_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<crate::lifecycle::completion::OwnedLaunchAssociationV1,LifecycleError> {
     let source = if p.action == Action::Initialize {
         p.clone()
     } else {
         cold(tx, &p.scope.run_id)?
     };
-    let v = immutable_anchor(tx, &source.scope.parent_step_id)?;
+    let v = anchor_context_read(tx, &source.scope.parent_step_id,false,read)?;
     crate::lifecycle::completion::association(tx, &v)?.ok_or(LifecycleError::Conflict)
 }
 pub(super) fn predecessors(
@@ -257,6 +261,9 @@ fn next_reservation(
     Ok(retained)
 }
 pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(), LifecycleError> {
+    prior_read(tx,p,&ReadValidation::new(tx))
+}
+pub(super) fn prior_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
     let _visit = PredecessorVisit::enter(&p.scope.operation_id)?;
     let snapshot = super::super::read_snapshot(tx, &p.scope.principal, &p.scope.run_id)
         .map_err(creation_error)?
@@ -289,7 +296,7 @@ pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(
         if ready.ready_probe_case.as_deref() != Some(ready_case.id()) {
             return Err(LifecycleError::CorruptStoredData);
         }
-        return inference::markers::baseline(tx, &ready);
+        return inference::markers::baseline_read(tx, &ready,read);
     }
     let anchor: String = tx.query_row(
         "SELECT step_id FROM qualification_case_actions WHERE run_id=?1 AND case_id=?2",
@@ -303,7 +310,7 @@ pub(super) fn prior(tx: &Transaction<'_>, p: &CandidateActionPlanV3) -> Result<(
         return Err(LifecycleError::CorruptStoredData);
     }
     let previous = exact_predecessor(tx, p, previous, &anchor)?;
-    validate_plan_inner(tx, &previous, false)?;
+    validate_plan_read(tx, &previous, false,read)?;
     let state: String = tx.query_row(
         "SELECT state FROM lifecycle_steps WHERE id=?1",
         [anchor],

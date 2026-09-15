@@ -2,6 +2,7 @@
 //! lifecycle transitions executed against engine/launcher participants,
 //! and evidence-only journaling (design §5).
 
+pub mod coordinator;
 pub mod operations;
 pub mod ownership;
 pub mod runtime;

@@ -291,7 +291,7 @@ enum ReadyKind {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompletionEvidenceV1 {
+pub(crate) struct CompletionEvidenceV1 {
     version: u8,
     kind: ReadyKind,
     token: TokenDto,
@@ -300,7 +300,7 @@ struct CompletionEvidenceV1 {
     control_receipt: Option<String>,
     milestones: Vec<MilestoneDto>,
 }
-fn completion_value(e: &CompletionEvidence) -> Result<CompletionEvidenceV1, LifecycleError> {
+pub(crate) fn completion_value(e: &CompletionEvidence) -> Result<CompletionEvidenceV1, LifecycleError> {
     nonempty_receipt(
         e.control_receipt
             .as_deref()
@@ -388,6 +388,11 @@ impl crate::Store {
     ) -> Result<(), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
+        if crate::ordinary_lifecycle::is_ordinary(&tx, id)? {
+            crate::ordinary_lifecycle::record_launch(&tx, s, id, r, now)?;
+            tx.commit()?;
+            return Ok(());
+        }
         let v3 = crate::candidate_creation::progression::is_v3(&tx, id)?;
         let v = if v3 {
             crate::candidate_creation::progression::validated_anchor(&tx, id)?
@@ -453,6 +458,11 @@ impl crate::Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let supplied = completion_value(e)?;
+        if crate::ordinary_lifecycle::is_ordinary(&tx, id)? {
+            crate::ordinary_lifecycle::complete(&tx, s, id, e, now, ttl)?;
+            tx.commit()?;
+            return Ok(());
+        }
         let v = validated_initialize(&tx, id)?;
         accounting(&tx, &v)?;
         let a = association(&tx, &v)?.ok_or(LifecycleError::Conflict)?;
