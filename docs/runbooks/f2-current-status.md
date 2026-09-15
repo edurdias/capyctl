@@ -6,6 +6,8 @@ not per task. Focused TDD and integration verification continue throughout.
 
 ## Recent committed work
 
+- `8c9a17a`: associated candidate Cleanup through the original retained runtime,
+  with clock-free discovery and verified atomic release.
 - `ec05bd8`: owned candidate Abort with retained accounting and strict SSE replay.
 - `c6da962`: deadline-bound owned Finish with preserved V3 catalog history.
 - `8a1fbec`: owned candidate Park/Restore through the original retained Fake.
@@ -186,6 +188,14 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
    prerequisites. CPU/Fake tests and source checks are not native qualification.
 
 ## Owner attention
+
+Execution capacity item: after Cleanup committed, fresh-worker creation for the
+queued trusted response-capture unit failed with `agent thread limit reached`.
+The visible workers are complete and no Cargo process remains. The available
+tools expose no worker close/release operation. The current execution skill keeps
+capacity-limited work queued and forbids reusing a completed worker for another
+unit. Continue from a fresh session with worker capacity, or explicitly direct
+inline implementation. No response-capture worker launched or changed source.
 
 Root verification for the associated candidate Cleanup slice: Store 204,
 controller 243 and management 67 tests pass (514 distinct core tests). The same
