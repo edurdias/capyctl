@@ -62,6 +62,13 @@ accepts scheduler, detokenizer, tokenizer, and warmup hooks. Its server composit
 installs the independent inference/admin authentication middleware. A protected health
 gate must remain effective after that middleware is added, including OPTIONS.
 
+The pinned `/flush_cache` handler returns a plain-text success response and status
+200, or status 400 on failure. It does not return JSON null. Release and resume
+handlers return implicitly on success (JSON null). Disk reload returns a JSON object
+containing `success`, `message`, and `num_paused_requests`. Deterministic control
+fixtures must reproduce these actual shapes before their tests can support native
+integration.
+
 [Engine startup](https://github.com/sgl-project/sglang/blob/fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1/python/sglang/srt/entrypoints/engine.py)
 logs server arguments inside `_launch_subprocesses`, configures logging, and loads
 plugins. Avoiding the public CLI does not by itself avoid that path. Startup must
