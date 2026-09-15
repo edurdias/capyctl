@@ -62,6 +62,11 @@ byte splits, including split UTF-8. It supports comments and multiline data but
 rejects other SSE fields, lone CR and incomplete frames. HTTP status/content type,
 clean transport completion and binding provenance remain runner obligations.
 
+The F2C phase-margin calculation now uses checked integer arithmetic for
+`peak + max(2 GiB, ceil(peak/4))`. It rejects overflow instead of saturating or
+wrapping. This numerical helper does not establish attribution, qualify a recipe
+or reduce any reservation; missing attribution keeps the conservative grant.
+
 Owned Fake candidate Initialize and its mandatory Ready probe pass root integration.
 Authenticated run-scoped submission returns the original durable acceptance
 envelope. The same retained instance executes each separately armed child; trusted
@@ -141,7 +146,7 @@ Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The harness passes all 69 tests and all-target Clippy, including six exact-marker,
+The harness passes all 71 tests and all-target Clippy, including two phase-margin, six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
 protected-storage tests.
 None is native qualification evidence.

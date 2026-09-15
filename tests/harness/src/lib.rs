@@ -10,6 +10,7 @@
 pub mod f2_pressure;
 pub mod f2_monitor;
 pub mod f2_metrics;
+pub mod f2_bounds;
 pub mod f2_correctness;
 pub mod f2_collected;
 pub mod f2_streamed;
