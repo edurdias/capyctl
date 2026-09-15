@@ -29,6 +29,12 @@ patch on host-a. Existing environments and drivers remain outside that change.
 
 ## Pinned source inspection
 
+The local `runtime/sglang_source_preflight.py` now verifies seven selected source
+files and revalidates retained identities without importing the engine. Its
+synthetic CPU tests and the full 111-test runtime suite pass. Production installed
+root selection and consumption by the guarded startup still remain open; selected
+files do not attest the complete import graph or compiled package.
+
 Source commit: `fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`. Inspection on September 14,
 2026 did not import an engine or execute a model.
 

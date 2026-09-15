@@ -1,4 +1,29 @@
-# Checkpoint preflight
+# Runtime preflight
+
+## Selected SGLang source preflight
+
+`sglang_source_preflight.verify_sglang_sources(root)` checks seven fixed Python
+sources under the installed `sglang/srt` directory against commit
+`fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`. The inventory covers server arguments,
+authentication, the saver adapter, scheduler, weight updater, engine startup, and
+HTTP startup. `revalidate_sglang_sources(previous)` repeats the checks and rejects
+even byte-identical inode replacement. Roots stay out of observation repr; errors
+are closed categories. No engine module is imported.
+
+Every directory ancestor and source leaf must be root/service-owned and have no
+group/world write permission. Symlinks and nonregular sources are rejected;
+individual files are bounded to 16 MiB. Tests use private temporary directories
+beneath the service home because `/tmp` is not a protected installation ancestor.
+
+These seven files are not the complete Python import graph or compiled runtime.
+The check neither attests the whole installed wheel nor proves the effective
+ServerArgs mapping, physical GPU identity, real saver, worker enrollment, or live
+compatibility. Native startup remains closed; production composition must select
+the protected installed package root and consume/revalidate this observation
+alongside the remaining gates. Same-service-user mutation after observation is
+outside its guarantee.
+
+## Checkpoint preflight
 
 This module performs a bounded observation of one fixed checkpoint contract. It
 does not qualify an engine or authorize a launch.
