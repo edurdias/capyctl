@@ -993,6 +993,7 @@ dependencies = [
  "mllm-config",
  "mllm-domain",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
