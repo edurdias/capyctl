@@ -577,15 +577,20 @@ async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
         ),
         ("qualified_ready_committed", "ready"),
         ("qualified_initialize_uncertain", "uncertain"),
+        ("ordinary_cleanup_accepted", "cleanup_accepted"),
+        ("ordinary_cleanup_armed", "cleanup_armed"),
+        ("ordinary_cleanup_completed", "cleanup_completed"),
     ] {
-        for corruption in 0..3 {
+        for corruption in 0..4 {
             let source = fake(move |_, _| {
                 let mut e = event(1);
                 e.kind = kind.into();
                 e.operation_id = Some(INCARNATION.into());
                 e.deployment_id = Some(INCARNATION.into());
-                let ready = transition == "ready";
-                let epoch = if ready ^ (corruption == 2) {
+                let ready = matches!(transition, "ready" | "cleanup_completed");
+                let epoch = if corruption == 3 {
+                    serde_json::json!(0)
+                } else if ready ^ (corruption == 2) {
                     serde_json::json!(u64::MAX)
                 } else {
                     serde_json::Value::Null
@@ -623,7 +628,7 @@ async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
                 assert_eq!(json["payload"]["transition"], transition);
                 assert_eq!(
                     json["payload"]["committed_epoch"],
-                    if transition == "ready" {
+                    if matches!(transition, "ready" | "cleanup_completed") {
                         serde_json::json!("18446744073709551615")
                     } else {
                         serde_json::Value::Null

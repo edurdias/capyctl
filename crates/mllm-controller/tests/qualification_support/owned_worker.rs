@@ -48,7 +48,11 @@ async fn owned_worker_initializes_once_for_joined_and_dropped_observers() {
     let step = a.step_id().to_owned();
     drop(a);
     drop(b);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // Parallel qualification fixtures can occupy the CPU while this worker
+    // validates durable provenance. This is a test hang detector; the service
+    // clock and persisted operation deadline remain 1900 and 10000 below.
+    let ready_wait_started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let done = {
                 let state = owner.lock().unwrap();
@@ -65,7 +69,16 @@ async fn owned_worker_initializes_once_for_joined_and_dropped_observers() {
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "owned worker did not reach Ready after {:?}: {error}",
+            ready_wait_started.elapsed()
+        )
+    });
+    eprintln!(
+        "owned worker Ready wait: {:?}",
+        ready_wait_started.elapsed()
+    );
     {
         let state = owner.lock().unwrap();
         assert_eq!(

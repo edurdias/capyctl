@@ -49,6 +49,8 @@ pub enum EventReadError {
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EventWriteError {
+    #[error("invalid event transition metadata")]
+    InvalidMetadata,
     #[error("event payload exceeds 16 KiB")]
     PayloadTooLarge,
     #[error(transparent)]
@@ -59,6 +61,15 @@ pub(crate) enum EventWriteError {
 #[derive(Serialize)]
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
+    #[serde(rename = "1")]
+    OrdinaryCleanupRecorded {
+        transition: OrdinaryCleanupTransition,
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        step_id: EventOperationId,
+        session_epoch: i64,
+        committed_epoch: Option<u64>,
+    },
     #[serde(rename = "1")]
     QualifiedLifecycleRecorded {
         transition: QualifiedLifecycleTransition,
@@ -150,6 +161,16 @@ pub(crate) enum QualifiedLifecycleTransition {
     Ready,
     Uncertain,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OrdinaryCleanupTransition {
+    #[serde(rename = "cleanup_accepted")]
+    Accepted,
+    #[serde(rename = "cleanup_armed")]
+    Armed,
+    #[serde(rename = "cleanup_completed")]
+    Completed,
+}
 #[derive(Clone)]
 pub(crate) struct EventOperationId(String);
 #[derive(Serialize)]
@@ -200,6 +221,11 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::OrdinaryCleanupRecorded { transition, .. } => match transition {
+                OrdinaryCleanupTransition::Accepted => "ordinary_cleanup_accepted",
+                OrdinaryCleanupTransition::Armed => "ordinary_cleanup_armed",
+                OrdinaryCleanupTransition::Completed => "ordinary_cleanup_completed",
+            },
             Self::QualifiedLifecycleRecorded { transition, .. } => match transition {
                 QualifiedLifecycleTransition::Accepted => "qualified_initialize_accepted",
                 QualifiedLifecycleTransition::Armed => "qualified_initialize_armed",
@@ -221,6 +247,7 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
+            Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::QualifiedLifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CandidateLifecycleRecorded {
@@ -264,6 +291,14 @@ fn append_event_at(
     event: &EventMetadata,
     at: i64,
 ) -> Result<i64, EventWriteError> {
+    if let EventMetadata::OrdinaryCleanupRecorded { transition, committed_epoch, session_epoch, .. } = event {
+        if *session_epoch <= 0 || match transition {
+            OrdinaryCleanupTransition::Completed => committed_epoch.is_none_or(|epoch| epoch == 0),
+            _ => committed_epoch.is_some(),
+        } {
+            return Err(EventWriteError::InvalidMetadata);
+        }
+    }
     let payload = serialize_bounded(event)?;
     let (deployment_id, operation_id) = event.identifiers();
     tx.execute("INSERT INTO management_events(recorded_at_ms,kind,deployment_id,operation_id,payload_json) VALUES(?1,?2,?3,?4,?5)", params![at,event.kind(),deployment_id,operation_id,payload])?;
@@ -398,6 +433,26 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_cleanup_writer_rejects_epoch_without_completion_and_missing_commit() {
+        use super::*;
+        for (transition, epoch, valid) in [
+            (OrdinaryCleanupTransition::Accepted,None,true),
+            (OrdinaryCleanupTransition::Armed,None,true),
+            (OrdinaryCleanupTransition::Completed,Some(7),true),
+            (OrdinaryCleanupTransition::Accepted,Some(7),false),
+            (OrdinaryCleanupTransition::Armed,Some(7),false),
+            (OrdinaryCleanupTransition::Completed,None,false),
+            (OrdinaryCleanupTransition::Completed,Some(0),false),
+        ] {
+            let store=crate::Store::open_in_memory().unwrap();
+            let tx=Transaction::new_unchecked(&store.conn,TransactionBehavior::Immediate).unwrap();
+            let id=ulid::Ulid::new();
+            let result=append_event(&tx,&EventMetadata::OrdinaryCleanupRecorded{transition,operation_id:EventOperationId::generated(id),deployment_id:EventOperationId::generated(id),step_id:EventOperationId::generated(id),session_epoch:1,committed_epoch:epoch});
+            assert_eq!(result.is_ok(),valid);
+            assert_eq!(tx.query_row("SELECT COUNT(*) FROM management_events",[],|r|r.get::<_,i64>(0)).unwrap(),i64::from(valid));
+        }
+    }
     #[test]
     fn candidate_acceptance_payload_is_bounded_and_maps_generated_identities() {
         use super::*;

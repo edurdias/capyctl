@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 
 #[path = "qualification_support/ordinary_initialize.rs"]
 mod ordinary_initialize;
+#[path = "qualification_support/ordinary_cleanup.rs"]
+mod ordinary_cleanup;
 
 #[path = "qualification_support/worker_store.rs"]
 mod worker_store;

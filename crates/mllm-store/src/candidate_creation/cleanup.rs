@@ -855,6 +855,15 @@ impl crate::Store {
     ) -> Result<(), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
+        let kind: String = tx.query_row("SELECT o.kind FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1", [id], |r| r.get(0)).optional()?.ok_or(LifecycleError::Unsupported)?;
+        if kind == "ordinary_cleanup" {
+            crate::ordinary_lifecycle::cleanup::complete(&tx, s, id, e, now, ttl)?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if kind != "candidate_cleanup" {
+            return Err(LifecycleError::Unsupported);
+        }
         let supplied = evidence_value(id, e)?;
         let r = read(&tx, id)?;
         if let Some(old) = recorded(&tx, &r)? {

@@ -429,7 +429,10 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         | "qualified_initialize_armed"
         | "qualified_owned_launch_associated"
         | "qualified_ready_committed"
-        | "qualified_initialize_uncertain" => &[
+        | "qualified_initialize_uncertain"
+        | "ordinary_cleanup_accepted"
+        | "ordinary_cleanup_armed"
+        | "ordinary_cleanup_completed" => &[
             "transition",
             "operation_id",
             "deployment_id",
@@ -448,11 +451,16 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         "qualified_owned_launch_associated" => Some("owned_launch_associated"),
         "qualified_ready_committed" => Some("ready"),
         "qualified_initialize_uncertain" => Some("uncertain"),
+        "ordinary_cleanup_accepted" => Some("cleanup_accepted"),
+        "ordinary_cleanup_armed" => Some("cleanup_armed"),
+        "ordinary_cleanup_completed" => Some("cleanup_completed"),
         _ => None,
     };
     if let Some(transition) = qualified_transition {
         let epoch = input.get("committed_epoch").ok_or(Failure::Internal)?;
-        if (transition == "ready") == epoch.is_null() {
+        if matches!(transition, "ready" | "cleanup_completed") == epoch.is_null()
+            || epoch.as_u64() == Some(0)
+        {
             return Err(Failure::Internal);
         }
     }

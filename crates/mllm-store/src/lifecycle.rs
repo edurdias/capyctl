@@ -195,6 +195,20 @@ pub(crate) fn insert_candidate_cleanup_run(
     operation: &str,
     deadline: i64,
 ) -> Result<(), LifecycleError> {
+    insert_owned_cleanup_run(tx, session, target, operation, deadline, "candidate_cleanup")
+}
+
+pub(crate) fn insert_owned_cleanup_run(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    target: &DeploymentFence,
+    operation: &str,
+    deadline: i64,
+    kind: &str,
+) -> Result<(), LifecycleError> {
+    if !matches!(kind, "candidate_cleanup" | "ordinary_cleanup") {
+        return Err(LifecycleError::Invalid);
+    }
     fenced(tx, session, target)?;
     let plan = bounded_json(&StoredPlan {
         version: 1,
@@ -205,7 +219,7 @@ pub(crate) fn insert_candidate_cleanup_run(
         cleanup_target: Some(target.deployment_id.clone()),
         handoffs: vec![],
     })?;
-    tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'candidate_cleanup','pending')",params![operation,target.deployment_id])?;
+    tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,?3,'pending')",params![operation,target.deployment_id,kind])?;
     tx.execute("INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) VALUES(?1,?2,?3,?4,?5,'stop','queued',?6,?7)",params![operation,target.deployment_id,target.revision,target.generation,session.id(),deadline,plan])?;
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! Qualified Fake cold initialization from a frozen managed configuration.
 pub mod worker;
+pub mod cleanup;
 use crate::candidate_creation::initialize::ArmResult;
 use crate::candidate_creation::progression::catalog::qualified_effective;
 use crate::lifecycle::completion::{
