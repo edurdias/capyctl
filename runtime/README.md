@@ -23,9 +23,16 @@ the protected installed package root and consume/revalidate this observation
 alongside the remaining gates. Same-service-user mutation after observation is
 outside its guarantee.
 
-## Checkpoint preflight
-
 ## Native startup output and external plugins
+
+`sglang_device.collect_inventory()` reads a bounded local NVIDIA PCI/UUID
+inventory from fixed Linux proc/sysfs roots without importing native libraries.
+`observe_placement(spec, trusted_mapping)` recollects it twice and requires an
+explicit service-authorized UUID/inventory digest plus that exact full UUID in
+the inherited `CUDA_VISIBLE_DEVICES`. It never sets the environment or infers a
+CUDA index from a logical device name. The inventory digest includes boot identity
+and is separate from the policy's opaque hardware fingerprint. Trusted kernel
+mounts and service-side mapping/namespace provisioning remain required.
 
 `sglang_startup_guards` supplies narrow preimport helpers for a fresh, isolated
 service-owned child only. `contain_startup_output()` permanently redirects stdout

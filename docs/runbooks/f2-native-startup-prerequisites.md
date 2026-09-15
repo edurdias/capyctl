@@ -14,7 +14,11 @@ findings. This does not complete F2B or qualify a native engine.
   The frozen descriptor now carries the reviewed host ID,
   hardware fingerprint, logical device selector, and memory domain. Resolve and
   corroborate that selection against the observed physical GPU before any model
-  load; a logical selector is not a CUDA index or observed UUID.
+  load. The `sglang_device` collector now correlates bounded proc/sysfs UUID and
+  PCI observations against an explicit trusted service mapping and a full-UUID
+  inherited CUDA namespace. Provision/freeze that mapping against policy and
+  establish the namespace before native imports; a logical selector is not a
+  CUDA index or observed UUID by itself.
 - Install the wrapper and its local helpers under a protected absolute service path.
   The current checkout has group-writable ancestors and cannot be that installation.
   Bind installed source and helper identities to the reviewed runtime recipe.
@@ -43,7 +47,7 @@ patch on host-a. Existing environments and drivers remain outside that change.
 
 The local `runtime/sglang_source_preflight.py` now verifies nine selected source
 files and revalidates retained identities without importing the engine. Its
-synthetic CPU tests and the full 130-test runtime suite pass. Production installed
+synthetic CPU tests and the full 142-test runtime suite pass. Production installed
 root selection and consumption by the guarded startup still remain open; selected
 files do not attest the complete import graph or compiled package.
 
