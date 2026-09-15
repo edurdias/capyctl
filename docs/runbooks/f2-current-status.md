@@ -24,6 +24,8 @@ not per task. Focused TDD and integration verification continue throughout.
 - `9de1fa8`: no-site isolated interpreter startup before protected native guards.
 - `14c2923`: authenticated owned Start and Stop submission.
 - `f3a2684`: bounded exact-marker correctness validation for the future F2C runner.
+- `3e4bd89`: expired never-armed Initialize terminalization without runtime effects.
+- `e4e2e95`: separate monotonic request timing validation.
 
 Expired, never-armed ordinary Fake Initialize requests now terminalize atomically.
 The worker proves absence of execution, grants, ownership and runtime identities
@@ -74,14 +76,14 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Latest full core root verification: Store 202, controller 180 and management
+Full core root verification for `3e4bd89`: Store 202, controller 180 and management
 50 tests pass (432 distinct tests), plus three-crate all-target Clippy.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The harness now passes all 28 tests and all-target Clippy, including six exact-marker
-tests. None is native qualification evidence.
+The harness at `e4e2e95` passes all 33 tests and all-target Clippy, including six
+exact-marker and five timing tests. None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier

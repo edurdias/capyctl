@@ -47,15 +47,35 @@ cold initialization, warm restoration, direct/routed inference and overlapping
 queue/activation intervals separate. Summary statistics do not establish those
 identities or qualify a run.
 
-Current local verification: 22 harness tests and all-target Clippy pass, including
+The latency-summary slice passed 22 harness tests and all-target Clippy, including
 four tests for exact statistics, empty/failure cases, duration overflow boundaries
 and bounded storage. No native measurements were collected.
+
+## Correctness and timing validation
+
+`f3a2684` adds a bounded public marker corpus and exact response validation. The
+validator accepts only the expected marker after outer ASCII whitespace trimming,
+a natural stop finish reason, and a valid terminal sequence. Content is limited
+to 128 UTF-8 bytes across 256 chunks, including empty chunks. Failures latch; later
+input cannot repair a malformed or truncated response. This is not an HTTP/SSE
+parser, and textual equality does not establish route or runtime identity.
+
+`e4e2e95` adds validation of completed request timestamps from one monotonic clock
+origin. Required timestamps and optional queue, activation and first-token
+observations must be ordered within their appropriate windows. Queue and activation
+may overlap and remain separate durations, never an additive latency decomposition.
+Missing observations remain absent. The runner must supply actual timestamps and
+keep failed and timed-out requests separate from completed latency samples.
+
+Current full harness verification passes 33 tests and all-target Clippy: ten
+library, eight pressure, four metrics, six correctness and five timing tests.
+No native measurements or engine baselines were collected.
 
 ## Remaining gates
 
 The API-driven runner, protected output manifest and metadata bounds, trusted
-host preflight, run abort/admission composition, correctness corpus, scenario
+host preflight, run abort/admission composition, correctness-corpus integration, scenario
 execution and Q1–Q11 reporting remain open. Native startup integration, trusted
 allocation/identity evidence and the owned lifecycle/API/CLI cutover remain
 prerequisites. Review stays consolidated at the requested F2 endpoint; no new
-owner decision is required by this pressure-monitor slice.
+owner decision is required by these local helper slices.
