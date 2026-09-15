@@ -25,6 +25,9 @@ findings. This does not complete F2B or qualify a native engine.
   alternate native logging channels remain required; these helpers are not a sandbox.
 - Wire the production clock, checkpoint preflight, and credential resolver into
   `NativeCandidateService`; the current interface alone is not production composition.
+  Acquire the lifetime controller lock before creating a coordinator session.
+  The lock helper now rejects noncanonical/writable directory chains, symlink or
+  hardlinked leaves, and nonregular files; it is not yet wired into production.
 - Guard the actual memory-saver implementation, collect complete worker identities,
   and compare attributed allocations with the retained grant.
 - Typed single-effect controls are implemented in `6c78908`, with deterministic
