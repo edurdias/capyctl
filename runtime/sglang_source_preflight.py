@@ -23,6 +23,7 @@ _SOURCES = (
     ("utils/auth.py", "016734a0263cbc2bd6657481ab11535f1cac073efb7eed4bcdbf66f81dfd3ef7"),
     ("utils/torch_memory_saver_adapter.py", "196266b5ac6c7a805b36c9953fcdd9cafb0dcc3ac7a9e25aae6edf34a8c6fba9"),
     ("managers/scheduler.py", "159837693ec244d2dfb482d5788b8f4fa934c780505609c90a728939abe89815"),
+    ("managers/detokenizer_manager.py", "b8c8a453f34ef3b9777a763e911e9daab161b528a6fc123f42119cd2765afa1f"),
     ("managers/scheduler_components/weight_updater.py", "60cc68d85a9399be91c681db68c3a57a4697354912483e3c7e61127caa7bc977"),
     ("entrypoints/engine.py", "3fc01012d5e06050767573a31ea6a5b07447e88136d23cb7fd8454743dac1db4"),
     ("entrypoints/http_server.py", "5cdce94aaf3a446ac43e5a8e46961cbafdca9de7f0234404d285ed47ef5274d6"),
@@ -100,7 +101,7 @@ def _observe_sources(root, inventory):
 
 
 def verify_sglang_sources(root):
-    """Observe the fixed nine-file inventory beneath an installed sglang/srt root."""
+    """Observe the fixed ten-file inventory beneath an installed sglang/srt root."""
     return _observe_sources(root, _SOURCES)
 
 

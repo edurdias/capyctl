@@ -43,8 +43,8 @@ class SourceTests(unittest.TestCase):
             observed.source_revision = "main"
 
     def test_compiled_inventory_is_closed_and_well_formed(self):
-        self.assertEqual(len(source._SOURCES), 9)
-        self.assertEqual(len({name for name, _ in source._SOURCES}), 9)
+        self.assertEqual(len(source._SOURCES), 10)
+        self.assertEqual(len({name for name, _ in source._SOURCES}), 10)
         self.assertIn("plugins/__init__.py", dict(source._SOURCES))
         self.assertIn("platforms/__init__.py", dict(source._SOURCES))
         for name, digest in source._SOURCES:
@@ -56,6 +56,33 @@ class SourceTests(unittest.TestCase):
         self.rejects("artifact_missing", lambda: source.verify_sglang_sources(str(self.root)))
         with self.assertRaises(TypeError):
             source.verify_sglang_sources(str(self.root), self.inventory)
+
+    def test_missing_or_changed_detokenizer_blocks_selected_startup_sources(self):
+        # Exercise the production-selected paths with synthetic bytes, preserving
+        # real protected filesystem reads. Only expected fixture hashes differ.
+        detokenizer = "managers/detokenizer_manager.py"
+        digest = hashlib.sha256(self.payload).hexdigest()
+        for relative, _ in source._SOURCES:
+            if relative == detokenizer:
+                continue
+            leaf = self.root / relative
+            leaf.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            leaf.write_bytes(self.payload)
+            leaf.chmod(0o600)
+        observe = source._observe_source_directories
+
+        def fixture_hashes(root, selected):
+            return observe(root, tuple((name, digest) for name, _ in selected))
+
+        with mock.patch.object(source, "_observe_source_directories", side_effect=fixture_hashes):
+            self.rejects("artifact_missing", lambda: source.verify_sglang_sources(str(self.root)))
+            leaf = self.root / detokenizer
+            leaf.write_bytes(self.payload)
+            leaf.chmod(0o600)
+            verified = source.verify_sglang_sources(str(self.root))
+            self.assertEqual(source.revalidate_sglang_sources(verified), verified)
+            leaf.write_bytes(b"changed detokenizer source\n")
+            self.rejects("artifact_mismatch", lambda: source.revalidate_sglang_sources(verified))
 
     def test_byte_mismatch(self):
         self.leaf.write_bytes(b"x" * len(self.payload))

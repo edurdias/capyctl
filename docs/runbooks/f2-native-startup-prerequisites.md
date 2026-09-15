@@ -118,11 +118,20 @@ driver was changed. Full runtime verification on the local host passed 212 tests
 
 ### Source contract
 
-The local `runtime/sglang_source_preflight.py` now verifies nine selected source
+The local `runtime/sglang_source_preflight.py` now verifies ten selected source
 files and revalidates retained identities without importing the engine. Its
-synthetic CPU tests and the full 200-test runtime suite pass. Production installed
+synthetic CPU tests and the full 213-test runtime suite pass. Production installed
 root selection and consumption by the guarded startup still remain open; selected
 files do not attest the complete import graph or compiled package.
+
+The added [detokenizer source](https://github.com/sgl-project/sglang/blob/fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1/python/sglang/srt/managers/detokenizer_manager.py)
+has SHA-256 `b8c8a453f34ef3b9777a763e911e9daab161b528a6fc123f42119cd2765afa1f`,
+matching both the exact upstream revision and the isolated Spark installation.
+A read-only invocation of the existing protected helper with the explicit
+ten-file inventory verified and revalidated all selected installed files without
+importing SGLang, Torch, Transformers or the saver. No helper/environment file
+was changed on Spark. The new CPU test proves a missing or changed detokenizer
+blocks the production-selected inventory. Process enrollment is still unfinished.
 
 Source commit: `fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`. Inspection on September 14,
 2026 did not import an engine or execute a model.
