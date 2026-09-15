@@ -90,11 +90,14 @@ pub async fn dispatch(
     let guard = deps
         .inflight
         .try_guard(&deployment_id, deps.limits.max_requests_per_deployment)
-        .ok_or_else(|| err("queue_full", "deployment in-flight bound reached"))?;
+        .ok_or_else(|| err("queue_full", "deployment in-flight bound reached"))?
+        .abandon();
+    // From the first poll onward the engine may have accepted work. Dropping
+    // this request or receiving an uncertain transport error cannot free it.
     let resp = forward
         .forward_chat(body)
         .await
-        .map_err(|e| err("engine_error", &format!("engine: {e:?}")))?;
+        .map_err(|_| err("engine_error", "backend completion unverified"))?;
     guard.release();
     Ok(resp)
 }

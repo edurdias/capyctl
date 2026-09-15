@@ -37,8 +37,11 @@ disk reload on restoration. Additional feature combinations remain unqualified.
   resume, reload, flush, and probe intent. A lost response remains uncertain;
   retain peak accounting and never replay a possibly applied control.
 - Complete the A2d/A3 coordinator, management API, CLI, inventory, and routing
-  cutover. Fix legacy router `try_send` chunk loss and uncertain-result guard
-  release. Neither transport closure nor client disconnect settles backend work.
+  cutover. Legacy delivery now fails closed after overflow instead of appending
+  a successful terminal, and uncertain streaming/nonstreaming work retains its
+  process-local charge. A backpressure-aware asynchronous sink and durable
+  settlement/reconciliation remain open. Neither transport closure nor client
+  disconnect settles backend work.
 - Extend trusted qualification collection/catalog beyond its current Fake
   program. Qualification requires exact recipe, checkpoint, source, saver,
   Torch/CUDA, hardware/environment, binding, and process identities.
