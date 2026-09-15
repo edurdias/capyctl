@@ -191,6 +191,14 @@ package. All 14 startup-guard tests and the full 218-test local runtime suite pa
 The isolated Spark helper has not been updated with this change. Package-path
 attestation and native startup composition remain open.
 
+A disposable local interpreter check found that Python3.12.14 under `-IS` resolves
+`sys.prefix` and `sysconfig` package paths against the base installation, unlike
+Python3.14.7, which retains the venv prefix. Explicit package-root provenance is
+therefore required; deriving it from the no-site child is not sufficient. The
+matching read-only check on Spark Python3.12.3 could not run because one SSH
+connection timed out on port22. This is not evidence about that interpreter's
+current paths or a lasting host outage. No existing environment was changed.
+
 ### Source contract
 
 The local `runtime/sglang_source_preflight.py` now verifies ten selected source
