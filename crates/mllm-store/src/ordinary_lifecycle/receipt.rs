@@ -206,7 +206,106 @@ fn historical(tx: &Transaction<'_>, stored: &StoredReceipt) -> Result<(), Lifecy
     Ok(())
 }
 
+fn lookup_in_transaction(
+    tx: &Transaction<'_>,
+    principal: &str,
+    deployment: &str,
+    expected_revision: i64,
+    key: &str,
+    requested_deadline: i64,
+) -> Result<Option<QualifiedStartReceipt>, LifecycleError> {
+    check_request(
+        principal,
+        deployment,
+        expected_revision,
+        key,
+        requested_deadline,
+    )?;
+    let scope = scope(deployment);
+    let request_hash = hash(principal, deployment, expected_revision, requested_deadline)?;
+    let prior = {
+        let mut statement = tx.prepare("SELECT request_hash,operation_id,response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3")?;
+        let mut rows = statement.query(params![principal, scope, key])?;
+        rows.next()?
+            .map(|row| {
+                Ok::<_, LifecycleError>((
+                    bounded_text(row, 0, 64)?,
+                    bounded_text(row, 1, 26)?,
+                    bounded_text(row, 2, 1 << 20)?,
+                ))
+            })
+            .transpose()?
+    };
+    if let Some((old_hash, operation, raw)) = prior {
+        if old_hash != request_hash {
+            return Err(LifecycleError::Conflict);
+        }
+        let stored: StoredReceipt = decode(&raw)?;
+        if stored.version != 1
+            || stored.method != "POST"
+            || stored.action != "start"
+            || stored.principal != principal
+            || stored.scope != scope
+            || stored.key != key
+            || stored.request_hash != request_hash
+            || stored.requested_deadline_ms != requested_deadline
+            || stored.receipt.operation_id != operation
+            || stored.receipt.deployment_id != deployment
+            || stored.receipt.revision != expected_revision
+        {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        historical(tx, &stored)?;
+        return Ok(Some(stored.receipt));
+    }
+    Ok(None)
+}
+
+fn check_request(
+    principal: &str,
+    deployment: &str,
+    expected_revision: i64,
+    key: &str,
+    requested_deadline: i64,
+) -> Result<(), LifecycleError> {
+    if principal.trim().is_empty()
+        || principal.len() > 256
+        || key.trim().is_empty()
+        || key.len() > 256
+        || ulid::Ulid::from_string(deployment).is_err()
+        || expected_revision < 1
+        || requested_deadline <= 0
+    {
+        return Err(LifecycleError::Invalid);
+    }
+    Ok(())
+}
+
 impl crate::Store {
+    /// Read an exact scoped receipt in a read-only transaction. Current session
+    /// validation precedes history lookup, including when the receipt is absent.
+    /// Historical validation never grants execution or performs new acceptance.
+    pub fn qualified_start_command_receipt(
+        &self,
+        session: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline: i64,
+    ) -> Result<Option<QualifiedStartReceipt>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        lookup_in_transaction(
+            &tx,
+            principal,
+            deployment,
+            expected_revision,
+            key,
+            requested_deadline,
+        )
+    }
+
     /// Accept a principal-scoped Start command atomically. Exact retries return
     /// committed history before checking today's deployment or qualification.
     /// The caller must use the normal arm path to obtain any execution authority.
@@ -221,55 +320,29 @@ impl crate::Store {
         now: i64,
         requested_deadline: i64,
     ) -> Result<QualifiedStartReceipt, LifecycleError> {
-        if principal.trim().is_empty()
-            || principal.len() > 256
-            || key.trim().is_empty()
-            || key.len() > 256
-            || ulid::Ulid::from_string(deployment).is_err()
-            || expected_revision < 1
-            || now < 0
-            || requested_deadline <= 0
-        {
+        check_request(
+            principal,
+            deployment,
+            expected_revision,
+            key,
+            requested_deadline,
+        )?;
+        if now < 0 {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
         let scope = scope(deployment);
         let request_hash = hash(principal, deployment, expected_revision, requested_deadline)?;
-        let prior = {
-            let mut statement = tx.prepare("SELECT request_hash,operation_id,response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3")?;
-            let mut rows = statement.query(params![principal, scope, key])?;
-            rows.next()?
-                .map(|row| {
-                    Ok::<_, LifecycleError>((
-                        bounded_text(row, 0, 64)?,
-                        bounded_text(row, 1, 26)?,
-                        bounded_text(row, 2, 1 << 20)?,
-                    ))
-                })
-                .transpose()?
-        };
-        if let Some((old_hash, operation, raw)) = prior {
-            if old_hash != request_hash {
-                return Err(LifecycleError::Conflict);
-            }
-            let stored: StoredReceipt = decode(&raw)?;
-            if stored.version != 1
-                || stored.method != "POST"
-                || stored.action != "start"
-                || stored.principal != principal
-                || stored.scope != scope
-                || stored.key != key
-                || stored.request_hash != request_hash
-                || stored.requested_deadline_ms != requested_deadline
-                || stored.receipt.operation_id != operation
-                || stored.receipt.deployment_id != deployment
-                || stored.receipt.revision != expected_revision
-            {
-                return Err(LifecycleError::CorruptStoredData);
-            }
-            historical(&tx, &stored)?;
-            return Ok(stored.receipt);
+        if let Some(receipt) = lookup_in_transaction(
+            &tx,
+            principal,
+            deployment,
+            expected_revision,
+            key,
+            requested_deadline,
+        )? {
+            return Ok(receipt);
         }
         if requested_deadline <= now {
             return Err(LifecycleError::Invalid);

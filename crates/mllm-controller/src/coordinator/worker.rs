@@ -14,6 +14,7 @@ use mllm_store::{
     lifecycle::{DeploymentFence, LifecycleError},
     ordinary_lifecycle::cleanup::{OrdinaryCleanupReceipt, OrdinaryCleanupStatus},
     ordinary_lifecycle::worker::{QualifiedInitializeStatus, QualifiedInitializeWork},
+    ordinary_lifecycle::QualifiedStartReceipt,
 };
 use std::{
     collections::BTreeMap,
@@ -112,6 +113,94 @@ pub struct OwnedCoordinator {
     task: Option<tokio::task::JoinHandle<WorkerStatus>>,
 }
 
+/// Cloneable admission handle for the existing application-owned worker.
+/// Handles retain its Store and process lock, but cannot shut down or restart it.
+#[derive(Clone)]
+pub struct CoordinatorCommands {
+    shared: Arc<Shared>,
+}
+
+/// Preserve Store rejection categories for the service's command boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum CoordinatorCommandError {
+    #[error(transparent)]
+    Coordinator(#[from] CoordinatorError),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
+}
+
+impl CoordinatorCommands {
+    /// Accept a scoped command and return observation-only committed history.
+    /// Principal authentication belongs to the trusted service caller.
+    pub fn start(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<QualifiedStartReceipt, CoordinatorCommandError> {
+        // Synchronous admission holds one existing observer slot only until the
+        // receipt returns. There is no task or unbounded queue per command.
+        let _permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            // PoisonError owns the guard; release it before fail reacquires.
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        let store_error = |error: LifecycleError| {
+            if matches!(
+                error,
+                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+            ) {
+                self.shared.fail_locked(&owner, error.to_string());
+            }
+            CoordinatorCommandError::Lifecycle(error)
+        };
+        if let Some(receipt) = owner
+            .store()
+            .qualified_start_command_receipt(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                requested_deadline_ms,
+            )
+            .map_err(store_error)?
+        {
+            return Ok(receipt);
+        }
+        if !self.shared.accepting.load(Ordering::Acquire)
+            || !self.shared.initializing.load(Ordering::Acquire)
+        {
+            return Err(
+                CoordinatorError::Stopped("worker is not admitting Initialize".into()).into(),
+            );
+        }
+        let receipt = owner
+            .store()
+            .accept_qualified_start_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                (self.shared.clock)()?,
+                requested_deadline_ms,
+            )
+            .map_err(store_error)?;
+        drop(owner);
+        self.shared.wake.notify_one();
+        Ok(receipt)
+    }
+}
+
 type CleanupFuture =
     Pin<Box<dyn Future<Output = Result<CleanupEvidence, CoordinatorError>> + Send>>;
 // Private bundle: both callbacks capture the same immutable Fake instance.
@@ -124,6 +213,12 @@ type DriverFactory =
     Arc<dyn Fn(&QualifiedInitializeWork) -> Result<Arc<Driver>, CoordinatorError> + Send + Sync>;
 
 impl OwnedCoordinator {
+    pub fn commands(&self) -> CoordinatorCommands {
+        CoordinatorCommands {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// First bounded lane: qualified Fake only. Construction has no engine I/O,
     /// and uses the immutable validated binding, never a profile lookup.
     pub fn spawn_fake(
@@ -234,7 +329,7 @@ impl OwnedCoordinator {
             let status = result.unwrap_or_else(|_| {
                 WorkerStatus::Failed("worker panicked; durable arm retained".into())
             });
-            task_shared.accepting.store(false, Ordering::Release);
+            task_shared.close_admission();
             status_tx.send_replace(status.clone());
             task_shared.changed.notify_waiters();
             status
@@ -260,11 +355,11 @@ impl OwnedCoordinator {
             .clone()
             .try_acquire_owned()
             .map_err(|_| CoordinatorError::Busy)?;
-        let owner = self
-            .shared
-            .owner
-            .lock()
-            .map_err(|_| self.shared.fail("ownership mutex poisoned"))?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            // PoisonError owns the guard; release it before fail reacquires.
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
         if !self.shared.accepting.load(Ordering::Acquire)
             || !self.shared.initializing.load(Ordering::Acquire)
         {
@@ -273,7 +368,7 @@ impl OwnedCoordinator {
         let accepted = owner
             .store()
             .accept_qualified_start(owner.session(), fence, (self.shared.clock)()?, deadline_ms)
-            .map_err(|error| self.shared.store_error(error))?;
+            .map_err(|error| self.shared.store_error(&owner, error))?;
         drop(owner);
         self.shared.wake.notify_one();
         Ok(InitializeObserver {
@@ -303,11 +398,11 @@ impl OwnedCoordinator {
             .clone()
             .try_acquire_owned()
             .map_err(|_| CoordinatorError::Busy)?;
-        let owner = self
-            .shared
-            .owner
-            .lock()
-            .map_err(|_| self.shared.fail("ownership mutex poisoned"))?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            // PoisonError owns the guard; release it before fail reacquires.
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(CoordinatorError::Stopped(format!("{:?}", self.status())));
         }
@@ -321,7 +416,7 @@ impl OwnedCoordinator {
                 (self.shared.clock)()?,
                 deadline_ms,
             )
-            .map_err(|e| self.shared.store_error(e))?;
+            .map_err(|e| self.shared.store_error(&owner, e))?;
         drop(owner);
         self.shared.wake.notify_one();
         Ok(CleanupObserver {
@@ -332,7 +427,7 @@ impl OwnedCoordinator {
     }
 
     pub async fn shutdown(mut self) -> Result<WorkerStatus, CoordinatorError> {
-        self.shared.accepting.store(false, Ordering::Release);
+        self.shared.close_admission();
         self.stop.send_replace(true);
         self.task
             .take()
@@ -343,7 +438,7 @@ impl OwnedCoordinator {
 }
 impl Drop for OwnedCoordinator {
     fn drop(&mut self) {
-        self.shared.accepting.store(false, Ordering::Release);
+        self.shared.close_admission();
         self.stop.send_replace(true);
     }
 }
@@ -456,17 +551,43 @@ impl CleanupObserver {
 }
 
 impl Shared {
+    fn close_admission(&self) {
+        // Serialize closure with the entire command lookup/check/commit boundary.
+        // Recover a poisoned guard only to close admission, never to access Store.
+        let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn set_initializing(&self, initializing: bool) {
+        let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        self.initializing.store(initializing, Ordering::Release);
+    }
+
     fn fail(&self, message: impl Into<String>) -> CoordinatorError {
+        let owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        self.fail_locked(&owner, message)
+    }
+
+    // Callers already holding the owned Store mutex must not acquire it again.
+    fn fail_locked(
+        &self,
+        _owner: &crate::ownership::OwnedCoordinatorState,
+        message: impl Into<String>,
+    ) -> CoordinatorError {
         self.accepting.store(false, Ordering::Release);
         self.wake.notify_one();
         CoordinatorError::Service(message.into())
     }
-    fn store_error(&self, error: LifecycleError) -> CoordinatorError {
+    fn store_error(
+        &self,
+        owner: &crate::ownership::OwnedCoordinatorState,
+        error: LifecycleError,
+    ) -> CoordinatorError {
         if matches!(
             error,
             LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
         ) {
-            self.fail(error.to_string())
+            self.fail_locked(owner, error.to_string())
         } else {
             CoordinatorError::Service(error.to_string())
         }
@@ -488,12 +609,12 @@ impl Shared {
         let shared = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let owner = shared
-                .owner
-                .lock()
-                .map_err(|_| shared.fail("ownership mutex poisoned"))?;
+            let owner = shared.owner.lock().map_err(|error| {
+                drop(error);
+                shared.fail("ownership mutex poisoned")
+            })?;
             let now = (shared.clock)()?;
-            action(&owner, now).map_err(|error| shared.store_error(error))
+            action(&owner, now).map_err(|error| shared.store_error(&owner, error))
         })
         .await
         .map_err(|_| self.fail("Store task panicked"))?
@@ -533,7 +654,7 @@ async fn run(
                         .is_some_and(|(binding, _)| binding == &cleanup.binding_id)
                     {
                         paused = None;
-                        shared.initializing.store(true, Ordering::Release);
+                        shared.set_initializing(true);
                         status_tx.send_replace(WorkerStatus::Running);
                     }
                     shared.changed.notify_waiters();
@@ -589,7 +710,7 @@ async fn run(
         match result {
             Ok(Ok(())) => shared.changed.notify_waiters(),
             failure => {
-                shared.initializing.store(false, Ordering::Release);
+                shared.set_initializing(false);
                 let reason = match failure {
                     Ok(Err(error)) => error.to_string(),
                     _ => "worker step panicked".into(),

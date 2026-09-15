@@ -17,11 +17,19 @@ not per task. Focused TDD and integration verification continue throughout.
 - `2c2b491`: bounded coherent historical operation lookup.
 - `8f238c9`: bounded F2C latency summaries with separate failures and timeouts.
 - `d430074`: owned ordinary Fake cleanup through verified durable release.
+- `2aff45e`: scoped Start receipts preserved across cleanup and replacement.
+- `949609b`: versioned private native launch scope from persisted execution.
+- `ae919db`: isolated Python 3.12.3 decoder verification on host-a.
 
 Scoped Start command receipts now pass root integration verification. Exact
 retries preserve the original operation, joined value and deadline after Ready,
 verified cleanup, replacement and valid session rotation. Historical reads grant
 no execution authority; current resource-policy gates still govern new acceptance.
+The owned worker now provides bounded command handles. Exact receipt history is
+read before current admission flags; fresh commands serialize with shutdown,
+Drop, initialization pause and fatal closure. Typed Store errors remain available
+to the future HTTP adapter. Retained handles keep the owned state/process lock
+for historical reads but cannot restart execution.
 
 The owned Fake cleanup worker passes root integration verification. It retains
 the original instance, waits for Initialize to exit,
@@ -30,8 +38,8 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Remaining implementation and verification
 
-1. Connect scoped Start receipts to bounded owned worker admission and shutdown
-   ordering before exposing idempotent management lifecycle actions.
+1. Expose authenticated lifecycle actions through the owned command boundary,
+   preserving scoped retries, service-resolved fences and typed public errors.
 2. Complete ordinary warm lifecycle, sequence/preinitialization, no-spawn
    terminalization, missing-association cleanup and restart reconciliation.
 3. Complete owned candidate execution and API actions/inference, durable router
@@ -48,12 +56,16 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Latest scoped root verification: Store 202, controller 161 and management 42
-tests pass (405 total), plus three-crate all-target Clippy. Tests used four
-threads to bound concurrent fixture load; internal race tests remain enabled.
-The unchanged adapters' 88 tests passed in the preceding cleanup slice. The 22
-harness tests and 213 Python runtime tests passed in their respective slices.
-These are not native qualification results.
+Latest scoped root verification: Store 202, controller library 52 and management
+42 tests pass (296 total), plus three-crate all-target Clippy. Eight new command
+tests are included in those 52. The four Start receipt integration tests also
+pass after shared decoder extraction. The preceding full core run passed 405
+tests before this eight-test addition; this is not a claim of another full run.
+Tests used four threads to bound concurrent fixture load; internal race tests
+remain enabled. Separate native-scope verification passed 15 runtime-binding and
+216 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
+Python 3.12.3. The unchanged adapters' 88 tests and harness's 22 tests passed in
+their respective preceding slices. None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier

@@ -6,6 +6,9 @@ use std::sync::{atomic::AtomicI64, Mutex};
 #[path = "tests_cleanup.rs"]
 mod cleanup;
 
+#[path = "tests_start_command.rs"]
+mod start_command;
+
 #[path = "../../tests/qualification_support/fixture.rs"]
 mod fixture;
 
