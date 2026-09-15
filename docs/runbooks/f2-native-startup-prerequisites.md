@@ -51,8 +51,11 @@ findings. This does not complete F2B or qualify a native engine.
   peer identity, validates the closed response and same-namespace monotonic time,
   and requires terminal EOF within one deadline. All 39 launcher tests pass,
   including actual Python transport interoperability with synthetic saver facts.
-  Listener provisioning, startup attachment, complete enrollment, and durable
-  consumption remain open. No transport result grants lifecycle authority.
+  The scheduler-side listener now creates only a fresh protected 0600 Unix socket,
+  retaining one thread and transport instance. Eight CPU tests cover custody and
+  shutdown; all 208 runtime tests pass, and the Rust interoperability test uses
+  this listener. Trusted path provisioning, startup attachment, complete enrollment,
+  and durable consumption remain open. No transport result grants lifecycle authority.
 - Typed single-effect controls are implemented in `6c78908`, with deterministic
   tests only; production observations and coordinator persistence remain open.
   Complete forwarding, coordinator/API/CLI integration, and F2C

@@ -51,7 +51,37 @@ all imported code, or authorize native startup. No native entrypoint is enabled
 by their presence. Effective recipe checks, physical placement, worker enrollment,
 and actual saver/allocation evidence remain independent obligations.
 
-## Checkpoint verification
+## Scheduler allocation observation transport
+
+The observation path composes an enrolled scheduler's existing saver instance,
+`sglang_scheduler_observer` safe-point bridge, `sglang_observation_transport`
+framing/authentication, and `sglang_observation_server` protected Unix listener.
+No helper imports an engine or converts allocation facts into Ready, idle,
+release, residency, or qualification evidence. Actual startup attachment and
+complete process enrollment remain required.
+
+`SchedulerObservationServer.start(...)` requires the exact current scheduler
+identity and a separately enrolled live controller identity. It creates a new
+socket only, under a canonical service-owned 0700 directory with protected
+ancestors. Existing files/sockets are never adopted, replaced or repaired. The
+socket is 0600, descriptors are non-inheritable, and one worker handles accepted
+connections through one retained transport instance. The existing bounded replay
+set therefore spans connections rather than resetting on each accept.
+
+Retain the server for the scheduler lifetime. `close()` interrupts socket I/O and
+waits at most three seconds for the worker. If a bridge or kernel call remains
+stalled, close reports a generic error and retains custody until a later close
+can confirm the thread ended. Successful close removes only the unchanged owned
+socket; a replaced path is never unlinked. This is transport shutdown, not engine
+cleanup or proof of memory release. Root/service UID and descriptor custody remain
+trusted assumptions; the listener is not a sandbox against either.
+
+The Rust `NativeObservationClient` interoperability fixture now uses this actual
+listener and transport with synthetic saver facts in an isolated CPU Python
+process. Eight listener tests and the full 208 runtime tests pass. No GPU or
+native engine is loaded by those checks.
+
+## Checkpoint verification contract
 
 This module performs a bounded observation of one fixed checkpoint contract. It
 does not qualify an engine or authorize a launch.
