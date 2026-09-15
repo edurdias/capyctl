@@ -4,6 +4,17 @@ use super::*;
 pub(super) const ERROR_CODE: &str = "deadline_expired_unarmed";
 
 fn no_effects(tx: &Transaction<'_>, p: &Plan) -> Result<(), LifecycleError> {
+    no_effects_with_successor(tx, p, None, true)
+}
+
+// Only the closed unarmed Stop validator may admit its separately validated
+// successor. Historical reads ignore a replacement's current ownership.
+pub(super) fn no_effects_with_successor(
+    tx: &Transaction<'_>,
+    p: &Plan,
+    successor: Option<(&str, &str)>,
+    current: bool,
+) -> Result<(), LifecycleError> {
     if p.execution.is_some() {
         return Err(LifecycleError::Conflict);
     }
@@ -11,12 +22,12 @@ fn no_effects(tx: &Transaction<'_>, p: &Plan) -> Result<(), LifecycleError> {
         "SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?1 AND identities_json='[]')
          AND NOT EXISTS(SELECT 1 FROM owned_launch_associations WHERE step_id=?2 OR binding_id=?1 OR incarnation=?3)
          AND NOT EXISTS(SELECT 1 FROM lifecycle_evidence WHERE step_id IN (SELECT id FROM lifecycle_steps WHERE id=?2 OR binding_id=?1))
-         AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE (id=?2 OR binding_id=?1) AND (state IN ('armed','uncertain','completed') OR grant_id IS NOT NULL))
-         AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?4)
-         AND NOT EXISTS(SELECT 1 FROM resource_owners WHERE owner_id=?5)
-         AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?5)
-         AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE binding_id=?1 AND id!=?2)",
-        params![p.binding_id,p.step_id,p.incarnation,p.operation_id,p.deployment_id],
+         AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE (id=?2 OR binding_id=?1) AND (state IN ('armed','uncertain') OR (state='completed' AND id IS NOT ?6) OR grant_id IS NOT NULL))
+         AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?4 OR operation_id=?7)
+         AND ((?8=0 AND EXISTS(SELECT 1 FROM deployments WHERE id=?5 AND (revision>?9 OR current_generation>?10+1))) OR NOT EXISTS(SELECT 1 FROM resource_owners WHERE owner_id=?5))
+         AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?5 AND (?8 OR (revision<=?9 AND generation<=?10+1)))
+         AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE binding_id=?1 AND id!=?2 AND id IS NOT ?6)",
+        params![p.binding_id,p.step_id,p.incarnation,p.operation_id,p.deployment_id,successor.map(|s|s.0),successor.map(|s|s.1),current,p.revision,p.generation],
         |r| r.get(0),
     )?;
     if !clean {

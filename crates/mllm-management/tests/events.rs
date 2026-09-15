@@ -12,6 +12,68 @@ const INFERENCE: &str = "inference-credential-0123456789012345678901";
 mod qualification_fixture;
 
 #[tokio::test]
+async fn unarmed_stop_writer_events_replay_to_sse_without_cleanup_epoch() {
+    let source = qualification_fixture::owned_source().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stop.sqlite3");
+    std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();
+    let writer = Store::open(&path).unwrap();
+    let session = writer.begin_coordinator_session().unwrap();
+    writer
+        .accept_qualified_start(&session, &source.fence, 1800, 10000)
+        .unwrap();
+    let cursor = writer.snapshot().unwrap().cursor.to_string();
+    let stop = writer
+        .accept_ordinary_stop_command(
+            &session,
+            "owner",
+            &source.fence.deployment_id,
+            1,
+            "stop",
+            1900,
+            10000,
+        )
+        .unwrap();
+    writer
+        .complete_unarmed_stop(&session, &stop.step_id)
+        .unwrap();
+    let app = read_only_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(StoreSnapshotSource::new(Store::open(&path).unwrap())),
+    );
+    let response = app
+        .oneshot(
+            request(&format!("/management/v1/events?after={cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body().into_data_stream();
+    for (kind, transition) in [
+        ("ordinary_unarmed_stop_accepted", "unarmed_stop_accepted"),
+        ("ordinary_unarmed_stop_completed", "unarmed_stop_completed"),
+    ] {
+        let frame = next(&mut body).await;
+        assert!(frame.contains(&format!("event: {kind}\n")), "{frame}");
+        assert!(
+            frame.contains(&format!("\"transition\":\"{transition}\"")),
+            "{frame}"
+        );
+        assert!(
+            frame.contains(&format!("\"operation_id\":\"{}\"", stop.operation_id)),
+            "{frame}"
+        );
+        assert!(frame.contains("\"committed_epoch\":null"), "{frame}");
+    }
+    writer.begin_coordinator_session().unwrap();
+    assert!(next(&mut body)
+        .await
+        .contains("event: coordinator_session_started\n"));
+}
+
+#[tokio::test]
 async fn expired_unarmed_writer_event_replays_and_stream_continues() {
     let source = qualification_fixture::owned_source().await;
     let dir = tempfile::tempdir().unwrap();

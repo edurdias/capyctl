@@ -1,5 +1,6 @@
 //! Explicit Stop authority for the original owned Qualified Fake incarnation.
 //! An arm permits one control only after the worker has awaited predecessor exit.
+use super::unarmed_stop::OrdinaryStopReceipt;
 use super::*;
 use crate::candidate_creation::cleanup::{CleanupExecutionContext, CleanupMode};
 use crate::events::OrdinaryCleanupTransition;
@@ -75,10 +76,10 @@ struct CleanupPlan {
     issued_at_ms: Option<i64>,
 }
 
-fn scope(deployment: &str) -> String {
+pub(super) fn scope(deployment: &str) -> String {
     format!("POST:/management/v1/deployments/{deployment}/actions")
 }
-fn hash(
+pub(super) fn hash(
     principal: &str,
     target: &DeploymentFence,
     deadline: i64,
@@ -494,11 +495,11 @@ impl crate::Store {
         revision: i64,
         key: &str,
         deadline: i64,
-    ) -> Result<Option<OrdinaryCleanupReceipt>, LifecycleError> {
+    ) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
         super::receipt::check_request(principal, deployment, revision, key, deadline)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, s)?;
-        lookup(
+        command_lookup(
             &tx,
             principal,
             &DeploymentFence {
@@ -522,14 +523,14 @@ impl crate::Store {
         key: &str,
         now: i64,
         deadline: i64,
-    ) -> Result<OrdinaryCleanupReceipt, LifecycleError> {
+    ) -> Result<OrdinaryStopReceipt, LifecycleError> {
         super::receipt::check_request(principal, deployment, revision, key, deadline)?;
         if now < 0 {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        if let Some(receipt) = lookup(
+        if let Some(receipt) = command_lookup(
             &tx,
             principal,
             &DeploymentFence {
@@ -544,11 +545,17 @@ impl crate::Store {
         }
         let fence = super::receipt::command_fence(&tx, deployment, revision)?;
         super::check_managed_command_target(&tx, deployment)?;
+        if let Some(receipt) =
+            super::unarmed_stop::accept(&tx, s, principal, &fence, key, now, deadline)?
+        {
+            tx.commit()?;
+            return Ok(receipt);
+        }
         let receipt = Self::accept_ordinary_cleanup_in_transaction(
             &tx, s, principal, &fence, key, now, deadline,
         )?;
         tx.commit()?;
-        Ok(receipt)
+        Ok(receipt.into())
     }
 
     /// Exact receipts replay independently of the service-resolved generation.
@@ -717,6 +724,22 @@ fn lookup(
     key: &str,
     deadline: i64,
 ) -> Result<Option<OrdinaryCleanupReceipt>, LifecycleError> {
+    let receipt = command_lookup(tx, principal, f, key, deadline)?;
+    receipt
+        .map(|r| {
+            let (p, _, _) = read(tx, &r.step_id).map_err(super::receipt::historical_error)?;
+            Ok(p.receipt)
+        })
+        .transpose()
+}
+
+fn command_lookup(
+    tx: &Transaction<'_>,
+    principal: &str,
+    f: &DeploymentFence,
+    key: &str,
+    deadline: i64,
+) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
     let request_hash = hash(principal, f, deadline)?;
     let prior = {
         let mut statement = tx.prepare("SELECT request_hash,operation_id,response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3")?;
@@ -737,6 +760,20 @@ fn lookup(
     if old != request_hash {
         return Err(LifecycleError::IdempotencyConflict);
     }
+    let kind = {
+        let mut statement = tx.prepare("SELECT kind FROM operations WHERE id=?1")?;
+        let mut rows = statement.query([&operation])?;
+        let row = rows.next()?.ok_or(LifecycleError::CorruptStoredData)?;
+        super::receipt::bounded_text(row, 0, 64)?
+    };
+    match kind.as_str() {
+        "ordinary_unarmed_stop" => {
+            return super::unarmed_stop::lookup(tx, principal, f, key, deadline, &operation, &raw)
+                .map(Some)
+        }
+        "ordinary_cleanup" => {}
+        _ => return Err(LifecycleError::CorruptStoredData),
+    }
     let receipt: OrdinaryCleanupReceipt = decode(&raw)?;
     let (p, _, _) = read(tx, &receipt.step_id).map_err(super::receipt::historical_error)?;
     if p.receipt != receipt
@@ -749,7 +786,7 @@ fn lookup(
     {
         return Err(LifecycleError::CorruptStoredData);
     }
-    Ok(Some(receipt))
+    Ok(Some(receipt.into()))
 }
 
 pub(crate) fn complete(

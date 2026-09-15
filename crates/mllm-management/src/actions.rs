@@ -119,9 +119,9 @@ impl ActionSource for OwnedActionSource {
                     )
                     .map_err(command_failure)?;
                 Ok(ActionReceipt {
-                    operation_id: receipt.operation_id,
+                    operation_id: receipt.operation_id().into(),
                     deployment_id: deployment.into(),
-                    revision: receipt.revision,
+                    revision: receipt.revision(),
                     joined: false,
                 })
             }

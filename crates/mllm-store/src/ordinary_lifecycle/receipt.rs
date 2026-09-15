@@ -155,6 +155,18 @@ fn historical(tx: &Transaction<'_>, stored: &StoredReceipt) -> Result<(), Lifecy
     {
         return Err(LifecycleError::CorruptStoredData);
     }
+    historical_source(tx, &p)
+}
+
+pub(super) fn historical_source(tx: &Transaction<'_>, p: &Plan) -> Result<(), LifecycleError> {
+    if p.version != 1
+        || p.revision < 1
+        || p.generation < 1
+        || p.accepted_at_ms < 0
+        || p.deadline_ms <= p.accepted_at_ms
+    {
+        return Err(LifecycleError::CorruptStoredData);
+    }
     for id in [
         &p.operation_id,
         &p.step_id,

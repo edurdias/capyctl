@@ -213,7 +213,7 @@ pub(crate) fn insert_owned_cleanup_run(
     deadline: i64,
     kind: &str,
 ) -> Result<(), LifecycleError> {
-    if !matches!(kind, "candidate_cleanup" | "ordinary_cleanup") {
+    if !matches!(kind, "candidate_cleanup" | "ordinary_cleanup" | "ordinary_unarmed_stop") {
         return Err(LifecycleError::Invalid);
     }
     fenced(tx, session, target)?;

@@ -433,6 +433,8 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         | "qualified_initialize_expired_unarmed"
         | "ordinary_cleanup_accepted"
         | "ordinary_cleanup_armed"
+        | "ordinary_unarmed_stop_accepted"
+        | "ordinary_unarmed_stop_completed"
         | "ordinary_cleanup_completed" => &[
             "transition",
             "operation_id",
@@ -456,6 +458,8 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         "ordinary_cleanup_accepted" => Some("cleanup_accepted"),
         "ordinary_cleanup_armed" => Some("cleanup_armed"),
         "ordinary_cleanup_completed" => Some("cleanup_completed"),
+        "ordinary_unarmed_stop_accepted" => Some("unarmed_stop_accepted"),
+        "ordinary_unarmed_stop_completed" => Some("unarmed_stop_completed"),
         _ => None,
     };
     if let Some(transition) = qualified_transition {

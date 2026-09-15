@@ -3,6 +3,8 @@ use mllm_store::lifecycle::LifecycleError;
 
 #[path = "expired_unarmed.rs"]
 mod expired_unarmed;
+#[path = "unarmed_stop.rs"]
+mod unarmed_stop;
 
 async fn fixture() -> (
     Store,

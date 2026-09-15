@@ -13,6 +13,7 @@ use mllm_store::{
     candidate_creation::cleanup::CleanupExecutionContext,
     lifecycle::{DeploymentFence, LifecycleError},
     ordinary_lifecycle::cleanup::{OrdinaryCleanupReceipt, OrdinaryCleanupStatus},
+    ordinary_lifecycle::unarmed_stop::OrdinaryStopReceipt,
     ordinary_lifecycle::worker::{
         QualifiedInitializePoll, QualifiedInitializeStatus, QualifiedInitializeWork,
     },
@@ -145,7 +146,7 @@ impl CoordinatorCommands {
         expected_revision: i64,
         key: &str,
         requested_deadline_ms: i64,
-    ) -> Result<OrdinaryCleanupReceipt, CoordinatorCommandError> {
+    ) -> Result<OrdinaryStopReceipt, CoordinatorCommandError> {
         let _permit = self
             .shared
             .observers
@@ -707,6 +708,35 @@ async fn run(
         if !shared.accepting.load(Ordering::Acquire) {
             return WorkerStatus::Failed("service stopped accepting work".into());
         }
+        // This loop owns the sole Initialize task. Reaching discovery means
+        // that task has exited, including any pre-arm observation future.
+        let unarmed = shared
+            .read(|owner, _| {
+                let Some(work) = owner.store().next_unarmed_stop(owner.session())? else {
+                    return Ok(None);
+                };
+                owner
+                    .store()
+                    .complete_unarmed_stop(owner.session(), &work.step_id)?;
+                Ok(Some(work))
+            })
+            .await;
+        match unarmed {
+            Ok(Some(work)) => {
+                if paused
+                    .as_ref()
+                    .is_some_and(|(binding, _)| binding == &work.binding_id)
+                {
+                    paused = None;
+                    shared.set_initializing(true);
+                    status_tx.send_replace(WorkerStatus::Running);
+                }
+                shared.changed.notify_waiters();
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => return WorkerStatus::Failed(error.to_string()),
+        }
         let cleanup = match shared
             .read(|owner, _| owner.store().next_ordinary_cleanup(owner.session()))
             .await
@@ -842,9 +872,16 @@ async fn run(
                         let predecessor = work.step_id().to_owned();
                         match shared
                             .read(move |owner, _| {
+                                if let Some(receipt) = owner
+                                    .store()
+                                    .unarmed_stop_for_predecessor(owner.session(), &predecessor)?
+                                {
+                                    return Ok(Some(receipt));
+                                }
                                 owner
                                     .store()
                                     .ordinary_cleanup_for_predecessor(owner.session(), &predecessor)
+                                    .map(|r| r.map(Into::into))
                             })
                             .await
                         {

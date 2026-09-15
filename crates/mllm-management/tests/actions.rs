@@ -40,6 +40,17 @@ async fn setup() -> (
     String,
     axum::Router,
 ) {
+    setup_with_observations(None).await
+}
+async fn setup_with_observations(
+    observations: Option<Arc<dyn ServiceObservation>>,
+) -> (
+    tempfile::TempDir,
+    Arc<Mutex<OwnedCoordinatorState>>,
+    OwnedCoordinator,
+    String,
+    axum::Router,
+) {
     let source = fixture::owned_source().await;
     let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -49,7 +60,7 @@ async fn setup() -> (
     let owner = Arc::new(Mutex::new(OwnedCoordinatorState::open(dir.path()).unwrap()));
     let worker = OwnedCoordinator::spawn_fake(
         owner.clone(),
-        Arc::new(Observations(source.observations.clone())),
+        observations.unwrap_or_else(|| Arc::new(Observations(source.observations.clone()))),
         Arc::new(|| Ok::<_, CoordinatorError>(1900)),
         CoordinatorOptions::default(),
     )
@@ -67,6 +78,117 @@ async fn setup() -> (
         Arc::new(OwnedActionSource::new(configuration, worker.commands()).unwrap()),
     );
     (dir, owner, worker, source.fence.deployment_id.clone(), app)
+}
+
+struct BeforeArm {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+impl ServiceObservation for BeforeArm {
+    fn observe(&self, _: String) -> ObservationFuture {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+            Ok(vec![])
+        })
+    }
+}
+
+#[tokio::test]
+async fn authenticated_stop_before_arm_retains_until_old_task_exits_without_effects() {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (dir, owner, worker, id, app) = setup_with_observations(Some(Arc::new(BeforeArm {
+        entered: entered.clone(),
+        release: release.clone(),
+    })))
+    .await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let epoch = owner
+        .lock()
+        .unwrap()
+        .store()
+        .resource_snapshot()
+        .unwrap()
+        .epoch;
+    let start = value(
+        app.clone()
+            .oneshot(request(&id, "start", "start"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let response = app
+        .clone()
+        .oneshot(request(&id, "stop", "stop"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202, "{}", value(response).await);
+    let stop = value(
+        app.clone()
+            .oneshot(request(&id, "stop", "stop"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let retained: (String, String, i64, i64) = sql.query_row("SELECT d.desired_state,b.state,d.current_generation,(SELECT COUNT(*) FROM endpoint_leases WHERE binding_id=b.id) FROM deployments d JOIN runtime_bindings b ON b.deployment_id=d.id WHERE d.id=?1 AND b.state!='released'",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(retained, ("stopped".into(), "reserved".into(), 2, 1));
+    assert_eq!(
+        sql.query_row(
+            "SELECT state FROM operations WHERE id=?1",
+            [stop["operation_id"].as_str().unwrap()],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "pending"
+    );
+    release.add_permits(1);
+    operation(&owner, stop["operation_id"].as_str().unwrap()).await;
+    assert_eq!(
+        sql.query_row(
+            "SELECT error_code FROM operations WHERE id=?1",
+            [start["operation_id"].as_str().unwrap()],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "stopped_before_initialize_armed"
+    );
+    assert_eq!(
+        sql.query_row("SELECT COUNT(*) FROM endpoint_leases", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(sql.query_row("SELECT COUNT(*) FROM lifecycle_evidence WHERE step_id IN (SELECT id FROM lifecycle_steps WHERE operation_id IN (?1,?2))",rusqlite::params![start["operation_id"].as_str().unwrap(),stop["operation_id"].as_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(
+        owner
+            .lock()
+            .unwrap()
+            .store()
+            .resource_snapshot()
+            .unwrap()
+            .epoch,
+        epoch
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while worker.status() != mllm_controller::coordinator::WorkerStatus::Running {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.shutdown().await.unwrap();
+    assert_eq!(
+        value(app.oneshot(request(&id, "stop", "stop")).await.unwrap()).await,
+        stop
+    );
 }
 fn request(id: &str, key: &str, action: &str) -> Request<Body> {
     Request::builder()

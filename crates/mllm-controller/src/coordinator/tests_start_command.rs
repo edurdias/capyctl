@@ -2,6 +2,107 @@ use super::*;
 use mllm_store::ordinary_lifecycle::QualifiedStartReceipt;
 use std::sync::atomic::AtomicUsize;
 
+#[tokio::test]
+async fn unarmed_stop_waits_for_old_observation_and_worker_completes_later_work() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let source = fixture::owned_source().await;
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let gate = Gate::new(false);
+    let adapter = gate.clone();
+    let original = fence.deployment_id.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(HeldObservation {
+            entered: entered.clone(),
+            release: release.clone(),
+            observations,
+        }),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+        Arc::new(move |work| {
+            // Driver construction may race the Stop fence, but only a fresh arm
+            // can produce any adapter command. Keep both calls observable.
+            assert!(
+                work.fence().deployment_id == original
+                    || work.fence().deployment_id == source.other.deployment_id
+            );
+            Ok(test_driver(adapter.clone()))
+        }),
+    )
+    .unwrap();
+    let commands = w.commands();
+    let start = commands
+        .start("owner", &fence.deployment_id, 1, "start", 10000)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let stop = commands
+        .stop("owner", &fence.deployment_id, 1, "stop", 10000)
+        .unwrap();
+    let later = commands
+        .start("owner", &source.other.deployment_id, 1, "later", 10000)
+        .unwrap();
+    {
+        let o = owner.lock().unwrap();
+        assert_eq!(
+            o.store()
+                .runtime_binding(&fence.deployment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "reserved"
+        );
+        assert_eq!(
+            o.store()
+                .qualified_initialize_status(o.session(), start.step_id(), 1900)
+                .unwrap(),
+            QualifiedInitializeStatus::Superseded
+        );
+    }
+    release.add_permits(2);
+    gate.entered().await;
+    assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    gate.release.add_permits(1);
+    completed(&owner, &later).await;
+    {
+        let o = owner.lock().unwrap();
+        assert!(o
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            o.store()
+                .snapshot()
+                .unwrap()
+                .operations
+                .iter()
+                .find(|r| r.id == stop.operation_id)
+                .unwrap()
+                .state,
+            "succeeded"
+        );
+        assert_eq!(
+            o.store()
+                .qualified_initialize_status(o.session(), start.step_id(), 1900)
+                .unwrap(),
+            QualifiedInitializeStatus::Superseded
+        );
+    }
+    assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    w.shutdown().await.unwrap();
+    assert_eq!(
+        commands
+            .stop("owner", &fence.deployment_id, 1, "stop", 10000)
+            .unwrap(),
+        stop
+    );
+}
+
 fn command_worker(
     owner: SharedCoordinatorState,
     observations: Vec<MemoryObservation>,

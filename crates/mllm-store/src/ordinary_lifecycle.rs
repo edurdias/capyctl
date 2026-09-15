@@ -2,6 +2,7 @@
 pub mod cleanup;
 mod expiry;
 mod receipt;
+pub mod unarmed_stop;
 pub mod worker;
 use crate::candidate_creation::initialize::ArmResult;
 use crate::candidate_creation::progression::catalog::qualified_effective;

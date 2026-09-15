@@ -62,6 +62,15 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
+    UnarmedStopRecorded {
+        transition: UnarmedStopTransition,
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        step_id: EventOperationId,
+        session_epoch: i64,
+        committed_epoch: Option<u64>,
+    },
+    #[serde(rename = "1")]
     OrdinaryCleanupRecorded {
         transition: OrdinaryCleanupTransition,
         operation_id: EventOperationId,
@@ -172,6 +181,14 @@ pub(crate) enum OrdinaryCleanupTransition {
     #[serde(rename = "cleanup_completed")]
     Completed,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UnarmedStopTransition {
+    #[serde(rename = "unarmed_stop_accepted")]
+    Accepted,
+    #[serde(rename = "unarmed_stop_completed")]
+    Completed,
+}
 #[derive(Clone)]
 pub(crate) struct EventOperationId(String);
 #[derive(Serialize)]
@@ -222,6 +239,10 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::UnarmedStopRecorded { transition, .. } => match transition {
+                UnarmedStopTransition::Accepted => "ordinary_unarmed_stop_accepted",
+                UnarmedStopTransition::Completed => "ordinary_unarmed_stop_completed",
+            },
             Self::OrdinaryCleanupRecorded { transition, .. } => match transition {
                 OrdinaryCleanupTransition::Accepted => "ordinary_cleanup_accepted",
                 OrdinaryCleanupTransition::Armed => "ordinary_cleanup_armed",
@@ -249,7 +270,8 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
-            Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
+            Self::UnarmedStopRecorded { operation_id, deployment_id, .. }
+            | Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::QualifiedLifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CandidateLifecycleRecorded {
@@ -293,6 +315,11 @@ fn append_event_at(
     event: &EventMetadata,
     at: i64,
 ) -> Result<i64, EventWriteError> {
+    if let EventMetadata::UnarmedStopRecorded { session_epoch, committed_epoch, .. } = event {
+        if *session_epoch <= 0 || committed_epoch.is_some() {
+            return Err(EventWriteError::InvalidMetadata);
+        }
+    }
     if let EventMetadata::OrdinaryCleanupRecorded { transition, committed_epoch, session_epoch, .. } = event {
         if *session_epoch <= 0 || match transition {
             OrdinaryCleanupTransition::Completed => committed_epoch.is_none_or(|epoch| epoch == 0),

@@ -33,6 +33,12 @@ before releasing unused endpoint and binding reservations. No memory release,
 cleanup evidence or ledger epoch is invented. Armed uncertainty remains retained.
 Expiry events replay through the management SSE stream.
 
+Explicit Stop before Initialize arms also passes root integration. Acceptance
+fences generation and retains reservations; the owned worker releases only after
+the prior task exits and a separate atomic no-effect proof succeeds. It records
+distinct Stop history and SSE events without cleanup evidence or a memory epoch.
+Associated runtime cleanup remains unchanged. Armed unassociated work is retained.
+
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
 trusted principal and bounded command capacity. Stop resolves generation in its
@@ -60,8 +66,8 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 1. Complete ordinary warm lifecycle, sequence/preinitialization, no-spawn
    terminalization, missing-association cleanup and restart reconciliation.
-   Expired, never-armed Initialize terminalization is implemented. The next bounded
-   unit is explicit Stop before Initialize arms, with separate acceptance and release.
+   Expiry and explicit Stop for never-armed Initialize are implemented. Other
+   no-spawn states and missing-association/restart recovery remain open.
 2. Complete owned candidate execution and API actions/inference, durable router
    accounting, management read models/policy/attachments/listener, and CLI cutover.
    Retire legacy authority only at the joint integration gate.
@@ -76,8 +82,11 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Full core root verification for `3e4bd89`: Store 202, controller 180 and management
-50 tests pass (432 distinct tests), plus three-crate all-target Clippy.
+Full core root verification for the explicit unarmed Stop slice: Store 202,
+controller 187 and management 52 tests pass (441 distinct tests), plus three-crate
+all-target Clippy. Two existing caller-timeout tests failed during the worker's
+concurrent fixture runs, then passed unchanged both in isolated reruns and this
+bounded full core run. No timeout or evidence-freshness limit was changed.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark

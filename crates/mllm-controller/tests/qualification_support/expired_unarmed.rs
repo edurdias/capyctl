@@ -187,7 +187,7 @@ async fn expired_unarmed_rejects_contradictions_and_stale_ownership_without_rele
     assert_eq!(counts(&sql), before);
 }
 
-fn limits(
+pub(super) fn limits(
     store: &Store,
     sql: &rusqlite::Connection,
     id: &str,
