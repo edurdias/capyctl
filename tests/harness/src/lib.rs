@@ -13,6 +13,8 @@ pub mod f2_metrics;
 pub mod f2_correctness;
 pub mod f2_timing;
 pub mod f2_records;
+#[cfg(target_os = "linux")]
+pub mod f2_artifacts;
 
 use mllm_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,

@@ -9,5 +9,7 @@ mllm-adapters = { workspace = true }
 mllm-agent = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
+tempfile = { workspace = true }
