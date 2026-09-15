@@ -564,6 +564,73 @@ async fn cancelled_preflight_retains_workers_and_sanitizes_provider_failure() {
 }
 
 #[tokio::test]
+async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
+    for (kind, transition) in [
+        ("qualified_initialize_accepted", "accepted"),
+        ("qualified_initialize_armed", "armed"),
+        (
+            "qualified_owned_launch_associated",
+            "owned_launch_associated",
+        ),
+        ("qualified_ready_committed", "ready"),
+    ] {
+        for corruption in 0..3 {
+            let source = fake(move |_, _| {
+                let mut e = event(1);
+                e.kind = kind.into();
+                e.operation_id = Some(INCARNATION.into());
+                e.deployment_id = Some(INCARNATION.into());
+                let ready = transition == "ready";
+                let epoch = if ready ^ (corruption == 2) {
+                    serde_json::json!(u64::MAX)
+                } else {
+                    serde_json::Value::Null
+                };
+                e.payload_json = serde_json::json!({
+                    "version":"1", "transition": if corruption == 1 { "wrong" } else { transition },
+                    "operation_id":INCARNATION, "deployment_id":INCARNATION,
+                    "step_id":INCARNATION, "session_epoch":1, "committed_epoch":epoch
+                })
+                .to_string();
+                Ok(page(vec![e], 1))
+            });
+            let response = fake_app(source, options())
+                .oneshot(
+                    request("/management/v1/events")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if corruption == 0 { 200 } else { 500 },
+                "{kind}, corruption {corruption}"
+            );
+            if corruption == 0 {
+                let mut body = response.into_body().into_data_stream();
+                let text = next(&mut body).await;
+                assert!(text.contains(&format!("event: {kind}\n")));
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_str(data).unwrap();
+                assert_eq!(json["payload"]["transition"], transition);
+                assert_eq!(
+                    json["payload"]["committed_epoch"],
+                    if transition == "ready" {
+                        serde_json::json!("18446744073709551615")
+                    } else {
+                        serde_json::Value::Null
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn every_supported_kind_projects_only_known_fields_and_wide_integer_strings() {
     let cases = [
         ("managed_configuration_accepted", "operation_id,deployment_id,revision,generation,session_epoch"),

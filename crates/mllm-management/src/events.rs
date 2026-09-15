@@ -424,7 +424,11 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         | "candidate_park_completed"
         | "candidate_cleanup_accepted"
         | "candidate_cleanup_armed"
-        | "candidate_cleanup_completed" => &[
+        | "candidate_cleanup_completed"
+        | "qualified_initialize_accepted"
+        | "qualified_initialize_armed"
+        | "qualified_owned_launch_associated"
+        | "qualified_ready_committed" => &[
             "transition",
             "operation_id",
             "deployment_id",
@@ -437,6 +441,19 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if input.len() != fields.len() + 1 {
         return Err(Failure::Internal);
     }
+    let qualified_transition = match event.kind.as_str() {
+        "qualified_initialize_accepted" => Some("accepted"),
+        "qualified_initialize_armed" => Some("armed"),
+        "qualified_owned_launch_associated" => Some("owned_launch_associated"),
+        "qualified_ready_committed" => Some("ready"),
+        _ => None,
+    };
+    if let Some(transition) = qualified_transition {
+        let epoch = input.get("committed_epoch").ok_or(Failure::Internal)?;
+        if (transition == "ready") == epoch.is_null() {
+            return Err(Failure::Internal);
+        }
+    }
     let mut payload = Map::new();
     for &field in fields {
         let value = input.get(field).ok_or(Failure::Internal)?;
@@ -447,7 +464,9 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             }
             value.clone()
         } else if field == "transition" {
-            if value.as_str() != event.kind.strip_prefix("candidate_") {
+            if value.as_str()
+                != qualified_transition.or_else(|| event.kind.strip_prefix("candidate_"))
+            {
                 return Err(Failure::Internal);
             }
             value.clone()
