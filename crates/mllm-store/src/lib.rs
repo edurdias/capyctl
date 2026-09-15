@@ -13,6 +13,7 @@ pub mod qualification;
 pub mod resource_ledger;
 pub mod resource_policy;
 pub mod schema;
+pub mod snapshot;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
