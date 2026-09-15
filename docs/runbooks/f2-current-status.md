@@ -26,6 +26,9 @@ not per task. Focused TDD and integration verification continue throughout.
 - `f3a2684`: bounded exact-marker correctness validation for the future F2C runner.
 - `3e4bd89`: expired never-armed Initialize terminalization without runtime effects.
 - `e4e2e95`: separate monotonic request timing validation.
+- `f40abd1`: explicit Stop for never-armed Initialize without runtime cleanup.
+- `c0a07dd`: bounded metadata-only request journals.
+- `e11c3de`: private descriptor-relative artifact storage with a shared byte cap.
 
 Expired, never-armed ordinary Fake Initialize requests now terminalize atomically.
 The worker proves absence of execution, grants, ownership and runtime identities
@@ -38,6 +41,14 @@ fences generation and retains reservations; the owned worker releases only after
 the prior task exits and a separate atomic no-effect proof succeeds. It records
 distinct Stop history and SSE events without cleanup evidence or a memory epoch.
 Associated runtime cleanup remains unchanged. Armed unassociated work is retained.
+
+F2C request journals now serialize only closed outcome codes, numeric corpus
+ordinals and validated monotonic durations. Private artifact storage creates
+exclusive mode-0700 run directories and mode-0600 fixed files relative to a trusted
+parent descriptor. Writers share an at-most100-MiB payload cap and stop on failure;
+partial evidence is retained. Each file requires explicit sync. These helpers do
+not validate a run manifest, prove route identity, authorize effects or complete
+the API-driven runner. Candidate Initialize integration is in progress.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -91,8 +102,9 @@ Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The harness at `e4e2e95` passes all 33 tests and all-target Clippy, including six
-exact-marker and five timing tests. None is native qualification evidence.
+The harness at `e11c3de` passes all 49 tests and all-target Clippy, including six
+exact-marker, five timing, seven journal and nine protected-storage tests.
+None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier
