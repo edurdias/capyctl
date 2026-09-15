@@ -11,6 +11,150 @@ fn fixture() -> (Value, Value) {
 }
 
 #[test]
+fn unchanged_command_replays_after_persisted_policy_and_profile_changes() {
+    let (store, session, mut config, host) = setup();
+    config.as_object_mut().unwrap().remove("request_deadline");
+    let body = json!({"config":config}).to_string();
+    let first = store
+        .create_stopped_managed_configuration(&session, "p", "replay", &body, &host, 1)
+        .unwrap();
+    let mut current = store.resource_policy("lab").unwrap().unwrap();
+    current.controls.queue.request_deadline_ms = 100_000;
+    current.controls.max_parked = 0;
+    store
+        .update_resource_policy(
+            &session,
+            "p",
+            "lab",
+            1,
+            "policy",
+            &current.controls,
+            &[mllm_domain::resources::MemoryObservation {
+                domain: "unified".into(),
+                capacity_bytes: 64 << 30,
+                available_bytes: 60 << 30,
+                sampled_at_ms: 2,
+            }],
+            2,
+        )
+        .unwrap();
+    let mut composed = mllm_config::effective::compose_current_resource_controls(
+        &host,
+        &current.context,
+        &current.controls,
+    )
+    .unwrap();
+    let mut next_config = config.clone();
+    next_config["name"] = json!("next");
+    next_config["routes"] = json!(["next"]);
+    let next = store
+        .create_stopped_managed_configuration(
+            &session,
+            "p",
+            "next",
+            &json!({"config":next_config}).to_string(),
+            &composed,
+            3,
+        )
+        .unwrap();
+    assert_eq!(next.resource_policy_revision, 2);
+    // Historical retries must not depend on a currently available profile.
+    composed["runtime_profiles"] = json!({});
+    assert_eq!(
+        first,
+        store
+            .create_stopped_managed_configuration(&session, "p", "replay", &body, &composed, 3)
+            .unwrap()
+    );
+    assert!(store
+        .create_stopped_managed_configuration(&session, "p", "new", &body, &composed, 3)
+        .is_err());
+    config["runtime_profile"] = json!("other");
+    assert!(matches!(
+        store.create_stopped_managed_configuration(
+            &session,
+            "p",
+            "replay",
+            &json!({"config":config}).to_string(),
+            &composed,
+            3
+        ),
+        Err(ManagedConfigurationError::IdempotencyConflict)
+    ));
+    assert_eq!(store.resource_policy("lab").unwrap().unwrap().revision, 2);
+}
+
+#[test]
+fn v2_command_fingerprint_corruption_is_not_a_valid_retry() {
+    let (store, session, config, host) = setup();
+    let body = json!({"config":config}).to_string();
+    store
+        .create_stopped_managed_configuration(&session, "p", "key", &body, &host, 1)
+        .unwrap();
+    store.conn.execute("UPDATE command_receipts SET response_json=json_set(response_json,'$.command_fingerprint',?1)", ["0".repeat(64)]).unwrap();
+    assert!(matches!(
+        store.create_stopped_managed_configuration(&session, "p", "key", &body, &host, 2),
+        Err(ManagedConfigurationError::CorruptStoredData)
+    ));
+}
+
+#[test]
+fn pre_v2_receipt_keeps_original_resolution_rule_without_rewriting_history() {
+    let (store, session, config, host) = setup();
+    let body = json!({"config":config}).to_string();
+    let first = store
+        .create_stopped_managed_configuration(&session, "p", "key", &body, &host, 1)
+        .unwrap();
+    let effective: Value = serde_json::from_str(
+        &store
+            .conn
+            .query_row("SELECT effective_json FROM effective_revisions", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let legacy_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({"version":1,"scope":"POST /management/v1/deployments/stopped","expected_revision":null,"effective":effective})).unwrap()));
+    let legacy_json = serde_json::to_string(&first).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE command_receipts SET response_json=?1,request_hash=?2",
+            params![legacy_json, legacy_hash],
+        )
+        .unwrap();
+    assert_eq!(
+        first,
+        store
+            .create_stopped_managed_configuration(&session, "p", "key", &body, &host, 2)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT response_json FROM command_receipts", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        legacy_json
+    );
+    let mut changed = config;
+    changed["name"] = json!("different");
+    assert!(matches!(
+        store.create_stopped_managed_configuration(
+            &session,
+            "p",
+            "key",
+            &json!({"config":changed}).to_string(),
+            &host,
+            2
+        ),
+        Err(ManagedConfigurationError::IdempotencyConflict)
+    ));
+}
+
+#[test]
 fn stopped_acceptance_replays_original_receipt_and_never_opens_dispatch() {
     let (config, host) = fixture();
     let store = Store::open_in_memory().unwrap();

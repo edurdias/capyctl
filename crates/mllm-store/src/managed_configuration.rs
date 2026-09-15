@@ -2,7 +2,7 @@
 use crate::dispatch::{check_session, CoordinatorSession};
 use crate::events::{append_event, EventMetadata, EventOperationId};
 use crate::resource_policy::read_singleton_policy;
-use mllm_config::effective::resolve_effective;
+use mllm_config::effective::{deployment_command_fingerprint, resolve_effective};
 use mllm_config::resource_controls::{ResourceContext, ResourceControls};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,14 @@ pub struct ManagedConfigurationReceipt {
     pub generation: i64,
     pub resource_policy_revision: i64,
     pub accepted_at_ms: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredReceiptV2 {
+    version: u8,
+    receipt: ManagedConfigurationReceipt,
+    command_fingerprint: String,
 }
 
 #[derive(Deserialize)]
@@ -150,14 +158,6 @@ impl crate::Store {
         let config =
             mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, raw_config.get())
                 .map_err(|_| ManagedConfigurationError::Invalid)?;
-        let mut effective = resolve_effective(&config, trusted_host)
-            .map_err(|_| ManagedConfigurationError::Invalid)?;
-        effective.routes.sort();
-        let effective_json =
-            serde_json::to_string(&effective).map_err(|_| ManagedConfigurationError::Invalid)?;
-        if effective_json.len() > MAX_BYTES {
-            return Err(ManagedConfigurationError::Invalid);
-        }
         let scope = target.map_or_else(
             || "POST /management/v1/deployments/stopped".to_string(),
             |id| format!("PUT /management/v1/deployments/{id}/stopped-configuration"),
@@ -167,12 +167,33 @@ impl crate::Store {
         } else {
             "managed_configuration_create"
         };
-        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({"version":1,"scope":scope,"expected_revision":expected_revision,"effective":effective})).map_err(|_| ManagedConfigurationError::Invalid)?));
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(|_| ManagedConfigurationError::StaleSession)?;
-        if let Some(receipt) = replay(&tx, principal, &scope, key, &hash, kind, target)? {
+        if let Some(receipt) = replay(
+            &tx,
+            principal,
+            &scope,
+            key,
+            kind,
+            target,
+            expected_revision,
+            &config,
+            trusted_host,
+        )? {
             return Ok(receipt);
         }
+        let mut effective = resolve_effective(&config, trusted_host)
+            .map_err(|_| ManagedConfigurationError::Invalid)?;
+        effective.routes.sort();
+        let effective_json =
+            serde_json::to_string(&effective).map_err(|_| ManagedConfigurationError::Invalid)?;
+        if effective_json.len() > MAX_BYTES {
+            return Err(ManagedConfigurationError::Invalid);
+        }
+        let command_fingerprint =
+            deployment_command_fingerprint(&config, effective.request_deadline_ms)
+                .map_err(|_| ManagedConfigurationError::Invalid)?;
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({"version":2,"scope":scope,"expected_revision":expected_revision,"effective":effective,"command_fingerprint":command_fingerprint})).map_err(|_| ManagedConfigurationError::Invalid)?));
         let policy = read_singleton_policy(&tx, &effective.host.name)
             .map_err(|_| ManagedConfigurationError::PolicyConflict)?
             .ok_or(ManagedConfigurationError::PolicyConflict)?;
@@ -228,7 +249,16 @@ impl crate::Store {
             )?;
         }
         tx.execute("INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) VALUES(?1,?2,?3,?4)",params![receipt.deployment_id,revision,effective_json,effective.qualification_fingerprint])?;
-        persist_receipt(&tx, principal, &scope, key, &hash, &receipt, kind)?;
+        persist_receipt(
+            &tx,
+            principal,
+            &scope,
+            key,
+            &hash,
+            &receipt,
+            kind,
+            &command_fingerprint,
+        )?;
         append_event(
             &tx,
             &EventMetadata::ManagedConfigurationAccepted {
@@ -269,27 +299,46 @@ fn ensure_routes(tx: &Transaction<'_>, name: &str, routes: &[String], own: &str)
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay(
     tx: &Transaction<'_>,
     principal: &str,
     scope: &str,
     key: &str,
-    hash: &str,
     kind: &str,
     target: Option<&str>,
+    requested_revision: Option<i64>,
+    config: &Value,
+    trusted_host: &Value,
 ) -> Result<Option<ManagedConfigurationReceipt>> {
     let row: Option<(String,String,String)> = tx.query_row("SELECT request_hash,operation_id,response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",params![principal,scope,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let Some((stored_hash, operation, body)) = row else {
         return Ok(None);
     };
-    if stored_hash != hash {
-        return Err(ManagedConfigurationError::IdempotencyConflict);
-    }
     if body.len() > MAX_BYTES {
         return Err(ManagedConfigurationError::CorruptStoredData);
     }
-    let receipt: ManagedConfigurationReceipt =
+    let envelope: Value =
         serde_json::from_str(&body).map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
+    let (receipt, command_fingerprint) = if envelope["version"] == 2 {
+        let stored: StoredReceiptV2 = serde_json::from_str(&body)
+            .map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
+        if stored.command_fingerprint.len() != 64
+            || !stored
+                .command_fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ManagedConfigurationError::CorruptStoredData);
+        }
+        (stored.receipt, Some(stored.command_fingerprint))
+    } else {
+        (
+            serde_json::from_str(&body)
+                .map_err(|_| ManagedConfigurationError::CorruptStoredData)?,
+            None,
+        )
+    };
     if receipt.version != 1
         || receipt.operation_id != operation
         || receipt.revision < 1
@@ -317,9 +366,45 @@ fn replay(
     let effective: Value =
         serde_json::from_str(&frozen).map_err(|_| ManagedConfigurationError::CorruptStoredData)?;
     let expected_revision = target.map(|_| receipt.revision - 1);
-    let frozen_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({"version":1,"scope":scope,"expected_revision":expected_revision,"effective":effective})).map_err(|_| ManagedConfigurationError::CorruptStoredData)?));
-    if frozen_hash != hash {
+    let mut frozen_input = json!({"version":1,"scope":scope,"expected_revision":expected_revision,"effective":effective});
+    if let Some(fingerprint) = &command_fingerprint {
+        frozen_input["version"] = json!(2);
+        frozen_input["command_fingerprint"] = json!(fingerprint);
+    }
+    let frozen_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&frozen_input)
+                .map_err(|_| ManagedConfigurationError::CorruptStoredData)?
+        )
+    );
+    if frozen_hash != stored_hash {
         return Err(ManagedConfigurationError::CorruptStoredData);
+    }
+    if requested_revision != expected_revision {
+        return Err(ManagedConfigurationError::IdempotencyConflict);
+    }
+    if let Some(fingerprint) = command_fingerprint {
+        let deadline = effective["request_deadline_ms"]
+            .as_i64()
+            .filter(|v| *v > 0)
+            .ok_or(ManagedConfigurationError::CorruptStoredData)?;
+        let requested = deployment_command_fingerprint(config, deadline)
+            .map_err(|_| ManagedConfigurationError::IdempotencyConflict)?;
+        if requested != fingerprint {
+            return Err(ManagedConfigurationError::IdempotencyConflict);
+        }
+    } else {
+        // Pre-V2 receipts did not retain independent command identity. Preserve
+        // their exact old resolution rule; never rewrite historical receipts.
+        let mut requested = resolve_effective(config, trusted_host)
+            .map_err(|_| ManagedConfigurationError::IdempotencyConflict)?;
+        requested.routes.sort();
+        if serde_json::to_value(requested).map_err(|_| ManagedConfigurationError::Invalid)?
+            != effective
+        {
+            return Err(ManagedConfigurationError::IdempotencyConflict);
+        }
     }
     Ok(Some(receipt))
 }
@@ -349,6 +434,7 @@ fn replacement_fence(tx: &Transaction<'_>, id: &str, expected: i64) -> Result<(i
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_receipt(
     tx: &Transaction<'_>,
     principal: &str,
@@ -357,12 +443,18 @@ fn persist_receipt(
     hash: &str,
     receipt: &ManagedConfigurationReceipt,
     kind: &str,
+    command_fingerprint: &str,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,?3,'succeeded')",
         params![receipt.operation_id, receipt.deployment_id, kind],
     )?;
-    tx.execute("INSERT INTO command_receipts(principal_id,command_scope,idempotency_key,request_hash,operation_id,response_json) VALUES(?1,?2,?3,?4,?5,?6)",params![principal,scope,key,hash,receipt.operation_id,serde_json::to_string(receipt).map_err(|_| ManagedConfigurationError::Invalid)?])?;
+    let stored = StoredReceiptV2 {
+        version: 2,
+        receipt: receipt.clone(),
+        command_fingerprint: command_fingerprint.into(),
+    };
+    tx.execute("INSERT INTO command_receipts(principal_id,command_scope,idempotency_key,request_hash,operation_id,response_json) VALUES(?1,?2,?3,?4,?5,?6)",params![principal,scope,key,hash,receipt.operation_id,serde_json::to_string(&stored).map_err(|_| ManagedConfigurationError::Invalid)?])?;
     Ok(())
 }
 

@@ -2,6 +2,8 @@
 
 pub mod candidate;
 mod core;
+mod current_policy;
+pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
 
 use crate::engine_policy::{validate_profile_args, validate_profile_env};
 use crate::resource_controls::{ResourceContext, ResourceControls};
