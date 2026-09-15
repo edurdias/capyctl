@@ -375,9 +375,9 @@ async fn missing_notification_is_recovered_by_durable_poll() {
 }
 
 #[tokio::test]
-async fn stale_observation_and_expired_queue_block_without_freeing_endpoint() {
+async fn stale_observation_blocks_but_expired_queue_releases_unused_endpoint() {
     for expired in [false, true] {
-        let (_dir, owner, fence, mut observations) = setup().await;
+        let (dir, owner, fence, mut observations) = setup().await;
         let clock = Arc::new(AtomicI64::new(1900));
         {
             let o = owner.lock().unwrap();
@@ -403,22 +403,238 @@ async fn stale_observation_and_expired_queue_block_without_freeing_endpoint() {
             Arc::new(move |_| Ok(test_driver(driver.clone()))),
         )
         .unwrap();
-        assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
+        if expired {
+            let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let failed: bool = sql.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='qualified_initialize' AND state='failed')", [&fence.deployment_id], |r| r.get(0)).unwrap();
+                    if failed { break; }
+                    assert_eq!(w.status(), WorkerStatus::Running);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+        } else {
+            assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
+        }
         assert!(gate.calls.lock().unwrap().is_empty());
         {
             let o = owner.lock().unwrap();
             assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
-            assert_eq!(
-                o.store()
-                    .runtime_binding(&fence.deployment_id)
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                "reserved"
-            );
+            let binding = o.store().runtime_binding(&fence.deployment_id).unwrap();
+            if expired {
+                assert!(binding.is_none());
+            } else {
+                assert_eq!(binding.unwrap().state, "reserved");
+            }
         }
         w.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn expired_unarmed_worker_skips_driver_and_continues_later_queued_work() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let source = fixture::owned_source().await;
+    let (expired, later) = {
+        let o = owner.lock().unwrap();
+        let expired = o
+            .store()
+            .accept_qualified_start(o.session(), &fence, 1800, 1900)
+            .unwrap();
+        let later = o
+            .store()
+            .accept_qualified_start(o.session(), &source.other, 1801, 10000)
+            .unwrap();
+        (expired, later)
+    };
+    let gate = Gate::new(false);
+    let driver = gate.clone();
+    let built = Arc::new(Mutex::new(Vec::new()));
+    let driver_built = built.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+        Arc::new(move |work| {
+            driver_built.lock().unwrap().push(work.step_id().to_owned());
+            Ok(test_driver(driver.clone()))
+        }),
+    )
+    .unwrap();
+    gate.entered().await;
+    assert_eq!(*built.lock().unwrap(), vec![later.step_id.clone()]);
+    assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    {
+        let o = owner.lock().unwrap();
+        assert_eq!(
+            o.store()
+                .qualified_initialize_status(o.session(), &expired.step_id, 1900)
+                .unwrap(),
+            QualifiedInitializeStatus::ExpiredUnarmed
+        );
+        assert!(o
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_none());
+    }
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let status = {
+                let o = owner.lock().unwrap();
+                o.store()
+                    .qualified_initialize_status(o.session(), &later.step_id, 1900)
+                    .unwrap()
+            };
+            if status == QualifiedInitializeStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(w.status(), WorkerStatus::Running);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_unarmed_during_observation_is_rechecked_before_driver_or_arm() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let clock = Arc::new(AtomicI64::new(1900));
+    let read_clock = clock.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(HeldObservation {
+            entered: entered.clone(),
+            release: release.clone(),
+            observations,
+        }),
+        Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))),
+        CoordinatorOptions::default(),
+        Arc::new(|_| panic!("expired observation must not construct driver")),
+    )
+    .unwrap();
+    let observer = w.start(&fence, 10000).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    clock.store(10000, Ordering::SeqCst);
+    release.add_permits(1);
+    assert_eq!(
+        observer.wait(Duration::from_secs(60)).await.unwrap(),
+        QualifiedInitializeStatus::ExpiredUnarmed
+    );
+    {
+        let o = owner.lock().unwrap();
+        assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+        assert!(o
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(w.status(), WorkerStatus::Running);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_unarmed_after_driver_validation_never_arms_or_executes() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let read_clock = clock.clone();
+    let gate = Gate::new(false);
+    let driver = gate.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))),
+        CoordinatorOptions::default(),
+        Arc::new(move |_| {
+            clock.store(10000, Ordering::SeqCst);
+            Ok(test_driver(driver.clone()))
+        }),
+    )
+    .unwrap();
+    let observer = w.start(&fence, 10000).unwrap();
+    assert_eq!(
+        observer.wait(Duration::from_secs(60)).await.unwrap(),
+        QualifiedInitializeStatus::ExpiredUnarmed
+    );
+    assert!(gate.calls.lock().unwrap().is_empty());
+    {
+        let o = owner.lock().unwrap();
+        assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+        assert!(o
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(w.status(), WorkerStatus::Running);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn expired_unarmed_discovery_does_not_require_current_launch_policy() {
+    let (dir, owner, fence, observations) = setup().await;
+    {
+        let o = owner.lock().unwrap();
+        o.store()
+            .accept_qualified_start(o.session(), &fence, 1800, 1900)
+            .unwrap();
+        let policy = o.store().resource_policy("lab").unwrap().unwrap();
+        let mut revoked = policy.controls;
+        revoked.device_sharing = mllm_config::effective::Sharing::Exclusive;
+        for sharing in revoked.device_sharing_overrides.values_mut() {
+            *sharing = mllm_config::effective::Sharing::Exclusive;
+        }
+        o.store()
+            .update_resource_policy(
+                o.session(),
+                "owner",
+                "lab",
+                policy.revision,
+                "expiry-revoke",
+                &revoked,
+                &observations,
+                1900,
+            )
+            .unwrap();
+    }
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+        Arc::new(|_| panic!("expired work must not construct driver")),
+    )
+    .unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let failed: bool = sql.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='qualified_initialize' AND state='failed')", [&fence.deployment_id], |r| r.get(0)).unwrap();
+            if failed { break; }
+            assert_eq!(w.status(),WorkerStatus::Running);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    {
+        let o = owner.lock().unwrap();
+        assert!(o
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_none());
+        assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+    }
+    w.shutdown().await.unwrap();
 }
 
 #[tokio::test]

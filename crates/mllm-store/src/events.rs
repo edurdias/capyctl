@@ -160,6 +160,7 @@ pub(crate) enum QualifiedLifecycleTransition {
     OwnedLaunchAssociated,
     Ready,
     Uncertain,
+    ExpiredUnarmed,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +233,7 @@ impl EventMetadata {
                 QualifiedLifecycleTransition::OwnedLaunchAssociated => "qualified_owned_launch_associated",
                 QualifiedLifecycleTransition::Ready => "qualified_ready_committed",
                 QualifiedLifecycleTransition::Uncertain => "qualified_initialize_uncertain",
+                QualifiedLifecycleTransition::ExpiredUnarmed => "qualified_initialize_expired_unarmed",
             },
             Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
             Self::CandidateLifecycleRecorded { transition, .. } => transition.kind(),

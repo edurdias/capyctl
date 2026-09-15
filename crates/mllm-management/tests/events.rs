@@ -8,6 +8,54 @@ use tower::ServiceExt;
 const MANAGEMENT: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 
+#[path = "../../mllm-controller/tests/qualification_support/fixture.rs"]
+mod qualification_fixture;
+
+#[tokio::test]
+async fn expired_unarmed_writer_event_replays_and_stream_continues() {
+    let source = qualification_fixture::owned_source().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("expiry.sqlite3");
+    std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();
+    let writer = Store::open(&path).unwrap();
+    let session = writer.begin_coordinator_session().unwrap();
+    let accepted = writer
+        .accept_qualified_start(&session, &source.fence, 1800, 1900)
+        .unwrap();
+    let cursor = writer.snapshot().unwrap().cursor.to_string();
+    writer
+        .expire_unarmed_qualified_initialize(&session, &accepted.step_id, 1900)
+        .unwrap();
+    let app = read_only_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(StoreSnapshotSource::new(Store::open(&path).unwrap())),
+    );
+    let response = app
+        .oneshot(
+            request(&format!("/management/v1/events?after={cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = response.into_body().into_data_stream();
+    let first = next(&mut body).await;
+    assert!(
+        first.contains("event: qualified_initialize_expired_unarmed\n"),
+        "{first}"
+    );
+    assert!(first.contains(&format!("\"operation_id\":\"{}\"", accepted.operation_id)));
+    assert!(first.contains("\"transition\":\"expired_unarmed\""));
+    assert!(first.contains("\"committed_epoch\":null"));
+    writer.begin_coordinator_session().unwrap();
+    let second = next(&mut body).await;
+    assert!(
+        second.contains("event: coordinator_session_started\n"),
+        "{second}"
+    );
+}
+
 #[tokio::test]
 async fn authenticated_replay_recovers_write_after_snapshot_and_follows_live() {
     let dir = tempfile::tempdir().unwrap();
@@ -577,6 +625,7 @@ async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
         ),
         ("qualified_ready_committed", "ready"),
         ("qualified_initialize_uncertain", "uncertain"),
+        ("qualified_initialize_expired_unarmed", "expired_unarmed"),
         ("ordinary_cleanup_accepted", "cleanup_accepted"),
         ("ordinary_cleanup_armed", "cleanup_armed"),
         ("ordinary_cleanup_completed", "cleanup_completed"),

@@ -9,6 +9,65 @@ pub enum QualifiedInitializeStatus {
     Uncertain,
     Superseded,
     Expired,
+    ExpiredUnarmed,
+}
+
+/// One bounded discovery result. Expiry is committed before this is returned;
+/// work still requires a fresh arm before any execution.
+pub enum QualifiedInitializePoll {
+    Idle,
+    ExpiredUnarmed,
+    Work(Box<QualifiedInitializeWork>),
+}
+
+fn next_plan(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+) -> Result<Option<(Plan, EffectiveDeployment)>, LifecycleError> {
+    let id: Option<String> = tx
+        .query_row(
+            "SELECT s.id FROM lifecycle_steps s
+         JOIN operations o ON o.id=s.operation_id
+         JOIN lifecycle_runs r ON r.operation_id=o.id
+         JOIN deployments d ON d.id=s.deployment_id
+         WHERE o.kind='qualified_initialize' AND s.state='planned'
+           AND s.session_id=?1 AND r.session_id=?1
+           AND d.revision=r.revision AND d.current_generation=r.generation
+           AND d.desired_state='ready' AND d.suspended=0
+         ORDER BY o.accepted_at,o.id LIMIT 1",
+            [session.id()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    if id.len() != 26 {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    let (plan, effective, state) = load(tx, &id)?;
+    current(tx, session, &plan, false)?;
+    if state != "planned" {
+        return Err(LifecycleError::Conflict);
+    }
+    Ok(Some((plan, effective)))
+}
+
+fn prepare_work(
+    tx: &Transaction<'_>,
+    plan: Plan,
+    effective: EffectiveDeployment,
+) -> Result<QualifiedInitializeWork, LifecycleError> {
+    let policy = policy(tx, &effective)?;
+    let binding = decode(&plan.binding_json)?;
+    let fence = plan.fence();
+    Ok(QualifiedInitializeWork {
+        plan,
+        effective,
+        policy,
+        binding,
+        fence,
+    })
 }
 
 /// Frozen, validated input for driver construction; never permission to execute.
@@ -102,6 +161,20 @@ impl crate::Store {
         }
         if plan.session_id != session.id() {
             return Err(LifecycleError::Stale);
+        }
+        if state == "cancelled" {
+            // An observer of old work must not inspect a successor's owners or
+            // reservation as though they belonged to the cancelled operation.
+            let same_terminal_fence: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND desired_state='stopped') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1)",
+                params![plan.deployment_id,plan.revision,plan.generation], |r| r.get(0),
+            )?;
+            if !same_terminal_fence {
+                return Ok(QualifiedInitializeStatus::Superseded);
+            }
+            let (plan, effective, _) = load(&tx, step_id)?;
+            expiry::terminal(&tx, session, &plan, &effective, now_ms)?;
+            return Ok(QualifiedInitializeStatus::ExpiredUnarmed);
         }
         match current(&tx, session, &plan, state == "completed") {
             Err(LifecycleError::Stale) => return Ok(QualifiedInitializeStatus::Superseded),
@@ -270,43 +343,38 @@ impl crate::Store {
     ) -> Result<Option<QualifiedInitializeWork>, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
-        let id: Option<String> = tx
-            .query_row(
-                "SELECT s.id FROM lifecycle_steps s
-             JOIN operations o ON o.id=s.operation_id
-             JOIN lifecycle_runs r ON r.operation_id=o.id
-             JOIN deployments d ON d.id=s.deployment_id
-             WHERE o.kind='qualified_initialize' AND s.state='planned'
-               AND s.session_id=?1 AND r.session_id=?1
-               AND d.revision=r.revision AND d.current_generation=r.generation
-               AND d.desired_state='ready' AND d.suspended=0
-             ORDER BY o.accepted_at,o.id LIMIT 1",
-                [session.id()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(id) = id else {
-            return Ok(None);
-        };
-        if id.len() != 26 {
-            return Err(LifecycleError::CorruptStoredData);
-        }
-        let (plan, effective, state) = load(&tx, &id)?;
-        current(&tx, session, &plan, false)?;
-        if state != "planned" {
-            return Err(LifecycleError::Conflict);
-        }
-        let policy = policy(&tx, &effective)?;
-        let binding = decode(&plan.binding_json)?;
-        let fence = plan.fence();
+        let work = next_plan(&tx, session)?
+            .map(|(plan, effective)| prepare_work(&tx, plan, effective))
+            .transpose()?;
         tx.commit()?;
-        Ok(Some(QualifiedInitializeWork {
-            plan,
-            effective,
-            policy,
-            binding,
-            fence,
-        }))
+        Ok(work)
+    }
+
+    /// Inspect one oldest current planned operation and durably expire it before
+    /// checking current launch policy. The release uses the same transaction-local
+    /// exact no-effect validation as an explicit expired-step retry.
+    pub fn next_qualified_initialize_or_expire(
+        &self,
+        session: &CoordinatorSession,
+        now_ms: i64,
+    ) -> Result<QualifiedInitializePoll, LifecycleError> {
+        if now_ms < 0 {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, session)?;
+        let result = match next_plan(&tx, session)? {
+            None => QualifiedInitializePoll::Idle,
+            Some((plan, effective)) if now_ms >= plan.deadline_ms => {
+                expiry::expire_in_transaction(&tx, session, &plan, &effective, "planned", now_ms)?;
+                QualifiedInitializePoll::ExpiredUnarmed
+            }
+            Some((plan, effective)) => {
+                QualifiedInitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
+            }
+        };
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Record an uncertain effect without releasing any grant, identity, claim or

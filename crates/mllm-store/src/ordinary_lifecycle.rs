@@ -1,5 +1,6 @@
 //! Qualified Fake cold initialization from a frozen managed configuration.
 pub mod cleanup;
+mod expiry;
 mod receipt;
 pub mod worker;
 use crate::candidate_creation::initialize::ArmResult;
@@ -335,21 +336,29 @@ fn validate_local(
         &p.session_id,
         p.deadline_ms,
     )?;
-    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND operation_id=?2 AND deployment_id=?3 AND binding_id=?4 AND session_id=?5 AND ordinal=0) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8 AND state=?9) AND EXISTS(SELECT 1 FROM endpoint_leases WHERE binding_id=?4 AND host='127.0.0.1' AND port=?10) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND (SELECT COUNT(*) FROM endpoint_leases WHERE binding_id=?4)=1 AND (SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?3 AND state!='released')=1",params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,if state=="planned" {"reserved"} else if state=="completed" {"live"} else {"uncertain"},endpoint.port()],|r|r.get(0))?;
+    let cancelled = state == "cancelled";
+    let binding_state = match state {
+        "planned" => "reserved",
+        "completed" => "live",
+        "cancelled" => "released",
+        _ => "uncertain",
+    };
+    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND operation_id=?2 AND deployment_id=?3 AND binding_id=?4 AND session_id=?5 AND ordinal=0) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8 AND state=?9) AND (?11 OR EXISTS(SELECT 1 FROM endpoint_leases WHERE binding_id=?4 AND host='127.0.0.1' AND port=?10)) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND (SELECT COUNT(*) FROM endpoint_leases WHERE binding_id=?4)=?12 AND (SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?3 AND state!='released')=?12",params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,binding_state,endpoint.port(),cancelled,i64::from(!cancelled)],|r|r.get(0))?;
     let expected_operation = match state {
         "planned" if run == "queued" => "pending",
         "armed" if run == "running" => "running",
         "uncertain" if run == "uncertain" => "running",
         "completed" if run == "succeeded" => "succeeded",
+        "cancelled" if run == "failed" => "failed",
         _ => return Err(LifecycleError::Conflict),
     };
-    let operation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind='qualified_initialize' AND state=?3 AND error_code IS NULL)",params![p.operation_id,p.deployment_id,expected_operation],|r|r.get(0))?;
+    let operation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind='qualified_initialize' AND state=?3 AND error_code IS ?4)",params![p.operation_id,p.deployment_id,expected_operation,cancelled.then_some(expiry::ERROR_CODE)],|r|r.get(0))?;
     if !valid || !operation {
         return Err(LifecycleError::CorruptStoredData);
     }
     let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
     match &p.execution {
-        None if state == "planned" => {
+        None if state == "planned" || cancelled => {
             let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?2 AND grant_id IS NOT NULL)",params![p.operation_id,p.step_id],|r|r.get(0))?;
             if effects || ledger.owners.contains_key(&p.deployment_id) {
                 return Err(LifecycleError::Conflict);

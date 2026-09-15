@@ -430,6 +430,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         | "qualified_owned_launch_associated"
         | "qualified_ready_committed"
         | "qualified_initialize_uncertain"
+        | "qualified_initialize_expired_unarmed"
         | "ordinary_cleanup_accepted"
         | "ordinary_cleanup_armed"
         | "ordinary_cleanup_completed" => &[
@@ -451,6 +452,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         "qualified_owned_launch_associated" => Some("owned_launch_associated"),
         "qualified_ready_committed" => Some("ready"),
         "qualified_initialize_uncertain" => Some("uncertain"),
+        "qualified_initialize_expired_unarmed" => Some("expired_unarmed"),
         "ordinary_cleanup_accepted" => Some("cleanup_accepted"),
         "ordinary_cleanup_armed" => Some("cleanup_armed"),
         "ordinary_cleanup_completed" => Some("cleanup_completed"),

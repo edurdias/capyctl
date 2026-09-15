@@ -1,6 +1,9 @@
 use super::*;
 use mllm_store::lifecycle::LifecycleError;
 
+#[path = "expired_unarmed.rs"]
+mod expired_unarmed;
+
 async fn fixture() -> (
     Store,
     mllm_store::dispatch::CoordinatorSession,

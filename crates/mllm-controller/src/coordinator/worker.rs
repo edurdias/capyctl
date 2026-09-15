@@ -13,7 +13,9 @@ use mllm_store::{
     candidate_creation::cleanup::CleanupExecutionContext,
     lifecycle::{DeploymentFence, LifecycleError},
     ordinary_lifecycle::cleanup::{OrdinaryCleanupReceipt, OrdinaryCleanupStatus},
-    ordinary_lifecycle::worker::{QualifiedInitializeStatus, QualifiedInitializeWork},
+    ordinary_lifecycle::worker::{
+        QualifiedInitializePoll, QualifiedInitializeStatus, QualifiedInitializeWork,
+    },
     ordinary_lifecycle::QualifiedStartReceipt,
 };
 use std::{
@@ -543,7 +545,9 @@ impl InitializeObserver {
                     .await?;
                 if !matches!(
                     status,
-                    QualifiedInitializeStatus::Planned | QualifiedInitializeStatus::Armed
+                    QualifiedInitializeStatus::Planned
+                        | QualifiedInitializeStatus::Armed
+                        | QualifiedInitializeStatus::Expired
                 ) {
                     return Ok(status);
                 }
@@ -753,11 +757,19 @@ async fn run(
             continue;
         }
         let work = match shared
-            .read(|owner, _| owner.store().next_qualified_initialize(owner.session()))
+            .read(|owner, now| {
+                owner
+                    .store()
+                    .next_qualified_initialize_or_expire(owner.session(), now)
+            })
             .await
         {
-            Ok(Some(work)) => work,
-            Ok(None) => {
+            Ok(QualifiedInitializePoll::Work(work)) => work,
+            Ok(QualifiedInitializePoll::ExpiredUnarmed) => {
+                shared.changed.notify_waiters();
+                continue;
+            }
+            Ok(QualifiedInitializePoll::Idle) => {
                 tokio::select! {
                     _ = stop.changed() => {},
                     _ = shared.wake.notified() => {},
@@ -793,7 +805,14 @@ async fn run(
                             &status_step,
                             now,
                         )?;
-                        if status == QualifiedInitializeStatus::Armed {
+                        if status == QualifiedInitializeStatus::Expired {
+                            owner.store().expire_unarmed_qualified_initialize(
+                                owner.session(),
+                                &status_step,
+                                now,
+                            )?;
+                            Ok(QualifiedInitializeStatus::ExpiredUnarmed)
+                        } else if status == QualifiedInitializeStatus::Armed {
                             owner.store().mark_qualified_initialize_uncertain(
                                 owner.session(),
                                 &status_step,
@@ -806,6 +825,11 @@ async fn run(
                     })
                     .await;
                 let outcome = match status {
+                    Ok(QualifiedInitializeStatus::ExpiredUnarmed) => {
+                        shared.set_initializing(true);
+                        shared.changed.notify_waiters();
+                        continue;
+                    }
                     Ok(QualifiedInitializeStatus::Uncertain) => WorkerStatus::Uncertain {
                         operation_id,
                         reason,
@@ -911,6 +935,7 @@ async fn drive(
             "invalid bounded service observation".into(),
         ));
     }
+    remaining(shared, work.deadline_ms())?;
     let driver = factory(work)?;
     let controls = &work.policy().controls;
     let limits: Vec<_> = controls

@@ -22,6 +22,14 @@ not per task. Focused TDD and integration verification continue throughout.
 - `ae919db`: isolated Python 3.12.3 decoder verification on host-a.
 - `7d139a8`: owned Start admission serialized with shutdown and fatal closure.
 - `9de1fa8`: no-site isolated interpreter startup before protected native guards.
+- `14c2923`: authenticated owned Start and Stop submission.
+- `f3a2684`: bounded exact-marker correctness validation for the future F2C runner.
+
+Expired, never-armed ordinary Fake Initialize requests now terminalize atomically.
+The worker proves absence of execution, grants, ownership and runtime identities
+before releasing unused endpoint and binding reservations. No memory release,
+cleanup evidence or ledger epoch is invented. Armed uncertainty remains retained.
+Expiry events replay through the management SSE stream.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -50,8 +58,8 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 1. Complete ordinary warm lifecycle, sequence/preinitialization, no-spawn
    terminalization, missing-association cleanup and restart reconciliation.
-   The next bounded unit addresses expired Initialize requests that never armed;
-   it is not yet implemented.
+   Expired, never-armed Initialize terminalization is implemented. The next bounded
+   unit is explicit Stop before Initialize arms, with separate acceptance and release.
 2. Complete owned candidate execution and API actions/inference, durable router
    accounting, management read models/policy/attachments/listener, and CLI cutover.
    Retire legacy authority only at the joint integration gate.
@@ -66,16 +74,14 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Latest scoped root verification: Store 202, controller library 55, management
-49, ordinary cleanup integration 10 and Start receipt integration 4 tests pass
-(320 distinct tests), plus three-crate all-target Clippy. The eleven command
-tests are included in those 55. The preceding full core run passed 405 tests
-before the owned-command additions; this is not a claim of another full run.
+Latest full core root verification: Store 202, controller 180 and management
+50 tests pass (432 distinct tests), plus three-crate all-target Clippy.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
-Python 3.12.3. The unchanged adapters' 88 tests and harness's 22 tests passed in
-their respective preceding slices. None is native qualification evidence.
+Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
+The harness now passes all 28 tests and all-target Clippy, including six exact-marker
+tests. None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier
