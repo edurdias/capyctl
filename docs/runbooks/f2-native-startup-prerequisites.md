@@ -29,11 +29,18 @@ findings. This does not complete F2B or qualify a native engine.
   alternate native logging channels remain required; these helpers are not a sandbox.
 - Wire the production clock, checkpoint preflight, and credential resolver into
   `NativeCandidateService`; the current interface alone is not production composition.
-  Acquire the lifetime controller lock before creating a coordinator session.
-  The lock helper now rejects noncanonical/writable directory chains, symlink or
-  hardlinked leaves, and nonregular files; it is not yet wired into production.
+  `OwnedCoordinatorState` now composes the lifetime lock before opening SQLite
+  or starting a session. It derives fixed state paths, rejects unsafe existing
+  database/sidecar files, and retains the lock beyond the connection lifetime.
+  Seven ownership tests and fifteen runtime-binding tests pass. Wire this owner
+  into the production worker at joint cutover; the legacy entrypoint is unchanged.
 - Guard the actual memory-saver implementation, collect complete worker identities,
   and compare attributed allocations with the retained grant.
+  `sglang_saver_binding` now checks the existing scheduler singleton chain,
+  initialized pool, enrolled process identity, and mapped library backing-file
+  provenance around one snapshot call. Its fourteen CPU tests pass. Attach the
+  hook to the actual scheduler and install the reviewed binary before native use;
+  these checks do not prove allocator routing or whole-process residency.
 - Typed single-effect controls are implemented in `6c78908`, with deterministic
   tests only; production observations and coordinator persistence remain open.
   Complete forwarding, coordinator/API/CLI integration, and F2C
@@ -69,7 +76,7 @@ The native entrypoint remains closed.
 
 The local `runtime/sglang_source_preflight.py` now verifies nine selected source
 files and revalidates retained identities without importing the engine. Its
-synthetic CPU tests and the full 142-test runtime suite pass. Production installed
+synthetic CPU tests and the full 156-test runtime suite pass. Production installed
 root selection and consumption by the guarded startup still remain open; selected
 files do not attest the complete import graph or compiled package.
 
