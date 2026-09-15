@@ -121,6 +121,7 @@ async fn candidate_abort_drops_required_baseline_and_post_wake_probe_futures_wit
             None::<mllm_domain::qualification::CandidateRequestObservation>,
         ));
         let driver = Arc::new(candidate::CandidateDriver {
+            cleanup: real.cleanup.clone(),
             engine: real.engine.clone(),
             parked_status: real.parked_status.clone(),
             security_control: real.security_control.clone(),
@@ -248,7 +249,28 @@ async fn candidate_abort_drops_required_baseline_and_post_wake_probe_futures_wit
                 .unwrap()
         ));
         release.add_permits(1);
+        let cleanup = worker.commands().cleanup_candidate("owner",&run,1,"cleanup",12000).unwrap();
+        settled(&worker,&sql,cleanup.operation_id()).await;
+        assert!(owner.lock().unwrap().store().resource_snapshot().unwrap().owners.is_empty());
+        assert_eq!(sql.query_row("SELECT count(*) FROM request_leases",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        if target > 1 {
+            let body=json!({"model":format!("candidate-{}",init.deployment_id()),"messages":[{"role":"user","content":"Repeat exactly: MLLM_ALPHA_71"}],"temperature":0,"max_tokens":16,"stream":false}).to_string();
+            let count: i64 = sql.query_row("SELECT count(*) FROM qualification_request_results",[],|r|r.get(0)).unwrap();
+            let retry = worker.commands().candidate_inference("owner",&run,1,"marker",&body);
+            assert!(retry.is_ok(),"verified Cleanup must preserve the original no-result inference receipt: {retry:?}");
+            assert_eq!(sql.query_row("SELECT count(*) FROM qualification_request_results",[],|r|r.get::<_,i64>(0)).unwrap(),count);
+        }
         worker.shutdown().await.unwrap();
+        if target>1 {
+            let state=owner.lock().unwrap();let session=state.store().begin_coordinator_session().unwrap();
+            let body=json!({"model":format!("candidate-{}",init.deployment_id()),"messages":[{"role":"user","content":"Repeat exactly: MLLM_ALPHA_71"}],"temperature":0,"max_tokens":16,"stream":false}).to_string();
+            assert!(state.store().candidate_inference_command_receipt(&session,"owner",&run,1,"marker",&body).unwrap().is_some());
+            let raw: String=sql.query_row("SELECT evidence_json FROM lifecycle_evidence WHERE step_id=?1",[cleanup.step_id()],|r|r.get(0)).unwrap();
+            sql.execute("UPDATE lifecycle_evidence SET evidence_json='{}' WHERE step_id=?1",[cleanup.step_id()]).unwrap();
+            assert!(matches!(state.store().candidate_inference_command_receipt(&session,"owner",&run,1,"marker",&body),Err(LifecycleError::CorruptStoredData)));
+            sql.execute("UPDATE lifecycle_evidence SET evidence_json=?1 WHERE step_id=?2",rusqlite::params![raw,cleanup.step_id()]).unwrap();
+            assert!(state.store().candidate_abort_command_receipt(&session,"owner",&run,"abort",r#"{"expected_revision":1,"action":"abort","deadline_ms":400000}"#).unwrap().is_some());
+        }
     }
 }
 
@@ -761,6 +783,7 @@ async fn candidate_abort_is_run_scoped_and_unrelated_candidate_progresses_with_r
         Arc::new(move || {
             if factory_builds.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(Arc::new(candidate::CandidateDriver {
+                    cleanup: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     engine: factory_gate.clone(),
                     parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     probe: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),

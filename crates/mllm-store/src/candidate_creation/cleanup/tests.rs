@@ -2,6 +2,62 @@ use super::*;
 use mllm_domain::completion::CleanupEvidence;
 
 #[test]
+fn owned_cleanup_atomic_context_exact_presend_and_final_clock_rollback() {
+    let (store,s,c)=created("fake");
+    let init=store.accept_candidate_initialize(&s,"owner",c.run_id(),"init",BODY,1100).unwrap();
+    arm(&store,&s,init.step_id()).unwrap();
+    let context=store.candidate_initialize_execution(&s,init.step_id()).unwrap();
+    store.record_owned_launch(&s,init.step_id(),&receipt(&context),1250).unwrap();
+    let body=r#"{"expected_revision":1,"action":"cleanup","deadline_ms":12000}"#;
+    for final_now in [1999,12000] {
+        let before=durable(&store);let mut calls=0;
+        assert!(store.accept_candidate_cleanup_with_clock(&s,"owner",c.run_id(),"cleanup",body,||{calls+=1;Ok(if calls==1 {2000}else{final_now})}).is_err());
+        assert_eq!(durable(&store),before);
+    }
+    let cleanup=store.accept_candidate_cleanup(&s,"owner",c.run_id(),"cleanup",body,2000).unwrap();
+    assert_eq!(store.next_candidate_cleanup(&s).unwrap(),Some(cleanup.clone()));
+    let (arm,context)=store.arm_candidate_cleanup_with_context(&s,cleanup.step_id(),2100).unwrap();
+    assert!(matches!(arm,ArmResult::New{..}));let context=context.unwrap();
+    assert_eq!(store.arm_candidate_cleanup_with_context(&s,cleanup.step_id(),2100).unwrap(),(ArmResult::AlreadyRecorded,None));
+    assert!(store.next_candidate_cleanup(&s).unwrap().is_none());
+    let ttl=store.revalidate_candidate_cleanup_send(&s,cleanup.step_id(),&context,2100).unwrap();
+    for field in ["mode","deadline","identities","incarnation","generation"] {
+        let mut wrong=context.clone();
+        match field {"mode"=>wrong.mode=crate::candidate_creation::cleanup::CleanupMode::InspectOwnedGone,"deadline"=>wrong.deadline_ms+=1,"identities"=>wrong.identities.clear(),"incarnation"=>wrong.incarnation=ulid::Ulid::new().to_string(),_=>wrong.fence.generation+=1};
+        assert!(store.revalidate_candidate_cleanup_send(&s,cleanup.step_id(),&wrong,2100).is_err(),"{field}");
+    }
+    let evidence=CleanupEvidence {binding_id:context.binding_id,incarnation:context.incarnation,identities:context.identities,observed_at_ms:2200,receipt:"exact owned members gone".into()};
+    for final_now in [2199,12001] {
+        let before=durable(&store);let mut calls=0;
+        assert!(store.complete_cleanup_with_clock(&s,cleanup.step_id(),&evidence,ttl,||{calls+=1;Ok(if calls==1 {2200}else{final_now})}).is_err());
+        assert_eq!(durable(&store),before);
+    }
+    store.complete_cleanup(&s,cleanup.step_id(),&evidence,2200,ttl).unwrap();
+}
+
+#[test]
+fn owned_cleanup_discovery_and_history_reject_nontext_and_oversized_sources() {
+    for query in [
+        "UPDATE command_receipts SET request_hash=zeroblob(65) WHERE operation_id=?1",
+        "UPDATE command_receipts SET request_hash=printf('%065d',0) WHERE operation_id=?1",
+        "UPDATE lifecycle_steps SET step_json=zeroblob(8) WHERE operation_id=?1",
+        "UPDATE command_receipts SET response_json=zeroblob(8) WHERE operation_id=?1",
+        "UPDATE lifecycle_steps SET step_json=json_set(step_json,'$.principal_id','another-principal') WHERE operation_id=?1",
+    ] {
+        let (store,s,c)=created("fake");
+        let init=store.accept_candidate_initialize(&s,"owner",c.run_id(),"init",BODY,1100).unwrap();
+        arm(&store,&s,init.step_id()).unwrap();
+        let context=store.candidate_initialize_execution(&s,init.step_id()).unwrap();
+        store.record_owned_launch(&s,init.step_id(),&receipt(&context),1250).unwrap();
+        let body=r#"{"expected_revision":1,"action":"cleanup","deadline_ms":12000}"#;
+        let cleanup=store.accept_candidate_cleanup(&s,"owner",c.run_id(),"cleanup",body,2000).unwrap();
+        store.conn.execute(query,[cleanup.operation_id()]).unwrap();
+        assert!(matches!(store.candidate_cleanup_command_receipt(&s,"owner",c.run_id(),"cleanup",body),Err(LifecycleError::CorruptStoredData)),"{query}");
+        assert!(matches!(store.next_candidate_cleanup(&s),Err(LifecycleError::CorruptStoredData)),"{query}");
+    }
+}
+
+#[test]
 fn unarmed_inspection_successor_retains_prior_termination_history() {
     let (store, s, c) = created("fake");
     let init = store
@@ -179,6 +235,8 @@ fn real_cleanup_releases_once_and_preserves_ready_replay() {
         .complete_step(&s, r.step_id(), &ready, 1300, ttl)
         .unwrap();
     let before = store.resource_snapshot().unwrap().epoch;
+    let abort_body=r#"{"expected_revision":1,"action":"abort","deadline_ms":400000}"#;
+    let abort=store.abort_candidate_run_with_clock(&s,"owner",c.run_id(),"abort",abort_body,||Ok(1900)).unwrap();
     let body = r#"{"expected_revision":1,"action":"cleanup","deadline_ms":12000}"#;
     let cleanup = store
         .accept_candidate_cleanup(&s, "owner", c.run_id(), "cleanup", body, 2000)
@@ -216,6 +274,9 @@ fn real_cleanup_releases_once_and_preserves_ready_replay() {
         0
     );
     let s2 = store.begin_coordinator_session().unwrap();
+    assert_eq!(store.candidate_abort_command_receipt(&s2,"owner",c.run_id(),"abort",abort_body).unwrap().unwrap(),abort);
+    let (manifest,host,_)=fixture("fake");
+    assert_eq!(store.create_candidate_run(&s2,"owner","create",&command(&manifest),&host,999999).unwrap(),c);
     store
         .complete_cleanup(&s2, cleanup.step_id(), &e, 999999, 1)
         .unwrap();

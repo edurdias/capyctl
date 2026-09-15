@@ -78,7 +78,7 @@ fn hash(principal: &str, run: &str, c: &Command) -> AbortResult<String> {
         )
     ))
 }
-fn bounded(row: &rusqlite::Row<'_>, index: usize, max: usize) -> AbortResult<String> {
+pub(super) fn bounded(row: &rusqlite::Row<'_>, index: usize, max: usize) -> AbortResult<String> {
     let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(index)? else {
         return Err(LifecycleError::CorruptStoredData);
     };
@@ -90,7 +90,7 @@ fn bounded(row: &rusqlite::Row<'_>, index: usize, max: usize) -> AbortResult<Str
         .map_err(|_| LifecycleError::CorruptStoredData)
 }
 // Bound the legacy snapshot decoder's inputs before it allocates any source DTO.
-fn source(tx: &Transaction<'_>, principal: &str, run: &str) -> AbortResult<CandidateRunSnapshot> {
+pub(super) fn source(tx: &Transaction<'_>, principal: &str, run: &str) -> AbortResult<CandidateRunSnapshot> {
     for query in [
         "SELECT host_id,deployment_id,binding_id,incarnation,operation_id,recipe_digest,authorization_json,state,cleanup_state,coalesce(cleanup_step_id,'') FROM qualification_runs WHERE id=?1 AND principal_id=?2",
         "SELECT c.principal_id,c.command_scope,c.idempotency_key,c.request_hash,c.response_json FROM command_receipts c JOIN qualification_runs q ON q.operation_id=c.operation_id WHERE q.id=?1 AND q.principal_id=?2 LIMIT 2",

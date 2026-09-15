@@ -33,7 +33,7 @@ or inference request is created. Exact-key retries return the original receipt,
 including after qualification policy revocation; a new key uses current policy.
 A receipt grants no new execution authority.
 
-`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore/Finish/Abort and
+`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore/Finish/Abort/Cleanup and
 candidate corpus inference. Its `OwnedActionSource` must share the exact configuration
 source's owned Store and coordinator session. The service retains the
 `OwnedCoordinator` outside the router; constructing a router does not start a
@@ -94,8 +94,31 @@ Abort neither terminates the runtime nor creates a resource completion epoch.
 Its durable event replays through authenticated SSE with only exact operation,
 deployment and run IDs plus a positive session epoch string. Retrying the action
 does not duplicate the event or interrupt later live delivery.
-Cleanup remains a separate authority and an outstanding worker integration.
+Cleanup remains a separate authority; Abort alone never performs it.
 Fatal Store errors and an already stopped worker still deny new commands.
+
+Candidate Cleanup uses `action:"cleanup"` with the strict revision/deadline/key
+envelope. Its separately bounded deadline and frozen cleanup permission can allow
+acceptance after the qualification run expires. A missing owned association or
+original retained runtime is unsupported; the service never reconstructs a Fake
+instance or guesses process membership.
+
+The single worker waits for the predecessor future to exit before arming Cleanup.
+A new arm and its exact context commit together; current authority, mode, deadline
+and shutdown are checked again before sending. The collector distinguishes
+termination from inspection and samples its trusted clock after observing gone
+members. Only validated exact-membership evidence releases charges, unsettled
+leases, endpoints and the binding atomically. A timeout, lost reply, clock failure
+or stale evidence retains accounting. A recorded arm is never resend permission.
+
+Associated candidate uncertainty closes normal admission but retains a bounded
+same-owner Cleanup lane. Fatal Store errors and shutdown close effect admission.
+Exact Cleanup retries preserve the original operation, including after shutdown;
+inference history with no result remains readable after verified Cleanup without
+inventing output. Accepted, armed and completed Cleanup events replay through SSE.
+Ordinary routing remains closed; a passed catalog still requires a fresh independent
+qualified binding. Idle Cleanup discovery does not sample the clock; each actual
+action still requires its independent trusted clock checks.
 
 Inference returns the original HTTP202 operation acceptance envelope, not a
 completion or response body. A bounded owned queue retains accepted work after
@@ -113,10 +136,10 @@ its permit early. Retry an uncertain submission with the original key. Read/SSE
 capacity is separately bounded. Responses disable caching and never expose raw
 Store/provider diagnostics.
 
-Verified at the owned Abort slice: all 66 management tests pass; final checked
-Store/controller/management sources pass 508 distinct tests, with four-crate
-all-target Clippy passing. Management was rerun after the final SSE-only repair;
-unchanged Store/controller results come from the preceding full run. Tests cover
+Verified at the owned Cleanup slice: all 67 management tests pass; final checked
+Store/controller/management sources pass 514 distinct tests, with five-crate
+all-target Clippy passing. The same complete run also passes 88 adapter and 74
+harness tests, for 676 distinct tests after the clock-discovery repair. Tests cover
 real owned Store acceptance for Fake, vLLM and SGLang manifests without engine
 execution, historical replay, revocation, malformed input, endpoint exhaustion,
 stale sessions, shared cancellation limits, owned Fake execution, exact corpus

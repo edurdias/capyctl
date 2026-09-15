@@ -77,14 +77,24 @@ impl crate::Store {
         };
         let (p, a) = load_attempt(&tx, &operation)?;
         validate_plan(&tx, &p)?;
+        if a.scope.session_id != session.id() {
+            // Session rollover deliberately marks retained leases uncertain.
+            // Only verified Cleanup permits history to outlive that boundary.
+            let gone: bool = tx.query_row("SELECT cleanup_state='verified_gone' FROM qualification_runs WHERE id=?1",[&p.scope.run_id],|r|r.get(0))?;
+            if !gone { return Err(LifecycleError::Stale); }
+            let cold = warm::cold(&tx, &p.scope.run_id)?;
+            let v = immutable_initialize_anchor(&tx, &cold.scope.parent_step_id)?;
+            super::super::super::cleanup::validate_gone_history(&tx, &v)?;
+        }
         if result(&tx, &p, &a)?.is_none() {
             let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases l JOIN operations o ON o.id=?1 WHERE l.id=?2 AND l.deployment_id=?3 AND l.revision=?4 AND l.generation=?5 AND l.session_id=?6 AND l.disposition='inflight' AND o.state='running')",params![a.request_operation_id,a.lease_id,a.scope.deployment_id,a.scope.revision,a.scope.generation,a.scope.session_id],|r|r.get(0))?;
             if !valid {
-                return Err(LifecycleError::CorruptStoredData);
+                let resolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND state='failed' AND error_code='resolved_by_owned_cleanup') AND NOT EXISTS(SELECT 1 FROM request_leases WHERE id=?2)",params![a.request_operation_id,a.lease_id],|r|r.get(0))?;
+                if !resolved { return Err(LifecycleError::CorruptStoredData); }
+                let cold = warm::cold(&tx, &p.scope.run_id)?;
+                let v = immutable_initialize_anchor(&tx, &cold.scope.parent_step_id)?;
+                super::super::super::cleanup::validate_gone_history(&tx, &v)?;
             }
-        }
-        if a.scope.session_id != session.id() {
-            return Err(LifecycleError::Stale);
         }
         if a.scope.principal != principal
             || a.scope.run_id != run

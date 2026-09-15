@@ -1,9 +1,9 @@
 use super::*;
 
 pub(in super::super) struct Cancellation {
-    run: String,
-    cancelled: AtomicBool,
-    wake: Notify,
+    pub(super) run: String,
+    pub(super) cancelled: AtomicBool,
+    pub(super) wake: Notify,
 }
 
 struct ActiveRegistration<'a>(&'a Shared);

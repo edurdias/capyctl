@@ -103,6 +103,8 @@ struct Shared {
     wake: Notify,
     changed: Notify,
     accepting: AtomicBool,
+    cleanup_accepting: AtomicBool,
+    shutdown_requested: AtomicBool,
     initializing: AtomicBool,
     observers: Arc<Semaphore>,
     store_jobs: Arc<Semaphore>,
@@ -588,6 +590,8 @@ impl OwnedCoordinator {
             wake: Notify::new(),
             changed: Notify::new(),
             accepting: AtomicBool::new(true),
+            cleanup_accepting: AtomicBool::new(true),
+            shutdown_requested: AtomicBool::new(false),
             initializing: AtomicBool::new(true),
             observers: Arc::new(Semaphore::new(options.max_observers)),
             store_jobs: Arc::new(Semaphore::new(options.max_observers + 1)),
@@ -600,6 +604,7 @@ impl OwnedCoordinator {
         let (status_tx, status) = watch::channel(WorkerStatus::Running);
         let task_shared = shared.clone();
         let task = tokio::spawn(async move {
+            let mut cleanup_stop = stop_rx.clone();
             let result = AssertUnwindSafe(run(
                 task_shared.clone(),
                 observations,
@@ -610,9 +615,15 @@ impl OwnedCoordinator {
             ))
             .catch_unwind()
             .await;
-            let status = result.unwrap_or_else(|_| {
+            let mut status = result.unwrap_or_else(|_| {
                 WorkerStatus::Failed("worker panicked; durable arm retained".into())
             });
+            if matches!(status, WorkerStatus::Uncertain { .. }) && task_shared.cleanup_accepting.load(Ordering::Acquire) && !*cleanup_stop.borrow() {
+                task_shared.close_normal_admission();
+                status_tx.send_replace(status.clone());
+                task_shared.changed.notify_waiters();
+                status = candidate::cleanup::recover(&task_shared, &mut cleanup_stop, &status_tx, status).await;
+            }
             task_shared.close_admission();
             status_tx.send_replace(status.clone());
             task_shared.changed.notify_waiters();
@@ -711,6 +722,7 @@ impl OwnedCoordinator {
     }
 
     pub async fn shutdown(mut self) -> Result<WorkerStatus, CoordinatorError> {
+        self.shared.shutdown_requested.store(true, Ordering::Release);
         self.shared.close_admission();
         self.stop.send_replace(true);
         self.task
@@ -722,6 +734,7 @@ impl OwnedCoordinator {
 }
 impl Drop for OwnedCoordinator {
     fn drop(&mut self) {
+        self.shared.shutdown_requested.store(true, Ordering::Release);
         self.shared.close_admission();
         self.stop.send_replace(true);
     }
@@ -837,11 +850,17 @@ impl CleanupObserver {
 }
 
 impl Shared {
+    fn close_normal_admission(&self) {
+        let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        self.accepting.store(false, Ordering::Release);
+        self.candidate_requests.lock().unwrap_or_else(|error|error.into_inner()).clear();
+    }
     fn close_admission(&self) {
         // Serialize closure with the entire command lookup/check/commit boundary.
         // Recover a poisoned guard only to close admission, never to access Store.
         let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
         self.accepting.store(false, Ordering::Release);
+        self.cleanup_accepting.store(false, Ordering::Release);
         self.candidate_requests
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -865,6 +884,7 @@ impl Shared {
         message: impl Into<String>,
     ) -> CoordinatorError {
         self.accepting.store(false, Ordering::Release);
+        self.cleanup_accepting.store(false, Ordering::Release);
         self.wake.notify_one();
         CoordinatorError::Service(message.into())
     }
@@ -888,6 +908,33 @@ impl Shared {
             + Send
             + 'static,
     ) -> Result<T, CoordinatorError> {
+        let shared = self.clone();
+        self.with_owner(move |owner| {
+            let now = (shared.clock)()?;
+            action(owner, now).map_err(|error| shared.store_error(owner, error))
+        })
+        .await
+    }
+
+    async fn read_without_clock<T: Send + 'static>(
+        self: &Arc<Self>,
+        action: impl FnOnce(&crate::ownership::OwnedCoordinatorState) -> Result<T, LifecycleError>
+            + Send
+            + 'static,
+    ) -> Result<T, CoordinatorError> {
+        let shared = self.clone();
+        self.with_owner(move |owner| {
+            action(owner).map_err(|error| shared.store_error(owner, error))
+        })
+        .await
+    }
+
+    async fn with_owner<T: Send + 'static>(
+        self: &Arc<Self>,
+        action: impl FnOnce(&crate::ownership::OwnedCoordinatorState) -> Result<T, CoordinatorError>
+            + Send
+            + 'static,
+    ) -> Result<T, CoordinatorError> {
         // The blocking job keeps its permit even if the awaiting observer is
         // cancelled. Repeated tiny caller timeouts cannot enqueue unlimited jobs.
         let permit = self
@@ -903,8 +950,7 @@ impl Shared {
                 drop(error);
                 shared.fail("ownership mutex poisoned")
             })?;
-            let now = (shared.clock)()?;
-            action(&owner, now).map_err(|error| shared.store_error(&owner, error))
+            action(&owner)
         })
         .await
         .map_err(|_| self.fail("Store task panicked"))?
@@ -926,6 +972,11 @@ async fn run(
         }
         if !shared.accepting.load(Ordering::Acquire) {
             return WorkerStatus::Failed("service stopped accepting work".into());
+        }
+        match candidate::cleanup::next(&shared, &mut stop).await {
+            Ok(true) => { shared.changed.notify_waiters(); continue; }
+            Ok(false) => {},
+            Err(status) => return status,
         }
         // This loop owns the sole Initialize task. Reaching discovery means
         // that task has exited, including any pre-arm observation future.

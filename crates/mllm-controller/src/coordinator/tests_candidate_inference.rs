@@ -38,6 +38,7 @@ async fn candidate_inference_uncertain_terminal_commit_timeout_and_shutdown_neve
                 let release = factory_release.clone();
                 let sends = factory_sends.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
+                    cleanup: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     engine,
                     security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
@@ -484,6 +485,8 @@ async fn candidate_inference_exact_grant_revalidates_scope_policy_deadline_and_s
         .revalidate_candidate_inference_send(state.session(), &work, &dispatch, admission(1900))
         .is_err());
     let session = state.store().begin_coordinator_session().unwrap();
+    let historical=state.store().candidate_inference_command_receipt(&session,"owner",&run,1,"marker",&request);
+    assert!(matches!(historical,Err(LifecycleError::Stale)),"ordinary old-session history without verified Cleanup is stale, not corruption: {historical:?}");
     assert!(state
         .store()
         .revalidate_candidate_inference_send(&session, &work, &dispatch, admission(1900))

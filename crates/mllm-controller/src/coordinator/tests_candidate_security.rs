@@ -153,7 +153,7 @@ async fn security_failure_matrix(child: usize) {
         "session",
     ] {
         let (dir, owner, run, observations, _) = candidate_fixture::fixture();
-        let fake = Arc::new(FakeEngine::for_qualification());
+        let fake = Arc::new(FakeEngine::for_qualification_with_clock(Arc::new(||Ok(1900))));
         let factory_fake = fake.clone();
         let builds = Arc::new(AtomicI64::new(0));
         let factory_builds = builds.clone();
@@ -175,6 +175,7 @@ async fn security_failure_matrix(child: usize) {
                 let control_fault = factory_fault.clone();
                 let probe_fault = factory_fault.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
+                    cleanup: { let fake=factory_fake.clone(); Arc::new(move |context| {let fake=fake.clone();Box::pin(async move {fake.qualification_cleanup_mode_observed(&context.binding_id,&context.incarnation,&context.identities,context.mode==mllm_store::candidate_creation::cleanup::CleanupMode::TerminateOwned).map_err(|e|CoordinatorError::Service(e.to_string()))})}) },
                     parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     engine: factory_fake.clone(),
                     security_control: Arc::new(move |d| {
@@ -229,6 +230,9 @@ async fn security_failure_matrix(child: usize) {
                 super::abort_tests::abort_and_wait(&worker,&sql,&run).await;
                 assert_eq!(builds.load(Ordering::SeqCst),1);
                 assert_eq!(fake.qualification_activity().unwrap(),(5+child as u64,2,5));
+                let cleanup=worker.commands().cleanup_candidate("owner",&run,1,"cleanup",12000).unwrap();
+                settled(&worker,&sql,cleanup.operation_id()).await;
+                assert!(owner.lock().unwrap().store().resource_snapshot().unwrap().owners.is_empty());
                 worker.shutdown().await.unwrap();
                 continue;
             }
@@ -339,6 +343,7 @@ async fn candidate_security_owned_discovery_never_recreates_or_replays() {
                 let probe = engine.clone();
                 let control = engine.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
+                    cleanup: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     engine: engine.clone(),
                     probe: Arc::new(move |d| {
@@ -500,6 +505,7 @@ async fn candidate_security_owned_final_clock_fences_each_child_before_send() {
             let probe_calls = requests.clone();
             let control_calls = controls.clone();
             let driver = Arc::new(candidate::CandidateDriver {
+                cleanup: real.cleanup.clone(),
                     parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                 engine: real.engine.clone(),
                 probe: Arc::new(move |d| {

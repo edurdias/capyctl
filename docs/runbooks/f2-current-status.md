@@ -6,6 +6,9 @@ not per task. Focused TDD and integration verification continue throughout.
 
 ## Recent committed work
 
+- `ec05bd8`: owned candidate Abort with retained accounting and strict SSE replay.
+- `c6da962`: deadline-bound owned Finish with preserved V3 catalog history.
+- `8a1fbec`: owned candidate Park/Restore through the original retained Fake.
 - `67c0678`: authenticated candidate-run creation using the owned Store/session,
   shared bounded command capacity, exact durable retries, and no runtime effects.
 - `1612945`: ordinary owned cleanup acceptance, arming and verified completion;
@@ -102,7 +105,7 @@ and the required Ready probe. Post-wake inference uses the validated Restore
 anchor without replaying baseline Security. Full conservative grants remain
 retained and ordinary gates remain closed. Each child requires a new durable arm;
 current policy, leases, pressure and final clock/shutdown fences govern sending.
-Cleanup and public operation-result reads remain separate work.
+Public operation-result reads remain separate work.
 
 The owned candidate Finish service now uses an explicitly versioned deadline-bound
 catalog/receipt record while preserving legacy V3 history. It reuses the exact
@@ -120,11 +123,24 @@ identity and without inventing a completion epoch. Run-scoped cancellation and
 Store arm/completion fences prevent later work or late success from promoting the
 run. Exact retries preserve the original operation; a new key cannot rewrite a
 terminal run or passed catalog. The original driver is retained inside a newly
-armed Initialize job even if its awaiting future is cancelled. Associated Cleanup
-and the post-uncertainty cleanup lane remain separate implementation work.
+armed Initialize job even if its awaiting future is cancelled.
 The durable Abort event replays through authenticated SSE with exact IDs and a
 positive string session epoch. Strict projection rejects expanded or corrupt
 payloads; exact retries emit no duplicate event and live delivery continues.
+
+Associated candidate Cleanup now passes root integration through the original
+retained Fake runtime. The single worker waits for its predecessor future to exit
+and sends only after a new durable arm and exact current-context validation.
+Frozen cleanup permission and a separate bounded deadline remain usable after
+run expiry. Verified exact-membership gone evidence atomically settles leases,
+releases ownership/endpoints/binding and advances the completion epoch once.
+Unverified outcomes retain accounting; missing association or retained runtime
+remains unsupported and never triggers reconstruction. After candidate uncertainty,
+normal admission stays closed while an explicit Cleanup-only lane remains live.
+Idle discovery is clock-free; acceptance, arm, send and completion retain their
+trusted clock fences. Exact receipts and validated missing-result inference history
+survive verified Cleanup without fabricated response content. Ordinary routing and
+native qualification remain gated; public result capture/reads are still open.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -171,10 +187,12 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Root verification for the candidate Abort slice: Store 202,
-controller 240 and management 66 tests pass (508 distinct tests). The full
-four-crate run passed before the final management-only SSE repair; all management
-targets were then rerun on the final projection and its two new tests. Two existing
+Root verification for the associated candidate Cleanup slice: Store 204,
+controller 243 and management 67 tests pass (514 distinct core tests). The same
+full five-crate run also passes all 88 adapter and 74 harness tests, for 676
+distinct tests. Initial integration exposed an unnecessary clock sample during
+idle Cleanup discovery. The narrow repair preserves every action clock fence and
+the existing two-sample assertion; the complete rerun passes on final code. Two existing
 caller-timeout tests failed during the earlier
 unarmed Stop worker's concurrent fixture runs, then passed unchanged in isolated
 reruns and subsequent bounded full core runs. No timeout or evidence-freshness
@@ -182,12 +200,12 @@ limit was changed.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
-Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
+Python 3.12.3.
 The full root run also passes all 74 harness tests, including five phase-bound/ceiling, six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
 protected-storage tests.
 The full Cargo harness count includes the three pressure-ceiling tests.
-All-target Clippy also passes for these four crates with warnings denied.
+All-target Clippy also passes for these five crates with warnings denied.
 None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
@@ -198,7 +216,7 @@ editing, formatting, tests and staging. The separately modified SDD Task 2 repor
 also remains excluded and untouched by this continuation.
 
 Owner access item: read-only SSH connections to host-a timed out on port22
-at approximately 2026-09-15 11:56, 12:30, 13:26, 14:18 and 15:16 UTC. No remote command executed
+at approximately 2026-09-15 11:56, 12:30, 13:26, 14:18, 15:16 and 16:08 UTC. No remote command executed
 in any attempt. Access remains unavailable from this session; restore reachability
 before native qualification. These observations do not identify the network or
 host cause. Local implementation continues without remote effects.

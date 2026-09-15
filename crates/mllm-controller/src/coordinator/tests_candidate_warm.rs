@@ -112,6 +112,12 @@ async fn failure_case(target: RuntimeAction, failure: &'static str) {
             let probe = factory_fake.clone(); let security = factory_fake.clone(); let status = factory_fake.clone();
             let probe_fault = factory_fault.clone(); let status_fault = factory_fault.clone();
             Ok(Arc::new(candidate::CandidateDriver {
+                cleanup: {
+                    let fake = factory_fake.clone();
+                    Arc::new(move |context| { let fake = fake.clone(); Box::pin(async move {
+                        fake.qualification_cleanup_mode_observed(&context.binding_id,&context.incarnation,&context.identities,context.mode == mllm_store::candidate_creation::cleanup::CleanupMode::TerminateOwned).map_err(|e|CoordinatorError::Service(e.to_string()))
+                    }) })
+                },
                 engine:factory_engine.clone(),
                 probe:Arc::new(move |d| { let fake=probe.clone(); let fault=probe_fault.clone(); Box::pin(async move {
                     let warm = d.security_endpoint().is_none() && d.request().contains("MLLM_READY_13");
@@ -223,6 +229,10 @@ async fn failure_case(target: RuntimeAction, failure: &'static str) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(*engine.calls.lock().unwrap(),calls);
         assert_eq!(builds.load(Ordering::SeqCst),1);
+        let cleanup = commands.cleanup_candidate("owner",&run,1,"cleanup",12000).unwrap();
+        settled(&worker,&sql,cleanup.operation_id()).await;
+        assert!(owner.lock().unwrap().store().resource_snapshot().unwrap().owners.is_empty());
+        assert_eq!(*engine.calls.lock().unwrap(),calls);
         worker.shutdown().await.unwrap();
         return;
     }

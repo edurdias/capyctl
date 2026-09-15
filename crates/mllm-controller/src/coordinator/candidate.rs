@@ -15,6 +15,8 @@ pub(super) use warm::drive_warm;
 #[path = "candidate_abort.rs"]
 mod abort;
 pub(super) use abort::{scoped, Cancellation};
+#[path = "candidate_cleanup.rs"]
+pub(super) mod cleanup;
 
 impl CoordinatorCommands {
     /// Finish is an atomic Store command, with no runtime callback or new driver.
@@ -298,6 +300,7 @@ type SecurityControlFuture = Pin<
     >,
 >;
 pub(super) struct CandidateDriver {
+    pub(super) cleanup: Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>,
     pub(super) engine: Arc<dyn EngineAdapter>,
     pub(super) parked_status: Arc<dyn Fn(mllm_domain::completion::StepExecutionContext) -> ParkedStatusFuture + Send + Sync>,
     pub(super) probe: Arc<dyn Fn(CandidateProbeDispatch) -> ProbeFuture + Send + Sync>,
@@ -328,7 +331,16 @@ impl CandidateDriver {
         let control_clock = clock.clone();
         let status_engine = engine.clone();
         let status_clock = clock.clone();
+        let cleanup_engine = engine.clone();
         Arc::new(Self {
+            cleanup: Arc::new(move |context| {
+                let engine = cleanup_engine.clone();
+                Box::pin(async move {
+                    engine.qualification_cleanup_mode_observed(&context.binding_id, &context.incarnation, &context.identities,
+                        context.mode == mllm_store::candidate_creation::cleanup::CleanupMode::TerminateOwned)
+                        .map_err(|error|CoordinatorError::Service(error.to_string()))
+                })
+            }),
             engine,
             parked_status: Arc::new(move |context| {
                 let engine = status_engine.clone();

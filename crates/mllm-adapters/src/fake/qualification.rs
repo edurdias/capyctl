@@ -649,6 +649,9 @@ mod tests {
         }));
         let c = command(RuntimeAction::Initialize, "initialize");
         let initialized = engine.execute_persisted(&c).await.unwrap();
+        let activity=engine.qualification_activity().unwrap();
+        assert!(engine.qualification_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).is_err(),"inspection must not terminate live Fake members");
+        assert_eq!(engine.qualification_activity().unwrap(),activity);
         now.store(1700, Ordering::SeqCst);
         let gone = engine
             .qualification_cleanup_observed(
@@ -659,6 +662,10 @@ mod tests {
             .unwrap();
         assert_eq!(gone.observed_at_ms, 1700);
         assert_eq!(gone.identities, initialized.identities);
+        now.store(1800,Ordering::SeqCst);
+        let inspected=engine.qualification_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).unwrap();
+        assert_eq!(inspected.observed_at_ms,1800);
+        assert_eq!(inspected.identities,initialized.identities);
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let failed = FakeEngine::for_qualification_with_clock(Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {

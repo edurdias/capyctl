@@ -100,9 +100,9 @@ from their caller; neither grants qualification or changes resource policy.
 
 Latest full harness run: 74 tests and all-target Clippy pass, including both
 phase-margin tests and all three pressure-ceiling tests. Integrated verification
-covers 508 Store/controller/management tests and four-crate all-target Clippy.
-All management targets were rerun after the final candidate Abort SSE repair;
-unchanged Store/controller/harness results come from the preceding full run.
+covers 514 Store/controller/management tests and all 88 adapter tests, for 676
+distinct tests in one five-crate all-target run after the candidate Cleanup
+clock-discovery repair. Five-crate all-target Clippy also passes.
 No native measurements, engine baselines or qualification results were collected.
 
 ## Remaining gates

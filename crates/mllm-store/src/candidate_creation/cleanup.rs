@@ -1,4 +1,5 @@
 use super::initialize::ArmResult;
+use super::abort::bounded;
 use super::initialize::{ValidatedInitialize, validated_initialize};
 use crate::dispatch::CoordinatorSession;
 use crate::events::CandidateLifecycleTransition;
@@ -33,6 +34,7 @@ pub struct CleanupExecutionContext {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateCleanupReceipt {
+    deployment_id: String,
     operation_id: String,
     step_id: String,
     run_id: String,
@@ -44,6 +46,7 @@ pub struct CandidateCleanupReceipt {
     deadline_ms: i64,
 }
 impl CandidateCleanupReceipt {
+    pub fn deployment_id(&self) -> &str { &self.deployment_id }
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }
@@ -103,8 +106,9 @@ struct CandidateCleanupReceiptV1 {
     deadline_ms: i64,
 }
 impl CandidateCleanupReceiptV1 {
-    fn public(&self) -> CandidateCleanupReceipt {
+    fn public(&self, deployment: &str) -> CandidateCleanupReceipt {
         CandidateCleanupReceipt {
+            deployment_id: deployment.into(),
             operation_id: self.operation_id.clone(),
             step_id: self.step_id.clone(),
             run_id: self.run_id.clone(),
@@ -184,6 +188,16 @@ fn recovery_mode(previous: &CleanupMode, issued: Option<i64>) -> CleanupMode {
         CleanupMode::TerminateOwned
     }
 }
+fn execution(r: &ReadCleanup) -> Result<CleanupExecutionContext, LifecycleError> {
+    if r.state != "armed" || r.run_state != "running" { return Err(LifecycleError::Conflict); }
+    let p = &r.planned;
+    Ok(CleanupExecutionContext {
+        fence: p.fence(), operation_id: p.operation_id.clone(), step_id: p.step_id.clone(),
+        binding_id: p.binding_id.clone(), incarnation: p.incarnation.clone(),
+        identities: members(&p.identities)?, issued_at_ms: r.issued.ok_or(LifecycleError::CorruptStoredData)?,
+        deadline_ms: p.deadline_ms, mode: p.mode.clone(),
+    })
+}
 fn target(run: &str) -> String {
     format!("/management/v1/qualification-runs/{run}/actions")
 }
@@ -210,15 +224,38 @@ fn hash(
         )
     ))
 }
-fn corrupt<T>(result: Result<T, super::CandidateCreationError>) -> Result<T, LifecycleError> {
-    result.map_err(|e| match e {
-        super::CandidateCreationError::Sql(e) => LifecycleError::Sql(e),
-        _ => LifecycleError::CorruptStoredData,
-    })
+fn guard_text(tx: &Transaction<'_>, query: &str, id: &str, limit: usize) -> Result<(),LifecycleError> {
+    let mut statement=tx.prepare(query)?;
+    let columns=statement.column_count();
+    let mut rows=statement.query([id])?;
+    let mut count=0;
+    let mut bytes=0usize;
+    while let Some(row)=rows.next()? {
+        count+=1;
+        if count>limit {return Err(LifecycleError::CorruptStoredData);}
+        for index in 0..columns {
+            let value=bounded(row,index,super::MAX_BYTES)?;
+            bytes=bytes.checked_add(value.len()).ok_or(LifecycleError::CorruptStoredData)?;
+            if bytes>8*1024*1024 {return Err(LifecycleError::CorruptStoredData);}
+        }
+    }
+    Ok(())
+}
+fn guard_deployment(tx:&Transaction<'_>,deployment:&str)->Result<(),LifecycleError> {
+    for query in [
+        "SELECT step_json,state,session_id,binding_id,coalesce(grant_id,'') FROM lifecycle_steps WHERE deployment_id=?1 LIMIT 4097",
+        "SELECT plan_json,state,session_id FROM lifecycle_runs WHERE deployment_id=?1 LIMIT 4097",
+        "SELECT kind,state,coalesce(error_code,'') FROM operations WHERE deployment_id=?1 LIMIT 4097",
+        "SELECT response_json FROM command_receipts WHERE operation_id IN (SELECT id FROM operations WHERE deployment_id=?1) LIMIT 4097",
+        "SELECT association_json FROM owned_launch_associations WHERE step_id IN (SELECT id FROM lifecycle_steps WHERE deployment_id=?1) LIMIT 4097",
+        "SELECT evidence_json FROM lifecycle_evidence WHERE step_id IN (SELECT id FROM lifecycle_steps WHERE deployment_id=?1) LIMIT 4097",
+    ] { guard_text(tx,query,deployment,4096)?; }
+    Ok(())
 }
 
 /// Immutable one-record reader. It never follows cleanup/accounting links recursively.
 fn read_one(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleError> {
+    guard_text(tx,"SELECT s.operation_id,s.deployment_id,s.binding_id,s.session_id,s.state,s.step_json,a.run_id,coalesce(a.predecessor_cleanup_operation_id,''),coalesce(s.grant_id,'') FROM lifecycle_steps s JOIN candidate_cleanup_actions a ON a.step_id=s.id AND a.operation_id=s.operation_id WHERE s.id=?1",id,1)?;
     type Row = (
         String,
         String,
@@ -262,6 +299,13 @@ fn read_one(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleErro
             (a.planned, Some(a.issued_at_ms))
         }
     };
+    // Bound the legacy source readers before they allocate any DTOs. Their
+    // existing semantic validators remain authoritative after these guards.
+    super::abort::source(tx,&p.principal_id,&p.run_id).map_err(|error|match error {
+        LifecycleError::Sql(error)=>LifecycleError::Sql(error),
+        _=>LifecycleError::CorruptStoredData,
+    })?;
+    guard_deployment(tx,&p.deployment_id)?;
     let v = validated_initialize(tx, &p.association_step_id)?;
     let a = association(tx, &v)?.ok_or(LifecycleError::CorruptStoredData)?;
     let c = v.snapshot.receipt();
@@ -315,7 +359,8 @@ fn read_one(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleErro
     if owner != p.principal_id {
         return Err(LifecycleError::CorruptStoredData);
     }
-    let records:Vec<(String,String,String,String,String)>=tx.prepare("SELECT principal_id,command_scope,idempotency_key,request_hash,response_json FROM command_receipts WHERE operation_id=?1")?.query_map([&operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<Result<_,_>>()?;
+    guard_text(tx,"SELECT principal_id,command_scope,idempotency_key,request_hash,response_json FROM command_receipts WHERE operation_id=?1 LIMIT 2",&operation,1)?;
+    let records:Vec<(String,String,String,String,String)>=tx.prepare("SELECT principal_id,command_scope,idempotency_key,request_hash,response_json FROM command_receipts WHERE operation_id=?1 LIMIT 2")?.query_map([&operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<Result<_,_>>()?;
     if records.len() != 1 {
         return Err(LifecycleError::CorruptStoredData);
     }
@@ -374,14 +419,14 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<ReadCleanup, LifecycleError> {
         if visited.len() >= 64 || !visited.insert(operation.clone()) {
             return Err(LifecycleError::CorruptStoredData);
         }
-        let step: String = tx
+        let step = tx
             .query_row(
                 "SELECT step_id FROM candidate_cleanup_actions WHERE operation_id=?1",
                 [&operation],
-                |r| r.get(0),
+                |r| Ok(bounded(r,0,26)),
             )
             .optional()?
-            .ok_or(LifecycleError::CorruptStoredData)?;
+            .ok_or(LifecycleError::CorruptStoredData)??;
         let previous = read_one(tx, &step)?;
         let p = previous.planned;
         if child.predecessor_operation_id.as_deref() != Some(&operation)
@@ -521,7 +566,7 @@ pub(crate) fn validate_gone_history(
     tx: &Transaction<'_>,
     v: &ValidatedInitialize,
 ) -> Result<(), LifecycleError> {
-    let id:Option<String>=tx.query_row("SELECT cleanup_step_id FROM qualification_runs WHERE id=?1 AND cleanup_state='verified_gone'",[v.snapshot.receipt().run_id()],|r|r.get(0)).optional()?.flatten();
+    let id=tx.query_row("SELECT cleanup_step_id FROM qualification_runs WHERE id=?1 AND cleanup_state='verified_gone'",[v.snapshot.receipt().run_id()],|r|Ok(bounded(r,0,26))).optional()?.transpose()?;
     let r = read(tx, &id.ok_or(LifecycleError::CorruptStoredData)?)?;
     if r.planned.association_step_id != v.context.token.step_id || recorded(tx, &r)?.is_none() {
         return Err(LifecycleError::CorruptStoredData);
@@ -530,6 +575,46 @@ pub(crate) fn validate_gone_history(
 }
 
 impl crate::Store {
+    /// Resolve the retained owned association without granting any effect.
+    pub fn candidate_cleanup_owned_binding(&self,s:&CoordinatorSession,principal:&str,run:&str)->Result<String,LifecycleError> {
+        let tx=Transaction::new_unchecked(&self.conn,TransactionBehavior::Deferred)?;
+        check_session(&tx,s)?;
+        if !super::valid_id(principal)||!super::ulid(run) {return Err(LifecycleError::Invalid);}
+        let snapshot=super::abort::source(&tx,principal,run)?;
+        let binding=snapshot.receipt().binding_id();
+        let associated:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM owned_launch_associations WHERE binding_id=?1 AND incarnation=?2)",params![binding,snapshot.receipt().incarnation()],|r|r.get(0))?;
+        if !associated {return Err(LifecycleError::Unsupported);}
+        Ok(binding.into())
+    }
+    /// Bounded current-session discovery. Historical arms are never redispatched.
+    pub fn next_candidate_cleanup(&self, s: &CoordinatorSession) -> Result<Option<CandidateCleanupReceipt>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let id = tx.query_row("SELECT a.step_id FROM candidate_cleanup_actions a JOIN lifecycle_steps s ON s.id=a.step_id WHERE s.session_id=?1 AND s.state='planned' ORDER BY a.operation_id LIMIT 1", [s.id()], |r|Ok(bounded(r,0,26))).optional()?.transpose()?;
+        let Some(id) = id else { return Ok(None); };
+        let r = read(&tx, &id)?;
+        current(&tx, s, &r)?;
+        accounting(&tx, &r.initialize)?;
+        Ok(Some(r.receipt.public(&r.planned.deployment_id)))
+    }
+
+    /// Receipt lookup is observation only, including after admission has closed.
+    pub fn candidate_cleanup_command_receipt(&self, s: &CoordinatorSession, principal: &str, run: &str, key: &str, command: &str) -> Result<Option<CandidateCleanupReceipt>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        if !super::valid_id(principal) || !super::ulid(run) || !super::valid_id(key) || command.len() > super::MAX_BYTES { return Err(LifecycleError::Invalid); }
+        let command: CleanupCommand = serde_json::from_str(command).map_err(|_|LifecycleError::Invalid)?;
+        let expected = hash(principal, run, command.expected_revision, command.deadline_ms)?;
+        let old = tx.query_row("SELECT request_hash,operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3", params![principal,format!("POST {}",target(run)),key],|r|Ok((bounded(r,0,64),bounded(r,1,26)))).optional()?;
+        let Some((old_hash, op)) = old else { return Ok(None); };
+        let (old_hash,op)=(old_hash?,op?);
+        if old_hash != expected { return Err(LifecycleError::Conflict); }
+        let id = tx.query_row("SELECT step_id FROM candidate_cleanup_actions WHERE operation_id=?1", [op], |r|Ok(bounded(r,0,26))).optional()?.ok_or(LifecycleError::CorruptStoredData)??;
+        let r = read(&tx, &id)?;
+        accounting(&tx, &r.initialize)?;
+        Ok(Some(r.receipt.public(&r.planned.deployment_id)))
+    }
+
     /// Creates separately bounded cleanup intent from frozen original ownership permission.
     pub fn accept_candidate_cleanup(
         &self,
@@ -539,6 +624,12 @@ impl crate::Store {
         key: &str,
         command: &str,
         now: i64,
+    ) -> Result<CandidateCleanupReceipt, LifecycleError> {
+        self.accept_candidate_cleanup_with_clock(s, principal, run, key, command, || Ok(now))
+    }
+    pub fn accept_candidate_cleanup_with_clock(
+        &self, s: &CoordinatorSession, principal: &str, run: &str, key: &str, command: &str,
+        mut clock: impl FnMut() -> Result<i64, LifecycleError>,
     ) -> Result<CandidateCleanupReceipt, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
@@ -559,25 +650,26 @@ impl crate::Store {
             command.deadline_ms,
         )?;
         let scope = format!("POST {}", target(run));
-        let old:Option<(String,String)>=tx.query_row("SELECT request_hash,operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",params![principal,scope,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let old=tx.query_row("SELECT request_hash,operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",params![principal,scope,key],|r|Ok((bounded(r,0,64),bounded(r,1,26)))).optional()?;
         if let Some((old_hash, op)) = old {
+            let (old_hash,op)=(old_hash?,op?);
             if old_hash != hash {
                 return Err(LifecycleError::Conflict);
             }
-            let id: String = tx
+            let id = tx
                 .query_row(
                     "SELECT step_id FROM candidate_cleanup_actions WHERE operation_id=?1",
                     [op],
-                    |r| r.get(0),
+                    |r| Ok(bounded(r,0,26)),
                 )
                 .optional()?
-                .ok_or(LifecycleError::CorruptStoredData)?;
+                .ok_or(LifecycleError::CorruptStoredData)??;
             let r = read(&tx, &id)?;
             accounting(&tx, &r.initialize)?;
-            return Ok(r.receipt.public());
+            return Ok(r.receipt.public(&r.planned.deployment_id));
         }
-        let snapshot =
-            corrupt(super::read_snapshot(&tx, principal, run))?.ok_or(LifecycleError::Conflict)?;
+        let now = clock()?;
+        let snapshot = super::abort::source(&tx,principal,run)?;
         let c = snapshot.receipt();
         if !c.allow_owned_abort_cleanup()
             || command.expected_revision != c.revision()
@@ -585,7 +677,8 @@ impl crate::Store {
         {
             return Err(LifecycleError::Conflict);
         }
-        let id:String=tx.query_row("SELECT step_id FROM owned_launch_associations WHERE binding_id=?1 AND incarnation=?2",params![c.binding_id(),c.incarnation()],|r|r.get(0)).optional()?.ok_or(LifecycleError::Conflict)?;
+        let id=tx.query_row("SELECT step_id FROM owned_launch_associations WHERE binding_id=?1 AND incarnation=?2",params![c.binding_id(),c.incarnation()],|r|Ok(bounded(r,0,26))).optional()?.ok_or(LifecycleError::Conflict)??;
+        guard_deployment(&tx,c.deployment_id())?;
         let v = validated_initialize(&tx, &id)?;
         accounting(&tx, &v)?;
         let a = association(&tx, &v)?.ok_or(LifecycleError::Conflict)?;
@@ -593,7 +686,7 @@ impl crate::Store {
         let mut origin = now;
         let mut mode = CleanupMode::TerminateOwned;
         let mut prior_cleanup = None;
-        let last:Vec<String>=tx.prepare("SELECT a.step_id FROM candidate_cleanup_actions a WHERE a.run_id=?1 AND NOT EXISTS(SELECT 1 FROM candidate_cleanup_actions b WHERE b.predecessor_cleanup_operation_id=a.operation_id)")?.query_map([run],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        let last:Vec<String>=tx.prepare("SELECT a.step_id FROM candidate_cleanup_actions a WHERE a.run_id=?1 AND NOT EXISTS(SELECT 1 FROM candidate_cleanup_actions b WHERE b.predecessor_cleanup_operation_id=a.operation_id) LIMIT 2")?.query_map([run],|r|Ok(bounded(r,0,26)))?.collect::<Result<Vec<_>,_>>()?.into_iter().collect::<Result<_,_>>()?;
         if last.len() > 1 {
             return Err(LifecycleError::CorruptStoredData);
         }
@@ -637,13 +730,13 @@ impl crate::Store {
         if fence.revision != c.revision() {
             return Err(LifecycleError::Stale);
         }
-        let predecessor: Option<String> = tx
+        let predecessor = tx
             .query_row(
                 "SELECT operation_id FROM lifecycle_claims WHERE deployment_id=?1",
                 [c.deployment_id()],
-                |r| r.get(0),
+                |r| Ok(bounded(r,0,26)),
             )
-            .optional()?;
+            .optional()?.transpose()?;
         if prior_cleanup
             .as_ref()
             .is_some_and(|p| predecessor.as_ref() != Some(p))
@@ -749,8 +842,10 @@ impl crate::Store {
             None,
         )?;
         read(&tx, &step)?;
+        let final_now = clock()?;
+        if final_now < now || final_now >= p.deadline_ms { return Err(LifecycleError::Stale); }
         tx.commit()?;
-        Ok(receipt.public())
+        Ok(receipt.public(&p.deployment_id))
     }
     pub fn arm_candidate_cleanup(
         &self,
@@ -758,6 +853,11 @@ impl crate::Store {
         id: &str,
         now: i64,
     ) -> Result<ArmResult, LifecycleError> {
+        self.arm_candidate_cleanup_with_context(s, id, now).map(|(arm, _)|arm)
+    }
+    pub fn arm_candidate_cleanup_with_context(
+        &self, s: &CoordinatorSession, id: &str, now: i64,
+    ) -> Result<(ArmResult, Option<CleanupExecutionContext>), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let r = read(&tx, id)?;
@@ -766,7 +866,7 @@ impl crate::Store {
             if r.state == "completed" {
                 recorded(&tx, &r)?;
             }
-            return Ok(ArmResult::AlreadyRecorded);
+            return Ok((ArmResult::AlreadyRecorded, None));
         }
         current(&tx, s, &r)?;
         let p = r.planned;
@@ -815,8 +915,19 @@ impl crate::Store {
             CandidateLifecycleTransition::CleanupArmed,
             None,
         )?;
+        let context = execution(&read(&tx, id)?)?;
         tx.commit()?;
-        Ok(ArmResult::New { step_id: id.into() })
+        Ok((ArmResult::New { step_id: id.into() }, Some(context)))
+    }
+    /// Revalidate every persisted execution field; a context is never replay authority.
+    pub fn revalidate_candidate_cleanup_send(&self, s: &CoordinatorSession, id: &str, expected: &CleanupExecutionContext, now: i64) -> Result<i64, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let r = read(&tx, id)?;
+        current(&tx, s, &r)?;
+        accounting(&tx, &r.initialize)?;
+        if execution(&r)? != *expected || now < expected.issued_at_ms || now >= expected.deadline_ms { return Err(LifecycleError::Stale); }
+        policy_ttl(&tx, r.initialize.snapshot.receipt().host_id())
     }
     /// Reading/cloning this context grants no send authority. Await predecessor exit
     /// and hold the lifetime controller lock before acting on a newly armed context.
@@ -829,21 +940,7 @@ impl crate::Store {
         check_session(&tx, s)?;
         let r = read(&tx, id)?;
         current(&tx, s, &r)?;
-        if r.state != "armed" || r.run_state != "running" {
-            return Err(LifecycleError::Conflict);
-        }
-        let p = r.planned;
-        Ok(CleanupExecutionContext {
-            fence: p.fence(),
-            operation_id: p.operation_id,
-            step_id: p.step_id,
-            binding_id: p.binding_id,
-            incarnation: p.incarnation,
-            identities: members(&p.identities)?,
-            issued_at_ms: r.issued.ok_or(LifecycleError::CorruptStoredData)?,
-            deadline_ms: p.deadline_ms,
-            mode: p.mode,
-        })
+        execution(&r)
     }
     pub fn complete_cleanup(
         &self,
@@ -853,10 +950,17 @@ impl crate::Store {
         now: i64,
         ttl: i64,
     ) -> Result<(), LifecycleError> {
+        self.complete_cleanup_with_clock(s,id,e,ttl,||Ok(now))
+    }
+    pub fn complete_cleanup_with_clock(
+        &self, s: &CoordinatorSession, id: &str, e: &CleanupEvidence, ttl: i64,
+        mut clock: impl FnMut()->Result<i64,LifecycleError>,
+    ) -> Result<(),LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let kind: String = tx.query_row("SELECT o.kind FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1", [id], |r| r.get(0)).optional()?.ok_or(LifecycleError::Unsupported)?;
+        let kind = tx.query_row("SELECT o.kind FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1", [id], |r| Ok(bounded(r,0,64))).optional()?.ok_or(LifecycleError::Unsupported)??;
         if kind == "ordinary_cleanup" {
+            let now=clock()?;
             crate::ordinary_lifecycle::cleanup::complete(&tx, s, id, e, now, ttl)?;
             tx.commit()?;
             return Ok(());
@@ -873,6 +977,7 @@ impl crate::Store {
                 Err(LifecycleError::Conflict)
             };
         }
+        let now=clock()?;
         current(&tx, s, &r)?;
         let p = &r.planned;
         let running: bool = tx.query_row(
@@ -957,6 +1062,9 @@ impl crate::Store {
             Some(epoch),
         )?;
         validate_gone_history(&tx, &r.initialize)?;
+        let final_now=clock()?;
+        if final_now<now {return Err(LifecycleError::Stale);}
+        fresh(r.issued.ok_or(LifecycleError::CorruptStoredData)?,p.deadline_ms,e.observed_at_ms,final_now,persisted)?;
         tx.commit()?;
         Ok(())
     }

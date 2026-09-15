@@ -22,6 +22,61 @@ const AUTH: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn candidate_cleanup_http_uses_original_runtime_and_releases_exactly_once() {
+    let clock=Arc::new(std::sync::atomic::AtomicI64::new(1200));
+    let (dir, owner, worker, run, app) = setup_clock(clock.clone());
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let body = json!({"expected_revision":1,"action":"cleanup","deadline_ms":650000});
+    for credential in [INFERENCE,"wrong"] {
+        let mut denied=request(&run,"cleanup",body.clone());denied.headers_mut().insert("authorization",format!("Bearer {credential}").parse().unwrap());
+        assert_eq!(app.clone().oneshot(denied).await.unwrap().status(),401);
+    }
+    for invalid in [json!({"expected_revision":1,"action":"cleanup"}),json!({"expected_revision":1,"action":"cleanup","deadline_ms":0}),json!({"expected_revision":1,"action":"cleanup","deadline_ms":650000,"evidence":{}})] {
+        assert_eq!(app.clone().oneshot(request(&run,"cleanup",invalid)).await.unwrap().status(),400);
+    }
+    let mut duplicate=request(&run,"cleanup",body.clone());*duplicate.body_mut()=Body::from(body.to_string().replacen('{',"{\"deadline_ms\":650000,",1));
+    assert_eq!(app.clone().oneshot(duplicate).await.unwrap().status(),400);
+    assert_eq!(app.clone().oneshot(request(&run,"missing-association",body.clone())).await.unwrap().status(),503);
+    let response = app.clone().oneshot(request(&run, "init", json!({"expected_revision":1,"action":"initialize","deadline_ms":400000}))).await.unwrap();
+    assert_eq!(response.status(), 202);
+    let init = value(response).await;
+    wait_operation(&worker, &sql, init["operation_id"].as_str().unwrap()).await;
+    let before = owner.lock().unwrap().store().resource_snapshot().unwrap();
+    clock.store(600000,std::sync::atomic::Ordering::SeqCst);
+    let guard=owner.lock().unwrap();
+    let first=tokio::spawn(app.clone().oneshot(request(&run,"cleanup",body.clone())));
+    let second=tokio::spawn(app.clone().oneshot(request(&run,"cleanup",body.clone())));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first.abort();second.abort();assert!(first.await.unwrap_err().is_cancelled());assert!(second.await.unwrap_err().is_cancelled());
+    assert_eq!(app.clone().oneshot(request(&run,"capacity",body.clone())).await.unwrap().status(),429);
+    drop(guard);
+    let response=tokio::time::timeout(Duration::from_secs(10),async {loop {
+        let response=app.clone().oneshot(request(&run,"cleanup",body.clone())).await.unwrap();
+        if response.status()!=429 {break response;}
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }}).await.unwrap();
+    assert_eq!(response.status(), 202, "associated Cleanup must use the retained owner");
+    let accepted = value(response).await;
+    assert_eq!(accepted["deployment_id"], init["deployment_id"]);
+    wait_operation(&worker, &sql, accepted["operation_id"].as_str().unwrap()).await;
+    let after = owner.lock().unwrap().store().resource_snapshot().unwrap();
+    assert_eq!(after.epoch, before.epoch + 1);
+    assert!(after.owners.is_empty());
+    assert_eq!(sql.query_row("SELECT count(*) FROM endpoint_leases", [], |r|r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(sql.query_row("SELECT cleanup_state FROM qualification_runs", [], |r|r.get::<_, String>(0)).unwrap(), "verified_gone");
+    assert_eq!(sql.query_row("SELECT admission_enabled+dispatch_enabled FROM deployments", [], |r|r.get::<_, i64>(0)).unwrap(), 0);
+    for (key,body) in [("cleanup",json!({"expected_revision":1,"action":"cleanup","deadline_ms":650001})),("init",json!({"expected_revision":1,"action":"cleanup","deadline_ms":650000})),("cleanup",json!({"expected_revision":1,"action":"abort","deadline_ms":650000}))] {
+        assert_eq!(app.clone().oneshot(request(&run,key,body)).await.unwrap().status(),409);
+    }
+    worker.shutdown().await.unwrap();
+    let retry = app.oneshot(request(&run, "cleanup", body)).await.unwrap();
+    assert_eq!(retry.status(), 202);
+    assert_eq!(value(retry).await, accepted);
+    assert_eq!(owner.lock().unwrap().store().resource_snapshot().unwrap(), after);
+}
+
+#[tokio::test]
 async fn candidate_abort_writer_replays_to_authenticated_sse_and_continues_after_retry() {
     use futures::StreamExt;
     let (_dir, owner, worker, run, app) = setup();
@@ -304,8 +359,33 @@ async fn candidate_warm_http_preserves_owner_and_accounts_twelve_requests() {
     ] {
         assert_eq!(app.clone().oneshot(request(&run, key, body)).await.unwrap().status(), 409);
     }
+    let cursor = owner.lock().unwrap().store().snapshot().unwrap().cursor.to_string();
+    let cleanup_body = json!({"expected_revision":1,"action":"cleanup","deadline_ms":12000});
+    let cleanup = app.clone().oneshot(request(&run,"cleanup",cleanup_body.clone())).await.unwrap();
+    assert_eq!(cleanup.status(),202);
+    let cleanup = value(cleanup).await;
+    wait_operation(&worker,&sql,cleanup["operation_id"].as_str().unwrap()).await;
+    assert!(owner.lock().unwrap().store().resource_snapshot().unwrap().owners.is_empty());
+    assert_eq!(sql.query_row("SELECT cleanup_state FROM qualification_runs",[],|r|r.get::<_,String>(0)).unwrap(),"verified_gone");
+    assert_eq!(sql.query_row("SELECT record_json FROM qualifications",[],|r|r.get::<_,String>(0)).unwrap(),original);
+    let replay = management_app.clone().oneshot(Request::builder().uri(format!("/management/v1/events?after={cursor}"))
+        .header("authorization",format!("Bearer {AUTH}")).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(replay.status(),200,"actual Cleanup writer must replay through authenticated SSE");
+    {
+        use futures::StreamExt;
+        let mut stream = replay.into_body().into_data_stream();
+        for kind in ["candidate_cleanup_accepted","candidate_cleanup_armed","candidate_cleanup_completed"] {
+            let frame = tokio::time::timeout(Duration::from_secs(3),stream.next()).await.unwrap().unwrap().unwrap();
+            let frame = std::str::from_utf8(&frame).unwrap();
+            assert!(frame.contains(&format!("event: {kind}\n")),"{frame}");
+            let data: Value = serde_json::from_str(frame.lines().find_map(|line|line.strip_prefix("data: ")).unwrap()).unwrap();
+            assert_eq!(data["operation_id"],cleanup["operation_id"]);
+            assert_eq!(data["payload"]["step_id"],cleanup["step_id"]);
+        }
+    }
     worker.shutdown().await.unwrap();
     clock.store(600000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(value(app.clone().oneshot(request(&run,"cleanup",cleanup_body)).await.unwrap()).await,cleanup);
     let retry = app.clone().oneshot(request(&run, "finish", finish_body)).await.unwrap();
     assert_eq!(retry.status(), 202);
     assert_eq!(value(retry).await, finish);

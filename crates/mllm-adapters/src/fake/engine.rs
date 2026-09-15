@@ -143,6 +143,13 @@ impl FakeEngine {
         incarnation: &str,
         identities: &[mllm_domain::completion::ProcessIdentity],
     ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
+        self.qualification_cleanup_mode_observed(binding, incarnation, identities, true)
+    }
+    /// Preserve the persisted cleanup mode and sample time after the gone check.
+    pub fn qualification_cleanup_mode_observed(
+        &self, binding: &str, incarnation: &str,
+        identities: &[mllm_domain::completion::ProcessIdentity], terminate: bool,
+    ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
         let clock = self
             .qualification_clock
             .as_deref()
@@ -152,7 +159,7 @@ impl FakeEngine {
             .unwrap()
             .as_mut()
             .ok_or(RuntimeError::Unsupported)?
-            .cleanup_with_clock(binding, incarnation, identities, true, clock)
+            .cleanup_with_clock(binding, incarnation, identities, terminate, clock)
     }
     pub fn qualification_security_control(
         &self,
