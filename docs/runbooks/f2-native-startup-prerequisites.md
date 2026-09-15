@@ -22,9 +22,10 @@ observation. Both unconditional native startup denials remain in place.
 Focused Rust coverage first failed on the old version-1 envelope, and the new
 Python positive case first failed because version 2 was unavailable. Final
 verification passes all 15 runtime-binding tests, all 216 Python runtime tests,
-and scoped Clippy. This change has not been installed remotely. Existing protected
-helper installations predate version 2 and must not be used as a compatible new
-startup composition. Protected enrollment paths, child descriptor transfer,
+and scoped Clippy. The isolated `949609b` helper install described below also
+passes its 16 launch-decoder tests on Python 3.12.3. Earlier protected helper
+installations predate version 2; none establishes a complete native startup
+composition. Protected enrollment paths, child descriptor transfer,
 complete process enrollment and startup integration remain unfinished.
 
 ## Remaining work
@@ -138,6 +139,18 @@ startup-guard tests then passed on that interpreter, including real subprocess
 argument imports and pre-import plugin rejection. No native package was imported,
 no observer binary was built, no model was loaded, and no existing environment or
 driver was changed. Full runtime verification on the local host passed 212 tests.
+
+A fourth immutable helper install, `$HOME/mllm-sglang-f2-runtime-949609b`,
+contains the version-2 private launch scope. The destination was first checked
+absent on host-a, then created with mode0700 and extracted from the committed
+`949609b` runtime archive without overwriting prior installations. All sixteen
+launch-decoder tests pass under the isolated Python 3.12.3 with `-I -B`.
+An explicit loaded-module check confirms no SGLang, Torch, Transformers or saver
+imports. The installed entry SHA-256 matches the committed source:
+`570170d9509d3d5e954e0baba1a0c761166b1329c9fe82d3cde59ddd9db06d33`.
+No existing engine environment, observer binary, checkpoint, driver or service was
+modified. This verifies decoder compatibility only, not native startup or process
+enrollment; both unconditional native denials remain closed.
 
 ### Source contract
 
