@@ -1,13 +1,13 @@
 use axum::{
-    body::{Body, to_bytes},
+    body::{to_bytes, Body},
     http::Request,
 };
 use mllm_config::effective::resolve_effective;
 use mllm_controller::OwnedCoordinatorState;
 use mllm_management::{
-    ManagementCredentials, configuration::SharedConfigurationSource, configuration_router,
+    configuration::SharedConfigurationSource, configuration_router, ManagementCredentials,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex},
@@ -126,13 +126,11 @@ async fn authenticated_configuration_accepts_replays_and_replaces_without_runtim
     let owner = state.lock().unwrap();
     assert_eq!(owner.session().epoch(), 1);
     assert!(owner.store().resource_snapshot().unwrap().owners.is_empty());
-    assert!(
-        owner
-            .store()
-            .runtime_binding(created["deployment_id"].as_str().unwrap())
-            .unwrap()
-            .is_none()
-    );
+    assert!(owner
+        .store()
+        .runtime_binding(created["deployment_id"].as_str().unwrap())
+        .unwrap()
+        .is_none());
     let deployment = owner
         .store()
         .get_deployment(created["deployment_id"].as_str().unwrap())
@@ -250,8 +248,21 @@ impl mllm_management::configuration::ConfigurationSource for RejectingSource {
         }
     }
 }
+impl mllm_management::candidates::CandidateSource for RejectingSource {
+    fn create_candidate(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<
+        mllm_store::candidate_creation::CandidateCreationReceipt,
+        mllm_management::configuration::ConfigurationFailure,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(mllm_management::configuration::ConfigurationFailure::Internal)
+    }
+}
 fn rejecting_app(source: Arc<RejectingSource>) -> axum::Router {
-    configuration_router(
+    mllm_management::candidate_acceptance_router(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
         source,
     )
@@ -476,6 +487,20 @@ async fn cancelled_requests_retain_command_capacity_until_blocking_work_finishes
         .unwrap();
     assert_eq!(response.status(), 429);
     assert_eq!(json_response(response).await["error"]["code"], "queue_full");
+    assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Candidate commands share the same capacity; separate route budgets would
+    // permit unbounded growth as management actions are added.
+    let candidate = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/management/v1/qualification-runs",
+            "overflow",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(candidate.status(), 429);
     assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     // Read capacity is independent: the snapshot provider's closed error is 500,
     // not the command queue's 429.

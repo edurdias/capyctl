@@ -1,11 +1,11 @@
 //! Stopped configuration commands only; no activation or engine callbacks.
-use crate::{AppState, SnapshotSource, SnapshotUnavailable, events::EventSource};
+use crate::{events::EventSource, AppState, SnapshotSource, SnapshotUnavailable};
 use axum::{
-    Json,
     body::to_bytes,
     extract::{Request, State},
     http::{Method, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use mllm_controller::OwnedCoordinatorState;
 use mllm_store::{
@@ -14,7 +14,7 @@ use mllm_store::{
     snapshot::Snapshot,
 };
 use serde::Deserialize;
-use serde_json::{Value, value::RawValue};
+use serde_json::{value::RawValue, Value};
 use std::{
     error::Error,
     sync::{Arc, Mutex},
@@ -41,10 +41,12 @@ pub enum ConfigurationFailure {
     RouteConflict,
     RuntimeRetained,
     ReconciliationRequired,
+    HostPolicyDenied,
+    CapacityBlocked,
     Internal,
 }
 impl ConfigurationFailure {
-    fn response(self) -> Response {
+    pub(crate) fn response(self) -> Response {
         use ConfigurationFailure::*;
         let (status, code, message, retryable) = match self {
             InvalidRequest => (
@@ -125,6 +127,18 @@ impl ConfigurationFailure {
                 "Management command failed",
                 false,
             ),
+            HostPolicyDenied => (
+                StatusCode::FORBIDDEN,
+                "host_policy_denied",
+                "Host policy denies candidate qualification",
+                false,
+            ),
+            CapacityBlocked => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity_blocked",
+                "Candidate endpoint capacity is unavailable",
+                true,
+            ),
         };
         (status, Json(serde_json::json!({"api_version":"1","error":{"code":code,"message":message,"retryable":retryable,"operation_id":null,"details":{}}}))).into_response()
     }
@@ -204,6 +218,39 @@ impl SnapshotSource for SharedConfigurationSource {
             .store()
             .snapshot()
             .map_err(|_| SnapshotUnavailable)
+    }
+}
+impl crate::candidates::CandidateSource for SharedConfigurationSource {
+    fn create_candidate(
+        &self,
+        key: &str,
+        command_json: &str,
+    ) -> Result<mllm_store::candidate_creation::CandidateCreationReceipt, ConfigurationFailure>
+    {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConfigurationFailure::Internal)?;
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ConfigurationFailure::Internal)?
+                .as_millis(),
+        )
+        .map_err(|_| ConfigurationFailure::Internal)?;
+        // Store composes current policy only after checking historical receipts.
+        // No startup policy import or fresh coordinator session is permitted here.
+        state
+            .store()
+            .create_candidate_run(
+                state.session(),
+                &self.principal,
+                key,
+                command_json,
+                &self.trusted_host,
+                now,
+            )
+            .map_err(Into::into)
     }
 }
 impl EventSource for SharedConfigurationSource {
@@ -321,23 +368,6 @@ async fn accept_inner(
     request: Request,
 ) -> Result<ManagedConfigurationReceipt, ConfigurationFailure> {
     use ConfigurationFailure::*;
-    if request.uri().query().is_some() {
-        return Err(InvalidRequest);
-    }
-    let key = single_header(&request, "idempotency-key")
-        .filter(|key| identifier(key))
-        .ok_or(InvalidRequest)?
-        .to_owned();
-    let content_type = single_header(&request, "content-type").ok_or(InvalidRequest)?;
-    if !matches!(
-        content_type.to_ascii_lowercase().as_str(),
-        "application/json" | "application/json; charset=utf-8"
-    ) {
-        return Err(InvalidRequest);
-    }
-    if request.headers().contains_key("content-encoding") {
-        return Err(InvalidRequest);
-    }
     let target = if request.method() == Method::PUT {
         let id = request
             .uri()
@@ -352,25 +382,7 @@ async fn accept_inner(
     } else {
         None
     };
-    let permit = state
-        .commands_in_flight
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| QueueFull)?;
-    let body = tokio::time::timeout(BODY_TIMEOUT, to_bytes(request.into_body(), MAX_BODY))
-        .await
-        .map_err(|_| DeadlineExceeded)?
-        .map_err(|error| {
-            if error
-                .source()
-                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-            {
-                BodyTooLarge
-            } else {
-                InvalidRequest
-            }
-        })?;
-    json_shape::validate(&body).map_err(|_| InvalidRequest)?;
+    let (key, body, permit) = read_command(&state, request).await?;
     let command = if let Some(deployment_id) = target {
         let input: Replace<'_> = serde_json::from_slice(&body).map_err(|_| InvalidRequest)?;
         if input.expected_revision < 1 {
@@ -391,15 +403,7 @@ async fn accept_inner(
         }
     };
     let source = state.configuration.clone().ok_or(Unsupported)?;
-    let result = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        source.accept(&key, command)
-    });
-    // Timeout/disconnect abandons observation, not an already-started transaction.
-    let receipt = tokio::time::timeout(ACCEPT_TIMEOUT, result)
-        .await
-        .map_err(|_| DeadlineExceeded)?
-        .map_err(|_| Internal)??;
+    let receipt = accept_blocking(permit, move || source.accept(&key, command)).await?;
     if receipt.version != 1
         || receipt.revision < 1
         || receipt.generation < 1
@@ -415,4 +419,65 @@ async fn accept_inner(
         return Err(Internal);
     }
     Ok(receipt)
+}
+
+/// Shared command budget, wire validation and body deadline for every mutation.
+pub(crate) async fn read_command(
+    state: &Arc<AppState>,
+    request: Request,
+) -> Result<(String, axum::body::Bytes, tokio::sync::OwnedSemaphorePermit), ConfigurationFailure> {
+    use ConfigurationFailure::*;
+    if request.uri().query().is_some() {
+        return Err(InvalidRequest);
+    }
+    let key = single_header(&request, "idempotency-key")
+        .filter(|key| identifier(key))
+        .ok_or(InvalidRequest)?
+        .to_owned();
+    let content_type = single_header(&request, "content-type").ok_or(InvalidRequest)?;
+    if !matches!(
+        content_type.to_ascii_lowercase().as_str(),
+        "application/json" | "application/json; charset=utf-8"
+    ) {
+        return Err(InvalidRequest);
+    }
+    if request.headers().contains_key("content-encoding") {
+        return Err(InvalidRequest);
+    }
+    let permit = state
+        .commands_in_flight
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| QueueFull)?;
+    let body = tokio::time::timeout(BODY_TIMEOUT, to_bytes(request.into_body(), MAX_BODY))
+        .await
+        .map_err(|_| DeadlineExceeded)?
+        .map_err(|error| {
+            if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                BodyTooLarge
+            } else {
+                InvalidRequest
+            }
+        })?;
+    json_shape::validate(&body).map_err(|_| InvalidRequest)?;
+    Ok((key, body, permit))
+}
+
+pub(crate) async fn accept_blocking<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> Result<T, ConfigurationFailure> + Send + 'static,
+) -> Result<T, ConfigurationFailure> {
+    use ConfigurationFailure::*;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    // Timeout/disconnect abandons observation, not an already-started transaction.
+    tokio::time::timeout(ACCEPT_TIMEOUT, result)
+        .await
+        .map_err(|_| DeadlineExceeded)?
+        .map_err(|_| Internal)?
 }
