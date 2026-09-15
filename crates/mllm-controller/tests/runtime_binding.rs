@@ -385,7 +385,7 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         &std::fs::read(format!("/proc/self/fd/{}", command.argv[6])).unwrap(),
     )
     .unwrap();
-    assert_eq!(private["schema_version"], 1);
+    assert_eq!(private["schema_version"], 2);
     assert_eq!(private["kind"], "sglang_candidate_private_launch");
     assert_eq!(
         private["checkpoint_root"],
@@ -395,7 +395,29 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         private["public_settings"],
         serde_json::from_str::<serde_json::Value>(&command.argv[4]).unwrap()
     );
-    assert_eq!(private.as_object().unwrap().len(), 4);
+    let execution = fixture
+        .store
+        .candidate_initialize_execution(&fixture.session, &fixture.step)
+        .unwrap();
+    assert_eq!(
+        private["launch_scope"],
+        serde_json::json!({
+            "session_id": fixture.session.id(),
+            "deployment_id": execution.token.deployment_id,
+            "operation_id": execution.token.operation_id,
+            "step_id": execution.token.step_id,
+            "revision": execution.token.revision,
+            "generation": execution.token.generation,
+            "binding_id": execution.binding_id,
+            "incarnation": execution.incarnation,
+            "issued_at_ms": execution.issued_at_ms,
+            "deadline_ms": execution.deadline_ms,
+        })
+    );
+    assert_eq!(private.as_object().unwrap().len(), 5);
+    for field in ["session_id", "deployment_id", "operation_id", "step_id"] {
+        assert!(!text.contains(private["launch_scope"][field].as_str().unwrap()));
+    }
     assert_eq!(
         std::fs::read(format!("/proc/self/fd/{}", command.argv[8])).unwrap(),
         b"private-inference-token"

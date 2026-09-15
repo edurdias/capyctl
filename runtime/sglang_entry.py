@@ -73,6 +73,9 @@ class LaunchSpec:
     _checkpoint_root: str = field(repr=False)
     _inference_key: str = field(repr=False)
     _admin_key: str = field(repr=False)
+    # Version 1 has no scope and must never be promoted implicitly. Version 2
+    # carries immutable private metadata, not enrollment or execution authority.
+    _launch_scope_json: str | None = field(default=None, repr=False)
 
     def __repr__(self):
         return "LaunchSpec(<private>)"
@@ -192,6 +195,24 @@ def _credential(raw):
     return raw.decode("ascii")
 
 
+def _validate_launch_scope(value, public):
+    _exact_object(value, ("session_id", "deployment_id", "operation_id", "step_id",
+                          "binding_id", "incarnation", "revision", "generation",
+                          "issued_at_ms", "deadline_ms"))
+    for name in ("session_id", "deployment_id", "operation_id", "step_id",
+                 "binding_id", "incarnation"):
+        _ulid(value[name])
+    for name in ("revision", "generation"):
+        _integer(value[name], 1, (1 << 63) - 1)
+    for name in ("issued_at_ms", "deadline_ms"):
+        _integer(value[name], 0, (1 << 63) - 1)
+    if (value["deadline_ms"] <= value["issued_at_ms"]
+            or value["binding_id"] != public["binding_id"]
+            or value["incarnation"] != public["incarnation"]):
+        _reject()
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def _read_descriptor(fd):
     """Consume a bounded inherited regular file; never open a caller-supplied path.
 
@@ -247,12 +268,16 @@ def build_launch(argv, descriptor_reader):
         public = _strict_json(options[names[0]])
         _validate_public(public)
         private = _strict_json(descriptor_reader(fds[0]))
-        _exact_object(private, ("schema_version", "kind", "checkpoint_root", "public_settings"))
-        _literal(private["schema_version"], 1)
+        version = private.get("schema_version")
+        _integer(version, 1, 2)
+        keys = ("schema_version", "kind", "checkpoint_root", "public_settings")
+        _exact_object(private, keys if version == 1 else (*keys, "launch_scope"))
         _literal(private["kind"], "sglang_candidate_private_launch")
         _validate_public(private["public_settings"])
         if private["public_settings"] != public:
             _reject()
+        launch_scope = (None if version == 1
+                        else _validate_launch_scope(private["launch_scope"], public))
         root = _text(private["checkpoint_root"], 4096)
         if not root.startswith("/") or any(part in ("", ".", "..") for part in root[1:].split("/")):
             _reject()
@@ -261,7 +286,7 @@ def build_launch(argv, descriptor_reader):
         if hmac.compare_digest(inference, admin):
             raise LaunchError("invalid_credentials")
         return LaunchSpec(json.dumps(public, sort_keys=True, separators=(",", ":")),
-                          root, inference, admin)
+                          root, inference, admin, launch_scope)
     except LaunchError as error:
         raise LaunchError(error.code) from None
     except Exception:

@@ -4,6 +4,29 @@ Status: native startup remains closed. The protected candidate handoff is implem
 through `49bed60` and its consolidated review has no remaining Critical or Important
 findings. This does not complete F2B or qualify a native engine.
 
+## Private launch scope
+
+The trusted Rust handoff now emits private descriptor version 2. Its sealed
+launch descriptor includes the current coordinator session, deployment revision
+and generation, operation and step IDs, binding and incarnation, and the original
+issued/deadline timestamps from the persisted Initialize execution. Those fields
+do not enter public settings, argv, environment or diagnostic representations.
+
+The Python decoder accepts explicit versions only. Version 2 requires the exact
+scope shape, canonical identifiers, bounded integer timestamps and matching
+public binding/incarnation. Version 1 remains shape-compatible with no scope;
+it is never silently upgraded. The private immutable scope is metadata, not a
+launch capability, enrollment proof, verified process identity or fresh clock
+observation. Both unconditional native startup denials remain in place.
+
+Focused Rust coverage first failed on the old version-1 envelope, and the new
+Python positive case first failed because version 2 was unavailable. Final
+verification passes all 15 runtime-binding tests, all 216 Python runtime tests,
+and scoped Clippy. This change has not been installed remotely. Existing protected
+helper installations predate version 2 and must not be used as a compatible new
+startup composition. Protected enrollment paths, child descriptor transfer,
+complete process enrollment and startup integration remain unfinished.
+
 ## Remaining work
 
 - The import-safe `sglang_server_args` mapper now checks 100 explicit native

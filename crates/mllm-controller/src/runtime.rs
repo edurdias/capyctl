@@ -215,10 +215,22 @@ impl<'a> NativeCandidateHandoff<'a> {
         let admin = resolve(frozen.admin_credential_ref())
             .map_err(|_| native_error("candidate credential resolution failed"))?;
         let private = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "sglang_candidate_private_launch",
             "checkpoint_root": frozen.checkpoint_root(),
             "public_settings": launch.public_metadata(),
+            "launch_scope": {
+                "session_id": session.id(),
+                "deployment_id": execution.token.deployment_id,
+                "operation_id": execution.token.operation_id,
+                "step_id": execution.token.step_id,
+                "revision": execution.token.revision,
+                "generation": execution.token.generation,
+                "binding_id": execution.binding_id,
+                "incarnation": execution.incarnation,
+                "issued_at_ms": execution.issued_at_ms,
+                "deadline_ms": execution.deadline_ms,
+            },
         }))
         .map_err(|_| native_error("candidate descriptor encoding failed"))?;
         let descriptors =

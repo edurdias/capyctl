@@ -89,6 +89,81 @@ class LaunchFixture:
             self.assertNotIn(private, repr(caught.exception))
 
 class LaunchTests(LaunchFixture, unittest.TestCase):
+    def scoped_payloads(self):
+        data = self.payloads()
+        private = json.loads(data[3])
+        private["schema_version"] = 2
+        private["launch_scope"] = {
+            "session_id": "01K00000000000000000000002",
+            "deployment_id": "01K00000000000000000000003",
+            "operation_id": "01K00000000000000000000004",
+            "step_id": "01K00000000000000000000005",
+            "binding_id": self.public["binding_id"],
+            "incarnation": self.public["incarnation"],
+            "revision": 1, "generation": 2,
+            "issued_at_ms": 1000, "deadline_ms": 10000,
+        }
+        data[3] = json.dumps(private).encode()
+        return data
+
+    def test_scoped_v2_descriptor_is_private_immutable_and_not_launch_authority(self):
+        data = self.scoped_payloads()
+        spec = self.build(payloads=data)
+        expected = json.loads(data[3])["launch_scope"]
+        self.assertEqual(json.loads(spec._launch_scope_json), expected)
+        self.assertNotIn(expected["session_id"], repr(spec))
+        self.assertNotIn("launch_scope", self.argv()[1])
+        with self.assertRaises((AttributeError, TypeError)):
+            spec._launch_scope_json = "{}"
+        for guarded in (lambda: entry._verified_native_contract(spec, None),
+                        lambda: entry._import_and_launch(spec, None, None)):
+            with self.assertRaises(entry.LaunchError) as caught:
+                guarded()
+            self.assertEqual(caught.exception.code, "pinned_source_contract_unavailable")
+        self.assertIsNone(self.build()._launch_scope_json)
+
+    def test_v2_scope_rejects_wrong_types_bounds_identity_and_unknown_fields(self):
+        original = json.loads(self.scoped_payloads()[3])
+        mutations = [("unexpected", 1), ("binding_id", original["launch_scope"]["step_id"]),
+                     ("incarnation", original["launch_scope"]["step_id"])]
+        for name in ("session_id", "deployment_id", "operation_id", "step_id",
+                     "binding_id", "incarnation"):
+            mutations.extend((name, value) for value in (None, True, "bad", "x" * 27))
+        for name in ("revision", "generation"):
+            mutations.extend((name, value) for value in (0, -1, True, 1.0, "1", 2 ** 63))
+        for name in ("issued_at_ms", "deadline_ms"):
+            mutations.extend((name, value) for value in (-1, True, 1.0, "1", 2 ** 63))
+        mutations.extend((("deadline_ms", 1000), ("deadline_ms", 999)))
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                private = copy.deepcopy(original)
+                private["launch_scope"][key] = value
+                data = self.payloads()
+                data[3] = json.dumps(private).encode()
+                self.rejects(payloads=data)
+        for missing in original["launch_scope"]:
+            private = copy.deepcopy(original)
+            del private["launch_scope"][missing]
+            data = self.payloads()
+            data[3] = json.dumps(private).encode()
+            self.rejects(payloads=data)
+
+    def test_descriptor_versions_never_infer_or_discard_scope(self):
+        for version in (1, 3, True, 2.0, "2"):
+            data = self.scoped_payloads()
+            private = json.loads(data[3])
+            private["schema_version"] = version
+            data[3] = json.dumps(private).encode()
+            self.rejects(payloads=data)
+        data = self.payloads()
+        private = json.loads(data[3])
+        private["schema_version"] = 2
+        data[3] = json.dumps(private).encode()
+        self.rejects(payloads=data)
+        data = self.scoped_payloads()
+        data[3] = data[3].replace(b'"generation": 2', b'"generation": 2, "generation": 2')
+        self.rejects(payloads=data)
+
     def test_valid_descriptor_stays_private_and_cannot_mutate(self):
         spec = self.build()
         for private in (self.root, self.inference.decode(), self.admin.decode()):
