@@ -1,21 +1,22 @@
-//! Preparatory read-only management boundary. Not the complete A3 API.
+//! Preparatory management boundaries. Not the complete A3 API.
 //!
-//! No listener, inference routes or mutations
-//! is composed here. The trusted service must resolve independent credentials and
+//! Optional mutations accept stopped configurations only. No listener, inference
+//! routes or activation are composed here. The trusted service must resolve independent credentials and
 //! mount this router ONLY on its separate loopback (or TLS) management listener.
 use axum::{
+    Json, Router,
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
-use mllm_store::{snapshot::Snapshot, Store};
+use mllm_store::{Store, snapshot::Snapshot};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+pub mod configuration;
 mod credentials;
 pub mod events;
 
@@ -96,6 +97,8 @@ struct AppState {
     events: Option<Arc<dyn events::EventSource>>,
     streams: Arc<Semaphore>,
     event_options: events::EventStreamOptions,
+    configuration: Option<Arc<dyn configuration::ConfigurationSource>>,
+    commands_in_flight: Arc<Semaphore>,
 }
 
 /// At most two queued/running blocking reads per router. Cancellation retains a
@@ -111,6 +114,8 @@ pub fn snapshot_router(
         events: None,
         streams: Arc::new(Semaphore::new(0)),
         event_options: events::EventStreamOptions::default(),
+        configuration: None,
+        commands_in_flight: Arc::new(Semaphore::new(0)),
     });
     routes(state, false)
 }
@@ -139,8 +144,32 @@ pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSour
         events: Some(source),
         streams: Arc::new(Semaphore::new(options.max_streams)),
         event_options: options,
+        configuration: None,
+        commands_in_flight: Arc::new(Semaphore::new(0)),
     });
     Ok(routes(state, true))
+}
+
+/// Adds only stopped managed configuration commands to snapshot/SSE. Activation,
+/// lifecycle actions, listener startup and full A3 composition remain unavailable.
+pub fn configuration_router<
+    T: SnapshotSource + events::EventSource + configuration::ConfigurationSource,
+>(
+    credentials: ManagementCredentials,
+    source: Arc<T>,
+) -> Router {
+    let options = events::EventStreamOptions::default();
+    let state = Arc::new(AppState {
+        credentials,
+        source: source.clone(),
+        reads: Arc::new(Semaphore::new(2)),
+        events: Some(source.clone()),
+        streams: Arc::new(Semaphore::new(options.max_streams)),
+        event_options: options,
+        configuration: Some(source),
+        commands_in_flight: Arc::new(Semaphore::new(2)),
+    });
+    routes(state, true)
 }
 
 fn routes(state: Arc<AppState>, include_events: bool) -> Router {
@@ -150,6 +179,19 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
             "/management/v1/events",
             get(events::subscribe).head(method_denied),
         )
+    } else {
+        router
+    };
+    let router = if state.configuration.is_some() {
+        router
+            .route(
+                "/management/v1/deployments",
+                axum::routing::post(configuration::accept),
+            )
+            .route(
+                "/management/v1/deployments/{id}",
+                axum::routing::put(configuration::accept),
+            )
     } else {
         router
     };

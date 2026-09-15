@@ -1102,7 +1102,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "http-body-util",
  "libc",
+ "mllm-config",
+ "mllm-controller",
+ "mllm-domain",
  "mllm-store",
  "rusqlite",
  "serde",
