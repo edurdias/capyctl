@@ -13,7 +13,7 @@ import os
 import stat
 import sys
 
-# The renderer invokes this file under python -I. Resolve our own package from
+# The renderer invokes this file under python -IS. Resolve our own package from
 # the installed wrapper location, never the current directory or PYTHONPATH.
 if __name__ in ("__main__", "__mp_main__") and not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -94,7 +94,7 @@ fn public_args(launch: &SglangLaunch) -> Value {
         &command.argv[..4],
         [
             "/opt/sglang/bin/python3",
-            "-I",
+            "-IS",
             wrapper().to_str().unwrap(),
             "--public-settings-json"
         ]

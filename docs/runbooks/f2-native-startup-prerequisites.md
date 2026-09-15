@@ -152,6 +152,30 @@ No existing engine environment, observer binary, checkpoint, driver or service w
 modified. This verifies decoder compatibility only, not native startup or process
 enrollment; both unconditional native denials remain closed.
 
+### Interpreter startup hooks
+
+The native renderer now uses combined `-IS` (isolated mode plus no automatic site
+initialization). A CPU-only test with a fresh stdlib virtual environment proves
+that `-I` alone still executes an installed `.pth` hook before protected entry
+code; `-IS` prevents that hook. This is a controlled fixture, not evidence of an
+unexpected hook in the installed engine environment. The renderer assertion was
+RED on the old `-I` command before the change.
+
+The actual multiprocessing-spawn test now uses the same flags and asserts both
+remain enabled when deferred argument imports occur. All 13 startup-guard tests
+are included in the passing 217-test Python runtime suite. All 10 renderer and
+15 runtime-binding tests, plus scoped Clippy, pass. A read-only invocation of the
+isolated Spark Python 3.12.3 confirms both flags and imports the existing protected
+`949609b` entry helper without importing native packages. No environment or helper
+file was changed by this check.
+
+Disabling site processing also disables automatic package-path discovery. Complete
+startup must explicitly establish trusted immutable package and metadata paths
+before plugin inventory or native imports. It must not process `.pth` files or
+call `site.main()` to recover those paths. An empty inventory under `-S` is not
+installed-package attestation. That composition is still open, and both native
+entrypoint denials remain closed.
+
 ### Source contract
 
 The local `runtime/sglang_source_preflight.py` now verifies ten selected source

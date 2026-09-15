@@ -157,7 +157,10 @@ impl SglangLaunch {
         Ok(RenderedCommand {
             argv: vec![
                 self.executable.clone(),
-                "-I".into(),
+                // Installed .pth/sitecustomize hooks otherwise run before our
+                // protected entry, even in isolated mode. Trusted package paths
+                // must be composed explicitly without invoking site processing.
+                "-IS".into(),
                 wrapper.to_str().ok_or(RuntimeError::Unsupported)?.into(),
                 "--public-settings-json".into(),
                 public,

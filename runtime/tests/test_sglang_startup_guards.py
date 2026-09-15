@@ -7,15 +7,43 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import venv
 
 
 ROOT = str(Path(__file__).resolve().parents[2])
 
 
 class StartupGuardsTests(unittest.TestCase):
+    def test_no_site_flag_prevents_installed_hooks_before_protected_entry(self):
+        # -I disables user site and environment paths, not installed .pth code.
+        # Use only a fresh stdlib-only test environment, never an engine install.
+        with tempfile.TemporaryDirectory() as root:
+            environment = Path(root, "python")
+            venv.EnvBuilder(with_pip=False).create(environment)
+            python = str(environment / "bin" / "python")
+            site = subprocess.run(
+                [python, "-I", "-B", "-c",
+                 "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                capture_output=True, text=True, timeout=15, check=True)
+            marker = Path(root, "site-hook-executed")
+            Path(site.stdout.strip(), "startup_probe.pth").write_text(
+                "import pathlib; pathlib.Path(" + repr(str(marker)) +
+                ").write_text('executed before entry')\n")
+            body = "import sys; print(sys.flags.isolated, sys.flags.no_site)"
+            before = subprocess.run([python, "-I", "-B", "-c", body],
+                                    capture_output=True, timeout=15, check=True)
+            self.assertEqual(before.stdout, b"1 0\n")
+            self.assertTrue(marker.exists(), "positive control did not execute installed hook")
+            marker.unlink()
+            protected = subprocess.run([python, "-IS", "-B", "-c", body],
+                                       capture_output=True, timeout=15, check=True)
+            self.assertEqual(protected.stdout, b"1 1\n")
+            self.assertEqual(protected.stderr, b"")
+            self.assertFalse(marker.exists(), "installed hook ran before the protected entry")
+
     def child(self, body):
         return subprocess.run(
-            [sys.executable, "-I", "-B", "-c",
+            [sys.executable, "-IS", "-B", "-c",
              "import sys\nsys.path.insert(0, " + repr(ROOT) + ")\n" +
              textwrap.dedent(body)], capture_output=True, timeout=10,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
@@ -36,7 +64,7 @@ class StartupGuardsTests(unittest.TestCase):
             libc = ctypes.CDLL(None)
             libc.puts(b"PRIVATE-C")
             libc.fflush(None)
-            subprocess.run([sys.executable, "-I", "-B", "-c",
+            subprocess.run([sys.executable, "-IS", "-B", "-c",
                             "import os; os.write(2,b'PRIVATE-CHILD')"], check=True)
         ''')
         self.assertEqual(child.returncode, 0, child.stderr)
@@ -207,7 +235,8 @@ class StartupGuardsTests(unittest.TestCase):
             with self.subTest(denied=denied), tempfile.TemporaryDirectory() as root:
                 marker = Path(root, "argument-imported")
                 Path(root, "argument_probe.py").write_text(
-                    "import os\nfrom pathlib import Path\n"
+                    "import os, sys\nfrom pathlib import Path\n"
+                    "assert sys.flags.isolated == 1 and sys.flags.no_site == 1\n"
                     f"Path({str(marker)!r}).write_text('imported')\n"
                     "os.write(1, b'PRIVATE-UNPICKLE-OUTPUT')\n"
                     "os.write(2, b'PRIVATE-UNPICKLE-ERROR')\n")

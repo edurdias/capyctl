@@ -367,7 +367,7 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
     assert_eq!(
         &command.argv[1..4],
         [
-            "-I",
+            "-IS",
             native_service().wrapper.to_str().unwrap(),
             "--public-settings-json"
         ]

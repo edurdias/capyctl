@@ -10,6 +10,11 @@ These are narrow controls, not a sandbox. The launcher must supply a clean isola
 interpreter, no inherited alternate output FDs/handlers, a closed environment, and
 trusted immutable package/code/metadata/search paths (including children). No file,
 network, syslog or explicitly reopened terminal channel is intercepted here.
+The renderer disables automatic site initialization with -IS: -I alone still
+executes installed .pth and sitecustomize hooks before this module can guard them.
+Before plugin inventory and native imports, startup must explicitly establish
+the trusted package/metadata paths without executing .pth files or site.main().
+An empty metadata inventory under -S does not attest the installed environment.
 Do not enable native file/request/crash logging. Spawned interpreters must run the
 same preimport plugin check; fd 1/2 suppression survives fork and exec by itself.
 The protected sglang_entry script repeats these guards during CPython spawn's
