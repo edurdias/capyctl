@@ -91,6 +91,10 @@ impl SglangLaunch {
             || !valid_reference(frozen.inference_credential_ref())
             || !valid_reference(frozen.admin_credential_ref())
             || frozen.inference_credential_ref() == frozen.admin_credential_ref()
+            || !selector(&m.device.host_id)
+            || !selector(&m.device.device_id)
+            || !selector(&m.device.memory_domain)
+            || !selector(&m.device.hardware_fingerprint)
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -124,6 +128,7 @@ impl SglangLaunch {
             "endpoint": m.endpoint,
             "served_name": m.served_name,
             "rendered_settings_digest": m.rendered_settings_digest,
+            "device": m.device,
             "settings": s,
             "minimum_kv_bytes": minimum_kv_bytes,
             "static_memory_fraction": fraction,
@@ -243,6 +248,14 @@ fn validate_settings(s: &SglangLaunchSettings) -> Result<(), RuntimeError> {
         return Err(RuntimeError::Unsupported);
     }
     Ok(())
+}
+
+fn selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
 }
 
 fn ulid(value: &str) -> bool {

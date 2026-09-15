@@ -7,8 +7,10 @@ findings. This does not complete F2B or qualify a native engine.
 ## Remaining work
 
 - Complete the pinned semantic-to-`ServerArgs` mapping and validate effective values
-  after construction. Carry the reviewed device identity through the frozen native
-  descriptor; map it explicitly to the observed local GPU before any model load.
+  after construction. The frozen descriptor now carries the reviewed host ID,
+  hardware fingerprint, logical device selector, and memory domain. Resolve and
+  corroborate that selection against the observed physical GPU before any model
+  load; a logical selector is not a CUDA index or observed UUID.
 - Install the wrapper and its local helpers under a protected absolute service path.
   The current checkout has group-writable ancestors and cannot be that installation.
   Bind installed source and helper identities to the reviewed runtime recipe.
@@ -16,7 +18,9 @@ findings. This does not complete F2B or qualify a native engine.
   `NativeCandidateService`; the current interface alone is not production composition.
 - Guard the actual memory-saver implementation, collect complete worker identities,
   and compare attributed allocations with the retained grant.
-- Complete typed controls, forwarding, coordinator/API/CLI integration, and F2C
+- Typed single-effect controls are implemented in `6c78908`, with deterministic
+  tests only; production observations and coordinator persistence remain open.
+  Complete forwarding, coordinator/API/CLI integration, and F2C
   single-engine and mixed-engine live qualification on host-a.
 
 These are implementation dependencies. No new owner decision is currently needed.
@@ -81,4 +85,5 @@ enrollment inputs, but require independent start-identity corroboration.
 The complete runtime suite needs `TMS_SOURCE_ARCHIVE` set to the existing pinned
 archive, `<saver-source-archive>`. The suite validates its
 SHA-256 before extraction. The initial unset-variable failure was resolved with
-that local archive: all 96 runtime tests passed. No owner action is required.
+that local archive: all 97 runtime tests passed after the device-descriptor addition.
+No owner action is required.

@@ -62,6 +62,16 @@ pub struct SglangRequestedBudget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FakeLaunchSettings;
 
+/// Reviewed logical placement, not an observed CUDA index or physical UUID.
+/// Native startup must independently resolve and corroborate this selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeDeviceSelection {
+    pub host_id: String,
+    pub hardware_fingerprint: String,
+    pub device_id: String,
+    pub memory_domain: String,
+}
+
 /// Redacted native candidate description. Neither metadata nor its digest is send authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCandidateMetadata {
@@ -74,6 +84,7 @@ pub struct NativeCandidateMetadata {
     pub endpoint: String,
     pub served_name: String,
     pub rendered_settings_digest: String,
+    pub device: NativeDeviceSelection,
 }
 
 /// Trusted, process-local projection of a persisted candidate descriptor.

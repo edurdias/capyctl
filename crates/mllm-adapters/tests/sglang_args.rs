@@ -34,6 +34,12 @@ fn metadata(index: u16) -> NativeCandidateMetadata {
         incarnation: "01K00000000000000000000099".into(),
         endpoint: format!("http://127.0.0.1:{}", 20000 + index),
         rendered_settings_digest: "a".repeat(64),
+        device: mllm_domain::launch::NativeDeviceSelection {
+            host_id: "host-a".into(),
+            hardware_fingerprint: "hardware-v1".into(),
+            device_id: "gpu0".into(),
+            memory_domain: "uma".into(),
+        },
     }
 }
 
@@ -189,6 +195,10 @@ fn two_frozen_bindings_keep_distinct_endpoints_and_served_names() {
     assert_eq!(a["source_revision"], SOURCE);
     assert_eq!(a["checkpoint_revision"], REVISION);
     assert_eq!(
+        a["device"],
+        json!({"host_id":"host-a", "hardware_fingerprint":"hardware-v1", "device_id":"gpu0", "memory_domain":"uma"})
+    );
+    assert_eq!(
         a["settings"],
         json!({
             "recipe": RECIPE,
@@ -205,6 +215,24 @@ fn two_frozen_bindings_keep_distinct_endpoints_and_served_names() {
     );
     assert_eq!(a["minimum_kv_bytes"], 603_979_776);
     assert_eq!(a["static_memory_fraction"], "0.7500");
+}
+
+#[test]
+fn frozen_device_selection_is_required_and_never_inferred_from_gpu_zero() {
+    for mutate in [
+        |m: &mut NativeCandidateMetadata| m.device.host_id.clear(),
+        |m: &mut NativeCandidateMetadata| m.device.hardware_fingerprint.clear(),
+        |m: &mut NativeCandidateMetadata| m.device.device_id = "gpu 0".into(),
+        |m: &mut NativeCandidateMetadata| m.device.memory_domain = "../uma".into(),
+    ] {
+        let mut m = metadata(1);
+        mutate(&mut m);
+        assert!(SglangLaunch::from_frozen(&frozen(m, settings())).is_err());
+    }
+    let mut m = metadata(1);
+    m.device.device_id = "gpu7".into();
+    let launch = SglangLaunch::from_frozen(&frozen(m, settings())).unwrap();
+    assert_eq!(public_args(&launch)["device"]["device_id"], "gpu7");
 }
 
 #[test]

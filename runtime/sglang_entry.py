@@ -134,7 +134,7 @@ def _validate_public(value):
     _exact_object(value, ("schema_version", "kind", "engine", "recipe", "source_revision",
                          "checkpoint_revision", "binding_id", "incarnation", "endpoint",
                          "served_name", "rendered_settings_digest", "settings",
-                         "minimum_kv_bytes", "static_memory_fraction"))
+                         "minimum_kv_bytes", "static_memory_fraction", "device"))
     for key, expected in (("schema_version", 1), ("kind", "sglang_candidate_launch"),
                           ("engine", "sglang"), ("recipe", _RECIPE),
                           ("source_revision", _SOURCE), ("checkpoint_revision", _CHECKPOINT),
@@ -142,6 +142,13 @@ def _validate_public(value):
         _literal(value[key], expected)
     _ulid(value["binding_id"])
     _ulid(value["incarnation"])
+    device = value["device"]
+    _exact_object(device, ("host_id", "hardware_fingerprint", "device_id", "memory_domain"))
+    for selector in device.values():
+        _text(selector, 256)
+        if not selector.isascii() or any(not (char.isalnum() or char in "_-.:")
+                                         for char in selector):
+            _reject()
     _literal(value["served_name"], "candidate-" + value["binding_id"])
     endpoint = _text(value["endpoint"], 128)
     prefix = "http://127.0.0.1:"

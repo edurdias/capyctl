@@ -39,6 +39,8 @@ def public_settings():
         "endpoint": "http://127.0.0.1:20001",
         "served_name": "candidate-01K00000000000000000000001",
         "rendered_settings_digest": "a" * 64,
+        "device": {"host_id": "host-a", "hardware_fingerprint": "hardware-v1",
+                   "device_id": "gpu0", "memory_domain": "uma"},
         "settings": {
             "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
             "tensor_parallel_size": 1, "data_parallel_size": 1, "tokenizer_workers": 1,
@@ -127,6 +129,23 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         argv = self.argv()
         argv[1] = json.dumps(self.public, indent=2)
         self.build(argv, data)
+
+    def test_device_selection_is_closed_and_bound_to_private_descriptor(self):
+        for key in self.public["device"]:
+            for value in ("", None, True, 0, "gpu 0", "../gpu0", "x" * 257):
+                public = copy.deepcopy(self.public)
+                public["device"][key] = value
+                with self.subTest(key=key, value=value):
+                    self.rejects(self.argv(public), self.payloads(public))
+        for device in ({}, {**self.public["device"], "cuda_index": 0}):
+            public = copy.deepcopy(self.public)
+            public["device"] = device
+            self.rejects(self.argv(public), self.payloads(public))
+        public = copy.deepcopy(self.public)
+        public["device"]["device_id"] = "gpu7"
+        self.rejects(self.argv(public), self.payloads())
+        spec = self.build(self.argv(public), self.payloads(public))
+        self.assertEqual(json.loads(spec._public_json)["device"]["device_id"], "gpu7")
 
     def test_closed_recipe_types_and_bounds(self):
         mutations = [

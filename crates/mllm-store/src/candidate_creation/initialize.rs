@@ -40,7 +40,8 @@ impl crate::Store {
         now_ms: i64,
     ) -> std::result::Result<mllm_domain::launch::NativeCandidateLaunch, LifecycleError> {
         use mllm_domain::launch::{
-            NativeCandidateLaunch, NativeCandidateMetadata, ProfileLaunchSettings,
+            NativeCandidateLaunch, NativeCandidateMetadata, NativeDeviceSelection,
+            ProfileLaunchSettings,
         };
         if !super::ulid(id) {
             return Err(LifecycleError::Invalid);
@@ -102,6 +103,15 @@ impl crate::Store {
             [&native.binding_id],
             |r| r.get(0),
         )?;
+        let manifest = snapshot.reviewed_manifest();
+        let recipe = manifest.effective_recipe();
+        let [selected] = recipe.devices() else {
+            return Err(LifecycleError::Unsupported);
+        };
+        let device = recipe
+            .host_devices()
+            .get(&selected.id)
+            .ok_or(LifecycleError::CorruptStoredData)?;
         let metadata = NativeCandidateMetadata {
             engine: "sglang".into(),
             recipe: settings.recipe.clone(),
@@ -113,6 +123,12 @@ impl crate::Store {
             endpoint: format!("http://{endpoint}"),
             served_name: format!("candidate-{}", read.planned.binding_id),
             rendered_settings_digest: native.rendered_settings_digest,
+            device: NativeDeviceSelection {
+                host_id: manifest.host().id().into(),
+                hardware_fingerprint: manifest.host().hardware_fingerprint().into(),
+                device_id: selected.id.clone(),
+                memory_domain: device.domain.clone(),
+            },
         };
         let launch = NativeCandidateLaunch::from_frozen_store(
             metadata,

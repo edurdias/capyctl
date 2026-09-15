@@ -1,6 +1,6 @@
 use super::*;
 use crate::candidate_creation::tests::{command, fixture, setup};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 const BODY: &str = r#"{"expected_revision":1,"action":"initialize","deadline_ms":400000}"#;
 #[path = "../../lifecycle/completion/tests.rs"]
 mod completion_tests;
@@ -222,16 +222,37 @@ fn native_arm_freezes_once_and_keeps_ordinary_dispatch_closed() {
     let r = store
         .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
         .unwrap();
-    assert!(store.candidate_native_launch(&s, r.step_id(), 1200).is_err());
+    assert!(
+        store
+            .candidate_native_launch(&s, r.step_id(), 1200)
+            .is_err()
+    );
     assert_eq!(
         arm(&store, &s, r.step_id()).unwrap(),
         ArmResult::New {
             step_id: r.step_id().into()
         }
     );
-    let frozen = store.candidate_native_launch(&s, r.step_id(), 1200).unwrap();
+    let frozen = store
+        .candidate_native_launch(&s, r.step_id(), 1200)
+        .unwrap();
     assert_eq!(frozen.metadata().binding_id, c.binding_id());
     assert_eq!(frozen.metadata().incarnation, c.incarnation());
+    assert_eq!(frozen.metadata().device.host_id, "lab");
+    assert_eq!(frozen.metadata().device.hardware_fingerprint, "hw-01");
+    assert_eq!(frozen.metadata().device.device_id, "gpu0");
+    let reviewed = store
+        .candidate_run_snapshot("owner", c.run_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frozen.metadata().device.memory_domain,
+        reviewed
+            .reviewed_manifest()
+            .effective_recipe()
+            .host_devices()["gpu0"]
+            .domain
+    );
     let leased_port: u16 = store
         .conn
         .query_row(
@@ -304,15 +325,25 @@ fn native_arm_failures_preserve_planned_intent_and_endpoint() {
         "CREATE TRIGGER fail BEFORE UPDATE ON lifecycle_steps BEGIN SELECT RAISE(ABORT,'injected'); END;",
     ] {
         let (store, s, c) = created("sglang-pinned");
-        let r = store.accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100).unwrap();
+        let r = store
+            .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+            .unwrap();
         store.conn.execute_batch(mutation).unwrap();
         let before = durable(&store);
         assert!(arm(&store, &s, r.step_id()).is_err(), "{mutation}");
         assert_eq!(durable(&store), before, "{mutation}");
         assert_eq!(count(&store, "resource_grants"), 0);
         assert_eq!(count(&store, "endpoint_leases"), 1);
-        assert!(store.candidate_initialize_execution(&s, r.step_id()).is_err());
-        assert!(store.candidate_native_launch(&s, r.step_id(), 1200).is_err());
+        assert!(
+            store
+                .candidate_initialize_execution(&s, r.step_id())
+                .is_err()
+        );
+        assert!(
+            store
+                .candidate_native_launch(&s, r.step_id(), 1200)
+                .is_err()
+        );
     }
     let (store, s, c) = created("sglang-pinned");
     let r = store
@@ -366,7 +397,9 @@ fn native_descriptor_mutation_invalidates_execution_and_replay() {
         );
         assert!(arm(&store, &s, r.step_id()).is_err(), "{field}");
         assert!(
-            store.candidate_native_launch(&s, r.step_id(), 1200).is_err(),
+            store
+                .candidate_native_launch(&s, r.step_id(), 1200)
+                .is_err(),
             "{field}"
         );
         assert_eq!(durable(&store), before);
@@ -592,10 +625,12 @@ fn initialize_input_owner_and_fences_fail_closed() {
     let r = store
         .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
         .unwrap();
-    assert!(store
-        .candidate_initialize_plan(&s, "other", c.run_id(), r.step_id())
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .candidate_initialize_plan(&s, "other", c.run_id(), r.step_id())
+            .unwrap()
+            .is_none()
+    );
     store
         .conn
         .execute("UPDATE deployments SET current_generation=2", [])
@@ -669,10 +704,18 @@ fn initialize_native_descriptors_are_informational_and_ordinary_admission_stays_
 }
 #[test]
 fn initialize_acceptance_rolls_back_late_failures() {
-    for trigger in ["CREATE TRIGGER fail BEFORE INSERT ON qualification_case_actions BEGIN SELECT RAISE(ABORT,'injected'); END;", "CREATE TRIGGER fail BEFORE INSERT ON management_events BEGIN SELECT RAISE(ABORT,'injected'); END;"] {
-        let (store,s,c)=created("fake"); store.conn.execute_batch(trigger).unwrap(); let before=durable(&store);
-        assert!(matches!(store.accept_candidate_initialize(&s,"owner",c.run_id(),"a",BODY,1100),Err(Error::Sql(_))));
-        assert_eq!(durable(&store),before);
+    for trigger in [
+        "CREATE TRIGGER fail BEFORE INSERT ON qualification_case_actions BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        "CREATE TRIGGER fail BEFORE INSERT ON management_events BEGIN SELECT RAISE(ABORT,'injected'); END;",
+    ] {
+        let (store, s, c) = created("fake");
+        store.conn.execute_batch(trigger).unwrap();
+        let before = durable(&store);
+        assert!(matches!(
+            store.accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100),
+            Err(Error::Sql(_))
+        ));
+        assert_eq!(durable(&store), before);
     }
 }
 #[test]
@@ -758,10 +801,22 @@ fn initialize_policy_revocation_blocks_fresh_but_not_replay() {
 
 #[test]
 fn initialize_owned_missing_association_and_receipt_scope_are_corruption() {
-    for mutation in ["DELETE FROM qualification_case_actions", "UPDATE command_receipts SET command_scope='wrong' WHERE operation_id IN (SELECT operation_id FROM lifecycle_steps)"] {
-        let (store,s,c)=created("fake"); let r=store.accept_candidate_initialize(&s,"owner",c.run_id(),"a",BODY,1100).unwrap();
+    for mutation in [
+        "DELETE FROM qualification_case_actions",
+        "UPDATE command_receipts SET command_scope='wrong' WHERE operation_id IN (SELECT operation_id FROM lifecycle_steps)",
+    ] {
+        let (store, s, c) = created("fake");
+        let r = store
+            .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+            .unwrap();
         store.conn.execute_batch(mutation).unwrap();
-        assert!(matches!(store.candidate_initialize_plan(&s,"owner",c.run_id(),r.step_id()),Err(Error::CorruptStoredData)),"{mutation}");
+        assert!(
+            matches!(
+                store.candidate_initialize_plan(&s, "owner", c.run_id(), r.step_id()),
+                Err(Error::CorruptStoredData)
+            ),
+            "{mutation}"
+        );
     }
 }
 #[test]
@@ -809,9 +864,11 @@ fn initialize_execution_rejects_wrong_running_operation() {
             [r.operation_id()],
         )
         .unwrap();
-    assert!(store
-        .candidate_initialize_execution(&s, r.step_id())
-        .is_err());
+    assert!(
+        store
+            .candidate_initialize_execution(&s, r.step_id())
+            .is_err()
+    );
 }
 
 #[test]
@@ -827,9 +884,11 @@ fn initialize_recorded_uncertainty_is_never_a_new_attempt() {
         arm(&store, &s, r.step_id()).unwrap(),
         ArmResult::AlreadyRecorded
     );
-    assert!(store
-        .candidate_initialize_execution(&s, r.step_id())
-        .is_err());
+    assert!(
+        store
+            .candidate_initialize_execution(&s, r.step_id())
+            .is_err()
+    );
     assert_eq!(durable(&store), before);
 }
 #[test]
@@ -843,20 +902,45 @@ fn initialize_grant_context_and_identity_corruption_fails_closed() {
         "UPDATE runtime_bindings SET identities_json='{}'",
         "DELETE FROM qualification_case_actions",
     ] {
-        let (store,s,c)=created("fake"); let r=store.accept_candidate_initialize(&s,"owner",c.run_id(),"a",BODY,1100).unwrap(); arm(&store,&s,r.step_id()).unwrap();
-        store.conn.execute_batch(mutation).unwrap(); let before=durable(&store);
-        assert!(matches!(store.candidate_initialize_execution(&s,r.step_id()),Err(LifecycleError::CorruptStoredData)),"{mutation}");
-        assert!(arm(&store,&s,r.step_id()).is_err(),"{mutation}"); assert_eq!(durable(&store),before);
+        let (store, s, c) = created("fake");
+        let r = store
+            .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+            .unwrap();
+        arm(&store, &s, r.step_id()).unwrap();
+        store.conn.execute_batch(mutation).unwrap();
+        let before = durable(&store);
+        assert!(
+            matches!(
+                store.candidate_initialize_execution(&s, r.step_id()),
+                Err(LifecycleError::CorruptStoredData)
+            ),
+            "{mutation}"
+        );
+        assert!(arm(&store, &s, r.step_id()).is_err(), "{mutation}");
+        assert_eq!(durable(&store), before);
     }
 }
 #[test]
 fn initialize_existing_state_and_competing_run_block_arm() {
-    for mutation in ["UPDATE runtime_bindings SET state='uncertain'", "UPDATE deployments SET admission_enabled=1", "UPDATE deployments SET dispatch_enabled=1", "UPDATE deployments SET suspended=1", "DELETE FROM lifecycle_claims", "UPDATE lifecycle_claims SET generation=2", "UPDATE lifecycle_steps SET ordinal=1", "UPDATE lifecycle_runs SET plan_json=json_set(plan_json,'$.steps[0].action','stop')",
+    for mutation in [
+        "UPDATE runtime_bindings SET state='uncertain'",
+        "UPDATE deployments SET admission_enabled=1",
+        "UPDATE deployments SET dispatch_enabled=1",
+        "UPDATE deployments SET suspended=1",
+        "DELETE FROM lifecycle_claims",
+        "UPDATE lifecycle_claims SET generation=2",
+        "UPDATE lifecycle_steps SET ordinal=1",
+        "UPDATE lifecycle_runs SET plan_json=json_set(plan_json,'$.steps[0].action','stop')",
         "INSERT INTO operations(id,deployment_id,kind,state) SELECT 'competing',deployment_id,'park','pending' FROM lifecycle_steps; INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) SELECT 'competing',deployment_id,revision,generation,session_id,'park','queued',deadline_ms,plan_json FROM lifecycle_runs WHERE operation_id!='competing'",
     ] {
-        let (store,s,c)=created("fake"); let r=store.accept_candidate_initialize(&s,"owner",c.run_id(),"a",BODY,1100).unwrap();
-        store.conn.execute_batch(mutation).unwrap(); let before=durable(&store);
-        assert!(arm(&store,&s,r.step_id()).is_err(),"{mutation}"); assert_eq!(durable(&store),before);
+        let (store, s, c) = created("fake");
+        let r = store
+            .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+            .unwrap();
+        store.conn.execute_batch(mutation).unwrap();
+        let before = durable(&store);
+        assert!(arm(&store, &s, r.step_id()).is_err(), "{mutation}");
+        assert_eq!(durable(&store), before);
     }
 }
 #[test]
@@ -1073,9 +1157,11 @@ fn initialize_two_connections_serialize_acceptance_and_arm() {
         if same_key {
             assert_eq!(results[0].as_ref().unwrap(), results[1].as_ref().unwrap());
         } else {
-            assert!(results
-                .iter()
-                .any(|r| matches!(r, Err(Error::LifecycleConflict))));
+            assert!(
+                results
+                    .iter()
+                    .any(|r| matches!(r, Err(Error::LifecycleConflict)))
+            );
         }
         let step = results
             .iter()
