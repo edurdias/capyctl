@@ -5,6 +5,10 @@ use mllm_store::candidate_creation::progression::{
     CandidateInferenceWork, CandidateProbeDispatch,
 };
 
+#[path = "candidate_security.rs"]
+mod security;
+pub(super) use security::drive_security;
+
 pub(super) struct InferenceCommand {
     pub(super) work: CandidateInferenceWork,
     pub(super) expected_revision: i64,
@@ -230,9 +234,26 @@ pub(super) async fn drive_inference(
 
 type ProbeFuture =
     Pin<Box<dyn Future<Output = Result<CandidateRequestObservation, CoordinatorError>> + Send>>;
+type SecurityControlFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    mllm_domain::qualification::CandidateSecurityControlObservation,
+                    CoordinatorError,
+                >,
+            > + Send,
+    >,
+>;
 pub(super) struct CandidateDriver {
     pub(super) engine: Arc<dyn EngineAdapter>,
     pub(super) probe: Arc<dyn Fn(CandidateProbeDispatch) -> ProbeFuture + Send + Sync>,
+    pub(super) security_control: Arc<
+        dyn Fn(
+                mllm_store::candidate_creation::progression::CandidateSecurityControlDispatch,
+            ) -> SecurityControlFuture
+            + Send
+            + Sync,
+    >,
 }
 pub(super) type CandidateFactory =
     Arc<dyn Fn() -> Result<Arc<CandidateDriver>, CoordinatorError> + Send + Sync>;
@@ -249,8 +270,23 @@ impl CandidateDriver {
             },
         )));
         let probe_engine = engine.clone();
+        let control_engine = engine.clone();
+        let control_clock = clock.clone();
         Arc::new(Self {
             engine,
+            security_control: Arc::new(move |dispatch| {
+                let engine = control_engine.clone();
+                let clock = control_clock.clone();
+                Box::pin(async move {
+                    crate::qualification::collect_security_control_with_clock(
+                        &engine,
+                        dispatch,
+                        &move || clock().map_err(|_| LifecycleError::Invalid),
+                    )
+                    .await
+                    .map_err(|error| CoordinatorError::Service(error.to_string()))
+                })
+            }),
             probe: Arc::new(move |dispatch| {
                 let engine = probe_engine.clone();
                 let clock = clock.clone();

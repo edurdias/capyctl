@@ -4,6 +4,9 @@ use serde_json::json;
 #[path = "tests_candidate_inference.rs"]
 mod inference_tests;
 
+#[path = "tests_candidate_security.rs"]
+mod security_tests;
+
 #[path = "../../tests/qualification_support/candidate_fixture.rs"]
 mod candidate_fixture;
 
@@ -46,6 +49,7 @@ fn worker_candidate_clock(
             let probes = probes.clone();
             Ok(Arc::new(candidate::CandidateDriver {
                 engine: gate.clone(),
+                security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                 probe: Arc::new(move |dispatch| {
                     let gate = probe_engine.clone();
                     let probes = probes.clone();
@@ -659,6 +663,7 @@ async fn candidate_required_probe_failure_preserves_lease_and_never_replays() {
                 let calls = calls.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
                     engine: gate.clone(),
+                    security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     probe: Arc::new(move |dispatch| {
                         let engine = engine.clone();
                         let entered = entered.clone();

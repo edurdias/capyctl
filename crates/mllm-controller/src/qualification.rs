@@ -60,6 +60,21 @@ pub async fn collect_security_control(
         .map_err(|_| mllm_store::lifecycle::LifecycleError::Conflict)
 }
 
+/// Trusted service timestamp is sampled after the terminal unauthorized check.
+/// The legacy fixture collector above intentionally retains its synthetic time.
+pub async fn collect_security_control_with_clock(
+    engine: &mllm_adapters::fake::FakeEngine,
+    dispatch: mllm_store::candidate_creation::progression::CandidateSecurityControlDispatch,
+    clock: &(dyn Fn() -> Result<i64, mllm_store::lifecycle::LifecycleError> + Send + Sync),
+) -> Result<
+    mllm_domain::qualification::CandidateSecurityControlObservation,
+    mllm_store::lifecycle::LifecycleError,
+> {
+    let mut observation = collect_security_control(engine, dispatch).await?;
+    observation.effect.observed_at_ms = clock()?;
+    Ok(observation)
+}
+
 /// Reads the retained Fake state locally; never issues an engine command.
 pub fn collect_parked_status(
     engine: &mllm_adapters::fake::FakeEngine,

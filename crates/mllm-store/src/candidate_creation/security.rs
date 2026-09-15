@@ -1,4 +1,6 @@
 use super::*;
+#[path = "security_owned.rs"]
+mod owned;
 use mllm_domain::qualification::{
     CandidateRequestObservation, CandidateResponseObservation, CandidateSecurityControlObservation,
     CandidateSecurityEndpoint, CandidateTerminal,
@@ -347,6 +349,15 @@ fn current_security(
     p: &CandidateActionPlanV3,
     context: AdmissionContext<'_>,
 ) -> Result<(), LifecycleError> {
+    current_security_with_lease(tx, session, p, context, None)
+}
+fn current_security_with_lease(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    p: &CandidateActionPlanV3,
+    context: AdmissionContext<'_>,
+    lease: Option<&str>,
+) -> Result<(), LifecycleError> {
     current(tx, session, p)?;
     let cold = source(tx, &p.scope.run_id)?;
     let v = validated_anchor(tx, &cold.scope.parent_step_id)?;
@@ -381,8 +392,8 @@ fn current_security(
         return Err(LifecycleError::Conflict);
     }
     let busy: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1)",
-        [&p.scope.deployment_id],
+        "SELECT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1 AND (?2 IS NULL OR id<>?2))",
+        params![p.scope.deployment_id, lease],
         |r| r.get(0),
     )?;
     if busy {

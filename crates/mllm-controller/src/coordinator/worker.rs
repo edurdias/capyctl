@@ -1003,6 +1003,41 @@ async fn run(
                 }
             }
         }
+        let security = match shared
+            .read(|owner, now| owner.store().next_candidate_security(owner.session(), now))
+            .await
+        {
+            Ok(work) => work,
+            Err(error) => return WorkerStatus::Failed(error.to_string()),
+        };
+        if let Some(work) = security {
+            let mut operation_id = None;
+            let result = AssertUnwindSafe(candidate::drive_security(
+                &shared,
+                &work,
+                observations.as_ref(),
+                &mut stop,
+                &mut operation_id,
+            ))
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(())) => {
+                    shared.changed.notify_waiters();
+                    continue;
+                }
+                failure => {
+                    let reason = match failure {
+                        Ok(Err(error)) => error.to_string(),
+                        _ => "candidate Security panicked; durable authority retained".into(),
+                    };
+                    return match operation_id {
+                        Some(operation_id) => WorkerStatus::Uncertain { operation_id, reason },
+                        None => WorkerStatus::Failed(reason),
+                    };
+                }
+            }
+        }
         let candidate = match shared
             .read(|owner, now| {
                 owner

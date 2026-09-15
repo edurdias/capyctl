@@ -24,6 +24,9 @@ mod owned_worker;
 #[path = "qualification_support/candidate_worker.rs"]
 mod candidate_worker;
 
+#[path = "qualification_support/security_owned.rs"]
+mod security_owned;
+
 #[path = "qualification_support/fixture.rs"]
 mod fixture_support;
 use fixture_support::*;

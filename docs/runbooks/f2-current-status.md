@@ -75,8 +75,16 @@ atomically to the original V3 request grant. Only a new grant sends through the
 original retained Fake runtime. Caller loss and exact retries cannot replay it;
 uncertain outcomes retain leases and the full conservative grant. All four closed
 Fake corpus requests complete through HTTP without opening ordinary gates.
-Internal security progression, remaining actions and public operation-result
-reads remain open. These Fake cases do not replace the native F2C corpus.
+Internal Security progression now also passes root integration. After all four
+baseline results, the same retained Fake performs the fixed unauthorized control
+check and two unauthorized endpoint checks. Each child requires a new durable arm,
+fresh observations, exact current authority and final clock/shutdown fences.
+Previously armed work never restores send permission; uncertainty retains leases
+and the full grant and stops later children. The service control collector samples
+its clock after the actual terminal observation. Discovery rejects malformed,
+non-text and oversized records before allocating them. No public Security action
+is added. Remaining actions and public operation-result reads remain open.
+These Fake cases do not replace the native F2C corpus.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -123,8 +131,8 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Full core root verification for the candidate inference slice: Store 202,
-controller 204 and management 60 tests pass (466 distinct tests), plus three-crate
+Full core root verification for the candidate Security slice: Store 202,
+controller 216 and management 60 tests pass (478 distinct tests), plus three-crate
 all-target Clippy. Two existing caller-timeout tests failed during the earlier
 unarmed Stop worker's concurrent fixture runs, then passed unchanged in isolated
 reruns and subsequent bounded full core runs. No timeout or evidence-freshness
