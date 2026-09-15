@@ -66,6 +66,310 @@ fn request(run: &str, key: &str, body: Value) -> Request<Body> {
 async fn value(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
 }
+
+fn inference_request(run: &str, key: &str, body: Value) -> Request<Body> {
+    let mut req = request(run, key, body);
+    *req.uri_mut() = format!("/management/v1/qualification-runs/{run}/inference")
+        .parse()
+        .unwrap();
+    req
+}
+
+#[tokio::test]
+async fn candidate_inference_denies_wrong_body_scope_and_credentials_without_leases() {
+    let (dir, _owner, worker, run, app) = setup();
+    let init = app
+        .clone()
+        .oneshot(request(
+            &run,
+            "init",
+            json!({"expected_revision":1,"action":"initialize","deadline_ms":400000}),
+        ))
+        .await
+        .unwrap();
+    let init = value(init).await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    wait_operation(&worker, &sql, init["operation_id"].as_str().unwrap()).await;
+    let body = json!({"expected_revision":1,"request":{"model":format!("candidate-{}",init["deployment_id"].as_str().unwrap()),"messages":[{"role":"user","content":"Repeat exactly: MLLM_ALPHA_71"}],"temperature":0,"max_tokens":16,"stream":false}});
+    for (field, status) in [
+        ("revision", 409),
+        ("model", 409),
+        ("prompt", 409),
+        ("tokens", 409),
+        ("stream", 409),
+        ("evidence", 400),
+        ("unknown", 400),
+    ] {
+        let mut changed = body.clone();
+        match field {
+            "revision" => changed["expected_revision"] = json!(2),
+            "model" => changed["request"]["model"] = json!("candidate-other-binding"),
+            "prompt" => {
+                changed["request"]["messages"][0]["content"] = json!("Repeat exactly: MLLM_BETA_29")
+            }
+            "tokens" => changed["request"]["max_tokens"] = json!(17),
+            "stream" => changed["request"]["stream"] = json!(true),
+            "evidence" => changed["evidence"] = json!({"passed":true}),
+            _ => changed["request"]["unknown"] = json!(true),
+        }
+        let response = app
+            .clone()
+            .oneshot(inference_request(&run, field, changed))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{field}");
+        let text = value(response).await.to_string();
+        assert!(!text.contains(AUTH) && !text.contains("MLLM_ALPHA_71"));
+    }
+    for credential in [INFERENCE, "wrong"] {
+        let mut req = inference_request(&run, "auth", body.clone());
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {credential}").parse().unwrap(),
+        );
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), 401);
+    }
+    for missing in ["authorization", "idempotency-key"] {
+        let mut req = inference_request(&run, "headers", body.clone());
+        req.headers_mut().remove(missing);
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            if missing == "authorization" { 401 } else { 400 }
+        );
+    }
+    let mut duplicate = inference_request(&run, "duplicate", body.clone());
+    *duplicate.body_mut() = Body::from(
+        body.to_string()
+            .replace("\"max_tokens\":16", "\"max_tokens\":16,\"max_tokens\":16"),
+    );
+    assert_eq!(app.clone().oneshot(duplicate).await.unwrap().status(), 400);
+    assert_eq!(
+        app.clone()
+            .oneshot(inference_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "wrong-run",
+                body.clone()
+            ))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(inference_request("not-a-run", "invalid", body.clone()))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let mut query = inference_request(&run, "query", body.clone());
+    *query.uri_mut() = format!("/management/v1/qualification-runs/{run}/inference?x=1")
+        .parse()
+        .unwrap();
+    assert_eq!(app.clone().oneshot(query).await.unwrap().status(), 400);
+    let mut oversized = inference_request(&run, "oversized", body);
+    *oversized.body_mut() = Body::from(" ".repeat((1 << 20) + 1));
+    assert_eq!(app.oneshot(oversized).await.unwrap().status(), 413);
+    assert_eq!(
+        sql.query_row(
+            "SELECT COUNT(*) FROM operations WHERE kind='candidate_marker_v3'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sql.query_row("SELECT COUNT(*) FROM request_leases", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    worker.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Hold acceptance only to drop real HTTP observers.
+async fn candidate_inference_dropped_http_callers_keep_acceptance_capacity_and_one_send() {
+    let (dir, owner, worker, run, app) = setup();
+    let init = app
+        .clone()
+        .oneshot(request(
+            &run,
+            "init",
+            json!({"expected_revision":1,"action":"initialize","deadline_ms":400000}),
+        ))
+        .await
+        .unwrap();
+    let init = value(init).await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    wait_operation(&worker, &sql, init["operation_id"].as_str().unwrap()).await;
+    let body = json!({"expected_revision":1,"request":{"model":format!("candidate-{}",init["deployment_id"].as_str().unwrap()),"messages":[{"role":"user","content":"Repeat exactly: MLLM_ALPHA_71"}],"temperature":0,"max_tokens":16,"stream":false}});
+    let guard = owner.lock().unwrap();
+    let first = tokio::spawn(
+        app.clone()
+            .oneshot(inference_request(&run, "lost", body.clone())),
+    );
+    let second = tokio::spawn(
+        app.clone()
+            .oneshot(inference_request(&run, "lost", body.clone())),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first.abort();
+    second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(second.await.unwrap_err().is_cancelled());
+    let full = app
+        .clone()
+        .oneshot(inference_request(&run, "full", body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(full.status(), 429);
+    drop(guard);
+    let accepted = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(inference_request(&run, "lost", body.clone()))
+                .await
+                .unwrap();
+            if response.status() == 202 {
+                break value(response).await;
+            }
+            assert_eq!(response.status(), 429);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_operation(&worker, &sql, accepted["operation_id"].as_str().unwrap()).await;
+    assert_eq!(
+        sql.query_row(
+            "SELECT COUNT(*) FROM operations WHERE kind='candidate_marker_v3'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sql.query_row("SELECT COUNT(*) FROM request_leases", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    worker.shutdown().await.unwrap();
+    let replay = app
+        .oneshot(inference_request(&run, "lost", body))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), 202);
+    assert_eq!(value(replay).await, accepted);
+}
+
+async fn wait_operation(worker: &OwnedCoordinator, sql: &rusqlite::Connection, operation: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if sql
+                .query_row(
+                    "SELECT state='succeeded' FROM operations WHERE id=?1",
+                    [operation],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            {
+                break;
+            }
+            assert_eq!(
+                worker.status(),
+                mllm_controller::coordinator::WorkerStatus::Running
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn candidate_inference_http_runs_exact_corpus_once_with_original_acceptance_scope() {
+    let (dir, _owner, worker, run, app) = setup();
+    let init = app
+        .clone()
+        .oneshot(request(
+            &run,
+            "init",
+            json!({"expected_revision":1,"action":"initialize","deadline_ms":400000}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(init.status(), 202);
+    let init = value(init).await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    wait_operation(&worker, &sql, init["operation_id"].as_str().unwrap()).await;
+    let mut receipts = Vec::new();
+    let original_grant: String = sql
+        .query_row("SELECT request_json FROM resource_grants", [], |r| r.get(0))
+        .unwrap();
+    for stream in [false, true] {
+        for marker in ["MLLM_ALPHA_71", "MLLM_BETA_29"] {
+            let key = format!("marker-{stream}-{marker}");
+            let body = json!({"expected_revision":1,"request":{"model":format!("candidate-{}", init["deployment_id"].as_str().unwrap()),"messages":[{"role":"user","content":format!("Repeat exactly: {marker}")}],"temperature":0,"max_tokens":16,"stream":stream}});
+            let response = app
+                .clone()
+                .oneshot(inference_request(&run, &key, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 202);
+            let accepted = value(response).await;
+            assert_eq!(accepted["api_version"], "1");
+            assert_eq!(accepted["deployment_id"], init["deployment_id"]);
+            assert_eq!(accepted["qualification_run_id"], run);
+            assert_eq!(accepted["revision"], "1");
+            assert_eq!(accepted["joined"], false);
+            wait_operation(&worker, &sql, accepted["operation_id"].as_str().unwrap()).await;
+            receipts.push((key, body, accepted));
+        }
+    }
+    worker.shutdown().await.unwrap();
+    for (key, body, accepted) in receipts {
+        let replay = app
+            .clone()
+            .oneshot(inference_request(&run, &key, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), 202);
+        assert_eq!(value(replay).await, accepted);
+        let mut changed = body;
+        changed["expected_revision"] = json!(2);
+        let conflict = app
+            .clone()
+            .oneshot(inference_request(&run, &key, changed))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), 409);
+        assert_eq!(
+            value(conflict).await["error"]["code"],
+            "idempotency_conflict"
+        );
+    }
+    for (query, expected) in [
+        ("SELECT COUNT(*) FROM operations WHERE kind='candidate_marker_v3' AND state='succeeded'",4),
+        ("SELECT COUNT(*) FROM request_leases",0),
+        ("SELECT COUNT(*) FROM resource_grants",1),
+        ("SELECT COUNT(*) FROM qualifications",0),
+        ("SELECT COUNT(*) FROM deployments WHERE admission_enabled!=0 OR dispatch_enabled!=0",0),
+    ] {
+        assert_eq!(sql.query_row(query, [], |r|r.get::<_, i64>(0)).unwrap(), expected, "{query}");
+    }
+    assert_eq!(
+        sql.query_row("SELECT request_json FROM resource_grants", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        original_grant
+    );
+}
 #[tokio::test]
 async fn candidate_initialize_http_retry_completes_once_without_ordinary_dispatch_or_promotion() {
     let (dir, owner, worker, run, app) = setup();
@@ -399,7 +703,7 @@ async fn cancelled_candidate_http_callers_keep_shared_capacity_and_one_owned_ope
 }
 
 #[tokio::test]
-async fn loopback_candidate_action_retry_returns_acceptance_after_transport_loss() {
+async fn loopback_candidate_action_and_inference_retry_returns_acceptance_after_transport_loss() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (dir, _owner, worker, run, app) = setup();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -470,6 +774,55 @@ async fn loopback_candidate_action_retry_returns_acceptance_after_transport_loss
     assert_eq!(
         sql.query_row(
             "SELECT COUNT(*) FROM operations WHERE kind='candidate_action_v3'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let body=json!({"expected_revision":1,"request":{"model":format!("candidate-{}",accepted["deployment_id"].as_str().unwrap()),"messages":[{"role":"user","content":"Repeat exactly: MLLM_ALPHA_71"}],"temperature":0,"max_tokens":16,"stream":false}}).to_string();
+    let wire=format!("POST /management/v1/qualification-runs/{run}/inference HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {AUTH}\r\nContent-Type: application/json\r\nIdempotency-Key: marker-network-retry\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(wire.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sql
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE kind='candidate_marker_v3'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    let mut retry = tokio::net::TcpStream::connect(address).await.unwrap();
+    retry.write_all(wire.as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        retry.take(65536).read_to_end(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 202 Accepted\r\n"),
+        "{response}"
+    );
+    assert!(!response.contains(AUTH) && !response.contains("MLLM_ALPHA_71"));
+    let marker: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    wait_operation(&worker, &sql, marker["operation_id"].as_str().unwrap()).await;
+    assert_eq!(marker["deployment_id"], accepted["deployment_id"]);
+    assert_eq!(marker["qualification_run_id"], run);
+    assert_eq!(
+        sql.query_row(
+            "SELECT COUNT(*) FROM operations WHERE kind='candidate_marker_v3'",
             [],
             |r| r.get::<_, i64>(0)
         )

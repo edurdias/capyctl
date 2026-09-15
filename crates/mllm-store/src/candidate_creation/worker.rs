@@ -4,7 +4,7 @@ use crate::resource_policy::ResourcePolicySnapshot;
 
 // Inspect SQLite's borrowed storage before allocating or decoding any new work
 // or history DTO. Non-text and oversized values are stored corruption.
-fn bounded_text(
+pub(super) fn bounded_text(
     row: &rusqlite::Row<'_>,
     index: usize,
     max: usize,

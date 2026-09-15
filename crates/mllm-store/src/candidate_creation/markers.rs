@@ -30,17 +30,213 @@ fn command_scope(run: &str) -> String {
     format!("POST /management/v1/qualification-runs/{run}/inference")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateInferenceReceipt {
+    pub operation_id: String,
+    pub deployment_id: String,
+    pub run_id: String,
+    pub revision: i64,
+}
+#[derive(Clone, Debug)]
+pub struct CandidateInferenceWork {
+    pub principal: String,
+    pub run_id: String,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub host_id: String,
+    pub deadline_ms: i64,
+    pub revision: i64,
+    pub policy: crate::resource_policy::ResourcePolicySnapshot,
+}
+
+impl crate::Store {
+    /// Historical observation only. V3 hashes the strict request body; the
+    /// command's expected revision must additionally match its original scope.
+    pub fn candidate_inference_command_receipt(
+        &self,
+        session: &CoordinatorSession,
+        principal: &str,
+        run: &str,
+        expected_revision: i64,
+        key: &str,
+        body: &str,
+    ) -> Result<Option<CandidateInferenceReceipt>, LifecycleError> {
+        if expected_revision < 1
+            || !super::super::super::valid_id(principal)
+            || !super::super::super::valid_id(key)
+            || !super::super::super::ulid(run)
+        {
+            return Err(LifecycleError::Invalid);
+        }
+        let supplied = request(body)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        let operation = tx.query_row("SELECT operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3", params![principal,command_scope(run),key], |r| Ok(worker::bounded_text(r,0,26))).optional()?.transpose()?;
+        let Some(operation) = operation else {
+            return Ok(None);
+        };
+        let (p, a) = load_attempt(&tx, &operation)?;
+        validate_plan(&tx, &p)?;
+        if result(&tx, &p, &a)?.is_none() {
+            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases l JOIN operations o ON o.id=?1 WHERE l.id=?2 AND l.deployment_id=?3 AND l.revision=?4 AND l.generation=?5 AND l.session_id=?6 AND l.disposition='inflight' AND o.state='running')",params![a.request_operation_id,a.lease_id,a.scope.deployment_id,a.scope.revision,a.scope.generation,a.scope.session_id],|r|r.get(0))?;
+            if !valid {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+        }
+        if a.scope.session_id != session.id() {
+            return Err(LifecycleError::Stale);
+        }
+        if a.scope.principal != principal
+            || a.scope.run_id != run
+            || a.idempotency_key != key
+            || expected_revision != a.scope.revision
+            || supplied != request(&template(&tx, &p, &a)?)?
+        {
+            return Err(LifecycleError::IdempotencyConflict);
+        }
+        Ok(Some(CandidateInferenceReceipt {
+            operation_id: operation,
+            deployment_id: a.scope.deployment_id,
+            run_id: a.scope.run_id,
+            revision: a.scope.revision,
+        }))
+    }
+
+    /// Discover immutable request authority to obtain fresh admission observations.
+    /// This creates no lease and confers no permission to send.
+    pub fn candidate_inference_work(
+        &self,
+        session: &CoordinatorSession,
+        principal: &str,
+        run: &str,
+        expected_revision: i64,
+        now: i64,
+    ) -> Result<CandidateInferenceWork, LifecycleError> {
+        if expected_revision < 1
+            || !super::super::super::valid_id(principal)
+            || !super::super::super::ulid(run)
+        {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        let snapshot = super::super::super::read_snapshot(&tx, principal, run)
+            .map_err(creation_error)?
+            .ok_or(LifecycleError::NotFound)?;
+        if snapshot.receipt().revision() != expected_revision {
+            return Err(LifecycleError::RevisionConflict);
+        }
+        let anchor = tx.query_row("SELECT q.parent_step_id FROM qualification_ready_probes q JOIN lifecycle_steps s ON s.id=q.parent_step_id WHERE q.run_id=?1 AND s.state='completed' ORDER BY q.rowid DESC LIMIT 1",[run],|r|Ok(worker::bounded_text(r,0,26))).optional()?.transpose()?.ok_or(LifecycleError::Conflict)?;
+        let p = plan_for_step(&tx, &anchor)?;
+        validate_plan(&tx, &p)?;
+        QualificationProgram::resolve(snapshot.reviewed_manifest())?;
+        if p.scope.principal != principal
+            || p.scope.run_id != run
+            || p.scope.session_id != session.id()
+            || p.action != Action::Initialize
+            || now < p.accepted_at_ms
+            || now >= snapshot.receipt().deadline_ms()
+        {
+            return Err(LifecycleError::Stale);
+        }
+        if p.scope.revision != expected_revision {
+            return Err(LifecycleError::RevisionConflict);
+        }
+        let policy = super::super::super::initialize::policy(&tx, &snapshot)?;
+        Ok(CandidateInferenceWork {
+            principal: principal.into(),
+            run_id: run.into(),
+            binding_id: p.scope.binding_id,
+            incarnation: p.scope.incarnation,
+            host_id: p.scope.host,
+            deadline_ms: snapshot.receipt().deadline_ms(),
+            revision: expected_revision,
+            policy,
+        })
+    }
+
+    /// Recheck the exact New grant after admission and immediately before send.
+    /// Rediscovering this context never replaces the original New permission.
+    pub fn revalidate_candidate_inference_send(
+        &self,
+        session: &CoordinatorSession,
+        work: &CandidateInferenceWork,
+        dispatch: &CandidateProbeDispatch,
+        context: AdmissionContext<'_>,
+    ) -> Result<(), LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        let (p, a) = load_attempt(&tx, dispatch.request_operation_id())?;
+        validate_plan(&tx, &p)?;
+        current_request_with_lease(&tx, session, &p, context, Some(&a.lease_id))?;
+        let v = validated_anchor(&tx, &p.scope.parent_step_id)?;
+        let owned = warm::owned(&tx, &p)?;
+        let mut expected = v.context;
+        expected.token = child_token(&p, &p.scope.parent_step_id);
+        expected.issued_at_ms = a.issued_at_ms;
+        expected.deadline_ms = a.deadline_ms;
+        expected.identities = mllm_domain::completion::ExecutionIdentities::Retained(
+            crate::lifecycle::completion::members(&owned.identities)?,
+        );
+        expected.completion_target = None;
+        expected.launch_settings = None;
+        let lease:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3 AND generation=?4 AND session_id=?5 AND disposition='inflight')",params![a.lease_id,p.scope.deployment_id,p.scope.revision,p.scope.generation,session.id()],|r|r.get(0))?;
+        if !work.matches(&p)
+            || work.deadline_ms != a.deadline_ms
+            || dispatch.context != expected
+            || dispatch.ticket
+                != DispatchTicket::candidate(
+                    a.lease_id.clone(),
+                    p.scope.deployment_id.clone(),
+                    p.scope.revision,
+                    p.scope.generation,
+                    p.scope.session_id.clone(),
+                )
+            || dispatch.request != template(&tx, &p, &a)?
+            || dispatch.security_endpoint.is_some()
+            || context.now_ms < a.issued_at_ms
+            || context.now_ms >= a.deadline_ms
+            || !lease
+            || result(&tx, &p, &a)?.is_some()
+        {
+            return Err(LifecycleError::Stale);
+        }
+        Ok(())
+    }
+}
+
+impl CandidateInferenceWork {
+    fn matches(&self, p: &CandidateActionPlanV3) -> bool {
+        self.principal == p.scope.principal
+            && self.run_id == p.scope.run_id
+            && self.revision == p.scope.revision
+            && self.binding_id == p.scope.binding_id
+            && self.incarnation == p.scope.incarnation
+            && self.host_id == p.scope.host
+            && self.policy.revision == p.scope.resource_policy_revision
+            && p.action == Action::Initialize
+    }
+}
+
 pub(in super::super) fn baseline(
     tx: &Transaction<'_>,
     p: &CandidateActionPlanV3,
 ) -> Result<(), LifecycleError> {
-    baseline_read(tx,p,&ReadValidation::new(tx))
+    baseline_read(tx, p, &ReadValidation::new(tx))
 }
-pub(in super::super) fn baseline_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
-    read.prove(tx,encode(&("baseline",p))?,|| baseline_body(tx,p,read))
+pub(in super::super) fn baseline_read(
+    tx: &Transaction<'_>,
+    p: &CandidateActionPlanV3,
+    read: &ReadValidation<'_, '_>,
+) -> Result<(), LifecycleError> {
+    read.prove(tx, encode(&("baseline", p))?, || baseline_body(tx, p, read))
 }
-fn baseline_body(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidation<'_, '_>)->Result<(),LifecycleError> {
-    let v = anchor_context_read(tx, &p.scope.parent_step_id,false,read)?;
+fn baseline_body(
+    tx: &Transaction<'_>,
+    p: &CandidateActionPlanV3,
+    read: &ReadValidation<'_, '_>,
+) -> Result<(), LifecycleError> {
+    let v = anchor_context_read(tx, &p.scope.parent_step_id, false, read)?;
     if v.state != "completed" {
         return Err(LifecycleError::Conflict);
     }
@@ -56,7 +252,7 @@ fn baseline_body(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&ReadValidati
         for item in 0..case.count() {
             let op:Option<String>=tx.query_row("SELECT request_operation_id FROM qualification_request_attempts WHERE run_id=?1 AND case_id=?2 AND item_ordinal=?3 AND subcheck_id=''",params![p.scope.run_id,case.id(),item],|r|r.get(0)).optional()?;
             let (_, a) = load_attempt(tx, &op.ok_or(LifecycleError::Conflict)?)?;
-            if !result_read(tx, p, &a,read)?.is_some_and(|e| e.passes()) {
+            if !result_read(tx, p, &a, read)?.is_some_and(|e| e.passes()) {
                 return Err(LifecycleError::Conflict);
             }
         }
@@ -73,6 +269,41 @@ impl crate::Store {
         key: &str,
         body: &str,
         context: AdmissionContext<'_>,
+    ) -> Result<CandidateDispatchResult, LifecycleError> {
+        self.grant_candidate_inference_inner(session, principal, run, key, body, context, None)
+    }
+
+    /// The service command binds the revision and immutable scope in the same
+    /// immediate transaction that creates the original V3 request attempt.
+    pub fn grant_candidate_inference_work(
+        &self,
+        session: &CoordinatorSession,
+        work: &CandidateInferenceWork,
+        key: &str,
+        body: &str,
+        context: AdmissionContext<'_>,
+    ) -> Result<CandidateDispatchResult, LifecycleError> {
+        self.grant_candidate_inference_inner(
+            session,
+            &work.principal,
+            &work.run_id,
+            key,
+            body,
+            context,
+            Some(work),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Preserve the legacy V3 API and hash while checking service scope atomically.
+    fn grant_candidate_inference_inner(
+        &self,
+        session: &CoordinatorSession,
+        principal: &str,
+        run: &str,
+        key: &str,
+        body: &str,
+        context: AdmissionContext<'_>,
+        work: Option<&CandidateInferenceWork>,
     ) -> Result<CandidateDispatchResult, LifecycleError> {
         if !super::super::super::valid_id(principal)
             || !super::super::super::valid_id(key)
@@ -95,9 +326,12 @@ impl crate::Store {
             return Err(LifecycleError::Invalid);
         }
         // Resolve the original command before selecting the next case or ordinal.
-        let prior: Option<String> = tx.query_row("SELECT operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3", params![principal,command_scope(run),key], |r|r.get(0)).optional()?;
+        let prior = tx.query_row("SELECT operation_id FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3", params![principal,command_scope(run),key], |r|Ok(worker::bounded_text(r,0,26))).optional()?.transpose()?;
         if let Some(operation) = prior {
             let (p, a) = load_attempt(&tx, &operation)?;
+            if work.is_some_and(|work| !work.matches(&p) || work.deadline_ms != a.deadline_ms) {
+                return Err(LifecycleError::IdempotencyConflict);
+            }
             validate_plan(&tx, &p)?;
             result(&tx, &p, &a)?;
             let expected = request(&template(&tx, &p, &a)?)?;
@@ -112,9 +346,14 @@ impl crate::Store {
                 request_operation_id: operation,
             });
         }
-        let anchor: Option<String> = tx.query_row("SELECT q.parent_step_id FROM qualification_ready_probes q JOIN lifecycle_steps s ON s.id=q.parent_step_id WHERE q.run_id=?1 AND s.state='completed' ORDER BY q.rowid DESC LIMIT 1",[run],|r|r.get(0)).optional()?;
+        let anchor = tx.query_row("SELECT q.parent_step_id FROM qualification_ready_probes q JOIN lifecycle_steps s ON s.id=q.parent_step_id WHERE q.run_id=?1 AND s.state='completed' ORDER BY q.rowid DESC LIMIT 1",[run],|r|Ok(worker::bounded_text(r,0,26))).optional()?.transpose()?;
         let p = plan_for_step(&tx, &anchor.ok_or(LifecycleError::Conflict)?)?;
         let v = validated_anchor(&tx, &p.scope.parent_step_id)?;
+        if work.is_some_and(|work| {
+            !work.matches(&p) || work.deadline_ms != v.snapshot.receipt().deadline_ms()
+        }) {
+            return Err(LifecycleError::RevisionConflict);
+        }
         if principal != p.scope.principal {
             return Err(LifecycleError::Conflict);
         }
@@ -136,7 +375,7 @@ impl crate::Store {
                 break;
             }
             for item in 0..case.count() {
-                let op: Option<String> = tx.query_row("SELECT request_operation_id FROM qualification_request_attempts WHERE run_id=?1 AND case_id=?2 AND item_ordinal=?3 AND subcheck_id=''",params![run,case.id(),item],|r|r.get(0)).optional()?;
+                let op = tx.query_row("SELECT request_operation_id FROM qualification_request_attempts WHERE run_id=?1 AND case_id=?2 AND item_ordinal=?3 AND subcheck_id=''",params![run,case.id(),item],|r|Ok(worker::bounded_text(r,0,26))).optional()?.transpose()?;
                 if let Some(op) = op {
                     let (_, a) = load_attempt(&tx, &op)?;
                     if !result(&tx, &p, &a)?.is_some_and(|e| e.passes()) {
@@ -244,12 +483,21 @@ pub(super) fn current_request(
     p: &CandidateActionPlanV3,
     context: AdmissionContext<'_>,
 ) -> Result<(), LifecycleError> {
+    current_request_with_lease(tx, session, p, context, None)
+}
+fn current_request_with_lease(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    p: &CandidateActionPlanV3,
+    context: AdmissionContext<'_>,
+    own_lease: Option<&str>,
+) -> Result<(), LifecycleError> {
     let v = validated_anchor(tx, &p.scope.parent_step_id)?;
     let s = &p.scope;
     if s.session_id != session.id() {
         return Err(LifecycleError::Stale);
     }
-    let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments d JOIN runtime_bindings b ON b.deployment_id=d.id JOIN qualification_runs q ON q.id=?1 WHERE d.id=?2 AND d.revision=?3 AND d.current_generation=?4 AND d.desired_state='stopped' AND d.admission_enabled=0 AND d.dispatch_enabled=0 AND d.observed_state='ready' AND b.id=?5 AND b.state='live' AND q.state='running' AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=d.id) AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=d.id))",params![s.run_id,s.deployment_id,s.revision,s.generation,s.binding_id],|r|r.get(0))?;
+    let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments d JOIN runtime_bindings b ON b.deployment_id=d.id JOIN qualification_runs q ON q.id=?1 WHERE d.id=?2 AND d.revision=?3 AND d.current_generation=?4 AND d.desired_state='stopped' AND d.admission_enabled=0 AND d.dispatch_enabled=0 AND d.observed_state='ready' AND b.id=?5 AND b.state='live' AND q.state='running' AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=d.id) AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=d.id AND (?6 IS NULL OR id!=?6)))",params![s.run_id,s.deployment_id,s.revision,s.generation,s.binding_id,own_lease],|r|r.get(0))?;
     if !valid
         || v.state != "completed"
         || context.now_ms < p.accepted_at_ms
@@ -319,11 +567,11 @@ pub(super) fn load_attempt(
     tx: &Transaction<'_>,
     operation: &str,
 ) -> Result<(CandidateActionPlanV3, RequestAttemptV3), LifecycleError> {
-    let raw: String = tx.query_row(
+    let raw = tx.query_row(
         "SELECT receipt_json FROM qualification_request_attempts WHERE request_operation_id=?1",
         [operation],
-        |r| r.get(0),
-    )?;
+        |r| Ok(worker::bounded_text(r, 0, super::super::super::MAX_BYTES)),
+    )??;
     let a: RequestAttemptV3 = decode(&raw)?;
     let p = plan_for_step(tx, &a.scope.parent_step_id)?;
     let snapshot = super::super::super::read_snapshot(tx, &p.scope.principal, &p.scope.run_id)
@@ -401,25 +649,30 @@ fn result(
     p: &CandidateActionPlanV3,
     a: &RequestAttemptV3,
 ) -> Result<Option<MarkerEvidence>, LifecycleError> {
-    result_read(tx,p,a,&ReadValidation::new(tx))
+    result_read(tx, p, a, &ReadValidation::new(tx))
 }
-fn result_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,a:&RequestAttemptV3,read:&ReadValidation<'_, '_>)->Result<Option<MarkerEvidence>,LifecycleError> {
-    let row:Option<(String,u64)>=tx.query_row("SELECT evidence_json,committed_epoch FROM qualification_request_results WHERE request_operation_id=?1",[&a.request_operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+fn result_read(
+    tx: &Transaction<'_>,
+    p: &CandidateActionPlanV3,
+    a: &RequestAttemptV3,
+    read: &ReadValidation<'_, '_>,
+) -> Result<Option<MarkerEvidence>, LifecycleError> {
+    let row=tx.query_row("SELECT evidence_json,committed_epoch FROM qualification_request_results WHERE request_operation_id=?1",[&a.request_operation_id],|r|Ok((worker::bounded_text(r,0,super::super::super::MAX_BYTES),r.get::<_,u64>(1)?))).optional()?;
     let Some((raw, epoch)) = row else {
         return Ok(None);
     };
-    let e: MarkerEvidence = decode(&raw)?;
+    let e: MarkerEvidence = decode(&raw?)?;
     let lease: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM request_leases WHERE id=?1)",
         [&a.lease_id],
         |r| r.get(0),
     )?;
-    let state: String = tx.query_row(
+    let state = tx.query_row(
         "SELECT state FROM operations WHERE id=?1",
         [&a.request_operation_id],
-        |r| r.get(0),
-    )?;
-    let owned = warm::owned_read(tx, p,read)?;
+        |r| Ok(worker::bounded_text(r, 0, 32)),
+    )??;
+    let owned = warm::owned_read(tx, p, read)?;
     let cleanup_resolved = e.terminal == Terminal::Uncertain && !lease && state == "failed";
     if cleanup_resolved {
         let cold = warm::cold(tx, &p.scope.run_id)?;
@@ -467,14 +720,19 @@ fn result_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,a:&RequestAttemptV3,
         source_digest: digest(&e)?,
         origin: e.origin.clone(),
     };
-    let mut stmt=tx.prepare("SELECT evidence_digest,metadata_json FROM qualification_evidence_refs WHERE run_id=?1 AND case_id=?2")?;
-    let rows = stmt
-        .query_map(params![p.scope.run_id, a.case_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    // The closed marker case contains exactly two corpus items. Inspect one
+    // excess row to reject corrupt cardinality without an unbounded collection.
+    let mut stmt=tx.prepare("SELECT evidence_digest,metadata_json FROM qualification_evidence_refs WHERE run_id=?1 AND case_id=?2 LIMIT 3")?;
+    let mut rows = stmt.query(params![p.scope.run_id, a.case_id])?;
     let mut found = 0;
-    for (hash, raw) in rows {
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > 2 {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        let hash = worker::bounded_text(row, 0, 64)?;
+        let raw = worker::bounded_text(row, 1, super::super::super::MAX_BYTES)?;
         let c: CoverageV3 = decode(&raw)?;
         if hash != digest(&c)? {
             return Err(LifecycleError::CorruptStoredData);

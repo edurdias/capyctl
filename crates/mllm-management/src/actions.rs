@@ -52,6 +52,16 @@ pub struct ActionReceipt {
     pub joined: bool,
 }
 pub trait ActionSource: Send + Sync + 'static {
+    fn candidate_inference(
+        &self,
+        run: &str,
+        key: &str,
+        expected_revision: i64,
+        request: &str,
+    ) -> Result<
+        mllm_store::candidate_creation::progression::CandidateInferenceReceipt,
+        ConfigurationFailure,
+    >;
     fn initialize_candidate(
         &self,
         run: &str,
@@ -91,6 +101,26 @@ impl OwnedActionSource {
     }
 }
 impl ActionSource for OwnedActionSource {
+    fn candidate_inference(
+        &self,
+        run: &str,
+        key: &str,
+        expected_revision: i64,
+        request: &str,
+    ) -> Result<
+        mllm_store::candidate_creation::progression::CandidateInferenceReceipt,
+        ConfigurationFailure,
+    > {
+        self.commands
+            .candidate_inference(
+                self.configuration.principal(),
+                run,
+                expected_revision,
+                key,
+                request,
+            )
+            .map_err(command_failure)
+    }
     fn initialize_candidate(
         &self,
         run: &str,
@@ -166,6 +196,71 @@ struct CandidateCommand {
     expected_revision: i64,
     action: CandidateAction,
     deadline_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateInferenceCommand {
+    expected_revision: i64,
+    request: serde_json::Value,
+}
+pub(crate) async fn accept_candidate_inference(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    match accept_candidate_inference_inner(state,request).await {
+        Ok(r)=>(StatusCode::ACCEPTED,Json(serde_json::json!({"api_version":"1","operation_id":r.operation_id,"deployment_id":r.deployment_id,"qualification_run_id":r.run_id,"joined":false,"revision":r.revision.to_string()}))).into_response(),
+        Err(error)=>error.response(),
+    }
+}
+async fn accept_candidate_inference_inner(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<
+    mllm_store::candidate_creation::progression::CandidateInferenceReceipt,
+    ConfigurationFailure,
+> {
+    use ConfigurationFailure::*;
+    let run = request
+        .uri()
+        .path()
+        .strip_prefix("/management/v1/qualification-runs/")
+        .and_then(|s| s.strip_suffix("/inference"))
+        .ok_or(InvalidRequest)?;
+    if !run
+        .parse::<ulid::Ulid>()
+        .is_ok_and(|id| id.to_string() == run)
+    {
+        return Err(InvalidRequest);
+    }
+    let run = run.to_owned();
+    let (key, body, permit) = configuration::read_command(&state, request).await?;
+    let command: CandidateInferenceCommand =
+        serde_json::from_slice(&body).map_err(|_| InvalidRequest)?;
+    if command.expected_revision < 1 || !command.request.is_object() {
+        return Err(InvalidRequest);
+    }
+    let source = state.actions.clone().ok_or(Unsupported)?;
+    let result = configuration::accept_blocking(permit, move || {
+        source.candidate_inference(
+            &run,
+            &key,
+            command.expected_revision,
+            &command.request.to_string(),
+        )
+    })
+    .await?;
+    if result.revision < 1
+        || ![&result.operation_id, &result.deployment_id, &result.run_id]
+            .iter()
+            .all(|id| {
+                id.parse::<ulid::Ulid>()
+                    .is_ok_and(|parsed| parsed.to_string() == **id)
+            })
+    {
+        return Err(Internal);
+    }
+    Ok(result)
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]

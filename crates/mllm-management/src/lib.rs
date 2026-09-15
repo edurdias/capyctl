@@ -248,6 +248,10 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
                 "/management/v1/qualification-runs/{id}/actions",
                 axum::routing::post(actions::accept_candidate),
             )
+            .route(
+                "/management/v1/qualification-runs/{id}/inference",
+                axum::routing::post(actions::accept_candidate_inference),
+            )
     } else {
         router
     };

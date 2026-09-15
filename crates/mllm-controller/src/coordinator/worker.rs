@@ -105,6 +105,7 @@ struct Shared {
     store_jobs: Arc<Semaphore>,
     retained: Mutex<BTreeMap<String, Arc<Driver>>>,
     retained_candidates: Mutex<BTreeMap<String, Arc<candidate::CandidateDriver>>>,
+    candidate_requests: Mutex<std::collections::VecDeque<candidate::InferenceCommand>>,
     options: CoordinatorOptions,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
@@ -137,6 +138,96 @@ pub enum CoordinatorCommandError {
 }
 
 impl CoordinatorCommands {
+    /// Blocking acceptance observer. The owned queue keeps its capacity permit
+    /// and command after a caller timeout; only the worker may obtain a New grant.
+    pub fn candidate_inference(
+        &self,
+        principal: &str,
+        run: &str,
+        expected_revision: i64,
+        key: &str,
+        body: &str,
+    ) -> Result<
+        mllm_store::candidate_creation::progression::CandidateInferenceReceipt,
+        CoordinatorCommandError,
+    > {
+        let permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self
+            .shared
+            .owner
+            .lock()
+            .map_err(|_| CoordinatorError::Service("ownership mutex poisoned".into()))?;
+        let store_error = |error: LifecycleError| {
+            if matches!(
+                error,
+                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+            ) {
+                self.shared.fail_locked(&owner, error.to_string());
+            }
+            CoordinatorCommandError::Lifecycle(error)
+        };
+        if let Some(receipt) = owner
+            .store()
+            .candidate_inference_command_receipt(
+                owner.session(),
+                principal,
+                run,
+                expected_revision,
+                key,
+                body,
+            )
+            .map_err(store_error)?
+        {
+            return Ok(receipt);
+        }
+        if !self.shared.accepting.load(Ordering::Acquire)
+            || !self.shared.initializing.load(Ordering::Acquire)
+        {
+            return Err(CoordinatorError::Stopped(
+                "worker is not admitting candidate inference".into(),
+            )
+            .into());
+        }
+        let work = owner
+            .store()
+            .candidate_inference_work(
+                owner.session(),
+                principal,
+                run,
+                expected_revision,
+                (self.shared.clock)()?,
+            )
+            .map_err(store_error)?;
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        self.shared
+            .candidate_requests
+            .lock()
+            .map_err(|_| CoordinatorError::Service("candidate command queue poisoned".into()))?
+            .push_back(candidate::InferenceCommand {
+                work,
+                expected_revision,
+                key: key.into(),
+                body: body.into(),
+                operation_id: None,
+                reply: Some(reply),
+                _permit: permit,
+            });
+        drop(owner);
+        self.shared.wake.notify_one();
+        receive
+            .recv_timeout(self.shared.options.protocol_timeout)
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => CoordinatorError::CallerTimeout,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    CoordinatorError::Stopped("candidate acceptance observer closed".into())
+                }
+            })?
+    }
     /// Accept only the closed V3 Fake Initialize action for an authenticated run.
     pub fn initialize_candidate(
         &self,
@@ -467,6 +558,7 @@ impl OwnedCoordinator {
             store_jobs: Arc::new(Semaphore::new(options.max_observers + 1)),
             retained: Mutex::new(BTreeMap::new()),
             retained_candidates: Mutex::new(BTreeMap::new()),
+            candidate_requests: Mutex::new(std::collections::VecDeque::new()),
             options,
         });
         let (stop, stop_rx) = watch::channel(false);
@@ -715,6 +807,10 @@ impl Shared {
         // Recover a poisoned guard only to close admission, never to access Store.
         let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
         self.accepting.store(false, Ordering::Release);
+        self.candidate_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     fn set_initializing(&self, initializing: bool) {
@@ -873,6 +969,39 @@ async fn run(
                 _ = tokio::time::sleep(shared.options.poll_interval) => {},
             }
             continue;
+        }
+        let request = match shared.candidate_requests.lock() {
+            Ok(mut queue) => queue.pop_front(),
+            Err(_) => return WorkerStatus::Failed("candidate command queue poisoned".into()),
+        };
+        if let Some(mut request) = request {
+            let outcome = AssertUnwindSafe(candidate::drive_inference(
+                &shared,
+                &mut request,
+                observations.as_ref(),
+                &mut stop,
+            ))
+            .catch_unwind()
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    shared.changed.notify_waiters();
+                    continue;
+                }
+                failure => {
+                    let reason = match failure {
+                        Ok(Err(e)) => e.to_string(),
+                        _ => "candidate request panicked; durable lease retained".into(),
+                    };
+                    return match request.operation_id {
+                        Some(operation_id) => WorkerStatus::Uncertain {
+                            operation_id,
+                            reason,
+                        },
+                        None => WorkerStatus::Failed(reason),
+                    };
+                }
+            }
         }
         let candidate = match shared
             .read(|owner, now| {

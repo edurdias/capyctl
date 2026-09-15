@@ -5,6 +5,7 @@ use mllm_domain::completion::StepExecutionContext;
 use mllm_scheduler::residency::AdmissionContext;
 #[path = "markers.rs"]
 pub(super) mod markers;
+pub use markers::{CandidateInferenceReceipt, CandidateInferenceWork};
 #[path = "security.rs"]
 pub(super) mod security;
 pub use security::{CandidateSecurityControlDispatch, CandidateSecurityDispatch};

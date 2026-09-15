@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::json;
 
+#[path = "tests_candidate_inference.rs"]
+mod inference_tests;
+
 #[path = "../../tests/qualification_support/candidate_fixture.rs"]
 mod candidate_fixture;
 

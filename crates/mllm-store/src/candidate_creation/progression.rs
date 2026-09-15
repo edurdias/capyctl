@@ -21,6 +21,7 @@ pub mod worker;
 use read_validation::ReadValidation;
 pub use catalog::QualificationReceipt;
 pub use inference::{
+    CandidateInferenceReceipt, CandidateInferenceWork,
     CandidateDispatchResult, CandidateProbeDispatch, CandidateSecurityControlDispatch,
     CandidateSecurityDispatch,
 };
