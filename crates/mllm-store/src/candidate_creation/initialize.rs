@@ -92,7 +92,7 @@ impl crate::Store {
             checkpoint_revision: native.checkpoint_revision,
             binding_id: native.binding_id,
             incarnation: native.incarnation,
-            endpoint,
+            endpoint: format!("http://{endpoint}"),
             served_name: format!("candidate-{}", read.planned.binding_id),
             rendered_settings_digest: native.rendered_settings_digest,
         };

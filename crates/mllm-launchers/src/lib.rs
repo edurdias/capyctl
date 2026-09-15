@@ -3,5 +3,8 @@ pub mod exec;
 mod durable;
 mod ownership;
 pub use exec::ExecLauncher;
-pub use durable::{AssociationError, DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation};
+pub use durable::{
+    AssociationError, DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation,
+    ProtectedLaunchDescriptors,
+};
 pub use ownership::ControllerLock;

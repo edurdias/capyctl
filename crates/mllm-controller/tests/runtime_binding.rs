@@ -12,6 +12,420 @@ use mllm_launchers::DurableSpawnOutcome;
 use mllm_store::lifecycle::{DeploymentFence, ReserveBinding};
 use mllm_store::{AcceptDeployment, Store};
 
+struct NativeFixture {
+    store: Store,
+    session: mllm_store::dispatch::CoordinatorSession,
+    deployment: String,
+    step: String,
+    observations: Vec<mllm_domain::resources::MemoryObservation>,
+    limits: Vec<mllm_domain::resources::MemoryLimit>,
+    ttl: i64,
+    max_parked: usize,
+    _directory: tempfile::TempDir,
+}
+
+impl NativeFixture {
+    fn new() -> Self {
+        use mllm_config::effective::{
+            candidate::validate_candidate_reviewed_snapshot_text, resolve_effective,
+        };
+        use mllm_domain::resources::{MemoryLimit, MemoryObservation};
+        use serde_json::{Value, json};
+        let ordinary: Value = serde_json::from_str(include_str!(
+            "../../mllm-config/tests/fixtures/effective-sglang-golden.json"
+        ))
+        .unwrap();
+        let mut host = ordinary["input"]["host"].clone();
+        let mut manifest: Value = serde_json::from_str(include_str!(
+            "../../mllm-config/tests/fixtures/candidate-sglang.json"
+        ))
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        manifest["effective_recipe"]["model"]["path"] = json!(root.to_str().unwrap());
+        manifest["effective_recipe"]["model"]["revision"] =
+            json!("cdbee75f17c01a7cc42f958dc650907174af0554");
+        manifest["effective_recipe"]["resolved_profile"]["build_fingerprint"] =
+            json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
+        host["runtime_profiles"]["local"]["build_fingerprint"] =
+            json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
+        manifest["limits"]["max_run_duration_ms"] = json!(600000);
+        manifest["limits"]["max_cleanup_duration_ms"] = json!(60000);
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        host["resource_policy"]["endpoint_port_range"] = json!({"start":port,"end":port});
+        let reviewed = validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap();
+        host["qualification_policy"] = json!({"revision":1,"allow_qualification_runs":true,"allow_experimental_controls":true,"allowed_manifest_digests":[reviewed.manifest_digest()],"max_run_duration":"600s","max_cleanup_duration":"60s","max_cases":128,"max_requests":4096,"max_request_body_bytes":"1MiB","max_input_tokens_per_request":131072,"max_output_tokens_per_request":16384});
+        let policy = resolve_effective(&ordinary["input"]["deployment"], &host)
+            .unwrap()
+            .host;
+        let store = Store::open(&directory.path().join("native.db")).unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        let observations: Vec<_> = policy
+            .domains
+            .keys()
+            .map(|domain| MemoryObservation {
+                domain: domain.clone(),
+                capacity_bytes: 1_i64 << 50,
+                available_bytes: 1_i64 << 50,
+                sampled_at_ms: 1000,
+            })
+            .collect();
+        store
+            .import_resource_policy(&session, &policy, &observations, 1000)
+            .unwrap();
+        store
+            .import_qualification_policy(&session, &policy)
+            .unwrap();
+        let command = json!({"host_id":"lab","expected_host_revision":1,"recipe_digest":reviewed.manifest_digest(),"manifest":manifest,"deadline_ms":500000,"allow_owned_abort_cleanup":true}).to_string();
+        let created = store
+            .create_candidate_run(&session, "owner", "create", &command, &host, 1000)
+            .unwrap();
+        let init = store
+            .accept_candidate_initialize(
+                &session,
+                "owner",
+                created.run_id(),
+                "init",
+                r#"{"expected_revision":1,"action":"initialize","deadline_ms":400000}"#,
+                1100,
+            )
+            .unwrap();
+        let resource = store.resource_policy("lab").unwrap().unwrap();
+        let limits = resource
+            .controls
+            .domains
+            .iter()
+            .map(|(domain, p)| MemoryLimit {
+                domain: domain.clone(),
+                managed_bytes: p.managed_limit,
+                free_reserve_bytes: p.free_reserve,
+                host_kv_bytes: p.host_kv_limit,
+                parked_bytes: p.parked_limit,
+            })
+            .collect();
+        Self {
+            store,
+            session,
+            deployment: created.deployment_id().into(),
+            step: init.step_id().into(),
+            observations,
+            limits,
+            ttl: resource.controls.observation_ttl_ms,
+            max_parked: resource.controls.max_parked as usize,
+            _directory: directory,
+        }
+    }
+
+    fn context(&self) -> mllm_scheduler::residency::AdmissionContext<'_> {
+        mllm_scheduler::residency::AdmissionContext::new(
+            &self.observations,
+            &self.limits,
+            1200,
+            self.ttl,
+            self.max_parked,
+        )
+    }
+}
+
+fn resolve_native_credential(reference: &str) -> Result<Vec<u8>, RuntimeError> {
+    match reference {
+        "secret://engine-key" => Ok(b"private-inference-token".to_vec()),
+        "secret://admin-key" => Ok(b"private-admin-token".to_vec()),
+        _ => panic!("unexpected reference"),
+    }
+}
+
+#[test]
+fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_closed() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    let fixture = NativeFixture::new();
+    let handoff = NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let command = handoff.command();
+    assert!(command.env.is_empty());
+    assert_eq!(
+        &command.argv[1..4],
+        ["-I", "runtime/sglang_entry.py", "--public-settings-json"]
+    );
+    let text = format!("{command:?}");
+    for private in [
+        "private-inference-token",
+        "private-admin-token",
+        "secret://",
+        fixture._directory.path().to_str().unwrap(),
+    ] {
+        assert!(!text.contains(private));
+    }
+    let private: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(format!("/proc/self/fd/{}", command.argv[6])).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(private["schema_version"], 1);
+    assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    assert_eq!(
+        private["checkpoint_root"],
+        fixture._directory.path().to_str().unwrap()
+    );
+    assert_eq!(
+        private["public_settings"],
+        serde_json::from_str::<serde_json::Value>(&command.argv[4]).unwrap()
+    );
+    assert_eq!(private.as_object().unwrap().len(), 4);
+    assert_eq!(
+        std::fs::read(format!("/proc/self/fd/{}", command.argv[8])).unwrap(),
+        b"private-inference-token"
+    );
+    assert_eq!(
+        std::fs::read(format!("/proc/self/fd/{}", command.argv[10])).unwrap(),
+        b"private-admin-token"
+    );
+    assert!(
+        NativeCandidateHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &|_| panic!("replay resolved credentials"),
+            &|_| panic!("replay preflight")
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(matches!(
+        RuntimeBindings::default().binding(&fixture.deployment, 1),
+        Err(RuntimeError::Missing)
+    ));
+    assert!(fixture.store.runtime_binding(&fixture.deployment).is_err());
+    assert_eq!(
+        fixture.store.resource_snapshot().unwrap().owners[&fixture.deployment].phase,
+        ResourcePhase::Cold
+    );
+    let connection =
+        rusqlite::Connection::open(fixture._directory.path().join("native.db")).unwrap();
+    let flags: (i64, i64) = connection
+        .query_row(
+            "SELECT admission_enabled,dispatch_enabled FROM deployments WHERE id=?1",
+            [&fixture.deployment],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(flags, (0, 0));
+    for table in ["runtime_bindings", "lifecycle_steps", "management_events"] {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table}"))
+            .unwrap();
+        let count = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..count)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        for row in rows {
+            let text = format!("{:?}", row.unwrap());
+            assert!(!text.contains("private-inference-token"));
+            assert!(!text.contains("private-admin-token"));
+        }
+    }
+    drop(handoff);
+    assert!(
+        NativeCandidateHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &resolve_native_credential,
+            &|_| Ok(())
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn native_candidate_preflight_failure_consumes_authority_without_handoff_or_secret_error() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    let fixture = NativeFixture::new();
+    let checked = std::cell::Cell::new(false);
+    let result = NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &|_| panic!("failed preflight resolved credentials"),
+        &|_| {
+            checked.set(true);
+            Err(RuntimeError::Uncertain("private-checkpoint-secret".into()))
+        },
+    );
+    let error = result.err().unwrap();
+    assert!(checked.get());
+    assert!(!format!("{error:?}").contains("private-checkpoint-secret"));
+    assert!(
+        NativeCandidateHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &resolve_native_credential,
+            &|_| Ok(())
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        fixture.store.resource_snapshot().unwrap().owners[&fixture.deployment].phase,
+        ResourcePhase::Cold
+    );
+}
+
+#[test]
+fn native_candidate_stale_session_cannot_spawn_prepared_handoff() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    let fixture = NativeFixture::new();
+    let handoff = NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let _new_session = fixture.store.begin_coordinator_session().unwrap();
+    // Revalidation must return before any process creation. Never execute Python here.
+    assert!(handoff.spawn(&mllm_launchers::DurableSpawn::new()).is_err());
+}
+
+#[test]
+fn native_candidate_stale_generation_cannot_spawn_prepared_handoff() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    let fixture = NativeFixture::new();
+    let handoff = NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    fixture.store.bump_generation(&fixture.deployment).unwrap();
+    assert!(handoff.spawn(&mllm_launchers::DurableSpawn::new()).is_err());
+}
+
+#[test]
+fn native_candidate_changed_binding_cannot_spawn_prepared_handoff() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    let fixture = NativeFixture::new();
+    let handoff = NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let connection =
+        rusqlite::Connection::open(fixture._directory.path().join("native.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE runtime_bindings SET incarnation=?1",
+            [ulid::Ulid::new().to_string()],
+        )
+        .unwrap();
+    assert!(handoff.spawn(&mllm_launchers::DurableSpawn::new()).is_err());
+}
+
+#[test]
+fn native_candidate_ambiguous_api_association_retains_endpoint_grant_and_closed_dispatch() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    use mllm_launchers::LaunchAssociation;
+    let fixture = NativeFixture::new();
+    let handoff = NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let connection =
+        rusqlite::Connection::open(fixture._directory.path().join("native.db")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_api BEFORE UPDATE OF identities_json ON runtime_bindings BEGIN SELECT RAISE(ABORT,'private-association-detail'); END;").unwrap();
+    let error = handoff
+        .persist_api_identity(&mllm_domain::completion::ProcessIdentity {
+            role: "api".into(),
+            pid: 42,
+            boot_id: "test-boot".into(),
+            start_ticks: 100,
+        })
+        .unwrap_err();
+    assert!(!format!("{error:?}").contains("private-association-detail"));
+    let retained: (String,String,i64,i64,i64,i64) = connection.query_row("SELECT b.state,b.identities_json,d.admission_enabled,d.dispatch_enabled,(SELECT COUNT(*) FROM endpoint_leases),(SELECT COUNT(*) FROM resource_grants) FROM runtime_bindings b JOIN deployments d ON d.id=b.deployment_id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+    assert_eq!(retained, ("uncertain".into(), "[]".into(), 0, 0, 1, 1));
+    assert!(
+        NativeCandidateHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &resolve_native_credential,
+            &|_| Ok(())
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn native_candidate_invalid_credentials_never_create_handoff_or_retry() {
+    use mllm_controller::runtime::NativeCandidateHandoff;
+    for secret in [b"duplicate-token".as_slice(), b"invalid\nsecret", b""] {
+        let fixture = NativeFixture::new();
+        assert!(
+            NativeCandidateHandoff::arm(
+                &fixture.store,
+                &fixture.session,
+                &fixture.step,
+                fixture.context(),
+                &|_| Ok(secret.to_vec()),
+                &|_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            NativeCandidateHandoff::arm(
+                &fixture.store,
+                &fixture.session,
+                &fixture.step,
+                fixture.context(),
+                &resolve_native_credential,
+                &|_| Ok(())
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+}
+
 fn footprint(phase: ResourcePhase) -> PhaseFootprint {
     PhaseFootprint {
         phase,

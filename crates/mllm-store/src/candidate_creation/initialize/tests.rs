@@ -202,6 +202,18 @@ fn native_arm_freezes_once_and_keeps_ordinary_dispatch_closed() {
     let frozen = store.candidate_native_launch(&s, r.step_id()).unwrap();
     assert_eq!(frozen.metadata().binding_id, c.binding_id());
     assert_eq!(frozen.metadata().incarnation, c.incarnation());
+    let leased_port: u16 = store
+        .conn
+        .query_row(
+            "SELECT port FROM endpoint_leases WHERE binding_id=?1",
+            [c.binding_id()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        frozen.metadata().endpoint,
+        format!("http://127.0.0.1:{leased_port}")
+    );
     let public = format!("{:?}", frozen.metadata());
     for private in [
         "/srv/models",
