@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mllm-adapters = { workspace = true }
+mllm-agent = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 

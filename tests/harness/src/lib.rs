@@ -7,6 +7,8 @@
 //! their own tests; the fake engine in `mllm-adapters::fake` is the
 //! reference implementation these checks were developed against.
 
+pub mod f2_pressure;
+
 use mllm_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
     Readiness, RenderedCommand, RequestRef,

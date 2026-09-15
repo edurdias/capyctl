@@ -9,8 +9,9 @@ readiness checkpoint. No owner decision is currently required.
 | Boundary | Implementation evidence | What it does not establish |
 | --- | --- | --- |
 | Protected candidate handoff | `49bed60`; consolidated handoff review cleared Critical/Important findings | Native ServerArgs mapping or complete process enrollment |
-| Reviewed placement | `0706d3f`; frozen host/hardware/device/domain validated in Rust and Python | Physical GPU UUID or CUDA index corroboration |
-| Checkpoint and selected source preflight | `ab1d9b2`, `23deeec`; 111 runtime tests pass | Installed binary compatibility or whole-package attestation |
+| Reviewed placement | `0706d3f`, `bf4b209`; frozen selection and read-only physical UUID/PCI corroboration | Trusted device-policy provisioning or guarded CUDA namespace composition |
+| Checkpoint and selected source preflight | 142 runtime tests; import-free installed preflight recorded in `67299e3` | Installed binary compatibility or whole-package attestation |
+| Process-group observation | `67299e3`; 31 launcher tests pass | Native role enrollment, no-escape contract, or cleanup authority |
 | Typed controls | `6c78908`; 17 deterministic control tests | Real saver behavior, durable coordinator composition, qualified memory release |
 | Shared forwarding | `2d7c426`; 10 cross-engine contract tests; all 92 adapter tests pass | Durable request settlement, lossless public-router delivery, or live output correctness |
 
@@ -29,8 +30,8 @@ disk reload on restoration. Additional feature combinations remain unqualified.
 - Complete the effective pinned ServerArgs map and startup checks. Corroborate
   physical placement, prohibit unreviewed plugins, protect startup logging, and
   verify the real saver instead of trusting an enable flag.
-- Install the wrapper/helpers at a protected absolute service path and wire the
-  production clock, credential provider, checkpoint/source revalidation, and
+- Bind the installed protected wrapper/helpers to the reviewed runtime recipe.
+  Wire the production clock, credential provider, checkpoint/source revalidation, and
   complete API/scheduler/detokenizer enrollment. Existing two-role Fake fixtures
   do not establish the native process topology.
 - Connect fresh native observations to each separately persisted drain, release,
@@ -83,6 +84,14 @@ not proven memory limits. Use 250 ms observations no older than 2 s, a stable
 30-second swap baseline, and stop new admissions on pressure or the prescribed
 swap-growth threshold. Do not derive per-owner release from global free memory.
 Cleanup requires frozen run permission and verified owned identities.
+
+The deterministic `tests/harness/src/f2_pressure.rs` guard now implements the
+fixed headroom/managed bounds, 30-second stable baseline (including existing swap),
+64-MiB/three-increase abort rules, and a no-I/O freshness watchdog. Errors latch
+for the run. Eight pressure tests and all thirteen harness tests pass, with
+all-target Clippy warnings denied. The runner must still wire 250-ms collection,
+watchdog scheduling, and admission closure; the guard performs no engine effects
+and does not establish host identity, attribution, or qualification.
 
 ## Owner-attention tracking
 
