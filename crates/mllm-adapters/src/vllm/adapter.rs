@@ -37,6 +37,7 @@ pub const fn level2_residue() -> i64 {
 /// by deployments riding the same profile — member A's park must never
 /// make member B report Parked or Initializing.
 pub struct VllmAdapter {
+    forward: crate::forward::ChatHttp,
     http: EngineHttp,
     fingerprint: String,
     policy: ParkPolicy,
@@ -56,6 +57,7 @@ impl VllmAdapter {
         model_id: String,
     ) -> Self {
         Self {
+            forward: crate::forward::ChatHttp::new(base.clone(), model_id.clone(), api_key.clone()),
             http: EngineHttp::new(base, api_key),
             fingerprint,
             policy,
@@ -277,62 +279,19 @@ impl EngineAdapter for VllmAdapter {
         Ok(CancellationOutcome::Uncertain)
     }
 }
-
-
 #[async_trait]
 impl crate::traits::ChatForward for VllmAdapter {
-    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError> {
-        // Non-streaming: buffer the SSE stream until [DONE] and join the
-        // chunks into the engine's final JSON (F1 keeps one code path —
-        // the internal request always streams, matching the SSE parser).
-        let mut req = body.clone();
-        req["stream"] = serde_json::Value::Bool(true);
-        let mut text = String::new();
-        let end = self
-            .http
-            .chat_completion_stream(&req, |c| text.push_str(&c.text))
-            .await
-            .map_err(|e| match e {
-                HttpError::Unreachable(_) => AdapterError::Crash(Phase::Startup),
-                other => AdapterError::Uncertain(format!("chat: {other:?}")),
-            })?;
-        let _ = end;
-        // Join the per-chunk delta.content pieces (chunks are independent
-        // JSON objects; wrap the concatenation into a JSON array and read
-        // each delta).
-        let mut content = String::new();
-        let wrapped = format!("[{}]", text.replace("}{", "},{"));
-        if let Ok(serde_json::Value::Array(chunks)) =
-            serde_json::from_str::<serde_json::Value>(&wrapped)
-        {
-            for v in &chunks {
-                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
-                    content.push_str(c);
-                }
-            }
-        }
-        Ok(serde_json::json!({
-            "model": body["model"],
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
-        }))
+    async fn forward_chat(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.forward.collect(body).await
     }
-
     async fn forward_chat_stream(
         &self,
         body: &serde_json::Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<crate::traits::StreamEnded, AdapterError> {
-        let end = self
-            .http
-            .chat_completion_stream(body, |c| on_chunk(c.text.clone()))
-            .await
-            .map_err(|e| match e {
-                HttpError::Unreachable(_) => AdapterError::Crash(Phase::Startup),
-                other => AdapterError::Uncertain(format!("chat: {other:?}")),
-            })?;
-        Ok(match end {
-            crate::vllm::StreamEnd::Completed => crate::traits::StreamEnded::Completed,
-            crate::vllm::StreamEnd::BackendClosed => crate::traits::StreamEnded::BackendClosed,
-        })
+        self.forward.stream(body, on_chunk).await
     }
 }

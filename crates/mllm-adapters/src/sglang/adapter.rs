@@ -71,6 +71,7 @@ impl Drop for Attempt<'_> {
 /// supplementary: persisted coordinator fencing remains mandatory across restart.
 /// After uncertainty, reconciliation must establish a new adapter binding.
 pub struct SglangAdapter {
+    pub(super) forward: crate::forward::ChatHttp,
     http: ControlHttp,
     binding_id: String,
     incarnation: String,
@@ -97,10 +98,18 @@ impl SglangAdapter {
                 .map_err(|_| RuntimeError::Unsupported)?,
             frozen.checkpoint_root().into(),
             metadata.served_name.clone(),
-            inference,
+            inference.clone(),
             admin,
         )?;
         Ok(Self {
+            forward: crate::forward::ChatHttp::new(
+                metadata
+                    .endpoint
+                    .parse()
+                    .map_err(|_| RuntimeError::Unsupported)?,
+                metadata.served_name.clone(),
+                Some(inference),
+            ),
             http,
             binding_id: metadata.binding_id.clone(),
             incarnation: metadata.incarnation.clone(),
