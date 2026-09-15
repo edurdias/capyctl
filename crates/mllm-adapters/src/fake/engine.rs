@@ -413,6 +413,28 @@ impl EngineAdapter for FakeEngine {
 
 #[async_trait]
 impl crate::traits::ChatForward for FakeEngine {
+    async fn forward_chat_stream_async(
+        &self,
+        body: &serde_json::Value,
+        sink: &mut dyn crate::traits::ChatSink,
+    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        // Qualification fault streams retain their explicit synchronous
+        // collector contract. Never buffer that generator to fake async support.
+        if self.qualification.lock().unwrap().is_some() {
+            return Err(AdapterError::UnsupportedCapability);
+        }
+        let model = body["model"].as_str().unwrap_or("fake");
+        for chunk in [
+            serde_json::json!({"id":"fake-stream", "model":model,"choices":[{"delta":{"content":"hel"}}]}).to_string(),
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string(),
+        ] {
+            if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), sink.send(chunk)).await, Ok(Ok(()))) {
+                break;
+            }
+        }
+        // This ordinary fake generates no external work to reconcile.
+        Ok(crate::traits::StreamEnded::Completed)
+    }
     async fn forward_chat(
         &self,
         body: &serde_json::Value,

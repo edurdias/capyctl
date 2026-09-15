@@ -1,12 +1,21 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
 //! qualification evidence; cancellation and partial output never prove idle.
-use crate::traits::{AdapterError, StreamEnded};
+use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::time::Duration;
 
 const EVENT_LIMIT: usize = 64 * 1024;
 const STREAM_LIMIT: usize = 16 * 1024 * 1024;
+
+struct CallbackSink<'a>(&'a mut (dyn FnMut(String) + Send));
+#[async_trait::async_trait]
+impl ChatSink for CallbackSink<'_> {
+    async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
+        (self.0)(chunk);
+        Ok(())
+    }
+}
 
 fn uncertain() -> AdapterError {
     AdapterError::Uncertain("chat terminal result unverified".into())
@@ -68,7 +77,15 @@ impl ChatHttp {
         body: &Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamEnded, AdapterError> {
-        tokio::time::timeout(Duration::from_secs(300), self.stream_inner(body, on_chunk))
+        self.stream_async(body, &mut CallbackSink(on_chunk)).await
+    }
+
+    pub(crate) async fn stream_async(
+        &self,
+        body: &Value,
+        sink: &mut dyn ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        tokio::time::timeout(Duration::from_secs(300), self.stream_inner(body, sink))
             .await
             .map_err(|_| uncertain())?
     }
@@ -76,7 +93,7 @@ impl ChatHttp {
     async fn stream_inner(
         &self,
         body: &Value,
-        on_chunk: &mut (dyn FnMut(String) + Send),
+        sink: &mut dyn ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         let public = body
             .get("model")
@@ -110,12 +127,24 @@ impl ChatHttp {
         }
         let mut stream = response.bytes_stream();
         let mut parser = Parser::new(&self.model, public);
+        let mut delivery_failed = false;
         while let Some(bytes) = tokio::time::timeout(Duration::from_secs(60), stream.next())
             .await
             .map_err(|_| uncertain())?
         {
             for byte in bytes.map_err(|_| uncertain())? {
-                if parser.byte(byte, on_chunk)? {
+                // A byte can finish at most one event. Hold only that payload
+                // while awaiting capacity; never collect a transport chunk's
+                // events into a second queue.
+                let mut payload = None;
+                let done = parser.byte(byte, &mut |chunk| payload = Some(chunk))?;
+                if let Some(chunk) = payload.filter(|_| !delivery_failed) {
+                    delivery_failed = !matches!(
+                        tokio::time::timeout(Duration::from_secs(10), sink.send(chunk)).await,
+                        Ok(Ok(()))
+                    );
+                }
+                if done {
                     return Ok(StreamEnded::Completed);
                 }
             }

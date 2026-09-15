@@ -10,6 +10,144 @@ const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
 const MODEL: &str = "candidate-01K00000000000000000000001";
 
+struct SlowSink {
+    chunks: Vec<String>,
+    fail: bool,
+}
+
+struct GateSink {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl mllm_adapters::traits::ChatSink for GateSink {
+    async fn send(&mut self, _: String) -> Result<(), mllm_adapters::traits::DeliveryFailed> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn backpressure_stops_parser_before_next_event_even_in_same_http_chunk() {
+    for sglang in [false, true] {
+        let (adapter, server) = engine(
+            sglang,
+            format!("{}data:invalid\n\n", chunk("first", Value::Null)),
+        )
+        .await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut sink = GateSink {
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let task = tokio::spawn(async move {
+            adapter
+                .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            !task.is_finished(),
+            "must await sink before parsing malformed next event"
+        );
+        release.notify_one();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(mllm_adapters::AdapterError::Uncertain(_))
+        ));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn timed_out_sink_is_not_called_again_but_backend_terminal_is_still_verified() {
+    let mut tasks = vec![];
+    for sglang in [false, true] {
+        tasks.push(tokio::spawn(async move {
+            let (adapter, server) = engine(
+                sglang,
+                format!(
+                    "{}{}data:[DONE]\n\n",
+                    chunk("first", Value::Null),
+                    chunk("last", json!("stop"))
+                ),
+            )
+            .await;
+            let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+            let mut sink = GateSink {
+                entered: entered.clone(),
+                release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                adapter.forward_chat_stream_async(&json!({"model":"public"}), &mut sink),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap(), StreamEnded::Completed);
+            server.abort();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+#[async_trait::async_trait]
+impl mllm_adapters::traits::ChatSink for SlowSink {
+    async fn send(&mut self, chunk: String) -> Result<(), mllm_adapters::traits::DeliveryFailed> {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        self.chunks.push(chunk);
+        if self.fail {
+            Err(mllm_adapters::traits::DeliveryFailed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn async_sink_waits_in_order_and_failure_drains_without_resuming_delivery() {
+    for sglang in [false, true] {
+        for fail in [false, true] {
+            for terminal in [false, true] {
+                let sse = format!(
+                    "{}{}{}",
+                    chunk("one", Value::Null),
+                    chunk("two", json!("stop")),
+                    if terminal { "data:[DONE]\n\n" } else { "" }
+                );
+                let (adapter, task) = engine(sglang, sse).await;
+                let mut sink = SlowSink {
+                    chunks: vec![],
+                    fail,
+                };
+                let result = adapter
+                    .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
+                    .await;
+                assert_eq!(matches!(result, Ok(StreamEnded::Completed)), terminal);
+                assert_eq!(sink.chunks.len(), if fail { 1 } else { 2 });
+                assert_eq!(
+                    serde_json::from_str::<Value>(&sink.chunks[0]).unwrap()["choices"][0]["delta"]
+                        ["content"],
+                    "one"
+                );
+                if !fail {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&sink.chunks[1]).unwrap()["choices"][0]["delta"]
+                            ["content"],
+                        "two"
+                    );
+                }
+                task.abort();
+            }
+        }
+    }
+}
+
 struct Observer;
 #[async_trait::async_trait]
 impl SglangRuntimeObserver for Observer {
@@ -174,7 +312,10 @@ async fn streams_in_order_and_reports_premature_close_without_completion() {
                 chunks.push(serde_json::from_str::<Value>(&s).unwrap())
             })
             .await;
-        assert!(matches!(end, Err(mllm_adapters::AdapterError::Uncertain(_))));
+        assert!(matches!(
+            end,
+            Err(mllm_adapters::AdapterError::Uncertain(_))
+        ));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0]["model"], "public");
         task.abort();

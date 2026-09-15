@@ -26,13 +26,19 @@ impl ChatForward for Forward {
         Err(AdapterError::Uncertain("private-backend-detail".into()))
     }
 
-    async fn forward_chat_stream(
+    async fn forward_chat_stream_async(
         &self,
         _: &Value,
-        on_chunk: &mut (dyn FnMut(String) + Send),
+        sink: &mut dyn mllm_adapters::traits::ChatSink,
     ) -> Result<StreamEnded, AdapterError> {
         for index in 0..self.chunks {
-            on_chunk(format!("{index}:{}", "x".repeat(self.chunk_bytes)));
+            if sink
+                .send(format!("{index}:{}", "x".repeat(self.chunk_bytes)))
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
         if let Some(gate) = &self.finish_gate {
             gate.notified().await;
@@ -82,7 +88,7 @@ async fn unverified_backend_end_never_sends_done_or_releases_accounting() {
 }
 
 #[tokio::test]
-async fn overflow_cannot_resume_partial_delivery_and_claim_success() {
+async fn slow_consumer_receives_all_chunks_before_success() {
     let counts = Arc::new(InFlight::default());
     let gate = Arc::new(Notify::new());
     let response = response(
@@ -96,7 +102,7 @@ async fn overflow_cannot_resume_partial_delivery_and_claim_success() {
     );
     let mut body = response.into_body().into_data_stream();
     let mut text = String::new();
-    // Callback sends the burst without awaiting, filling the 16-element queue.
+    // A burst larger than the bounded queue must wait, not drop chunks.
     for _ in 0..16 {
         text.push_str(&String::from_utf8_lossy(
             &body.next().await.unwrap().unwrap(),
@@ -106,10 +112,11 @@ async fn overflow_cannot_resume_partial_delivery_and_claim_success() {
     while let Some(bytes) = body.next().await {
         text.push_str(&String::from_utf8_lossy(&bytes.unwrap()));
     }
-    assert!(
-        !text.contains("[DONE]"),
-        "lost chunks cannot produce successful delivery"
-    );
+    let expected = (0..20)
+        .map(|index| format!("data: {index}:xxxx\n\n"))
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    assert_eq!(text, expected);
     assert_eq!(
         counts.current("d"),
         0,
@@ -275,4 +282,70 @@ async fn client_disconnect_waits_for_backend_completion_before_release() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn stalled_delivery_times_out_without_done_but_settles_verified_backend() {
+    let counts = Arc::new(InFlight::default());
+    let response = response(
+        Forward {
+            chunks: 20,
+            chunk_bytes: 1,
+            finish: Ok(StreamEnded::Completed),
+            finish_gate: None,
+        },
+        &counts,
+    );
+    // Do not poll the body until the bounded sink's wait expires.
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        while counts.current("d") != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("data:"))
+            .count(),
+        16
+    );
+    assert!(!text.contains("[DONE]"));
+}
+
+struct PanicForward;
+#[async_trait]
+impl ChatForward for PanicForward {
+    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+        unreachable!()
+    }
+    async fn forward_chat_stream_async(
+        &self,
+        _: &Value,
+        _: &mut dyn mllm_adapters::traits::ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        panic!("backend task lost");
+    }
+}
+
+#[tokio::test]
+async fn backend_panic_keeps_abandoned_accounting() {
+    let counts = Arc::new(InFlight::default());
+    let response = stream_response(
+        Arc::new(PanicForward),
+        json!({"model":"m"}),
+        counts.guard_arc("d"),
+    )
+    .into_response();
+    assert!(
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(counts.current("d"), 1);
 }

@@ -10,9 +10,41 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 
 use crate::admission::StaticStreamGuard;
-use mllm_adapters::traits::StreamEnded;
+use mllm_adapters::traits::{ChatSink, DeliveryFailed, StreamEnded};
 
 const MAX_CHUNK_BYTES: usize = 64 * 1024;
+
+struct ResponseSink {
+    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    failed: bool,
+}
+
+#[async_trait::async_trait]
+impl ChatSink for ResponseSink {
+    async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed> {
+        if self.failed {
+            return Err(DeliveryFailed);
+        }
+        // Set failure before awaiting so cancellation by the adapter's delivery
+        // deadline cannot later append a successful terminal to partial output.
+        self.failed = true;
+        if chunk.len() > MAX_CHUNK_BYTES {
+            return Err(DeliveryFailed);
+        }
+        if !matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.tx.send(Ok(Event::default().data(chunk)))
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            return Err(DeliveryFailed);
+        }
+        self.failed = false;
+        Ok(())
+    }
+}
 
 pub fn stream_response(
     forward: Arc<dyn mllm_adapters::traits::ChatForward>,
@@ -27,38 +59,28 @@ pub fn stream_response(
         // only — accounting stays conservative until the backend ends (F1
         // design §5: client disconnect is not proof the engine stopped).
         let guard = guard.abandon();
-        // The legacy synchronous callback cannot await capacity. Fail the
-        // delivery on overflow; never resume after a missing chunk and append
-        // a successful terminal. The F2 cutover still needs an async bounded
-        // sink and durable lease settlement instead of this process-local guard.
-        let mut delivery_failed = false;
-        let mut on_chunk = |chunk: String| {
-            if delivery_failed {
-                return;
-            }
-            if chunk.len() > MAX_CHUNK_BYTES
-                || tx.try_send(Ok(Event::default().data(chunk))).is_err()
-            {
-                delivery_failed = true;
-            }
-        };
-        let result = forward.forward_chat_stream(&body, &mut on_chunk).await;
-        if matches!(result, Ok(StreamEnded::Completed)) {
+        let mut sink = ResponseSink { tx, failed: false };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            forward.forward_chat_stream_async(&body, &mut sink),
+        )
+        .await;
+        if matches!(result, Ok(Ok(StreamEnded::Completed))) {
             // Backend completion and downstream delivery are separate facts.
             guard.release();
-            if !delivery_failed {
+            if !sink.failed {
                 // A full final queue does not silently lose the terminal. Bound
                 // waiting for a stalled consumer after backend work has settled.
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    tx.send(Ok(Event::default().data("[DONE]"))),
+                    sink.tx.send(Ok(Event::default().data("[DONE]"))),
                 )
                 .await;
             }
         }
         // Errors, premature close, cancellation and panic retain the abandoned
         // charge. A transport end alone cannot establish backend quiescence.
-        drop(tx);
+        drop(sink);
     });
     let stream = async_stream::stream! {
         while let Some(ev) = rx.recv().await {

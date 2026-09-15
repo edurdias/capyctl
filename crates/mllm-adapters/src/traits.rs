@@ -164,14 +164,18 @@ pub enum AdapterError {
 pub trait EngineAdapter: Send + Sync {
     /// One persisted child effect only. Implementations must not hide legacy
     /// compound Restore/reload/probe behavior behind this entry point.
-    async fn execute_persisted(&self, _command: &RuntimeCommand) -> Result<mllm_domain::qualification::EffectObservation,RuntimeError> {
+    async fn execute_persisted(
+        &self,
+        _command: &RuntimeCommand,
+    ) -> Result<mllm_domain::qualification::EffectObservation, RuntimeError> {
         Err(RuntimeError::Unsupported)
     }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError>;
     async fn render_plan(&self, plan: &PlanInput) -> Result<RenderedCommand, AdapterError>;
     async fn check_readiness(&self, member: &MemberRef) -> Result<Readiness, AdapterError>;
     async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError>;
-    async fn park(&self, member: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError>;
+    async fn park(&self, member: &MemberRef, level: ParkLevel)
+    -> Result<ParkOutcome, AdapterError>;
     async fn restore(&self, member: &MemberRef) -> Result<RestoreOutcome, AdapterError>;
     async fn reload_weights(&self, member: &MemberRef) -> Result<ReloadOutcome, AdapterError>;
     async fn observe_work(&self, member: &MemberRef) -> Result<WorkObservation, AdapterError>;
@@ -234,13 +238,37 @@ pub enum StreamEnded {
     BackendClosed,
 }
 
+/// Downstream delivery failed; this says nothing about backend completion.
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryFailed;
+
+/// A bounded, backpressure-aware destination for one decoded payload.
+#[async_trait]
+pub trait ChatSink: Send {
+    async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed>;
+}
+
 /// Inference forwarding: how the router reaches a deployment's engine
 /// through its adapter (F1 design §5). Streaming chunk accounting lives in
 /// the router; forwarders return decoded data payloads.
 #[async_trait]
 pub trait ChatForward: Send + Sync {
+    /// Await delivery in order. On sink failure or timeout, stop delivery and
+    /// drain the backend within its existing limits. Completed describes only
+    /// the backend protocol terminator, never successful downstream delivery.
+    /// No synchronous fallback: implementations must explicitly support this.
+    async fn forward_chat_stream_async(
+        &self,
+        _body: &serde_json::Value,
+        _sink: &mut dyn ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
     /// Non-streaming chat completion: returns the engine's JSON response.
-    async fn forward_chat(&self, body: &serde_json::Value) -> Result<serde_json::Value, AdapterError>;
+    async fn forward_chat(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AdapterError>;
     /// Streaming chat completion: yields data payloads in order; the final
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(

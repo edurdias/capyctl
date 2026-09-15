@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use crate::fake::ParkPolicy;
 use crate::traits::{
     AdapterError, CancellationOutcome, EngineAdapter, EngineState, MemberRef, ParkLevel,
-    ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome, RequestRef,
-    RenderedCommand, RestoreOutcome, WorkObservation,
+    ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome, RenderedCommand,
+    RequestRef, RestoreOutcome, WorkObservation,
 };
 use crate::vllm::http::{EngineHttp, HttpError};
 
@@ -107,7 +107,6 @@ impl VllmAdapter {
     }
 }
 
-
 #[async_trait]
 impl EngineAdapter for VllmAdapter {
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
@@ -148,7 +147,7 @@ impl EngineAdapter for VllmAdapter {
             return Err(AdapterError::UnsupportedCapability);
         };
         let mut spec = spec.clone();
-        
+
         spec.api_key = None; // launch secret rides the env, not argv (redaction)
         let mut cmd = crate::vllm::args::render_command(&spec)
             .map_err(|e| AdapterError::Uncertain(format!("render: {e}")))?;
@@ -203,14 +202,16 @@ impl EngineAdapter for VllmAdapter {
         // Quiescence = what the adapter can prove: no live work observed.
         match self.observe_work(member).await? {
             WorkObservation::Idle => Ok(Quiescence { quiescent: true }),
-            WorkObservation::Streaming { .. } => {
-                Ok(Quiescence { quiescent: false })
-            }
+            WorkObservation::Streaming { .. } => Ok(Quiescence { quiescent: false }),
             WorkObservation::Unknown => Ok(Quiescence { quiescent: false }),
         }
     }
 
-    async fn park(&self, member: &MemberRef, level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+    async fn park(
+        &self,
+        member: &MemberRef,
+        level: ParkLevel,
+    ) -> Result<ParkOutcome, AdapterError> {
         // Deep-park security gate (SPEC §9.1 / T21): both sleep levels on the
         // vllm-sleep profile require the host-policy opt-in — the profile
         // itself is gated, not just the operations (design §7).
@@ -226,7 +227,9 @@ impl EngineAdapter for VllmAdapter {
         match outcome {
             crate::vllm::SleepOutcome::Applied => {
                 self.set_parked(member, true);
-                Ok(ParkOutcome::Parked { retained_bytes: level2_residue() })
+                Ok(ParkOutcome::Parked {
+                    retained_bytes: level2_residue(),
+                })
             }
         }
     }
@@ -235,11 +238,16 @@ impl EngineAdapter for VllmAdapter {
         // Waking allocations alone is not successful restoration (SPEC §9.1):
         // wake, then reload weights through the collective, then the caller
         // verifies readiness + generation.
-        self.http.wake().await.map_err(|e| Self::uncertain_http("restore wake", e))?;
+        self.http
+            .wake()
+            .await
+            .map_err(|e| Self::uncertain_http("restore wake", e))?;
         self.reload_weights(member).await?;
         // Discarded KV allocations must never be reused through stale prefix
         // metadata. Require invalidation after reload, before releasing Ready.
-        self.http.reset_prefix_cache().await
+        self.http
+            .reset_prefix_cache()
+            .await
             .map_err(|e| Self::uncertain_http("restore cache reset", e))?;
         self.set_parked(member, false);
         Ok(RestoreOutcome::Restored)
@@ -281,6 +289,13 @@ impl EngineAdapter for VllmAdapter {
 }
 #[async_trait]
 impl crate::traits::ChatForward for VllmAdapter {
+    async fn forward_chat_stream_async(
+        &self,
+        body: &serde_json::Value,
+        sink: &mut dyn crate::traits::ChatSink,
+    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        self.forward.stream_async(body, sink).await
+    }
     async fn forward_chat(
         &self,
         body: &serde_json::Value,

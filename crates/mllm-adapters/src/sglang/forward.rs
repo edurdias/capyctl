@@ -5,6 +5,13 @@ use async_trait::async_trait;
 
 #[async_trait]
 impl ChatForward for SglangAdapter {
+    async fn forward_chat_stream_async(
+        &self,
+        body: &serde_json::Value,
+        sink: &mut dyn crate::traits::ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        self.forward.stream_async(body, sink).await
+    }
     async fn forward_chat(
         &self,
         body: &serde_json::Value,
