@@ -98,9 +98,9 @@ case cannot demonstrate Q6, not permission to shrink reservations or headroom.
 Both calculations require trusted attribution and complete ledger/planner inputs
 from their caller; neither grants qualification or changes resource policy.
 
-Latest full harness run: 71 tests and all-target Clippy pass. Three subsequently
-added pressure-ceiling tests pass alongside both margin tests under isolated
-source/test Clippy. That five-test check is not a new full Cargo-suite result.
+Latest full harness run: 74 tests and all-target Clippy pass, including both
+phase-margin tests and all three pressure-ceiling tests. The same integrated
+run passes 490 Store/controller/management tests and four-crate all-target Clippy.
 No native measurements, engine baselines or qualification results were collected.
 
 ## Remaining gates

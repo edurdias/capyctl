@@ -174,8 +174,8 @@ editing, formatting, tests and staging. The separately modified SDD Task 2 repor
 also remains excluded and untouched by this continuation.
 
 Owner access item: read-only SSH connections to host-a timed out on port22
-at approximately 2026-09-15 11:56 and 12:30 UTC. No remote command executed in
-either attempt. Access remains unavailable from this session; restore reachability
+at approximately 2026-09-15 11:56, 12:30 and 13:26 UTC. No remote command executed
+in any attempt. Access remains unavailable from this session; restore reachability
 before native qualification. These observations do not identify the network or
 host cause. Local implementation continues without remote effects.
 
