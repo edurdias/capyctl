@@ -135,6 +135,25 @@ impl FakeEngine {
             .ok_or(RuntimeError::Unsupported)?
             .cleanup(binding, incarnation, identities, terminate, observed_at_ms)
     }
+    /// Service-owned cleanup samples the configured clock at the actual gone
+    /// observation boundary. A clock failure after control remains uncertain.
+    pub fn qualification_cleanup_observed(
+        &self,
+        binding: &str,
+        incarnation: &str,
+        identities: &[mllm_domain::completion::ProcessIdentity],
+    ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
+        let clock = self
+            .qualification_clock
+            .as_deref()
+            .ok_or(RuntimeError::Unsupported)?;
+        self.qualification
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or(RuntimeError::Unsupported)?
+            .cleanup_with_clock(binding, incarnation, identities, true, clock)
+    }
     pub fn qualification_security_control(
         &self,
         command: &RuntimeCommand,

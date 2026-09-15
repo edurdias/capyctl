@@ -3,6 +3,9 @@ use mllm_adapters::traits::*;
 use mllm_domain::resources::ResourcePhase;
 use std::sync::{atomic::AtomicI64, Mutex};
 
+#[path = "tests_cleanup.rs"]
+mod cleanup;
+
 #[path = "../../tests/qualification_support/fixture.rs"]
 mod fixture;
 
@@ -41,6 +44,8 @@ struct Gate {
     release: Semaphore,
     active: AtomicBool,
     panic: bool,
+    association: Mutex<Option<SharedCoordinatorState>>,
+    lost_reply: AtomicBool,
 }
 impl Gate {
     fn new(panic: bool) -> Arc<Self> {
@@ -51,14 +56,20 @@ impl Gate {
             release: Semaphore::new(0),
             active: AtomicBool::new(false),
             panic,
+            association: Mutex::new(None),
+            lost_reply: AtomicBool::new(false),
         })
     }
     async fn entered(&self) {
-        tokio::time::timeout(Duration::from_secs(10), self.entered.acquire())
+        // Real qualification proof fans out across independent copied stores.
+        // This hang detector is not the service clock or protocol deadline.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), self.entered.acquire())
             .await
-            .unwrap()
+            .unwrap_or_else(|error| panic!("Initialize gate wait {:?}: {error}", started.elapsed()))
             .unwrap()
             .forget();
+        eprintln!("Initialize gate wait: {:?}", started.elapsed());
     }
 }
 struct Active<'a>(&'a AtomicBool);
@@ -78,9 +89,31 @@ impl EngineAdapter for Gate {
         self.active.store(true, Ordering::SeqCst);
         let _active = Active(&self.active);
         let result = self.engine.execute_persisted(command).await;
+        if let (Some(owner), Ok(observation)) = (&*self.association.lock().unwrap(), &result) {
+            let o = owner.lock().unwrap();
+            o.store()
+                .record_owned_launch(
+                    o.session(),
+                    &command.context.token.step_id,
+                    &OwnedLaunchReceipt {
+                        binding_id: observation.binding_id.clone(),
+                        incarnation: observation.incarnation.clone(),
+                        identities: observation.identities.clone(),
+                        observed_at_ms: observation.observed_at_ms,
+                        receipt: observation.receipt.clone(),
+                    },
+                    1900,
+                )
+                .unwrap();
+        }
         self.entered.add_permits(1);
         assert!(!self.panic, "injected adapter panic after effect");
         self.release.acquire().await.unwrap().forget();
+        if self.lost_reply.load(Ordering::SeqCst) {
+            return Err(RuntimeError::Uncertain(
+                "lost Initialize reply after associated launch".into(),
+            ));
+        }
         result
     }
     async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
@@ -128,12 +161,33 @@ fn worker(
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
         options,
-        Arc::new(move |_| Ok(gate.clone())),
+        Arc::new(move |_| Ok(test_driver(gate.clone()))),
     )
     .unwrap()
 }
+fn test_driver(gate: Arc<Gate>) -> Arc<Driver> {
+    let cleanup = gate.clone();
+    Arc::new(Driver {
+        engine: gate,
+        cleanup: Arc::new(move |context| {
+            let gate = cleanup.clone();
+            Box::pin(async move {
+                gate.engine
+                    .qualification_cleanup(
+                        &context.binding_id,
+                        &context.incarnation,
+                        &context.identities,
+                        true,
+                        1900,
+                    )
+                    .map_err(|e| CoordinatorError::Service(e.to_string()))
+            })
+        }),
+    })
+}
 async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let started = std::time::Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let status = worker.status();
             if status != WorkerStatus::Running {
@@ -143,7 +197,9 @@ async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
         }
     })
     .await
-    .unwrap()
+    .unwrap_or_else(|error| panic!("worker status wait {:?}: {error}", started.elapsed()));
+    eprintln!("worker status wait: {:?}", started.elapsed());
+    status
 }
 fn assert_peak(owner: &SharedCoordinatorState, fence: &DeploymentFence) {
     let o = owner.lock().unwrap();
@@ -341,7 +397,7 @@ async fn stale_observation_and_expired_queue_block_without_freeing_endpoint() {
             Arc::new(Observations(observations)),
             Arc::new(move || Ok(clock_read.load(Ordering::SeqCst))),
             CoordinatorOptions::default(),
-            Arc::new(move |_| Ok(driver.clone())),
+            Arc::new(move |_| Ok(test_driver(driver.clone()))),
         )
         .unwrap();
         assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
@@ -444,7 +500,7 @@ async fn current_policy_race_and_observation_timeout_deny_send() {
                 protocol_timeout: Duration::from_millis(200),
                 ..Default::default()
             },
-            Arc::new(move |_| Ok(driver.clone())),
+            Arc::new(move |_| Ok(test_driver(driver.clone()))),
         )
         .unwrap();
         let a = w.start(&fence, 10000).unwrap();
@@ -506,7 +562,7 @@ async fn clock_read_after_validation_preserves_arm_when_freshness_expires() {
         Arc::new(Observations(observations)),
         clock,
         CoordinatorOptions::default(),
-        Arc::new(move |_| Ok(driver.clone())),
+        Arc::new(move |_| Ok(test_driver(driver.clone()))),
     )
     .unwrap();
     let a = w.start(&fence, 10000).unwrap();
@@ -681,7 +737,9 @@ async fn real_elapsed_service_clock_bounds_provenance_before_send() {
     )
     .unwrap();
     let a = w.start(&fence, 30000).unwrap();
-    let status = a.wait(Duration::from_secs(20)).await.unwrap();
+    // Wait for the durable result even when concurrent fixture validation uses
+    // most of its unchanged 30000ms deadline. This is only a caller watchdog.
+    let status = a.wait(Duration::from_secs(60)).await.unwrap();
     eprintln!(
         "owned ordinary real-clock acceptance to observation: {:?}; {status:?}; {:?}",
         started.elapsed(),
@@ -836,7 +894,7 @@ async fn completed_observer_rejects_binding_identity_and_evidence_corruption() {
     .unwrap();
     let a = w.start(&fence, 10000).unwrap();
     assert_eq!(
-        a.wait(Duration::from_secs(20)).await.unwrap(),
+        a.wait(Duration::from_secs(60)).await.unwrap(),
         QualifiedInitializeStatus::Completed
     );
     {

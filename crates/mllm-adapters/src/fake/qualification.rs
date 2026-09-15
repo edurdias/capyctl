@@ -56,6 +56,22 @@ impl QualificationState {
         terminate: bool,
         observed_at_ms: i64,
     ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
+        if observed_at_ms < 0 {
+            return Err(RuntimeError::StaleRevision);
+        }
+        self.cleanup_with_clock(binding, incarnation, identities, terminate, &|| {
+            Ok(observed_at_ms)
+        })
+    }
+
+    pub(super) fn cleanup_with_clock(
+        &mut self,
+        binding: &str,
+        incarnation: &str,
+        identities: &[ProcessIdentity],
+        terminate: bool,
+        clock: &(dyn Fn() -> Result<i64, RuntimeError> + Send + Sync),
+    ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
         let mut expected = identities.to_vec();
         expected.sort();
         let mut actual = self.members.clone();
@@ -66,7 +82,6 @@ impl QualificationState {
             .is_none_or(|(b, i)| b != binding || i != incarnation)
             || actual.len() != 2
             || expected != actual
-            || observed_at_ms < 0
         {
             return Err(RuntimeError::StaleRevision);
         }
@@ -81,6 +96,12 @@ impl QualificationState {
         if self.alive {
             return Err(RuntimeError::Uncertain(
                 "owned Fake members remain alive".into(),
+            ));
+        }
+        let observed_at_ms = clock()?;
+        if observed_at_ms < 0 {
+            return Err(RuntimeError::Uncertain(
+                "cleanup observation clock is negative".into(),
             ));
         }
         Ok(mllm_domain::completion::CleanupEvidence {
@@ -612,6 +633,59 @@ mod tests {
             c.context.token.qualification_id = id.into();
             assert!(QualificationState::default().execute(&c).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_samples_its_own_observation_clock_after_control() {
+        use crate::{fake::FakeEngine, traits::EngineAdapter};
+        use std::sync::{
+            atomic::{AtomicI64, Ordering},
+            Arc,
+        };
+        let now = Arc::new(AtomicI64::new(1300));
+        let clock = now.clone();
+        let engine = FakeEngine::for_qualification_with_clock(Arc::new(move || {
+            Ok(clock.load(Ordering::SeqCst))
+        }));
+        let c = command(RuntimeAction::Initialize, "initialize");
+        let initialized = engine.execute_persisted(&c).await.unwrap();
+        now.store(1700, Ordering::SeqCst);
+        let gone = engine
+            .qualification_cleanup_observed(
+                &initialized.binding_id,
+                &initialized.incarnation,
+                &initialized.identities,
+            )
+            .unwrap();
+        assert_eq!(gone.observed_at_ms, 1700);
+        assert_eq!(gone.identities, initialized.identities);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let failed = FakeEngine::for_qualification_with_clock(Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(1300)
+            } else {
+                Err(RuntimeError::Uncertain("cleanup clock unavailable".into()))
+            }
+        }));
+        let identities = failed.execute_persisted(&c).await.unwrap().identities;
+        assert!(failed
+            .qualification_cleanup_observed(
+                &c.context.binding_id,
+                &c.context.incarnation,
+                &identities
+            )
+            .is_err());
+        // Failure to timestamp is after the control: read-only inspection sees
+        // those exact members gone without another terminate operation.
+        assert!(failed
+            .qualification_cleanup(
+                &c.context.binding_id,
+                &c.context.incarnation,
+                &identities,
+                false,
+                1700
+            )
+            .is_ok());
     }
 
     #[tokio::test]

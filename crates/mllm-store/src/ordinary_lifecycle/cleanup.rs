@@ -7,6 +7,10 @@ use crate::lifecycle::completion::nonempty_receipt;
 use mllm_domain::completion::CleanupEvidence;
 use sha2::{Digest, Sha256};
 
+#[path = "cleanup_worker.rs"]
+mod worker;
+pub use worker::OrdinaryCleanupStatus;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrdinaryCleanupReceipt {
@@ -141,7 +145,10 @@ fn event(
         },
     )
     .map(|_| ())
-    .map_err(resource)
+    .map_err(|error| match error {
+        crate::events::EventWriteError::Sql(error) => LifecycleError::Sql(error),
+        _ => LifecycleError::CorruptStoredData,
+    })
 }
 
 /// Validate immutable source authority without consulting today's qualification policy.
