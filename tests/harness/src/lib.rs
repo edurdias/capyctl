@@ -8,6 +8,7 @@
 //! reference implementation these checks were developed against.
 
 pub mod f2_pressure;
+pub mod f2_monitor;
 
 use mllm_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
