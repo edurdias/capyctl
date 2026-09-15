@@ -10,10 +10,12 @@ readiness checkpoint. No owner decision is currently required.
 | --- | --- | --- |
 | Protected candidate handoff | `49bed60`; consolidated handoff review cleared Critical/Important findings | Native ServerArgs mapping or complete process enrollment |
 | Reviewed placement | `0706d3f`, `bf4b209`; frozen selection and read-only physical UUID/PCI corroboration | Trusted device-policy provisioning or guarded CUDA namespace composition |
-| Checkpoint and selected source preflight | 142 runtime tests; import-free installed preflight recorded in `67299e3` | Installed binary compatibility or whole-package attestation |
+| Checkpoint and selected source preflight | 179 committed runtime tests; installed SGLang/checkpoint/saver source preflights recorded in native startup runbook | Installed binary compatibility or whole-package attestation |
 | Process-group observation | `67299e3`; 31 launcher tests pass | Native role enrollment, no-escape contract, or cleanup authority |
 | Typed controls | `6c78908`; 17 deterministic control tests | Real saver behavior, durable coordinator composition, qualified memory release |
 | Shared forwarding | `2d7c426`; 10 cross-engine contract tests; all 92 adapter tests pass | Durable request settlement, lossless public-router delivery, or live output correctness |
+| Owned controller state | `c551e43`; lock-before-session startup and seven focused tests | Production worker/API cutover or restart reconciliation |
+| Durable snapshot | `359a827`; seven snapshot and ten event tests | Full public snapshot semantics, live observations, or complete writer event coverage |
 
 Adapter all-target Clippy passes with warnings denied. These are CPU/fake-server
 results. They are not Q11 evidence and never set Qualified.

@@ -41,6 +41,11 @@ findings. This does not complete F2B or qualify a native engine.
   provenance around one snapshot call. Its fourteen CPU tests pass. Attach the
   hook to the actual scheduler and install the reviewed binary before native use;
   these checks do not prove allocator routing or whole-process residency.
+  The process-local scheduler bridge now observes after the original
+  `process_input_requests` returns, with one retained request and bounded deadlines.
+  Its thirteen CPU tests pass. This is not a GPU synchronization point; authenticated
+  transport, actual startup attachment, complete enrollment, and durable consumption
+  still remain open.
 - Typed single-effect controls are implemented in `6c78908`, with deterministic
   tests only; production observations and coordinator persistence remain open.
   Complete forwarding, coordinator/API/CLI integration, and F2C
@@ -72,11 +77,20 @@ This is read-only prerequisite evidence, not device-policy provisioning,
 whole-package attestation, live qualification, or durable launch authority.
 The native entrypoint remains closed.
 
+A second immutable helper install, `$HOME/mllm-sglang-f2-runtime-8356c51`,
+contains the committed saver-source and scheduler-bridge helpers. It used the same
+new-directory/no-overwrite procedure. Import-free preflight verified and revalidated
+all nine saver Python files against release `0.0.9.post1` and source archive SHA-256
+`25fd4b691ed3242c3a18b2bef0dbe9de84d2e7068b96a37686a923d55c274f43`.
+All nine selected SGLang sources and closed external-plugin checks also passed.
+The check imported none of `sglang`, `torch`, `transformers`, or `torch_memory_saver`.
+The observer binary patch is still not built/installed, and no model was loaded.
+
 ### Source contract
 
 The local `runtime/sglang_source_preflight.py` now verifies nine selected source
 files and revalidates retained identities without importing the engine. Its
-synthetic CPU tests and the full 156-test runtime suite pass. Production installed
+synthetic CPU tests and the 179-test committed runtime suite pass. Production installed
 root selection and consumption by the guarded startup still remain open; selected
 files do not attest the complete import graph or compiled package.
 

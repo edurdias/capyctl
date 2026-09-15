@@ -1,7 +1,7 @@
 """Protected SGLang candidate startup boundary, using only the standard library.
 
-This module does not yet have a verified pinned ServerArgs/source contract. Real
-startup therefore fails closed before engine import. A descriptor validates
+The pinned helpers are not yet composed into a verified native startup contract.
+Real startup therefore fails closed before engine import. A descriptor validates
 shape and binds private inputs; it does not authorize a launch or qualify memory
 release. The controller retains those obligations.
 """
@@ -257,10 +257,10 @@ def build_launch(argv, descriptor_reader):
 def _verified_native_contract(spec, checkpoint):
     """A pinned source map and real memory-saver observation are mandatory.
 
-    No verified map currently exists in this repository. A caller-supplied
-    assertion, settings.memory_saver=true, or installed module is insufficient.
-    Replacing this denial requires audited pinned-source mapping for every field
-    and a guard proving the selected saver cannot fall back to its no-op class.
+    Source/argument/saver helpers exist, but protected startup, worker enrollment,
+    and service observation are not yet composed. A caller-supplied assertion,
+    settings.memory_saver=true, or installed module is insufficient. Replacing
+    this denial requires the complete audited startup and observation contract.
     """
     raise LaunchError("pinned_source_contract_unavailable")
 
