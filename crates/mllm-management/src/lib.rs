@@ -1,6 +1,6 @@
 //! Preparatory snapshot-only management boundary. Not the complete A3 API.
 //!
-//! No listener, inference routes, mutations, credentials loader or event protocol
+//! No listener, inference routes, mutations or event protocol
 //! is composed here. The trusted service must resolve independent credentials and
 //! mount this router ONLY on its separate loopback (or TLS) management listener.
 use axum::{
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+mod credentials;
 
 /// Hashes only; intentionally neither Debug nor Serialize. This validates token
 /// syntax/distinctness, not randomness or provenance. Inputs MUST come from the

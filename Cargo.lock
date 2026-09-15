@@ -1098,10 +1098,12 @@ name = "mllm-management"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "mllm-store",
  "serde_json",
  "sha2",
  "subtle",
+ "tempfile",
  "tokio",
  "tower",
 ]
