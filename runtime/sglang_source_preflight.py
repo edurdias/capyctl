@@ -68,8 +68,8 @@ def _permissions(parent, leaves):
             _protected(info)
 
 
-def _observe_sources(root, inventory):
-    """Private synthetic fixture seam; no public API accepts an inventory."""
+def _observe_source_directories(root, inventory):
+    """Shared protected source observation; no package identity is assigned here."""
     try:
         _check_platform()
         _check_root(root)
@@ -87,11 +87,16 @@ def _observe_sources(root, inventory):
             observation = _observe(parent, _Manifest(tuple(artifacts)))
             _permissions(parent, leaves)
             records.append((relative, observation))
-        return VerifiedSglangSources(_REVISION, tuple(records), root)
+        return tuple(records)
     except CheckpointPreflightError as error:
         raise SourcePreflightError(error.code) from None
     except OSError as error:
         raise SourcePreflightError(_error_from_os(error)) from None
+
+
+def _observe_sources(root, inventory):
+    """Private synthetic fixture seam; no public API accepts an inventory."""
+    return VerifiedSglangSources(_REVISION, _observe_source_directories(root, inventory), root)
 
 
 def verify_sglang_sources(root):
