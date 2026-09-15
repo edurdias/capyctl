@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_JSON_BYTES: usize = 1 << 20;
 const MAX_IDENTIFIER_BYTES: usize = 256;
+const MAX_OPERATION_FIELD_BYTES: usize = 16 * 1024;
 const UPDATE_METHOD: &str = "PUT";
 const UPDATE_KIND: &str = "host_resource_policy_update";
 
@@ -686,16 +687,27 @@ impl crate::Store {
         if !valid_id(id) {
             return Err(ResourcePolicyError::Invalid);
         }
-        type Row = (
-            String,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-        );
-        let row: Option<Row> = self.conn.query_row("SELECT id,deployment_id,kind,state,error_code,accepted_at,updated_at FROM operations WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+        // The operation and host receipt are one historical observation. Never
+        // mix revisions across separate autocommit reads or allocate unchecked
+        // durable strings before applying the public read boundary's byte cap.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let row = {
+            let mut statement = tx.prepare("SELECT id,deployment_id,kind,state,error_code,accepted_at,updated_at FROM operations WHERE id=?1")?;
+            let mut rows = statement.query([id])?;
+            rows.next()?
+                .map(|r| {
+                    Ok::<_, ResourcePolicyError>((
+                        operation_text(r, 0, MAX_OPERATION_FIELD_BYTES)?,
+                        optional_operation_text(r, 1)?,
+                        operation_text(r, 2, MAX_OPERATION_FIELD_BYTES)?,
+                        operation_text(r, 3, MAX_OPERATION_FIELD_BYTES)?,
+                        optional_operation_text(r, 4)?,
+                        operation_text(r, 5, MAX_OPERATION_FIELD_BYTES)?,
+                        operation_text(r, 6, MAX_OPERATION_FIELD_BYTES)?,
+                    ))
+                })
+                .transpose()?
+        };
         let Some((id, deployment_id, kind, state, error_code, accepted_at, updated_at)) = row
         else {
             return Ok(None);
@@ -707,11 +719,17 @@ impl crate::Store {
             }
             ManagementOperationTarget::Deployment { deployment_id }
         } else if kind == UPDATE_KIND {
-            let receipts: Vec<(String, String)> = self
-                .conn
-                .prepare("SELECT command_scope,response_json FROM command_receipts WHERE operation_id=?1")?
-                .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<Result<_, _>>()?;
+            // Two rows suffice to reject ambiguous provenance. LIMIT also
+            // bounds allocation when many principals reference an operation.
+            let mut statement = tx.prepare("SELECT command_scope,response_json FROM command_receipts WHERE operation_id=?1 LIMIT 2")?;
+            let mut rows = statement.query([&id])?;
+            let mut receipts = Vec::with_capacity(2);
+            while let Some(row) = rows.next()? {
+                receipts.push((
+                    operation_text(row, 0, MAX_OPERATION_FIELD_BYTES)?,
+                    operation_text(row, 1, MAX_JSON_BYTES)?,
+                ));
+            }
             if receipts.len() != 1 {
                 return Err(ResourcePolicyError::CorruptStoredPolicy);
             }
@@ -730,6 +748,7 @@ impl crate::Store {
         } else {
             return Err(ResourcePolicyError::CorruptStoredPolicy);
         };
+        tx.commit()?;
         Ok(Some(ManagementOperation {
             id,
             kind,
@@ -739,6 +758,31 @@ impl crate::Store {
             updated_at,
             target,
         }))
+    }
+}
+fn operation_text(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    max_bytes: usize,
+) -> Result<String, ResourcePolicyError> {
+    let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(column)? else {
+        return Err(ResourcePolicyError::CorruptStoredPolicy);
+    };
+    if bytes.len() > max_bytes {
+        return Err(ResourcePolicyError::CorruptStoredPolicy);
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| ResourcePolicyError::CorruptStoredPolicy)
+}
+fn optional_operation_text(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> Result<Option<String>, ResourcePolicyError> {
+    if matches!(row.get_ref(column)?, rusqlite::types::ValueRef::Null) {
+        Ok(None)
+    } else {
+        operation_text(row, column, MAX_OPERATION_FIELD_BYTES).map(Some)
     }
 }
 fn decode_receipt(json: &str) -> Result<StoredReceipt, ResourcePolicyError> {

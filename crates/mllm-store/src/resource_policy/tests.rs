@@ -274,6 +274,142 @@ fn generic_reader_handles_host_targets_and_legacy_reader_excludes_them() {
 }
 
 #[test]
+fn generic_reader_rejects_oversized_operation_fields() {
+    for column in ["kind", "error_code", "accepted_at", "updated_at"] {
+        let store = crate::Store::open_in_memory().unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        store
+            .import_resource_policy(&session, &host(), &observations(), 11_000)
+            .unwrap();
+        let result = store
+            .update_resource_policy(
+                &session,
+                "alice",
+                "host-a",
+                1,
+                "key",
+                &ResourceControls::from_host(&host()),
+                &observations(),
+                11_000,
+            )
+            .unwrap();
+        // Corrupt an otherwise real accepted operation. Limits count bytes,
+        // not SQLite text characters, and must run before String allocation.
+        store
+            .conn
+            .execute(
+                &format!("UPDATE operations SET {column}=?1 WHERE id=?2"),
+                params!["é".repeat(8_193), result.operation_id],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                store.get_management_operation(&result.operation_id),
+                Err(ResourcePolicyError::CorruptStoredPolicy)
+            ),
+            "oversized {column} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn generic_reader_rejects_oversized_receipt_scope_before_returning_target() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let result = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "key",
+            &ResourceControls::from_host(&host()),
+            &observations(),
+            11_000,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE command_receipts SET command_scope=?1 WHERE operation_id=?2",
+            params!["é".repeat(8_193), result.operation_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+}
+
+#[test]
+fn generic_reader_receipt_boundary_and_ambiguity_leave_no_writes_or_open_transaction() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+    let result = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "key",
+            &ResourceControls::from_host(&host()),
+            &observations(),
+            11_000,
+        )
+        .unwrap();
+    let mut receipt: String = store
+        .conn
+        .query_row(
+            "SELECT response_json FROM command_receipts WHERE operation_id=?1",
+            [&result.operation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    receipt.extend(std::iter::repeat_n(' ', MAX_JSON_BYTES - receipt.len()));
+    store
+        .conn
+        .execute("UPDATE command_receipts SET response_json=?1", [&receipt])
+        .unwrap();
+    let before = store.snapshot().unwrap();
+    assert!(store
+        .get_management_operation(&result.operation_id)
+        .unwrap()
+        .is_some());
+    assert_eq!(store.snapshot().unwrap(), before);
+
+    receipt.push(' ');
+    store
+        .conn
+        .execute("UPDATE command_receipts SET response_json=?1", [&receipt])
+        .unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+    receipt.pop();
+    store
+        .conn
+        .execute("UPDATE command_receipts SET response_json=?1", [&receipt])
+        .unwrap();
+    // Ambiguous provenance must reject, not choose whichever receipt SQLite
+    // visits first. This is corruption injection, never acceptance authority.
+    store.conn.execute("INSERT INTO command_receipts SELECT 'other',command_scope,idempotency_key,request_hash,operation_id,response_json FROM command_receipts", []).unwrap();
+    assert!(matches!(
+        store.get_management_operation(&result.operation_id),
+        Err(ResourcePolicyError::CorruptStoredPolicy)
+    ));
+    assert!(store.get_management_operation("missing").unwrap().is_none());
+    assert!(store.conn.is_autocommit());
+    assert_eq!(store.snapshot().unwrap(), before);
+}
+
+#[test]
 fn failed_receipt_write_rolls_back_policy_epoch_operation_and_event() {
     let store = crate::Store::open_in_memory().unwrap();
     let session = store.begin_coordinator_session().unwrap();
