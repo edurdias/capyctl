@@ -6,8 +6,12 @@ findings. This does not complete F2B or qualify a native engine.
 
 ## Remaining work
 
-- Complete the pinned semantic-to-`ServerArgs` mapping and validate effective values
-  after construction. The frozen descriptor now carries the reviewed host ID,
+- The import-safe `sglang_server_args` mapper now checks 100 explicit native
+  fields plus private/dynamic inputs and resolved graph backends after a guarded
+  constructor call. Wire it only after the constructor's plugin, environment,
+  logging, model/config, and GPU-discovery effects are guarded; remaining
+  auto-resolved backend/page/chunk settings need effective-recipe checks.
+  The frozen descriptor now carries the reviewed host ID,
   hardware fingerprint, logical device selector, and memory domain. Resolve and
   corroborate that selection against the observed physical GPU before any model
   load; a logical selector is not a CUDA index or observed UUID.
