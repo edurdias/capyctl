@@ -16,6 +16,12 @@ not per task. Focused TDD and integration verification continue throughout.
   selected files match the isolated installation and upstream pin without imports.
 - `2c2b491`: bounded coherent historical operation lookup.
 - `8f238c9`: bounded F2C latency summaries with separate failures and timeouts.
+- `d430074`: owned ordinary Fake cleanup through verified durable release.
+
+Scoped Start command receipts now pass root integration verification. Exact
+retries preserve the original operation, joined value and deadline after Ready,
+verified cleanup, replacement and valid session rotation. Historical reads grant
+no execution authority; current resource-policy gates still govern new acceptance.
 
 The owned Fake cleanup worker passes root integration verification. It retains
 the original instance, waits for Initialize to exit,
@@ -24,8 +30,8 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Remaining implementation and verification
 
-1. Add scoped Start command receipts before exposing idempotent management
-   lifecycle actions.
+1. Connect scoped Start receipts to bounded owned worker admission and shutdown
+   ordering before exposing idempotent management lifecycle actions.
 2. Complete ordinary warm lifecycle, sequence/preinitialization, no-spawn
    terminalization, missing-association cleanup and restart reconciliation.
 3. Complete owned candidate execution and API actions/inference, durable router
@@ -42,11 +48,12 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Latest scoped root verification: Store 202, adapters 88, controller 157 and
-management 42 tests pass (489 total), plus all-target Clippy. Controller and
-management used four test threads to bound concurrent fixture load; internal
-race tests remain enabled. The 22 harness tests and 213 Python runtime tests
-passed in their respective slices. These are not native qualification results.
+Latest scoped root verification: Store 202, controller 161 and management 42
+tests pass (405 total), plus three-crate all-target Clippy. Tests used four
+threads to bound concurrent fixture load; internal race tests remain enabled.
+The unchanged adapters' 88 tests passed in the preceding cleanup slice. The 22
+harness tests and 213 Python runtime tests passed in their respective slices.
+These are not native qualification results.
 
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier

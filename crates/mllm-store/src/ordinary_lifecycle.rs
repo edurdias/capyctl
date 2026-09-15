@@ -1,6 +1,8 @@
 //! Qualified Fake cold initialization from a frozen managed configuration.
 pub mod worker;
 pub mod cleanup;
+mod receipt;
+pub use receipt::QualifiedStartReceipt;
 use crate::candidate_creation::initialize::ArmResult;
 use crate::candidate_creation::progression::catalog::qualified_effective;
 use crate::lifecycle::completion::{
@@ -384,10 +386,22 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
+        let accepted = Self::accept_qualified_start_in_transaction(&tx, s, f, now, deadline)?;
+        tx.commit()?;
+        Ok(accepted)
+    }
+
+    fn accept_qualified_start_in_transaction(
+        tx: &Transaction<'_>,
+        s: &CoordinatorSession,
+        f: &DeploymentFence,
+        now: i64,
+        deadline: i64,
+    ) -> Result<QualifiedStart, LifecycleError> {
         let existing: Option<String> = tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=?1 AND r.revision=?2 AND r.generation=?3 AND r.state IN ('queued','running','uncertain') AND o.kind='qualified_initialize'",params![f.deployment_id,f.revision,f.generation],|r|r.get(0)).optional()?;
         if let Some(id) = existing {
-            let (p, _, _) = load(&tx, &id)?;
-            current(&tx, s, &p, false)?;
+            let (p, _, _) = load(tx, &id)?;
+            current(tx, s, &p, false)?;
             return Ok(QualifiedStart {
                 operation_id: p.operation_id,
                 step_id: p.step_id,
@@ -395,9 +409,9 @@ impl crate::Store {
                 joined: true,
             });
         }
-        let (raw, e) = effective(&tx, f)?;
-        let catalog = qualified_effective(&tx, &e, &f.deployment_id)?;
-        let controls = policy(&tx, &e)?.controls;
+        let (raw, e) = effective(tx, f)?;
+        let catalog = qualified_effective(tx, &e, &f.deployment_id)?;
+        let controls = policy(tx, &e)?.controls;
         let outstanding: i64 = tx.query_row(
             "SELECT COUNT(*) FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='qualified_initialize' AND r.state NOT IN ('succeeded','failed')",
             [], |row| row.get(0),
@@ -452,7 +466,7 @@ impl crate::Store {
             };
             match PreparedBinding::prepare_v1(&request) {
                 Ok(binding) => {
-                    insert_prepared_binding(&tx, s, &binding)?;
+                    insert_prepared_binding(tx, s, &binding)?;
                     reserved = Some(binding);
                     break;
                 }
@@ -484,15 +498,14 @@ impl crate::Store {
             execution: None,
         };
         tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'qualified_initialize','pending')",params![operation_id,f.deployment_id])?;
-        crate::lifecycle::insert_candidate_initialize_run(&tx, s, f, &operation_id, deadline)?;
+        crate::lifecycle::insert_candidate_initialize_run(tx, s, f, &operation_id, deadline)?;
         tx.execute("INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) VALUES(?1,?2,?3,?4)",params![f.deployment_id,operation_id,f.revision,f.generation])?;
         tx.execute("INSERT INTO lifecycle_steps(id,operation_id,ordinal,deployment_id,binding_id,session_id,state,step_json) VALUES(?1,?2,0,?3,?4,?5,'planned',?6)",params![step_id,operation_id,f.deployment_id,binding_id,s.id(),encode(&p)?])?;
         tx.execute(
             "UPDATE deployments SET desired_state='ready',admission_enabled=1 WHERE id=?1",
             [&f.deployment_id],
         )?;
-        event(&tx, s, &p, Transition::Accepted, None)?;
-        tx.commit()?;
+        event(tx, s, &p, Transition::Accepted, None)?;
         Ok(QualifiedStart {
             operation_id,
             step_id,
@@ -813,5 +826,8 @@ fn event(
         },
     )
     .map(|_| ())
-    .map_err(resource)
+    .map_err(|error| match error {
+        crate::events::EventWriteError::Sql(error) => LifecycleError::Sql(error),
+        _ => LifecycleError::CorruptStoredData,
+    })
 }
