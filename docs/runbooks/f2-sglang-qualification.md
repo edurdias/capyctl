@@ -10,16 +10,17 @@ readiness checkpoint. No owner decision is currently required.
 | --- | --- | --- |
 | Protected candidate handoff | `49bed60`; consolidated handoff review cleared Critical/Important findings | Native ServerArgs mapping or complete process enrollment |
 | Reviewed placement | `0706d3f`, `bf4b209`; frozen selection and read-only physical UUID/PCI corroboration | Trusted device-policy provisioning or guarded CUDA namespace composition |
-| Checkpoint and selected source preflight | 208 committed runtime tests, including the protected scheduler observation listener; installed preflights recorded in native startup runbook | Installed binary compatibility or whole-package attestation |
+| Checkpoint, selected source preflight and child guards | 212 committed runtime tests, including protected scheduler listener and pre-unpickle child guards; twelve startup-guard tests also pass in the isolated Spark environment | Installed binary compatibility, complete native startup or whole-package attestation |
 | Process-group observation | `67299e3`; 31 launcher tests pass | Native role enrollment, no-escape contract, or cleanup authority |
 | Typed controls | `6c78908`; 17 deterministic control tests | Real saver behavior, durable coordinator composition, qualified memory release |
 | Shared asynchronous forwarding | `d335d37`; 13 cross-engine contract tests, all 95 adapter and 25 router tests pass | Durable request settlement, global buffer admission, or live output correctness |
 | Owned controller state | `c551e43`; lock-before-session startup and seven focused tests | Production worker/API cutover or restart reconciliation |
 | Durable snapshot | `359a827`; seven snapshot and ten event tests | Full public snapshot semantics, live observations, or complete writer event coverage |
-| Management authentication and SSE | `b2db142`, `6f8baea`, `dcb3265`, `5be054e`; 28 tests cover protected credentials, bounded authenticated snapshots/events, replay and qualified lifecycle projection | Listener/CLI composition, complete public projection, or mutation handlers |
+| Management authentication and SSE | `b2db142`, `6f8baea`, `dcb3265`, `5be054e`, `3f24b70`; 28 tests cover protected credentials, bounded authenticated snapshots/events, replay and all five qualified Initialize projections | Listener/CLI composition or complete public projection |
 | Scheduler observation connection | `afe5b2b`, `4f9f180`; bounded Rust client, protected Python listener, actual cross-language transport test | Scheduler startup attachment, native allocation truth, or qualification |
-| Stopped managed configuration | `06dbb78`; thirteen acceptance tests and twelve event regressions pass | Activation, qualified runtime construction, or public command composition |
-| Current policy and historical retries | `294bfe3`; config all-target and 196 Store tests pass | Service composition, ordinary lifecycle authority, or retroactive changes to old receipt formats |
+| Stopped managed configuration | `06dbb78`, `c2d3a7b`; authenticated create/replace commands share owned Store/session; all 38 management tests and all-target Clippy pass | Activation, lifecycle actions or complete public command composition |
+| Current policy and historical retries | `294bfe3`, `c2d3a7b`; stopped HTTP commands compose current controls and preserve accepted historical retries | Lifecycle command composition or retroactive changes to old receipt formats |
+| Ordinary Qualified Fake initialization | `3f24b70`; atomic acceptance/arm/owned association/Ready, uncertainty retention and scoped provenance reuse; 551 combined tests and five-crate all-target Clippy pass | Owned worker completion, warm lifecycle, ordinary cleanup, recovery or native qualification |
 
 Adapter all-target Clippy passes with warnings denied. These are CPU/fake-server
 results. They are not Q11 evidence and never set Qualified.

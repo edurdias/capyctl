@@ -30,8 +30,9 @@ findings. This does not complete F2B or qualify a native engine.
   unpickling; a scheduler target-function guard alone would be too late. This
   requires retaining the protected script as the actual main path and using
   `spawn`; alternate main-module, fork and forkserver paths are not covered.
-  The full local CPU runtime suite passes all 212 tests. These changes are not
-  installed on host-a yet and do not authorize native startup.
+  The full local CPU runtime suite passes all 212 tests. The protected `c17819e`
+  helper install on host-a passes all twelve startup-guard tests under its
+  isolated Python 3.12.3, including real spawn. This does not authorize native startup.
   API preimport composition and enforcement of this native spawn topology remain
   open. Source preflight now covers both pinned
   plugin/platform initializers. Trusted package metadata/search paths and disabled
@@ -104,6 +105,16 @@ all nine saver Python files against release `0.0.9.post1` and source archive SHA
 All nine selected SGLang sources and closed external-plugin checks also passed.
 The check imported none of `sglang`, `torch`, `transformers`, or `torch_memory_saver`.
 The observer binary patch is still not built/installed, and no model was loaded.
+
+A third immutable helper install, `$HOME/mllm-sglang-f2-runtime-c17819e`,
+contains the spawn-preparation guard and prior committed runtime helpers. The
+mode-0700 destination was checked absent and created without overwriting either
+older installation. A read-only inspection of the isolated Python 3.12.3 confirms
+that spawn prepares the main script before unpickling the Process. All twelve
+startup-guard tests then passed on that interpreter, including real subprocess
+argument imports and pre-import plugin rejection. No native package was imported,
+no observer binary was built, no model was loaded, and no existing environment or
+driver was changed. Full runtime verification on the local host passed 212 tests.
 
 ### Source contract
 
