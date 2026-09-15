@@ -12,6 +12,7 @@ pub mod f2_monitor;
 pub mod f2_metrics;
 pub mod f2_correctness;
 pub mod f2_collected;
+pub mod f2_streamed;
 pub mod f2_timing;
 pub mod f2_records;
 #[cfg(target_os = "linux")]

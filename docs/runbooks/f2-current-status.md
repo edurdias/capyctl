@@ -29,6 +29,7 @@ not per task. Focused TDD and integration verification continue throughout.
 - `f40abd1`: explicit Stop for never-armed Initialize without runtime cleanup.
 - `c0a07dd`: bounded metadata-only request journals.
 - `e11c3de`: private descriptor-relative artifact storage with a shared byte cap.
+- `861a3ad`: bounded collected JSON marker response validation.
 
 Expired, never-armed ordinary Fake Initialize requests now terminalize atomically.
 The worker proves absence of execution, grants, ownership and runtime identities
@@ -49,6 +50,13 @@ parent descriptor. Writers share an at-most100-MiB payload cap and stop on failu
 partial evidence is retained. Each file requires explicit sync. These helpers do
 not validate a run manifest, prove route identity, authorize effects or complete
 the API-driven runner.
+
+Collected JSON and decoded streaming data events now have bounded marker checks.
+They validate the served model, one choice, exact ordered content and natural stop;
+streaming also requires one terminal event. Malformed envelopes and alternative
+output fail closed without response text in diagnostics. Streaming checks accept
+already-decoded data events, not raw SSE bytes, and reject usage-only events.
+Transport framing/completion and binding provenance remain runner obligations.
 
 Owned Fake candidate Initialize and its mandatory Ready probe pass root integration.
 Authenticated run-scoped submission returns the original durable acceptance
@@ -113,8 +121,9 @@ Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The harness at `e11c3de` passes all 49 tests and all-target Clippy, including six
-exact-marker, five timing, seven journal and nine protected-storage tests.
+The harness passes all 64 tests and all-target Clippy, including six exact-marker,
+seven collected JSON, eight streamed-data, five timing, seven journal and nine
+protected-storage tests.
 None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
