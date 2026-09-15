@@ -67,13 +67,45 @@ may overlap and remain separate durations, never an additive latency decompositi
 Missing observations remain absent. The runner must supply actual timestamps and
 keep failed and timed-out requests separate from completed latency samples.
 
-Current full harness verification passes 33 tests and all-target Clippy: ten
-library, eight pressure, four metrics, six correctness and five timing tests.
-No native measurements or engine baselines were collected.
+Collected JSON and streaming data validators now check the served model, one
+choice, ordered marker content and natural stop. Streams additionally require
+exactly one terminal event and reject events after completion. Alternative output,
+malformed envelopes and duplicate fields fail without echoing response text.
+The streaming subset rejects usage-only events.
+
+The bounded SSE framing layer accepts LF/CRLF lines, comments and multiline data
+across arbitrary network splits, including split UTF-8. Unsupported fields, lone
+CR and truncated frames fail. The runner still verifies HTTP status/content type,
+clean transport completion and exact binding provenance.
+
+## Protected artifacts and numerical bounds
+
+Request journals contain only closed outcomes, corpus ordinals and validated
+monotonic durations. No free-text field accepts prompts, responses or credentials.
+Partial writes and byte-limit failures stop the writer without replay or repair.
+
+Descriptor-relative storage creates exclusive mode-0700 run directories and
+mode-0600 fixed artifacts beneath a trusted parent. Writers share an at-most
+100-MiB payload budget. Each file and directory requires explicit sync; dropping
+a writer does not claim durability or delete evidence. These primitives do not
+validate the manifest or establish host identity.
+
+Phase-margin arithmetic computes `peak + max(2 GiB, ceil(peak/4))` with checked
+integer addition. A separate helper finds the smallest whole-GiB ceiling that
+covers all supplied intermediate charged demands, remains within the safe ceiling
+and is strictly below direct-wake demand. No valid interval means this supplied
+case cannot demonstrate Q6, not permission to shrink reservations or headroom.
+Both calculations require trusted attribution and complete ledger/planner inputs
+from their caller; neither grants qualification or changes resource policy.
+
+Latest full harness run: 71 tests and all-target Clippy pass. Three subsequently
+added pressure-ceiling tests pass alongside both margin tests under isolated
+source/test Clippy. That five-test check is not a new full Cargo-suite result.
+No native measurements, engine baselines or qualification results were collected.
 
 ## Remaining gates
 
-The API-driven runner, protected output manifest and metadata bounds, trusted
+The API-driven runner, validated protected output manifest, artifact integration, trusted
 host preflight, run abort/admission composition, correctness-corpus integration, scenario
 execution and Q1–Q11 reporting remain open. Native startup integration, trusted
 allocation/identity evidence and the owned lifecycle/API/CLI cutover remain
