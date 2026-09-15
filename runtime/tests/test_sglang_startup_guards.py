@@ -151,6 +151,92 @@ class StartupGuardsTests(unittest.TestCase):
         ''')
         self.assertEqual(child.returncode, 0, child.stderr)
 
+    def test_spawn_preparation_contains_output_before_process_unpickle(self):
+        # Exercise CPython's actual spawn preparation phase. It runs the main
+        # script before unpickling the Process (and its native argument classes).
+        child = self.child(f'''
+            import multiprocessing.spawn, os
+            os.environ.pop("SGLANG_PLATFORM", None)
+            os.environ.pop("SGLANG_PLUGINS", None)
+            multiprocessing.spawn.prepare({{"init_main_from_path": {str(Path(ROOT, "runtime/sglang_entry.py"))!r}}})
+            assert "sglang" not in sys.modules
+            assert "torch" not in sys.modules
+            os.write(1, b"PRIVATE-AFTER-PREPARATION")
+            os.write(2, b"PRIVATE-ARGUMENT-UNPICKLE")
+        ''')
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual((child.stdout, child.stderr), (b"", b""))
+
+    def test_spawn_preparation_denies_plugins_before_process_unpickle(self):
+        for name in ("SGLANG_PLUGINS", "SGLANG_PLATFORM"):
+            child = self.child(f'''
+                import multiprocessing.spawn, os
+                os.environ[{name!r}] = "PRIVATE-SELECTION"
+                try:
+                    multiprocessing.spawn.prepare({{"init_main_from_path": {str(Path(ROOT, "runtime/sglang_entry.py"))!r}}})
+                except BaseException:
+                    os._exit(73)
+                os._exit(74)
+            ''')
+            self.assertEqual(child.returncode, 73, child.stderr)
+            self.assertEqual((child.stdout, child.stderr), (b"", b""))
+
+    def test_spawn_preparation_denies_installed_plugin_without_loading_target(self):
+        with tempfile.TemporaryDirectory() as root:
+            dist = Path(root, "fixture-1.0.dist-info")
+            dist.mkdir()
+            (dist / "METADATA").write_text("Name: fixture\nVersion: 1.0\n")
+            (dist / "entry_points.txt").write_text(
+                "[sglang.srt.plugins]\nprivate = module_that_must_not_load:run\n")
+            child = self.child(f'''
+                import multiprocessing.spawn, os
+                sys.path.insert(0, {root!r})
+                os.environ.pop("SGLANG_PLATFORM", None)
+                os.environ.pop("SGLANG_PLUGINS", None)
+                try:
+                    multiprocessing.spawn.prepare({{"init_main_from_path": {str(Path(ROOT, "runtime/sglang_entry.py"))!r}}})
+                except BaseException:
+                    os._exit(73 if "module_that_must_not_load" not in sys.modules else 75)
+                os._exit(74)
+            ''')
+            self.assertEqual(child.returncode, 73, child.stderr)
+            self.assertEqual((child.stdout, child.stderr), (b"", b""))
+
+    def test_real_spawn_guards_imports_triggered_by_argument_unpickling(self):
+        for denied in (False, True):
+            with self.subTest(denied=denied), tempfile.TemporaryDirectory() as root:
+                marker = Path(root, "argument-imported")
+                Path(root, "argument_probe.py").write_text(
+                    "import os\nfrom pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('imported')\n"
+                    "os.write(1, b'PRIVATE-UNPICKLE-OUTPUT')\n"
+                    "os.write(2, b'PRIVATE-UNPICKLE-ERROR')\n")
+                child = self.child(f'''
+                    import multiprocessing, os
+                    sys.path.insert(0, {root!r})
+                    os.environ.pop("SGLANG_PLATFORM", None)
+                    os.environ.pop("SGLANG_PLUGINS", None)
+                    if {denied!r}:
+                        os.environ["SGLANG_PLUGINS"] = "PRIVATE-SELECTION"
+                    # The protected wrapper is the actual production main path.
+                    sys.modules["__main__"].__file__ = {str(Path(ROOT, "runtime/sglang_entry.py"))!r}
+                    class DeferredArgument:
+                        def __reduce__(self):
+                            return (__import__, ("argument_probe",))
+                    process = multiprocessing.get_context("spawn").Process(
+                        target=id, args=(DeferredArgument(),))
+                    process.start()
+                    process.join(5)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(2)
+                        raise AssertionError("spawn did not finish")
+                    assert process.exitcode == {1 if denied else 0}, process.exitcode
+                ''')
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual((child.stdout, child.stderr), (b"", b""))
+                self.assertEqual(marker.exists(), not denied)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,8 +15,22 @@ import sys
 
 # The renderer invokes this file under python -I. Resolve our own package from
 # the installed wrapper location, never the current directory or PYTHONPATH.
-if __name__ == "__main__" and not __package__:
+if __name__ in ("__main__", "__mp_main__") and not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# CPython spawn prepares this main script before unpickling the Process object.
+# Native argument classes can import SGLang during that unpickle, before any
+# scheduler/detokenizer target runs. A target-function guard alone is too late.
+# The production launcher must retain this protected script as the main path;
+# alternative spawn/forkserver/main-module paths are not covered by this guard.
+if __name__ == "__mp_main__":
+    try:
+        from runtime.sglang_startup_guards import contain_startup_output, enforce_closed_plugins
+        contain_startup_output()
+        enforce_closed_plugins()
+    except BaseException:
+        # No native/input exception text, including if containment itself fails.
+        raise SystemExit(1) from None
 
 from runtime.checkpoint_preflight import (
     CheckpointPreflightError, verify_checkpoint, revalidate_checkpoint,

@@ -12,6 +12,10 @@ trusted immutable package/code/metadata/search paths (including children). No fi
 network, syslog or explicitly reopened terminal channel is intercepted here.
 Do not enable native file/request/crash logging. Spawned interpreters must run the
 same preimport plugin check; fd 1/2 suppression survives fork and exec by itself.
+The protected sglang_entry script repeats these guards during CPython spawn's
+__mp_main__ preparation, before native Process arguments are unpickled. Keeping
+that exact protected main path and spawn method is a startup composition duty;
+guarding only the scheduler target cannot protect argument-class imports.
 
 Pinned plugin contract fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1:
 plugins.load_plugins_by_group discovers importlib.metadata entry_points for both

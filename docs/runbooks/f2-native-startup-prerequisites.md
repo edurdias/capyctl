@@ -23,8 +23,17 @@ findings. This does not complete F2B or qualify a native engine.
   path recorded below. Bind their identities and installed engine sources to the
   reviewed runtime recipe before use; installation alone grants no launch authority.
 - Startup output containment and closed external-plugin checks are implemented
-  and tested in CPU subprocesses. They still need composition before imports in
-  the API and spawned interpreters. Source preflight now covers both pinned
+  and tested in CPU subprocesses. The protected entry script now repeats output
+  containment and closed-plugin checks when CPython prepares it as `__mp_main__`,
+  before unpickling the Process and its native argument classes. Four new CPU
+  tests include real multiprocessing spawn and an import triggered by argument
+  unpickling; a scheduler target-function guard alone would be too late. This
+  requires retaining the protected script as the actual main path and using
+  `spawn`; alternate main-module, fork and forkserver paths are not covered.
+  The full local CPU runtime suite passes all 212 tests. These changes are not
+  installed on host-a yet and do not authorize native startup.
+  API preimport composition and enforcement of this native spawn topology remain
+  open. Source preflight now covers both pinned
   plugin/platform initializers. Trusted package metadata/search paths and disabled
   alternate native logging channels remain required; these helpers are not a sandbox.
 - Wire the production clock, checkpoint preflight, and credential resolver into
