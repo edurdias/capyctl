@@ -1,11 +1,41 @@
-# Preparatory management read boundary
+# Management reads and owned command submission
 
 This crate implements authenticated `GET /management/v1/snapshot` and optional
 durable SSE at `GET /management/v1/events` through `read_only_router`.
 The response retains `scope: "durable_store_foundation"`: it is historical
 durable state, not complete A3 status, fresh ownership proof or readiness.
-Every other path is absent; other methods are denied. There are no engine,
-coordinator, inference, mutation, CLI or listener integration callbacks.
+Narrow read constructors expose only those routes. Optional constructors compose
+stopped configuration, candidate creation, and owned Start/Stop submission.
+No constructor starts a listener or exposes inference routes.
+
+`lifecycle_router` adds `POST /management/v1/deployments/{id}/actions` to the
+configuration and candidate boundaries. Construct `OwnedActionSource` from a
+`SharedConfigurationSource` and the existing worker's `CoordinatorCommands`;
+construction rejects different owned Store/session authorities. Keep the
+`OwnedCoordinator` owner outside the router for its full application lifetime.
+The source reuses the configured principal and worker clock and never creates
+a session, driver, database connection, or runtime adapter.
+
+Actions require one `Idempotency-Key` header and exactly `expected_revision`,
+`action`, and `deadline_ms`. Revisions and absolute deadlines are positive JSON
+integers. `start` and `stop` use existing qualified Fake lifecycle authority;
+`park`, `suspend`, `resume`, and `undeploy` remain unsupported. Other actions,
+extra fields, duplicate fields, noncanonical ULIDs, and query strings are invalid.
+Stop resolves generation inside its acceptance transaction after exact history
+lookup. No new cleanup authority or support for attached/native targets is added.
+
+Successful submission returns HTTP 202 with only `api_version`, `operation_id`,
+`deployment_id`, `joined`, and decimal-string `revision`. This proves committed
+acceptance; clients observe lifecycle completion separately. Exact historical
+retries retain the original revision/deadline identity after cleanup, replacement,
+or worker shutdown, with a current session. Changed bodies under the same action
+scope/key conflict. A closed worker admits no fresh Start or Stop.
+
+All mutation routes share two command slots, a 1 MiB body limit, a five-second
+body deadline, and a fifteen-second response deadline. Cancellation or response
+timeout retains the slot until started blocking work exits. Retry with the same
+key after an ambiguous response. Narrower constructors acquire no lifecycle
+authority implicitly.
 
 The trusted service must supply independently generated management and inference
 credentials through `ManagementCredentials::from_trusted_resolver`. Both must
@@ -94,5 +124,5 @@ changes. This is not a complete lifecycle audit stream: full visible-transaction
 writer coverage remains parent Task 3 work. The transport does not fill those gaps.
 
 Remaining A3 work: protected service listener and credential-path composition,
-complete snapshot projection and event writer coverage, mutation and operation
+complete snapshot projection and event writer coverage, remaining mutation and operation
 routes, and CLI cutover.

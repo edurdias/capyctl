@@ -1,8 +1,7 @@
 //! Qualified Fake cold initialization from a frozen managed configuration.
-pub mod worker;
 pub mod cleanup;
 mod receipt;
-pub use receipt::QualifiedStartReceipt;
+pub mod worker;
 use crate::candidate_creation::initialize::ArmResult;
 use crate::candidate_creation::progression::catalog::qualified_effective;
 use crate::lifecycle::completion::{
@@ -28,6 +27,7 @@ use mllm_domain::resources::{
     Allocation, DeviceClaim, MemoryLimit, PhaseFootprint, ResourcePhase, Sharing,
 };
 use mllm_scheduler::residency::AdmissionContext;
+pub use receipt::QualifiedStartReceipt;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +151,14 @@ pub(crate) fn is_ordinary(tx: &Transaction<'_>, id: &str) -> Result<bool, Lifecy
     Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='qualified_initialize')", [id], |r| r.get(0))?)
 }
 
+fn check_managed_command_target(tx: &Transaction<'_>, id: &str) -> Result<(), LifecycleError> {
+    let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments d JOIN operations o ON o.deployment_id=d.id WHERE d.id=?1 AND d.kind='model' AND o.kind='managed_configuration_create' AND o.state='succeeded') AND NOT EXISTS(SELECT 1 FROM qualification_runs WHERE deployment_id=?1)", [id], |r| r.get(0))?;
+    if !managed {
+        return Err(LifecycleError::Unsupported);
+    }
+    Ok(())
+}
+
 fn effective(
     tx: &Transaction<'_>,
     fence: &DeploymentFence,
@@ -189,11 +197,26 @@ fn policy(
     tx: &Transaction<'_>,
     effective: &EffectiveDeployment,
 ) -> Result<ResourcePolicySnapshot, LifecycleError> {
+    policy_checked(tx, effective, false)
+}
+fn policy_checked(
+    tx: &Transaction<'_>,
+    effective: &EffectiveDeployment,
+    detailed: bool,
+) -> Result<ResourcePolicySnapshot, LifecycleError> {
     let policy = read_singleton_policy(tx, &effective.host.name)
         .map_err(resource)?
-        .ok_or(LifecycleError::Conflict)?;
+        .ok_or(if detailed {
+            LifecycleError::ReconciliationRequired
+        } else {
+            LifecycleError::Conflict
+        })?;
     if policy.context != ResourceContext::from_host(&effective.host) {
-        return Err(LifecycleError::Conflict);
+        return Err(if detailed {
+            LifecycleError::ReconciliationRequired
+        } else {
+            LifecycleError::Conflict
+        });
     }
     policy
         .controls
@@ -208,7 +231,11 @@ fn policy(
         if selected.sharing == mllm_config::effective::Sharing::Shared
             && (*sharing != selected.sharing || policy.controls.device_sharing != selected.sharing)
         {
-            return Err(LifecycleError::Conflict);
+            return Err(if detailed {
+                LifecycleError::HostPolicyDenied
+            } else {
+                LifecycleError::Conflict
+            });
         }
     }
     Ok(policy)
@@ -386,7 +413,8 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let accepted = Self::accept_qualified_start_in_transaction(&tx, s, f, now, deadline)?;
+        let accepted =
+            Self::accept_qualified_start_in_transaction(&tx, s, f, now, deadline, false)?;
         tx.commit()?;
         Ok(accepted)
     }
@@ -397,6 +425,7 @@ impl crate::Store {
         f: &DeploymentFence,
         now: i64,
         deadline: i64,
+        detailed: bool,
     ) -> Result<QualifiedStart, LifecycleError> {
         let existing: Option<String> = tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=?1 AND r.revision=?2 AND r.generation=?3 AND r.state IN ('queued','running','uncertain') AND o.kind='qualified_initialize'",params![f.deployment_id,f.revision,f.generation],|r|r.get(0)).optional()?;
         if let Some(id) = existing {
@@ -409,14 +438,26 @@ impl crate::Store {
                 joined: true,
             });
         }
+        if detailed {
+            check_managed_command_target(tx, &f.deployment_id)?;
+        }
         let (raw, e) = effective(tx, f)?;
-        let catalog = qualified_effective(tx, &e, &f.deployment_id)?;
-        let controls = policy(tx, &e)?.controls;
+        let catalog =
+            qualified_effective(tx, &e, &f.deployment_id).map_err(|error| match error {
+                LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
+                    LifecycleError::Unsupported
+                }
+                error => error,
+            })?;
+        let controls = policy_checked(tx, &e, detailed)?.controls;
         let outstanding: i64 = tx.query_row(
             "SELECT COUNT(*) FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='qualified_initialize' AND r.state NOT IN ('succeeded','failed')",
             [], |row| row.get(0),
         )?;
         if outstanding >= i64::from(controls.queue.max_pending_total) {
+            if detailed {
+                return Err(LifecycleError::QueueFull);
+            }
             return Err(LifecycleError::Rejected(
                 "qualified initialization queue full".into(),
             ));
@@ -429,6 +470,12 @@ impl crate::Store {
         }
         let stopped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND name=?4 AND kind='model' AND desired_state='stopped' AND observed_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0 AND suspended=0) AND NOT EXISTS(SELECT 1 FROM runtime_bindings WHERE deployment_id=?1 AND state!='released') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1) AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1) AND NOT EXISTS(SELECT 1 FROM resource_owners WHERE owner_id=?1) AND NOT EXISTS(SELECT 1 FROM lifecycle_runs WHERE deployment_id=?1 AND state NOT IN ('succeeded','failed'))", params![f.deployment_id,f.revision,f.generation,e.name],|r|r.get(0))?;
         if !stopped {
+            if detailed {
+                let retained: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE deployment_id=?1 AND state!='released') OR EXISTS(SELECT 1 FROM resource_owners WHERE owner_id=?1) OR EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1)", [&f.deployment_id], |r| r.get(0))?;
+                if retained {
+                    return Err(LifecycleError::RuntimeRetained);
+                }
+            }
             return Err(LifecycleError::Conflict);
         }
         let operation_id = ulid::Ulid::new().to_string();
@@ -474,7 +521,11 @@ impl crate::Store {
                 Err(error) => return Err(error),
             }
         }
-        let _reservation = reserved.ok_or(LifecycleError::Conflict)?;
+        let _reservation = reserved.ok_or(if detailed {
+            LifecycleError::CapacityBlocked
+        } else {
+            LifecycleError::Conflict
+        })?;
         let binding_json = tx.query_row(
             "SELECT binding_json FROM runtime_bindings WHERE id=?1",
             [&binding_id],

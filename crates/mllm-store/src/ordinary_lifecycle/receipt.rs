@@ -107,7 +107,7 @@ fn accepted_identity(p: &Plan, joined: bool) -> Result<String, LifecycleError> {
     ))
 }
 
-fn historical_error(error: LifecycleError) -> LifecycleError {
+pub(super) fn historical_error(error: LifecycleError) -> LifecycleError {
     match error {
         LifecycleError::Sql(rusqlite::Error::QueryReturnedNoRows) => {
             LifecycleError::CorruptStoredData
@@ -117,7 +117,7 @@ fn historical_error(error: LifecycleError) -> LifecycleError {
     }
 }
 
-fn bounded_text(
+pub(super) fn bounded_text(
     row: &rusqlite::Row<'_>,
     column: usize,
     max_bytes: usize,
@@ -238,7 +238,7 @@ fn lookup_in_transaction(
     };
     if let Some((old_hash, operation, raw)) = prior {
         if old_hash != request_hash {
-            return Err(LifecycleError::Conflict);
+            return Err(LifecycleError::IdempotencyConflict);
         }
         let stored: StoredReceipt = decode(&raw)?;
         if stored.version != 1
@@ -261,7 +261,7 @@ fn lookup_in_transaction(
     Ok(None)
 }
 
-fn check_request(
+pub(super) fn check_request(
     principal: &str,
     deployment: &str,
     expected_revision: i64,
@@ -347,25 +347,14 @@ impl crate::Store {
         if requested_deadline <= now {
             return Err(LifecycleError::Invalid);
         }
-        let generation = tx
-            .query_row(
-                "SELECT current_generation FROM deployments WHERE id=?1 AND revision=?2",
-                params![deployment, expected_revision],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or(LifecycleError::Conflict)?;
-        let fence = DeploymentFence {
-            deployment_id: deployment.into(),
-            revision: expected_revision,
-            generation,
-        };
+        let fence = command_fence(&tx, deployment, expected_revision)?;
         let accepted = Self::accept_qualified_start_in_transaction(
             &tx,
             session,
             &fence,
             now,
             requested_deadline,
+            true,
         )?;
         let p = historical_plan(&tx, &accepted.step_id)?;
         let receipt = QualifiedStartReceipt::from_plan(&p, accepted.joined);
@@ -386,4 +375,27 @@ impl crate::Store {
         tx.commit()?;
         Ok(receipt)
     }
+}
+
+pub(super) fn command_fence(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    expected_revision: i64,
+) -> Result<DeploymentFence, LifecycleError> {
+    let (revision, generation): (i64, i64) = tx
+        .query_row(
+            "SELECT revision,current_generation FROM deployments WHERE id=?1",
+            [deployment],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or(LifecycleError::NotFound)?;
+    if revision != expected_revision {
+        return Err(LifecycleError::RevisionConflict);
+    }
+    Ok(DeploymentFence {
+        deployment_id: deployment.into(),
+        revision,
+        generation,
+    })
 }

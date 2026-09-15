@@ -43,12 +43,19 @@ pub enum ConfigurationFailure {
     ReconciliationRequired,
     HostPolicyDenied,
     CapacityBlocked,
+    LifecycleConflict,
     Internal,
 }
 impl ConfigurationFailure {
     pub(crate) fn response(self) -> Response {
         use ConfigurationFailure::*;
         let (status, code, message, retryable) = match self {
+            LifecycleConflict => (
+                StatusCode::CONFLICT,
+                "lifecycle_conflict",
+                "Lifecycle state does not permit this action",
+                false,
+            ),
             InvalidRequest => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -82,7 +89,7 @@ impl ConfigurationFailure {
             Unsupported => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unsupported_capability",
-                "Activation is not available on this configuration boundary",
+                "Requested capability is unavailable",
                 false,
             ),
             NotFound => (
@@ -130,13 +137,13 @@ impl ConfigurationFailure {
             HostPolicyDenied => (
                 StatusCode::FORBIDDEN,
                 "host_policy_denied",
-                "Host policy denies candidate qualification",
+                "Host policy denies this command",
                 false,
             ),
             CapacityBlocked => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "capacity_blocked",
-                "Candidate endpoint capacity is unavailable",
+                "Endpoint capacity is unavailable",
                 true,
             ),
         };
@@ -188,6 +195,12 @@ pub struct SharedConfigurationSource {
     principal: String,
 }
 impl SharedConfigurationSource {
+    pub(crate) fn owned_state(&self) -> &Arc<Mutex<OwnedCoordinatorState>> {
+        &self.state
+    }
+    pub(crate) fn principal(&self) -> &str {
+        &self.principal
+    }
     pub fn new(
         state: Arc<Mutex<OwnedCoordinatorState>>,
         trusted_host: Value,

@@ -1,7 +1,8 @@
 //! Preparatory management boundaries. Not the complete A3 API.
 //!
-//! Optional mutations accept stopped configurations and candidate runs. No listener, inference
-//! routes or activation are composed here. The trusted service must resolve independent credentials and
+//! Optional mutations accept stopped configurations, candidate runs, and owned
+//! Start/Stop commands. No listener or inference routes are composed here.
+//! The trusted service must resolve independent credentials and
 //! mount this router ONLY on its separate loopback (or TLS) management listener.
 use axum::{
     extract::{Request, State},
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+pub mod actions;
 pub mod candidates;
 pub mod configuration;
 mod credentials;
@@ -100,6 +102,7 @@ struct AppState {
     event_options: events::EventStreamOptions,
     configuration: Option<Arc<dyn configuration::ConfigurationSource>>,
     candidates: Option<Arc<dyn candidates::CandidateSource>>,
+    actions: Option<Arc<dyn actions::ActionSource>>,
     commands_in_flight: Arc<Semaphore>,
 }
 
@@ -118,6 +121,7 @@ pub fn snapshot_router(
         event_options: events::EventStreamOptions::default(),
         configuration: None,
         candidates: None,
+        actions: None,
         commands_in_flight: Arc::new(Semaphore::new(0)),
     });
     routes(state, false)
@@ -149,6 +153,7 @@ pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSour
         event_options: options,
         configuration: None,
         candidates: None,
+        actions: None,
         commands_in_flight: Arc::new(Semaphore::new(0)),
     });
     Ok(routes(state, true))
@@ -172,6 +177,7 @@ pub fn configuration_router<
         event_options: options,
         configuration: Some(source),
         candidates: None,
+        actions: None,
         commands_in_flight: Arc::new(Semaphore::new(2)),
     });
     routes(state, true)
@@ -199,6 +205,31 @@ pub fn candidate_acceptance_router<
             event_options: options,
             configuration: Some(source.clone()),
             candidates: Some(source),
+            actions: None,
+            commands_in_flight: Arc::new(Semaphore::new(2)),
+        }),
+        true,
+    )
+}
+
+/// Compose Start/Stop explicitly with the same owned snapshot, configuration and
+/// candidate authority. The service must retain OwnedCoordinator outside this router.
+pub fn lifecycle_router(
+    credentials: ManagementCredentials,
+    source: Arc<actions::OwnedActionSource>,
+) -> Router {
+    let options = events::EventStreamOptions::default();
+    routes(
+        Arc::new(AppState {
+            credentials,
+            source: source.clone(),
+            reads: Arc::new(Semaphore::new(2)),
+            events: Some(source.clone()),
+            streams: Arc::new(Semaphore::new(options.max_streams)),
+            event_options: options,
+            configuration: Some(source.clone()),
+            candidates: Some(source.clone()),
+            actions: Some(source),
             commands_in_flight: Arc::new(Semaphore::new(2)),
         }),
         true,
@@ -207,6 +238,14 @@ pub fn candidate_acceptance_router<
 
 fn routes(state: Arc<AppState>, include_events: bool) -> Router {
     let router = Router::new().route("/management/v1/snapshot", get(snapshot).head(method_denied));
+    let router = if state.actions.is_some() {
+        router.route(
+            "/management/v1/deployments/{id}/actions",
+            axum::routing::post(actions::accept),
+        )
+    } else {
+        router
+    };
     let router = if include_events {
         router.route(
             "/management/v1/events",

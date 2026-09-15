@@ -127,7 +127,7 @@ fn event(
     transition: OrdinaryCleanupTransition,
     epoch: Option<u64>,
 ) -> Result<(), LifecycleError> {
-    use crate::events::{EventMetadata, EventOperationId, append_event};
+    use crate::events::{append_event, EventMetadata, EventOperationId};
     let id = |v: &str| {
         v.parse()
             .map(EventOperationId::generated)
@@ -485,6 +485,72 @@ fn retained(
 }
 
 impl crate::Store {
+    /// Observation-only exact history, checked before current worker admission.
+    pub fn ordinary_stop_command_receipt(
+        &self,
+        s: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        revision: i64,
+        key: &str,
+        deadline: i64,
+    ) -> Result<Option<OrdinaryCleanupReceipt>, LifecycleError> {
+        super::receipt::check_request(principal, deployment, revision, key, deadline)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        lookup(
+            &tx,
+            principal,
+            &DeploymentFence {
+                deployment_id: deployment.into(),
+                revision,
+                generation: 0,
+            },
+            key,
+            deadline,
+        )
+    }
+
+    /// Resolve generation in the same acceptance transaction, after receipt lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_ordinary_stop_command(
+        &self,
+        s: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        revision: i64,
+        key: &str,
+        now: i64,
+        deadline: i64,
+    ) -> Result<OrdinaryCleanupReceipt, LifecycleError> {
+        super::receipt::check_request(principal, deployment, revision, key, deadline)?;
+        if now < 0 {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, s)?;
+        if let Some(receipt) = lookup(
+            &tx,
+            principal,
+            &DeploymentFence {
+                deployment_id: deployment.into(),
+                revision,
+                generation: 0,
+            },
+            key,
+            deadline,
+        )? {
+            return Ok(receipt);
+        }
+        let fence = super::receipt::command_fence(&tx, deployment, revision)?;
+        super::check_managed_command_target(&tx, deployment)?;
+        let receipt = Self::accept_ordinary_cleanup_in_transaction(
+            &tx, s, principal, &fence, key, now, deadline,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
     /// Exact receipts replay independently of the service-resolved generation.
     /// Separate keys cannot join retained cleanup. No prior-session adoption.
     pub fn accept_ordinary_cleanup(
@@ -508,24 +574,36 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        let request_hash = hash(principal, f, deadline)?;
-        let prior:Option<(String,String)>=tx.query_row("SELECT request_hash,response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",params![principal,scope(&f.deployment_id),key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        if let Some((old, raw)) = prior {
-            if old != request_hash {
-                return Err(LifecycleError::Conflict);
-            }
-            let receipt: OrdinaryCleanupReceipt = decode(&raw)?;
-            let (p, _, _) = read(&tx, &receipt.step_id)?;
-            if p.receipt != receipt {
-                return Err(LifecycleError::CorruptStoredData);
-            }
+        if let Some(receipt) =
+            lookup(&tx, principal, f, key, deadline).map_err(|error| match error {
+                LifecycleError::IdempotencyConflict => LifecycleError::Conflict,
+                error => error,
+            })?
+        {
             return Ok(receipt);
         }
+        let receipt =
+            Self::accept_ordinary_cleanup_in_transaction(&tx, s, principal, f, key, now, deadline)?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_ordinary_cleanup_in_transaction(
+        tx: &Transaction<'_>,
+        s: &CoordinatorSession,
+        principal: &str,
+        f: &DeploymentFence,
+        key: &str,
+        now: i64,
+        deadline: i64,
+    ) -> Result<OrdinaryCleanupReceipt, LifecycleError> {
+        let request_hash = hash(principal, f, deadline)?;
         let (raw,state):(String,String)=tx.query_row("SELECT s.step_json,s.state FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND o.kind='qualified_initialize' AND b.state!='released'",[&f.deployment_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?.ok_or(LifecycleError::Conflict)?;
         let original: Plan = decode(&raw)?;
-        let e = source(&tx, &original)?;
-        super::validate_local(&tx, &original, &e, &state)?;
-        super::current(&tx, s, &original, state == "completed")?;
+        let e = source(tx, &original)?;
+        super::validate_local(tx, &original, &e, &state)?;
+        super::current(tx, s, &original, state == "completed")?;
         if original.fence() != *f
             || deadline <= now
             || now < original.accepted_at_ms
@@ -535,11 +613,11 @@ impl crate::Store {
         {
             return Err(LifecycleError::Conflict);
         }
-        let association = super::association(&tx, &original)?.ok_or(LifecycleError::Conflict)?;
-        let next = Self::fence_lifecycle_in_transaction(&tx, s, f, false)?;
+        let association = super::association(tx, &original)?.ok_or(LifecycleError::Conflict)?;
+        let next = Self::fence_lifecycle_in_transaction(tx, s, f, false)?;
         let operation = ulid::Ulid::new().to_string();
         crate::lifecycle::insert_owned_cleanup_run(
-            &tx,
+            tx,
             s,
             &next,
             &operation,
@@ -550,7 +628,7 @@ impl crate::Store {
             tx.execute("INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) VALUES(?1,?2,?3,?4)",params![f.deployment_id,operation,next.revision,next.generation])?;
         } else {
             Self::handoff_claims_in_transaction(
-                &tx,
+                tx,
                 s,
                 &operation,
                 &original.operation_id,
@@ -584,9 +662,8 @@ impl crate::Store {
             "UPDATE deployments SET admission_enabled=0 WHERE id=?1",
             [&f.deployment_id],
         )?;
-        read(&tx, &receipt.step_id)?;
-        event(&tx, s, &p, OrdinaryCleanupTransition::Accepted, None)?;
-        tx.commit()?;
+        read(tx, &receipt.step_id)?;
+        event(tx, s, &p, OrdinaryCleanupTransition::Accepted, None)?;
         Ok(receipt)
     }
 
@@ -631,6 +708,48 @@ impl crate::Store {
         tx.commit()?;
         Ok((ArmResult::New { step_id: id.into() }, Some(context)))
     }
+}
+
+fn lookup(
+    tx: &Transaction<'_>,
+    principal: &str,
+    f: &DeploymentFence,
+    key: &str,
+    deadline: i64,
+) -> Result<Option<OrdinaryCleanupReceipt>, LifecycleError> {
+    let request_hash = hash(principal, f, deadline)?;
+    let prior = {
+        let mut statement = tx.prepare("SELECT request_hash,operation_id,response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3")?;
+        let mut rows = statement.query(params![principal, scope(&f.deployment_id), key])?;
+        rows.next()?
+            .map(|row| {
+                Ok::<_, LifecycleError>((
+                    super::receipt::bounded_text(row, 0, 64)?,
+                    super::receipt::bounded_text(row, 1, 26)?,
+                    super::receipt::bounded_text(row, 2, 1 << 20)?,
+                ))
+            })
+            .transpose()?
+    };
+    let Some((old, operation, raw)) = prior else {
+        return Ok(None);
+    };
+    if old != request_hash {
+        return Err(LifecycleError::IdempotencyConflict);
+    }
+    let receipt: OrdinaryCleanupReceipt = decode(&raw)?;
+    let (p, _, _) = read(tx, &receipt.step_id).map_err(super::receipt::historical_error)?;
+    if p.receipt != receipt
+        || receipt.operation_id != operation
+        || receipt.deadline_ms != deadline
+        || p.source.deployment_id != f.deployment_id
+        || p.source.revision != f.revision
+        || p.principal != principal
+        || p.key != key
+    {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    Ok(Some(receipt))
 }
 
 pub(crate) fn complete(

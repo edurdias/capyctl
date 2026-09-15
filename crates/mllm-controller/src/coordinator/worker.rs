@@ -130,6 +130,73 @@ pub enum CoordinatorCommandError {
 }
 
 impl CoordinatorCommands {
+    /// Verify composition uses the worker's exact owned Store and session.
+    pub fn shares_state(&self, state: &SharedCoordinatorState) -> bool {
+        Arc::ptr_eq(&self.shared.owner, state)
+    }
+
+    /// Commit Stop using a service-resolved generation. History is observation only.
+    pub fn stop(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<OrdinaryCleanupReceipt, CoordinatorCommandError> {
+        let _permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        let store_error = |error: LifecycleError| {
+            if matches!(
+                error,
+                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+            ) {
+                self.shared.fail_locked(&owner, error.to_string());
+            }
+            CoordinatorCommandError::Lifecycle(error)
+        };
+        if let Some(receipt) = owner
+            .store()
+            .ordinary_stop_command_receipt(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                requested_deadline_ms,
+            )
+            .map_err(store_error)?
+        {
+            return Ok(receipt);
+        }
+        if !self.shared.accepting.load(Ordering::Acquire) {
+            return Err(CoordinatorError::Stopped("worker is not admitting cleanup".into()).into());
+        }
+        let receipt = owner
+            .store()
+            .accept_ordinary_stop_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                (self.shared.clock)()?,
+                requested_deadline_ms,
+            )
+            .map_err(store_error)?;
+        drop(owner);
+        self.shared.wake.notify_one();
+        Ok(receipt)
+    }
+
     /// Accept a scoped command and return observation-only committed history.
     /// Principal authentication belongs to the trusted service caller.
     pub fn start(

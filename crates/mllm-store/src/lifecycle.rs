@@ -3,7 +3,7 @@ use std::net::TcpListener;
 pub(crate) mod completion;
 
 use mllm_domain::completion::ProcessIdentity;
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch::CoordinatorSession;
@@ -195,7 +195,14 @@ pub(crate) fn insert_candidate_cleanup_run(
     operation: &str,
     deadline: i64,
 ) -> Result<(), LifecycleError> {
-    insert_owned_cleanup_run(tx, session, target, operation, deadline, "candidate_cleanup")
+    insert_owned_cleanup_run(
+        tx,
+        session,
+        target,
+        operation,
+        deadline,
+        "candidate_cleanup",
+    )
 }
 
 pub(crate) fn insert_owned_cleanup_run(
@@ -219,7 +226,10 @@ pub(crate) fn insert_owned_cleanup_run(
         cleanup_target: Some(target.deployment_id.clone()),
         handoffs: vec![],
     })?;
-    tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,?3,'pending')",params![operation,target.deployment_id,kind])?;
+    tx.execute(
+        "INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,?3,'pending')",
+        params![operation, target.deployment_id, kind],
+    )?;
     tx.execute("INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) VALUES(?1,?2,?3,?4,?5,'stop','queued',?6,?7)",params![operation,target.deployment_id,target.revision,target.generation,session.id(),deadline,plan])?;
     Ok(())
 }
@@ -375,6 +385,22 @@ pub(crate) fn validate_candidate_initialize_run(
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
+    #[error("deployment not found")]
+    NotFound,
+    #[error("expected revision does not match")]
+    RevisionConflict,
+    #[error("idempotency key identifies a different command")]
+    IdempotencyConflict,
+    #[error("retained runtime requires cleanup")]
+    RuntimeRetained,
+    #[error("host policy denies lifecycle action")]
+    HostPolicyDenied,
+    #[error("endpoint capacity exhausted")]
+    CapacityBlocked,
+    #[error("lifecycle command queue full")]
+    QueueFull,
+    #[error("resource policy requires reconciliation")]
+    ReconciliationRequired,
     #[error("unsupported lifecycle step or backend validation")]
     Unsupported,
     #[error("corrupt stored lifecycle data")]

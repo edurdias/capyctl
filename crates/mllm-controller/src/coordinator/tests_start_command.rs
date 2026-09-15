@@ -52,6 +52,282 @@ fn counts(dir: &tempfile::TempDir) -> (i64, i64, i64, i64) {
 }
 
 #[tokio::test]
+async fn scoped_stop_resolves_generation_and_replays_after_worker_shutdown() {
+    let (dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let factories = Arc::new(AtomicUsize::new(0));
+    let w = command_worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        factories.clone(),
+        Arc::new(|| Ok(1900)),
+    );
+    let commands = w.commands();
+    let start = commands
+        .start("owner", &fence.deployment_id, 1, "start", 10000)
+        .unwrap();
+    gate.entered().await;
+    gate.release.add_permits(1);
+    completed(&owner, &start).await;
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    for (table, condition) in [
+        ("command_receipts", "NEW.idempotency_key='stop'"),
+        ("management_events", "NEW.kind='ordinary_cleanup_accepted'"),
+    ] {
+        sql.execute_batch(&format!("CREATE TRIGGER fail_stop BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'stop rollback'); END;")).unwrap();
+        let before = counts(&dir);
+        let o = owner.lock().unwrap();
+        assert!(matches!(
+            o.store().accept_ordinary_stop_command(
+                o.session(),
+                "owner",
+                &fence.deployment_id,
+                1,
+                "stop",
+                1900,
+                10000
+            ),
+            Err(LifecycleError::Sql(_))
+        ));
+        drop(o);
+        assert_eq!(counts(&dir), before);
+        sql.execute_batch("DROP TRIGGER fail_stop").unwrap();
+    }
+    let stop = commands
+        .stop("owner", &fence.deployment_id, 1, "stop", 10000)
+        .unwrap();
+    assert_eq!(stop.generation, 2);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = {
+                let o = owner.lock().unwrap();
+                o.store()
+                    .ordinary_cleanup_status(o.session(), &stop.step_id, 1900)
+                    .unwrap()
+            };
+            if status == OrdinaryCleanupStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../mllm-config/tests/fixtures/effective-fake-golden.json"
+    ))
+    .unwrap();
+    let mut config = golden["input"]["deployment"].clone();
+    config["name"] = serde_json::json!("ordinary");
+    config["routes"] = serde_json::json!(["ordinary-replaced"]);
+    let mut host = golden["input"]["host"].clone();
+    let effective: String = sql
+        .query_row(
+            "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1 AND revision=1",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let effective = mllm_config::effective::decode_effective_snapshot(&effective).unwrap();
+    host["runtime_profiles"]["local"]["build_fingerprint"] =
+        serde_json::json!("qualification-fake-v1");
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+        serde_json::json!("secret://another-admin");
+    host["runtime_profiles"]["local"]["qualification_id"] =
+        serde_json::json!(effective.profile.qualification_id);
+    {
+        let o = owner.lock().unwrap();
+        o.store()
+            .replace_stopped_managed_configuration(
+                o.session(),
+                "owner",
+                "replace",
+                &fence.deployment_id,
+                &serde_json::json!({"expected_revision":1,"config":config}).to_string(),
+                &host,
+                1900,
+            )
+            .unwrap();
+    }
+    w.shutdown().await.unwrap();
+    let before = counts(&dir);
+    assert_eq!(
+        commands
+            .stop("owner", &fence.deployment_id, 1, "stop", 10000)
+            .unwrap(),
+        stop
+    );
+    assert!(matches!(
+        commands.stop("owner", &fence.deployment_id, 2, "stop", 10000),
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::IdempotencyConflict
+        ))
+    ));
+    assert!(matches!(
+        commands.stop("owner", &fence.deployment_id, 1, "stop", 10001),
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::IdempotencyConflict
+        ))
+    ));
+    assert!(commands
+        .stop("owner", &fence.deployment_id, 1, "new", 10000)
+        .is_err());
+    assert_eq!(counts(&dir), before);
+    assert_eq!(factories.load(Ordering::SeqCst), 1);
+    sql.execute("UPDATE command_receipts SET response_json=json_set(response_json,'$.step_id',?1) WHERE idempotency_key='stop'",[ulid::Ulid::new().to_string()]).unwrap();
+    assert!(matches!(
+        commands.stop("owner", &fence.deployment_id, 1, "stop", 10000),
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::CorruptStoredData
+        ))
+    ));
+    for corruption in [
+        "UPDATE command_receipts SET response_json=printf('%1048577s','x') WHERE idempotency_key='stop'",
+        "UPDATE command_receipts SET response_json=CAST('{}' AS BLOB) WHERE idempotency_key='stop'",
+        "UPDATE command_receipts SET request_hash=printf('%65s','x') WHERE idempotency_key='stop'",
+    ] {
+        sql.execute_batch(corruption).unwrap();
+        assert!(matches!(commands.stop("owner",&fence.deployment_id,1,"stop",10000),Err(CoordinatorCommandError::Lifecycle(LifecycleError::CorruptStoredData))));
+    }
+}
+
+#[tokio::test]
+async fn scoped_stop_is_available_while_initialize_is_paused_but_not_after_fatal_closure() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    *gate.association.lock().unwrap() = Some(owner.clone());
+    gate.lost_reply.store(true, Ordering::SeqCst);
+    let w = command_worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(|| Ok(1900)),
+    );
+    let handle = w.commands();
+    handle
+        .start("owner", &fence.deployment_id, 1, "start", 10000)
+        .unwrap();
+    gate.entered().await;
+    gate.release.add_permits(1);
+    assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
+    let receipt = handle
+        .stop("owner", &fence.deployment_id, 1, "stop", 10000)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = {
+                let o = owner.lock().unwrap();
+                o.store()
+                    .ordinary_cleanup_status(o.session(), &receipt.step_id, 1900)
+                    .unwrap()
+            };
+            if status == OrdinaryCleanupStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    w.shared.fail("fatal private-path credential-string");
+    assert_eq!(
+        handle
+            .stop("owner", &fence.deployment_id, 1, "stop", 10000)
+            .unwrap(),
+        receipt
+    );
+    assert!(matches!(
+        handle.stop("owner", &fence.deployment_id, 1, "new", 10000),
+        Err(CoordinatorCommandError::Coordinator(
+            CoordinatorError::Stopped(_)
+        ))
+    ));
+    assert_eq!(gate.calls.lock().unwrap().len(), 1);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn command_policy_and_queue_rejections_are_typed_at_acceptance() {
+    let (dir, owner, fence, observations) = setup().await;
+    let source = fixture::owned_source().await;
+    let w = command_worker(
+        owner.clone(),
+        observations.clone(),
+        Gate::new(false),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(|| Ok(1900)),
+    );
+    let handle = w.commands();
+    let policy = owner
+        .lock()
+        .unwrap()
+        .store()
+        .resource_policy("lab")
+        .unwrap()
+        .unwrap();
+    let mut denied = policy.controls.clone();
+    denied.device_sharing = mllm_config::effective::Sharing::Exclusive;
+    for sharing in denied.device_sharing_overrides.values_mut() {
+        *sharing = mllm_config::effective::Sharing::Exclusive;
+    }
+    {
+        let o = owner.lock().unwrap();
+        o.store()
+            .update_resource_policy(
+                o.session(),
+                "owner",
+                "lab",
+                policy.revision,
+                "deny",
+                &denied,
+                &observations,
+                1900,
+            )
+            .unwrap();
+    }
+    let before = counts(&dir);
+    assert!(matches!(
+        handle.start("owner", &fence.deployment_id, 1, "denied", 10000),
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::HostPolicyDenied
+        ))
+    ));
+    assert_eq!(counts(&dir), before);
+    let mut allowed = policy.controls;
+    allowed.queue.max_pending_total = 1;
+    allowed.queue.max_pending_per_deployment = 1;
+    {
+        let o = owner.lock().unwrap();
+        o.store()
+            .update_resource_policy(
+                o.session(),
+                "owner",
+                "lab",
+                policy.revision + 1,
+                "allow",
+                &allowed,
+                &observations,
+                1900,
+            )
+            .unwrap();
+    }
+    handle
+        .start("owner", &fence.deployment_id, 1, "start", 10000)
+        .unwrap();
+    let before = counts(&dir);
+    assert!(matches!(
+        handle.start("owner", &source.other.deployment_id, 1, "full", 10000),
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::QueueFull
+        ))
+    ));
+    assert_eq!(counts(&dir), before);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn scoped_start_joins_once_and_history_survives_cleanup_shutdown_and_handle_drop() {
     let (dir, owner, fence, observations) = setup().await;
     let gate = Gate::new(false);
@@ -184,7 +460,9 @@ async fn scoped_start_paused_history_is_read_only_and_conflicts_and_corruption_s
     ));
     assert!(matches!(
         handle.start("owner", &fence.deployment_id, 1, "start", 10001),
-        Err(CoordinatorCommandError::Lifecycle(LifecycleError::Conflict))
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::IdempotencyConflict
+        ))
     ));
     assert_eq!(counts(&dir), before);
     w.shutdown().await.unwrap();

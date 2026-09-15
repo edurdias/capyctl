@@ -220,11 +220,9 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
             .unwrap(),
         receipt
     );
-    assert!(
-        store
-            .accept_qualified_start_command(&session, "owner", id, 1, "new-ready", 2000, 10000)
-            .is_err()
-    );
+    assert!(store
+        .accept_qualified_start_command(&session, "owner", id, 1, "new-ready", 2000, 10000)
+        .is_err());
     assert_eq!(counts(&sql), ready);
     let stop = store
         .accept_ordinary_cleanup(&session, "owner", &source.fence, "stop", 2000, 10000)
@@ -239,7 +237,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     assert_eq!(counts(&sql), stopping);
     assert!(matches!(
         store.accept_qualified_start_command(&session, "owner", id, 1, "stop", 2000, 10000),
-        Err(LifecycleError::Conflict)
+        Err(LifecycleError::IdempotencyConflict)
     ));
     let (_, context) = store
         .arm_ordinary_cleanup_with_context(&session, &stop.step_id, 2050)
@@ -324,35 +322,31 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
             .unwrap(),
         receipt
     );
-    assert!(
-        store
-            .accept_qualified_start_command(
-                &current,
-                "owner",
-                id,
-                replaced.revision,
-                "new",
-                2300,
-                10000
-            )
-            .is_err()
-    );
+    assert!(store
+        .accept_qualified_start_command(
+            &current,
+            "owner",
+            id,
+            replaced.revision,
+            "new",
+            2300,
+            10000
+        )
+        .is_err());
     assert_eq!(counts(&sql), before);
-    assert!(
-        store
-            .arm_step(
-                &current,
-                receipt.step_id(),
-                AdmissionContext::new(
-                    &source.observations,
-                    &limits,
-                    2300,
-                    controls.observation_ttl_ms,
-                    controls.max_parked as usize
-                )
+    assert!(store
+        .arm_step(
+            &current,
+            receipt.step_id(),
+            AdmissionContext::new(
+                &source.observations,
+                &limits,
+                2300,
+                controls.observation_ttl_ms,
+                controls.max_parked as usize
             )
-            .is_err()
-    );
+        )
+        .is_err());
 }
 
 #[tokio::test]
@@ -386,11 +380,9 @@ async fn start_receipt_concurrent_same_key_has_one_acceptance() {
             .collect::<Vec<_>>(),
         [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
     );
-    assert!(
-        store
-            .qualified_initialize_execution(&session, receipts[0].step_id())
-            .is_err()
-    );
+    assert!(store
+        .qualified_initialize_execution(&session, receipts[0].step_id())
+        .is_err());
 }
 
 #[tokio::test]
@@ -497,12 +489,14 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
         (1, "start", 10001),
         (2, "stale", 10000),
     ] {
-        assert!(matches!(
-            store.accept_qualified_start_command(
-                &session, "owner", id, revision, key, 1802, deadline
-            ),
-            Err(LifecycleError::Conflict)
-        ));
+        let error = store
+            .accept_qualified_start_command(&session, "owner", id, revision, key, 1802, deadline)
+            .unwrap_err();
+        if key == "stale" {
+            assert!(matches!(error, LifecycleError::RevisionConflict));
+        } else {
+            assert!(matches!(error, LifecycleError::IdempotencyConflict));
+        }
     }
     assert!(matches!(
         store.accept_ordinary_cleanup(&session, "owner", &source.fence, "start", 1802, 10000),

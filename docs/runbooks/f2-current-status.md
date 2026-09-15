@@ -20,6 +20,16 @@ not per task. Focused TDD and integration verification continue throughout.
 - `2aff45e`: scoped Start receipts preserved across cleanup and replacement.
 - `949609b`: versioned private native launch scope from persisted execution.
 - `ae919db`: isolated Python 3.12.3 decoder verification on host-a.
+- `7d139a8`: owned Start admission serialized with shutdown and fatal closure.
+- `9de1fa8`: no-site isolated interpreter startup before protected native guards.
+
+Authenticated Start and Stop HTTP submission now passes root integration
+verification. The optional lifecycle router shares the existing owned state,
+trusted principal and bounded command capacity. Stop resolves generation in its
+acceptance transaction after historical receipt lookup. Exact retries survive
+cleanup, replacement and worker shutdown; accepted responses do not claim Ready
+or cleanup completion. Narrower routers gain no lifecycle authority. No listener,
+native lifecycle support or additional cleanup/recovery path is introduced.
 
 Scoped Start command receipts now pass root integration verification. Exact
 retries preserve the original operation, joined value and deadline after Ready,
@@ -27,8 +37,8 @@ verified cleanup, replacement and valid session rotation. Historical reads grant
 no execution authority; current resource-policy gates still govern new acceptance.
 The owned worker now provides bounded command handles. Exact receipt history is
 read before current admission flags; fresh commands serialize with shutdown,
-Drop, initialization pause and fatal closure. Typed Store errors remain available
-to the future HTTP adapter. Retained handles keep the owned state/process lock
+Drop, initialization pause and fatal closure. The HTTP adapter maps typed Store
+errors to fixed public categories. Retained handles keep the owned state/process lock
 for historical reads but cannot restart execution.
 
 The owned Fake cleanup worker passes root integration verification. It retains
@@ -38,32 +48,32 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Remaining implementation and verification
 
-1. Expose authenticated lifecycle actions through the owned command boundary,
-   preserving scoped retries, service-resolved fences and typed public errors.
-2. Complete ordinary warm lifecycle, sequence/preinitialization, no-spawn
+1. Complete ordinary warm lifecycle, sequence/preinitialization, no-spawn
    terminalization, missing-association cleanup and restart reconciliation.
-3. Complete owned candidate execution and API actions/inference, durable router
+   The next bounded unit addresses expired Initialize requests that never armed;
+   it is not yet implemented.
+2. Complete owned candidate execution and API actions/inference, durable router
    accounting, management read models/policy/attachments/listener, and CLI cutover.
    Retire legacy authority only at the joint integration gate.
-4. Complete guarded native startup: private launch scope, complete process
+3. Complete guarded native startup composition: explicit child descriptor transfer, complete process
    enrollment, installed-source/device/allocator verification, scheduler observer
    attachment, and protected authentication/control composition.
-5. Complete the API-driven F2C runner, protected manifest/artifacts, trusted host
+4. Complete the API-driven F2C runner, protected manifest/artifacts, trusted host
    inventory, pressure-abort wiring, correctness corpus and scenario reports.
-6. Run the consolidated review, fix required findings, satisfy remaining F1/M1
+5. Run the consolidated review, fix required findings, satisfy remaining F1/M1
    gates, and perform authorized pressure-guarded native qualification after its
    prerequisites. CPU/Fake tests and source checks are not native qualification.
 
 ## Owner attention
 
-Latest scoped root verification: Store 202, controller library 52 and management
-42 tests pass (296 total), plus three-crate all-target Clippy. Eight new command
-tests are included in those 52. The four Start receipt integration tests also
-pass after shared decoder extraction. The preceding full core run passed 405
-tests before this eight-test addition; this is not a claim of another full run.
+Latest scoped root verification: Store 202, controller library 55, management
+49, ordinary cleanup integration 10 and Start receipt integration 4 tests pass
+(320 distinct tests), plus three-crate all-target Clippy. The eleven command
+tests are included in those 55. The preceding full core run passed 405 tests
+before the owned-command additions; this is not a claim of another full run.
 Tests used four threads to bound concurrent fixture load; internal race tests
-remain enabled. Separate native-scope verification passed 15 runtime-binding and
-216 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
+remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
+and 217 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests and harness's 22 tests passed in
 their respective preceding slices. None is native qualification evidence.
 
