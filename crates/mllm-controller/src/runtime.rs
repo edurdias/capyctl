@@ -162,6 +162,14 @@ pub struct NativeCandidateHandoff<'a> {
     frozen: mllm_domain::launch::NativeCandidateLaunch,
     command: mllm_adapters::traits::RenderedCommand,
     descriptors: mllm_launchers::ProtectedLaunchDescriptors,
+    now_ms: &'a dyn Fn() -> Result<i64, RuntimeError>,
+}
+
+/// Trusted service dependencies; never populated from candidate or request data.
+/// The clock must read current service time on every invocation, not cache arm time.
+pub struct NativeCandidateService<'a> {
+    pub wrapper: &'a std::path::Path,
+    pub now_ms: &'a dyn Fn() -> Result<i64, RuntimeError>,
 }
 
 impl<'a> NativeCandidateHandoff<'a> {
@@ -176,6 +184,7 @@ impl<'a> NativeCandidateHandoff<'a> {
         context: mllm_scheduler::residency::AdmissionContext<'_>,
         resolve: &dyn Fn(&str) -> Result<Vec<u8>, RuntimeError>,
         preflight: &dyn Fn(&mllm_domain::launch::NativeCandidateLaunch) -> Result<(), RuntimeError>,
+        service: NativeCandidateService<'a>,
     ) -> Result<Option<Self>, RuntimeError> {
         use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
         use mllm_store::candidate_creation::initialize::ArmResult;
@@ -186,7 +195,11 @@ impl<'a> NativeCandidateHandoff<'a> {
             return Ok(None);
         };
         let frozen = store
-            .candidate_native_launch(session, &step_id)
+            .candidate_native_launch(
+                session,
+                &step_id,
+                (service.now_ms)().map_err(|_| native_error("candidate clock unavailable"))?,
+            )
             .map_err(|_| native_error("candidate descriptor unavailable"))?;
         let execution = store
             .candidate_initialize_execution(session, &step_id)
@@ -212,11 +225,14 @@ impl<'a> NativeCandidateHandoff<'a> {
             mllm_launchers::ProtectedLaunchDescriptors::new(&private, &inference, &admin)
                 .map_err(|_| native_error("candidate descriptor creation failed"))?;
         let [launch_fd, inference_fd, admin_fd] = descriptors.numbers();
-        let command = launch.render_for_launcher(ProtectedDescriptorFds::for_launcher(
-            launch_fd.into(),
-            inference_fd.into(),
-            admin_fd.into(),
-        )?)?;
+        let command = launch.render_for_launcher(
+            ProtectedDescriptorFds::for_launcher(
+                launch_fd.into(),
+                inference_fd.into(),
+                admin_fd.into(),
+            )?,
+            service.wrapper,
+        )?;
         let handoff = Self {
             store,
             session,
@@ -229,6 +245,7 @@ impl<'a> NativeCandidateHandoff<'a> {
             frozen,
             command,
             descriptors,
+            now_ms: service.now_ms,
         };
         // A provider may take time or lose the coordinator session. Revalidate
         // after all external work, as well as immediately before process creation.
@@ -255,9 +272,16 @@ impl<'a> NativeCandidateHandoff<'a> {
     }
 
     fn validate_current(&self) -> Result<(), RuntimeError> {
+        mllm_adapters::sglang::SglangLaunch::validate_wrapper_path(std::path::Path::new(
+            &self.command.argv[2],
+        ))?;
         let current = self
             .store
-            .candidate_native_launch(self.session, &self.step_id)
+            .candidate_native_launch(
+                self.session,
+                &self.step_id,
+                (self.now_ms)().map_err(|_| native_error("candidate clock unavailable"))?,
+            )
             .map_err(|_| native_error("candidate handoff is stale"))?;
         if current.metadata() != self.frozen.metadata()
             || current.settings() != self.frozen.settings()

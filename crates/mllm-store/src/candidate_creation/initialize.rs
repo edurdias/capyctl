@@ -31,11 +31,13 @@ pub enum ArmResult {
 impl crate::Store {
     /// Trusted controller read of an armed candidate, never a grant of send authority.
     /// No management handler may project the returned paths or references.
+    /// `now_ms` must be freshly sampled from the service clock at each handoff boundary.
     #[doc(hidden)]
     pub fn candidate_native_launch(
         &self,
         s: &CoordinatorSession,
         id: &str,
+        now_ms: i64,
     ) -> std::result::Result<mllm_domain::launch::NativeCandidateLaunch, LifecycleError> {
         use mllm_domain::launch::{
             NativeCandidateLaunch, NativeCandidateMetadata, ProfileLaunchSettings,
@@ -59,6 +61,22 @@ impl crate::Store {
             |r| r.get(0),
         )?;
         if !running {
+            return Err(LifecycleError::Conflict);
+        }
+        let resource = policy(&tx, &snapshot)?;
+        let qualification = read_candidate_policy(&tx, snapshot.receipt().host_id())
+            .map_err(super::map_qualification)
+            .map_err(Error::from)?
+            .ok_or(LifecycleError::Conflict)?;
+        let execution = read
+            .execution
+            .as_ref()
+            .ok_or(LifecycleError::CorruptStoredData)?;
+        if now_ms < execution.issued_at_ms
+            || now_ms >= read.planned.deadline_ms
+            || resource.revision != execution.resource_policy_revision
+            || qualification.revision != execution.qualification_policy_revision
+        {
             return Err(LifecycleError::Conflict);
         }
         let StoredLaunch::SglangPinned(native) = read

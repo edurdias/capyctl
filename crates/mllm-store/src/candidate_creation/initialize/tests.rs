@@ -187,19 +187,49 @@ fn initialize_arm_rolls_back_after_grant_and_denies_native() {
     }
 }
 #[test]
+fn native_descriptor_revalidates_clock_boundaries_and_current_policy() {
+    let (store, s, c) = created("sglang-pinned");
+    let r = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+        .unwrap();
+    arm(&store, &s, r.step_id()).unwrap();
+    let before = durable(&store);
+    for now in [1200, 399999] {
+        assert!(store.candidate_native_launch(&s, r.step_id(), now).is_ok());
+    }
+    for now in [i64::MIN, 1100, 1199, 400000, i64::MAX] {
+        assert!(store.candidate_native_launch(&s, r.step_id(), now).is_err());
+        assert_eq!(durable(&store), before);
+    }
+    store.conn.execute("UPDATE host_qualification_policies SET revision=revision+1,policy_json=json_set(policy_json,'$.revision',revision+1)", []).unwrap();
+    let changed = durable(&store);
+    assert!(
+        store
+            .candidate_native_launch(&s, r.step_id(), 1200)
+            .is_err()
+    );
+    assert_eq!(durable(&store), changed);
+    assert_eq!(
+        arm(&store, &s, r.step_id()).unwrap(),
+        ArmResult::AlreadyRecorded
+    );
+    assert_eq!(count(&store, "resource_grants"), 1);
+}
+
+#[test]
 fn native_arm_freezes_once_and_keeps_ordinary_dispatch_closed() {
     let (store, s, c) = created("sglang-pinned");
     let r = store
         .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
         .unwrap();
-    assert!(store.candidate_native_launch(&s, r.step_id()).is_err());
+    assert!(store.candidate_native_launch(&s, r.step_id(), 1200).is_err());
     assert_eq!(
         arm(&store, &s, r.step_id()).unwrap(),
         ArmResult::New {
             step_id: r.step_id().into()
         }
     );
-    let frozen = store.candidate_native_launch(&s, r.step_id()).unwrap();
+    let frozen = store.candidate_native_launch(&s, r.step_id(), 1200).unwrap();
     assert_eq!(frozen.metadata().binding_id, c.binding_id());
     assert_eq!(frozen.metadata().incarnation, c.incarnation());
     let leased_port: u16 = store
@@ -282,7 +312,7 @@ fn native_arm_failures_preserve_planned_intent_and_endpoint() {
         assert_eq!(count(&store, "resource_grants"), 0);
         assert_eq!(count(&store, "endpoint_leases"), 1);
         assert!(store.candidate_initialize_execution(&s, r.step_id()).is_err());
-        assert!(store.candidate_native_launch(&s, r.step_id()).is_err());
+        assert!(store.candidate_native_launch(&s, r.step_id(), 1200).is_err());
     }
     let (store, s, c) = created("sglang-pinned");
     let r = store
@@ -336,7 +366,7 @@ fn native_descriptor_mutation_invalidates_execution_and_replay() {
         );
         assert!(arm(&store, &s, r.step_id()).is_err(), "{field}");
         assert!(
-            store.candidate_native_launch(&s, r.step_id()).is_err(),
+            store.candidate_native_launch(&s, r.step_id(), 1200).is_err(),
             "{field}"
         );
         assert_eq!(durable(&store), before);
@@ -365,7 +395,7 @@ fn native_descriptor_duplicate_fields_cannot_reconstruct_a_launch() {
         .unwrap();
     let before = durable(&store);
     assert!(matches!(
-        store.candidate_native_launch(&s, r.step_id()),
+        store.candidate_native_launch(&s, r.step_id(), 1200),
         Err(LifecycleError::CorruptStoredData)
     ));
     assert!(arm(&store, &s, r.step_id()).is_err());

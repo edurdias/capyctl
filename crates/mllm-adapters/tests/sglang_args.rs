@@ -1,10 +1,10 @@
-use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
 use mllm_adapters::RuntimeError;
+use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
 use mllm_config::effective::candidate::validate_candidate_reviewed_snapshot;
 use mllm_domain::launch::{
     NativeCandidateLaunch, NativeCandidateMetadata, SglangLaunchSettings, SglangRequestedBudget,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const CHECKPOINT: &str = "/private/checkpoints/qwen";
 const INFERENCE_REF: &str = "private://candidate-inference-reference";
@@ -12,6 +12,15 @@ const ADMIN_REF: &str = "private://candidate-admin-reference";
 const SOURCE: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
 const REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
 const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+
+fn wrapper() -> &'static std::path::Path {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::path::Path::new("/usr/bin/true")
+            .canonicalize()
+            .unwrap()
+    })
+}
 
 fn metadata(index: u16) -> NativeCandidateMetadata {
     let binding = format!("01K0000000000000000000{index:04}");
@@ -70,14 +79,17 @@ fn frozen(meta: NativeCandidateMetadata, config: SglangLaunchSettings) -> Native
 
 fn public_args(launch: &SglangLaunch) -> Value {
     let command = launch
-        .render_for_launcher(ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap())
+        .render_for_launcher(
+            ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(),
+            wrapper(),
+        )
         .unwrap();
     assert_eq!(
         &command.argv[..4],
         [
             "/opt/sglang/bin/python3",
             "-I",
-            "runtime/sglang_entry.py",
+            wrapper().to_str().unwrap(),
             "--public-settings-json"
         ]
     );
@@ -94,6 +106,72 @@ fn public_args(launch: &SglangLaunch) -> Value {
     );
     assert!(command.env.is_empty());
     serde_json::from_str(&command.argv[4]).unwrap()
+}
+
+#[test]
+fn wrapper_command_cannot_resolve_through_daemon_working_directory() {
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    let command = launch
+        .render_for_launcher(
+            ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(),
+            wrapper(),
+        )
+        .unwrap();
+    assert!(
+        std::path::Path::new(&command.argv[2]).is_absolute(),
+        "wrapper selected through daemon working directory"
+    );
+}
+
+#[test]
+fn wrapper_rejects_relative_symlink_nonregular_and_untrusted_writes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    let directory = Directory(
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".mllm-wrapper-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )),
+    );
+    std::fs::create_dir(&directory.0).unwrap();
+    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = directory.0.join("sglang_entry.py");
+    std::fs::write(&file, b"# Never executed by renderer tests.\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    let render = |path: &std::path::Path| {
+        launch.render_for_launcher(ProtectedDescriptorFds::for_launcher(3, 4, 5).unwrap(), path)
+    };
+    assert!(render(&file).is_ok());
+    let link = directory.0.join("symlink.py");
+    symlink(&file, &link).unwrap();
+    for path in [
+        std::path::Path::new("runtime/sglang_entry.py"),
+        &directory.0,
+        &link,
+        &directory.0.join("missing.py"),
+        &directory.0.join("nested/../sglang_entry.py"),
+    ] {
+        assert!(matches!(render(path), Err(RuntimeError::Unsupported)));
+    }
+    for mode in [0o620, 0o602, 0o666] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(matches!(render(&file), Err(RuntimeError::Unsupported)));
+    }
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for mode in [0o720, 0o702, 0o777] {
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(matches!(render(&file), Err(RuntimeError::Unsupported)));
+    }
+    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(render(&file).is_ok());
 }
 
 #[test]
@@ -227,7 +305,10 @@ fn ordinary_missing_and_malformed_candidate_metadata_is_rejected() {
 fn private_paths_references_and_errors_never_enter_public_command_data() {
     let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
     let command = launch
-        .render_for_launcher(ProtectedDescriptorFds::for_launcher(7, 8, 9).unwrap())
+        .render_for_launcher(
+            ProtectedDescriptorFds::for_launcher(7, 8, 9).unwrap(),
+            wrapper(),
+        )
         .unwrap();
     let outputs = [
         format!("{launch:?}"),
@@ -316,6 +397,7 @@ fn launcher_descriptors_must_be_distinct_nonstandard_and_exact_native_integers()
     let command = launch
         .render_for_launcher(
             ProtectedDescriptorFds::for_launcher(i64::from(i32::MAX), 4, 5).unwrap(),
+            wrapper(),
         )
         .unwrap();
     assert_eq!(command.argv[6], "2147483647");

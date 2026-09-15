@@ -11,7 +11,7 @@ use mllm_config::effective::candidate::{
     NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
 };
 use mllm_domain::launch::{NativeCandidateLaunch, SglangLaunchSettings};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{fmt, path::Path};
 
 /// Inherited descriptor numbers selected by the final launcher. This validates
@@ -145,13 +145,15 @@ impl SglangLaunch {
     pub fn render_for_launcher(
         &self,
         fds: ProtectedDescriptorFds,
+        wrapper: &Path,
     ) -> Result<RenderedCommand, RuntimeError> {
+        Self::validate_wrapper_path(wrapper)?;
         let public = serde_json::to_string(&self.public).map_err(|_| RuntimeError::Unsupported)?;
         Ok(RenderedCommand {
             argv: vec![
                 self.executable.clone(),
                 "-I".into(),
-                "runtime/sglang_entry.py".into(),
+                wrapper.to_str().ok_or(RuntimeError::Unsupported)?.into(),
                 "--public-settings-json".into(),
                 public,
                 "--launch-descriptor-fd".into(),
@@ -163,6 +165,40 @@ impl SglangLaunch {
             ],
             env: Default::default(),
         })
+    }
+
+    /// Service configuration supplies this path, never a candidate or HTTP request.
+    /// The file and its directory chain must be owned by root or the service user
+    /// and unwritable by other users. Owner writes remain inside the service trust
+    /// boundary. Recheck immediately before passing protected descriptors to a child.
+    pub fn validate_wrapper_path(path: &Path) -> Result<(), RuntimeError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let reject = || RuntimeError::Unsupported;
+            if !path.to_str().is_some_and(absolute_path)
+                || path.canonicalize().map_err(|_| reject())? != path
+            {
+                return Err(reject());
+            }
+            let service_uid = std::fs::metadata("/proc/self").map_err(|_| reject())?.uid();
+            for (index, component) in path.ancestors().enumerate() {
+                let metadata = std::fs::symlink_metadata(component).map_err(|_| reject())?;
+                if (index == 0 && !metadata.is_file())
+                    || (index != 0 && !metadata.is_dir())
+                    || ![0, service_uid].contains(&metadata.uid())
+                    || metadata.mode() & 0o022 != 0
+                {
+                    return Err(reject());
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(RuntimeError::Unsupported)
+        }
     }
 }
 

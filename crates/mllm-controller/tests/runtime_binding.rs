@@ -127,6 +127,31 @@ impl NativeFixture {
             self.max_parked,
         )
     }
+
+    fn revoke(&self) {
+        let connection =
+            rusqlite::Connection::open(self._directory.path().join("native.db")).unwrap();
+        connection.execute("UPDATE host_qualification_policies SET policy_json=json_set(policy_json,'$.state.policy.allow_qualification_runs',json('false'))", []).unwrap();
+    }
+
+    fn assert_retained(&self) {
+        let connection =
+            rusqlite::Connection::open(self._directory.path().join("native.db")).unwrap();
+        let retained: (String, String, i64, i64, i64, i64) = connection.query_row("SELECT b.state,b.identities_json,d.admission_enabled,d.dispatch_enabled,(SELECT COUNT(*) FROM endpoint_leases),(SELECT COUNT(*) FROM resource_grants) FROM runtime_bindings b JOIN deployments d ON d.id=b.deployment_id", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+        assert_eq!(retained, ("uncertain".into(), "[]".into(), 0, 0, 1, 1));
+    }
+}
+
+fn native_service() -> mllm_controller::runtime::NativeCandidateService<'static> {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    mllm_controller::runtime::NativeCandidateService {
+        wrapper: PATH.get_or_init(|| {
+            std::path::Path::new("/usr/bin/true")
+                .canonicalize()
+                .unwrap()
+        }),
+        now_ms: &|| Ok(1200),
+    }
 }
 
 fn resolve_native_credential(reference: &str) -> Result<Vec<u8>, RuntimeError> {
@@ -135,6 +160,191 @@ fn resolve_native_credential(reference: &str) -> Result<Vec<u8>, RuntimeError> {
         "secret://admin-key" => Ok(b"private-admin-token".to_vec()),
         _ => panic!("unexpected reference"),
     }
+}
+
+#[test]
+fn native_candidate_policy_revoked_during_preflight_rejects_handoff() {
+    let fixture = NativeFixture::new();
+    let result = mllm_controller::runtime::NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| {
+            fixture.revoke();
+            Ok(())
+        },
+        native_service(),
+    );
+    assert!(
+        result.is_err(),
+        "revoked policy still produced a launch handoff"
+    );
+    assert_eq!(
+        fixture.store.resource_snapshot().unwrap().owners[&fixture.deployment].phase,
+        ResourcePhase::Cold
+    );
+    fixture.assert_retained();
+}
+
+#[test]
+fn native_candidate_deadline_advanced_during_callbacks_rejects_handoff() {
+    for during_preflight in [true, false] {
+        let fixture = NativeFixture::new();
+        let now = std::cell::Cell::new(1200);
+        let clock = || Ok(now.get());
+        let result = mllm_controller::runtime::NativeCandidateHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &|reference| {
+                if !during_preflight {
+                    now.set(400000);
+                }
+                resolve_native_credential(reference)
+            },
+            &|_| {
+                if during_preflight {
+                    now.set(400000);
+                }
+                Ok(())
+            },
+            mllm_controller::runtime::NativeCandidateService {
+                now_ms: &clock,
+                ..native_service()
+            },
+        );
+        assert!(result.is_err(), "expired callbacks produced handoff");
+        fixture.assert_retained();
+    }
+}
+
+#[test]
+fn native_candidate_revocation_and_deadline_are_checked_before_spawn_and_acknowledgement() {
+    use mllm_launchers::LaunchAssociation;
+    for revoke in [true, false] {
+        let fixture = NativeFixture::new();
+        let now = std::cell::Cell::new(1200);
+        let clock = || Ok(now.get());
+        let handoff = mllm_controller::runtime::NativeCandidateHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &resolve_native_credential,
+            &|_| Ok(()),
+            mllm_controller::runtime::NativeCandidateService {
+                now_ms: &clock,
+                ..native_service()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        if revoke {
+            fixture.revoke();
+        } else {
+            now.set(400000);
+        }
+        let error = handoff
+            .persist_api_identity(&mllm_domain::completion::ProcessIdentity {
+                role: "api".into(),
+                pid: 42,
+                boot_id: "test-boot".into(),
+                start_ticks: 100,
+            })
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("candidate handoff is stale"));
+        let error = handoff
+            .spawn(&mllm_launchers::DurableSpawn::new())
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            RuntimeError::Uncertain("candidate handoff is stale".into())
+        );
+        fixture.assert_retained();
+    }
+}
+
+#[test]
+fn native_candidate_clock_failure_is_redacted_and_retains_reservations() {
+    let fixture = NativeFixture::new();
+    let calls = std::cell::Cell::new(0);
+    let clock = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            Ok(1200)
+        } else {
+            Err(RuntimeError::Uncertain("private-clock-detail".into()))
+        }
+    };
+    let error = mllm_controller::runtime::NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+        mllm_controller::runtime::NativeCandidateService {
+            now_ms: &clock,
+            ..native_service()
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error,
+        RuntimeError::Uncertain("candidate clock unavailable".into())
+    );
+    fixture.assert_retained();
+}
+
+#[test]
+fn native_candidate_wrapper_permissions_rechecked_before_spawn_and_acknowledgement() {
+    use mllm_launchers::LaunchAssociation;
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.path().join("sglang_entry.py");
+    std::fs::write(&path, b"# Never executed by handoff tests.\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let fixture = NativeFixture::new();
+    let handoff = mllm_controller::runtime::NativeCandidateHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+        mllm_controller::runtime::NativeCandidateService {
+            wrapper: &path,
+            ..native_service()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(handoff.command().argv[2], path.to_str().unwrap());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(
+        handoff
+            .persist_api_identity(&mllm_domain::completion::ProcessIdentity {
+                role: "api".into(),
+                pid: 42,
+                boot_id: "test-boot".into(),
+                start_ticks: 100,
+            })
+            .is_err()
+    );
+    assert_eq!(
+        handoff
+            .spawn(&mllm_launchers::DurableSpawn::new())
+            .err()
+            .unwrap(),
+        RuntimeError::Unsupported
+    );
+    fixture.assert_retained();
 }
 
 #[test]
@@ -148,6 +358,7 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
+        native_service(),
     )
     .unwrap()
     .unwrap();
@@ -155,7 +366,11 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
     assert!(command.env.is_empty());
     assert_eq!(
         &command.argv[1..4],
-        ["-I", "runtime/sglang_entry.py", "--public-settings-json"]
+        [
+            "-I",
+            native_service().wrapper.to_str().unwrap(),
+            "--public-settings-json"
+        ]
     );
     let text = format!("{command:?}");
     for private in [
@@ -196,7 +411,8 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
             &fixture.step,
             fixture.context(),
             &|_| panic!("replay resolved credentials"),
-            &|_| panic!("replay preflight")
+            &|_| panic!("replay preflight"),
+            native_service(),
         )
         .unwrap()
         .is_none()
@@ -246,7 +462,8 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
-            &|_| Ok(())
+            &|_| Ok(()),
+            native_service(),
         )
         .unwrap()
         .is_none()
@@ -268,6 +485,7 @@ fn native_candidate_preflight_failure_consumes_authority_without_handoff_or_secr
             checked.set(true);
             Err(RuntimeError::Uncertain("private-checkpoint-secret".into()))
         },
+        native_service(),
     );
     let error = result.err().unwrap();
     assert!(checked.get());
@@ -279,7 +497,8 @@ fn native_candidate_preflight_failure_consumes_authority_without_handoff_or_secr
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
-            &|_| Ok(())
+            &|_| Ok(()),
+            native_service(),
         )
         .unwrap()
         .is_none()
@@ -301,6 +520,7 @@ fn native_candidate_stale_session_cannot_spawn_prepared_handoff() {
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
+        native_service(),
     )
     .unwrap()
     .unwrap();
@@ -320,6 +540,7 @@ fn native_candidate_stale_generation_cannot_spawn_prepared_handoff() {
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
+        native_service(),
     )
     .unwrap()
     .unwrap();
@@ -338,6 +559,7 @@ fn native_candidate_changed_binding_cannot_spawn_prepared_handoff() {
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
+        native_service(),
     )
     .unwrap()
     .unwrap();
@@ -364,6 +586,7 @@ fn native_candidate_ambiguous_api_association_retains_endpoint_grant_and_closed_
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
+        native_service(),
     )
     .unwrap()
     .unwrap();
@@ -388,7 +611,8 @@ fn native_candidate_ambiguous_api_association_retains_endpoint_grant_and_closed_
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
-            &|_| Ok(())
+            &|_| Ok(()),
+            native_service(),
         )
         .unwrap()
         .is_none()
@@ -407,7 +631,8 @@ fn native_candidate_invalid_credentials_never_create_handoff_or_retry() {
                 &fixture.step,
                 fixture.context(),
                 &|_| Ok(secret.to_vec()),
-                &|_| Ok(())
+                &|_| Ok(()),
+                native_service(),
             )
             .is_err()
         );
@@ -418,7 +643,8 @@ fn native_candidate_invalid_credentials_never_create_handoff_or_retry() {
                 &fixture.step,
                 fixture.context(),
                 &resolve_native_credential,
-                &|_| Ok(())
+                &|_| Ok(()),
+                native_service(),
             )
             .unwrap()
             .is_none()
