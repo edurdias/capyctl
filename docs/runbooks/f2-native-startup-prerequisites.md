@@ -47,7 +47,11 @@ findings. This does not complete F2B or qualify a native engine.
   exact controller/scheduler process identities and kernel peer credentials, with
   1-KiB requests, 64-KiB responses, one active request, and a two-second socket
   deadline. Its twenty-one CPU tests pass. This is not a GPU synchronization point;
-  listener provisioning, startup attachment, complete enrollment, and durable
+  the Rust client in `afe5b2b` now pins protected socket custody and exact scheduler
+  peer identity, validates the closed response and same-namespace monotonic time,
+  and requires terminal EOF within one deadline. All 39 launcher tests pass,
+  including actual Python transport interoperability with synthetic saver facts.
+  Listener provisioning, startup attachment, complete enrollment, and durable
   consumption remain open. No transport result grants lifecycle authority.
 - Typed single-effect controls are implemented in `6c78908`, with deterministic
   tests only; production observations and coordinator persistence remain open.

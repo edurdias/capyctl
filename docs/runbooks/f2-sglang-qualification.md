@@ -10,12 +10,15 @@ readiness checkpoint. No owner decision is currently required.
 | --- | --- | --- |
 | Protected candidate handoff | `49bed60`; consolidated handoff review cleared Critical/Important findings | Native ServerArgs mapping or complete process enrollment |
 | Reviewed placement | `0706d3f`, `bf4b209`; frozen selection and read-only physical UUID/PCI corroboration | Trusted device-policy provisioning or guarded CUDA namespace composition |
-| Checkpoint and selected source preflight | 179 committed runtime tests; installed SGLang/checkpoint/saver source preflights recorded in native startup runbook | Installed binary compatibility or whole-package attestation |
+| Checkpoint and selected source preflight | 200 committed runtime tests, including authenticated scheduler observation transport; installed preflights recorded in native startup runbook | Installed binary compatibility or whole-package attestation |
 | Process-group observation | `67299e3`; 31 launcher tests pass | Native role enrollment, no-escape contract, or cleanup authority |
 | Typed controls | `6c78908`; 17 deterministic control tests | Real saver behavior, durable coordinator composition, qualified memory release |
-| Shared forwarding | `2d7c426`; 10 cross-engine contract tests; all 92 adapter tests pass | Durable request settlement, lossless public-router delivery, or live output correctness |
+| Shared asynchronous forwarding | `d335d37`; 13 cross-engine contract tests, all 95 adapter and 25 router tests pass | Durable request settlement, global buffer admission, or live output correctness |
 | Owned controller state | `c551e43`; lock-before-session startup and seven focused tests | Production worker/API cutover or restart reconciliation |
 | Durable snapshot | `359a827`; seven snapshot and ten event tests | Full public snapshot semantics, live observations, or complete writer event coverage |
+| Management authentication | `b2db142`, `6f8baea`; twelve tests cover snapshot authorization and independent protected credential files | Listener/CLI composition, event streaming, or mutation handlers |
+| Stopped managed configuration | `06dbb78`; thirteen acceptance tests and twelve event regressions pass | Activation, qualified runtime construction, or public command composition |
+| Current policy and historical retries | `294bfe3`; config all-target and 196 Store tests pass | Service composition, ordinary lifecycle authority, or retroactive changes to old receipt formats |
 
 Adapter all-target Clippy passes with warnings denied. These are CPU/fake-server
 results. They are not Q11 evidence and never set Qualified.
@@ -40,11 +43,11 @@ disk reload on restoration. Additional feature combinations remain unqualified.
   resume, reload, flush, and probe intent. A lost response remains uncertain;
   retain peak accounting and never replay a possibly applied control.
 - Complete the A2d/A3 coordinator, management API, CLI, inventory, and routing
-  cutover. Legacy delivery now fails closed after overflow instead of appending
-  a successful terminal, and uncertain streaming/nonstreaming work retains its
-  process-local charge. A backpressure-aware asynchronous sink and durable
-  settlement/reconciliation remain open. Neither transport closure nor client
-  disconnect settles backend work.
+  cutover. Delivery now awaits bounded queue capacity. Failed or timed-out delivery
+  cannot append a successful terminal, while backend parsing continues within its
+  independent bounds. Uncertain streaming/nonstreaming work retains its process-local
+  charge. Durable settlement/reconciliation and global buffer admission remain open.
+  Neither transport closure nor client disconnect settles backend work.
 - Extend trusted qualification collection/catalog beyond its current Fake
   program. Qualification requires exact recipe, checkpoint, source, saver,
   Torch/CUDA, hardware/environment, binding, and process identities.
@@ -54,6 +57,12 @@ The current native entrypoint remains closed. A passing source preflight or
 adapter construction cannot remove any of these gates. Ordinary dispatch stays
 closed for candidate bindings; successful candidate work retains conservative
 accounting until the appropriate verified transition commits.
+
+New configuration receipts retain command identity separately from resolved host
+policy. Unchanged retries use their original resolved deadline even after policy
+or profile changes. New submissions still require current persisted controls.
+Pre-integration V1 receipts retain their original full-resolution rule rather
+than being rewritten with guessed command identity.
 
 ## Sole live execution and evidence owner
 
