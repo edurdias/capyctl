@@ -133,7 +133,7 @@ impl crate::Store {
         if p.scope.principal != principal
             || p.scope.run_id != run
             || p.scope.session_id != session.id()
-            || p.action != Action::Initialize
+            || !matches!(p.action, Action::Initialize | Action::Restore)
             || now < p.accepted_at_ms
             || now >= snapshot.receipt().deadline_ms()
         {
@@ -214,7 +214,7 @@ impl CandidateInferenceWork {
             && self.incarnation == p.scope.incarnation
             && self.host_id == p.scope.host
             && self.policy.revision == p.scope.resource_policy_revision
-            && p.action == Action::Initialize
+            && matches!(p.action, Action::Initialize | Action::Restore)
     }
 }
 

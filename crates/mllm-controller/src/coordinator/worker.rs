@@ -128,6 +128,13 @@ pub struct CoordinatorCommands {
     shared: Arc<Shared>,
 }
 
+#[derive(Clone, Copy)]
+pub enum CandidateLifecycleAction {
+    Initialize,
+    Park,
+    Restore,
+}
+
 /// Preserve Store rejection categories for the service's command boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorCommandError {
@@ -240,6 +247,18 @@ impl CoordinatorCommands {
         mllm_store::candidate_creation::progression::CandidateActionReceipt,
         CoordinatorCommandError,
     > {
+        self.candidate_action(principal, run, expected_revision, key, deadline_ms, CandidateLifecycleAction::Initialize)
+    }
+
+    pub fn candidate_action(
+        &self,
+        principal: &str,
+        run: &str,
+        expected_revision: i64,
+        key: &str,
+        deadline_ms: i64,
+        action: CandidateLifecycleAction,
+    ) -> Result<mllm_store::candidate_creation::progression::CandidateActionReceipt, CoordinatorCommandError> {
         let _permit = self
             .shared
             .observers
@@ -259,10 +278,15 @@ impl CoordinatorCommands {
             }
             CoordinatorCommandError::Lifecycle(error)
         };
-        let text = serde_json::json!({"expected_revision":expected_revision,"action":"initialize","deadline_ms":deadline_ms}).to_string();
+        let action = match action {
+            CandidateLifecycleAction::Initialize => "initialize",
+            CandidateLifecycleAction::Park => "park",
+            CandidateLifecycleAction::Restore => "restore",
+        };
+        let text = serde_json::json!({"expected_revision":expected_revision,"action":action,"deadline_ms":deadline_ms}).to_string();
         if let Some(receipt) = owner
             .store()
-            .candidate_initialize_command_receipt(owner.session(), principal, run, key, &text)
+            .candidate_action_command_receipt(owner.session(), principal, run, key, &text)
             .map_err(store_error)?
         {
             return Ok(receipt);
@@ -273,6 +297,12 @@ impl CoordinatorCommands {
             return Err(
                 CoordinatorError::Stopped("worker is not admitting Initialize".into()).into(),
             );
+        }
+        let snapshot = owner.store().candidate_run_snapshot(principal, run)
+            .map_err(|error| store_error(mllm_store::candidate_creation::initialize::CandidateInitializeError::from(error).into()))?
+            .ok_or(LifecycleError::NotFound)?;
+        if snapshot.receipt().revision() != expected_revision {
+            return Err(LifecycleError::RevisionConflict.into());
         }
         let receipt = owner
             .store()
@@ -1036,6 +1066,20 @@ async fn run(
                         None => WorkerStatus::Failed(reason),
                     };
                 }
+            }
+        }
+        let warm = match shared.read(|owner, now| owner.store().next_candidate_warm(owner.session(), now)).await {
+            Ok(work) => work,
+            Err(error) => return WorkerStatus::Failed(error.to_string()),
+        };
+        if let Some(work) = warm {
+            let result = AssertUnwindSafe(candidate::drive_warm(&shared, &work, observations.as_ref(), &mut stop)).catch_unwind().await;
+            match result {
+                Ok(Ok(())) => { shared.changed.notify_waiters(); continue; }
+                failure => return WorkerStatus::Uncertain {
+                    operation_id: work.operation_id,
+                    reason: match failure { Ok(Err(error)) => error.to_string(), _ => "candidate warm child panicked; durable arm retained".into() },
+                },
             }
         }
         let candidate = match shared

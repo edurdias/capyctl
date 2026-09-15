@@ -88,6 +88,20 @@ pub fn collect_parked_status(
         .map_err(|_| mllm_store::lifecycle::LifecycleError::Conflict)
 }
 
+/// Read-only service collection samples time after observing the retained runtime.
+pub fn collect_parked_status_with_clock(
+    engine: &mllm_adapters::fake::FakeEngine,
+    context: &mllm_domain::completion::StepExecutionContext,
+    clock: &(dyn Fn() -> Result<i64, mllm_store::lifecycle::LifecycleError> + Send + Sync),
+) -> Result<mllm_domain::qualification::CandidateParkedStatusObservation, mllm_store::lifecycle::LifecycleError> {
+    let mut observation = collect_parked_status(engine, context)?;
+    observation.observed_at_ms = clock()?;
+    if observation.observed_at_ms < context.issued_at_ms || observation.observed_at_ms >= context.deadline_ms {
+        return Err(mllm_store::lifecycle::LifecycleError::Invalid);
+    }
+    Ok(observation)
+}
+
 pub async fn collect_probe(
     engine: &mllm_adapters::fake::FakeEngine,
     dispatch: CandidateProbeDispatch,

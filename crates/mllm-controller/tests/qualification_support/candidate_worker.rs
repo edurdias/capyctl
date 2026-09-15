@@ -63,6 +63,9 @@ async fn candidate_probe_send_revalidates_time_current_lease_and_session() {
         .store
         .revalidate_candidate_probe_send(&f.session, &dispatch, 1200)
         .is_ok());
+    f.sql.execute_batch("INSERT INTO request_leases SELECT id || '-unknown',deployment_id,revision,generation,session_id,'uncertain' FROM request_leases").unwrap();
+    assert!(f.store.revalidate_candidate_probe_send(&f.session,&dispatch,1200).is_err(), "probe must reject unrelated unproven work before send");
+    f.sql.execute("DELETE FROM request_leases WHERE id LIKE '%-unknown'", []).unwrap();
     for now in [-1, 1199, 400000] {
         assert!(f
             .store

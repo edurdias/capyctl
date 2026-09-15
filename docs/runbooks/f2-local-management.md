@@ -33,8 +33,8 @@ or inference request is created. Exact-key retries return the original receipt,
 including after qualification policy revocation; a new key uses current policy.
 A receipt grants no new execution authority.
 
-`lifecycle_router` adds ordinary Start/Stop, candidate Initialize and candidate
-corpus inference. Its `OwnedActionSource` must share the exact configuration
+`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore and
+candidate corpus inference. Its `OwnedActionSource` must share the exact configuration
 source's owned Store and coordinator session. The service retains the
 `OwnedCoordinator` outside the router; constructing a router does not start a
 listener. The narrower constructors above gain no execution capability.
@@ -53,6 +53,19 @@ with `expected_revision` and a strict `request` object; it cannot override the
 original run deadline or select a different model, prompt, stream mode or token
 limit from the next reviewed corpus item. Both commands require idempotency keys.
 
+After all four baseline corpus results, the owned worker runs the fixed internal
+Security checks through that same retained Fake. There is no public Security
+action. Each check requires a new durable arm and current policy, lease,
+observation and clock fences; recorded uncertainty cannot authorize a replay.
+
+Candidate Park and Restore use the same action endpoint and envelope with
+`action:"park"` or `action:"restore"`. Park requires completed predecessor
+coverage and separately executes Drain, Park and a read-only parked-status check.
+Restore separately executes allocation restore, weight reload, cache invalidation
+and the required Ready probe before post-wake corpus inference. Each effect is
+armed independently. Shutdown rechecks under the owned Store lock prevent a new
+arm after admission closes. Full candidate ownership remains retained throughout.
+
 Inference returns the original HTTP202 operation acceptance envelope, not a
 completion or response body. A bounded owned queue retains accepted work after
 caller loss. Only a New durable grant may send; retries never replay uncertain
@@ -69,10 +82,11 @@ its permit early. Retry an uncertain submission with the original key. Read/SSE
 capacity is separately bounded. Responses disable caching and never expose raw
 Store/provider diagnostics.
 
-Verified at the owned inference slice: all 60 management tests and all-target
-Clippy pass; the complete Store/controller/management run passes 466 distinct
-tests. Tests cover
+Verified at the owned Park/Restore slice: all 61 management tests pass; the
+complete Store/controller/management run passes 490 distinct tests, with
+all-target Clippy passing. Tests cover
 real owned Store acceptance for Fake, vLLM and SGLang manifests without engine
 execution, historical replay, revocation, malformed input, endpoint exhaustion,
 stale sessions, shared cancellation limits, owned Fake execution, exact corpus
-progression and real TCP response-loss retries. This is CPU/Fake/API evidence only.
+progression, the full real TCP warm cycle and response-loss retries. This is
+CPU/Fake/API evidence only.

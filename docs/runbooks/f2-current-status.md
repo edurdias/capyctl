@@ -95,6 +95,15 @@ non-text and oversized records before allocating them. No public Security action
 is added. Remaining actions and public operation-result reads remain open.
 These Fake cases do not replace the native F2C corpus.
 
+Owned candidate Park/Restore now use the original retained Fake through the
+authenticated action endpoint. Park separates Drain, Park and read-only parked
+status; Restore separates allocation restore, weight reload, cache invalidation
+and the required Ready probe. Post-wake inference uses the validated Restore
+anchor without replaying baseline Security. Full conservative grants remain
+retained and ordinary gates remain closed. Each child requires a new durable arm;
+current policy, leases, pressure and final clock/shutdown fences govern sending.
+Finish, Abort, Cleanup and public operation-result reads remain separate work.
+
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
 trusted principal and bounded command capacity. Stop resolves generation in its
@@ -140,9 +149,9 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Full core root verification for the candidate Security slice: Store 202,
-controller 216 and management 60 tests pass (478 distinct tests), plus three-crate
-all-target Clippy. Two existing caller-timeout tests failed during the earlier
+Full core root verification for the candidate Park/Restore slice: Store 202,
+controller 227 and management 61 tests pass (490 distinct tests). Two existing
+caller-timeout tests failed during the earlier
 unarmed Stop worker's concurrent fixture runs, then passed unchanged in isolated
 reruns and subsequent bounded full core runs. No timeout or evidence-freshness
 limit was changed.
@@ -150,11 +159,11 @@ Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The harness passes all 71 tests and all-target Clippy, including two phase-margin, six exact-marker,
+The same root run passes all 74 harness tests, including five phase-bound/ceiling, six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
 protected-storage tests.
-Three additional pressure-ceiling tests pass with isolated source/test Clippy;
-the preceding full Cargo harness count does not include those three tests.
+The full Cargo harness count includes the three pressure-ceiling tests.
+All-target Clippy also passes for these four crates with warnings denied.
 None is native qualification evidence.
 
 One existing item remains for the owner's inspection: check the untracked

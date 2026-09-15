@@ -34,12 +34,26 @@ pub struct CandidateInitializeWork {
     pub policy: ResourcePolicySnapshot,
 }
 
-fn policy(
+#[derive(Clone, Debug)]
+pub struct CandidateWarmWork {
+    pub principal: String,
+    pub run_id: String,
+    pub operation_id: String,
+    pub parent_step_id: String,
+    pub effects: Vec<(String, PersistedEffectKind)>,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub host_id: String,
+    pub deadline_ms: i64,
+    pub policy: ResourcePolicySnapshot,
+}
+
+pub(super) fn policy(
     tx: &Transaction<'_>,
     p: &CandidateActionPlanV3,
     now: i64,
 ) -> Result<ResourcePolicySnapshot, LifecycleError> {
-    if p.version != 3 || p.action != Action::Initialize {
+    if p.version != 3 || !matches!(p.action, Action::Initialize | Action::Park | Action::Restore) {
         return Err(LifecycleError::Unsupported);
     }
     let snapshot = super::super::read_snapshot(tx, &p.scope.principal, &p.scope.run_id)
@@ -63,6 +77,83 @@ fn policy(
 }
 
 impl crate::Store {
+    /// Bounded discovery never supplies send authority, including armed history.
+    pub fn next_candidate_warm(
+        &self,
+        session: &CoordinatorSession,
+        now: i64,
+    ) -> Result<Option<CandidateWarmWork>, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        let raw = tx.query_row(
+            "SELECT r.plan_json FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id
+             WHERE o.kind='candidate_action_v3' AND o.state IN ('pending','running') AND r.session_id=?1
+             AND CASE WHEN typeof(r.plan_json)!='text' OR length(CAST(r.plan_json AS BLOB))>?2 OR NOT json_valid(r.plan_json) THEN 1
+                      ELSE json_extract(r.plan_json,'$.version')=3 AND json_extract(r.plan_json,'$.action') IN ('park','restore') END
+             ORDER BY o.rowid LIMIT 1",
+            params![session.id(), super::super::MAX_BYTES as i64],
+            |r| Ok(bounded_text(r, 0, super::super::MAX_BYTES)),
+        ).optional()?.transpose()?;
+        let Some(raw) = raw else { return Ok(None) };
+        let p: CandidateActionPlanV3 = decode(&raw)?;
+        validate_plan(&tx, &p)?;
+        current(&tx, session, &p)?;
+        if !matches!(p.action, Action::Park | Action::Restore) {
+            return Err(LifecycleError::CorruptStoredData);
+        }
+        let policy = policy(&tx, &p, now)?;
+        Ok(Some(CandidateWarmWork {
+            principal: p.scope.principal,
+            run_id: p.scope.run_id,
+            operation_id: p.scope.operation_id,
+            parent_step_id: p.scope.parent_step_id,
+            effects: p.effects.into_iter().map(|e| (e.step_id, e.effect)).collect(),
+            binding_id: p.scope.binding_id,
+            incarnation: p.scope.incarnation,
+            host_id: p.scope.host,
+            deadline_ms: p.deadline_ms,
+            policy,
+        }))
+    }
+
+    /// Rechecks accounting and current fences for a caller-held New warm child.
+    pub fn revalidate_candidate_warm_send(
+        &self,
+        session: &CoordinatorSession,
+        child: &str,
+        expected: &mllm_domain::completion::StepExecutionContext,
+        admission: mllm_scheduler::residency::AdmissionContext<'_>,
+    ) -> Result<(), LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, session)?;
+        let p = plan_for_step(&tx, child)?;
+        validate_plan(&tx, &p)?;
+        current_anchor(&tx, session, &p.scope.parent_step_id)?;
+        let resource = policy(&tx, &p, admission.now_ms)?;
+        if !matches!(p.action, Action::Park | Action::Restore) {
+            return Err(LifecycleError::Unsupported);
+        }
+        let limits: Vec<_> = resource.controls.domains.iter().map(|(domain, d)| mllm_domain::resources::MemoryLimit {
+            domain: domain.clone(), managed_bytes: d.managed_limit, free_reserve_bytes: d.free_reserve,
+            host_kv_bytes: d.host_kv_limit, parked_bytes: d.parked_limit,
+        }).collect();
+        let mut supplied = admission.limits.to_vec();
+        supplied.sort_by(|a,b| a.domain.cmp(&b.domain));
+        let leases: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1)", [&p.scope.deployment_id], |r| r.get(0))?;
+        if leases || supplied != limits || admission.ttl_ms != resource.controls.observation_ttl_ms
+            || admission.max_parked != resource.controls.max_parked as usize || admission.now_ms < expected.issued_at_ms {
+            return Err(LifecycleError::Stale);
+        }
+        let ledger = crate::resource_ledger::read_snapshot(&tx).map_err(resource_error)?;
+        let retained = ledger.owners.get(&p.scope.deployment_id).ok_or(LifecycleError::Conflict)?;
+        mllm_scheduler::residency::admit_phase(&ledger, &p.scope.deployment_id, retained, admission)
+            .map_err(|e| LifecycleError::Rejected(e.to_string()))?;
+        drop(tx);
+        let (_, actual) = self.candidate_effect_execution(session, child)?;
+        if actual != *expected { return Err(LifecycleError::Stale); }
+        Ok(())
+    }
+
     /// Read one oldest current-session candidate action, validating its immutable
     /// history and current authority. Armed work is returned for conservative
     /// handling, never converted back to planned work.
@@ -110,6 +201,22 @@ impl crate::Store {
         key: &str,
         text: &str,
     ) -> Result<Option<CandidateActionReceipt>, LifecycleError> {
+        if text.len() > super::super::MAX_BYTES {
+            return Err(LifecycleError::Invalid);
+        }
+        let command: Command = serde_json::from_str(text).map_err(|_| LifecycleError::Invalid)?;
+        if command.action != WireAction::Initialize { return Err(LifecycleError::Invalid); }
+        self.candidate_action_command_receipt(session, principal, run, key, text)
+    }
+
+    pub fn candidate_action_command_receipt(
+        &self,
+        session: &CoordinatorSession,
+        principal: &str,
+        run: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<Option<CandidateActionReceipt>, LifecycleError> {
         if text.len() > super::super::MAX_BYTES
             || !super::super::valid_id(principal)
             || !super::super::valid_id(key)
@@ -118,8 +225,7 @@ impl crate::Store {
             return Err(LifecycleError::Invalid);
         }
         let command: Command = serde_json::from_str(text).map_err(|_| LifecycleError::Invalid)?;
-        if command.action != WireAction::Initialize
-            || command.expected_revision < 1
+        if command.expected_revision < 1
             || command.deadline_ms < 1
         {
             return Err(LifecycleError::Invalid);
@@ -147,7 +253,11 @@ impl crate::Store {
             || r.request_hash != hash
             || r.plan.scope.operation_id != operation
             || r.plan.scope.run_id != run
-            || r.plan.action != Action::Initialize
+            || r.plan.action != match command.action {
+                WireAction::Initialize => Action::Initialize,
+                WireAction::Park => Action::Park,
+                WireAction::Restore => Action::Restore,
+            }
         {
             return Err(LifecycleError::CorruptStoredData);
         }

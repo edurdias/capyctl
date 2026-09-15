@@ -8,6 +8,9 @@ use mllm_store::candidate_creation::progression::{
 #[path = "candidate_security.rs"]
 mod security;
 pub(super) use security::drive_security;
+#[path = "candidate_warm.rs"]
+mod warm;
+pub(super) use warm::drive_warm;
 
 pub(super) struct InferenceCommand {
     pub(super) work: CandidateInferenceWork,
@@ -246,6 +249,7 @@ type SecurityControlFuture = Pin<
 >;
 pub(super) struct CandidateDriver {
     pub(super) engine: Arc<dyn EngineAdapter>,
+    pub(super) parked_status: Arc<dyn Fn(mllm_domain::completion::StepExecutionContext) -> Result<mllm_domain::qualification::CandidateParkedStatusObservation, CoordinatorError> + Send + Sync>,
     pub(super) probe: Arc<dyn Fn(CandidateProbeDispatch) -> ProbeFuture + Send + Sync>,
     pub(super) security_control: Arc<
         dyn Fn(
@@ -272,8 +276,14 @@ impl CandidateDriver {
         let probe_engine = engine.clone();
         let control_engine = engine.clone();
         let control_clock = clock.clone();
+        let status_engine = engine.clone();
+        let status_clock = clock.clone();
         Arc::new(Self {
             engine,
+            parked_status: Arc::new(move |context| {
+                crate::qualification::collect_parked_status_with_clock(&status_engine, &context, &|| status_clock().map_err(|_| LifecycleError::Invalid))
+                    .map_err(|error| CoordinatorError::Service(error.to_string()))
+            }),
             security_control: Arc::new(move |dispatch| {
                 let engine = control_engine.clone();
                 let clock = control_clock.clone();

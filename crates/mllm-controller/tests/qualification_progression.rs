@@ -24,6 +24,9 @@ mod owned_worker;
 #[path = "qualification_support/candidate_worker.rs"]
 mod candidate_worker;
 
+#[path = "qualification_support/warm_owned.rs"]
+mod warm_owned;
+
 #[path = "qualification_support/security_owned.rs"]
 mod security_owned;
 

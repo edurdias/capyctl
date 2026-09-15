@@ -37,6 +37,7 @@ async fn candidate_inference_uncertain_terminal_commit_timeout_and_shutdown_neve
                 let release = factory_release.clone();
                 let sends = factory_sends.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
+                    parked_status: Arc::new(|_| Err(CoordinatorError::Invalid)),
                     engine,
                     security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     probe: Arc::new(move |dispatch| {

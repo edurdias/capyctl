@@ -302,7 +302,7 @@ pub(super) fn prior_read(tx:&Transaction<'_>,p:&CandidateActionPlanV3,read:&Read
         "SELECT step_id FROM qualification_case_actions WHERE run_id=?1 AND case_id=?2",
         params![p.scope.run_id, previous.id()],
         |r| r.get(0),
-    )?;
+    ).optional()?.ok_or(LifecycleError::Conflict)?;
     if !matches!(
         (p.action, previous.kind()),
         (Action::Restore, CandidateCaseKind::Park) | (Action::Park, CandidateCaseKind::Security)
@@ -369,6 +369,11 @@ pub(super) fn accept(
     hash: &str,
     now: i64,
 ) -> Result<CandidateActionPlanV3, LifecycleError> {
+    let initialized: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM qualification_case_actions a JOIN lifecycle_runs r ON r.operation_id=a.operation_id WHERE a.run_id=?1 AND r.action='activate')",
+        [snapshot.receipt().run_id()], |r| r.get(0),
+    )?;
+    if !initialized { return Err(LifecycleError::Conflict); }
     let cold = cold(tx, snapshot.receipt().run_id())?;
     validate_plan(tx, &cold)?;
     let selected=snapshot.reviewed_manifest().cases().iter().find(|c| {
@@ -909,6 +914,9 @@ impl crate::Store {
         if p.action != Action::Park || now < p.accepted_at_ms || now >= p.deadline_ms {
             return Err(LifecycleError::Conflict);
         }
+        worker::policy(&tx, &p, now)?;
+        let unproven: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?1)", [&p.scope.deployment_id], |r| r.get(0))?;
+        if unproven { return Err(LifecycleError::Conflict); }
         let done: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND state='completed')",
             [&p.effects[1].step_id],

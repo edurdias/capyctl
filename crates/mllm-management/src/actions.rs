@@ -52,6 +52,14 @@ pub struct ActionReceipt {
     pub joined: bool,
 }
 pub trait ActionSource: Send + Sync + 'static {
+    fn warm_candidate(
+        &self,
+        run: &str,
+        key: &str,
+        expected_revision: i64,
+        deadline_ms: i64,
+        restore: bool,
+    ) -> Result<mllm_store::candidate_creation::progression::CandidateActionReceipt, ConfigurationFailure>;
     fn candidate_inference(
         &self,
         run: &str,
@@ -101,6 +109,14 @@ impl OwnedActionSource {
     }
 }
 impl ActionSource for OwnedActionSource {
+    fn warm_candidate(
+        &self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64, restore: bool,
+    ) -> Result<mllm_store::candidate_creation::progression::CandidateActionReceipt, ConfigurationFailure> {
+        use mllm_controller::coordinator::CandidateLifecycleAction;
+        self.commands.candidate_action(self.configuration.principal(), run, expected_revision, key, deadline_ms,
+            if restore { CandidateLifecycleAction::Restore } else { CandidateLifecycleAction::Park })
+            .map_err(command_failure)
+    }
     fn candidate_inference(
         &self,
         run: &str,
@@ -311,18 +327,20 @@ async fn accept_candidate_inner(
     if command.expected_revision < 1 || command.deadline_ms < 1 {
         return Err(InvalidRequest);
     }
-    if !matches!(command.action, CandidateAction::Initialize) {
+    if !matches!(command.action, CandidateAction::Initialize | CandidateAction::Park | CandidateAction::Restore) {
         return Err(Unsupported);
     }
     let source = state.actions.clone().ok_or(Unsupported)?;
     let target = run.clone();
     let receipt = configuration::accept_blocking(permit, move || {
-        source.initialize_candidate(
+        if matches!(command.action, CandidateAction::Park | CandidateAction::Restore) {
+            source.warm_candidate(&target, &key, command.expected_revision, command.deadline_ms, matches!(command.action, CandidateAction::Restore))
+        } else { source.initialize_candidate(
             &target,
             &key,
             command.expected_revision,
             command.deadline_ms,
-        )
+        ) }
     })
     .await?;
     if receipt.revision() < 1

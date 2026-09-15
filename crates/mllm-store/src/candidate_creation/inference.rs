@@ -67,7 +67,7 @@ impl crate::Store {
         expected.completion_target = None;
         expected.launch_settings = None;
         let lease: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3 AND generation=?4 AND session_id=?5 AND disposition='inflight')",
+            "SELECT EXISTS(SELECT 1 FROM request_leases WHERE id=?1 AND deployment_id=?2 AND revision=?3 AND generation=?4 AND session_id=?5 AND disposition='inflight') AND (SELECT count(*) FROM request_leases WHERE deployment_id=?2)=1",
             params![a.lease_id,p.scope.deployment_id,p.scope.revision,p.scope.generation,session.id()], |r| r.get(0),
         )?;
         if dispatch.context != expected || dispatch.ticket.id() != a.lease_id

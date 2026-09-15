@@ -20,6 +20,124 @@ use tower::ServiceExt;
 
 const AUTH: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
+
+#[derive(Clone)]
+struct LoopbackApp(std::net::SocketAddr);
+impl LoopbackApp {
+    async fn oneshot(self, request: Request<Body>) -> std::io::Result<axum::response::Response> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, 1 << 20).await.unwrap();
+        let mut wire = format!("{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n", parts.method, parts.uri, body.len());
+        for (name, value) in &parts.headers {
+            wire.push_str(&format!("{}: {}\r\n", name, value.to_str().unwrap()));
+        }
+        wire.push_str("\r\n");
+        let mut stream = tokio::net::TcpStream::connect(self.0).await?;
+        stream.write_all(wire.as_bytes()).await?;
+        stream.write_all(&body).await?;
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stream.take(1 << 20).read_to_end(&mut bytes)).await.unwrap()?;
+        let response = String::from_utf8(bytes).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let status: u16 = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+        Ok(axum::response::Response::builder().status(status).body(Body::from(body.to_owned())).unwrap())
+    }
+}
+
+#[tokio::test]
+async fn candidate_warm_http_preserves_owner_and_accounts_twelve_requests() {
+    let (dir, owner, worker, run, app) = setup();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).with_graceful_shutdown(async move { let _ = stopped.await; }).await.unwrap();
+    });
+    let app = LoopbackApp(address);
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    for action in ["park", "restore"] {
+        let response = app.clone().oneshot(request(&run, &format!("before-init-{action}"), json!({"expected_revision":1,"action":action,"deadline_ms":400000}))).await.unwrap();
+        assert_eq!(response.status(), 409, "warm action before Initialize");
+    }
+    let init_body = json!({"expected_revision":1,"action":"initialize","deadline_ms":400000});
+    let init = app.clone().oneshot(request(&run, "init", init_body.clone())).await.unwrap();
+    assert_eq!(init.status(), 202);
+    let init = value(init).await;
+    wait_operation(&worker, &sql, init["operation_id"].as_str().unwrap()).await;
+    let before = owner.lock().unwrap().store().resource_snapshot().unwrap().owners;
+    for action in ["park", "restore"] {
+        let response = app.clone().oneshot(request(&run, &format!("early-{action}"), json!({"expected_revision":1,"action":action,"deadline_ms":400000}))).await.unwrap();
+        assert_eq!(response.status(), 409, "warm action before baseline coverage");
+    }
+    let identities: String = sql.query_row("SELECT association_json FROM owned_launch_associations", [], |r| r.get(0)).unwrap();
+    let mut history = vec![("init".to_owned(), init_body, init.clone())];
+    let mut inference_history = Vec::new();
+    for cycle in 0..2 {
+        if cycle == 1 {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let done: i64 = sql.query_row("SELECT count(*) FROM lifecycle_runs WHERE json_extract(plan_json,'$.action')='security' AND state='succeeded'", [], |r| r.get(0)).unwrap();
+                    if done == 1 { break; }
+                    assert_eq!(worker.status(), mllm_controller::coordinator::WorkerStatus::Running);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            for action in ["park", "restore"] {
+                for (name, revision, deadline, code) in [
+                    ("revision", 2, 400000, "revision_conflict"),
+                    ("expired", 1, 1200, "lifecycle_conflict"),
+                    ("beyond-run", 1, 500001, "lifecycle_conflict"),
+                ] {
+                    let response = app.clone().oneshot(request(&run, &format!("{action}-{name}"), json!({"expected_revision":revision,"action":action,"deadline_ms":deadline}))).await.unwrap();
+                    assert_eq!(response.status(), 409);
+                    assert_eq!(value(response).await["error"]["code"], code);
+                }
+                let mut denied = request(&run, "wrong-auth", json!({"expected_revision":1,"action":action,"deadline_ms":400000}));
+                denied.headers_mut().insert("authorization", format!("Bearer {INFERENCE}").parse().unwrap());
+                assert_eq!(app.clone().oneshot(denied).await.unwrap().status(), 401);
+                let body = json!({"expected_revision":1,"action":action,"deadline_ms":400000});
+                let response = app.clone().oneshot(request(&run, action, body.clone())).await.unwrap();
+                assert_eq!(response.status(), 202, "{action}: {}", value(response).await);
+                let accepted = value(response).await;
+                wait_operation(&worker, &sql, accepted["operation_id"].as_str().unwrap()).await;
+                assert_eq!(owner.lock().unwrap().store().resource_snapshot().unwrap().owners, before);
+                history.push((action.into(), body, accepted));
+            }
+        }
+        for stream in [false, true] {
+            for marker in ["MLLM_ALPHA_71", "MLLM_BETA_29"] {
+                let body = json!({"expected_revision":1,"request":{"model":format!("candidate-{}",init["deployment_id"].as_str().unwrap()),"messages":[{"role":"user","content":format!("Repeat exactly: {marker}")}],"temperature":0,"max_tokens":16,"stream":stream}});
+                let key = format!("{cycle}-{stream}-{marker}");
+                let response = app.clone().oneshot(inference_request(&run, &key, body.clone())).await.unwrap();
+                assert_eq!(response.status(), 202);
+                let accepted = value(response).await;
+                wait_operation(&worker, &sql, accepted["operation_id"].as_str().unwrap()).await;
+                inference_history.push((key, body, accepted));
+            }
+        }
+    }
+    worker.shutdown().await.unwrap();
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualification_request_attempts", [], |r| r.get::<_, i64>(0)).unwrap(), 12);
+    assert_eq!(sql.query_row("SELECT count(*) FROM request_leases", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualification_parked_status", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(sql.query_row("SELECT association_json FROM owned_launch_associations", [], |r| r.get::<_, String>(0)).unwrap(), identities);
+    assert_eq!(sql.query_row("SELECT admission_enabled+dispatch_enabled FROM deployments", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(sql.query_row("SELECT count(*) FROM qualifications", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(sql.query_row("SELECT count(*) FROM lifecycle_runs WHERE json_extract(plan_json,'$.action')='security'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    for (key, body, accepted) in history {
+        let response = app.clone().oneshot(request(&run, &key, body)).await.unwrap();
+        assert_eq!(response.status(), 202);
+        assert_eq!(value(response).await, accepted);
+    }
+    for (key, body, accepted) in inference_history {
+        let response = app.clone().oneshot(inference_request(&run, &key, body)).await.unwrap();
+        assert_eq!(response.status(), 202);
+        assert_eq!(value(response).await, accepted);
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
 #[path = "../../mllm-controller/tests/qualification_support/candidate_fixture.rs"]
 mod candidate_fixture;
 struct Observations(Vec<MemoryObservation>);
