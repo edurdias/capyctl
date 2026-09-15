@@ -29,6 +29,85 @@ pub enum ArmResult {
     AlreadyRecorded,
 }
 impl crate::Store {
+    /// Trusted controller read of an armed candidate, never a grant of send authority.
+    /// No management handler may project the returned paths or references.
+    #[doc(hidden)]
+    pub fn candidate_native_launch(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+    ) -> std::result::Result<mllm_domain::launch::NativeCandidateLaunch, LifecycleError> {
+        use mllm_domain::launch::{
+            NativeCandidateLaunch, NativeCandidateMetadata, ProfileLaunchSettings,
+        };
+        if !super::ulid(id) {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        session(&tx, s)?;
+        let (snapshot, _, read) = load_execution_step(&tx, id)?;
+        current(&tx, s, &snapshot, &read)?;
+        if read.state != "armed"
+            || read.run_state != "running"
+            || snapshot.state() != super::CandidateRunState::Running
+        {
+            return Err(LifecycleError::Conflict);
+        }
+        let running: bool = tx.query_row(
+            "SELECT state='running' FROM operations WHERE id=?1",
+            [&read.planned.operation_id],
+            |r| r.get(0),
+        )?;
+        if !running {
+            return Err(LifecycleError::Conflict);
+        }
+        let StoredLaunch::SglangPinned(native) = read
+            .execution
+            .ok_or(LifecycleError::CorruptStoredData)?
+            .launch_settings
+        else {
+            return Err(LifecycleError::Unsupported);
+        };
+        let ProfileLaunchSettings::Sglang(settings) = launch_settings(
+            snapshot
+                .reviewed_manifest()
+                .effective_recipe()
+                .profile()
+                .launch_settings(),
+        ) else {
+            return Err(LifecycleError::CorruptStoredData);
+        };
+        // load_execution_step already validates the binding against the immutable
+        // descriptor, its endpoint lease, session, claim, and deployment fences.
+        let endpoint: String = tx.query_row(
+            "SELECT json_extract(binding_json,'$.endpoint') FROM runtime_bindings WHERE id=?1",
+            [&native.binding_id],
+            |r| r.get(0),
+        )?;
+        let metadata = NativeCandidateMetadata {
+            engine: "sglang".into(),
+            recipe: settings.recipe.clone(),
+            source_revision: mllm_config::effective::candidate::NATIVE_SGLANG_SOURCE_REVISION
+                .into(),
+            checkpoint_revision: native.checkpoint_revision,
+            binding_id: native.binding_id,
+            incarnation: native.incarnation,
+            endpoint,
+            served_name: format!("candidate-{}", read.planned.binding_id),
+            rendered_settings_digest: native.rendered_settings_digest,
+        };
+        let launch = NativeCandidateLaunch::from_frozen_store(
+            metadata,
+            native.checkpoint_root,
+            native.executable,
+            native.inference_credential_ref,
+            native.admin_credential_ref,
+            settings,
+        );
+        tx.commit()?;
+        Ok(launch)
+    }
+
     /// Records one spawn attempt and conservative grant atomically. Only New may lead to a later send.
     pub fn arm_step(
         &self,
@@ -61,13 +140,10 @@ impl crate::Store {
         eligible(&tx, &snapshot, false)?;
         let resource = policy(&tx, &snapshot)?;
         let m = snapshot.reviewed_manifest();
-        // Config structure alone does not validate the pinned native allocator/settings contract.
-        if !matches!(
-            m.effective_recipe().profile().launch_settings(),
-            CandidateLaunch::Fake
-        ) {
-            return Err(LifecycleError::Unsupported);
-        }
+        // Validate the closed descriptor before reserving resources. This is pure
+        // validation; filesystem preflight and launch belong outside this transaction.
+        let selected_launch =
+            StoredLaunch::from_snapshot(&snapshot).map_err(|_| LifecycleError::Unsupported)?;
         let limits: Vec<_> = resource
             .controls
             .domains
@@ -143,9 +219,7 @@ impl crate::Store {
         let execution = ExecutionV2 {
             issued_at_ms: context.now_ms,
             grant_id: grant.clone(),
-            launch_settings: StoredLaunch {
-                engine: FakeEngine::Fake,
-            },
+            launch_settings: selected_launch,
             completion_target: StoredTarget::from_footprint(&ready),
             resource_policy_revision: resource.revision,
             qualification_policy_revision: qualification.revision,
@@ -626,17 +700,93 @@ struct ExecutionV2 {
     qualification_policy_revision: i64,
     expected_epoch: u64,
 }
-// An internally tagged enum's unit variant may ignore extra fields. A strict struct
-// explicitly describes the only currently supported persisted allocator settings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// Strict struct variants preserve the original Fake bytes and reject extra fields,
+// including fields on a unit-like Fake variant. Native descriptors are versioned.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredLaunch {
+    Fake(StoredFakeLaunch),
+    SglangPinned(Box<StoredSglangLaunch>),
+}
+impl std::fmt::Debug for StoredLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fake(_) => f.write_str("StoredLaunch::Fake"),
+            Self::SglangPinned(native) => f
+                .debug_struct("StoredLaunch::SglangPinned")
+                .field("version", &native.version)
+                .field("binding_id", &native.binding_id)
+                .field("incarnation", &native.incarnation)
+                .field("rendered_settings_digest", &native.rendered_settings_digest)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+impl StoredLaunch {
+    fn from_snapshot(snapshot: &CandidateRunSnapshot) -> Result<Self> {
+        let m = snapshot.reviewed_manifest();
+        if matches!(
+            m.effective_recipe().profile().launch_settings(),
+            CandidateLaunch::Fake
+        ) {
+            return Ok(Self::Fake(StoredFakeLaunch {
+                engine: FakeEngine::Fake,
+            }));
+        }
+        let metadata = m
+            .native_launch_metadata(
+                snapshot.runtime_credential_ref(),
+                snapshot.admin_credential_ref(),
+            )
+            .map_err(|_| Error::CorruptStoredData)?;
+        Ok(Self::SglangPinned(Box::new(StoredSglangLaunch {
+            engine: SglangEngine::Sglang,
+            version: 1,
+            checkpoint_root: m.effective_recipe().model().path.clone(),
+            checkpoint_revision: m.effective_recipe().model().revision.clone(),
+            executable: m.effective_recipe().profile().executable().into(),
+            binding_id: snapshot.receipt().binding_id().into(),
+            incarnation: snapshot.receipt().incarnation().into(),
+            inference_credential_ref: snapshot
+                .runtime_credential_ref()
+                .ok_or(Error::CorruptStoredData)?
+                .into(),
+            admin_credential_ref: snapshot
+                .admin_credential_ref()
+                .ok_or(Error::CorruptStoredData)?
+                .into(),
+            rendered_settings_digest: metadata.rendered_settings_digest().into(),
+        })))
+    }
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredLaunch {
+struct StoredFakeLaunch {
     engine: FakeEngine,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum FakeEngine {
     Fake,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSglangLaunch {
+    engine: SglangEngine,
+    version: u8,
+    checkpoint_root: String,
+    checkpoint_revision: String,
+    executable: String,
+    binding_id: String,
+    incarnation: String,
+    inference_credential_ref: String,
+    admin_credential_ref: String,
+    rendered_settings_digest: String,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SglangEngine {
+    Sglang,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1051,14 +1201,7 @@ fn read_step(
                 || e.issued_at_ms >= step.deadline_ms
                 || e.resource_policy_revision <= 0
                 || e.qualification_policy_revision <= 0
-                || !matches!(
-                    snapshot
-                        .reviewed_manifest()
-                        .effective_recipe()
-                        .profile()
-                        .launch_settings(),
-                    CandidateLaunch::Fake
-                )
+                || e.launch_settings != StoredLaunch::from_snapshot(snapshot)?
                 || e.completion_target
                     != StoredTarget::from_footprint(&footprint(
                         snapshot

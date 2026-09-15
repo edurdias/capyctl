@@ -3,6 +3,111 @@ use mllm_config::effective::{
     resolve_effective,
 };
 
+fn pinned_native_candidate() -> serde_json::Value {
+    let (mut candidate, _, _) = engine_fixture("sglang");
+    candidate["effective_recipe"]["model"]["revision"] =
+        serde_json::json!("cdbee75f17c01a7cc42f958dc650907174af0554");
+    candidate["effective_recipe"]["model"]["path"] =
+        serde_json::json!("/srv/models/Qwen3-4B-Instruct-2507");
+    candidate["effective_recipe"]["resolved_profile"]["build_fingerprint"] =
+        serde_json::json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
+    candidate
+}
+
+#[test]
+fn native_descriptor_rejects_non_pinned_settings_and_private_reference_mistakes() {
+    use mllm_config::effective::candidate::validate_candidate_reviewed_snapshot;
+    use serde_json::json;
+    let candidate = pinned_native_candidate();
+    let snapshot = validate_candidate_reviewed_snapshot(&candidate).unwrap();
+    let expected = snapshot
+        .native_launch_metadata(Some("private://inference"), Some("private://admin"))
+        .unwrap();
+    assert_eq!(expected.rendered_settings_digest().len(), 64);
+    assert_eq!(
+        expected,
+        snapshot
+            .native_launch_metadata(
+                Some("private://rotated-inference"),
+                Some("private://rotated-admin")
+            )
+            .unwrap()
+    );
+    for (runtime, admin) in [
+        (None, Some("admin")),
+        (Some("inference"), None),
+        (Some("same"), Some("same")),
+        (Some(""), Some("admin")),
+        (Some("inference"), Some(" \n")),
+    ] {
+        assert!(snapshot.native_launch_metadata(runtime, admin).is_err());
+    }
+    let prefix = "/effective_recipe/resolved_profile/launch_settings/";
+    for (field, value) in [
+        ("recipe", json!("other")),
+        ("tensor_parallel_size", json!(2)),
+        ("data_parallel_size", json!(2)),
+        ("tokenizer_workers", json!(2)),
+        ("model_dtype", json!("float16")),
+        ("context_tokens", json!(8192)),
+        ("max_running_requests", json!(9)),
+        ("max_total_tokens", json!(8192)),
+        ("prefill_cuda_graphs", json!(true)),
+        ("decode_cuda_graphs", json!(true)),
+        ("memory_saver", json!(false)),
+        ("cpu_weight_backup", json!(true)),
+        ("speculative_decoding", json!(true)),
+        ("lora", json!(true)),
+        ("trust_remote_code", json!(true)),
+        ("disaggregation", json!(true)),
+        ("external_cache", json!(true)),
+        ("cpu_kv_offload", json!(true)),
+        ("native_grpc", json!(true)),
+        ("weight_restore", json!("cpu")),
+    ] {
+        let mut changed = candidate.clone();
+        *changed.pointer_mut(&format!("{prefix}{field}")).unwrap() = value;
+        let rejected = validate_candidate_reviewed_snapshot(&changed)
+            .map(|s| {
+                s.native_launch_metadata(Some("inference"), Some("admin"))
+                    .is_err()
+            })
+            .unwrap_or(true);
+        assert!(rejected, "accepted non-pinned {field}");
+    }
+    for (path, value) in [
+        ("/effective_recipe/model/path", json!("relative/checkpoint")),
+        ("/effective_recipe/model/path", json!("/srv/../checkpoint")),
+        ("/effective_recipe/model/revision", json!("main")),
+        (
+            "/effective_recipe/resolved_profile/build_fingerprint",
+            json!("v0.5.16"),
+        ),
+        (
+            "/effective_recipe/resolved_profile/args",
+            json!(["--max-model-len", "4096"]),
+        ),
+        (
+            "/effective_recipe/resolved_profile/env",
+            json!({"PYTHONPATH":"/untrusted"}),
+        ),
+    ] {
+        let mut changed = candidate.clone();
+        *changed.pointer_mut(path).unwrap() = value;
+        assert!(
+            validate_candidate_reviewed_snapshot(&changed)
+                .map(|s| s
+                    .native_launch_metadata(Some("inference"), Some("admin"))
+                    .is_err())
+                .unwrap_or(true),
+            "accepted {path}"
+        );
+    }
+    let mut changed = candidate;
+    changed["effective_recipe"]["resolved_profile"]["launch_settings"]["unknown"] = json!(true);
+    assert!(validate_candidate_reviewed_snapshot(&changed).is_err());
+}
+
 fn fixture() -> (serde_json::Value, serde_json::Value) {
     let all: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/f2-deployment.json")).unwrap();

@@ -61,3 +61,76 @@ pub struct SglangRequestedBudget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FakeLaunchSettings;
+
+/// Redacted native candidate description. Neither metadata nor its digest is send authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCandidateMetadata {
+    pub engine: String,
+    pub recipe: String,
+    pub source_revision: String,
+    pub checkpoint_revision: String,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub endpoint: String,
+    pub served_name: String,
+    pub rendered_settings_digest: String,
+}
+
+/// Trusted, process-local projection of a persisted candidate descriptor.
+///
+/// Deliberately has no Debug, Display, or serialization implementation. Reading,
+/// constructing, or retaining this value does not authorize a send. The controller
+/// must separately own the current persisted arm's `New` outcome.
+pub struct NativeCandidateLaunch {
+    metadata: NativeCandidateMetadata,
+    checkpoint_root: String,
+    executable: String,
+    inference_credential_ref: String,
+    admin_credential_ref: String,
+    settings: SglangLaunchSettings,
+}
+impl NativeCandidateLaunch {
+    /// Internal cross-crate bridge. Call only with a validated persisted store read;
+    /// this constructor does not supply proof of persistence or launch authority.
+    #[doc(hidden)]
+    pub fn from_frozen_store(
+        metadata: NativeCandidateMetadata,
+        checkpoint_root: String,
+        executable: String,
+        inference_credential_ref: String,
+        admin_credential_ref: String,
+        settings: SglangLaunchSettings,
+    ) -> Self {
+        Self {
+            metadata,
+            checkpoint_root,
+            executable,
+            inference_credential_ref,
+            admin_credential_ref,
+            settings,
+        }
+    }
+    pub fn metadata(&self) -> &NativeCandidateMetadata {
+        &self.metadata
+    }
+    /// Trusted launcher/adapter use only; never expose through a management DTO.
+    #[doc(hidden)]
+    pub fn checkpoint_root(&self) -> &str {
+        &self.checkpoint_root
+    }
+    #[doc(hidden)]
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+    #[doc(hidden)]
+    pub fn inference_credential_ref(&self) -> &str {
+        &self.inference_credential_ref
+    }
+    #[doc(hidden)]
+    pub fn admin_credential_ref(&self) -> &str {
+        &self.admin_credential_ref
+    }
+    pub fn settings(&self) -> &SglangLaunchSettings {
+        &self.settings
+    }
+}

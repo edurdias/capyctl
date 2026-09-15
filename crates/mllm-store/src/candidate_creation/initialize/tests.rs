@@ -186,6 +186,179 @@ fn initialize_arm_rolls_back_after_grant_and_denies_native() {
         assert_eq!(durable(&store), before);
     }
 }
+#[test]
+fn native_arm_freezes_once_and_keeps_ordinary_dispatch_closed() {
+    let (store, s, c) = created("sglang-pinned");
+    let r = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+        .unwrap();
+    assert!(store.candidate_native_launch(&s, r.step_id()).is_err());
+    assert_eq!(
+        arm(&store, &s, r.step_id()).unwrap(),
+        ArmResult::New {
+            step_id: r.step_id().into()
+        }
+    );
+    let frozen = store.candidate_native_launch(&s, r.step_id()).unwrap();
+    assert_eq!(frozen.metadata().binding_id, c.binding_id());
+    assert_eq!(frozen.metadata().incarnation, c.incarnation());
+    let public = format!("{:?}", frozen.metadata());
+    for private in [
+        "/srv/models",
+        "/bin/true",
+        "secret://",
+        "engine-key",
+        "admin-key",
+    ] {
+        assert!(!public.contains(private));
+    }
+    assert_eq!(
+        frozen.checkpoint_root(),
+        "/srv/models/Qwen3-4B-Instruct-2507"
+    );
+    let before = durable(&store);
+    assert_eq!(
+        arm(&store, &s, r.step_id()).unwrap(),
+        ArmResult::AlreadyRecorded
+    );
+    assert_eq!(durable(&store), before);
+    let context = store
+        .candidate_initialize_execution(&s, r.step_id())
+        .unwrap();
+    assert!(matches!(
+        context.launch_settings,
+        Some(mllm_domain::launch::ProfileLaunchSettings::Sglang(_))
+    ));
+    assert_eq!(count(&store, "resource_grants"), 1);
+    assert_eq!(count(&store, "deployment_routes"), 0);
+    let gates: (bool, bool) = store
+        .conn
+        .query_row(
+            "SELECT admission_enabled,dispatch_enabled FROM deployments",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(gates, (false, false));
+    assert_eq!(count(&store, "qualifications"), 0);
+    let json: String = store
+        .conn
+        .query_row("SELECT step_json FROM lifecycle_steps", [], |r| r.get(0))
+        .unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["execution"]["launch_settings"]["engine"], "sglang");
+    assert_eq!(value["execution"]["launch_settings"]["version"], 1);
+}
+
+#[test]
+fn native_arm_failures_preserve_planned_intent_and_endpoint() {
+    for mutation in [
+        "UPDATE host_qualification_policies SET policy_json=json_set(policy_json,'$.state.policy.allow_qualification_runs',json('false'))",
+        "UPDATE lifecycle_claims SET generation=2",
+        "DELETE FROM lifecycle_claims",
+        "UPDATE runtime_bindings SET state='uncertain'",
+        "UPDATE lifecycle_steps SET step_json=json_set(step_json,'$.descriptor.manifest_digest','mutated')",
+        "CREATE TRIGGER fail BEFORE INSERT ON resource_grants BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        "CREATE TRIGGER fail BEFORE UPDATE ON lifecycle_steps BEGIN SELECT RAISE(ABORT,'injected'); END;",
+    ] {
+        let (store, s, c) = created("sglang-pinned");
+        let r = store.accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100).unwrap();
+        store.conn.execute_batch(mutation).unwrap();
+        let before = durable(&store);
+        assert!(arm(&store, &s, r.step_id()).is_err(), "{mutation}");
+        assert_eq!(durable(&store), before, "{mutation}");
+        assert_eq!(count(&store, "resource_grants"), 0);
+        assert_eq!(count(&store, "endpoint_leases"), 1);
+        assert!(store.candidate_initialize_execution(&s, r.step_id()).is_err());
+        assert!(store.candidate_native_launch(&s, r.step_id()).is_err());
+    }
+    let (store, s, c) = created("sglang-pinned");
+    let r = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+        .unwrap();
+    store.begin_coordinator_session().unwrap();
+    let before = durable(&store);
+    assert!(matches!(
+        arm(&store, &s, r.step_id()),
+        Err(LifecycleError::Stale)
+    ));
+    assert_eq!(durable(&store), before);
+}
+
+#[test]
+fn native_descriptor_mutation_invalidates_execution_and_replay() {
+    for (field, value) in [
+        ("checkpoint_root", json!("/another/root")),
+        ("checkpoint_revision", json!("main")),
+        ("executable", json!("/bin/other")),
+        ("binding_id", json!("other")),
+        ("incarnation", json!("other")),
+        ("inference_credential_ref", json!("other")),
+        ("admin_credential_ref", json!("other")),
+        ("rendered_settings_digest", json!("0".repeat(64))),
+        ("version", json!(2)),
+        ("extra", json!(true)),
+    ] {
+        let (store, s, c) = created("sglang-pinned");
+        let r = store
+            .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+            .unwrap();
+        arm(&store, &s, r.step_id()).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE lifecycle_steps SET step_json=json_set(step_json,?1,json(?2))",
+                params![
+                    format!("$.execution.launch_settings.{field}"),
+                    value.to_string()
+                ],
+            )
+            .unwrap();
+        let before = durable(&store);
+        assert!(
+            matches!(
+                store.candidate_initialize_execution(&s, r.step_id()),
+                Err(LifecycleError::CorruptStoredData)
+            ),
+            "{field}"
+        );
+        assert!(arm(&store, &s, r.step_id()).is_err(), "{field}");
+        assert!(
+            store.candidate_native_launch(&s, r.step_id()).is_err(),
+            "{field}"
+        );
+        assert_eq!(durable(&store), before);
+    }
+}
+
+#[test]
+fn native_descriptor_duplicate_fields_cannot_reconstruct_a_launch() {
+    let (store, s, c) = created("sglang-pinned");
+    let r = store
+        .accept_candidate_initialize(&s, "owner", c.run_id(), "a", BODY, 1100)
+        .unwrap();
+    arm(&store, &s, r.step_id()).unwrap();
+    let original: String = store
+        .conn
+        .query_row("SELECT step_json FROM lifecycle_steps", [], |r| r.get(0))
+        .unwrap();
+    let malformed = original.replace(
+        "\"checkpoint_root\":",
+        "\"checkpoint_root\":\"/unexpected\",\"checkpoint_root\":",
+    );
+    assert_ne!(malformed, original);
+    store
+        .conn
+        .execute("UPDATE lifecycle_steps SET step_json=?1", [malformed])
+        .unwrap();
+    let before = durable(&store);
+    assert!(matches!(
+        store.candidate_native_launch(&s, r.step_id()),
+        Err(LifecycleError::CorruptStoredData)
+    ));
+    assert!(arm(&store, &s, r.step_id()).is_err());
+    assert_eq!(durable(&store), before);
+}
 fn created(
     engine: &str,
 ) -> (
@@ -194,7 +367,11 @@ fn created(
     super::super::CandidateCreationReceipt,
 ) {
     let store = crate::Store::open_in_memory().unwrap();
-    let (manifest, host, policy) = fixture(engine);
+    let (manifest, host, policy) = if engine == "sglang-pinned" {
+        pinned_fixture()
+    } else {
+        fixture(engine)
+    };
     let session = setup(&store, &policy);
     let receipt = store
         .create_candidate_run(
@@ -207,6 +384,24 @@ fn created(
         )
         .unwrap();
     (store, session, receipt)
+}
+fn pinned_fixture() -> (Value, Value, mllm_config::effective::HostPolicy) {
+    let (mut manifest, mut host, mut policy) = fixture("sglang");
+    manifest["effective_recipe"]["model"]["path"] = json!("/srv/models/Qwen3-4B-Instruct-2507");
+    manifest["effective_recipe"]["model"]["revision"] =
+        json!("cdbee75f17c01a7cc42f958dc650907174af0554");
+    manifest["effective_recipe"]["resolved_profile"]["build_fingerprint"] =
+        json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
+    host["runtime_profiles"]["local"]["build_fingerprint"] =
+        json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
+    let reviewed =
+        super::super::validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap();
+    policy
+        .qualification_policy
+        .as_mut()
+        .unwrap()
+        .allowed_manifest_digests = vec![reviewed.manifest_digest().into()];
+    (manifest, host, policy)
 }
 fn count(store: &crate::Store, table: &str) -> i64 {
     store

@@ -6,6 +6,20 @@ use serde_json::Value;
 
 const MAX_ENCODED: usize = 1 << 20;
 const DIGEST_DOMAIN: &[u8] = b"mllm.candidate-manifest.v1\0";
+pub const NATIVE_SGLANG_SOURCE_REVISION: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
+pub const NATIVE_CHECKPOINT_REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
+pub const NATIVE_SGLANG_RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+
+/// Public behavior only. Validation is informational and grants no launch authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeLaunchMetadata {
+    rendered_settings_digest: String,
+}
+impl NativeLaunchMetadata {
+    pub fn rendered_settings_digest(&self) -> &str {
+        &self.rendered_settings_digest
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct NormalizedCandidateManifest {
@@ -49,6 +63,104 @@ pub struct CandidateReviewedSnapshot {
 }
 
 impl CandidateReviewedSnapshot {
+    /// Checks the closed native recipe without filesystem or engine effects.
+    /// Credential references are checked for structure only and never hashed.
+    pub fn native_launch_metadata(
+        &self,
+        inference_reference: Option<&str>,
+        admin_reference: Option<&str>,
+    ) -> Result<NativeLaunchMetadata, ConfigError> {
+        let reject = || {
+            invalid(
+                "candidate.native_launch",
+                "unsupported native launch descriptor",
+            )
+        };
+        let p = &self.effective_recipe.resolved_profile;
+        let m = &self.effective_recipe.model;
+        let valid_reference = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 4096
+                && !value.chars().any(char::is_whitespace)
+                && !value.chars().any(char::is_control)
+        };
+        let (Some(inference), Some(admin)) = (inference_reference, admin_reference) else {
+            return Err(reject());
+        };
+        if !valid_reference(inference)
+            || !valid_reference(admin)
+            || inference == admin
+            || !p.runtime_auth
+            || !p.admin_auth
+            || !p.experimental_controls
+            || p.engine != Engine::Sglang
+            || p.build_fingerprint != NATIVE_SGLANG_SOURCE_REVISION
+            || m.revision != NATIVE_CHECKPOINT_REVISION
+            || !p.args.is_empty()
+            || !Path::new(&m.path).is_absolute()
+            || m.path.chars().any(char::is_control)
+            || m.path.split('/').any(|part| matches!(part, "." | ".."))
+            || m.path == "/"
+            || p.executable.chars().any(char::is_control)
+            || p.env
+                .iter()
+                .any(|(key, value)| key != "RUST_LOG" || value != "info")
+            || self.effective_recipe.devices.len() != 1
+        {
+            return Err(reject());
+        }
+        let CandidateLaunch::Sglang {
+            recipe,
+            tensor_parallel_size: 1,
+            data_parallel_size: 1,
+            tokenizer_workers: 1,
+            model_dtype,
+            context_tokens: 4096,
+            max_running_requests: 8,
+            max_total_tokens: 4096,
+            prefill_cuda_graphs: false,
+            decode_cuda_graphs: false,
+            memory_saver: true,
+            cpu_weight_backup: false,
+            speculative_decoding: false,
+            lora: false,
+            trust_remote_code: false,
+            disaggregation: false,
+            external_cache: false,
+            cpu_kv_offload: false,
+            native_grpc: false,
+            weight_restore,
+            requested_budget,
+        } = &p.launch_settings
+        else {
+            return Err(reject());
+        };
+        if recipe != NATIVE_SGLANG_RECIPE
+            || model_dtype != "bfloat16"
+            || weight_restore != "disk_reload"
+            || requested_budget.kv_cache_bytes <= 0
+            || !(1..=10000).contains(&requested_budget.static_memory_fraction_bps)
+        {
+            return Err(reject());
+        }
+        // Paths and references are retained separately; this digest describes only
+        // the public behavior that the native renderer must preserve.
+        let public = serde_json::to_vec(&(
+            1_u8,
+            NATIVE_SGLANG_SOURCE_REVISION,
+            NATIVE_CHECKPOINT_REVISION,
+            &p.launch_settings,
+            &self.effective_recipe.devices,
+        ))
+        .map_err(|_| reject())?;
+        let mut digest = Sha256::new();
+        digest.update(b"mllm.native-candidate-launch.v1\0");
+        digest.update(public);
+        Ok(NativeLaunchMetadata {
+            rendered_settings_digest: format!("{:x}", digest.finalize()),
+        })
+    }
+
     pub fn host_id(&self) -> &str {
         &self.host.id
     }
