@@ -1101,14 +1101,18 @@ name = "mllm-management"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures",
  "libc",
  "mllm-store",
+ "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "subtle",
  "tempfile",
  "tokio",
  "tower",
+ "ulid",
 ]
 
 [[package]]

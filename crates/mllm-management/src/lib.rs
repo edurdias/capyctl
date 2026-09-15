@@ -1,6 +1,6 @@
-//! Preparatory snapshot-only management boundary. Not the complete A3 API.
+//! Preparatory read-only management boundary. Not the complete A3 API.
 //!
-//! No listener, inference routes, mutations or event protocol
+//! No listener, inference routes or mutations
 //! is composed here. The trusted service must resolve independent credentials and
 //! mount this router ONLY on its separate loopback (or TLS) management listener.
 use axum::{
@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 mod credentials;
+pub mod events;
 
 /// Hashes only; intentionally neither Debug nor Serialize. This validates token
 /// syntax/distinctness, not randomness or provenance. Inputs MUST come from the
@@ -92,6 +93,9 @@ struct AppState {
     credentials: ManagementCredentials,
     source: Arc<dyn SnapshotSource>,
     reads: Arc<Semaphore>,
+    events: Option<Arc<dyn events::EventSource>>,
+    streams: Arc<Semaphore>,
+    event_options: events::EventStreamOptions,
 }
 
 /// At most two queued/running blocking reads per router. Cancellation retains a
@@ -104,9 +108,52 @@ pub fn snapshot_router(
         credentials,
         source,
         reads: Arc::new(Semaphore::new(2)),
+        events: None,
+        streams: Arc::new(Semaphore::new(0)),
+        event_options: events::EventStreamOptions::default(),
     });
-    Router::new()
-        .route("/management/v1/snapshot", get(snapshot).head(method_denied))
+    routes(state, false)
+}
+
+/// Combined historical snapshot and durable SSE provider. Mount once on the
+/// separately secured management listener; this does not start a listener.
+pub fn read_only_router<T: SnapshotSource + events::EventSource>(
+    credentials: ManagementCredentials,
+    source: Arc<T>,
+) -> Router {
+    read_only_router_with_event_options(credentials, source, events::EventStreamOptions::default())
+        .expect("default event options are bounded")
+}
+
+/// Configurable service limits may only tighten the built-in upper bounds.
+pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSource>(
+    credentials: ManagementCredentials,
+    source: Arc<T>,
+    options: events::EventStreamOptions,
+) -> Result<Router, &'static str> {
+    options.validate()?;
+    let state = Arc::new(AppState {
+        credentials,
+        source: source.clone(),
+        reads: Arc::new(Semaphore::new(2)),
+        events: Some(source),
+        streams: Arc::new(Semaphore::new(options.max_streams)),
+        event_options: options,
+    });
+    Ok(routes(state, true))
+}
+
+fn routes(state: Arc<AppState>, include_events: bool) -> Router {
+    let router = Router::new().route("/management/v1/snapshot", get(snapshot).head(method_denied));
+    let router = if include_events {
+        router.route(
+            "/management/v1/events",
+            get(events::subscribe).head(method_denied),
+        )
+    } else {
+        router
+    };
+    router
         .fallback(not_found)
         .method_not_allowed_fallback(method_denied)
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -163,5 +210,10 @@ fn error(status: StatusCode, code: &'static str, retryable: bool) -> Response {
         "method_not_allowed" => "Method not allowed",
         _ => "Management read failed",
     };
-    (status, Json(serde_json::json!({"api_version":"1","error":{"code":code,"message":message,"retryable":retryable,"operation_id":null,"details":{}}}))).into_response()
+    let details = if code == "cursor_expired" {
+        serde_json::json!({"resnapshot_required":true})
+    } else {
+        serde_json::json!({})
+    };
+    (status, Json(serde_json::json!({"api_version":"1","error":{"code":code,"message":message,"retryable":retryable,"operation_id":null,"details":details}}))).into_response()
 }
