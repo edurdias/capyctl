@@ -14,6 +14,7 @@ impl crate::Store {
         let raw = tx.query_row(
             "SELECT r.plan_json FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id
              WHERE o.kind='candidate_action_v3' AND r.session_id=?1 AND r.state='succeeded'
+             AND NOT EXISTS(SELECT 1 FROM qualification_runs q WHERE q.deployment_id=r.deployment_id AND q.state='aborted')
              AND CASE
                WHEN typeof(r.plan_json)!='text' OR length(CAST(r.plan_json AS BLOB))>?2 OR NOT json_valid(r.plan_json) THEN 1
                WHEN json_extract(r.plan_json,'$.version') IS NOT 3 OR json_extract(r.plan_json,'$.action') IS NULL OR json_extract(r.plan_json,'$.action') NOT IN ('initialize','security','park','restore') THEN 1

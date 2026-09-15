@@ -21,8 +21,135 @@ use tower::ServiceExt;
 const AUTH: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 
+#[tokio::test]
+async fn candidate_abort_writer_replays_to_authenticated_sse_and_continues_after_retry() {
+    use futures::StreamExt;
+    let (_dir, owner, worker, run, app) = setup();
+    let cursor = owner.lock().unwrap().store().snapshot().unwrap().cursor.to_string();
+    let command = json!({"expected_revision":1,"action":"abort","deadline_ms":400000});
+    let response = app.clone().oneshot(request(&run, "abort-sse", command.clone())).await.unwrap();
+    assert_eq!(response.status(), 202);
+    let accepted = value(response).await;
+    let response = app.clone().oneshot(Request::builder()
+        .uri(format!("/management/v1/events?after={cursor}"))
+        .header("authorization", format!("Bearer {AUTH}"))
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), 200, "actual Abort writer must replay through SSE projection");
+    let mut stream = response.into_body().into_data_stream();
+    let frame = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().unwrap();
+    let text = std::str::from_utf8(&frame).unwrap();
+    assert!(text.contains("event: candidate_abort_accepted\n"));
+    let data: Value = serde_json::from_str(text.lines().find_map(|line| line.strip_prefix("data: ")).unwrap()).unwrap();
+    let page = owner.lock().unwrap().store().events_after(Some(&cursor), 64).unwrap();
+    assert_eq!(page.events.len(), 1);
+    let durable: Value = serde_json::from_str(&page.events[0].payload_json).unwrap();
+    assert_eq!(data["api_version"], "1");
+    assert_eq!(data["operation_id"], accepted["operation_id"]);
+    assert_eq!(data["deployment_id"], accepted["deployment_id"]);
+    assert_eq!(data["payload"], json!({
+        "operation_id": accepted["operation_id"], "deployment_id": accepted["deployment_id"],
+        "run_id": run, "session_epoch": durable["session_epoch"].as_u64().unwrap().to_string()
+    }));
+    assert!(text.contains(&format!("id: {}\n", page.events[0].cursor)));
+    let retry = app.oneshot(request(&run, "abort-sse", command)).await.unwrap();
+    assert_eq!(retry.status(), 202);
+    assert_eq!(value(retry).await, accepted);
+    assert_eq!(owner.lock().unwrap().store().events_after(Some(&cursor), 64).unwrap().events.len(), 1);
+    worker.shutdown().await.unwrap();
+    owner.lock().unwrap().store().begin_coordinator_session().unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().unwrap();
+    let text = std::str::from_utf8(&frame).unwrap();
+    assert!(text.contains("event: coordinator_session_started\n"), "{text}");
+    assert!(!text.contains("candidate_abort_accepted"));
+}
+
+#[tokio::test]
+async fn candidate_abort_http_is_durable_before_initialize_without_release_or_epoch() {
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(1200));
+    let (dir, owner, worker, run, app) = setup_clock(clock.clone());
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let resources = owner.lock().unwrap().store().resource_snapshot().unwrap();
+    let body = json!({"expected_revision":1,"action":"abort","deadline_ms":400000});
+    for credential in [INFERENCE,"wrong"] {
+        let mut denied=request(&run,"abort",body.clone());
+        denied.headers_mut().insert("authorization",format!("Bearer {credential}").parse().unwrap());
+        assert_eq!(app.clone().oneshot(denied).await.unwrap().status(),401);
+    }
+    for invalid in [
+        json!({"expected_revision":1,"action":"abort"}),
+        json!({"expected_revision":1,"action":"abort","deadline_ms":null}),
+        json!({"expected_revision":1,"action":"abort","deadline_ms":0}),
+        json!({"expected_revision":1,"action":"abort","deadline_ms":400000,"cleanup":true}),
+    ] { assert_eq!(app.clone().oneshot(request(&run,"abort",invalid)).await.unwrap().status(),400); }
+    let mut duplicate=request(&run,"abort",body.clone());
+    *duplicate.body_mut()=Body::from(body.to_string().replacen('{',"{\"deadline_ms\":400000,",1));
+    assert_eq!(app.clone().oneshot(duplicate).await.unwrap().status(),400);
+    let mut missing=request(&run,"abort",body.clone());missing.headers_mut().remove("idempotency-key");
+    assert_eq!(app.clone().oneshot(missing).await.unwrap().status(),400);
+    let response = app.clone().oneshot(request(&run, "abort", body.clone())).await.unwrap();
+    assert_eq!(response.status(), 202, "Abort must accept independently of Initialize");
+    let accepted = value(response).await;
+    assert_eq!(accepted["qualification_run_id"], run);
+    assert!(accepted.get("step_id").is_none());
+    assert_eq!(sql.query_row("SELECT state FROM qualification_runs", [], |r|r.get::<_, String>(0)).unwrap(), "aborted");
+    assert_eq!(owner.lock().unwrap().store().resource_snapshot().unwrap(), resources);
+    assert_eq!(sql.query_row("SELECT count(*) FROM endpoint_leases", [], |r|r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(sql.query_row("SELECT count(*) FROM lifecycle_steps", [], |r|r.get::<_, i64>(0)).unwrap(), 0);
+    for (key, command) in [
+        ("abort", json!({"expected_revision":1,"action":"abort","deadline_ms":399999})),
+        ("abort", json!({"expected_revision":1,"action":"initialize","deadline_ms":400000})),
+        ("new-abort", body.clone()),
+        ("init", json!({"expected_revision":1,"action":"initialize","deadline_ms":400000})),
+    ] {
+        assert_eq!(app.clone().oneshot(request(&run, key, command)).await.unwrap().status(), 409);
+    }
+    worker.shutdown().await.unwrap();
+    clock.store(600000, std::sync::atomic::Ordering::SeqCst);
+    let retry = app.oneshot(request(&run, "abort", body)).await.unwrap();
+    assert_eq!(retry.status(), 202);
+    assert_eq!(value(retry).await, accepted);
+    assert_eq!(owner.lock().unwrap().store().resource_snapshot().unwrap(), resources);
+}
+
 #[derive(Clone)]
 struct LoopbackApp(std::net::SocketAddr);
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // Exercise caller loss while accepted blocking jobs wait for Store.
+async fn candidate_abort_real_http_caller_loss_preserves_shared_capacity_and_original_202() {
+    let (dir,owner,worker,run,app)=setup();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address=listener.local_addr().unwrap();
+    let (stop,stopped)=tokio::sync::oneshot::channel::<()>();
+    let server=tokio::spawn(async move{axum::serve(listener,app).with_graceful_shutdown(async move{let _=stopped.await;}).await.unwrap();});
+    let app=LoopbackApp(address);
+    let sql=rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let body=json!({"expected_revision":1,"action":"abort","deadline_ms":400000});
+    let guard=owner.lock().unwrap();
+    let first=tokio::spawn(app.clone().oneshot(request(&run,"abort",body.clone())));
+    let second=tokio::spawn(app.clone().oneshot(request(&run,"abort",body.clone())));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first.abort();second.abort();
+    assert!(first.await.unwrap_err().is_cancelled());assert!(second.await.unwrap_err().is_cancelled());
+    let full=app.clone().oneshot(request(&run,"another",body.clone())).await.unwrap();
+    assert_eq!(full.status(),429);
+    assert_eq!(value(full).await["error"]["code"],"queue_full");
+    assert_eq!(sql.query_row("SELECT count(*) FROM operations WHERE kind='candidate_abort_v1'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    drop(guard);
+    let accepted=tokio::time::timeout(Duration::from_secs(30),async {
+        loop {
+            let response=app.clone().oneshot(request(&run,"abort",body.clone())).await.unwrap();
+            if response.status()==202 { break value(response).await; }
+            assert_eq!(response.status(),429);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(accepted["qualification_run_id"],run);
+    assert_eq!(sql.query_row("SELECT count(*) FROM operations WHERE kind='candidate_abort_v1'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(sql.query_row("SELECT count(*) FROM command_receipts WHERE idempotency_key='abort'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(value(app.oneshot(request(&run,"abort",body)).await.unwrap()).await,accepted);
+    worker.shutdown().await.unwrap();stop.send(()).unwrap();server.await.unwrap();
+}
 impl LoopbackApp {
     async fn oneshot(self, request: Request<Body>) -> std::io::Result<axum::response::Response> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -172,6 +299,8 @@ async fn candidate_warm_http_preserves_owner_and_accounts_twelve_requests() {
         ("finish", json!({"expected_revision":1,"action":"park","deadline_ms":400000})),
         ("init", finish_body.clone()),
         ("another-finish", finish_body.clone()),
+        ("finish", json!({"expected_revision":1,"action":"abort","deadline_ms":400000})),
+        ("abort-passed", json!({"expected_revision":1,"action":"abort","deadline_ms":400000})),
     ] {
         assert_eq!(app.clone().oneshot(request(&run, key, body)).await.unwrap().status(), 409);
     }

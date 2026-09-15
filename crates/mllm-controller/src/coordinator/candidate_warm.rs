@@ -224,7 +224,11 @@ pub(in super::super) async fn drive_warm(
             "shutdown before parked status".into(),
         ));
     }
-    let observation = (driver.parked_status)(context)?;
+    let observation = tokio::select! {
+        biased;
+        _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during parked status".into())),
+        result = tokio::time::timeout(remaining(shared,work.deadline_ms)?,(driver.parked_status)(context)) => result.map_err(|_|CoordinatorError::Service("parked status timeout".into()))??,
+    };
     let principal = work.principal.clone();
     let run = work.run_id.clone();
     shared

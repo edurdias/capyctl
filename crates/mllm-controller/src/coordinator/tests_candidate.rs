@@ -10,6 +10,9 @@ mod security_tests;
 #[path = "tests_candidate_warm.rs"]
 mod warm_tests;
 
+#[path = "tests_candidate_abort.rs"]
+mod abort_tests;
+
 #[path = "../../tests/qualification_support/candidate_fixture.rs"]
 mod candidate_fixture;
 
@@ -51,7 +54,7 @@ fn worker_candidate_clock(
             let probe_engine = gate.clone();
             let probes = probes.clone();
             Ok(Arc::new(candidate::CandidateDriver {
-                parked_status: Arc::new(|_| Err(CoordinatorError::Invalid)),
+                parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                 engine: gate.clone(),
                 security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                 probe: Arc::new(move |dispatch| {
@@ -666,7 +669,7 @@ async fn candidate_required_probe_failure_preserves_lease_and_never_replays() {
                 let release = probe_release.clone();
                 let calls = calls.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
-                    parked_status: Arc::new(|_| Err(CoordinatorError::Invalid)),
+                    parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     engine: gate.clone(),
                     security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     probe: Arc::new(move |dispatch| {

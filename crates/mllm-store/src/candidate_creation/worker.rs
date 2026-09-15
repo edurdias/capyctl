@@ -88,6 +88,7 @@ impl crate::Store {
         let raw = tx.query_row(
             "SELECT r.plan_json FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id
              WHERE o.kind='candidate_action_v3' AND o.state IN ('pending','running') AND r.session_id=?1
+             AND NOT EXISTS(SELECT 1 FROM qualification_runs q WHERE q.deployment_id=r.deployment_id AND q.state='aborted')
              AND CASE WHEN typeof(r.plan_json)!='text' OR length(CAST(r.plan_json AS BLOB))>?2 OR NOT json_valid(r.plan_json) THEN 1
                       ELSE json_extract(r.plan_json,'$.version')=3 AND json_extract(r.plan_json,'$.action') IN ('park','restore') END
              ORDER BY o.rowid LIMIT 1",
@@ -165,7 +166,7 @@ impl crate::Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
         let json = tx.query_row(
-            "SELECT r.plan_json FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='candidate_action_v3' AND o.state IN ('pending','running') AND r.session_id=?1 AND CASE WHEN typeof(r.plan_json)!='text' OR length(CAST(r.plan_json AS BLOB))>?2 OR NOT json_valid(r.plan_json) THEN 1 ELSE json_extract(r.plan_json,'$.version')=3 AND json_extract(r.plan_json,'$.action')='initialize' END ORDER BY o.rowid LIMIT 1",
+            "SELECT r.plan_json FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='candidate_action_v3' AND o.state IN ('pending','running') AND r.session_id=?1 AND NOT EXISTS(SELECT 1 FROM qualification_runs q WHERE q.deployment_id=r.deployment_id AND q.state='aborted') AND CASE WHEN typeof(r.plan_json)!='text' OR length(CAST(r.plan_json AS BLOB))>?2 OR NOT json_valid(r.plan_json) THEN 1 ELSE json_extract(r.plan_json,'$.version')=3 AND json_extract(r.plan_json,'$.action')='initialize' END ORDER BY o.rowid LIMIT 1",
             params![session.id(),super::super::MAX_BYTES as i64], |r| Ok(bounded_text(r,0,super::super::MAX_BYTES)),
         ).optional()?.transpose()?;
         let Some(json) = json else { return Ok(None) };

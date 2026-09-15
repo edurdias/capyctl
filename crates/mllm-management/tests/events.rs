@@ -766,6 +766,10 @@ async fn every_supported_kind_projects_only_known_fields_and_wide_integer_string
             "operation_id,deployment_id,run_id,step_id,revision,generation,session_epoch",
         ),
         (
+            "candidate_abort_accepted",
+            "operation_id,deployment_id,run_id,session_epoch",
+        ),
+        (
             "candidate_run_accepted",
             "operation_id,deployment_id,run_id,revision,generation,resource_policy_revision,qualification_policy_revision,session_epoch",
         ),
@@ -925,6 +929,48 @@ async fn null_required_revision_is_corruption() {
             .status(),
         500
     );
+}
+
+#[tokio::test]
+async fn candidate_abort_projection_rejects_corrupt_or_expanded_payloads() {
+    for case in 0..16 {
+        let source = fake(move |_, _| {
+            let mut e = event(1);
+            e.kind = "candidate_abort_accepted".into();
+            e.operation_id = Some(INCARNATION.into());
+            e.deployment_id = Some(INCARNATION.into());
+            let mut payload = serde_json::json!({"version":"1", "operation_id":INCARNATION,
+                "deployment_id":INCARNATION,"run_id":INCARNATION,"session_epoch":i64::MAX});
+            match case {
+                0 => payload["version"] = serde_json::json!(1),
+                1 => payload["session_epoch"] = serde_json::json!("1"),
+                2 => payload["session_epoch"] = serde_json::json!(-1),
+                3 => payload["session_epoch"] = serde_json::json!(u64::MAX),
+                4 => payload["run_id"] = serde_json::json!("bad-id"),
+                5 => { payload.as_object_mut().unwrap().remove("run_id"); },
+                6 => payload["step_id"] = serde_json::json!(INCARNATION),
+                7 => payload["committed_epoch"] = serde_json::json!(1),
+                8 => payload["run_id"] = serde_json::json!("x".repeat(16 * 1024)),
+                9 => e.operation_id = Some("00000000000000000000000000".into()),
+                10 => e.deployment_id = None,
+                11 => payload["session_epoch"] = serde_json::Value::Null,
+                15 => payload["session_epoch"] = serde_json::json!(0),
+                _ => (),
+            }
+            e.payload_json = payload.to_string();
+            match case {
+                12 => e.payload_json = e.payload_json.replacen('{', "{\"session_epoch\":1,", 1),
+                13 => e.payload_json.push_str(" trailing"),
+                14 => e.payload_json = "[".into(),
+                _ => (),
+            }
+            Ok(page(vec![e], 1))
+        });
+        let response = fake_app(source, options()).oneshot(
+            request("/management/v1/events").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), 500, "corruption case {case}");
+    }
 }
 
 #[tokio::test]

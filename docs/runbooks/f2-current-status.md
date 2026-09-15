@@ -102,7 +102,7 @@ and the required Ready probe. Post-wake inference uses the validated Restore
 anchor without replaying baseline Security. Full conservative grants remain
 retained and ordinary gates remain closed. Each child requires a new durable arm;
 current policy, leases, pressure and final clock/shutdown fences govern sending.
-Abort, Cleanup and public operation-result reads remain separate work.
+Cleanup and public operation-result reads remain separate work.
 
 The owned candidate Finish service now uses an explicitly versioned deadline-bound
 catalog/receipt record while preserving legacy V3 history. It reuses the exact
@@ -113,6 +113,18 @@ after completion conflicts. Current-session completion can validate immutable
 older-session evidence without reconstructing a runtime. All candidate accounting
 and identities remain retained; ordinary use still requires verified cleanup and
 a fresh independent binding. This does not qualify a native recipe.
+
+Candidate Abort now has strict owned submission and atomic versioned history.
+It closes an eligible run without releasing grants, leases, endpoints or runtime
+identity and without inventing a completion epoch. Run-scoped cancellation and
+Store arm/completion fences prevent later work or late success from promoting the
+run. Exact retries preserve the original operation; a new key cannot rewrite a
+terminal run or passed catalog. The original driver is retained inside a newly
+armed Initialize job even if its awaiting future is cancelled. Associated Cleanup
+and the post-uncertainty cleanup lane remain separate implementation work.
+The durable Abort event replays through authenticated SSE with exact IDs and a
+positive string session epoch. Strict projection rejects expanded or corrupt
+payloads; exact retries emit no duplicate event and live delivery continues.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -159,8 +171,10 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
 
 ## Owner attention
 
-Full core root verification for the candidate Finish slice: Store 202,
-controller 230 and management 62 tests pass (494 distinct tests). Two existing
+Root verification for the candidate Abort slice: Store 202,
+controller 240 and management 66 tests pass (508 distinct tests). The full
+four-crate run passed before the final management-only SSE repair; all management
+targets were then rerun on the final projection and its two new tests. Two existing
 caller-timeout tests failed during the earlier
 unarmed Stop worker's concurrent fixture runs, then passed unchanged in isolated
 reruns and subsequent bounded full core runs. No timeout or evidence-freshness
@@ -169,7 +183,7 @@ Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
 and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
 Python 3.12.3. The unchanged adapters' 88 tests passed in their preceding slice.
-The same root run passes all 74 harness tests, including five phase-bound/ceiling, six exact-marker,
+The full root run also passes all 74 harness tests, including five phase-bound/ceiling, six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
 protected-storage tests.
 The full Cargo harness count includes the three pressure-ceiling tests.
@@ -184,7 +198,7 @@ editing, formatting, tests and staging. The separately modified SDD Task 2 repor
 also remains excluded and untouched by this continuation.
 
 Owner access item: read-only SSH connections to host-a timed out on port22
-at approximately 2026-09-15 11:56, 12:30 and 13:26 UTC. No remote command executed
+at approximately 2026-09-15 11:56, 12:30, 13:26, 14:18 and 15:16 UTC. No remote command executed
 in any attempt. Access remains unavailable from this session; restore reachability
 before native qualification. These observations do not identify the network or
 host cause. Local implementation continues without remote effects.

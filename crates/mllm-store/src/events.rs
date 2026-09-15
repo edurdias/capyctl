@@ -62,6 +62,13 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
+    CandidateAbortAccepted {
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        run_id: EventOperationId,
+        session_epoch: i64,
+    },
+    #[serde(rename = "1")]
     UnarmedStopRecorded {
         transition: UnarmedStopTransition,
         operation_id: EventOperationId,
@@ -239,6 +246,7 @@ pub(crate) enum HostQualificationPolicyChangeKind {
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
+            Self::CandidateAbortAccepted { .. } => "candidate_abort_accepted",
             Self::UnarmedStopRecorded { transition, .. } => match transition {
                 UnarmedStopTransition::Accepted => "ordinary_unarmed_stop_accepted",
                 UnarmedStopTransition::Completed => "ordinary_unarmed_stop_completed",
@@ -270,6 +278,7 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
+            Self::CandidateAbortAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::UnarmedStopRecorded { operation_id, deployment_id, .. }
             | Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::QualifiedLifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),

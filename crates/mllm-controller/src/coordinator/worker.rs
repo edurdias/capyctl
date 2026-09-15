@@ -96,6 +96,9 @@ pub enum WorkerStatus {
 }
 
 struct Shared {
+    // Ordering: candidate_poll, then owner. Store jobs never take candidate_poll.
+    candidate_poll: Mutex<()>,
+    active_candidate: Mutex<Option<Arc<candidate::Cancellation>>>,
     clock: ServiceClock,
     wake: Notify,
     changed: Notify,
@@ -578,6 +581,8 @@ impl OwnedCoordinator {
             ));
         }
         let shared = Arc::new(Shared {
+            candidate_poll: Mutex::new(()),
+            active_candidate: Mutex::new(None),
             owner,
             clock,
             wake: Notify::new(),
@@ -1005,16 +1010,21 @@ async fn run(
             Err(_) => return WorkerStatus::Failed("candidate command queue poisoned".into()),
         };
         if let Some(mut request) = request {
-            let outcome = AssertUnwindSafe(candidate::drive_inference(
+            let request_run = request.work.run_id.clone();
+            let request_principal = request.work.principal.clone();
+            let outcome = AssertUnwindSafe(candidate::scoped(&shared, &request_principal, &request_run, candidate::drive_inference(
                 &shared,
                 &mut request,
                 observations.as_ref(),
                 &mut stop,
-            ))
+            )))
             .catch_unwind()
             .await;
             match outcome {
                 Ok(Ok(())) => {
+                    // Only cancelled admission lacks a response on a successful
+                    // drive. Failures retain their existing service error path.
+                    request.respond(Err(LifecycleError::Conflict.into()));
                     shared.changed.notify_waiters();
                     continue;
                 }
@@ -1042,13 +1052,13 @@ async fn run(
         };
         if let Some(work) = security {
             let mut operation_id = None;
-            let result = AssertUnwindSafe(candidate::drive_security(
+            let result = AssertUnwindSafe(candidate::scoped(&shared, &work.principal, &work.run_id, candidate::drive_security(
                 &shared,
                 &work,
                 observations.as_ref(),
                 &mut stop,
                 &mut operation_id,
-            ))
+            )))
             .catch_unwind()
             .await;
             match result {
@@ -1073,7 +1083,7 @@ async fn run(
             Err(error) => return WorkerStatus::Failed(error.to_string()),
         };
         if let Some(work) = warm {
-            let result = AssertUnwindSafe(candidate::drive_warm(&shared, &work, observations.as_ref(), &mut stop)).catch_unwind().await;
+            let result = AssertUnwindSafe(candidate::scoped(&shared, &work.principal, &work.run_id, candidate::drive_warm(&shared, &work, observations.as_ref(), &mut stop))).catch_unwind().await;
             match result {
                 Ok(Ok(())) => { shared.changed.notify_waiters(); continue; }
                 failure => return WorkerStatus::Uncertain {
@@ -1094,13 +1104,13 @@ async fn run(
             Err(error) => return WorkerStatus::Failed(error.to_string()),
         };
         if let Some(work) = candidate {
-            let result = AssertUnwindSafe(candidate::drive(
+            let result = AssertUnwindSafe(candidate::scoped(&shared, &work.principal, &work.run_id, candidate::drive(
                 &shared,
                 &work,
                 observations.as_ref(),
                 &candidate_factory,
                 &mut stop,
-            ))
+            )))
             .catch_unwind()
             .await;
             match result {

@@ -7,6 +7,7 @@ fn body(deployment: &str) -> String {
 #[tokio::test]
 async fn candidate_inference_uncertain_terminal_commit_timeout_and_shutdown_never_replay() {
     for failure in [
+        "abort",
         "uncertain",
         "commit",
         "timeout",
@@ -37,7 +38,7 @@ async fn candidate_inference_uncertain_terminal_commit_timeout_and_shutdown_neve
                 let release = factory_release.clone();
                 let sends = factory_sends.clone();
                 Ok(Arc::new(candidate::CandidateDriver {
-                    parked_status: Arc::new(|_| Err(CoordinatorError::Invalid)),
+                    parked_status: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     engine,
                     security_control: Arc::new(|_| Box::pin(async { Err(CoordinatorError::Invalid) })),
                     probe: Arc::new(move |dispatch| {
@@ -129,6 +130,12 @@ async fn candidate_inference_uncertain_terminal_commit_timeout_and_shutdown_neve
             None
         };
         match failure {
+            "abort" => {
+                super::abort_tests::abort_and_wait(&worker,&sql,&run).await;
+                assert_eq!(sends.load(Ordering::SeqCst),1);
+                worker.shutdown().await.unwrap();
+                continue;
+            }
             "commit" => {
                 sql.execute_batch("CREATE TRIGGER fail_marker_result BEFORE INSERT ON qualification_request_results BEGIN SELECT RAISE(ABORT,'injected marker commit failure'); END;").unwrap();
                 release.add_permits(1);

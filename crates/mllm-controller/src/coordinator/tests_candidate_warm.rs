@@ -1,5 +1,13 @@
 use super::*;
 
+#[tokio::test]
+async fn candidate_abort_cancels_each_warm_child_and_parked_read_without_release() {
+    for target in [RuntimeAction::Drain,RuntimeAction::Park,RuntimeAction::Inspect,RuntimeAction::Restore,RuntimeAction::ReloadWeights,RuntimeAction::InvalidateCache,RuntimeAction::Probe] {
+        eprintln!("Abort warm target: {target:?}");
+        failure_case(target,"abort").await;
+    }
+}
+
 struct WarmFault {
     target: RuntimeAction,
     failure: &'static str,
@@ -118,13 +126,19 @@ async fn failure_case(target: RuntimeAction, failure: &'static str) {
                 }) }),
                 security_control:Arc::new(move |d| { let fake=security.clone(); Box::pin(async move { crate::qualification::collect_security_control_with_clock(&fake,d,&||Ok(1900)).await.map_err(|e|CoordinatorError::Service(e.to_string())) }) }),
                 parked_status:Arc::new(move |c| {
+                    let status = status.clone(); let status_fault = status_fault.clone();
+                    Box::pin(async move {
                     let result = crate::qualification::collect_parked_status_with_clock(&status,&c,&||Ok(1900)).map_err(|e|CoordinatorError::Service(e.to_string()));
                     if status_fault.target==RuntimeAction::Inspect {
-                        if status_fault.failure=="commit" {
+                        if status_fault.failure=="abort" {
+                            status_fault.entered.add_permits(1);
+                            status_fault.release.acquire().await.unwrap().forget();
+                        } else if status_fault.failure=="commit" {
                             rusqlite::Connection::open(&status_fault.database).unwrap().execute_batch("CREATE TRIGGER fail_status BEFORE INSERT ON qualification_parked_status BEGIN SELECT RAISE(ABORT,'parked status commit failure'); END;").unwrap();
                         } else { return Err(CoordinatorError::Service("parked status unavailable".into())); }
                     }
                     result
+                    })
                 }),
             }))
         })).unwrap();
@@ -183,7 +197,7 @@ async fn failure_case(target: RuntimeAction, failure: &'static str) {
     let accepted = commands
         .candidate_action("owner", &run, 1, "fault", 400000, action)
         .unwrap();
-    if failure != "missing" && target != RuntimeAction::Inspect {
+    if failure != "missing" && (target != RuntimeAction::Inspect || failure == "abort") {
         tokio::time::timeout(Duration::from_secs(90), fault.entered.acquire())
             .await
             .unwrap()
@@ -200,6 +214,18 @@ async fn failure_case(target: RuntimeAction, failure: &'static str) {
             .operation_id(),
         accepted.operation_id()
     );
+    if failure == "abort" {
+        super::abort_tests::abort_and_wait(&worker,&sql,&run).await;
+        assert_eq!(commands.candidate_action("owner",&run,1,"fault",400000,action).unwrap().operation_id(),accepted.operation_id(),"warm history remains an observation after Abort");
+        assert!(Arc::ptr_eq(&retained,worker.shared.retained_candidates.lock().unwrap().values().next().unwrap()));
+        let calls = engine.calls.lock().unwrap().clone();
+        fault.release.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*engine.calls.lock().unwrap(),calls);
+        assert_eq!(builds.load(Ordering::SeqCst),1);
+        worker.shutdown().await.unwrap();
+        return;
+    }
     if failure == "commit" && target != RuntimeAction::Inspect {
         sql.execute_batch("CREATE TRIGGER fail_warm_effect BEFORE INSERT ON lifecycle_evidence BEGIN SELECT RAISE(ABORT,'warm commit failure'); END;").unwrap();
     }

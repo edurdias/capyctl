@@ -52,6 +52,8 @@ pub struct ActionReceipt {
     pub joined: bool,
 }
 pub trait ActionSource: Send + Sync + 'static {
+    fn abort_candidate(&self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64)
+        -> Result<mllm_store::candidate_creation::abort::CandidateAbortReceipt, ConfigurationFailure>;
     fn finish_candidate(
         &self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64,
     ) -> Result<mllm_store::qualification::QualificationReceipt, ConfigurationFailure>;
@@ -112,6 +114,10 @@ impl OwnedActionSource {
     }
 }
 impl ActionSource for OwnedActionSource {
+    fn abort_candidate(&self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64)
+        -> Result<mllm_store::candidate_creation::abort::CandidateAbortReceipt, ConfigurationFailure> {
+        self.commands.abort_candidate(self.configuration.principal(),run,expected_revision,key,deadline_ms).map_err(command_failure)
+    }
     fn finish_candidate(
         &self, run: &str, key: &str, expected_revision: i64, deadline_ms: i64,
     ) -> Result<mllm_store::qualification::QualificationReceipt, ConfigurationFailure> {
@@ -330,11 +336,16 @@ async fn accept_candidate_inner(
     if command.expected_revision < 1 || command.deadline_ms < 1 {
         return Err(InvalidRequest);
     }
-    if !matches!(command.action, CandidateAction::Initialize | CandidateAction::Park | CandidateAction::Restore | CandidateAction::Finish) {
+    if !matches!(command.action, CandidateAction::Initialize | CandidateAction::Park | CandidateAction::Restore | CandidateAction::Finish | CandidateAction::Abort) {
         return Err(Unsupported);
     }
     let source = state.actions.clone().ok_or(Unsupported)?;
     let target = run.clone();
+    if matches!(command.action,CandidateAction::Abort) {
+        let receipt = configuration::accept_blocking(permit,move || source.abort_candidate(&target,&key,command.expected_revision,command.deadline_ms)).await?;
+        if receipt.run_id() != run || receipt.revision() < 1 || ![receipt.operation_id(),receipt.deployment_id()].iter().all(|id|id.parse::<ulid::Ulid>().is_ok_and(|parsed|parsed.to_string()==*id)) { return Err(Internal); }
+        return Ok(serde_json::json!({"api_version":"1","qualification_run_id":run,"operation_id":receipt.operation_id(),"deployment_id":receipt.deployment_id(),"revision":receipt.revision().to_string(),"joined":false}));
+    }
     if matches!(command.action, CandidateAction::Finish) {
         let receipt = configuration::accept_blocking(permit, move || {
             source.finish_candidate(&target, &key, command.expected_revision, command.deadline_ms)

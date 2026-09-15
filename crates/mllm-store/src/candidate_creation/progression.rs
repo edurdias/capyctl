@@ -1021,6 +1021,8 @@ fn current(
     if p.scope.session_id != session.id() {
         return Err(LifecycleError::Stale);
     }
+    let active: bool = tx.query_row("SELECT state IN ('accepted','running') FROM qualification_runs WHERE id=?1",[&p.scope.run_id],|r|r.get(0))?;
+    if !active { return Err(LifecycleError::Conflict); }
     let fenced:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments d JOIN lifecycle_claims c ON c.deployment_id=d.id WHERE d.id=?1 AND d.revision=?2 AND d.current_generation=?3 AND c.revision=?2 AND c.generation=?3 AND c.operation_id=?4 AND d.desired_state='stopped' AND d.admission_enabled=0 AND d.dispatch_enabled=0)",params![p.scope.deployment_id,p.scope.revision,p.scope.generation,p.scope.operation_id],|r|r.get(0))?;
     if !fenced {
         return Err(LifecycleError::Stale);

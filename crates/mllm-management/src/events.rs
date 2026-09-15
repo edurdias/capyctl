@@ -378,6 +378,12 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     }
     let fields: &[&str] = match event.kind.as_str() {
         "coordinator_session_started" => &["session_epoch"],
+        "candidate_abort_accepted" => &[
+            "operation_id",
+            "deployment_id",
+            "run_id",
+            "session_epoch",
+        ],
         "managed_configuration_accepted" => &[
             "operation_id",
             "deployment_id",
@@ -502,6 +508,9 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             Value::Null
         } else {
             let number = value.as_u64().ok_or(Failure::Internal)?;
+            if event.kind == "candidate_abort_accepted" && field == "session_epoch" && number == 0 {
+                return Err(Failure::Internal);
+            }
             if !matches!(field, "committed_epoch" | "ledger_epoch") && number > i64::MAX as u64 {
                 return Err(Failure::Internal);
             }

@@ -33,7 +33,7 @@ or inference request is created. Exact-key retries return the original receipt,
 including after qualification policy revocation; a new key uses current policy.
 A receipt grants no new execution authority.
 
-`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore/Finish and
+`lifecycle_router` adds ordinary Start/Stop, candidate Initialize/Park/Restore/Finish/Abort and
 candidate corpus inference. Its `OwnedActionSource` must share the exact configuration
 source's owned Store and coordinator session. The service retains the
 `OwnedCoordinator` outside the router; constructing a router does not start a
@@ -79,6 +79,24 @@ from an older session remains eligible for validation by a current coordinator.
 Finish neither releases resources nor adopts the candidate into ordinary routing.
 Verified cleanup and a fresh qualified binding remain required for ordinary use.
 
+Candidate Abort uses `action:"abort"` with the same strict revision/deadline/key
+envelope. It atomically closes an accepted, running or uncertain retained run and
+records its own operation, receipt and event. New Abort deadlines must remain
+inside the original run deadline. Passed, failed, expired or already aborted
+runs reject a new key; exact-key retries preserve the original acceptance after
+expiry and current admission closure. Abort cannot rewrite a passed catalog.
+
+Owned execution serializes Abort acceptance with candidate future polling, fences
+new Store arms and drops the matching in-flight child before later work. Late
+success cannot reopen Ready or qualify the run. The original runtime, all resource
+grants, endpoint reservations, armed children and unsettled leases remain retained;
+Abort neither terminates the runtime nor creates a resource completion epoch.
+Its durable event replays through authenticated SSE with only exact operation,
+deployment and run IDs plus a positive session epoch string. Retrying the action
+does not duplicate the event or interrupt later live delivery.
+Cleanup remains a separate authority and an outstanding worker integration.
+Fatal Store errors and an already stopped worker still deny new commands.
+
 Inference returns the original HTTP202 operation acceptance envelope, not a
 completion or response body. A bounded owned queue retains accepted work after
 caller loss. Only a New durable grant may send; retries never replay uncertain
@@ -95,9 +113,10 @@ its permit early. Retry an uncertain submission with the original key. Read/SSE
 capacity is separately bounded. Responses disable caching and never expose raw
 Store/provider diagnostics.
 
-Verified at the owned Finish slice: all 62 management tests pass; the
-complete Store/controller/management run passes 494 distinct tests, with
-all-target Clippy passing. Tests cover
+Verified at the owned Abort slice: all 66 management tests pass; final checked
+Store/controller/management sources pass 508 distinct tests, with four-crate
+all-target Clippy passing. Management was rerun after the final SSE-only repair;
+unchanged Store/controller results come from the preceding full run. Tests cover
 real owned Store acceptance for Fake, vLLM and SGLang manifests without engine
 execution, historical replay, revocation, malformed input, endpoint exhaustion,
 stale sessions, shared cancellation limits, owned Fake execution, exact corpus

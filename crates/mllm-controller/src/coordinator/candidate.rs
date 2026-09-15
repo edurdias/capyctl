@@ -12,6 +12,10 @@ pub(super) use security::drive_security;
 mod warm;
 pub(super) use warm::drive_warm;
 
+#[path = "candidate_abort.rs"]
+mod abort;
+pub(super) use abort::{scoped, Cancellation};
+
 impl CoordinatorCommands {
     /// Finish is an atomic Store command, with no runtime callback or new driver.
     /// The permit stays owned while waiting for the Store and through commit,
@@ -69,7 +73,7 @@ pub(super) struct InferenceCommand {
     pub(super) _permit: OwnedSemaphorePermit,
 }
 impl InferenceCommand {
-    fn respond(&mut self, response: Result<CandidateInferenceReceipt, CoordinatorCommandError>) {
+    pub(super) fn respond(&mut self, response: Result<CandidateInferenceReceipt, CoordinatorCommandError>) {
         if let Some(reply) = self.reply.take() {
             let _ = reply.send(response);
         }
@@ -282,6 +286,7 @@ pub(super) async fn drive_inference(
 
 type ProbeFuture =
     Pin<Box<dyn Future<Output = Result<CandidateRequestObservation, CoordinatorError>> + Send>>;
+type ParkedStatusFuture = Pin<Box<dyn Future<Output = Result<mllm_domain::qualification::CandidateParkedStatusObservation, CoordinatorError>> + Send>>;
 type SecurityControlFuture = Pin<
     Box<
         dyn Future<
@@ -294,7 +299,7 @@ type SecurityControlFuture = Pin<
 >;
 pub(super) struct CandidateDriver {
     pub(super) engine: Arc<dyn EngineAdapter>,
-    pub(super) parked_status: Arc<dyn Fn(mllm_domain::completion::StepExecutionContext) -> Result<mllm_domain::qualification::CandidateParkedStatusObservation, CoordinatorError> + Send + Sync>,
+    pub(super) parked_status: Arc<dyn Fn(mllm_domain::completion::StepExecutionContext) -> ParkedStatusFuture + Send + Sync>,
     pub(super) probe: Arc<dyn Fn(CandidateProbeDispatch) -> ProbeFuture + Send + Sync>,
     pub(super) security_control: Arc<
         dyn Fn(
@@ -326,8 +331,12 @@ impl CandidateDriver {
         Arc::new(Self {
             engine,
             parked_status: Arc::new(move |context| {
-                crate::qualification::collect_parked_status_with_clock(&status_engine, &context, &|| status_clock().map_err(|_| LifecycleError::Invalid))
-                    .map_err(|error| CoordinatorError::Service(error.to_string()))
+                let engine = status_engine.clone();
+                let clock = status_clock.clone();
+                Box::pin(async move {
+                    crate::qualification::collect_parked_status_with_clock(&engine, &context, &|| clock().map_err(|_| LifecycleError::Invalid))
+                        .map_err(|error| CoordinatorError::Service(error.to_string()))
+                })
             }),
             security_control: Arc::new(move |dispatch| {
                 let engine = control_engine.clone();
@@ -397,6 +406,9 @@ pub(super) async fn drive(
     let child = work.initialize_step_id.clone();
     let arm_observed = observed.clone();
     let arm_limits = limits.clone();
+    let retained_shared = shared.clone();
+    let retained_driver = driver.clone();
+    let retained_binding = work.binding_id.clone();
     let (arm, context) = shared
         .read(move |owner, now| {
             let arm = owner.store().arm_candidate_effect(
@@ -411,6 +423,11 @@ pub(super) async fn drive(
                 ),
             )?;
             let context = if permits_send(&arm) {
+                // The blocking arm job may outlive its awaiting future. Retain
+                // the original driver before returning any newly armed result.
+                let mut retained = retained_shared.retained_candidates.lock().map_err(|_|LifecycleError::CorruptStoredData)?;
+                if retained.contains_key(&retained_binding) { return Err(LifecycleError::CorruptStoredData); }
+                retained.insert(retained_binding,retained_driver);
                 Some(
                     owner
                         .store()
@@ -438,21 +455,6 @@ pub(super) async fn drive(
         return Err(CoordinatorError::Service(
             "candidate frozen context mismatch".into(),
         ));
-    }
-    {
-        use std::collections::btree_map::Entry;
-        let mut retained = shared
-            .retained_candidates
-            .lock()
-            .map_err(|_| shared.fail("candidate runtime registry poisoned"))?;
-        match retained.entry(work.binding_id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(driver.clone());
-            }
-            Entry::Occupied(_) => {
-                return Err(shared.fail("immutable candidate binding already retained"))
-            }
-        }
     }
     let child = work.initialize_step_id.clone();
     let expected = context.clone();
