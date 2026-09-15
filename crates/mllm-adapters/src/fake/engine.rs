@@ -8,7 +8,7 @@
 use crate::traits::*;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Resident bytes with everything loaded (weights + KV + buffers).
@@ -51,17 +51,24 @@ struct Knobs {
 /// Deterministic engine simulator: one state per member (deployments on
 /// the same engine share the adapter but hold independent member states —
 /// A parked must not make B unready).
-#[derive(Debug)]
 pub struct FakeEngine {
+    qualification_clock: Option<Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>>,
     qualification: Mutex<Option<super::qualification::QualificationState>>,
     knobs: Mutex<Knobs>,
     states: Mutex<HashMap<String, MemberState>>,
     started_at: std::time::Instant,
 }
 
+impl std::fmt::Debug for FakeEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeEngine").finish_non_exhaustive()
+    }
+}
+
 impl FakeEngine {
     pub fn new() -> Self {
         Self {
+            qualification_clock: None,
             qualification: Mutex::new(None),
             knobs: Mutex::new(Knobs {
                 policy: ParkPolicy::default(),
@@ -79,6 +86,16 @@ impl FakeEngine {
         let engine = Self::new();
         *engine.qualification.lock().unwrap() =
             Some(super::qualification::QualificationState::default());
+        engine
+    }
+
+    /// Service composition may timestamp actual Fake milestones using a trusted
+    /// clock. The deterministic fixture constructor preserves arm-time samples.
+    pub fn for_qualification_with_clock(
+        clock: Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>,
+    ) -> Self {
+        let mut engine = Self::for_qualification();
+        engine.qualification_clock = Some(clock);
         engine
     }
 
@@ -263,7 +280,7 @@ impl EngineAdapter for FakeEngine {
             .unwrap()
             .as_mut()
             .ok_or(RuntimeError::Unsupported)?
-            .execute(command)
+            .execute_with_clock(command, self.qualification_clock.as_deref())
     }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
         let st = self.member(member);

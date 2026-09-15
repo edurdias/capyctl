@@ -1055,6 +1055,7 @@ name = "mllm-controller"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "hex",
  "mllm-adapters",
  "mllm-config",

@@ -374,19 +374,45 @@ impl QualificationState {
         }
         Ok(crate::traits::StreamEnded::Completed)
     }
+    #[cfg(test)]
     pub(super) fn execute(
         &mut self,
         command: &RuntimeCommand,
+    ) -> Result<EffectObservation, RuntimeError> {
+        self.execute_with_clock(command, None)
+    }
+
+    pub(super) fn execute_with_clock(
+        &mut self,
+        command: &RuntimeCommand,
+        clock: Option<&(dyn Fn() -> Result<i64, RuntimeError> + Send + Sync)>,
     ) -> Result<EffectObservation, RuntimeError> {
         let c = &command.context;
         // Ordinary cold initialization explicitly includes a model-usability
         // probe. Candidate child effects retain their separate probe protocol.
         // This dispatch shape recognizes scope; catalog authority stays in Store.
         let ordinary = command.action == RuntimeAction::Initialize
-            && c.token.qualification_id.strip_prefix("qualified:").is_some_and(|id| id.len()==26 && id.as_bytes()[0]<=b'7' && id.bytes().all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b)))
-            && matches!(c.identities, mllm_domain::completion::ExecutionIdentities::OwnedLaunch)
-            && c.completion_target.as_ref().is_some_and(|p| p.phase == mllm_domain::resources::ResourcePhase::Ready && mllm_domain::resources::validate_footprint(p).is_ok());
-        if (c.completion_target.is_some() && !ordinary) || c.grant_id.is_none() || c.issued_at_ms >= c.deadline_ms
+            && c.token
+                .qualification_id
+                .strip_prefix("qualified:")
+                .is_some_and(|id| {
+                    id.len() == 26
+                        && id.as_bytes()[0] <= b'7'
+                        && id
+                            .bytes()
+                            .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
+                })
+            && matches!(
+                c.identities,
+                mllm_domain::completion::ExecutionIdentities::OwnedLaunch
+            )
+            && c.completion_target.as_ref().is_some_and(|p| {
+                p.phase == mllm_domain::resources::ResourcePhase::Ready
+                    && mllm_domain::resources::validate_footprint(p).is_ok()
+            });
+        if (c.completion_target.is_some() && !ordinary)
+            || c.grant_id.is_none()
+            || c.issued_at_ms >= c.deadline_ms
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -468,18 +494,34 @@ impl QualificationState {
         if ordinary {
             let model = format!("candidate-{}", c.token.deployment_id);
             let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: MLLM_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
-            let result = self.forward(&body).map_err(|_| RuntimeError::Uncertain("ordinary Fake readiness probe failed".into()))?;
-            if result["model"] != model || result["choices"][0]["message"]["content"] != "MLLM_READY_13" || result["choices"][0]["finish_reason"] != "stop" {
-                return Err(RuntimeError::Uncertain("ordinary Fake readiness probe failed".into()));
+            let result = self.forward(&body).map_err(|_| {
+                RuntimeError::Uncertain("ordinary Fake readiness probe failed".into())
+            })?;
+            if result["model"] != model
+                || result["choices"][0]["message"]["content"] != "MLLM_READY_13"
+                || result["choices"][0]["finish_reason"] != "stop"
+            {
+                return Err(RuntimeError::Uncertain(
+                    "ordinary Fake readiness probe failed".into(),
+                ));
             }
             facts.push(Milestone::ModelUsable);
+        }
+        let observed_at_ms = match clock {
+            Some(clock) => clock()?,
+            None => c.issued_at_ms,
+        };
+        if observed_at_ms < c.issued_at_ms || observed_at_ms >= c.deadline_ms {
+            return Err(RuntimeError::Uncertain(
+                "Fake observation clock outside accepted deadline".into(),
+            ));
         }
         Ok(EffectObservation {
             token: c.token.clone(),
             binding_id: c.binding_id.clone(),
             incarnation: c.incarnation.clone(),
             identities: self.members.clone(),
-            observed_at_ms: c.issued_at_ms,
+            observed_at_ms,
             receipt: format!(
                 "qualification-fake-v1:{:?}:{}",
                 command.action, c.token.step_id
@@ -526,22 +568,77 @@ mod tests {
         use mllm_domain::resources::{Allocation, PhaseFootprint, ResourcePhase};
         let mut c = command(RuntimeAction::Initialize, "ordinary");
         c.context.token.qualification_id = "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
-        c.context.completion_target = Some(PhaseFootprint { phase: ResourcePhase::Ready, allocations: vec![Allocation { domain:"unified".into(),bytes:8,host_kv_bytes:1 }], devices:vec![] });
+        c.context.completion_target = Some(PhaseFootprint {
+            phase: ResourcePhase::Ready,
+            allocations: vec![Allocation {
+                domain: "unified".into(),
+                bytes: 8,
+                host_kv_bytes: 1,
+            }],
+            devices: vec![],
+        });
         let mut state = QualificationState::default();
         let result = state.execute(&c).unwrap();
-        assert_eq!(result.facts, vec![Milestone::AllocationsRestored, Milestone::WeightsUsable, Milestone::CacheValid, Milestone::ModelUsable]);
-        assert_eq!(state.activity(), (1,1,1));
+        assert_eq!(
+            result.facts,
+            vec![
+                Milestone::AllocationsRestored,
+                Milestone::WeightsUsable,
+                Milestone::CacheValid,
+                Milestone::ModelUsable
+            ]
+        );
+        assert_eq!(state.activity(), (1, 1, 1));
         assert!(state.execute(&c).is_err());
-        for fault in [QualificationFault::WrongProbeOutput, QualificationFault::LostProbeReply, QualificationFault::FailedProbe, QualificationFault::MissingProbeFinish] {
-            let mut state = QualificationState { fault:Some(fault),..Default::default() };
+        for fault in [
+            QualificationFault::WrongProbeOutput,
+            QualificationFault::LostProbeReply,
+            QualificationFault::FailedProbe,
+            QualificationFault::MissingProbeFinish,
+        ] {
+            let mut state = QualificationState {
+                fault: Some(fault),
+                ..Default::default()
+            };
             assert!(state.execute(&c).is_err());
             assert!(state.allocations);
             assert!(state.alive);
         }
-        for id in ["candidate:run", "qualified:ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAI"] {
-            c.context.token.qualification_id=id.into();
+        for id in [
+            "candidate:run",
+            "qualified:ZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAI",
+        ] {
+            c.context.token.qualification_id = id.into();
             assert!(QualificationState::default().execute(&c).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn service_clock_timestamps_actual_fake_effect_and_failure_is_uncertain() {
+        use crate::{fake::FakeEngine, traits::EngineAdapter};
+        use std::sync::Arc;
+        let c = command(RuntimeAction::Initialize, "initialize");
+        let engine = FakeEngine::for_qualification_with_clock(Arc::new(|| Ok(1300)));
+        let result = engine.execute_persisted(&c).await.unwrap();
+        assert_eq!(result.observed_at_ms, 1300);
+        assert_ne!(result.observed_at_ms, c.context.issued_at_ms);
+        assert!(!result.identities.is_empty());
+        for now in [1199, 400000] {
+            let engine = FakeEngine::for_qualification_with_clock(Arc::new(move || Ok(now)));
+            assert!(matches!(
+                engine.execute_persisted(&c).await,
+                Err(RuntimeError::Uncertain(_))
+            ));
+            assert!(engine.execute_persisted(&c).await.is_err());
+        }
+        let engine = FakeEngine::for_qualification_with_clock(Arc::new(|| {
+            Err(RuntimeError::Uncertain("clock unavailable".into()))
+        }));
+        assert!(matches!(
+            engine.execute_persisted(&c).await,
+            Err(RuntimeError::Uncertain(_))
+        ));
     }
 
     #[test]
@@ -569,11 +666,9 @@ mod tests {
             .execute(&warm_command(RuntimeAction::Drain, "drain"))
             .unwrap();
         state.unknown_work = true;
-        assert!(
-            state
-                .execute(&warm_command(RuntimeAction::Park, "unknown-work"))
-                .is_err()
-        );
+        assert!(state
+            .execute(&warm_command(RuntimeAction::Park, "unknown-work"))
+            .is_err());
         state.unknown_work = false;
         state
             .execute(&warm_command(RuntimeAction::Park, "park"))
@@ -582,14 +677,12 @@ mod tests {
             .execute(&warm_command(RuntimeAction::Restore, "restore"))
             .unwrap();
         assert_eq!(restored.facts, vec![Milestone::AllocationsRestored]);
-        assert!(
-            state
-                .execute(&warm_command(
-                    RuntimeAction::InvalidateCache,
-                    "invalidate-too-early"
-                ))
-                .is_err()
-        );
+        assert!(state
+            .execute(&warm_command(
+                RuntimeAction::InvalidateCache,
+                "invalidate-too-early"
+            ))
+            .is_err());
         assert_eq!(
             state
                 .execute(&warm_command(RuntimeAction::ReloadWeights, "reload"))

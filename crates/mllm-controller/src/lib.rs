@@ -2,6 +2,9 @@
 //! lifecycle transitions executed against engine/launcher participants,
 //! and evidence-only journaling (design §5).
 
+#[cfg(test)]
+extern crate self as mllm_controller;
+
 pub mod coordinator;
 pub mod operations;
 pub mod ownership;

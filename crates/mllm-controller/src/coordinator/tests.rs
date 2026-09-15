@@ -1,0 +1,1120 @@
+use super::*;
+use mllm_adapters::traits::*;
+use mllm_domain::resources::ResourcePhase;
+use std::sync::{atomic::AtomicI64, Mutex};
+
+#[path = "../../tests/qualification_support/fixture.rs"]
+mod fixture;
+
+struct Observations(Vec<MemoryObservation>);
+impl ServiceObservation for Observations {
+    fn observe(&self, _: String) -> ObservationFuture {
+        let values = self.0.clone();
+        Box::pin(async move { Ok(values) })
+    }
+}
+
+async fn setup() -> (
+    tempfile::TempDir,
+    SharedCoordinatorState,
+    DeploymentFence,
+    Vec<MemoryObservation>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let source = fixture::owned_source().await;
+    let fence = source.fence.clone();
+    let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("srv.sqlite3");
+    std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = Arc::new(Mutex::new(
+        crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+    ));
+    (dir, owner, fence, source.observations.clone())
+}
+
+struct Gate {
+    engine: FakeEngine,
+    calls: Mutex<Vec<RuntimeAction>>,
+    entered: Semaphore,
+    release: Semaphore,
+    active: AtomicBool,
+    panic: bool,
+}
+impl Gate {
+    fn new(panic: bool) -> Arc<Self> {
+        Arc::new(Self {
+            engine: FakeEngine::for_qualification(),
+            calls: Mutex::new(vec![]),
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            active: AtomicBool::new(false),
+            panic,
+        })
+    }
+    async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+}
+struct Active<'a>(&'a AtomicBool);
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl EngineAdapter for Gate {
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<mllm_domain::qualification::EffectObservation, RuntimeError> {
+        self.calls.lock().unwrap().push(command.action);
+        self.active.store(true, Ordering::SeqCst);
+        let _active = Active(&self.active);
+        let result = self.engine.execute_persisted(command).await;
+        self.entered.add_permits(1);
+        assert!(!self.panic, "injected adapter panic after effect");
+        self.release.acquire().await.unwrap().forget();
+        result
+    }
+    async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn prepare_park(&self, _: &MemberRef) -> Result<Quiescence, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn restore(&self, _: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+    async fn cancel_work(
+        &self,
+        _: &MemberRef,
+        _: &RequestRef,
+        _: bool,
+    ) -> Result<CancellationOutcome, AdapterError> {
+        Err(AdapterError::UnsupportedCapability)
+    }
+}
+
+fn worker(
+    owner: SharedCoordinatorState,
+    observations: Vec<MemoryObservation>,
+    gate: Arc<Gate>,
+    options: CoordinatorOptions,
+) -> OwnedCoordinator {
+    OwnedCoordinator::spawn(
+        owner,
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        options,
+        Arc::new(move |_| Ok(gate.clone())),
+    )
+    .unwrap()
+}
+async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = worker.status();
+            if status != WorkerStatus::Running {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+fn assert_peak(owner: &SharedCoordinatorState, fence: &DeploymentFence) {
+    let o = owner.lock().unwrap();
+    assert_eq!(
+        o.store().resource_snapshot().unwrap().owners[&fence.deployment_id].phase,
+        ResourcePhase::Cold
+    );
+    assert_eq!(
+        o.store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "uncertain"
+    );
+}
+
+#[tokio::test]
+async fn dropped_waiters_and_caller_timeout_do_not_cancel_or_hold_store() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = Arc::new(worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    ));
+    let first = w.clone();
+    let second = w.clone();
+    let first_fence = fence.clone();
+    let second_fence = fence.clone();
+    let (a, b) = tokio::join!(
+        tokio::task::spawn_blocking(move || first.start(&first_fence, 10000)),
+        tokio::task::spawn_blocking(move || second.start(&second_fence, 10000)),
+    );
+    let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+    let w = Arc::try_unwrap(w).unwrap_or_else(|_| panic!("unexpected coordinator owner"));
+    assert_eq!(a.operation_id(), b.operation_id());
+    gate.entered().await;
+    assert!(matches!(
+        a.wait(Duration::from_millis(10)).await,
+        Err(CoordinatorError::CallerTimeout)
+    ));
+    let step = a.step_id().to_owned();
+    drop(a);
+    drop(b);
+    // The engine is suspended here: acquiring Store and writing a transaction
+    // must succeed, proving the driver await does not retain a Store guard.
+    {
+        let owned = owner.clone();
+        let step = step.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let o = owned.lock().unwrap();
+                assert_eq!(
+                    o.store()
+                        .qualified_initialize_execution(o.session(), &step)
+                        .unwrap()
+                        .deadline_ms,
+                    10000
+                );
+            }),
+        )
+        .await
+        .expect("Store guard held across driver await")
+        .unwrap();
+    }
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let done = {
+                let o = owner.lock().unwrap();
+                o.store()
+                    .qualified_initialize_status(o.session(), &step, 1900)
+                    .unwrap()
+                    == QualifiedInitializeStatus::Completed
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    assert!(!gate.active.load(Ordering::SeqCst));
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn timeout_and_panic_retain_peak_and_never_stop_or_continue() {
+    for panic in [false, true] {
+        let (_dir, owner, fence, observations) = setup().await;
+        let gate = Gate::new(panic);
+        let w = worker(
+            owner.clone(),
+            observations,
+            gate.clone(),
+            CoordinatorOptions {
+                protocol_timeout: Duration::from_millis(30),
+                ..Default::default()
+            },
+        );
+        let a = w.start(&fence, 10000).unwrap();
+        gate.entered().await;
+        assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
+        assert_eq!(
+            a.wait(Duration::from_secs(10)).await.unwrap(),
+            QualifiedInitializeStatus::Uncertain
+        );
+        assert_peak(&owner, &fence);
+        assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+        assert!(!gate.active.load(Ordering::SeqCst));
+        assert!(w.start(&fence, 10000).is_err());
+        w.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn shutdown_joins_effect_before_ownership_can_be_reacquired() {
+    let (dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    );
+    let a = w.start(&fence, 10000).unwrap();
+    gate.entered().await;
+    drop(a);
+    drop(owner);
+    assert!(crate::ownership::OwnedCoordinatorState::open(dir.path()).is_err());
+    assert!(matches!(
+        w.shutdown().await.unwrap(),
+        WorkerStatus::Uncertain { .. }
+    ));
+    assert!(!gate.active.load(Ordering::SeqCst));
+    let restarted = crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap();
+    assert!(restarted
+        .store()
+        .next_qualified_initialize(restarted.session())
+        .unwrap()
+        .is_none());
+    assert_eq!(gate.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn missing_notification_is_recovered_by_durable_poll() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    {
+        let o = owner.lock().unwrap();
+        o.store()
+            .accept_qualified_start(o.session(), &fence, 1900, 10000)
+            .unwrap();
+    }
+    gate.entered().await;
+    assert_eq!(gate.calls.lock().unwrap().len(), 1);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_observation_and_expired_queue_block_without_freeing_endpoint() {
+    for expired in [false, true] {
+        let (_dir, owner, fence, mut observations) = setup().await;
+        let clock = Arc::new(AtomicI64::new(1900));
+        {
+            let o = owner.lock().unwrap();
+            o.store()
+                .accept_qualified_start(o.session(), &fence, 1800, 1901)
+                .unwrap();
+        }
+        if expired {
+            clock.store(1902, Ordering::SeqCst);
+        } else {
+            for o in &mut observations {
+                o.sampled_at_ms = 1901;
+            }
+        }
+        let clock_read = clock.clone();
+        let gate = Gate::new(false);
+        let driver = gate.clone();
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(move || Ok(clock_read.load(Ordering::SeqCst))),
+            CoordinatorOptions::default(),
+            Arc::new(move |_| Ok(driver.clone())),
+        )
+        .unwrap();
+        assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
+        assert!(gate.calls.lock().unwrap().is_empty());
+        {
+            let o = owner.lock().unwrap();
+            assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+            assert_eq!(
+                o.store()
+                    .runtime_binding(&fence.deployment_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "reserved"
+            );
+        }
+        w.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn observer_bound_is_enforced_without_accepting_extra_work() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = worker(
+        owner,
+        observations,
+        gate,
+        CoordinatorOptions {
+            max_observers: 1,
+            ..Default::default()
+        },
+    );
+    let a = w.start(&fence, 10000).unwrap();
+    assert!(matches!(
+        w.start(&fence, 10000),
+        Err(CoordinatorError::Busy)
+    ));
+    drop(a);
+    let b = w.start(&fence, 10000).unwrap();
+    drop(b);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_worker_cannot_claim_the_same_owned_session() {
+    let (_dir, owner, _fence, observations) = setup().await;
+    let w = worker(
+        owner.clone(),
+        observations.clone(),
+        Gate::new(false),
+        CoordinatorOptions::default(),
+    );
+    assert!(OwnedCoordinator::spawn_fake(
+        owner,
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default()
+    )
+    .is_err());
+    w.shutdown().await.unwrap();
+}
+
+struct HeldObservation {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+    observations: Vec<MemoryObservation>,
+}
+impl ServiceObservation for HeldObservation {
+    fn observe(&self, _: String) -> ObservationFuture {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        let observations = self.observations.clone();
+        Box::pin(async move {
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+            Ok(observations)
+        })
+    }
+}
+
+#[tokio::test]
+async fn current_policy_race_and_observation_timeout_deny_send() {
+    for timeout in [false, true] {
+        let (_dir, owner, fence, observations) = setup().await;
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let source = Arc::new(HeldObservation {
+            entered: entered.clone(),
+            release: release.clone(),
+            observations: observations.clone(),
+        });
+        let gate = Gate::new(false);
+        let driver = gate.clone();
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            source,
+            Arc::new(|| Ok(1900)),
+            CoordinatorOptions {
+                protocol_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+            Arc::new(move |_| Ok(driver.clone())),
+        )
+        .unwrap();
+        let a = w.start(&fence, 10000).unwrap();
+        entered.acquire().await.unwrap().forget();
+        if !timeout {
+            let o = owner.lock().unwrap();
+            let mut controls = o.store().resource_policy("lab").unwrap().unwrap().controls;
+            controls.domains.get_mut("unified").unwrap().managed_limit = 9_i64 << 30;
+            o.store()
+                .update_resource_policy(
+                    o.session(),
+                    "owner",
+                    "lab",
+                    1,
+                    "race",
+                    &controls,
+                    &observations,
+                    1900,
+                )
+                .unwrap();
+            release.add_permits(1);
+        }
+        assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
+        assert!(gate.calls.lock().unwrap().is_empty());
+        assert!(owner
+            .lock()
+            .unwrap()
+            .store()
+            .resource_snapshot()
+            .unwrap()
+            .owners
+            .is_empty());
+        drop(a);
+        w.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn clock_read_after_validation_preserves_arm_when_freshness_expires() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let arm_seen = armed.clone();
+    let clock_owner = owner.clone();
+    // Service time advances only at the final clock read outside Store. This
+    // simulates costly provenance validation consuming the observation window.
+    let clock = Arc::new(move || {
+        if let Ok(o) = clock_owner.try_lock() {
+            if !o.store().resource_snapshot().unwrap().owners.is_empty() {
+                arm_seen.store(true, Ordering::SeqCst);
+                return Ok(9999);
+            }
+        }
+        Ok(1900)
+    });
+    let gate = Gate::new(false);
+    let driver = gate.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        clock,
+        CoordinatorOptions::default(),
+        Arc::new(move |_| Ok(driver.clone())),
+    )
+    .unwrap();
+    let a = w.start(&fence, 10000).unwrap();
+    assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
+    assert!(armed.load(Ordering::SeqCst));
+    assert!(gate.calls.lock().unwrap().is_empty());
+    assert_peak(&owner, &fence);
+    drop(a);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_racing_completion_cannot_publish_ready() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    );
+    let a = w.start(&fence, 10000).unwrap();
+    gate.entered().await;
+    {
+        let o = owner.lock().unwrap();
+        o.store().fence_stop(o.session(), &fence, 10000).unwrap();
+    }
+    gate.release.add_permits(1);
+    assert!(matches!(stopped(&w).await, WorkerStatus::Failed(_)));
+    assert_eq!(
+        a.wait(Duration::from_secs(3)).await.unwrap(),
+        QualifiedInitializeStatus::Superseded
+    );
+    assert_peak(&owner, &fence);
+    assert_eq!(gate.calls.lock().unwrap().len(), 1);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_store_after_effect_halts_later_increases_and_retains_arm() {
+    let (dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    );
+    let a = w.start(&fence, 10000).unwrap();
+    gate.entered().await;
+    let other = fixture::owned_source().await.other.clone();
+    let b = w.start(&other, 10000).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    // Named negative fault: fail both evidence and uncertainty writes.
+    sql.execute_batch("CREATE TRIGGER fail_worker_association BEFORE INSERT ON owned_launch_associations BEGIN SELECT RAISE(ABORT,'injected Store write failure'); END; CREATE TRIGGER fail_worker_uncertain BEFORE UPDATE OF state ON lifecycle_steps WHEN NEW.state='uncertain' BEGIN SELECT RAISE(ABORT,'injected uncertain failure'); END;").unwrap();
+    gate.release.add_permits(1);
+    assert!(matches!(stopped(&w).await, WorkerStatus::Failed(_)));
+    assert_peak(&owner, &fence);
+    assert_eq!(gate.calls.lock().unwrap().len(), 1);
+    let state: String = sql
+        .query_row(
+            "SELECT state FROM lifecycle_steps WHERE id=?1",
+            [a.step_id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "armed");
+    {
+        let o = owner.lock().unwrap();
+        assert_eq!(
+            o.store()
+                .runtime_binding(&other.deployment_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "reserved"
+        );
+    }
+    drop(a);
+    drop(b);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn persisted_queue_bound_denies_new_work_but_allows_join() {
+    let (_dir, owner, fence, observations) = setup().await;
+    {
+        let o = owner.lock().unwrap();
+        let mut controls = o.store().resource_policy("lab").unwrap().unwrap().controls;
+        controls.queue.max_pending_total = 1;
+        controls.queue.max_pending_per_deployment = 1;
+        o.store()
+            .update_resource_policy(
+                o.session(),
+                "owner",
+                "lab",
+                1,
+                "bound",
+                &controls,
+                &observations,
+                1800,
+            )
+            .unwrap();
+    }
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    );
+    let a = w.start(&fence, 10000).unwrap();
+    let b = w.start(&fence, 10000).unwrap();
+    assert_eq!(a.operation_id(), b.operation_id());
+    let other = fixture::owned_source().await.other.clone();
+    assert!(w.start(&other, 10000).is_err());
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store()
+        .runtime_binding(&other.deployment_id)
+        .unwrap()
+        .is_none());
+    drop(a);
+    drop(b);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn real_elapsed_service_clock_bounds_provenance_before_send() {
+    let (dir, owner, fence, observations) = setup().await;
+    // Explicit test-only 10s policy accommodates concurrent debug validation.
+    // The strict default-2s expiry test above remains separate.
+    {
+        let o = owner.lock().unwrap();
+        let mut controls = o.store().resource_policy("lab").unwrap().unwrap().controls;
+        controls.observation_ttl_ms = 10000;
+        o.store()
+            .update_resource_policy(
+                o.session(),
+                "owner",
+                "lab",
+                1,
+                "timing-fixture",
+                &controls,
+                &observations,
+                1800,
+            )
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let clock: ServiceClock = Arc::new(move || Ok(1900 + started.elapsed().as_millis() as i64));
+    struct FreshSource(ServiceClock);
+    impl ServiceObservation for FreshSource {
+        fn observe(&self, _: String) -> ObservationFuture {
+            let now = (self.0)().unwrap();
+            Box::pin(async move {
+                Ok(vec![MemoryObservation {
+                    domain: "unified".into(),
+                    capacity_bytes: 1_i64 << 50,
+                    available_bytes: 1_i64 << 50,
+                    sampled_at_ms: now,
+                }])
+            })
+        }
+    }
+    let w = OwnedCoordinator::spawn_fake(
+        owner,
+        Arc::new(FreshSource(clock.clone())),
+        clock,
+        CoordinatorOptions::default(),
+    )
+    .unwrap();
+    let a = w.start(&fence, 30000).unwrap();
+    let status = a.wait(Duration::from_secs(20)).await.unwrap();
+    eprintln!(
+        "owned ordinary real-clock acceptance to observation: {:?}; {status:?}; {:?}",
+        started.elapsed(),
+        w.status()
+    );
+    assert_eq!(status, QualifiedInitializeStatus::Completed);
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let (issued, observed): (i64, i64) = sql.query_row(
+        "SELECT json_extract(s.step_json,'$.execution.issued_at_ms'),json_extract(a.association_json,'$.observed_at_ms') FROM lifecycle_steps s JOIN owned_launch_associations a ON a.step_id=s.id WHERE s.id=?1",
+        [a.step_id()], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert!(
+        observed > issued,
+        "real milestone must not reuse arm timestamp"
+    );
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() {
+    let (dir, owner, fence, observations) = setup().await;
+    let o = owner.lock().unwrap();
+    let accepted = o
+        .store()
+        .accept_qualified_start(o.session(), &fence, 1800, 10000)
+        .unwrap();
+    let policy = o.store().resource_policy("lab").unwrap().unwrap();
+    let limits: Vec<_> = policy
+        .controls
+        .domains
+        .iter()
+        .map(|(domain, d)| MemoryLimit {
+            domain: domain.clone(),
+            managed_bytes: d.managed_limit,
+            free_reserve_bytes: d.free_reserve,
+            host_kv_bytes: d.host_kv_limit,
+            parked_bytes: d.parked_limit,
+        })
+        .collect();
+    let admission = || {
+        mllm_scheduler::residency::AdmissionContext::new(
+            &observations,
+            &limits,
+            1900,
+            policy.controls.observation_ttl_ms,
+            policy.controls.max_parked as usize,
+        )
+    };
+    let (arm, context) = o
+        .store()
+        .arm_qualified_initialize_with_context(o.session(), &accepted.step_id, admission())
+        .unwrap();
+    assert!(permits_send(&arm));
+    let context = context.unwrap();
+    let (retry, no_context) = o
+        .store()
+        .arm_qualified_initialize_with_context(o.session(), &accepted.step_id, admission())
+        .unwrap();
+    assert!(!permits_send(&retry));
+    assert!(no_context.is_none());
+    assert!(o
+        .store()
+        .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, 1900)
+        .is_ok());
+    assert!(o
+        .store()
+        .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, 10000)
+        .is_err());
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    // Named negative injections after arm. Each failed validation is read-only.
+    for (mutation, restore) in [
+        (
+            "UPDATE lifecycle_steps SET step_json=json_set(step_json,'$.execution.issued_at_ms',1901) WHERE id=?1",
+            "UPDATE lifecycle_steps SET step_json=json_set(step_json,'$.execution.issued_at_ms',1900) WHERE id=?1",
+        ),
+        (
+            "UPDATE lifecycle_steps SET state='uncertain' WHERE id=?1",
+            "UPDATE lifecycle_steps SET state='armed' WHERE id=?1",
+        ),
+        (
+            "UPDATE runtime_bindings SET identities_json='[{}]' WHERE id=(SELECT binding_id FROM lifecycle_steps WHERE id=?1)",
+            "UPDATE runtime_bindings SET identities_json='[]' WHERE id=(SELECT binding_id FROM lifecycle_steps WHERE id=?1)",
+        ),
+        (
+            "UPDATE endpoint_leases SET host='127.0.0.2' WHERE binding_id=(SELECT binding_id FROM lifecycle_steps WHERE id=?1)",
+            "UPDATE endpoint_leases SET host='127.0.0.1' WHERE binding_id=(SELECT binding_id FROM lifecycle_steps WHERE id=?1)",
+        ),
+        (
+            "UPDATE lifecycle_claims SET generation=generation+1 WHERE operation_id=(SELECT operation_id FROM lifecycle_steps WHERE id=?1)",
+            "UPDATE lifecycle_claims SET generation=generation-1 WHERE operation_id=(SELECT operation_id FROM lifecycle_steps WHERE id=?1)",
+        ),
+        (
+            "UPDATE deployments SET dispatch_enabled=1 WHERE id=(SELECT deployment_id FROM lifecycle_steps WHERE id=?1)",
+            "UPDATE deployments SET dispatch_enabled=0 WHERE id=(SELECT deployment_id FROM lifecycle_steps WHERE id=?1)",
+        ),
+        (
+            "UPDATE resource_grants SET committed_epoch=committed_epoch+10 WHERE id=(SELECT grant_id FROM lifecycle_steps WHERE id=?1)",
+            "UPDATE resource_grants SET committed_epoch=committed_epoch-10 WHERE id=(SELECT grant_id FROM lifecycle_steps WHERE id=?1)",
+        ),
+    ] {
+        sql.execute(mutation, [&accepted.step_id]).unwrap();
+        assert!(
+            o.store()
+                .revalidate_qualified_initialize_send(
+                    o.session(),
+                    &accepted.step_id,
+                    &context,
+                    1900
+                )
+                .is_err(),
+            "{mutation}"
+        );
+        sql.execute(restore, [&accepted.step_id]).unwrap();
+        assert!(
+            o.store()
+                .revalidate_qualified_initialize_send(
+                    o.session(),
+                    &accepted.step_id,
+                    &context,
+                    1900
+                )
+                .is_ok()
+        );
+    }
+    o.store()
+        .update_resource_policy(
+            o.session(),
+            "owner",
+            "lab",
+            1,
+            "after-arm",
+            &policy.controls,
+            &observations,
+            1900,
+        )
+        .unwrap();
+    assert!(o
+        .store()
+        .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, 1900)
+        .is_err());
+}
+
+#[tokio::test]
+async fn completed_observer_rejects_binding_identity_and_evidence_corruption() {
+    let (dir, owner, fence, observations) = setup().await;
+    let w = OwnedCoordinator::spawn_fake(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+    )
+    .unwrap();
+    let a = w.start(&fence, 10000).unwrap();
+    assert_eq!(
+        a.wait(Duration::from_secs(20)).await.unwrap(),
+        QualifiedInitializeStatus::Completed
+    );
+    {
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        let o = owner.lock().unwrap();
+        for (select, update, corrupt) in [
+            (
+                "SELECT b.state FROM runtime_bindings b JOIN lifecycle_steps s ON s.binding_id=b.id WHERE s.id=?1",
+                "UPDATE runtime_bindings SET state=?2 WHERE id=(SELECT binding_id FROM lifecycle_steps WHERE id=?1)",
+                "uncertain",
+            ),
+            (
+                "SELECT b.identities_json FROM runtime_bindings b JOIN lifecycle_steps s ON s.binding_id=b.id WHERE s.id=?1",
+                "UPDATE runtime_bindings SET identities_json=?2 WHERE id=(SELECT binding_id FROM lifecycle_steps WHERE id=?1)",
+                "[]",
+            ),
+            (
+                "SELECT evidence_json FROM lifecycle_evidence WHERE step_id=?1",
+                "UPDATE lifecycle_evidence SET evidence_json=?2 WHERE step_id=?1",
+                "{}",
+            ),
+            (
+                "SELECT o.state FROM operations o JOIN lifecycle_steps s ON s.operation_id=o.id WHERE s.id=?1",
+                "UPDATE operations SET state=?2 WHERE id=(SELECT operation_id FROM lifecycle_steps WHERE id=?1)",
+                "running",
+            ),
+        ] {
+            let original: String = sql.query_row(select, [a.step_id()], |r| r.get(0)).unwrap();
+            sql.execute(update, [a.step_id(), corrupt]).unwrap();
+            assert!(
+                o.store()
+                    .qualified_initialize_status(o.session(), a.step_id(), 1900)
+                    .is_err(),
+                "{update}"
+            );
+            sql.execute(update, [a.step_id(), &original]).unwrap();
+            assert_eq!(
+                o.store()
+                    .qualified_initialize_status(o.session(), a.step_id(), 1900)
+                    .unwrap(),
+                QualifiedInitializeStatus::Completed
+            );
+        }
+    }
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_with_an_armed_step_never_resends_it() {
+    let (dir, owner, fence, observations) = setup().await;
+    {
+        let o = owner.lock().unwrap();
+        let accepted = o
+            .store()
+            .accept_qualified_start(o.session(), &fence, 1800, 10000)
+            .unwrap();
+        let p = o.store().resource_policy("lab").unwrap().unwrap();
+        let limits: Vec<_> = p
+            .controls
+            .domains
+            .iter()
+            .map(|(domain, d)| MemoryLimit {
+                domain: domain.clone(),
+                managed_bytes: d.managed_limit,
+                free_reserve_bytes: d.free_reserve,
+                host_kv_bytes: d.host_kv_limit,
+                parked_bytes: d.parked_limit,
+            })
+            .collect();
+        let result = o
+            .store()
+            .arm_step(
+                o.session(),
+                &accepted.step_id,
+                mllm_scheduler::residency::AdmissionContext::new(
+                    &observations,
+                    &limits,
+                    1900,
+                    p.controls.observation_ttl_ms,
+                    p.controls.max_parked as usize,
+                ),
+            )
+            .unwrap();
+        assert!(permits_send(&result));
+    }
+    drop(owner);
+    let owner = Arc::new(Mutex::new(
+        crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+    ));
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(gate.calls.lock().unwrap().is_empty());
+    assert_peak(&owner, &fence);
+    assert!(w.start(&fence, 10000).is_err());
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_observer_reads_remain_bounded_until_blocking_jobs_exit() {
+    let (_dir, owner, fence, observations) = setup().await;
+    let gate = Gate::new(false);
+    let w = worker(
+        owner.clone(),
+        observations,
+        gate.clone(),
+        CoordinatorOptions {
+            max_observers: 1,
+            ..Default::default()
+        },
+    );
+    let a = w.start(&fence, 10000).unwrap();
+    gate.entered().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _guard = owner.lock().unwrap();
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.await.unwrap();
+    for _ in 0..8 {
+        assert!(matches!(
+            a.wait(Duration::from_millis(5)).await,
+            Err(CoordinatorError::CallerTimeout)
+        ));
+    }
+    // Two submitted Store jobs retain their permits despite caller cancellation;
+    // later reads wait outside the blocking pool and are cancelled there.
+    assert_eq!(w.shared.store_jobs.available_permits(), 0);
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap();
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        w.shared.store_jobs.clone().acquire_many_owned(2),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    assert_eq!(gate.calls.lock().unwrap().len(), 1);
+    w.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
+    let (_dir, owner, fence, mut observations) = setup().await;
+    let started = std::time::Instant::now();
+    let now = move || 1900 + started.elapsed().as_millis() as i64;
+    fn stage<T>(
+        owner: &SharedCoordinatorState,
+        name: &str,
+        f: impl FnOnce(&crate::ownership::OwnedCoordinatorState) -> T,
+    ) -> T {
+        let started = std::time::Instant::now();
+        let result = f(&owner.lock().unwrap());
+        eprintln!("ordinary worker stage {name}: {:?}", started.elapsed());
+        result
+    }
+    let controls = stage(&owner, "test-only-10s-policy", |o| {
+        let mut c = o.store().resource_policy("lab").unwrap().unwrap().controls;
+        c.observation_ttl_ms = 10000;
+        o.store()
+            .update_resource_policy(
+                o.session(),
+                "owner",
+                "lab",
+                1,
+                "stage-timing",
+                &c,
+                &observations,
+                1800,
+            )
+            .unwrap();
+        c
+    });
+    let accepted = stage(&owner, "acceptance", |o| {
+        o.store()
+            .accept_qualified_start(o.session(), &fence, now(), 30000)
+            .unwrap()
+    });
+    stage(&owner, "discovery", |o| {
+        assert!(o
+            .store()
+            .next_qualified_initialize(o.session())
+            .unwrap()
+            .is_some());
+    });
+    let limits: Vec<_> = controls
+        .domains
+        .iter()
+        .map(|(domain, d)| MemoryLimit {
+            domain: domain.clone(),
+            managed_bytes: d.managed_limit,
+            free_reserve_bytes: d.free_reserve,
+            host_kv_bytes: d.host_kv_limit,
+            parked_bytes: d.parked_limit,
+        })
+        .collect();
+    for observation in &mut observations {
+        observation.sampled_at_ms = now();
+    }
+    let (arm, context) = stage(&owner, "arm-and-context", |o| {
+        o.store()
+            .arm_qualified_initialize_with_context(
+                o.session(),
+                &accepted.step_id,
+                mllm_scheduler::residency::AdmissionContext::new(
+                    &observations,
+                    &limits,
+                    now(),
+                    controls.observation_ttl_ms,
+                    controls.max_parked as usize,
+                ),
+            )
+            .unwrap()
+    });
+    assert!(permits_send(&arm));
+    let context = context.unwrap();
+    stage(&owner, "pre-send-local-fences", |o| {
+        o.store()
+            .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, now())
+            .unwrap()
+    });
+    let engine = FakeEngine::for_qualification_with_clock(Arc::new(move || Ok(now())));
+    let observation = engine
+        .execute_persisted(&RuntimeCommand {
+            action: RuntimeAction::Initialize,
+            context,
+        })
+        .await
+        .unwrap();
+    let observed_at_ms = observation.observed_at_ms;
+    stage(&owner, "owned-association-full-proof", |o| {
+        o.store()
+            .record_owned_launch(
+                o.session(),
+                &accepted.step_id,
+                &OwnedLaunchReceipt {
+                    binding_id: observation.binding_id,
+                    incarnation: observation.incarnation,
+                    identities: observation.identities.clone(),
+                    observed_at_ms,
+                    receipt: observation.receipt.clone(),
+                },
+                now(),
+            )
+            .unwrap()
+    });
+    let evidence = CompletionEvidence {
+        token: observation.token,
+        identities: observation.identities,
+        observed_at_ms,
+        control_receipt: Some(observation.receipt),
+        milestones: observation.facts,
+    };
+    stage(&owner, "completion-full-proof", |o| {
+        o.store()
+            .complete_step(
+                o.session(),
+                &accepted.step_id,
+                &evidence,
+                now(),
+                controls.observation_ttl_ms,
+            )
+            .unwrap()
+    });
+    assert_eq!(evidence.observed_at_ms, observed_at_ms);
+    assert_eq!(
+        stage(&owner, "observer-local-proof", |o| o
+            .store()
+            .qualified_initialize_status(o.session(), &accepted.step_id, now())
+            .unwrap()),
+        QualifiedInitializeStatus::Completed
+    );
+}

@@ -2,13 +2,16 @@
 
 use mllm_launchers::ControllerLock;
 use mllm_store::{
-    Store, StoreError,
     dispatch::{CoordinatorSession, DispatchError},
+    Store, StoreError,
 };
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+/// Shared application ownership; guards must never cross an external await.
+pub type SharedCoordinatorState = std::sync::Arc<std::sync::Mutex<OwnedCoordinatorState>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OwnedStateError {
@@ -25,6 +28,7 @@ pub enum OwnedStateError {
 pub struct OwnedCoordinatorState {
     store: Store,
     session: CoordinatorSession,
+    worker_claimed: bool,
     _lock: ControllerLock,
 }
 
@@ -53,6 +57,7 @@ impl OwnedCoordinatorState {
         Ok(Self {
             store,
             session,
+            worker_claimed: false,
             _lock: lock,
         })
     }
@@ -62,6 +67,15 @@ impl OwnedCoordinatorState {
     }
     pub fn session(&self) -> &CoordinatorSession {
         &self.session
+    }
+
+    /// One worker for this session, including after it conservatively halts.
+    pub(crate) fn claim_worker(&mut self) -> bool {
+        if self.worker_claimed {
+            return false;
+        }
+        self.worker_claimed = true;
+        true
     }
 }
 

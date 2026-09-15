@@ -1,4 +1,7 @@
-//! Owned coordinator dispatch decisions. Production worker composition is pending.
+//! Owned, qualified Fake initialization. Production consumer cutover is pending.
+
+mod worker;
+pub use worker::*;
 
 use mllm_store::candidate_creation::initialize::ArmResult;
 

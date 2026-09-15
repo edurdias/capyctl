@@ -6,26 +6,26 @@ use crate::lifecycle::completion::{
     canonical_members, check_session, completion_value, decode, encode, fresh, identity_dtos,
     members,
 };
-use crate::resource_ledger::{self, GrantRequest, reserve_increase_in_transaction};
-use crate::resource_policy::{ResourcePolicySnapshot, read_singleton_policy};
+use crate::resource_ledger::{self, reserve_increase_in_transaction, GrantRequest};
+use crate::resource_policy::{read_singleton_policy, ResourcePolicySnapshot};
 use crate::{
     dispatch::CoordinatorSession,
     lifecycle::{
-        BindingDto, DeploymentFence, IdentityDto, LifecycleError, PreparedBinding, ReserveBinding,
-        insert_prepared_binding,
+        insert_prepared_binding, BindingDto, DeploymentFence, IdentityDto, LifecycleError,
+        PreparedBinding, ReserveBinding,
     },
 };
-use mllm_config::effective::{EffectiveDeployment, decode_effective_snapshot};
+use mllm_config::effective::{decode_effective_snapshot, EffectiveDeployment};
 use mllm_config::resource_controls::ResourceContext;
 use mllm_domain::completion::{
-    CompletionEvidence, CompletionExpectation, ExecutionIdentities, OwnedLaunchReceipt,
-    StepExecutionContext, TransitionToken, verify_completion,
+    verify_completion, CompletionEvidence, CompletionExpectation, ExecutionIdentities,
+    OwnedLaunchReceipt, StepExecutionContext, TransitionToken,
 };
 use mllm_domain::resources::{
     Allocation, DeviceClaim, MemoryLimit, PhaseFootprint, ResourcePhase, Sharing,
 };
 use mllm_scheduler::residency::AdmissionContext;
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -276,6 +276,18 @@ fn load(
     {
         return Err(LifecycleError::Conflict);
     }
+    validate_local(tx, &p, &e, &state)?;
+    Ok((p, e, state))
+}
+
+/// Current local arm/ownership relationships. No catalog cache or send authority.
+fn validate_local(
+    tx: &Transaction<'_>,
+    p: &Plan,
+    e: &EffectiveDeployment,
+    state: &str,
+) -> Result<(), LifecycleError> {
+    let binding: BindingDto = decode(&p.binding_json)?;
     let endpoint: std::net::SocketAddr = binding
         .endpoint
         .parse()
@@ -294,7 +306,7 @@ fn load(
         p.deadline_ms,
     )?;
     let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?1 AND operation_id=?2 AND deployment_id=?3 AND binding_id=?4 AND session_id=?5 AND ordinal=0) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8 AND state=?9) AND EXISTS(SELECT 1 FROM endpoint_leases WHERE binding_id=?4 AND host='127.0.0.1' AND port=?10) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND (SELECT COUNT(*) FROM endpoint_leases WHERE binding_id=?4)=1 AND (SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?3 AND state!='released')=1",params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,if state=="planned" {"reserved"} else if state=="completed" {"live"} else {"uncertain"},endpoint.port()],|r|r.get(0))?;
-    let expected_operation = match state.as_str() {
+    let expected_operation = match state {
         "planned" if run == "queued" => "pending",
         "armed" if run == "running" => "running",
         "uncertain" if run == "uncertain" => "running",
@@ -308,7 +320,7 @@ fn load(
     let ledger = resource_ledger::read_snapshot(tx).map_err(resource)?;
     match &p.execution {
         None if state == "planned" => {
-            let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?2 AND grant_id IS NOT NULL)",params![p.operation_id,id],|r|r.get(0))?;
+            let effects: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1) OR EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?2 AND grant_id IS NOT NULL)",params![p.operation_id,p.step_id],|r|r.get(0))?;
             if effects || ledger.owners.contains_key(&p.deployment_id) {
                 return Err(LifecycleError::Conflict);
             }
@@ -330,7 +342,7 @@ fn load(
                 execution.expected_epoch,
                 &frozen,
             ))?;
-            let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE id=?1 AND deployment_id=?2 AND operation_id=?3 AND request_json=?4 AND committed_epoch=?5) AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?6 AND grant_id=?1) AND (SELECT COUNT(*) FROM resource_grants WHERE operation_id=?3)=1", params![execution.grant_id,p.deployment_id,p.operation_id,identity,execution.expected_epoch.checked_add(1).ok_or(LifecycleError::CorruptStoredData)?,id],|r|r.get(0))?;
+            let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resource_grants WHERE id=?1 AND deployment_id=?2 AND operation_id=?3 AND request_json=?4 AND committed_epoch=?5) AND EXISTS(SELECT 1 FROM lifecycle_steps WHERE id=?6 AND grant_id=?1) AND (SELECT COUNT(*) FROM resource_grants WHERE operation_id=?3)=1", params![execution.grant_id,p.deployment_id,p.operation_id,identity,execution.expected_epoch.checked_add(1).ok_or(LifecycleError::CorruptStoredData)?,p.step_id],|r|r.get(0))?;
             let expected = if state == "completed" {
                 phase(&e.resources.ready, ResourcePhase::Ready)
             } else {
@@ -345,7 +357,7 @@ fn load(
         }
         _ => return Err(LifecycleError::CorruptStoredData),
     }
-    Ok((p, e, state))
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -384,7 +396,16 @@ impl crate::Store {
         }
         let (raw, e) = effective(&tx, f)?;
         let catalog = qualified_effective(&tx, &e, &f.deployment_id)?;
-        policy(&tx, &e)?;
+        let controls = policy(&tx, &e)?.controls;
+        let outstanding: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='qualified_initialize' AND r.state NOT IN ('succeeded','failed')",
+            [], |row| row.get(0),
+        )?;
+        if outstanding >= i64::from(controls.queue.max_pending_total) {
+            return Err(LifecycleError::Rejected(
+                "qualified initialization queue full".into(),
+            ));
+        }
         if deadline
             .checked_sub(now)
             .is_none_or(|duration| duration > e.request_deadline_ms)
@@ -498,10 +519,19 @@ pub(crate) fn arm(
     id: &str,
     context: AdmissionContext<'_>,
 ) -> Result<ArmResult, LifecycleError> {
+    arm_with_context(tx, s, id, context).map(|(arm, _)| arm)
+}
+
+fn arm_with_context(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    id: &str,
+    context: AdmissionContext<'_>,
+) -> Result<(ArmResult, Option<StepExecutionContext>), LifecycleError> {
     let (mut p, e, state) = load(tx, id)?;
     current(tx, s, &p, false)?;
     if matches!(state.as_str(), "armed" | "uncertain") {
-        return Ok(ArmResult::AlreadyRecorded);
+        return Ok((ArmResult::AlreadyRecorded, None));
     }
     if state != "planned"
         || context.now_ms < p.accepted_at_ms
@@ -564,7 +594,7 @@ pub(crate) fn arm(
     p.execution = Some(execution);
     one(tx.execute("UPDATE lifecycle_steps SET state='armed',step_json=?2,grant_id=?3 WHERE id=?1 AND session_id=?4 AND state='planned' AND grant_id IS NULL",params![id,encode(&p)?,p.execution.as_ref().unwrap().grant_id,s.id()])?)?;
     event(tx, s, &p, Transition::Armed, None)?;
-    Ok(ArmResult::New { step_id: id.into() })
+    Ok((ArmResult::New { step_id: id.into() }, Some(p.context(&e)?)))
 }
 
 fn association(tx: &Transaction<'_>, p: &Plan) -> Result<Option<Association>, LifecycleError> {
@@ -764,7 +794,7 @@ fn event(
     transition: Transition,
     epoch: Option<u64>,
 ) -> Result<(), LifecycleError> {
-    use crate::events::{EventMetadata, EventOperationId, append_event};
+    use crate::events::{append_event, EventMetadata, EventOperationId};
     let id = |s: &str| {
         s.parse()
             .map(EventOperationId::generated)
