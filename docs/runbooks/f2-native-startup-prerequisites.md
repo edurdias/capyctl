@@ -30,6 +30,13 @@ complete process enrollment and startup integration remain unfinished.
 
 ## Remaining work
 
+- Complete the closed native qualification program and both engines' persisted
+  adapters. The current Store evaluator resolves only `CandidateLaunch::Fake`
+  with `qualification-fake-v1`, two fixed markers and a 16-token output bound.
+  The separate F2C marker helpers do not extend that authority or establish native
+  case counts. vLLM still inherits the unsupported persisted-effect entry point;
+  its legacy lifecycle implementation is not a permitted candidate shortcut.
+  Existing vLLM environment files remain outside the authorized changes.
 - The import-safe `sglang_server_args` mapper now checks 100 explicit native
   fields plus private/dynamic inputs and resolved graph backends after a guarded
   constructor call. Wire it only after the constructor's plugin, environment,
