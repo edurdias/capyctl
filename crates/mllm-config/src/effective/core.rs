@@ -250,8 +250,27 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
         &resources.wake,
     ] {
         for a in &p.allocations {
-            if !host.domains.contains_key(&a.domain) {
-                return Err(invalid("resources.allocations.domain", "unknown domain"));
+            let domain = host
+                .domains
+                .get(&a.domain)
+                .ok_or_else(|| invalid("resources.allocations.domain", "unknown domain"))?;
+            // SPEC §6.2's host-backed park retains a weight backup in host RAM. Where a
+            // domain's device and host memory are one pool, that allocates from the
+            // pool it is supposed to free, so the park succeeds and releases nothing.
+            // The failure is otherwise silent, which is why it is refused here rather
+            // than at first park. Every phase is checked, not just one: a deployment
+            // whose `ready` phase names a distinct domain but whose `wake` phase names
+            // a unified one is still broken.
+            if d.residency == Residency::HostBacked && domain.memory == DomainMemory::Unified {
+                return Err(invalid(
+                    "residency",
+                    format!(
+                        "host_backed retains weights in host memory, but domain \
+                         '{}' declares device and host memory as one pool, so it \
+                         would free nothing; use deep or restart_only",
+                        a.domain
+                    ),
+                ));
             }
         }
     }

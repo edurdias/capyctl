@@ -73,6 +73,40 @@ fn residency_names_which_park_the_deployment_asks_for() {
     }
 }
 
+/// A host-backed park retains weights in host RAM. Where that is the same pool the
+/// device allocates from, it frees nothing: the park reports success, the memory is
+/// still held, and the eviction it was meant to enable does not relieve pressure.
+/// Refusing at configuration time is the only point where that is visible.
+#[test]
+fn a_host_backed_park_is_refused_on_a_unified_domain() {
+    let (mut deployment, _) = fixture();
+    deployment["residency"] = "host_backed".into();
+    let host = host_with_domain_memory("unified");
+
+    let error = resolve_effective(&deployment, &host).expect_err("must be refused");
+    let text = format!("{error}");
+    assert!(text.contains("unified"), "names the domain: {text}");
+}
+
+/// The same deployment is valid where the pools are distinct - that is the hardware
+/// the tier exists for.
+#[test]
+fn a_host_backed_park_resolves_on_a_distinct_domain() {
+    let (mut deployment, _) = fixture();
+    deployment["residency"] = "host_backed".into();
+    let host = host_with_domain_memory("distinct");
+    resolve_effective(&deployment, &host).expect("host-backed is valid where pools differ");
+}
+
+/// Deep parking releases the weights, so it is valid on either topology.
+#[test]
+fn deep_parking_resolves_on_a_unified_domain() {
+    let (mut deployment, _) = fixture();
+    deployment["residency"] = "deep".into();
+    let host = host_with_domain_memory("unified");
+    resolve_effective(&deployment, &host).expect("deep parking releases, so it is valid");
+}
+
 /// `auto` is deliberately not adopted: choosing a tier at runtime is the fallback
 /// ladder ADR 0010 rejects, and SGLang cannot implement one because its memory-saver
 /// and weights-CPU-backup are startup flags.
