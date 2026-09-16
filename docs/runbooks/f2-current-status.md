@@ -258,6 +258,50 @@ unqualified machinery. M1 remains the higher-value unblock.
 
 **Review gate 1** — at M2 completion, before any native work.
 
+#### First native SGLang park/restore evidence — 2026-09-16
+
+Live on host-a: GB10, driver 580.173.02, CUDA 13.0, kernel 6.17.0-1031-nvidia.
+SGLang 0.5.19, torch 2.13.0+cu130, real `torch_memory_saver`, Qwen3-4B-Instruct
+BF16, TP=1, context 4096, token pool 4096, cuda graphs disabled, memory saver on.
+
+The pinned control contract in `crates/mllm-adapters/src/sglang/http.rs` holds
+unchanged at 0.5.19:
+
+- `/release_memory_occupation` and `/resume_memory_occupation` with
+  `{"tags":["kv_cache","weights"]}` both return `null` at HTTP 200.
+- `/flush_cache?timeout=0` returns the exact plaintext the adapter byte-matches.
+- `/update_weights_from_disk` returns `{"success":true,"message":...,
+  "num_paused_requests":0}`, matching `ReloadReply` and its `deny_unknown_fields`.
+- Both endpoints are `ADMIN_OPTIONAL`; `tags` still accepts only `weights` and
+  `kv_cache`.
+
+Measured park cycle, unified memory via `/proc/meminfo`:
+
+| Stage | Available |
+|---|---|
+| before release | 104.8 GiB |
+| after release | 113.1 GiB |
+| after resume | 104.6 GiB |
+| after reload | 104.8 GiB |
+
+Release frees 8.3 GiB and resume reclaims it, consistent with a 4B BF16 checkpoint.
+
+Resume alone does not restore weight contents. A probe taken after resume but
+before reload returned `'!!!!!!!!'` with `finish_reason` `length` instead of `OK`
+with `stop`. Reload then restored correct output, confirmed twice. This is direct
+evidence for SPEC section 9.1 and shows the adapter's exact-marker probe gate is
+load-bearing rather than ceremonial.
+
+Environment prerequisites found by this run, all outside the adapter: Triton needs
+`python3.12-dev` for its startup JIT, the scheduler needs the venv `bin` directory
+on `PATH` to find `ninja`, and the server must be started detached to survive its
+launching session. `--disable-cuda-graph` is deprecated in favour of
+`--cuda-graph-backend-{decode,prefill}=disabled`.
+
+Not yet qualified: multi-rank acknowledgement, allocator-bound verification against
+committed grants, concurrent vLLM and SGLang serving, and pressure-driven warm
+switching. The server was shut down after the run and the GPU is idle.
+
 ### M3 — A3 trusted result capture and operation reads
 
 Serial units sharing Store result and cleanup contracts. They cannot run
