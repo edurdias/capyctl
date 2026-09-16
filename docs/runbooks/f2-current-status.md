@@ -6,6 +6,10 @@ not per task. Focused TDD and integration verification continue throughout.
 
 ## Recent committed work
 
+- `c6915fd`: the A1 gate on the Fake engine — deploy, start, and one inference
+  served through the router, with the coordinator as the sole authority.
+- `d2a6117`: a start binding is identified by what it is, not by one spelling, so
+  a restart-only deployment can be started at all.
 - `8c9a17a`: associated candidate Cleanup through the original retained runtime,
   with clock-free discovery and verified atomic release.
 - `ec05bd8`: owned candidate Abort with retained accounting and strict SSE replay.
@@ -199,31 +203,47 @@ most intricate logic in the project against tests that have never run in product
 
 ### A1 — Production cutover
 
-Nothing runs through mllm today. `mllm-cli/src/roles.rs` wires the F1 controller,
-which holds one adapter for every deployment and owns processes in a map that does
-not survive a restart. The whole F2 stack is reachable only from tests.
+The cutover is done on the Fake engine and the gate is met there. A native engine
+still cannot be started, for the reason recorded below.
 
 - [x] Engine family to adapter resolution (`mllm-adapters/src/resolve.rs`).
 - [x] Proof that recorded processes are gone, from identities rather than a live
       handle, so it survives the restart that destroys handles.
-- [ ] Engine-generic driver factory: read the declared engine, build an
-      `AdapterSpec`, resolve, and prove cleanup with `verify_gone`. Additive beside
-      `spawn_fake`.
+- [x] Engine-generic driver factory (`spawn_resolved`): read the declared engine,
+      build an `AdapterSpec`, resolve, prove cleanup with `observed_gone`.
 - [x] Wire the coordinator into `roles.rs`; retire the handle map; resolve adapters
       per binding (`23e3f35`, `ffe6af6`, `8996065`).
 - [x] Accept an ordinary Start for a restart-only deployment (`d2a6117`). The start
       validator asserted the fake-engine fixture's shape, so every Start was refused
       as corrupt stored data and nothing could run at all.
-- [ ] Drive an accepted Start to Ready: launch the binding, probe it, settle the
-      operation. The command is accepted today and then `wait_terminal` never
-      returns, which is what keeps the three standalone tests ignored.
+- [x] Drive an accepted Start to Ready and serve through the router (`c6915fd`).
+      Four fixture assumptions blocked it: the observation source reported the
+      agent's `system` label rather than the host's declared domains; `AdapterSpec::Fake`
+      resolved to a bare `FakeEngine` whose `execute_persisted` answers `Unsupported`;
+      the Fake engine recognised an ordinary initialize by a `qualified:` id prefix;
+      and the router read routes only from the legacy `route_model_id` column, which
+      managed configuration clears.
 - [ ] Remove the legacy authorities together, as the A2d plan requires: synthetic
       admission, empty-ledger checks, old reservation writers, router-owned eviction
       and in-memory release guards. Never two authorities at once.
 
 **Gate:** deploy, start and serve one inference through the router with the
-coordinator as the sole lifecycle authority, on a real engine. That is the first
-end-to-end evidence the project has.
+coordinator as the sole lifecycle authority, on a real engine.
+
+`crates/mllm-cli/tests/a1_gate.rs` is that gate as one test and it passes **on the
+embedded Fake engine**, which is what standalone declares when no live profile is
+configured. That is the first end-to-end evidence the project has, and it is not
+qualification of a native recipe (SPEC §18).
+
+The native half of the gate is still open, and the blocker is specific:
+`VllmAdapter` has no `execute_persisted`, so it inherits the trait default and
+answers `Unsupported` to the only call the ordinary lifecycle makes. SGLang has a
+complete one (`sglang/adapter.rs`), but `ProfileBindings` refuses to build an SGLang
+runtime because nothing resolves its admin credential or supplies a trusted
+observation socket. Both are read from the code, not from an observed run: no
+native start has been attempted since the cutover. Closing this is either giving
+vLLM a persisted control path or wiring SGLang's two prerequisites; neither is
+started.
 
 Park was originally part of this gate and has moved to A1b. The ordinary lifecycle
 has no park at all — only the candidate path does — and ordinary stop needs the
