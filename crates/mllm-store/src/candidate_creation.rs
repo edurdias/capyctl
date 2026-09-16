@@ -16,7 +16,7 @@ use mllm_config::effective::candidate::{
     normalize_candidate_manifest, validate_candidate_reviewed_snapshot_text,
     CandidateReviewedSnapshot, NormalizedCandidateManifest,
 };
-use mllm_config::effective::Sharing;
+use mllm_config::effective::{DomainMemory, Sharing};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
@@ -421,9 +421,16 @@ fn compose_host(local: &Value, resource: &ResourcePolicySnapshot) -> Result<Valu
         Sharing::Shared => "shared",
         Sharing::Exclusive => "exclusive",
     };
+    let domain_memory = |m: DomainMemory| match m {
+        DomainMemory::Unified => "unified",
+        DomainMemory::Distinct => "distinct",
+    };
     let mut domains = serde_json::Map::new();
     for (id, d) in &controls.domains {
-        let mut value = json!({"managed_limit":format!("{}B",d.managed_limit),"free_reserve":format!("{}B",d.free_reserve)});
+        // SPEC §6.2: a domain's memory topology is a declared hardware fact, but it
+        // is required on every domain, so it must round-trip through composition
+        // like the other required fields.
+        let mut value = json!({"managed_limit":format!("{}B",d.managed_limit),"free_reserve":format!("{}B",d.free_reserve),"memory":domain_memory(d.memory)});
         if let Some(n) = d.host_kv_limit {
             value["host_kv_limit"] = json!(format!("{n}B"));
         }

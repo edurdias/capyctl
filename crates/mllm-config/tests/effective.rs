@@ -1,6 +1,6 @@
 use mllm_config::effective::{
     binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, Engine,
+    resolve_effective, DomainMemory, Engine,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
@@ -10,6 +10,44 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
     let all: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/f2-deployment.json")).expect("fixture JSON");
     (all["deployment"].clone(), all["host"].clone())
+}
+
+/// Set the topology of the lab host's only domain. Used by this task and Task 4.
+fn host_with_domain_memory(memory: &str) -> serde_json::Value {
+    let (_, mut host) = fixture();
+    host["resource_policy"]["domains"]["unified"]["memory"] = memory.into();
+    host
+}
+
+/// A host-backed park retains weights in host RAM, which frees nothing where that
+/// is the same pool the device allocates from. The host is the only party that
+/// knows which it is, so it states it rather than having it guessed from a domain's
+/// name or from which limits happen to be set.
+#[test]
+fn a_domain_declares_whether_its_memory_is_one_pool() {
+    let (deployment, _) = fixture();
+    for (declared, expected) in [
+        ("unified", DomainMemory::Unified),
+        ("distinct", DomainMemory::Distinct),
+    ] {
+        let host = host_with_domain_memory(declared);
+        let resolved = resolve_effective(&deployment, &host).expect("valid host");
+        assert_eq!(resolved.host.domains["unified"].memory, expected, "{declared}");
+    }
+}
+
+/// Omitting it is a configuration error, not a default. Either default is wrong on
+/// one class of hardware, and the failure it causes is silent: a park that frees
+/// nothing and an eviction that does not relieve pressure.
+#[test]
+fn a_domain_without_declared_memory_is_rejected() {
+    let (deployment, mut host) = fixture();
+    host["resource_policy"]["domains"]["unified"]
+        .as_object_mut()
+        .expect("the domain is an object")
+        .remove("memory");
+    let error = resolve_effective(&deployment, &host).expect_err("must be rejected");
+    assert!(format!("{error}").contains("memory"), "{error}");
 }
 
 #[test]

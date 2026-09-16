@@ -88,6 +88,10 @@ pub fn compose_current_resource_controls(
             let mut value = json!({
                 "managed_limit": format!("{}B", domain.managed_limit),
                 "free_reserve": format!("{}B", domain.free_reserve),
+                // SPEC §6.2: a domain's memory topology is a declared hardware fact,
+                // not a runtime control, but it is required on every domain, so it
+                // must round-trip through composition like the other required fields.
+                "memory": domain.memory,
             });
             if let Some(bytes) = domain.host_kv_limit {
                 value["host_kv_limit"] = json!(format!("{bytes}B"));

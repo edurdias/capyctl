@@ -755,7 +755,13 @@ fn rename_exact_key_and_value(value: &mut serde_json::Value, old: &str, new: &st
             if let Some(value) = map.remove(old) {
                 map.insert(new.into(), value);
             }
-            for value in map.values_mut() {
+            for (key, value) in map.iter_mut() {
+                // "memory" holds a fixed topology enum ("unified"/"distinct"), not a
+                // domain identifier. Its value must not be swept up merely because it
+                // happens to spell the same as the domain name under test.
+                if key == "memory" {
+                    continue;
+                }
                 rename_exact_key_and_value(value, old, new);
             }
         }

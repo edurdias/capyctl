@@ -1,6 +1,6 @@
 use super::*;
 use mllm_config::effective::{
-    DevicePolicy, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing,
+    DevicePolicy, DomainMemory, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_domain::resources::MemoryObservation;
@@ -18,6 +18,7 @@ fn host() -> HostPolicy {
                 free_reserve: 20,
                 host_kv_limit: Some(40),
                 parked_limit: Some(50),
+                memory: DomainMemory::Distinct,
             },
         )]),
         devices: BTreeMap::from([(

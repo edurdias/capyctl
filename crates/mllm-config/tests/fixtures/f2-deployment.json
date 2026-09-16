@@ -17,7 +17,7 @@
   "host": {
     "schema_version": 1, "kind": "host", "name": "lab", "hardware_fingerprint": "hw-01", "environment_fingerprint": "env-01",
     "resource_policy": {
-      "domains": {"unified": {"managed_limit": "32GiB", "free_reserve": "16GiB", "host_kv_limit": "4GiB", "parked_limit": "8GiB"}},
+      "domains": {"unified": {"managed_limit": "32GiB", "free_reserve": "16GiB", "host_kv_limit": "4GiB", "parked_limit": "8GiB", "memory": "unified"}},
       "devices": {"gpu0": {"domain": "unified", "sharing": "shared"}},
       "max_parked": 16, "observation_ttl": "2s", "device_sharing": "shared",
       "endpoint_port_range": {"start": 8100, "end": 8199}, "planner_max_states": 4096,

@@ -305,12 +305,27 @@ impl QualificationPolicy {
     }
 }
 
+/// Whether a domain's device memory and host memory are one physical pool.
+///
+/// On a unified-memory host such as a GB10, retaining a weight backup "in host RAM"
+/// allocates from the same pool the device allocates from, so it frees nothing. Only
+/// the operator registering the host knows this; it must not be inferred from a
+/// domain's name or from which limits are set. SPEC §6.2's host-backed park is
+/// meaningful only where this is `Distinct`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainMemory {
+    Unified,
+    Distinct,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DomainPolicy {
     pub managed_limit: i64,
     pub free_reserve: i64,
     pub host_kv_limit: Option<i64>,
     pub parked_limit: Option<i64>,
+    pub memory: DomainMemory,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -419,6 +434,7 @@ struct RawDomain {
     free_reserve: String,
     host_kv_limit: Option<String>,
     parked_limit: Option<String>,
+    memory: DomainMemory,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -2,7 +2,7 @@ use crate::dispatch::{check_session, CoordinatorSession, DispatchError};
 use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteError};
 use crate::resource_ledger::{read_snapshot, ResourceStoreError};
 use crate::OpState;
-use mllm_config::effective::{DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing};
+use mllm_config::effective::{DomainMemory, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing};
 use mllm_config::resource_controls::{ResourceContext, ResourceControls};
 use mllm_domain::resources::{LedgerSnapshot, MemoryObservation, ResourcePhase};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -121,6 +121,9 @@ struct StoredDomain {
     free_reserve: i64,
     host_kv_limit: Option<i64>,
     parked_limit: Option<i64>,
+    // SPEC §6.2: whether a host-backed park frees anything depends on this; it must
+    // persist losslessly like every other required domain field.
+    memory: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,6 +177,20 @@ fn parse_sharing(value: &str) -> Result<Sharing, ResourcePolicyError> {
         _ => Err(ResourcePolicyError::CorruptStoredPolicy),
     }
 }
+fn domain_memory(value: DomainMemory) -> String {
+    match value {
+        DomainMemory::Unified => "unified",
+        DomainMemory::Distinct => "distinct",
+    }
+    .into()
+}
+fn parse_domain_memory(value: &str) -> Result<DomainMemory, ResourcePolicyError> {
+    match value {
+        "unified" => Ok(DomainMemory::Unified),
+        "distinct" => Ok(DomainMemory::Distinct),
+        _ => Err(ResourcePolicyError::CorruptStoredPolicy),
+    }
+}
 
 impl StoredContext {
     fn from_public(value: &ResourceContext) -> Self {
@@ -211,6 +228,7 @@ impl StoredControls {
                             free_reserve: d.free_reserve,
                             host_kv_limit: d.host_kv_limit,
                             parked_limit: d.parked_limit,
+                            memory: domain_memory(d.memory),
                         },
                     )
                 })
@@ -239,17 +257,18 @@ impl StoredControls {
                 .domains
                 .iter()
                 .map(|(id, d)| {
-                    (
+                    Ok((
                         id.clone(),
                         DomainPolicy {
                             managed_limit: d.managed_limit,
                             free_reserve: d.free_reserve,
                             host_kv_limit: d.host_kv_limit,
                             parked_limit: d.parked_limit,
+                            memory: parse_domain_memory(&d.memory)?,
                         },
-                    )
+                    ))
                 })
-                .collect(),
+                .collect::<Result<_, ResourcePolicyError>>()?,
             max_parked: self.max_parked,
             observation_ttl_ms: self.observation_ttl_ms,
             planner_max_states: self.planner_max_states,

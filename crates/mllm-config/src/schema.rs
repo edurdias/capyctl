@@ -146,6 +146,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("free_reserve", BYTES),
         ("host_kv_limit", BYTES),
         ("parked_limit", BYTES),
+        ("memory", SCALAR),
     ]);
     const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[("domain", SCALAR), ("sharing", SCALAR)]);
     const QUEUE: &[(&str, FieldSpec)] = &[

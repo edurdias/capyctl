@@ -60,7 +60,10 @@ pub fn host_policy(
                     "managed_limit": share(MANAGED_FRACTION),
                     "free_reserve": share(FREE_RESERVE_FRACTION),
                     "parked_limit": share(PARKED_FRACTION),
-                    "host_kv_limit": share(HOST_KV_FRACTION)
+                    "host_kv_limit": share(HOST_KV_FRACTION),
+                    // One physical pool: a weight backup "in host RAM" would
+                    // allocate from the memory it is meant to free.
+                    "memory": "unified"
                 }
             },
             "devices": {"gpu0": {"domain": DOMAIN, "sharing": "shared"}},

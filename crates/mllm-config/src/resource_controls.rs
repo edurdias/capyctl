@@ -114,7 +114,7 @@ impl ResourceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effective::{DevicePolicy, DomainPolicy, PortRange, QueuePolicy, Sharing};
+    use crate::effective::{DevicePolicy, DomainMemory, DomainPolicy, PortRange, QueuePolicy, Sharing};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn host() -> crate::effective::HostPolicy {
@@ -159,6 +159,7 @@ mod tests {
                     free_reserve: 16 << 30,
                     host_kv_limit: Some(8 << 30),
                     parked_limit: Some(32 << 30),
+                    memory: DomainMemory::Distinct,
                 },
             )]),
             max_parked: 16,

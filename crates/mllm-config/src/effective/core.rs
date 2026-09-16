@@ -133,6 +133,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             free_reserve: parse_bytes(&raw.free_reserve)?,
             host_kv_limit: raw.host_kv_limit.as_deref().map(parse_bytes).transpose()?,
             parked_limit: raw.parked_limit.as_deref().map(parse_bytes).transpose()?,
+            memory: raw.memory,
         };
         domains.insert(name, value);
     }

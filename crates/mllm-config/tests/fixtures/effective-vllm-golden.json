@@ -115,6 +115,7 @@
             "free_reserve": "16GiB",
             "host_kv_limit": "4GiB",
             "managed_limit": "32GiB",
+            "memory": "unified",
             "parked_limit": "8GiB"
           }
         },
@@ -188,6 +189,7 @@
           "free_reserve": 17179869184,
           "host_kv_limit": 4294967296,
           "managed_limit": 34359738368,
+          "memory": "unified",
           "parked_limit": 8589934592
         }
       },
