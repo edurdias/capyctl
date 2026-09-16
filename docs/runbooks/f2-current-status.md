@@ -286,6 +286,11 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       carrying the operator's intent alone; `suspended` keeps its nine eligibility
       readers untouched. This is what the earlier attempt could not do by writing
       `suspended`, from either side of acceptance.
+- [x] Make the park tier declarable and host-validated (ADR 0010). Residency names
+      the tier (`restart_only`, `host_backed`, `deep`); a host declares each domain's
+      memory topology; a host-backed park is refused at configuration time on a
+      one-pool domain; SGLang's startup flags follow the declared tier. This makes
+      the choice expressible and checkable. It does not implement park.
 - [ ] Implement ordinary park. The ordinary lifecycle has no park at all; only the
       candidate path (`candidate_creation/warm.rs`) does. This is the premise of the
       product and the largest remaining piece of A1b.
@@ -427,6 +432,42 @@ host with several devices or across hosts.
 
    Not started. The mechanism of ordinary park is independent of this question and
    can be built first; this decides only when a deployment is allowed to use it.
+
+4. A resource policy written before ADR 0010 cannot be read back.
+   `StoredPolicy.version` stayed at `1` when `StoredDomain` gained a required
+   `memory` field, so a policy row written before that change now fails to decode as
+   `CorruptStoredPolicy`, and `import_resource_policy` does not overwrite it — it
+   reads the existing row first and propagates the error. Failing closed is correct:
+   the old row genuinely lacks the topology fact and ADR 0010 forbids inferring it.
+   The defect is the diagnosis, which says "corrupt" for what is merely a superseded
+   shape. No persisted policy exists on this machine. **If standalone refuses to boot
+   against a state directory created before 2026-09-16, delete the directory** — the
+   host policy is republished at every boot.
+
+5. One test fails between a third and two thirds of the time, on an idle machine.
+   `qualification_progression::ordinary_cleanup_races_ready_completion_and_duplicate_accept_and_arm`
+   fails with `Sql(SqliteFailure(DatabaseBusy, "database is locked"))` at
+   `qualification_support/ordinary_cleanup.rs:820`. The test deliberately races three
+   connections against one SQLite file — two threads calling
+   `accept_ordinary_cleanup` and one calling `complete_step` — and asserts the two
+   cleanup receipts are identical. When a racing connection loses the lock instead of
+   serialising behind it, the `unwrap` panics.
+
+   Measured on 2026-09-16, single test, idle machine, 32 CPUs: 2 of 3 runs failed at
+   `d3e5b8e`, and 1 of 3 failed at `e8b943e`, which predates the ADR 0010 work. It is
+   therefore **not** a regression from that work, and it is not specific to
+   multi-crate runs.
+
+   Earlier in the same session this was recorded as "passes when run alone" on the
+   strength of two isolated passes. That inference was wrong: a test failing about
+   half the time passes alone often enough to look green. Treat any single green run
+   of this test as no evidence either way.
+
+   The test is not currently useful as a gate — it cannot distinguish a real
+   regression from its own lock contention. Fixing it means giving the racing
+   connections a `busy_timeout`, or asserting that one of the two racers may lose the
+   lock, rather than that both must win. Until then, a failure here needs the
+   assertion read: `DatabaseBusy` is the known mode, and anything else is new.
 
 ## Owner attention
 
