@@ -13,7 +13,10 @@
 //! error here rather than a silent reclassification into the nearest neighbour.
 
 use mllm_adapters::traits::AdapterError;
+use mllm_store::lifecycle::LifecycleError;
 use mllm_store::StoreError;
+
+use crate::coordinator::{CoordinatorCommandError, CoordinatorError};
 
 use crate::operations::ControllerError;
 
@@ -96,6 +99,60 @@ impl From<AdapterError> for LifecycleFault {
             // A crash is a definite outcome about the engine, not about whether a
             // request was accepted, so it is a failure rather than uncertainty.
             AdapterError::Crash(_) => Self::Failed(text),
+        }
+    }
+}
+
+impl From<LifecycleError> for LifecycleFault {
+    fn from(error: LifecycleError) -> Self {
+        let text = error.to_string();
+        match error {
+            LifecycleError::NotFound => Self::NotFound(text),
+            LifecycleError::RevisionConflict
+            | LifecycleError::IdempotencyConflict
+            | LifecycleError::Stale
+            | LifecycleError::Conflict => Self::Conflict(text),
+            // Refusals that decided nothing and may be re-made once the condition
+            // clears.
+            LifecycleError::RuntimeRetained
+            | LifecycleError::HostPolicyDenied
+            | LifecycleError::CapacityBlocked
+            | LifecycleError::QueueFull
+            | LifecycleError::Disabled
+            | LifecycleError::Unsupported
+            | LifecycleError::Invalid
+            | LifecycleError::Rejected(_) => Self::Blocked(text),
+            // The store cannot say what the current state is, so nothing about the
+            // request was decided.
+            LifecycleError::ReconciliationRequired
+            | LifecycleError::CorruptStoredData
+            | LifecycleError::Sql(_) => Self::Unavailable(text),
+        }
+    }
+}
+
+impl From<CoordinatorError> for LifecycleFault {
+    fn from(error: CoordinatorError) -> Self {
+        let text = error.to_string();
+        match error {
+            // The command was never admitted, so it decided nothing and may be
+            // re-made once the coordinator has capacity again.
+            CoordinatorError::Busy => Self::Blocked(text),
+            CoordinatorError::Stopped(_) => Self::Unavailable(text),
+            CoordinatorError::Service(_) => Self::Unavailable(text),
+            CoordinatorError::Invalid => Self::Blocked(text),
+            // The caller stopped waiting; the coordinator did not stop working. The
+            // command may well have been accepted, so this is never a failure.
+            CoordinatorError::CallerTimeout => Self::Uncertain(text),
+        }
+    }
+}
+
+impl From<CoordinatorCommandError> for LifecycleFault {
+    fn from(error: CoordinatorCommandError) -> Self {
+        match error {
+            CoordinatorCommandError::Coordinator(inner) => inner.into(),
+            CoordinatorCommandError::Lifecycle(inner) => inner.into(),
         }
     }
 }

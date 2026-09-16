@@ -138,3 +138,57 @@ fn adapter_refusals_are_blocked_and_a_crash_is_a_failure() {
         LifecycleFault::Failed(_)
     ));
 }
+
+/// A caller that stopped waiting has not established that the coordinator stopped
+/// working. The command may already have been accepted, so this is uncertainty
+/// rather than failure — the same reasoning as a controller timeout.
+#[test]
+fn a_caller_timeout_is_uncertain() {
+    use crate::coordinator::CoordinatorError;
+    assert!(matches!(
+        LifecycleFault::from(CoordinatorError::CallerTimeout),
+        LifecycleFault::Uncertain(_)
+    ));
+}
+
+/// A command refused before admission decided nothing and may be re-made; a stopped
+/// or failed coordinator is the authority being unavailable.
+#[test]
+fn coordinator_refusals_and_outages_are_distinguished() {
+    use crate::coordinator::CoordinatorError;
+    assert!(matches!(
+        LifecycleFault::from(CoordinatorError::Busy),
+        LifecycleFault::Blocked(_)
+    ));
+    assert!(matches!(
+        LifecycleFault::from(CoordinatorError::Stopped("draining".into())),
+        LifecycleFault::Unavailable(_)
+    ));
+    assert!(matches!(
+        LifecycleFault::from(CoordinatorError::Service("poisoned".into())),
+        LifecycleFault::Unavailable(_)
+    ));
+}
+
+/// Corrupt or unreadable lifecycle state says nothing about the request.
+#[test]
+fn unreadable_lifecycle_state_is_unavailable_not_blocked() {
+    use mllm_store::lifecycle::LifecycleError;
+    for error in [
+        LifecycleError::CorruptStoredData,
+        LifecycleError::ReconciliationRequired,
+    ] {
+        assert!(matches!(
+            LifecycleFault::from(error),
+            LifecycleFault::Unavailable(_)
+        ));
+    }
+    assert!(matches!(
+        LifecycleFault::from(LifecycleError::NotFound),
+        LifecycleFault::NotFound(_)
+    ));
+    assert!(matches!(
+        LifecycleFault::from(LifecycleError::RevisionConflict),
+        LifecycleFault::Conflict(_)
+    ));
+}
