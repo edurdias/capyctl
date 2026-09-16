@@ -331,6 +331,41 @@ Forward-looking dependency notes that remain live: `operation-read-dependencies.
 (A3), `ordinary-warm-composition-dependencies.md`, `no-effect-recovery-dependencies.md`
 and `candidate-terminal-api-dependencies.md` (A2d).
 
+## Open questions for the owner
+
+These need a decision rather than more implementation. Each names what changes
+depending on the answer.
+
+1. **Does deep park earn its place on unified memory?** Measured warm restore saves
+   3% against cold start at 27B and 17% at 4B, because reload rereads every weight
+   from disk. The benefit is capacity reclaim of 61.96 GiB in 0.68 s and retention of
+   the process, port, binding and CUDA context, not latency. If the product promise
+   is fast switching, this hardware does not deliver it by parking, and that should
+   be stated rather than implied.
+
+2. **Residency policy needs a memory-topology input.** `SPEC.md` §6.2 has `auto`
+   select a qualified deep-park path, but on unified memory deep park and
+   host-backed park are near-opposites: one reclaims capacity slowly to restore, the
+   other restores instantly and reclaims almost nothing. On discrete devices a host
+   backup frees real VRAM and is strictly better. `auto` cannot choose without
+   knowing the topology, which no current contract carries. This likely warrants an
+   ADR amending §6.2.
+
+3. **How should reasoning models be qualified?** The probe now names a leaked
+   reasoning trace instead of failing opaquely, but naming it does not enable those
+   models. Enabling them means launching with a reasoning parser, which changes
+   `rendered_settings_digest` and therefore qualification identity. Open: is a
+   reasoning model a separate pinned recipe, or a recipe field that re-qualifies?
+
+4. **Nothing measured so far went through mllm.** Concurrent serving and pressure
+   switching were both proven at engine level with the router out of the path,
+   because the controller cannot yet construct an adapter for a live binding. The F2
+   exit gate asks for these through the product, and that remains unproven.
+
+5. **Is the 27B checkpoint representative?** It is a reasoning model, which the
+   qualification corpus was not designed for, and it is dense. MoE behaviour is
+   untested; `Qwen3-30B-A3B` is downloading for that comparison.
+
 ## Live engine measurements — 2026-09-16, host-a
 
 GB10, driver 580.173.02, CUDA 13.0, kernel 6.17.0-1031-nvidia. SGLang 0.5.19 and
