@@ -187,6 +187,27 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
    gates, and perform authorized pressure-guarded native qualification after its
    prerequisites. CPU/Fake tests and source checks are not native qualification.
 
+## Next queued work
+
+This runbook is the single status authority for F2. Per-slice progress notes and
+continuation summaries under `.superpowers/sdd/` were removed on 2026-09-15; the
+per-unit briefs and reports are archived under each slice's `archive/` directory.
+
+Queued units run serially. They share Store result and cleanup contracts and must
+not run concurrently.
+
+| Order | Packet | Exact base | State |
+|---|---|---|---|
+| 1 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/candidate-result-capture-queued-brief.md` | `eed70879a8d4ff8acae8f048474ed8a7d3e004e1` | Ready; base equals current HEAD |
+| 2 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/operation-results-queued-brief.md` | UNSET | Blocked on unit 1; must reuse capture, not add a second format |
+
+Unit 1 covers trusted versioned result persistence and bounded observational reads.
+It does not add an HTTP route. Verify exact HEAD before editing either packet.
+
+Forward-looking dependency notes that remain live:
+`operation-read-dependencies.md` (A3), `ordinary-warm-composition-dependencies.md`,
+`no-effect-recovery-dependencies.md` and `candidate-terminal-api-dependencies.md` (A2d).
+
 ## Owner attention
 
 Execution capacity item: after Cleanup committed, fresh-worker creation for the
