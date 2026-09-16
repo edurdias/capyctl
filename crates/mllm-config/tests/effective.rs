@@ -1008,7 +1008,7 @@ fn strict_yaml_rejects_unknown_nested_and_wrong_scalar_type() {
     let without_unknown = complete_unknown.replace("    surprise: true\n", "");
     assert!(parse_strict(ConfigKind::Deployment, &without_unknown).is_ok());
 
-    let wrong = "schema_version: 1\nkind: deployment\nname: d\nmodel:\n  path: /m\n  content_fingerprint: fp\n  revision: r\nroutes: route-a\nruntime_profile: p\nruntime_profile_revision: 1\nrecipe: r\nresidency: warm\nrecovery: reconcile\ndevices: []\nresources: {}\n";
+    let wrong = "schema_version: 1\nkind: deployment\nname: d\nmodel:\n  path: /m\n  content_fingerprint: fp\n  revision: r\nroutes: route-a\nruntime_profile: p\nruntime_profile_revision: 1\nrecipe: r\nresidency: deep\nrecovery: reconcile\ndevices: []\nresources: {}\n";
     assert!(parse_strict(ConfigKind::Deployment, wrong).is_err());
 }
 

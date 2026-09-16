@@ -435,7 +435,7 @@ struct RawQualificationPolicy {
     max_input_tokens_per_request: u32,
     max_output_tokens_per_request: u32,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHostPolicy {
     domains: BTreeMap<String, RawDomain>,
@@ -447,23 +447,97 @@ struct RawHostPolicy {
     planner_max_states: Option<u32>,
     queue: Option<RawQueue>,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDomain {
     managed_limit: String,
     free_reserve: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     host_kv_limit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parked_limit: Option<String>,
     memory: DomainMemory,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawQueue {
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_pending_per_deployment: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_pending_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_buffered_bytes_total: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     request_deadline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     admission_window: Option<String>,
+}
+
+/// Composes the `resource_policy` object of a host document's raw JSON shape from
+/// normalized resource controls, by constructing the same `Raw*` structs that
+/// `resolve_effective` parses rather than writing keys by hand. This is the one
+/// writer of that shape: a required field added to `RawDomain`, `RawHostPolicy`, or
+/// `RawQueue` breaks this struct literal at compile time instead of silently being
+/// omitted at runtime by an independent hand-built JSON writer.
+///
+/// SPEC §6.2: a domain's memory topology is a declared hardware fact, required on
+/// every domain, so it must round-trip through composition like the other required
+/// fields.
+pub fn compose_resource_policy(
+    controls: &crate::resource_controls::ResourceControls,
+    context: &crate::resource_controls::ResourceContext,
+) -> serde_json::Value {
+    let domains: BTreeMap<String, RawDomain> = controls
+        .domains
+        .iter()
+        .map(|(id, d)| {
+            (
+                id.clone(),
+                RawDomain {
+                    managed_limit: format!("{}B", d.managed_limit),
+                    free_reserve: format!("{}B", d.free_reserve),
+                    host_kv_limit: d.host_kv_limit.map(|n| format!("{n}B")),
+                    parked_limit: d.parked_limit.map(|n| format!("{n}B")),
+                    memory: d.memory,
+                },
+            )
+        })
+        .collect();
+    let devices: BTreeMap<String, DevicePolicy> = context
+        .device_domains
+        .iter()
+        .map(|(id, domain)| {
+            let sharing = controls
+                .device_sharing_overrides
+                .get(id)
+                .copied()
+                .unwrap_or(controls.device_sharing);
+            (
+                id.clone(),
+                DevicePolicy {
+                    domain: domain.clone(),
+                    sharing,
+                },
+            )
+        })
+        .collect();
+    let raw = RawHostPolicy {
+        domains,
+        devices,
+        max_parked: Some(controls.max_parked),
+        observation_ttl: Some(format!("{}ms", controls.observation_ttl_ms)),
+        device_sharing: controls.device_sharing,
+        endpoint_port_range: context.endpoint_port_range.clone(),
+        planner_max_states: Some(controls.planner_max_states),
+        queue: Some(RawQueue {
+            max_pending_per_deployment: Some(controls.queue.max_pending_per_deployment),
+            max_pending_total: Some(controls.queue.max_pending_total),
+            max_buffered_bytes_total: Some(format!("{}B", controls.queue.max_buffered_bytes_total)),
+            request_deadline: Some(format!("{}ms", controls.queue.request_deadline_ms)),
+            admission_window: Some(format!("{}ms", controls.queue.admission_window_ms)),
+        }),
+    };
+    serde_json::to_value(&raw).expect("Raw* composition types always encode to JSON")
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

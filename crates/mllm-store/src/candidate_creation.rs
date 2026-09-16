@@ -16,7 +16,6 @@ use mllm_config::effective::candidate::{
     normalize_candidate_manifest, validate_candidate_reviewed_snapshot_text,
     CandidateReviewedSnapshot, NormalizedCandidateManifest,
 };
-use mllm_config::effective::{DomainMemory, Sharing};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
@@ -416,48 +415,13 @@ fn compose_host(local: &Value, resource: &ResourcePolicySnapshot) -> Result<Valu
     {
         return Err(CandidateCreationError::RevisionConflict);
     }
-    let controls = &resource.controls;
-    let sharing = |s: Sharing| match s {
-        Sharing::Shared => "shared",
-        Sharing::Exclusive => "exclusive",
-    };
-    let domain_memory = |m: DomainMemory| match m {
-        DomainMemory::Unified => "unified",
-        DomainMemory::Distinct => "distinct",
-    };
-    let mut domains = serde_json::Map::new();
-    for (id, d) in &controls.domains {
-        // SPEC §6.2: a domain's memory topology is a declared hardware fact, but it
-        // is required on every domain, so it must round-trip through composition
-        // like the other required fields.
-        let mut value = json!({"managed_limit":format!("{}B",d.managed_limit),"free_reserve":format!("{}B",d.free_reserve),"memory":domain_memory(d.memory)});
-        if let Some(n) = d.host_kv_limit {
-            value["host_kv_limit"] = json!(format!("{n}B"));
-        }
-        if let Some(n) = d.parked_limit {
-            value["parked_limit"] = json!(format!("{n}B"));
-        }
-        domains.insert(id.clone(), value);
-    }
-    let devices: serde_json::Map<_, _> = context
-        .device_domains
-        .iter()
-        .map(|(id, domain)| {
-            let s = controls
-                .device_sharing_overrides
-                .get(id)
-                .copied()
-                .unwrap_or(controls.device_sharing);
-            (id.clone(), json!({"domain":domain,"sharing":sharing(s)}))
-        })
-        .collect();
-    let q = &controls.queue;
+    // The raw `resource_policy` shape belongs to mllm-config, beside the `Raw*`
+    // structs `resolve_effective` parses; it is composed there, from typed structs,
+    // so a required field added to that shape fails this crate's build instead of
+    // being silently omitted here.
     let mut composed = local.clone();
-    composed["resource_policy"] = json!({"domains":domains,"devices":devices,"device_sharing":sharing(controls.device_sharing),
-        "endpoint_port_range":{"start":context.endpoint_port_range.start,"end":context.endpoint_port_range.end},
-        "max_parked":controls.max_parked,"observation_ttl":format!("{}ms",controls.observation_ttl_ms),"planner_max_states":controls.planner_max_states,
-        "queue":{"max_pending_per_deployment":q.max_pending_per_deployment,"max_pending_total":q.max_pending_total,
-            "max_buffered_bytes_total":format!("{}B",q.max_buffered_bytes_total),"request_deadline":format!("{}ms",q.request_deadline_ms),"admission_window":format!("{}ms",q.admission_window_ms)}});
+    composed["resource_policy"] =
+        mllm_config::effective::compose_resource_policy(&resource.controls, &resource.context);
     Ok(composed)
 }
 
