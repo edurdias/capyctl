@@ -17,7 +17,7 @@ use mllm_domain::LifecycleState;
 use mllm_store::deployments::{DeploymentRow, OperationRow};
 use crate::fault::LifecycleFault;
 
-use crate::operations::{Controller, DeployRequest, OperationHandle};
+use crate::operations::{Controller, OperationHandle};
 use mllm_domain::LifecycleAction;
 
 #[async_trait]
@@ -90,8 +90,6 @@ pub trait LifecyclePort: Send + Sync {
         action: LifecycleAction,
     ) -> Result<OperationHandle, LifecycleFault>;
 
-    /// Accept a deployment durably and return its id.
-    async fn submit_deploy(&self, req: DeployRequest) -> Result<String, LifecycleFault>;
 }
 
 #[async_trait]
@@ -153,8 +151,5 @@ impl LifecyclePort for Controller {
         action: LifecycleAction,
     ) -> Result<OperationHandle, LifecycleFault> {
         Controller::request_transition(self, deployment, action).await.map_err(Into::into)
-    }
-    async fn submit_deploy(&self, req: DeployRequest) -> Result<String, LifecycleFault> {
-        Controller::submit_deploy(self, req).await.map_err(Into::into)
     }
 }

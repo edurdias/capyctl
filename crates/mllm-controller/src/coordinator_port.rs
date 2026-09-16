@@ -19,7 +19,7 @@ use mllm_store::deployments::{DeploymentRow, OperationRow};
 
 use crate::coordinator::CoordinatorCommands;
 use crate::fault::LifecycleFault;
-use crate::operations::{DeployRequest, OperationHandle};
+use crate::operations::OperationHandle;
 use crate::port::LifecyclePort;
 
 /// How long a router-initiated activation may take before its receipt expires.
@@ -244,9 +244,6 @@ impl LifecyclePort for CoordinatorLifecycle {
         }
     }
 
-    async fn submit_deploy(&self, _req: DeployRequest) -> Result<String, LifecycleFault> {
-        Err(Self::unsupported("accept a new deployment"))
-    }
 
     fn clear_suspension(&self, _deployment: &str) -> Result<(), LifecycleFault> {
         // A write the router should not be making at all; it disappears with
