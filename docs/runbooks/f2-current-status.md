@@ -187,278 +187,73 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
    gates, and perform authorized pressure-guarded native qualification after its
    prerequisites. CPU/Fake tests and source checks are not native qualification.
 
-## Work plan and review gates
+## Milestones and review gates
 
-This runbook is the single status authority for F2. Per-slice progress notes and
-continuation summaries were removed on 2026-09-15; per-unit briefs and reports are
-archived under each slice's `archive/` directory.
+Work follows [ADR 0009](../design/adr/0009-proof-carrying-reconciliation.md). Review
+happens at a milestone boundary, not after each task. Units inside a milestone are
+verified by focused TDD plus the core suite and carry no separate review pass.
 
-Review happens at the gates below, not after every task. Units inside a milestone
-run serially and are verified by focused TDD plus the core suite; no separate
-review pass runs between them.
+Each milestone leaves a working system and is independently reversible. The order is
+deliberate: the largest deletion is last, because doing it first would restructure the
+most intricate logic in the project against tests that have never run in production.
 
-### M1 — Restore GPU availability on host-a (owner action required)
+### A1 — Production cutover
 
-- [x] Verify host reachability. SSH succeeds; `host-a.tailnet.ts.net`
-      resolves to `100.64.0.10` and port 22 is open. The earlier 2026-09-15
-      timeouts no longer reproduce.
-- [x] Diagnose GPU unavailability. `nvidia-smi` cannot reach the driver, no nvidia
-      modules are loaded, and no `/dev/nvidia*` nodes exist.
-- [ ] **Owner:** restore a kernel that has the GPU driver, then pin it. See the
-      kernel item under Owner attention.
-- [ ] Re-verify `nvidia-smi`, `/dev/nvidia*` and module load after the change.
+Nothing runs through mllm today. `mllm-cli/src/roles.rs` wires the F1 controller,
+which holds one adapter for every deployment and owns processes in a map that does
+not survive a restart. The whole F2 stack is reachable only from tests.
 
-M1 blocks all live qualification. It does not block M2 or M3.
+- [x] Engine family to adapter resolution (`mllm-adapters/src/resolve.rs`).
+- [x] Proof that recorded processes are gone, from identities rather than a live
+      handle, so it survives the restart that destroys handles.
+- [ ] Engine-generic driver factory: read the declared engine, build an
+      `AdapterSpec`, resolve, and prove cleanup with `verify_gone`. Additive beside
+      `spawn_fake`.
+- [ ] Wire the coordinator into `roles.rs`; retire the handle map; resolve adapters
+      per binding.
+- [ ] Remove the legacy authorities together, as the A2d plan requires: synthetic
+      admission, empty-ledger checks, old reservation writers, router-owned eviction
+      and in-memory release guards. Never two authorities at once.
 
-### M2 — Connect the SGLang adapter to production (F2B)
+**Gate:** one inference served through the router, and one park or restore driven by
+the coordinator, both on a real engine. That is the first end-to-end evidence the
+project has.
 
-Correction to an earlier reading of this gap. The SGLang control path is already
-implemented and matches the pinned contract. `crates/mllm-adapters/src/sglang/http.rs`
-issues `/release_memory_occupation` and `/resume_memory_occupation` with
-`{"tags":["kv_cache","weights"]}`, `/update_weights_from_disk` with the frozen body,
-and `/flush_cache?timeout=0` validated against its exact plaintext acknowledgement,
-under the planned per-action deadlines with redirects, retries and proxies disabled
-and native error bodies never read. `SglangAdapter::execute_persisted` gates every
-control on a fresh `SglangRuntimeObserver` observation validated against the
-persisted command context.
+### A2 — Extract the domain
 
-The `EngineAdapter::park`, `restore`, `reload_weights` and `render_plan` methods
-return `UnsupportedCapability` deliberately: they are the un-fenced legacy path that
-vLLM still uses, and SGLang refuses it so callers must go through the durable
-coordinator. That is correct and should not be "fixed".
+`mllm-store` is larger than the controller, management, adapters, router and
+scheduler combined because workflow logic followed the transaction into it.
 
-The real gap is that none of it is reachable in production:
+- [ ] Create `mllm-domain` as a pure crate: planner, policies, resource algebra,
+      proof rules. No async runtime, no clock, no engine knowledge.
+- [ ] Move rules out of `lifecycle`, `progression`, `initialize`, `security`, `warm`
+      and `cleanup` with no behaviour change. The store keeps its tables.
 
-- `SglangRuntimeObserver` has no production implementation. The only two are test
-  doubles in `crates/mllm-adapters/tests/{sglang_control,engine_contract}.rs`.
-- `SglangAdapter::from_frozen` is never constructed outside tests.
-- `execute_persisted` is only ever called from tests.
+**Gate:** `mllm-domain` compiles without an async runtime and its tests run with no
+database and no network. A rule that cannot be tested that way is in the wrong layer.
 
-The supporting pieces exist on both sides and are not joined. `runtime/` holds the
-entrypoint, saver binding, scheduler observer and observation server;
-`crates/mllm-launchers/src/native_observation.rs` holds the Rust client, whose
-`observe()` returns `AllocationFacts`.
+### A3 — Capabilities and proofs as data
 
-- [ ] Implement a production `SglangRuntimeObserver` over `NativeObservationClient`.
-      Map `AllocationFacts` binding/incarnation/owner and per-tag allocation groups
-      onto `allocations`, `weights` and `cache`.
-- [ ] Source `real_memory_saver` from verified saver-library identity, not from a
-      control response. The no-op saver must never satisfy it.
-- [ ] Source `quiesced` and `unknown_work` from the scheduler observer. Missing
-      metrics must set `unknown_work`, never a false `quiesced`.
-- [ ] Carry `TransitionToken` from the persisted coordinator step, not the observer.
-- [ ] Construct `SglangAdapter` on the controller's runtime-binding path and drive
-      controls through `execute_persisted`.
-- [ ] Failure and uncertainty tests: lost reply, partial allocation state, saver
-      absent, stale binding or incarnation, unknown work.
+- [ ] Engines declare the actions they perform and the facts they can prove instead
+      of failing when called.
+- [ ] The domain permits a transition when its required proofs are a subset of what
+      the installation proves.
+- [ ] vLLM reaches restart-only parking by mechanism rather than by special case,
+      which is the fallback `SPEC.md` §6.2 already describes.
 
-Note the sequencing risk. This work can be written and unit-tested without a GPU,
-but it cannot be qualified until M1 completes, so it adds to the stock of
-unqualified machinery. M1 remains the higher-value unblock.
+**Gate:** adding an engine family requires publishing two sets and no coordinator
+edit. The proof set gates the commit, not the call.
 
-**Review gate 1** — at M2 completion, before any native work.
+### A4 — Collapse the second lifecycle
 
-#### First native SGLang park/restore evidence — 2026-09-16
+`candidate_creation` and `ordinary_lifecycle` are two state machines over the same
+transitions, differing in authority rather than meaning.
 
-Live on host-a: GB10, driver 580.173.02, CUDA 13.0, kernel 6.17.0-1031-nvidia.
-SGLang 0.5.19, torch 2.13.0+cu130, real `torch_memory_saver`, Qwen3-4B-Instruct
-BF16, TP=1, context 4096, token pool 4096, cuda graphs disabled, memory saver on.
+- [ ] One planner with an `Authority` parameter; a candidate run becomes ordinary
+      reconciliation under scoped authority that cannot promote itself.
 
-The pinned control contract in `crates/mllm-adapters/src/sglang/http.rs` holds
-unchanged at 0.5.19:
-
-- `/release_memory_occupation` and `/resume_memory_occupation` with
-  `{"tags":["kv_cache","weights"]}` both return `null` at HTTP 200.
-- `/flush_cache?timeout=0` returns the exact plaintext the adapter byte-matches.
-- `/update_weights_from_disk` returns `{"success":true,"message":...,
-  "num_paused_requests":0}`, matching `ReloadReply` and its `deny_unknown_fields`.
-- Both endpoints are `ADMIN_OPTIONAL`; `tags` still accepts only `weights` and
-  `kv_cache`.
-
-Measured park cycle, unified memory via `/proc/meminfo`:
-
-| Stage | Available |
-|---|---|
-| before release | 104.8 GiB |
-| after release | 113.1 GiB |
-| after resume | 104.6 GiB |
-| after reload | 104.8 GiB |
-
-Release frees 8.3 GiB and resume reclaims it, consistent with a 4B BF16 checkpoint.
-
-Resume alone does not restore weight contents. A probe taken after resume but
-before reload returned `'!!!!!!!!'` with `finish_reason` `length` instead of `OK`
-with `stop`. Reload then restored correct output, confirmed twice. This is direct
-evidence for SPEC section 9.1 and shows the adapter's exact-marker probe gate is
-load-bearing rather than ceremonial.
-
-Environment prerequisites found by this run, all outside the adapter: Triton needs
-`python3.12-dev` for its startup JIT, the scheduler needs the venv `bin` directory
-on `PATH` to find `ninja`, and the server must be started detached to survive its
-launching session. `--disable-cuda-graph` is deprecated in favour of
-`--cuda-graph-backend-{decode,prefill}=disabled`.
-
-Not yet qualified: multi-rank acknowledgement, allocator-bound verification against
-committed grants, concurrent vLLM and SGLang serving, and pressure-driven warm
-switching. The server was shut down after the run and the GPU is idle.
-
-### M3 — A3 trusted result capture and operation reads
-
-Serial units sharing Store result and cleanup contracts. They cannot run
-concurrently with each other.
-
-| Order | Packet | Exact base | State |
-|---|---|---|---|
-| 1 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/candidate-result-capture-queued-brief.md` | `eed7087` | Ready. Base is source-equivalent to HEAD; `972fe48` changed documentation only |
-| 2 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/operation-results-queued-brief.md` | UNSET | Blocked on unit 1; must reuse capture, not add a second format |
-
-Unit 1 covers trusted versioned result persistence and bounded observational reads.
-It does not add an HTTP route.
-
-**Review gate 2** — at M3 completion.
-
-### M4 — Native qualification and consolidated review
-
-Requires M1, M2 and M3. Covers guarded native startup composition, the closed
-qualification program, both engines' persisted adapters, and the API-driven F2C
-runner.
-
-**Review gate 3** — final consolidated review across the whole branch, including
-the structural question of whether `candidate_creation/*` workflow logic belongs in
-`mllm-store`.
-
-Forward-looking dependency notes that remain live: `operation-read-dependencies.md`
-(A3), `ordinary-warm-composition-dependencies.md`, `no-effect-recovery-dependencies.md`
-and `candidate-terminal-api-dependencies.md` (A2d).
-
-## Open questions for the owner
-
-These need a decision rather than more implementation. Each names what changes
-depending on the answer.
-
-1. **Answered: deep park earns its place through multiplexing, not latency.** The
-   owner's position is that the purpose is orchestrating several models dynamically
-   on one machine, particularly for agentic workloads, so the comparison against cold
-   start is the wrong yardstick. Park is what makes a second model possible at all
-   while the first exists; without it the alternative is not a slower switch but no
-   coexistence. Read the 61.96 GiB reclaimed in 0.68 s as the headline figure and the
-   3% startup saving as incidental.
-
-   The open part is switch cost under that goal. Restoring a parked 27B costs 336.9 s
-   because reload rereads every weight, which is a long gap for an agentic caller
-   waiting on a specialist model. Three shapes are worth measuring before committing
-   to one: several smaller models held resident together, which already works since
-   two 4B runtimes coexisted and served concurrently; park used only as overflow past
-   what fits resident; and one MoE covering several specialities so that no switch is
-   needed. Note that host-backed park, the one mode with a sub-second restore, frees
-   almost nothing on unified memory, so fast switching and capacity reclaim cannot
-   currently both be had on this hardware.
-
-2. **Residency policy needs a memory-topology input.** `SPEC.md` §6.2 has `auto`
-   select a qualified deep-park path, but on unified memory deep park and
-   host-backed park are near-opposites: one reclaims capacity slowly to restore, the
-   other restores instantly and reclaims almost nothing. On discrete devices a host
-   backup frees real VRAM and is strictly better. `auto` cannot choose without
-   knowing the topology, which no current contract carries. This likely warrants an
-   ADR amending §6.2.
-
-3. **How should reasoning models be qualified?** The probe now names a leaked
-   reasoning trace instead of failing opaquely, but naming it does not enable those
-   models. Enabling them means launching with a reasoning parser, which changes
-   `rendered_settings_digest` and therefore qualification identity. Open: is a
-   reasoning model a separate pinned recipe, or a recipe field that re-qualifies?
-
-4. **Nothing measured so far went through mllm.** Concurrent serving and pressure
-   switching were both proven at engine level with the router out of the path,
-   because the controller cannot yet construct an adapter for a live binding. The F2
-   exit gate asks for these through the product, and that remains unproven.
-
-5. **Is the 27B checkpoint representative?** It is a reasoning model, which the
-   qualification corpus was not designed for, and it is dense. MoE behaviour is
-   untested; `Qwen3-30B-A3B` is downloading for that comparison.
-
-## Live engine measurements — 2026-09-16, host-a
-
-GB10, driver 580.173.02, CUDA 13.0, kernel 6.17.0-1031-nvidia. SGLang 0.5.19 and
-vLLM 0.29.0, both on torch 2.13.0+cu130. All figures are engine-direct: mllm's
-router was not in the request path, so none of this is end-to-end evidence.
-
-Both engines ran eager with CUDA graphs disabled. These are pinned-profile
-comparisons, not tuned ones, and per `SPEC.md` T40 no speedup claim is made.
-
-### Concurrent serving
-
-Qwen3-4B on both engines simultaneously, ten concurrent requests, ten correct
-replies, 3.62 s wall clock, both processes healthy. Two 4B runtimes coexist in
-roughly 32 GiB of the 128 GiB unified pool.
-
-### Throughput, 27B, 413-token prompt
-
-| engine | conc | TTFT p50 | prefill tok/s | decode tok/s/req | agg out tok/s |
-|---|---|---|---|---|---|
-| SGLang | 1 | 0.610 | 677 | 4.72 | 4.6 |
-| vLLM | 1 | 0.562 | 734 | 4.54 | 4.5 |
-| SGLang | 4 | 0.524 | 788 | 4.58 | 18.1 |
-| vLLM | 4 | 1.623 | 254 | 4.40 | 16.8 |
-| SGLang | 16 | 29.696 | 13.9 | 4.47 | 35.2 |
-| vLLM | 16 | 4.245 | 97.3 | 3.82 | 54.2 |
-
-The concurrency-16 difference is a configuration artifact. SGLang ran with
-`--max-running-requests 8`, so sixteen requests queued behind eight slots; vLLM
-used its default sequence limit. At concurrency 1 and 4 the engines are within
-noise of each other. Do not cite the 16-way row as an engine comparison.
-
-### Park and restore
-
-| | 4B | 27B |
-|---|---|---|
-| release | 0.149 s | 0.677 s |
-| freed | 9.01 GiB | 61.96 GiB |
-| resume | 0.339 s | 1.967 s |
-| reload from disk | 56.8 s | 329.9 s |
-| flush | 0.002 s | 0.020 s |
-| probe | 0.091 s | 4.974 s |
-| restore total | 57.3 s | 336.9 s |
-| cold start | 69.3 s | 347.3 s |
-| warm saving | 17% | **3%** |
-
-Deep park's value on this hardware is capacity reclaim and identity retention, not
-latency. Release returns 61.96 GiB in 0.68 s while the process, port, binding and
-CUDA context survive, but the return path costs essentially a cold start because
-reload rereads every weight from disk. Reload is 98% of restore at 27B, and the
-saving shrinks as the model grows, because reload scales with weights while the
-initialization it avoids is fixed.
-
-Host-backed park inverts the trade and is unusable here. With
-`--enable-weights-cpu-backup`, resume alone restores usable weights in 0.58 s with
-no reload, but release frees only 1.09 GiB instead of 9.01 GiB, because on unified
-memory the host backup occupies the same physical pool as device memory. The backup
-costs a further 8 GiB, retained and stable across four cycles rather than leaking.
-At 27B the mode is infeasible outright: weights twice over is about 110 GiB against
-a 128 GiB pool.
-
-Residency policy therefore depends on memory topology, which `SPEC.md` §6.2 does not
-currently model. On discrete devices a host backup frees real VRAM and is strictly
-better; on unified memory the two modes are near-opposites and `auto` cannot choose
-without knowing which goal it serves.
-
-### Pressure switch
-
-SGLang held a 27B runtime at about 67 GiB resident. Deep park released 61.96 GiB in
-0.68 s while retaining the runtime, vLLM then cold-started the same checkpoint into
-the reclaimed space, and both processes coexisted throughout. vLLM could not have
-started otherwise: two resident 27B runtimes exceed the pool. The reverse switch
-stopped vLLM in 2.06 s and restored SGLang in 336.9 s.
-
-### Probe contract gap
-
-The exact-marker probe assumes a non-reasoning model. Qwen3.5 emits a reasoning
-trace, so `Reply with exactly OK` returns `'...Final only OK.\n</think>\n\nOK'`,
-and with a small token budget it truncates mid-thought and returns `length`. Both
-engine adapters validate readiness as content equal to `OK` with `finish_reason`
-`stop`, so a healthy reasoning runtime reads as unusable and every transition is
-blocked. The F2C correctness corpus shares the assumption. SGLang did not populate
-`reasoning_content` because no `--reasoning-parser` was configured.
+**Gate:** one planner, one set of transition rules, and the consolidated review
+across the whole branch.
 
 ## Tracked for later: naming and engine resolution
 
