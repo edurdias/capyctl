@@ -2,7 +2,7 @@
 //! qualification evidence; cancellation and partial output never prove idle.
 use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const EVENT_LIMIT: usize = 64 * 1024;
@@ -54,11 +54,15 @@ impl ChatHttp {
         }
         let mut response = serde_json::from_str::<Value>(&chunks[0]).map_err(|_| uncertain())?;
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut finish = Value::Null;
         for chunk in chunks {
             let chunk: Value = serde_json::from_str(&chunk).map_err(|_| uncertain())?;
             if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
                 content.push_str(text);
+            }
+            if let Some(text) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
+                reasoning.push_str(text);
             }
             if !chunk["choices"][0]["finish_reason"].is_null() {
                 finish = chunk["choices"][0]["finish_reason"].clone();
@@ -68,7 +72,14 @@ impl ChatHttp {
             }
         }
         response["object"] = json!("chat.completion");
-        response["choices"] = json!([{"index":0,"message":{"role":"assistant","content":content},"finish_reason":finish}]);
+        // Collecting must not silently discard the trace a streaming caller would
+        // have received. The field is omitted entirely when the engine sent none,
+        // so a non-reasoning response keeps its existing shape.
+        let mut message = json!({"role":"assistant","content":content});
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = json!(reasoning);
+        }
+        response["choices"] = json!([{"index":0,"message":message,"finish_reason":finish}]);
         Ok(response)
     }
 
@@ -248,13 +259,21 @@ impl<'a> Parser<'a> {
                 return Err(uncertain());
             }
             let delta = choices[0]["delta"].as_object().ok_or_else(uncertain)?;
+            // SPEC §10 requires reasoning fields to be preserved. A reasoning model
+            // streams its trace as `reasoning_content` deltas, so rejecting the key
+            // fails every chunk and the whole stream, even though the engine is
+            // behaving correctly. It is relayed unchanged and validated like
+            // `content`; the allowlist stays closed to everything else so unknown
+            // fields are still never passed through untested.
             if delta
                 .keys()
-                .any(|k| !matches!(k.as_str(), "role" | "content"))
+                .any(|k| !matches!(k.as_str(), "role" | "content" | "reasoning_content"))
                 || delta.get("role").is_some_and(|r| r != "assistant")
-                || delta
-                    .get("content")
-                    .is_some_and(|c| !c.is_null() && !c.is_string())
+                || ["content", "reasoning_content"].iter().any(|key| {
+                    delta
+                        .get(*key)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                })
             {
                 return Err(uncertain());
             }

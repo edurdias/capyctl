@@ -1,11 +1,11 @@
-use axum::{Json, Router, http::HeaderMap, routing::post};
-use mllm_adapters::RuntimeError;
+use axum::{http::HeaderMap, routing::post, Json, Router};
 use mllm_adapters::sglang::{SglangAdapter, SglangRuntimeObservation, SglangRuntimeObserver};
-use mllm_adapters::{ChatForward, StreamEnded, fake::ParkPolicy, vllm::VllmAdapter};
+use mllm_adapters::RuntimeError;
+use mllm_adapters::{fake::ParkPolicy, vllm::VllmAdapter, ChatForward, StreamEnded};
 use mllm_domain::launch::{
     NativeCandidateLaunch, NativeCandidateMetadata, SglangLaunchSettings, SglangRequestedBudget,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
 const MODEL: &str = "candidate-01K00000000000000000000001";
@@ -137,8 +137,8 @@ async fn async_sink_waits_in_order_and_failure_drains_without_resuming_delivery(
                 );
                 if !fail {
                     assert_eq!(
-                        serde_json::from_str::<Value>(&sink.chunks[1]).unwrap()["choices"][0]["delta"]
-                            ["content"],
+                        serde_json::from_str::<Value>(&sink.chunks[1]).unwrap()["choices"][0]
+                            ["delta"]["content"],
                         "two"
                     );
                 }
@@ -291,12 +291,10 @@ async fn rejects_malformed_mismatched_and_unfinished_streams() {
             chunk("partial", Value::Null),
         ] {
             let (adapter, task) = engine(sglang, sse).await;
-            assert!(
-                adapter
-                    .forward_chat(&json!({"model":"public"}))
-                    .await
-                    .is_err()
-            );
+            assert!(adapter
+                .forward_chat(&json!({"model":"public"}))
+                .await
+                .is_err());
             task.abort();
         }
     }
@@ -351,12 +349,10 @@ async fn rejects_changed_response_identity_duplicate_fields_and_trailing_generat
             format!("data: {}\n\n", "x".repeat(65536)),
         ] {
             let (adapter, task) = engine(sglang, bad).await;
-            assert!(
-                adapter
-                    .forward_chat(&json!({"model":"public"}))
-                    .await
-                    .is_err()
-            );
+            assert!(adapter
+                .forward_chat(&json!({"model":"public"}))
+                .await
+                .is_err());
             task.abort();
         }
     }
@@ -453,16 +449,14 @@ async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness()
         id: "request".into(),
     };
     for adapter in [&sglang as &dyn ChatForward, &vllm as &dyn ChatForward] {
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(30),
-                adapter.forward_chat_stream(&json!({"model":"public"}), &mut |_| panic!(
-                    "no chunks expected"
-                ))
-            )
-            .await
-            .is_err()
-        );
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            adapter.forward_chat_stream(&json!({"model":"public"}), &mut |_| panic!(
+                "no chunks expected"
+            ))
+        )
+        .await
+        .is_err());
     }
     assert_eq!(
         sglang.cancel_work(&member, &request, true).await.unwrap(),
@@ -482,8 +476,8 @@ async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness()
 #[tokio::test]
 async fn redirects_never_receive_the_inference_credential() {
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     let hits = Arc::new(AtomicUsize::new(0));
     let count = hits.clone();
@@ -616,12 +610,100 @@ async fn bounded_stream_rejects_many_small_events_before_done() {
             chunk("", json!("stop"))
         );
         let (adapter, task) = engine(sglang, sse).await;
-        assert!(
-            adapter
-                .forward_chat_stream(&json!({"model":"public"}), &mut |_| {})
-                .await
-                .is_err()
-        );
+        assert!(adapter
+            .forward_chat_stream(&json!({"model":"public"}), &mut |_| {})
+            .await
+            .is_err());
         task.abort();
     }
+}
+
+fn reasoning_chunk(reasoning: &str, content: &str, finish: Value) -> String {
+    let mut delta = json!({});
+    if !reasoning.is_empty() {
+        delta["reasoning_content"] = json!(reasoning);
+    }
+    if !content.is_empty() {
+        delta["content"] = json!(content);
+    }
+    format!(
+        "data: {}\r\n\r\n",
+        json!({"id":"chat-1","object":"chat.completion.chunk","created":1,"model":MODEL,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
+    )
+}
+
+/// SPEC §10 requires reasoning fields to be preserved. A reasoning model streams its
+/// trace as `reasoning_content`, so rejecting the key fails every chunk and the whole
+/// stream while the engine is behaving correctly. Observed live on host-a with
+/// Qwen3-30B-A3B and `--reasoning-parser qwen3`.
+#[tokio::test]
+async fn a_reasoning_trace_streams_through_and_survives_collection() {
+    for sglang in [false, true] {
+        let sse = format!(
+            "{}{}{}data:[DONE]\n\n",
+            reasoning_chunk("thinking ", "", Value::Null),
+            reasoning_chunk("more", "", Value::Null),
+            reasoning_chunk("", "OK", json!("stop")),
+        );
+        let (adapter, task) = engine(sglang, sse).await;
+        let mut chunks = vec![];
+        let end = adapter
+            .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |s| {
+                chunks.push(serde_json::from_str::<Value>(&s).unwrap())
+            })
+            .await
+            .expect("a reasoning stream is valid, not a protocol violation");
+        assert_eq!(end, StreamEnded::Completed);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0]["choices"][0]["delta"]["reasoning_content"],
+            "thinking "
+        );
+        assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "OK");
+
+        let collected = adapter
+            .forward_chat(&json!({"model":"public"}))
+            .await
+            .unwrap();
+        assert_eq!(collected["choices"][0]["message"]["content"], "OK");
+        assert_eq!(
+            collected["choices"][0]["message"]["reasoning_content"], "thinking more",
+            "collecting must not discard what a streaming caller would have seen"
+        );
+        drop(task);
+    }
+}
+
+/// A response with no trace keeps its existing shape: the field is absent, not empty.
+#[tokio::test]
+async fn a_response_without_a_trace_gains_no_reasoning_field() {
+    let sse = format!("{}data:[DONE]\n\n", chunk("OK", json!("stop")));
+    let (adapter, task) = engine(false, sse).await;
+    let collected = adapter
+        .forward_chat(&json!({"model":"public"}))
+        .await
+        .unwrap();
+    assert_eq!(collected["choices"][0]["message"]["content"], "OK");
+    assert!(collected["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+    drop(task);
+}
+
+/// The allowlist stays closed: an unknown delta field is still never relayed.
+#[tokio::test]
+async fn an_unknown_delta_field_is_still_rejected() {
+    let sse = format!(
+        "data: {}\r\n\r\ndata:[DONE]\n\n",
+        json!({"id":"chat-1","object":"chat.completion.chunk","created":1,"model":MODEL,"choices":[{"index":0,"delta":{"content":"OK","speculative_tokens":3},"finish_reason":"stop"}]})
+    );
+    let (adapter, task) = engine(false, sse).await;
+    assert!(
+        adapter
+            .forward_chat_stream(&json!({"model":"public","stream":true}), &mut |_| {})
+            .await
+            .is_err(),
+        "untested fields must not pass through"
+    );
+    drop(task);
 }
