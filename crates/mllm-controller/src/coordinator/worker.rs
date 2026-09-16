@@ -169,6 +169,21 @@ impl CoordinatorCommands {
         query(owner.store()).map_err(Into::into)
     }
 
+    /// Lock the owned state for a read whose error type is not a store error.
+    ///
+    /// `read` covers the common case; this exists for the few store APIs that
+    /// report lifecycle errors instead, so neither has to widen to accommodate the
+    /// other.
+    pub fn owner_for_read(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, crate::ownership::OwnedCoordinatorState>, crate::fault::LifecycleFault>
+    {
+        self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
+        })
+    }
+
     /// Accept a deployment durably and return what was accepted.
     ///
     /// Acceptance is idempotent on the caller's key: a response lost after the

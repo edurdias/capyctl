@@ -136,6 +136,28 @@ impl CoordinatorLifecycle {
         Ok(accepted.deployment_id.0.to_string())
     }
 
+    /// The processes this deployment's retained runtime is recorded as owning.
+    ///
+    /// Replaces reading a live pid out of an in-memory handle map. That map does not
+    /// survive a restart, so after one the controller could no longer say what it
+    /// owned; these identities are durable, and each carries a boot id and start time,
+    /// so a caller can establish whether the process is still the one recorded rather
+    /// than trusting that a pid number still means what it did.
+    ///
+    /// An empty result means no retained binding, which is not the same as a runtime
+    /// that has gone: use the absence proof for that.
+    pub fn live_identities(
+        &self,
+        deployment: &str,
+    ) -> Result<Vec<mllm_domain::completion::ProcessIdentity>, LifecycleFault> {
+        let owner = self.commands.owner_for_read()?;
+        let binding = owner
+            .store()
+            .runtime_binding(deployment)
+            .map_err(LifecycleFault::from)?;
+        Ok(binding.map(|b| b.identities).unwrap_or_default())
+    }
+
     /// Reject a dispatch carrying a generation older than the deployment's current
     /// one (T18): an ingress gate must refuse late work after it closes.
     pub fn check_dispatch_generation(
