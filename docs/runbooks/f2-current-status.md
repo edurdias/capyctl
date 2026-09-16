@@ -336,12 +336,23 @@ and `candidate-terminal-api-dependencies.md` (A2d).
 These need a decision rather than more implementation. Each names what changes
 depending on the answer.
 
-1. **Does deep park earn its place on unified memory?** Measured warm restore saves
-   3% against cold start at 27B and 17% at 4B, because reload rereads every weight
-   from disk. The benefit is capacity reclaim of 61.96 GiB in 0.68 s and retention of
-   the process, port, binding and CUDA context, not latency. If the product promise
-   is fast switching, this hardware does not deliver it by parking, and that should
-   be stated rather than implied.
+1. **Answered: deep park earns its place through multiplexing, not latency.** The
+   owner's position is that the purpose is orchestrating several models dynamically
+   on one machine, particularly for agentic workloads, so the comparison against cold
+   start is the wrong yardstick. Park is what makes a second model possible at all
+   while the first exists; without it the alternative is not a slower switch but no
+   coexistence. Read the 61.96 GiB reclaimed in 0.68 s as the headline figure and the
+   3% startup saving as incidental.
+
+   The open part is switch cost under that goal. Restoring a parked 27B costs 336.9 s
+   because reload rereads every weight, which is a long gap for an agentic caller
+   waiting on a specialist model. Three shapes are worth measuring before committing
+   to one: several smaller models held resident together, which already works since
+   two 4B runtimes coexisted and served concurrently; park used only as overflow past
+   what fits resident; and one MoE covering several specialities so that no switch is
+   needed. Note that host-backed park, the one mode with a sub-second restore, frees
+   almost nothing on unified memory, so fast switching and capacity reclaim cannot
+   currently both be had on this hardware.
 
 2. **Residency policy needs a memory-topology input.** `SPEC.md` §6.2 has `auto`
    select a qualified deep-park path, but on unified memory deep park and

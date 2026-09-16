@@ -748,3 +748,74 @@ async fn a_foreign_reply_with_a_trace_is_not_a_parser_diagnosis() {
         other => panic!("expected uncertainty, got {other:?}"),
     }
 }
+
+/// With a reasoning parser configured the trace is separated correctly, but the
+/// model can still spend the whole probe budget thinking. The runtime is healthy and
+/// the probe is undersized, which is a different repair from a missing parser.
+/// Measured live: Qwen3.5-27B with `--reasoning-parser qwen3` returned empty content
+/// at eight tokens and the exact marker at 512.
+#[tokio::test]
+async fn a_budget_consumed_by_reasoning_is_reported_separately() {
+    let f = Fixture::new().await;
+    f.reply(
+        StatusCode::OK,
+        &json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"We need answer exactly OK. User says"},"finish_reason":"length"}]}).to_string(),
+    );
+    let error = f
+        .adapter
+        .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+        .await
+        .expect_err("an unanswered probe is not model usability");
+    match error {
+        RuntimeError::Uncertain(message) => {
+            assert!(
+                message.contains("probe budget"),
+                "expected the budget to be named, got: {message}"
+            );
+            assert!(
+                !message.contains("reasoning parser"),
+                "the parser is configured; naming it would send the wrong repair"
+            );
+        }
+        other => panic!("expected uncertainty, got {other:?}"),
+    }
+}
+
+/// An empty answer without a separated trace is ordinary failure, not a budget
+/// problem: nothing shows the model was thinking rather than broken.
+#[tokio::test]
+async fn an_empty_answer_without_a_trace_is_ordinary_uncertainty() {
+    for reply in [
+        json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"length"}]}),
+        json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"  "},"finish_reason":"length"}]}),
+    ] {
+        let f = Fixture::new().await;
+        f.reply(StatusCode::OK, &reply.to_string());
+        let error = f
+            .adapter
+            .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+            .await
+            .expect_err("an empty answer is never usability");
+        match error {
+            RuntimeError::Uncertain(message) => assert!(
+                !message.contains("probe budget") && !message.contains("reasoning parser"),
+                "no reasoning evidence, so no reasoning diagnosis: {message}"
+            ),
+            other => panic!("expected uncertainty, got {other:?}"),
+        }
+    }
+}
+
+/// A separated trace with a correct answer is a healthy probe and must still pass.
+#[tokio::test]
+async fn a_separated_trace_with_the_exact_marker_still_passes() {
+    let f = Fixture::new().await;
+    f.reply(
+        StatusCode::OK,
+        &json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":"\n\nOK","reasoning_content":"Final only OK."},"finish_reason":"stop"}]}).to_string(),
+    );
+    f.adapter
+        .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+        .await
+        .expect("a separated trace with the exact marker is usable");
+}

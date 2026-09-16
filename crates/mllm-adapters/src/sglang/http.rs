@@ -38,6 +38,10 @@ struct ProbeChoice {
 struct ProbeMessage {
     role: String,
     content: String,
+    /// Present when the engine runs a reasoning parser. Only its emptiness is
+    /// examined; the trace itself is never read, logged or copied into an error.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// Credentials and the checkpoint root deliberately have no Debug surface.
@@ -73,6 +77,21 @@ fn leaked_reasoning(content: &str) -> bool {
     REASONING_TERMINATORS
         .iter()
         .any(|terminator| content.contains(terminator))
+}
+
+/// With a reasoning parser configured the trace is separated correctly, but a
+/// reasoning model can still spend the whole probe budget thinking, leaving empty
+/// content and a length finish. The runtime is healthy and the probe is simply too
+/// small, which is a different repair from a missing parser.
+///
+/// Measured on host-a with Qwen3.5-27B and `--reasoning-parser qwen3`: eight
+/// tokens yielded empty content, while 512 yielded the exact marker.
+pub(super) fn reasoning_budget_too_small() -> RuntimeError {
+    RuntimeError::Uncertain(
+        "SGLang probe budget was consumed by reasoning before an answer was \
+         produced; the recipe needs a probe budget that fits this model's trace"
+            .into(),
+    )
 }
 
 pub(super) fn reasoning_not_separated() -> RuntimeError {
@@ -225,6 +244,24 @@ impl ControlHttp {
                 });
                 if leaked {
                     return Err(reasoning_not_separated());
+                }
+                // A separated trace that consumed the whole budget: healthy runtime,
+                // undersized probe. Distinguished from a missing parser because the
+                // repair differs.
+                let starved = reply.as_ref().is_some_and(|reply| {
+                    value.get("error").is_none()
+                        && reply.model == self.model
+                        && reply.choices.len() == 1
+                        && reply.choices[0].message.content.trim().is_empty()
+                        && reply.choices[0]
+                            .message
+                            .reasoning_content
+                            .as_ref()
+                            .is_some_and(|trace| !trace.trim().is_empty())
+                        && reply.choices[0].finish_reason == "length"
+                });
+                if starved {
+                    return Err(reasoning_budget_too_small());
                 }
                 value.get("error").is_none()
                     && reply.is_some_and(|reply| {
