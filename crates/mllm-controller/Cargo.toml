@@ -19,6 +19,7 @@ mllm-domain = { workspace = true }
 mllm-scheduler = { workspace = true }
 mllm-store = { workspace = true }
 mllm-launchers = { path = "../mllm-launchers" }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
