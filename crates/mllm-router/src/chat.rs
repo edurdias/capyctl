@@ -107,21 +107,32 @@ fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
             "queue_full" => StatusCode::PAYLOAD_TOO_LARGE,
             "unsupported" => StatusCode::NOT_IMPLEMENTED,
             "insufficient_resources" => StatusCode::TOO_MANY_REQUESTS,
+            "conflict" => StatusCode::CONFLICT,
+            // Still in progress as far as anyone can tell: not a failure the client
+            // should read as "nothing happened".
+            "activation_uncertain" => StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         },
         Json(serde_json::json!({ "code": code, "message": message })),
     )
 }
 
-fn map_controller(e: mllm_controller::ControllerError) -> (StatusCode, Json<serde_json::Value>) {
+/// Exhaustive on purpose. The previous catch-all reported every unclassified
+/// outcome as an activation failure, which told a client that nothing happened even
+/// when the activation was still running. A new fault variant must be a compile
+/// error here, not silently absorbed into that claim.
+fn map_controller(e: mllm_controller::LifecycleFault) -> (StatusCode, Json<serde_json::Value>) {
+    use mllm_controller::LifecycleFault as F;
     match e {
-        mllm_controller::ControllerError::Blocked(b) => {
-            err("insufficient_resources", &format!("admission blocked: {b:?}"))
-        }
-        mllm_controller::ControllerError::UnknownDeployment(d) => {
-            err("unknown_model", &format!("deployment {d} vanished"))
-        }
-        other => err("activation_failed", &other.to_string()),
+        F::NotFound(d) => err("unknown_model", &format!("deployment {d} vanished")),
+        F::Blocked(m) => err("insufficient_resources", &format!("admission blocked: {m}")),
+        F::Conflict(m) => err("conflict", &m),
+        // The activation may still be running. Saying it failed would invite a
+        // client to treat the deployment as untouched.
+        F::Uncertain(m) => err("activation_uncertain", &m),
+        F::Failed(m) => err("activation_failed", &m),
+        F::Unavailable(m) => err("unavailable", &m),
     }
 }
 
