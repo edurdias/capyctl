@@ -184,6 +184,30 @@ impl CoordinatorCommands {
         })
     }
 
+    /// Publish the host's resource policy: the ceiling admission is judged against.
+    ///
+    /// It is imported with the observations that justify it rather than on its own,
+    /// because a ceiling asserted without a reading of the machine is a guess, and a
+    /// guess is what lets a host be overcommitted.
+    pub fn import_resource_policy(
+        &self,
+        host: &mllm_config::effective::HostPolicy,
+        observations: &[mllm_domain::resources::MemoryObservation],
+        now_ms: i64,
+    ) -> Result<(), crate::fault::LifecycleFault> {
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
+        })?;
+        owner
+            .store()
+            .import_resource_policy(owner.session(), host, observations, now_ms)
+            .map_err(|error| {
+                crate::fault::LifecycleFault::Blocked(format!("resource policy refused: {error}"))
+            })?;
+        Ok(())
+    }
+
     /// Create a stopped managed configuration, which is how a deployment comes into
     /// existence with an effective configuration to be qualified against.
     ///

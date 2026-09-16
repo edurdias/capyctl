@@ -160,6 +160,35 @@ impl CoordinatorLifecycle {
         Ok(binding.map(|b| b.identities).unwrap_or_default())
     }
 
+    /// Publish the host's resource policy with the observations that justify it.
+    pub fn publish_resource_policy(
+        &self,
+        host: &mllm_config::effective::HostPolicy,
+        observations: &[mllm_domain::resources::MemoryObservation],
+    ) -> Result<(), LifecycleFault> {
+        let now = self.commands.now_ms()?;
+        self.commands.import_resource_policy(host, observations, now)
+    }
+
+    /// Create a deployment together with the effective configuration it will be
+    /// qualified against.
+    ///
+    /// Replaces the bare-record path. A deployment created without a configuration
+    /// can be named but never started, because the coordinator starts only what it
+    /// can qualify, so the two are written together or not at all.
+    pub fn create_configuration(
+        &self,
+        principal: &str,
+        key: &str,
+        request_json: &str,
+        trusted_host: &serde_json::Value,
+    ) -> Result<mllm_store::managed_configuration::ManagedConfigurationReceipt, LifecycleFault>
+    {
+        let now = self.commands.now_ms()?;
+        self.commands
+            .create_managed_configuration(principal, key, request_json, trusted_host, now)
+    }
+
     /// Reject a dispatch carrying a generation older than the deployment's current
     /// one (T18): an ingress gate must refuse late work after it closes.
     pub fn check_dispatch_generation(

@@ -109,14 +109,22 @@ pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_b
         json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}])
     };
     json!({
+        "schema_version": 1,
         "kind": "deployment",
         "name": name,
         "routes": [route],
+        // The installation this deployment runs on. Named `runtime_profile` in the
+        // configuration schema; ADR 0008 calls the same object an engine
+        // installation, and the rename is tracked there rather than diverging here.
+        "runtime_profile": STANDALONE_PROFILE,
+        "runtime_profile_revision": 1,
         "recipe": "standalone",
-        "residency": "warm",
+        // Standalone issues no qualification of its own, and warm residency requires
+        // a qualified parking recipe. Restart-only is the honest declaration, and is
+        // the fallback SPEC §6.2 already describes for an unqualified deep-park path.
+        "residency": "restart_only",
         "recovery": "reconcile",
         "request_deadline": "300s",
-        "profile": STANDALONE_PROFILE,
         "model": {
             "path": model_path,
             "content_fingerprint": format!("sha256:{name}"),

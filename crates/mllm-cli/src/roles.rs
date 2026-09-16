@@ -40,6 +40,11 @@ pub struct App {
     /// A separate read-only connection for direct observation in tests. It never
     /// writes: the coordinator is the only writer.
     pub store: Rc<Store>,
+    /// The engine installation this host published, and the capacity its limits were
+    /// derived from. Deployments are qualified against this, so it is kept rather
+    /// than recomposed per request — recomposing risks declaring one thing at boot
+    /// and a different thing at deploy.
+    engine_declaration: (String, String, bool, i64),
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     deps: mllm_router::RouterDeps,
@@ -58,6 +63,35 @@ impl App {
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
+
+    /// Create a deployment that can actually be started.
+    ///
+    /// A deployment comes into existence together with the effective configuration
+    /// it will be qualified against, because the coordinator starts only what it can
+    /// qualify. Creating a bare record first — which is what the previous path did —
+    /// produces a deployment that can be named and never run.
+    pub fn deploy(&self, name: &str, model_path: &str) -> Result<String, StartError> {
+        let (engine, executable, experimental, capacity) = &self.engine_declaration;
+        let host = crate::standalone_config::host_policy(
+            engine,
+            executable,
+            "standalone-1",
+            *experimental,
+            *capacity,
+        );
+        let deployment =
+            crate::standalone_config::deployment_document(name, name, model_path, *capacity);
+        let receipt = self
+            .controller
+            .create_configuration(
+                "standalone",
+                name,
+                &serde_json::json!({ "config": deployment }).to_string(),
+                &host,
+            )
+            .map_err(|error| StartError::Deploy(error.to_string()))?;
+        Ok(receipt.deployment_id)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +108,8 @@ pub enum StartError {
     Ownership(#[from] mllm_controller::OwnedStateError),
     #[error("coordinator: {0}")]
     Coordinator(#[from] mllm_controller::coordinator::CoordinatorError),
+    #[error("deploy: {0}")]
+    Deploy(String),
 }
 
 impl From<StartError> for StructuredError {
@@ -282,7 +318,25 @@ async fn start_standalone_inner(
     let controller = Arc::new(CoordinatorLifecycle::new(coordinator.commands()));
     // The adapter and launcher built above now inform only the forwarding table;
     // the coordinator resolves an adapter per binding from its frozen profile.
-    let _ = (adapter, launcher, policy);
+    let _ = (adapter, launcher);
+    // What this host publishes about its engine. Derived from the live profile when
+    // one is configured, otherwise the embedded fake, and from observed capacity
+    // rather than a configured guess.
+    let engine_declaration = {
+        let (engine, executable) = match LiveVllmProfile::from_env() {
+            Some(p) => ("vllm".to_string(), p.engine_bin.to_string_lossy().to_string()),
+            None => ("fake".to_string(), "/bin/true".to_string()),
+        };
+        let capacity = mllm_agent::memory::read_host_memory()
+            .map(|sample| sample.memory.capacity_bytes)
+            .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
+        (
+            engine,
+            executable,
+            policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed,
+            capacity,
+        )
+    };
     let deps = mllm_router::RouterDeps {
         controller: controller.clone(),
         forwards,
@@ -295,7 +349,42 @@ async fn start_standalone_inner(
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
     };
     let router = mllm_router::serve_router(deps.clone());
-    Ok(App { controller, _coordinator: coordinator, store, router, deps, api_key })
+    // Publish the ceiling before anything can be admitted against it. A deployment
+    // cannot be qualified until the host has said what it will allow, and the policy
+    // is imported with the observation that justifies it rather than on its own.
+    {
+        let (engine, executable, experimental, capacity) = &engine_declaration;
+        let host = crate::standalone_config::host_policy(
+            engine,
+            executable,
+            "standalone-1",
+            *experimental,
+            *capacity,
+        );
+        let probe = crate::standalone_config::deployment_document(
+            "policy-probe",
+            "policy-probe",
+            "/dev/null",
+            *capacity,
+        );
+        let effective = mllm_config::effective::resolve_effective(&probe, &host)
+            .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
+        let sample = mllm_agent::memory::read_host_memory()
+            .map_err(|error| StartError::Deploy(format!("host memory unreadable: {error}")))?;
+        let observations: Vec<_> = effective
+            .host
+            .domains
+            .keys()
+            .map(|domain| mllm_domain::resources::MemoryObservation {
+                domain: domain.clone(),
+                ..sample.memory.clone()
+            })
+            .collect();
+        controller
+            .publish_resource_policy(&effective.host, &observations)
+            .map_err(|error| StartError::Deploy(error.to_string()))?;
+    }
+    Ok(App { controller, _coordinator: coordinator, store, engine_declaration, router, deps, api_key })
 }
 
 fn live_vllm_sleep_flags(policy: mllm_adapters::fake::ParkPolicy) -> Vec<String> {

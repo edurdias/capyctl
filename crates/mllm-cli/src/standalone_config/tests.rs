@@ -106,6 +106,6 @@ fn a_parked_deployment_holds_no_device() {
 #[test]
 fn the_deployment_names_its_installation() {
     let d = deployment_document("m", "route-m", "/models/m", CAPACITY);
-    assert_eq!(d["profile"], STANDALONE_PROFILE);
+    assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
 }

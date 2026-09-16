@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 serde_json = "1"
+mllm-domain = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -21,7 +22,6 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-mllm-domain = { workspace = true }
 
 
 [[bin]]
