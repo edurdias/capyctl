@@ -215,10 +215,15 @@ not survive a restart. The whole F2 stack is reachable only from tests.
       admission, empty-ledger checks, old reservation writers, router-owned eviction
       and in-memory release guards. Never two authorities at once.
 
-**Gate:** one inference served through the router, and one park or restore driven by
-the coordinator, both on a real engine. That is the first end-to-end evidence the
-project has. Pressure-driven switching is deliberately not part of this gate; it is
-A1b, because the capability does not exist yet in any authority.
+**Gate:** deploy, start and serve one inference through the router with the
+coordinator as the sole lifecycle authority, on a real engine. That is the first
+end-to-end evidence the project has.
+
+Park was originally part of this gate and has moved to A1b. The ordinary lifecycle
+has no park at all — only the candidate path does — and ordinary stop needs the
+suspension predicate split recorded below. Both belong with eviction rather than with
+the cutover. Until A1b lands, the CLI loses park and stop, which is the deliberate
+price of having one authority instead of two.
 
 ### A1b — Implement eviction in the authority
 
