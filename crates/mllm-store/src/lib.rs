@@ -13,6 +13,7 @@ pub mod qualification_policy;
 pub mod qualification;
 pub mod ordinary_lifecycle;
 pub mod resource_ledger;
+pub mod residency;
 pub mod resource_policy;
 pub mod schema;
 pub mod snapshot;

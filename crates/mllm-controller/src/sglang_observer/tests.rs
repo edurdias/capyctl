@@ -403,3 +403,34 @@ fn multi_device_residency_is_unknown() {
     .residency();
     assert!(o.unknown_work, "multi-rank evidence is not implemented");
 }
+
+/// A source bound to one deployment must never answer for another. Returning zero
+/// would report quiescence the controller has not established.
+#[test]
+fn store_sources_reject_a_foreign_deployment() {
+    let store = Arc::new(std::sync::Mutex::new(
+        mllm_store::Store::open_in_memory().unwrap(),
+    ));
+    let sources = StoreSources::new(store, "dep-1".into()).unwrap();
+    assert_eq!(sources.outstanding("dep-2"), Err(SourceUnavailable));
+    assert!(
+        StoreSources::new(
+            Arc::new(std::sync::Mutex::new(
+                mllm_store::Store::open_in_memory().unwrap()
+            )),
+            String::new()
+        )
+        .is_err()
+    );
+}
+
+/// An unknown binding is unavailable, not an empty history: empty would read as a
+/// released runtime and permit a restore that has no committed basis.
+#[test]
+fn store_sources_report_an_unknown_binding_as_unavailable() {
+    let store = Arc::new(std::sync::Mutex::new(
+        mllm_store::Store::open_in_memory().unwrap(),
+    ));
+    let sources = StoreSources::new(store, "dep-1".into()).unwrap();
+    assert_eq!(sources.facts("bind-x", "inc-x"), Err(SourceUnavailable));
+}

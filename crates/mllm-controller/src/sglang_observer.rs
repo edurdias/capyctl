@@ -272,3 +272,54 @@ impl SglangRuntimeObserver for NativeSglangObserver {
 
 #[cfg(test)]
 mod tests;
+
+/// Store-backed residency sources.
+///
+/// The lock is held only for the duration of one read. Both reads are plain
+/// queries, so they can run while a coordinator step is in flight without
+/// serialising against it for longer than the query itself.
+pub struct StoreSources {
+    store: Arc<std::sync::Mutex<mllm_store::Store>>,
+    deployment_id: String,
+}
+
+impl StoreSources {
+    pub fn new(
+        store: Arc<std::sync::Mutex<mllm_store::Store>>,
+        deployment_id: String,
+    ) -> Result<Self, RuntimeError> {
+        if deployment_id.is_empty() {
+            return Err(RuntimeError::Unsupported);
+        }
+        Ok(Self {
+            store,
+            deployment_id,
+        })
+    }
+}
+
+impl CommittedFacts for StoreSources {
+    fn facts(&self, binding_id: &str, incarnation: &str) -> Observed<Vec<Milestone>> {
+        self.store
+            .lock()
+            .map_err(|_| SourceUnavailable)?
+            .committed_milestones(binding_id, incarnation)
+            .map_err(|_| SourceUnavailable)
+    }
+}
+
+impl RegisteredWork for StoreSources {
+    fn outstanding(&self, deployment_id: &str) -> Observed<usize> {
+        // The observer passes the token's deployment. A mismatch means this source
+        // was bound to a different deployment than the step being executed, which
+        // is unknown rather than zero outstanding work.
+        if deployment_id != self.deployment_id {
+            return Err(SourceUnavailable);
+        }
+        self.store
+            .lock()
+            .map_err(|_| SourceUnavailable)?
+            .outstanding_requests(deployment_id)
+            .map_err(|_| SourceUnavailable)
+    }
+}
