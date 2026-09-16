@@ -3,10 +3,10 @@
 use std::time::Duration;
 
 use reqwest::{
+    header::{HeaderValue, AUTHORIZATION},
     Client, Url,
-    header::{AUTHORIZATION, HeaderValue},
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::traits::{RuntimeAction, RuntimeError};
 
@@ -52,6 +52,35 @@ pub(super) struct ControlHttp {
 
 pub(super) fn uncertain() -> RuntimeError {
     RuntimeError::Uncertain("SGLang control requires reconciliation".into())
+}
+
+/// A reasoning model emits its chain of thought before its answer. When the engine
+/// is launched without a reasoning parser that trace stays in `content` instead of
+/// being separated, so an exact-marker probe fails against a runtime that is in fact
+/// healthy, and every transition gated on the probe is blocked.
+///
+/// The marker check itself is deliberately not relaxed: requiring exact content is
+/// what distinguishes a restored runtime from one whose weights were resumed but
+/// never reloaded, which produces plausible-looking output. Instead the leak is
+/// named, so the operator is told to configure a reasoning parser rather than being
+/// left with an indistinguishable uncertainty.
+///
+/// Only the presence of a terminator is inspected. No response content is read into
+/// the error, because it can carry private model output.
+const REASONING_TERMINATORS: &[&str] = &["</think>", "</reasoning>", "<|end_thinking|>"];
+
+fn leaked_reasoning(content: &str) -> bool {
+    REASONING_TERMINATORS
+        .iter()
+        .any(|terminator| content.contains(terminator))
+}
+
+pub(super) fn reasoning_not_separated() -> RuntimeError {
+    RuntimeError::Uncertain(
+        "SGLang probe content carries a reasoning trace; launch the engine with a \
+         reasoning parser so the answer is separated from the trace"
+            .into(),
+    )
 }
 
 pub(super) fn action_timeout(action: RuntimeAction) -> Result<Duration, RuntimeError> {
@@ -184,8 +213,21 @@ impl ControlHttp {
                 serde_json::from_slice::<ReloadReply>(&bytes).is_ok_and(|reply| reply.success)
             }
             RuntimeAction::Probe => {
+                let reply = serde_json::from_slice::<ProbeReply>(&bytes).ok();
+                // Name the misconfiguration before the generic failure, but only for
+                // an otherwise well-formed reply from this runtime: a malformed or
+                // foreign reply is ordinary uncertainty, not a parser problem.
+                let leaked = reply.as_ref().is_some_and(|reply| {
+                    value.get("error").is_none()
+                        && reply.model == self.model
+                        && reply.choices.len() == 1
+                        && leaked_reasoning(&reply.choices[0].message.content)
+                });
+                if leaked {
+                    return Err(reasoning_not_separated());
+                }
                 value.get("error").is_none()
-                    && serde_json::from_slice::<ProbeReply>(&bytes).is_ok_and(|reply| {
+                    && reply.is_some_and(|reply| {
                         reply.model == self.model
                             && reply.choices.len() == 1
                             && reply.choices[0].index == 0
@@ -196,6 +238,10 @@ impl ControlHttp {
             }
             _ => false,
         };
-        if accepted { Ok(()) } else { Err(uncertain()) }
+        if accepted {
+            Ok(())
+        } else {
+            Err(uncertain())
+        }
     }
 }

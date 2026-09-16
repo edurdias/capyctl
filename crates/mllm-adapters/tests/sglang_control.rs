@@ -3,11 +3,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::{
-    Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
+    Router,
 };
 use mllm_adapters::{
     sglang::{SglangAdapter, SglangRuntimeObservation, SglangRuntimeObserver},
@@ -21,7 +21,7 @@ use mllm_domain::{
         NativeCandidateLaunch, NativeCandidateMetadata, SglangLaunchSettings, SglangRequestedBudget,
     },
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 const BINDING: &str = "01K00000000000000000000001";
@@ -337,11 +337,9 @@ async fn restore_is_separate_from_reload_flush_and_accounted_probe() {
         requests[3].body,
         json!({"model":MODEL,"messages":[{"role":"user","content":"Reply with exactly OK."}],"temperature":0,"max_tokens":8,"stream":false})
     );
-    assert!(
-        requests[..3]
-            .iter()
-            .all(|r| r.authorization == "Bearer admin-secret")
-    );
+    assert!(requests[..3]
+        .iter()
+        .all(|r| r.authorization == "Bearer admin-secret"));
 }
 
 #[tokio::test]
@@ -672,4 +670,81 @@ async fn pending_control_cannot_report_ready_or_accept_concurrent_work() {
     f.server.proceed.notify_one();
     work.await.unwrap().unwrap();
     assert_eq!(f.requests().len(), 1);
+}
+
+/// A reasoning model's trace stays in `content` when the engine runs without a
+/// reasoning parser. The runtime is healthy, so the failure must name the
+/// misconfiguration instead of presenting as indistinguishable uncertainty.
+/// Measured live on host-a with Qwen3.5-27B on 2026-09-16.
+#[tokio::test]
+async fn a_leaked_reasoning_trace_is_reported_as_a_parser_misconfiguration() {
+    for content in [
+        "We need answer exactly OK. Final only OK.\n</think>\n\nOK",
+        "thinking</reasoning>OK",
+        "aside<|end_thinking|>OK",
+    ] {
+        let f = Fixture::new().await;
+        f.reply(
+            StatusCode::OK,
+            &json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}]}).to_string(),
+        );
+        let error = f
+            .adapter
+            .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+            .await
+            .expect_err("a leaked trace is not a usable model");
+        match error {
+            RuntimeError::Uncertain(message) => assert!(
+                message.contains("reasoning parser"),
+                "expected the parser misconfiguration to be named, got: {message}"
+            ),
+            other => panic!("expected uncertainty, got {other:?}"),
+        }
+    }
+}
+
+/// The marker check itself must stay exact. Resumed-but-not-reloaded weights
+/// produce plausible output, and relaxing the comparison would let that pass. The
+/// live reproduction of that failure emitted `!!!!!!!!`.
+#[tokio::test]
+async fn plausible_but_wrong_probe_output_is_still_rejected() {
+    for content in ["!!!!!!!!", "OK.", "Sure, OK", "ok"] {
+        let f = Fixture::new().await;
+        f.reply(
+            StatusCode::OK,
+            &json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}]}).to_string(),
+        );
+        let error = f
+            .adapter
+            .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+            .await
+            .expect_err("only the exact marker establishes model usability");
+        match error {
+            RuntimeError::Uncertain(message) => assert!(
+                !message.contains("reasoning parser"),
+                "a wrong answer is not a parser problem: {message}"
+            ),
+            other => panic!("expected uncertainty, got {other:?}"),
+        }
+    }
+}
+
+/// A trace terminator in a reply from another model is ordinary uncertainty: the
+/// reply is not evidence about this runtime at all.
+#[tokio::test]
+async fn a_foreign_reply_with_a_trace_is_not_a_parser_diagnosis() {
+    let f = Fixture::new().await;
+    f.reply(
+        StatusCode::OK,
+        &json!({"model":"other-model","choices":[{"index":0,"message":{"role":"assistant","content":"x</think>OK"},"finish_reason":"stop"}]}).to_string(),
+    );
+    let error = f
+        .adapter
+        .execute_persisted(&f.next(RuntimeAction::Probe, "probe"))
+        .await
+        .expect_err("a foreign reply proves nothing");
+    match error {
+        RuntimeError::Uncertain(message) => assert!(!message.contains("reasoning parser")),
+        other => panic!("expected uncertainty, got {other:?}"),
+    }
 }
