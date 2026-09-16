@@ -1,6 +1,7 @@
 pub mod fake;
 mod forward;
 pub mod sglang;
+pub mod resolve;
 pub mod traits;
 pub mod vllm;
 
