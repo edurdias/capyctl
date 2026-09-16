@@ -270,6 +270,19 @@ impl crate::Store {
         }
     }
 
+    /// The deployment's current effective revision.
+    ///
+    /// Commands fence on this, and it is not the same as `schema_version`: a caller
+    /// that confuses them gets a revision conflict rather than an obvious error.
+    pub fn current_revision(&self, id: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT revision FROM deployments WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     pub fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, StoreError> {
         let raw: Option<RawDeploymentRow> = self
             .conn

@@ -150,6 +150,25 @@ pub enum CoordinatorCommandError {
 }
 
 impl CoordinatorCommands {
+    /// Answer a read against the owned store.
+    ///
+    /// The coordinator owns its store exclusively behind the controller lock, so
+    /// callers receive answers rather than a handle. That is what makes a second
+    /// authority impossible rather than merely discouraged.
+    ///
+    /// A poisoned ownership mutex fails the worker: this coordinator is unavailable,
+    /// which is a different thing from the caller's question having no answer.
+    pub fn read<T>(
+        &self,
+        query: impl FnOnce(&mllm_store::Store) -> Result<T, mllm_store::StoreError>,
+    ) -> Result<T, crate::fault::LifecycleFault> {
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
+        })?;
+        query(owner.store()).map_err(Into::into)
+    }
+
     /// Blocking acceptance observer. The owned queue keeps its capacity permit
     /// and command after a caller timeout; only the worker may obtain a New grant.
     pub fn candidate_inference(

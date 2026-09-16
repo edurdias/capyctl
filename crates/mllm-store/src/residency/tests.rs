@@ -9,7 +9,7 @@ fn seed(store: &Store) {
         .conn
         .execute_batch(
             "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) \
-               VALUES('dep-1','d','managed','running',1,0,1,1);
+               VALUES('dep-1','d','model','ready',1,0,1,1);
              INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) \
                VALUES('bind-1','dep-1',1,'inc-1','managed','{}','[]','live');
              INSERT INTO operations(id,deployment_id,kind,state) VALUES('op-1','dep-1','park','running');
@@ -169,4 +169,21 @@ fn uncertain_leases_count_as_outstanding_work() {
         2,
         "uncertain work is not proven terminated"
     );
+}
+
+/// Commands fence on the effective revision, which is not the row's schema version.
+/// A caller that confuses them gets a revision conflict rather than an obvious
+/// error, so the two must be readable apart.
+#[test]
+fn the_effective_revision_is_distinct_from_the_schema_version() {
+    let store = Store::open_in_memory().unwrap();
+    seed(&store);
+    store
+        .conn
+        .execute("UPDATE deployments SET revision=7, schema_version=1", ())
+        .unwrap();
+    assert_eq!(store.current_revision("dep-1").unwrap(), Some(7));
+    let row = store.get_deployment("dep-1").unwrap().unwrap();
+    assert_eq!(row.schema_version, 1, "the two are different numbers");
+    assert_eq!(store.current_revision("missing").unwrap(), None);
 }
