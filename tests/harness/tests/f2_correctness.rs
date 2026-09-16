@@ -15,10 +15,9 @@ fn corpus_has_bounded_distinct_markers_and_a_repeated_public_prefix() {
     for index in 0..4096 {
         let case = MarkerCase::new(index).unwrap();
         assert!(markers.insert(case.marker()));
-        assert!(
-            case.prompt()
-                .starts_with("Reply with exactly this marker, without explanation: ")
-        );
+        assert!(case
+            .prompt()
+            .starts_with("Reply with exactly this marker, without explanation: "));
         assert!(case.prompt().is_ascii());
         assert!(case.prompt().len() < 128);
     }
@@ -148,4 +147,49 @@ fn empty_chunks_are_bounded_even_without_content_growth() {
     }
     assert_eq!(response.push(""), Err(CorrectnessError::ChunkLimit));
     assert_eq!(response.complete(), Err(CorrectnessError::ChunkLimit));
+}
+
+/// A reasoning trace in the corpus means the engine ran without a reasoning parser.
+/// The model is answering correctly, so this must not be reported as a wrong answer
+/// or as a size complaint; the recipe needs changing, not the model.
+#[test]
+fn a_reasoning_trace_is_distinguished_from_a_wrong_answer() {
+    for chunk in [
+        "reasoning here</think>F2_MARKER_0001",
+        "aside</reasoning>",
+        "<|end_thinking|>",
+    ] {
+        let mut r = MarkerResponse::new(MarkerCase::new(1).unwrap());
+        assert_eq!(r.push(chunk), Err(CorrectnessError::ReasoningTrace));
+    }
+}
+
+/// The trace check runs before the size bound, otherwise a long trace is reported as
+/// a content-limit failure and the real cause is hidden.
+#[test]
+fn a_long_reasoning_trace_is_not_reported_as_a_size_failure() {
+    let mut r = MarkerResponse::new(MarkerCase::new(2).unwrap());
+    let long = format!("{}</think>F2_MARKER_0002", "thinking ".repeat(40));
+    assert!(long.len() > 128);
+    assert_eq!(r.push(&long), Err(CorrectnessError::ReasoningTrace));
+}
+
+/// An ordinary wrong answer stays a content mismatch.
+#[test]
+fn a_wrong_answer_without_a_trace_is_still_a_content_mismatch() {
+    let mut r = MarkerResponse::new(MarkerCase::new(3).unwrap());
+    r.push("F2_MARKER_9999").unwrap();
+    r.finish_reason("stop").unwrap();
+    r.terminal().unwrap();
+    assert_eq!(r.complete(), Err(CorrectnessError::ContentMismatch));
+}
+
+/// The exact marker still passes unchanged.
+#[test]
+fn an_exact_marker_still_passes() {
+    let mut r = MarkerResponse::new(MarkerCase::new(4).unwrap());
+    r.push("F2_MARKER_0004").unwrap();
+    r.finish_reason("stop").unwrap();
+    r.terminal().unwrap();
+    assert_eq!(r.complete(), Ok(()));
 }

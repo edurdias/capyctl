@@ -16,6 +16,19 @@ pub enum CorrectnessError {
     ProtocolOrder,
     ContentLimit,
     ChunkLimit,
+    /// A reasoning model's trace reached the corpus because the engine ran without a
+    /// reasoning parser. Distinguished from `ContentMismatch` because the model is
+    /// answering correctly and the recipe, not the model, needs changing.
+    ReasoningTrace,
+}
+
+/// Terminators emitted by reasoning models when their trace is not separated into a
+/// dedicated field. Only their presence is tested; content is never inspected
+/// further, logged, or copied into an error.
+const REASONING_TERMINATORS: &[&str] = &["</think>", "</reasoning>", "<|end_thinking|>"];
+
+fn carries_reasoning(text: &str) -> bool {
+    REASONING_TERMINATORS.iter().any(|t| text.contains(t))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +103,11 @@ impl MarkerResponse {
         if self.chunks >= 256 {
             return self.fail(CorrectnessError::ChunkLimit);
         }
+        // Checked before the size bound: a trace usually exceeds the content cap, so
+        // the limit would otherwise mask the real cause with a size complaint.
+        if carries_reasoning(text) {
+            return self.fail(CorrectnessError::ReasoningTrace);
+        }
         if text.len() > 128 - self.content.len() {
             return self.fail(CorrectnessError::ContentLimit);
         }
@@ -125,6 +143,9 @@ impl MarkerResponse {
         }
         if self.stage != Stage::Terminal {
             return Err(CorrectnessError::Incomplete);
+        }
+        if carries_reasoning(&self.content) {
+            return Err(CorrectnessError::ReasoningTrace);
         }
         if self.content.trim_matches([' ', '\t', '\r', '\n']) != self.case.marker() {
             return Err(CorrectnessError::ContentMismatch);
