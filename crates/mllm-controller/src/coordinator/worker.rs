@@ -169,6 +169,26 @@ impl CoordinatorCommands {
         query(owner.store()).map_err(Into::into)
     }
 
+    /// Accept a deployment durably and return what was accepted.
+    ///
+    /// Acceptance is idempotent on the caller's key: a response lost after the
+    /// record was written must not produce a second deployment when the caller
+    /// retries, which the store enforces on the unique key rather than by the
+    /// caller checking first.
+    ///
+    /// This does not start anything. A deployment exists as durable intent before
+    /// any runtime does, which is what lets its id be returned before readiness.
+    pub fn accept_deployment(
+        &self,
+        request: mllm_store::deployments::AcceptDeployment,
+    ) -> Result<mllm_store::deployments::Accepted, crate::fault::LifecycleFault> {
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
+        })?;
+        owner.store().accept_deployment(request).map_err(Into::into)
+    }
+
     /// Blocking acceptance observer. The owned queue keeps its capacity permit
     /// and command after a caller timeout; only the worker may obtain a New grant.
     pub fn candidate_inference(

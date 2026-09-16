@@ -95,6 +95,58 @@ impl CoordinatorLifecycle {
         }
     }
 
+    /// Accept a deployment durably and return its id.
+    ///
+    /// Not part of the lifecycle port: the router never creates deployments, and
+    /// putting a management concern on the router's contract would widen what every
+    /// authority must answer. The CLI calls it here directly.
+    ///
+    /// The idempotency key is derived from the context, name and manifest, so a
+    /// retry after a lost response resolves to the same deployment rather than
+    /// creating a second one (T09).
+    pub fn submit_deploy(
+        &self,
+        context_id: &str,
+        request: &crate::operations::DeployRequest,
+    ) -> Result<String, LifecycleFault> {
+        use sha2::{Digest as _, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(context_id.as_bytes());
+        hash.update([0u8]);
+        hash.update(request.name.as_bytes());
+        hash.update([0u8]);
+        hash.update(&request.manifest);
+        let key = format!("{:x}", hash.finalize());
+        let accepted = self.commands.accept_deployment(
+            mllm_store::deployments::AcceptDeployment {
+                id: mllm_domain::DeploymentId::new(),
+                name: request.name.clone(),
+                kind: request.kind.clone(),
+                route_model_id: request.route_model_id.clone(),
+                // A deployment begins as durable intent, not as a running runtime.
+                desired_state: LifecycleState::Stopped,
+                schema_version: 1,
+                idempotency_key: key,
+                initial_operation_id: mllm_domain::OperationId(format!(
+                    "op-{}",
+                    ulid::Ulid::new()
+                )),
+            },
+        )?;
+        Ok(accepted.deployment_id.0.to_string())
+    }
+
+    /// Reject a dispatch carrying a generation older than the deployment's current
+    /// one (T18): an ingress gate must refuse late work after it closes.
+    pub fn check_dispatch_generation(
+        &self,
+        deployment: &str,
+        observed: i64,
+    ) -> Result<i64, LifecycleFault> {
+        self.commands
+            .read(|store| store.check_generation(deployment, observed))
+    }
+
     fn unsupported(what: &str) -> LifecycleFault {
         LifecycleFault::Blocked(format!(
             "the coordinator cannot {what} yet; refusing rather than performing a \

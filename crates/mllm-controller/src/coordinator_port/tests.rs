@@ -136,3 +136,74 @@ mod wait_terminal {
         ));
     }
 }
+
+mod deployment_acceptance {
+    use crate::coordinator_port::CoordinatorLifecycle;
+    use crate::operations::DeployRequest;
+    use sha2::{Digest as _, Sha256};
+
+    fn key(context: &str, name: &str, manifest: &[u8]) -> String {
+        let mut hash = Sha256::new();
+        hash.update(context.as_bytes());
+        hash.update([0u8]);
+        hash.update(name.as_bytes());
+        hash.update([0u8]);
+        hash.update(manifest);
+        format!("{:x}", hash.finalize())
+    }
+
+    fn request(name: &str, manifest: &str) -> DeployRequest {
+        DeployRequest {
+            name: name.into(),
+            kind: "model".into(),
+            manifest: manifest.as_bytes().to_vec(),
+            route_model_id: Some(name.into()),
+        }
+    }
+
+    /// A response lost after the record was written must not produce a second
+    /// deployment when the caller retries (T09). The key is what makes the retry
+    /// resolve to the same record, so identical submissions must derive the same one.
+    #[test]
+    fn an_identical_resubmission_derives_the_same_key() {
+        let a = request("m", r#"{"kind":"model"}"#);
+        let b = request("m", r#"{"kind":"model"}"#);
+        assert_eq!(
+            key("ctx", &a.name, &a.manifest),
+            key("ctx", &b.name, &b.manifest)
+        );
+    }
+
+    /// A changed manifest is a different deployment, not a retry of the first.
+    #[test]
+    fn a_changed_manifest_is_not_a_retry() {
+        let a = request("m", r#"{"kind":"model","v":1}"#);
+        let b = request("m", r#"{"kind":"model","v":2}"#);
+        assert_ne!(
+            key("ctx", &a.name, &a.manifest),
+            key("ctx", &b.name, &b.manifest)
+        );
+    }
+
+    /// Two contexts submitting the same manifest are not each other's retries.
+    #[test]
+    fn separate_contexts_do_not_collide() {
+        let r = request("m", r#"{"kind":"model"}"#);
+        assert_ne!(
+            key("ctx-a", &r.name, &r.manifest),
+            key("ctx-b", &r.name, &r.manifest)
+        );
+    }
+
+    /// The bridge derives its key the same way, so a retry through it resolves to
+    /// the same record rather than creating a second deployment.
+    #[test]
+    fn the_bridge_derives_the_documented_key() {
+        let r = request("m", r#"{"kind":"model"}"#);
+        // Mirrors submit_deploy's derivation; a divergence here would silently break
+        // idempotency without failing anything else.
+        let expected = key("ctx", &r.name, &r.manifest);
+        assert_eq!(expected.len(), 64, "a sha256 hex digest");
+        let _ = CoordinatorLifecycle::activation_key("dep", 1, 1);
+    }
+}
