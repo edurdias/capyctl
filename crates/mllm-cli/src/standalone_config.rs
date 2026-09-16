@@ -103,7 +103,8 @@ pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_b
         "runtime_profile": STANDALONE_PROFILE,
         "runtime_profile_revision": 1,
         "recipe": "standalone",
-        // SPEC §6.2's fallback: no qualification, so no warm parking.
+        // SPEC §6.2's fallback. Ordinary park is not implemented, so no parking tier
+        // can be declared yet; ADR 0010 makes the choice expressible.
         "residency": "restart_only",
         "recovery": "reconcile",
         // Ordered: activation window <= deployment deadline <= host ceiling.

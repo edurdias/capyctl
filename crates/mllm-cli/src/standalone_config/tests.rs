@@ -109,3 +109,24 @@ fn the_deployment_names_its_installation() {
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
 }
+
+/// The hardware standalone runs on has one physical pool, which is what the domain
+/// name has always claimed and nothing has ever stated. Declaring it is what makes
+/// a host-backed park refusable rather than silently useless.
+#[test]
+fn the_published_host_declares_one_memory_pool() {
+    let host = host_policy("fake", "/bin/true", "fp", false, 1 << 40);
+    assert_eq!(
+        host["resource_policy"]["domains"]["unified"]["memory"],
+        "unified"
+    );
+}
+
+/// Standalone's deployments stay restart-only until ordinary park exists. The point
+/// of asserting it is that the value is now one of three rather than one of two, so
+/// a later change to a parking tier is a deliberate edit with a test behind it.
+#[test]
+fn a_standalone_deployment_is_restart_only() {
+    let deployment = deployment_document("m", "m", "/models/m", 1 << 40);
+    assert_eq!(deployment["residency"], "restart_only");
+}
