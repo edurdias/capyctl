@@ -242,6 +242,17 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       one operation, keyed by deployment, revision and generation.
 - [ ] Delete `SwitchEngine` and, with it, the two writes the router currently makes
       through the port.
+- [ ] Give the ordinary stop an intent, so an administrative stop suspends and an
+      idle eviction stays on-demand eligible. This is not a parameter addition: nine
+      store queries gate on `suspended=0`, six of them in the ordinary path, and
+      writing the flag breaks completion, replay and expiry after a stop. The
+      predicate currently does two jobs, meaning both "not administratively stopped"
+      and "eligible to proceed", and separating them is what makes idle stop
+      expressible. Attempted on 2026-09-16 and reverted: placing the write before
+      acceptance broke five tests because acceptance itself requires an unsuspended
+      deployment, and placing it after acceptance still broke three post-stop flows.
+      Until this lands, the coordinator must refuse idle stop rather than silently
+      performing an administrative one.
 
 Ported faithfully first, keeping the existing T16 and T19 tests as the contract. The
 semantics were written against F1's assumptions and deserve revisiting against the
