@@ -210,21 +210,51 @@ review pass runs between them.
 
 M1 blocks all live qualification. It does not block M2 or M3.
 
-### M2 — Real SGLang park, restore and reload (F2B)
+### M2 — Connect the SGLang adapter to production (F2B)
 
-`crates/mllm-adapters/src/sglang/adapter.rs` currently returns
-`UnsupportedCapability` for `park`, `restore`, `reload_weights` and `render_plan`,
-and `check_readiness` always returns `Initializing`. SPEC §9.2 requires qualified
-release and restoration for a selected SGLang recipe, and the F2 exit gate depends
-on it. This is the milestone's largest unknown and is sequenced first.
+Correction to an earlier reading of this gap. The SGLang control path is already
+implemented and matches the pinned contract. `crates/mllm-adapters/src/sglang/http.rs`
+issues `/release_memory_occupation` and `/resume_memory_occupation` with
+`{"tags":["kv_cache","weights"]}`, `/update_weights_from_disk` with the frozen body,
+and `/flush_cache?timeout=0` validated against its exact plaintext acknowledgement,
+under the planned per-action deadlines with redirects, retries and proxies disabled
+and native error bodies never read. `SglangAdapter::execute_persisted` gates every
+control on a fresh `SglangRuntimeObserver` observation validated against the
+persisted command context.
 
-- [ ] Resolve the pinned SGLang memory-saver release/resume contract from the F2B
-      plan and `[S3]`; record the exact endpoints and preconditions.
-- [ ] Add failing adapter tests for release, resume, weight reload and their
-      failure and uncertainty paths.
-- [ ] Implement `park`, `restore` and `reload_weights` against that contract.
-- [ ] Implement `render_plan` and real `check_readiness` and `prepare_park`.
-- [ ] Report capabilities honestly; unqualified paths stay `Unsupported`.
+The `EngineAdapter::park`, `restore`, `reload_weights` and `render_plan` methods
+return `UnsupportedCapability` deliberately: they are the un-fenced legacy path that
+vLLM still uses, and SGLang refuses it so callers must go through the durable
+coordinator. That is correct and should not be "fixed".
+
+The real gap is that none of it is reachable in production:
+
+- `SglangRuntimeObserver` has no production implementation. The only two are test
+  doubles in `crates/mllm-adapters/tests/{sglang_control,engine_contract}.rs`.
+- `SglangAdapter::from_frozen` is never constructed outside tests.
+- `execute_persisted` is only ever called from tests.
+
+The supporting pieces exist on both sides and are not joined. `runtime/` holds the
+entrypoint, saver binding, scheduler observer and observation server;
+`crates/mllm-launchers/src/native_observation.rs` holds the Rust client, whose
+`observe()` returns `AllocationFacts`.
+
+- [ ] Implement a production `SglangRuntimeObserver` over `NativeObservationClient`.
+      Map `AllocationFacts` binding/incarnation/owner and per-tag allocation groups
+      onto `allocations`, `weights` and `cache`.
+- [ ] Source `real_memory_saver` from verified saver-library identity, not from a
+      control response. The no-op saver must never satisfy it.
+- [ ] Source `quiesced` and `unknown_work` from the scheduler observer. Missing
+      metrics must set `unknown_work`, never a false `quiesced`.
+- [ ] Carry `TransitionToken` from the persisted coordinator step, not the observer.
+- [ ] Construct `SglangAdapter` on the controller's runtime-binding path and drive
+      controls through `execute_persisted`.
+- [ ] Failure and uncertainty tests: lost reply, partial allocation state, saver
+      absent, stale binding or incarnation, unknown work.
+
+Note the sequencing risk. This work can be written and unit-tested without a GPU,
+but it cannot be qualified until M1 completes, so it adds to the stock of
+unqualified machinery. M1 remains the higher-value unblock.
 
 **Review gate 1** — at M2 completion, before any native work.
 
