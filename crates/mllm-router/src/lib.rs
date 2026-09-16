@@ -31,7 +31,9 @@ pub struct QueueLimits {
 #[derive(Clone)]
 pub struct RouterDeps {
     pub store: Arc<Mutex<mllm_store::Store>>,
-    pub controller: Arc<mllm_controller::Controller>,
+    /// The lifecycle authority, named by port rather than by implementation, so
+    /// which authority runs is a wiring decision rather than a compile-time one.
+    pub controller: Arc<dyn mllm_controller::LifecyclePort>,
     /// profile/kind name → inference forwarder.
     pub forwards: HashMap<String, Arc<dyn ChatForward>>,
     pub limits: QueueLimits,

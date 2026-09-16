@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mllm_controller::Controller;
+use mllm_controller::LifecyclePort;
 use mllm_domain::LifecycleState;
 
 /// Bounded, non-resetting admission window (T19): busy traffic cannot
@@ -120,7 +120,7 @@ impl<E: Clone> WakeJoin<E> {
 }
 
 pub struct SwitchEngine {
-    controller: Arc<Controller>,
+    controller: Arc<dyn LifecyclePort>,
     /// Bounded drain grace before the best-effort abort (design §5).
     drain_grace: Duration,
     /// In-flight wake joins (T15): concurrent activations for one target
@@ -129,7 +129,7 @@ pub struct SwitchEngine {
 }
 
 impl SwitchEngine {
-    pub fn new(controller: Arc<Controller>, drain_grace: Duration) -> Self {
+    pub fn new(controller: Arc<dyn LifecyclePort>, drain_grace: Duration) -> Self {
         Self {
             controller,
             drain_grace,
@@ -145,7 +145,7 @@ impl SwitchEngine {
     }
 
     async fn current_generation(&self, target: &str) -> Result<u64, SwitchError> {
-        let store = self.controller.store_ref();
+        let store = self.controller.store();
         let gen = store
             .lock()
             .unwrap()
@@ -157,7 +157,7 @@ impl SwitchEngine {
     }
 
     async fn activate(&self, target: &str) -> Result<u64, SwitchError> {
-        let store = self.controller.store_ref();
+        let store = self.controller.store();
         let (target_state, target_observed) = {
             let s = store.lock().unwrap();
             let row = s
@@ -202,7 +202,7 @@ impl SwitchEngine {
     /// failure: A reopens (not suspended, window preserved) and the failed
     /// switch is journaled (T16/T19 failure branch).
     async fn drain_and_release(&self, a: &str) -> Result<(), SwitchError> {
-        let store = self.controller.store_ref();
+        let store = self.controller.store();
         let deadline = Instant::now() + self.drain_grace;
         // Drain: the fake's observe_work is the quiescence oracle; real
         // engines' in-flight telemetry arrives via the adapter (F1 design
@@ -299,7 +299,7 @@ impl SwitchEngine {
         // A reopens with its window state preserved: not suspended, the
         // failed switch does not punish A. The event feeds SPEC §17's
         // failed-switches metric.
-        let store = self.controller.store_ref();
+        let store = self.controller.store();
         let _ = store.lock().unwrap().set_suspended(a, false);
         self.journal_switch_failed(a);
         SwitchError::DrainTimeout(a.to_string())
@@ -311,7 +311,7 @@ impl SwitchEngine {
 
     fn journal_switch(&self, a: &str, evidence: &str) {
         // Journal on the deployment's latest operation (evidence-only).
-        let store = self.controller.store_ref();
+        let store = self.controller.store();
         let op = store
             .lock()
             .unwrap()
