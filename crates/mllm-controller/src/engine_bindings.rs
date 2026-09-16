@@ -9,16 +9,27 @@
 //! prerequisites are missing is refused by name, because constructing it with
 //! plausible placeholders would produce a runtime that looks configured and is not.
 
+use std::sync::Arc;
+
 use mllm_adapters::resolve::AdapterSpec;
 use mllm_config::engine_policy::Engine;
 use mllm_store::ordinary_lifecycle::worker::QualifiedInitializeWork;
 
-use crate::coordinator::{CoordinatorError, EngineBindings};
+use crate::coordinator::{CoordinatorError, EngineBindings, ServiceClock};
 
 /// Builds adapter specs from frozen bindings.
-pub struct ProfileBindings;
+pub struct ProfileBindings {
+    clock: ServiceClock,
+}
 
 impl ProfileBindings {
+    /// The clock is the service's own. The Fake family stamps the milestones it
+    /// observes with it, so evidence is dated by the authority that reads it back
+    /// rather than by whatever the adapter could reach for itself.
+    pub fn new(clock: ServiceClock) -> Self {
+        Self { clock }
+    }
+
     fn missing(family: &str, what: &str) -> CoordinatorError {
         CoordinatorError::Service(format!(
             "cannot build a {family} runtime yet: {what}. Refusing rather than \
@@ -65,7 +76,18 @@ impl EngineBindings for ProfileBindings {
                         .unwrap_or_else(|| effective.name.clone()),
                 })
             }
-            Engine::Fake => Ok(AdapterSpec::Fake),
+            Engine::Fake => {
+                let clock = self.clock.clone();
+                Ok(AdapterSpec::Fake {
+                    clock: Arc::new(move || {
+                        clock().map_err(|_| {
+                            mllm_adapters::traits::RuntimeError::Uncertain(
+                                "service observation clock failed".into(),
+                            )
+                        })
+                    }),
+                })
+            }
             Engine::Sglang => Err(Self::missing(
                 "SGLang",
                 "its controls need a resolved admin credential and a trusted \

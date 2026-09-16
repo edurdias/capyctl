@@ -40,8 +40,17 @@ pub enum AdapterSpec {
         admin: String,
         observer: Arc<dyn SglangRuntimeObserver>,
     },
-    Fake,
+    /// The Fake family exists for the persisted control path, so it takes the
+    /// clock that stamps the milestones it observes. A Fake without one cannot
+    /// answer an Initialize, which is the only call the ordinary lifecycle makes.
+    Fake {
+        clock: PersistedClock,
+    },
 }
+
+/// A trusted clock for stamping observed effects. The service supplies its own so
+/// that evidence is dated by the authority that will read it back.
+pub type PersistedClock = Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>;
 
 impl AdapterSpec {
     /// The family this spec builds. Used to check a resolved adapter against the
@@ -50,7 +59,7 @@ impl AdapterSpec {
         match self {
             Self::Vllm { .. } => Engine::Vllm,
             Self::Sglang { .. } => Engine::Sglang,
-            Self::Fake => Engine::Fake,
+            Self::Fake { .. } => Engine::Fake,
         }
     }
 }
@@ -90,7 +99,7 @@ pub fn resolve(
         } => Box::new(SglangAdapter::from_frozen(
             &frozen, inference, admin, observer,
         )?),
-        AdapterSpec::Fake => Box::new(FakeEngine::new()),
+        AdapterSpec::Fake { clock } => Box::new(FakeEngine::for_qualification_with_clock(clock)),
     })
 }
 

@@ -18,18 +18,7 @@ fn safe_state_dir() -> tempfile::TempDir {
 
 use mllm_controller::LifecyclePort as _;
 use mllm_cli::roles;
-use mllm_controller::DeployRequest;
 
-// Pending: the coordinator accepts a Start but nothing drives it to Ready.
-//
-// Both tests still deploy through `submit_deploy`, which records a deployment with
-// no managed configuration behind it, so there is no effective revision for the
-// coordinator to start against and the command is refused. Rewriting them onto
-// `App::deploy` gets the command accepted and then blocks in `wait_terminal`,
-// because launching the binding and probing it is milestone A1's remaining work.
-//
-// These return with that work, not before.
-#[ignore = "pending A1: a Start is accepted but nothing drives the binding to Ready"]
 #[tokio::test]
 async fn standalone_boots_and_serves_router() {
     let dir = safe_state_dir();
@@ -40,15 +29,7 @@ async fn standalone_boots_and_serves_router() {
     let _ = router; // servable; full serve loop covered by run_standalone
 
     // Deploy through the controller (the CLI deploy path) and activate.
-    let id = app
-        .controller
-        .submit_deploy("standalone", &DeployRequest {
-            name: "wired-m".into(),
-            kind: "model".into(),
-            manifest: br#"{"kind":"model","name":"wired-m"}"#.to_vec(),
-            route_model_id: Some("wired-m".into()),
-        })
-        .unwrap();
+    let id = app.deploy("wired-m", "/models/wired-m").unwrap();
     let op = app
         .controller
         .request_transition(&id, mllm_domain::LifecycleAction::Start)
@@ -69,29 +50,11 @@ async fn standalone_boots_and_serves_router() {
     assert!(resp["choices"][0]["message"]["content"].is_string());
 }
 
-// Pending: the coordinator accepts a Start but nothing drives it to Ready.
-//
-// Both tests still deploy through `submit_deploy`, which records a deployment with
-// no managed configuration behind it, so there is no effective revision for the
-// coordinator to start against and the command is refused. Rewriting them onto
-// `App::deploy` gets the command accepted and then blocks in `wait_terminal`,
-// because launching the binding and probing it is milestone A1's remaining work.
-//
-// These return with that work, not before.
-#[ignore = "pending A1: a Start is accepted but nothing drives the binding to Ready"]
 #[tokio::test]
 async fn router_serves_models_and_chat_over_http() {
     let dir = safe_state_dir();
     let app = roles::start_standalone(dir.path()).await.unwrap();
-    let id = app
-        .controller
-        .submit_deploy("standalone", &DeployRequest {
-            name: "http-m".into(),
-            kind: "model".into(),
-            manifest: br#"{"kind":"model","name":"http-m"}"#.to_vec(),
-            route_model_id: Some("http-m".into()),
-        })
-        .unwrap();
+    let id = app.deploy("http-m", "/models/http-m").unwrap();
     let op = app
         .controller
         .request_transition(&id, mllm_domain::LifecycleAction::Start)

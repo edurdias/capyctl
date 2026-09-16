@@ -495,9 +495,17 @@ impl crate::Store {
     pub fn list_enabled_route_ids(&self) -> Result<Vec<String>, StoreError> {
         self.conn
             .prepare(
-                "SELECT route_model_id FROM deployments \
-                 WHERE admission_enabled = 1 AND suspended = 0 AND route_model_id IS NOT NULL \
-                 ORDER BY route_model_id",
+                // A managed configuration records its routes in `deployment_routes`
+                // and clears the column, so both have to be read. The gate is the
+                // same for either: admission open and the deployment not suspended.
+                "SELECT route FROM (\
+                   SELECT route_model_id AS route, id AS deployment_id FROM deployments \
+                     WHERE route_model_id IS NOT NULL \
+                   UNION \
+                   SELECT route, deployment_id FROM deployment_routes\
+                 ) r JOIN deployments d ON d.id = r.deployment_id \
+                 WHERE d.admission_enabled = 1 AND d.suspended = 0 \
+                 ORDER BY route",
             )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()
@@ -510,9 +518,16 @@ impl crate::Store {
         let raw: Option<RawDeploymentRow> = self
             .conn
             .query_row(
-                "SELECT id, name, kind, route_model_id, desired_state, observed_state,
-                        schema_version, current_generation
-                 FROM deployments WHERE route_model_id = ?1 ORDER BY updated_at DESC LIMIT 1",
+                // Either route form resolves to the same deployment. Managed
+                // creation refuses a route already claimed elsewhere, so a route
+                // cannot name two deployments across the two tables.
+                "SELECT d.id, d.name, d.kind, d.route_model_id, d.desired_state, d.observed_state,
+                        d.schema_version, d.current_generation
+                 FROM deployments d
+                 WHERE d.route_model_id = ?1
+                    OR EXISTS(SELECT 1 FROM deployment_routes
+                              WHERE route = ?1 AND deployment_id = d.id)
+                 ORDER BY d.updated_at DESC LIMIT 1",
                 [route],
                 |row| {
                     Ok((
@@ -777,6 +792,68 @@ mod tests {
             schema_version: 1,
             idempotency_key: key.to_string(),
             initial_operation_id: OperationId(format!("op-{}", ulid::Ulid::new())),
+        }
+    }
+
+    /// A managed deployment's routes live in `deployment_routes`; the column on
+    /// the deployment row is the legacy single-route form and managed creation
+    /// deliberately clears it. A router that reads only the column serves nothing
+    /// a managed configuration created, which is every deployment the CLI makes.
+    #[test]
+    fn a_managed_route_is_servable() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "UPDATE deployments SET admission_enabled=1,observed_state='ready' WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO deployment_routes(route,deployment_id) VALUES('managed-route',?1)",
+                [&id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.list_enabled_route_ids().unwrap(),
+            vec!["managed-route".to_string()],
+            "a managed route is listed"
+        );
+        let found = store
+            .find_deployment_by_route("managed-route")
+            .unwrap()
+            .expect("a managed route resolves to its deployment");
+        assert_eq!(found.id, id);
+    }
+
+    /// Suspension and closed admission still hide a managed route, exactly as they
+    /// hide a legacy one. The route's storage changed; the gate did not.
+    #[test]
+    fn a_suspended_managed_route_is_not_listed() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO deployment_routes(route,deployment_id) VALUES('managed-route',?1)",
+                [&id],
+            )
+            .unwrap();
+        for sql in [
+            "UPDATE deployments SET admission_enabled=1,suspended=1 WHERE id=?1",
+            "UPDATE deployments SET admission_enabled=0,suspended=0 WHERE id=?1",
+        ] {
+            store.conn.execute(sql, [&id]).unwrap();
+            assert!(
+                store.list_enabled_route_ids().unwrap().is_empty(),
+                "a closed or suspended deployment offers no route"
+            );
         }
     }
 

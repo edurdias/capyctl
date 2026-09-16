@@ -13,7 +13,7 @@ use std::sync::Arc;
 use mllm_agent::Host;
 use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::schema::ConfigKind;
-use mllm_controller::coordinator::{CoordinatorOptions, OwnedCoordinator};
+use mllm_controller::coordinator::{CoordinatorOptions, OwnedCoordinator, ServiceObservation as _};
 use mllm_controller::{CoordinatorLifecycle, OwnedCoordinatorState, ProfileBindings};
 use crate::host_observation::{system_clock, HostMemoryObservation};
 use mllm_store::Store;
@@ -303,22 +303,6 @@ async fn start_standalone_inner(
         }
     };
 
-    // The coordinator opens the durable state itself and holds the controller lock
-    // for as long as it runs, so nothing else may act as an authority over it.
-    let owner = Arc::new(std::sync::Mutex::new(OwnedCoordinatorState::open(
-        &state_dir.join("server"),
-    )?));
-    let coordinator = OwnedCoordinator::spawn_resolved(
-        owner,
-        Arc::new(HostMemoryObservation),
-        system_clock(),
-        CoordinatorOptions::default(),
-        Arc::new(ProfileBindings),
-    )?;
-    let controller = Arc::new(CoordinatorLifecycle::new(coordinator.commands()));
-    // The adapter and launcher built above now inform only the forwarding table;
-    // the coordinator resolves an adapter per binding from its frozen profile.
-    let _ = (adapter, launcher);
     // What this host publishes about its engine. Derived from the live profile when
     // one is configured, otherwise the embedded fake, and from observed capacity
     // rather than a configured guess.
@@ -337,6 +321,47 @@ async fn start_standalone_inner(
             capacity,
         )
     };
+    // The host's own accounting units, resolved before anything can observe or be
+    // admitted against them. The coordinator's observation source is named by these,
+    // so it has to exist before the coordinator does.
+    let declared_host = {
+        let (engine, executable, experimental, capacity) = &engine_declaration;
+        let host = crate::standalone_config::host_policy(
+            engine,
+            executable,
+            "standalone-1",
+            *experimental,
+            *capacity,
+        );
+        let probe = crate::standalone_config::deployment_document(
+            "policy-probe",
+            "policy-probe",
+            "/dev/null",
+            *capacity,
+        );
+        mllm_config::effective::resolve_effective(&probe, &host)
+            .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
+            .host
+    };
+
+    // The coordinator opens the durable state itself and holds the controller lock
+    // for as long as it runs, so nothing else may act as an authority over it.
+    let owner = Arc::new(std::sync::Mutex::new(OwnedCoordinatorState::open(
+        &state_dir.join("server"),
+    )?));
+    let coordinator = OwnedCoordinator::spawn_resolved(
+        owner,
+        Arc::new(HostMemoryObservation::new(
+            declared_host.domains.keys().cloned(),
+        )),
+        system_clock(),
+        CoordinatorOptions::default(),
+        Arc::new(ProfileBindings::new(system_clock())),
+    )?;
+    let controller = Arc::new(CoordinatorLifecycle::new(coordinator.commands()));
+    // The adapter and launcher built above now inform only the forwarding table;
+    // the coordinator resolves an adapter per binding from its frozen profile.
+    let _ = (adapter, launcher);
     let deps = mllm_router::RouterDeps {
         controller: controller.clone(),
         forwards,
@@ -353,35 +378,14 @@ async fn start_standalone_inner(
     // cannot be qualified until the host has said what it will allow, and the policy
     // is imported with the observation that justifies it rather than on its own.
     {
-        let (engine, executable, experimental, capacity) = &engine_declaration;
-        let host = crate::standalone_config::host_policy(
-            engine,
-            executable,
-            "standalone-1",
-            *experimental,
-            *capacity,
-        );
-        let probe = crate::standalone_config::deployment_document(
-            "policy-probe",
-            "policy-probe",
-            "/dev/null",
-            *capacity,
-        );
-        let effective = mllm_config::effective::resolve_effective(&probe, &host)
-            .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
-        let sample = mllm_agent::memory::read_host_memory()
-            .map_err(|error| StartError::Deploy(format!("host memory unreadable: {error}")))?;
-        let observations: Vec<_> = effective
-            .host
-            .domains
-            .keys()
-            .map(|domain| mllm_domain::resources::MemoryObservation {
-                domain: domain.clone(),
-                ..sample.memory.clone()
-            })
-            .collect();
+        // The same source the coordinator will observe through, so the policy and
+        // the evidence for it cannot disagree about what a domain is called.
+        let observations = HostMemoryObservation::new(declared_host.domains.keys().cloned())
+            .observe(declared_host.name.clone())
+            .await
+            .map_err(|error| StartError::Deploy(error.to_string()))?;
         controller
-            .publish_resource_policy(&effective.host, &observations)
+            .publish_resource_policy(&declared_host, &observations)
             .map_err(|error| StartError::Deploy(error.to_string()))?;
     }
     Ok(App { controller, _coordinator: coordinator, store, engine_declaration, router, deps, api_key })

@@ -14,17 +14,46 @@ use std::sync::Arc;
 
 use mllm_controller::coordinator::{CoordinatorError, ObservationFuture, ServiceObservation};
 
-/// Reads the host's memory through the agent's `/proc/meminfo` parser.
-pub struct HostMemoryObservation;
+/// Reads the host's memory through the agent's `/proc/meminfo` parser and reports
+/// it under the domains the host published.
+///
+/// The agent reads one physical pool and labels it `system`, which is a fact about
+/// where the reading came from. A domain is the host's own accounting unit, named
+/// by its resource policy, and the coordinator admits work per domain: an
+/// observation naming a domain the policy does not declare is dropped as invalid.
+/// So the translation belongs here, at the one adapter that sees both.
+pub struct HostMemoryObservation {
+    domains: Vec<String>,
+}
+
+impl HostMemoryObservation {
+    /// `domains` are the host policy's own domain names, in the order it declares
+    /// them. A host that declares none observes nothing; inventing a domain would
+    /// admit work against a ceiling that was never published.
+    pub fn new(domains: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            domains: domains.into_iter().collect(),
+        }
+    }
+}
 
 impl ServiceObservation for HostMemoryObservation {
     fn observe(&self, _host_id: String) -> ObservationFuture {
+        let domains = self.domains.clone();
         Box::pin(async move {
             // Synchronous and short: a `/proc` read, not a syscall that blocks.
             let sample = mllm_agent::memory::read_host_memory().map_err(|error| {
                 CoordinatorError::Service(format!("host memory observation failed: {error}"))
             })?;
-            Ok(vec![sample.memory])
+            // One reading, reported once per domain. This host's domains share a
+            // single physical pool, which is what `unified` in its policy means.
+            Ok(domains
+                .into_iter()
+                .map(|domain| mllm_domain::resources::MemoryObservation {
+                    domain,
+                    ..sample.memory.clone()
+                })
+                .collect())
         })
     }
 }
@@ -62,7 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_observation_reports_a_real_domain_with_capacity() {
-        let observed = HostMemoryObservation
+        let observed = HostMemoryObservation::new(["unified".to_string()])
             .observe("host".into())
             .await
             .expect("this host can read its own memory");
@@ -74,5 +103,35 @@ mod tests {
             "available cannot exceed capacity"
         );
         assert!(memory.sampled_at_ms > 0, "the sample must be dated");
+    }
+
+    /// The reading is reported against the domains the host declared, not the
+    /// name `/proc/meminfo` is read under. A coordinator admits work per domain
+    /// and drops an observation naming one it does not know, so an adapter that
+    /// reports the agent's own label stalls every activation on this host.
+    #[tokio::test]
+    async fn observations_are_named_by_the_hosts_declared_domains() {
+        let declared = ["unified".to_string(), "second".to_string()];
+        let observed = HostMemoryObservation::new(declared.clone())
+            .observe("host".into())
+            .await
+            .expect("this host can read its own memory");
+        let names: Vec<_> = observed.iter().map(|o| o.domain.clone()).collect();
+        assert_eq!(names, declared, "every declared domain is observed, in order");
+        assert!(
+            observed.iter().all(|o| o.capacity_bytes > 0),
+            "each carries the same real reading"
+        );
+    }
+
+    /// A host that declared no domain has nothing to admit against. Reporting an
+    /// invented one would let work in against a ceiling nobody published.
+    #[tokio::test]
+    async fn a_host_with_no_declared_domain_observes_nothing() {
+        let observed = HostMemoryObservation::new([])
+            .observe("host".into())
+            .await
+            .expect("this host can read its own memory");
+        assert!(observed.is_empty(), "no domain declared, none observed");
     }
 }

@@ -412,17 +412,14 @@ impl QualificationState {
         // Ordinary cold initialization explicitly includes a model-usability
         // probe. Candidate child effects retain their separate probe protocol.
         // This dispatch shape recognizes scope; catalog authority stays in Store.
+        //
+        // Scope is read from what the command is, not from how its qualification
+        // id is spelled. A candidate child effect acts on identities it retains
+        // and names no completion target; only an ordinary cold Initialize owns
+        // the launch and is asked to land on Ready. Requiring a `qualified:` id
+        // as well excluded every restart-only deployment, which carries a
+        // declared identity and is still an ordinary initialize.
         let ordinary = command.action == RuntimeAction::Initialize
-            && c.token
-                .qualification_id
-                .strip_prefix("qualified:")
-                .is_some_and(|id| {
-                    id.len() == 26
-                        && id.as_bytes()[0] <= b'7'
-                        && id
-                            .bytes()
-                            .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
-                })
             && matches!(
                 c.identities,
                 mllm_domain::completion::ExecutionIdentities::OwnedLaunch
@@ -625,14 +622,31 @@ mod tests {
             assert!(state.allocations);
             assert!(state.alive);
         }
-        for id in [
-            "candidate:run",
-            "qualified:ZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-            "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAI",
-        ] {
+        // A restart-only deployment is identified by its recipe rather than by a
+        // qualification, and it is still an ordinary cold initialize.
+        for id in ["declared:recipe-fingerprint", "candidate:run", ""] {
             c.context.token.qualification_id = id.into();
-            assert!(QualificationState::default().execute(&c).is_err());
+            let result = QualificationState::default().execute(&c).unwrap();
+            assert!(
+                result.facts.contains(&Milestone::ModelUsable),
+                "an ordinary initialize proves the model usable whatever its id says"
+            );
         }
+    }
+
+    /// Scope is read from the command, not from its qualification id. A candidate
+    /// child effect acts on identities it retains and names no completion target,
+    /// so it keeps its own probe protocol and never takes the ordinary path.
+    #[test]
+    fn a_child_effect_is_not_an_ordinary_initialize() {
+        let mut c = command(RuntimeAction::Initialize, "child");
+        c.context.token.qualification_id = "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+        let mut state = QualificationState::default();
+        let result = state.execute(&c).unwrap();
+        assert!(
+            !result.facts.contains(&Milestone::ModelUsable),
+            "no completion target means no ordinary readiness probe"
+        );
     }
 
     #[tokio::test]
