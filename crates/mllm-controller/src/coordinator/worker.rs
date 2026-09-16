@@ -471,6 +471,44 @@ struct Driver {
     engine: Arc<dyn EngineAdapter>,
     cleanup: Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>,
 }
+/// Supplies what the lifecycle must not know: resolved credentials and the frozen
+/// launch plan a binding was qualified against. Implemented by the application,
+/// which owns credential storage.
+pub trait EngineBindings: Send + Sync {
+    fn spec(
+        &self,
+        work: &QualifiedInitializeWork,
+    ) -> Result<mllm_adapters::resolve::AdapterSpec, CoordinatorError>;
+}
+
+/// Cleanup evidence for any engine family: the recorded processes are observed
+/// gone. Anything short of every identity proven absent retains ownership, because
+/// an unreadable or racing observation looks exactly like absence while the process
+/// keeps holding device memory.
+fn observed_gone(
+    context: &CleanupExecutionContext,
+    clock: &ServiceClock,
+) -> Result<CleanupEvidence, CoordinatorError> {
+    use mllm_launchers::process_absence::{verify_gone, GoneProof};
+    let observed_at_ms =
+        clock().map_err(|_| CoordinatorError::Service("cleanup clock failed".into()))?;
+    match verify_gone(&context.identities) {
+        GoneProof::AllGone => Ok(CleanupEvidence {
+            binding_id: context.binding_id.clone(),
+            incarnation: context.incarnation.clone(),
+            identities: context.identities.clone(),
+            observed_at_ms,
+            receipt: "every recorded process observed gone".into(),
+        }),
+        GoneProof::SomeAlive => Err(CoordinatorError::Service(
+            "a recorded process is still alive; ownership is retained".into(),
+        )),
+        GoneProof::Indeterminate => Err(CoordinatorError::Service(
+            "process absence could not be established; ownership is retained".into(),
+        )),
+    }
+}
+
 type DriverFactory =
     Arc<dyn Fn(&QualifiedInitializeWork) -> Result<Arc<Driver>, CoordinatorError> + Send + Sync>;
 
@@ -479,6 +517,57 @@ impl OwnedCoordinator {
         CoordinatorCommands {
             shared: self.shared.clone(),
         }
+    }
+
+    /// Spawn a coordinator that drives whichever engine family each binding
+    /// declares, rather than the single Fake lane.
+    ///
+    /// The coordinator deliberately does not resolve secrets or frozen launch
+    /// plans; `bindings` supplies those, so credential handling stays outside the
+    /// lifecycle. Resolution then rejects a spec whose family differs from the one
+    /// the runtime profile declares, because a profile's fingerprint, reserved-flag
+    /// policy and qualification evidence are only meaningful for the engine it names.
+    ///
+    /// Cleanup is proved the same way for every family: the recorded identities must
+    /// be observed gone. An engine's own report that it shut down is not evidence
+    /// that its processes released the device.
+    pub fn spawn_resolved(
+        owner: SharedCoordinatorState,
+        observations: Arc<dyn ServiceObservation>,
+        clock: ServiceClock,
+        options: CoordinatorOptions,
+        bindings: Arc<dyn EngineBindings>,
+    ) -> Result<Self, CoordinatorError> {
+        let cleanup_clock = clock.clone();
+        Self::spawn(
+            owner,
+            observations,
+            clock,
+            options,
+            Arc::new(move |work| {
+                let declared = work.effective().profile.engine;
+                if work.endpoint().is_empty() || work.credential_ref().is_empty() {
+                    return Err(CoordinatorError::Service(
+                        "frozen binding lacks an endpoint or credential reference".into(),
+                    ));
+                }
+                let spec = bindings.spec(work)?;
+                let engine: Arc<dyn EngineAdapter> =
+                    Arc::from(mllm_adapters::resolve::resolve(declared, spec).map_err(|_| {
+                        CoordinatorError::Service(
+                            "engine spec does not match the declared family".into(),
+                        )
+                    })?);
+                let clock = cleanup_clock.clone();
+                Ok(Arc::new(Driver {
+                    engine,
+                    cleanup: Arc::new(move |context| {
+                        let clock = clock.clone();
+                        Box::pin(async move { observed_gone(&context, &clock) })
+                    }),
+                }))
+            }),
+        )
     }
 
     /// First bounded lane: qualified Fake only. Construction has no engine I/O,

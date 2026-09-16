@@ -1398,3 +1398,109 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
         QualifiedInitializeStatus::Completed
     );
 }
+
+mod cleanup_evidence {
+    use super::super::*;
+    use mllm_domain::completion::ProcessIdentity;
+    use mllm_store::candidate_creation::cleanup::{CleanupExecutionContext, CleanupMode};
+
+    fn boot() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn identity(pid: u32, start_ticks: u64, boot_id: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            role: "api".into(),
+            pid,
+            boot_id: boot_id.into(),
+            start_ticks,
+        }
+    }
+
+    fn context(identities: Vec<ProcessIdentity>) -> CleanupExecutionContext {
+        CleanupExecutionContext {
+            operation_id: "op-1".into(),
+            step_id: "step-1".into(),
+            binding_id: "bind-1".into(),
+            incarnation: "inc-1".into(),
+            fence: mllm_store::lifecycle::DeploymentFence {
+                deployment_id: "dep-1".into(),
+                revision: 1,
+                generation: 1,
+            },
+            identities,
+            issued_at_ms: 10,
+            deadline_ms: i64::MAX,
+            mode: CleanupMode::InspectOwnedGone,
+        }
+    }
+
+    fn clock(value: i64) -> ServiceClock {
+        Arc::new(move || Ok(value))
+    }
+
+    /// Absence of every recorded process is the only shape that yields evidence,
+    /// and the evidence must carry exactly what was proven.
+    #[test]
+    fn every_process_proven_gone_produces_evidence() {
+        let ids = vec![
+            identity(0x7FFF_FFF0, 1, &boot()),
+            identity(0x7FFF_FFF1, 2, &boot()),
+        ];
+        let evidence = observed_gone(&context(ids.clone()), &clock(4242)).unwrap();
+        assert_eq!(evidence.binding_id, "bind-1");
+        assert_eq!(evidence.incarnation, "inc-1");
+        assert_eq!(evidence.identities, ids);
+        assert_eq!(evidence.observed_at_ms, 4242);
+    }
+
+    /// A live process retains ownership. An engine reporting its own shutdown is
+    /// not evidence that its processes released the device.
+    #[test]
+    fn a_live_process_retains_ownership() {
+        // Name this very process, with its real start time, so it is genuinely alive.
+        let pid = std::process::id();
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let close = raw.rfind(')').unwrap();
+        let start: u64 = raw[close + 2..]
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let ids = vec![
+            identity(0x7FFF_FFF0, 1, &boot()),
+            identity(pid, start, &boot()),
+        ];
+        assert!(
+            observed_gone(&context(ids), &clock(1)).is_err(),
+            "a live member denies release"
+        );
+    }
+
+    /// An empty identity set is a missing record, not an observation of absence.
+    #[test]
+    fn an_empty_identity_set_denies_release() {
+        assert!(observed_gone(&context(Vec::new()), &clock(1)).is_err());
+    }
+
+    /// An unresolvable member denies release even when its siblings are proven gone.
+    #[test]
+    fn an_unresolvable_member_denies_release() {
+        let ids = vec![identity(0x7FFF_FFF0, 1, &boot()), identity(0, 0, &boot())];
+        assert!(observed_gone(&context(ids), &clock(1)).is_err());
+    }
+
+    /// Evidence is stamped with an observed time; a failing clock cannot be
+    /// substituted with a default, which would date the proof to the epoch.
+    #[test]
+    fn a_failing_clock_denies_release() {
+        let failing: ServiceClock =
+            Arc::new(|| Err(CoordinatorError::Service("clock unavailable".into())));
+        let ids = vec![identity(0x7FFF_FFF0, 1, &boot())];
+        assert!(observed_gone(&context(ids), &failing).is_err());
+    }
+}
