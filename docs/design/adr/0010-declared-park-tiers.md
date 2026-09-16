@@ -141,11 +141,22 @@ the ladder this document rejects, and on the only hardware in hand the selection
 forced anyway. `deep_required` collapses into `deep`, because a declared tier that
 cannot be delivered is already a validation failure.
 
-**4. vLLM declares its park level.** Add the level to `VllmLaunchSettings` so vLLM
-matches SGLang's model, where the strategy is a launch setting. The runtime derivation
-from `ParkPolicy` is deleted. The security gate of `SPEC.md` §9.1 is unchanged and
-still independently governs whether the experimental control path may be used at all;
-it stops doubling as a memory-strategy switch.
+**4. Residency determines the engine's park strategy, at the place each engine takes
+it.** The two engines take it at different times and the configuration must not pretend
+otherwise:
+
+- SGLang's `memory_saver` and `cpu_weight_backup` are startup flags, so residency
+  determines **launch settings**. They are constants today — `memory_saver: true`,
+  `cpu_weight_backup: false` — and become derived.
+- vLLM's level is a parameter of the sleep call, not a launch flag. Residency therefore
+  determines the **level passed at park time**; only `enable_sleep_mode` remains a
+  launch setting, and the existing check that warm requires it is kept.
+
+The runtime derivation of the level from `ParkPolicy::ExperimentalAllowed` is removed
+with the F1 controller that holds it; `crates/mllm-controller/src/operations.rs` has no
+production caller and is deleted by A1's legacy-authority removal. The security gate of
+`SPEC.md` §9.1 is unchanged and still independently governs whether the experimental
+control path may be used at all; it stops doubling as a memory-strategy switch.
 
 **5. The host declares its memory topology, and it validates the tier.** `DomainPolicy`
 gains one field recording whether that domain's device memory and host memory are one
