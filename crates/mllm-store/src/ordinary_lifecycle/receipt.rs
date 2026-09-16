@@ -193,10 +193,15 @@ pub(super) fn historical_source(tx: &Transaction<'_>, p: &Plan) -> Result<(), Li
         }
         _ => LifecycleError::CorruptStoredData,
     })?;
+    // Re-derive the identity this binding must carry instead of matching one
+    // shape of it. A restart-only deployment is identified by its recipe and
+    // host, a warm one by its qualification, and hard-coding the qualified
+    // spelling here reported every other kind of deployment as corrupt.
+    let identity = super::binding_identity(tx, &e, &p.deployment_id)?;
     let binding: BindingDto = decode(&p.binding_json)?;
     if binding.version != 1
-        || e.profile.engine != mllm_config::effective::Engine::Fake
-        || format!("qualified:{}", binding.qualification_id) != e.profile.qualification_id
+        || binding.qualification_id != identity.id()
+        || binding.payload != identity.payload()?
         || Some(&binding.credential_ref) != e.profile.security.credential_ref.as_ref()
     {
         return Err(LifecycleError::CorruptStoredData);

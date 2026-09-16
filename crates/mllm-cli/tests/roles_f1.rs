@@ -20,18 +20,16 @@ use mllm_controller::LifecyclePort as _;
 use mllm_cli::roles;
 use mllm_controller::DeployRequest;
 
-// Pending: standalone declares no runtime profile.
+// Pending: the coordinator accepts a Start but nothing drives it to Ready.
 //
-// The coordinator starts only a qualified deployment, and qualification requires a
-// succeeded managed_configuration_create, which in turn requires a host policy
-// carrying a runtime profile. The standalone default generates `runtime_profiles: {}`
-// (mllm-config defaults), so no deployment created here can be qualified. F1 could
-// start an unqualified deployment because it admitted work itself; the coordinator
-// deliberately will not.
+// Both tests still deploy through `submit_deploy`, which records a deployment with
+// no managed configuration behind it, so there is no effective revision for the
+// coordinator to start against and the command is refused. Rewriting them onto
+// `App::deploy` gets the command accepted and then blocks in `wait_terminal`,
+// because launching the binding and probing it is milestone A1's remaining work.
 //
-// These return once standalone declares its engine as a runtime profile, which is
-// the engine-installation concept in ADR 0008.
-#[ignore = "pending: standalone declares no runtime profile, so nothing can be qualified"]
+// These return with that work, not before.
+#[ignore = "pending A1: a Start is accepted but nothing drives the binding to Ready"]
 #[tokio::test]
 async fn standalone_boots_and_serves_router() {
     let dir = safe_state_dir();
@@ -71,18 +69,16 @@ async fn standalone_boots_and_serves_router() {
     assert!(resp["choices"][0]["message"]["content"].is_string());
 }
 
-// Pending: standalone declares no runtime profile.
+// Pending: the coordinator accepts a Start but nothing drives it to Ready.
 //
-// The coordinator starts only a qualified deployment, and qualification requires a
-// succeeded managed_configuration_create, which in turn requires a host policy
-// carrying a runtime profile. The standalone default generates `runtime_profiles: {}`
-// (mllm-config defaults), so no deployment created here can be qualified. F1 could
-// start an unqualified deployment because it admitted work itself; the coordinator
-// deliberately will not.
+// Both tests still deploy through `submit_deploy`, which records a deployment with
+// no managed configuration behind it, so there is no effective revision for the
+// coordinator to start against and the command is refused. Rewriting them onto
+// `App::deploy` gets the command accepted and then blocks in `wait_terminal`,
+// because launching the binding and probing it is milestone A1's remaining work.
 //
-// These return once standalone declares its engine as a runtime profile, which is
-// the engine-installation concept in ADR 0008.
-#[ignore = "pending: standalone declares no runtime profile, so nothing can be qualified"]
+// These return with that work, not before.
+#[ignore = "pending A1: a Start is accepted but nothing drives the binding to Ready"]
 #[tokio::test]
 async fn router_serves_models_and_chat_over_http() {
     let dir = safe_state_dir();

@@ -28,10 +28,10 @@ fn req_fake_engine(name: &str) -> DeployRequest {
     }
 }
 
-// Pending for the same reason as the roles_f1 start tests: the coordinator starts
-// only a qualified deployment, and standalone declares no runtime profile to qualify
-// against. Returns once standalone declares its engine as a runtime profile.
-#[ignore = "pending: standalone declares no runtime profile, so nothing can be qualified"]
+// Pending for the same reason as the roles_f1 start tests, plus one of its own: this
+// walks a park/wake cycle, and the deployment standalone declares is restart-only, so
+// it has no park to walk. Returns with A1's runtime drive and A1b's ordinary park.
+#[ignore = "pending A1: a Start is accepted but nothing drives the binding to Ready"]
 #[tokio::test]
 async fn standalone_boot_runs_full_fake_lifecycle() {
     let dir = safe_state_dir();
