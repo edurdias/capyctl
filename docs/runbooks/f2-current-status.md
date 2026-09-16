@@ -331,6 +331,26 @@ Forward-looking dependency notes that remain live: `operation-read-dependencies.
 (A3), `ordinary-warm-composition-dependencies.md`, `no-effect-recovery-dependencies.md`
 and `candidate-terminal-api-dependencies.md` (A2d).
 
+## Tracked for later: naming and engine resolution
+
+[ADR 0008](../design/adr/0008-engine-installations-and-runtime-types.md) makes
+"engine installation" the term of record, but internal type names still say runtime
+profile. Rename `RuntimeProfile` and its configuration key, and keep one name per
+concept on every new surface in the meantime. The mockups additionally use "runtime"
+for three different things — start mechanism, Python version and CUDA version — and
+only the first is the runtime type; the others are build metadata that
+`build_fingerprint` already covers.
+
+Add the engine-family to adapter resolution layer. Adapters are currently selected
+at hardcoded construction sites, which is what blocks both a third engine family and
+the construction of `SglangAdapter` on the runtime-binding path.
+
+Two mockup behaviours conflict with the spec and should not be implemented as drawn.
+Raw engine flags include `--served-model-name`, which `engine_policy.rs` reserves,
+and the interface warns that a raw flag overrides a structured setting; T14 requires
+conflicts to fail with provenance instead. The CLI grammar is also resource-first
+(`mllm hosts list`), where R11 requires action-first (`mllm list hosts`).
+
 ## Tracked for later: multi-node and parallelism beyond TP=1
 
 Not in F2 scope. The pinned recipe is TP=1, DP=1 on one device, and `SPEC.md` §11

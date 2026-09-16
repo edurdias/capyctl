@@ -323,3 +323,49 @@ impl RegisteredWork for StoreSources {
             .map_err(|_| SourceUnavailable)
     }
 }
+
+/// Saver-map facts from the enrolled runtime's observation socket.
+pub struct NativeSaverFacts(pub mllm_launchers::native_observation::NativeObservationClient);
+
+impl PhysicalFacts for NativeSaverFacts {
+    fn observe(&self, timeout: Duration) -> Observed<AllocationFacts> {
+        self.0.observe(timeout).map_err(|_| SourceUnavailable)
+    }
+}
+
+/// Liveness of the persisted identity set, anchored to the API process.
+///
+/// `observe_process_group` deliberately infers no engine roles, so this matches the
+/// expected identities against observed kernel facts by process identity alone and
+/// returns only those actually found. A missing rank shortens the returned set, and
+/// the adapter rejects the observation because it no longer matches what the step
+/// expects. Absence therefore fails closed rather than being reported as liveness.
+pub struct NativeLiveness {
+    api: ProcessIdentity,
+}
+
+impl NativeLiveness {
+    pub fn new(api: ProcessIdentity) -> Result<Self, RuntimeError> {
+        if api.role != "api" || api.pid == 0 || api.start_ticks == 0 || api.boot_id.is_empty() {
+            return Err(RuntimeError::Unsupported);
+        }
+        Ok(Self { api })
+    }
+}
+
+impl GroupLiveness for NativeLiveness {
+    fn live(&self, expected: &[ProcessIdentity]) -> Observed<Vec<ProcessIdentity>> {
+        let observed = mllm_launchers::group_observation::observe_process_group(&self.api)
+            .map_err(|_| SourceUnavailable)?;
+        let members = observed
+            .members()
+            .iter()
+            .map(|m| (m.pid, m.boot_id.as_str(), m.start_ticks))
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok(expected
+            .iter()
+            .filter(|i| members.contains(&(i.pid, i.boot_id.as_str(), i.start_ticks)))
+            .cloned()
+            .collect())
+    }
+}

@@ -434,3 +434,27 @@ fn store_sources_report_an_unknown_binding_as_unavailable() {
     let sources = StoreSources::new(store, "dep-1".into()).unwrap();
     assert_eq!(sources.facts("bind-x", "inc-x"), Err(SourceUnavailable));
 }
+
+#[test]
+fn liveness_requires_an_api_anchor() {
+    let mut worker = identities()[1].clone();
+    assert!(
+        NativeLiveness::new(worker.clone()).is_err(),
+        "role must be api"
+    );
+    worker.role = "api".into();
+    worker.pid = 0;
+    assert!(NativeLiveness::new(worker).is_err());
+    assert!(NativeLiveness::new(identities()[0].clone()).is_ok());
+}
+
+/// A process that no longer exists must shorten the live set rather than be assumed
+/// present; the adapter then rejects the observation on arity.
+#[test]
+fn liveness_of_a_dead_anchor_is_unavailable() {
+    let mut api = identities()[0].clone();
+    api.pid = 0x7FFF_FFFE; // not a live pid in this namespace
+    api.boot_id = "00000000-0000-0000-0000-000000000000".into();
+    let liveness = NativeLiveness::new(api).unwrap();
+    assert_eq!(liveness.live(&identities()), Err(SourceUnavailable));
+}
