@@ -331,6 +331,38 @@ Forward-looking dependency notes that remain live: `operation-read-dependencies.
 (A3), `ordinary-warm-composition-dependencies.md`, `no-effect-recovery-dependencies.md`
 and `candidate-terminal-api-dependencies.md` (A2d).
 
+## Tracked for later: multi-node and parallelism beyond TP=1
+
+Not in F2 scope. The pinned recipe is TP=1, DP=1 on one device, and `SPEC.md` §11
+plus the F4 slice own multi-node. Recorded here so the constraints are not
+rediscovered later. Applies to tensor, pipeline, data and expert parallelism, on one
+host with several devices or across hosts.
+
+1. The identity model admits exactly two processes.
+   `crates/mllm-store/src/lifecycle/completion.rs:49` sorts identities and requires
+   `ids[0].role == "api"` and `ids[1].role == "worker-0"`, so any third rank is
+   rejected. The SGLang adapter compares whole sets and is already arity-agnostic.
+2. Configuration carries `tensor_parallel_size` and `pipeline_parallel_size` but no
+   data or expert parallel sizes, and validates only that they are non-zero. Nothing
+   ties a parallel size to the number of claimed devices or hosts, so an infeasible
+   plan is accepted at configuration time and fails at launch. `SPEC.md` T27 implies
+   that cross-check.
+3. There is no engine-group or member model in `mllm-domain`, although `SPEC.md` §2
+   defines an engine group as the complete runtime realization of one deployment
+   across processes and hosts, and §11 requires a group launch plan carrying member
+   identities, rank roles, peer addresses and rendezvous data.
+4. Multi-rank release and resume acknowledgement is unqualified. Per the F2B plan,
+   SGLang's release and resume await their communicators, and a success reply from
+   the tokenizer manager does not prove every rank released. A partial release that
+   reads as success would be exactly the unevidenced release `SPEC.md` §6.1 forbids.
+   The 2026-09-16 qualification proved the single-rank path only.
+5. `NativeResidencyObserver` now fails closed when allocations span more than one
+   device, because summing mapped bytes across devices cannot distinguish a fully
+   restored group from one restored rank. Per-rank evidence, and cross-host
+   aggregation for a multi-node group, remain unimplemented.
+6. Hardware: host-a has a single GB10, so no parallel topology can be qualified
+   there. Tensor parallelism needs a multi-device host; multi-node needs two hosts.
+
 ## Owner attention
 
 Execution capacity item: after Cleanup committed, fresh-worker creation for the

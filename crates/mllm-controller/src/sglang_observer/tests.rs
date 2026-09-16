@@ -372,3 +372,34 @@ async fn sglang_binding_carries_residency_through_unchanged() {
     assert_eq!(observed.token, token());
     assert_eq!(observed.binding_id, "bind-1");
 }
+
+/// Tensor parallelism is not in scope for the pinned recipe. A runtime spanning
+/// devices must read as unknown rather than letting one restored rank stand in for
+/// the whole group.
+#[test]
+fn multi_device_residency_is_unknown() {
+    struct TwoDevices;
+    impl PhysicalFacts for TwoDevices {
+        fn observe(&self, _: Duration) -> Observed<AllocationFacts> {
+            let mut facts = facts_with(8 << 30, 4 << 30, SAVER);
+            let mut second = group(AllocationTag::Weights, 8 << 30);
+            second.device = 1;
+            facts.allocations.groups.push(second);
+            Ok(facts)
+        }
+    }
+    let o = NativeResidencyObserver::new(
+        token(),
+        "bind-1".into(),
+        "inc-1".into(),
+        identities(),
+        SAVER.into(),
+        Arc::new(Facts(Ok(vec![Milestone::AllocationsRestored]))),
+        Arc::new(Work(Ok(0))),
+        Arc::new(TwoDevices),
+        Arc::new(Live(Ok(identities()))),
+    )
+    .unwrap()
+    .residency();
+    assert!(o.unknown_work, "multi-rank evidence is not implemented");
+}

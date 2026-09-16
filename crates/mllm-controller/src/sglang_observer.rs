@@ -117,6 +117,11 @@ fn residency(facts: &[Milestone]) -> Residency {
 
 /// Bytes the saver currently has mapped for a tag. Paused allocations are mapped
 /// in the saver's table but hold no device memory, so they are not residency.
+///
+/// Summing across devices is only sound for a single-device runtime. Under tensor
+/// parallelism a non-zero sum can mean one rank restored while another stayed dark,
+/// which would report residency that does not exist. `single_device` gates that, so
+/// multi-rank runtimes fail closed until per-rank evidence is implemented.
 fn mapped(facts: &AllocationFacts, tag: AllocationTag) -> u64 {
     facts
         .allocations
@@ -125,6 +130,20 @@ fn mapped(facts: &AllocationFacts, tag: AllocationTag) -> u64 {
         .filter(|g| g.tag == tag)
         .map(|g| g.mapped_bytes)
         .sum()
+}
+
+/// The pinned recipe is TP=1, DP=1. A runtime spanning several devices needs
+/// per-rank release and restore evidence that neither this observer nor the
+/// engine's control replies currently provide, so it is reported as unknown.
+fn single_device(facts: &AllocationFacts) -> bool {
+    facts
+        .allocations
+        .groups
+        .iter()
+        .map(|g| g.device)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        <= 1
 }
 
 impl NativeResidencyObserver {
@@ -186,6 +205,7 @@ impl NativeResidencyObserver {
                 note(false);
             }
             note(observed.library_sha256 == self.expected_saver_sha256);
+            note(single_device(observed));
             let weight_bytes = mapped(observed, AllocationTag::Weights);
             let cache_bytes = mapped(observed, AllocationTag::KvCache);
             let any = weight_bytes > 0 || cache_bytes > 0;
