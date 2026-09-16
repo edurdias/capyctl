@@ -452,7 +452,7 @@ fn binding_identity(
     e: &mllm_config::effective::EffectiveDeployment,
     deployment: &str,
 ) -> Result<BindingIdentity, LifecycleError> {
-    if e.residency == mllm_config::effective::Residency::RestartOnly {
+    if !e.residency.parks() {
         // Bound to the recipe and host it was admitted against, so a change
         // produces a different identity rather than reusing this binding.
         let descriptor = DeclaredBindingV1 {

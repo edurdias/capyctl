@@ -705,7 +705,7 @@ fn candidate_creation_hash_has_literal_domain_separated_golden() {
     // Independently calculated with Node crypto over recursively sorted fixture JSON.
     assert_eq!(
         hash,
-        "0978fe57f31e9bd0b5d9998ffa452d729ad0a8c8cc34ee7ac004fbf01b387f5c"
+        "7c1090f4f5c17363818a43c0b6eccc196d97c1baf7e1e4cde406afd67cca8d85"
     );
 }
 

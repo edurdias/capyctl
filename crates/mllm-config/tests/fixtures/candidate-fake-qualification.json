@@ -4,7 +4,7 @@
   "host": {"id":"lab","hardware_fingerprint":"hw-01","environment_fingerprint":"env-01"},
   "effective_recipe": {
     "model":{"content_fingerprint":"sha256:model","path":"/srv/models/toy","revision":"r1"},
-    "recipe":"standard","residency":"warm","recovery":"reconcile",
+    "recipe":"standard","residency":"deep","recovery":"reconcile",
     "runtime_profile":"local","runtime_profile_revision":7,
     "resolved_profile": {
       "engine":"fake","revision":7,"executable":"/bin/true",

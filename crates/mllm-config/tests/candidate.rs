@@ -136,7 +136,7 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
         "schema_version":1,"kind":"candidate_recipe",
         "host":{"id":"lab","hardware_fingerprint":"hw-01","environment_fingerprint":"env-01"},
         "effective_recipe":{
-            "model":deployment["model"],"recipe":"standard","residency":"warm","recovery":"reconcile",
+            "model":deployment["model"],"recipe":"standard","residency":"deep","recovery":"reconcile",
             "runtime_profile":"local","runtime_profile_revision":7,
             "resolved_profile":{"engine":"vllm","revision":7,"executable":"/bin/true","build_fingerprint":"vllm-build-1",
                 "args":["--max-model-len","4096"],"launch_settings":{"engine":"vllm","tensor_parallel_size":1,
@@ -169,12 +169,12 @@ fn valid_candidate_normalizes_without_authority_material() {
     assert_eq!(normalized.manifest_digest().len(), 64);
     assert_eq!(
         normalized.manifest_digest(),
-        "f7fafaa108d062fb62417ccef59a1088a158a51890c8af1915e3b331dca1b0e9"
+        "0d5c2e0938bc96b3d42ddbdd30fb28287a5d568b533333e0abfc529eb10d6f2d"
     );
     let (deployment, ordinary_host) = ordinary_fixture();
     assert_eq!(
         normalized.recipe_fingerprint(),
-        "8fca6812174ea5c21d212fce2b2923a52e6fcdd7ea38aef251a0a7ebf751a1ef"
+        "d1aa844beb6830c02eaf8edf93b322e40e5faff2045b23bcc4c0f1ad21c7e2c2"
     );
     assert_eq!(
         normalized.recipe_fingerprint(),
@@ -196,7 +196,7 @@ fn text_entry_rejects_duplicates_and_multiple_documents() {
         normalize_candidate_manifest_text(&json, &host)
             .unwrap()
             .manifest_digest(),
-        "f7fafaa108d062fb62417ccef59a1088a158a51890c8af1915e3b331dca1b0e9"
+        "0d5c2e0938bc96b3d42ddbdd30fb28287a5d568b533333e0abfc529eb10d6f2d"
     );
     let duplicate = json.replacen("{\"cases\"", "{\"kind\":\"candidate_recipe\",\"cases\"", 1);
     assert!(normalize_candidate_manifest_text(&duplicate, &host).is_err());
@@ -348,15 +348,15 @@ fn all_engines_share_literal_recipe_fingerprints() {
     for (engine, fingerprint) in [
         (
             "vllm",
-            "8fca6812174ea5c21d212fce2b2923a52e6fcdd7ea38aef251a0a7ebf751a1ef",
+            "d1aa844beb6830c02eaf8edf93b322e40e5faff2045b23bcc4c0f1ad21c7e2c2",
         ),
         (
             "sglang",
-            "b7863d64c7a21c4ed88c046154afdaa02f886e0ad723498ad58f267564913484",
+            "1008bc93bf285b157d3db54551731b14d13e9e528d21e9f4a136572bb0f2224b",
         ),
         (
             "fake",
-            "faa5d521b8427650c9edaa0746590c69e79a9acf45af6943fc3a0e75eafebc9b",
+            "61d272915d3bb8a7e35a27d93dc1bd537191a80ef3bf35c89d2d2cbf775bac9f",
         ),
     ] {
         let (candidate, deployment, host) = engine_fixture(engine);
@@ -665,7 +665,7 @@ fn normalized_recipe_is_consumable_through_immutable_typed_views() {
     let normalized = normalize_candidate_manifest(&candidate, &host).unwrap();
     let recipe = normalized.effective_recipe();
     assert_eq!(recipe.recipe(), "standard");
-    assert_eq!(recipe.residency(), Residency::Warm);
+    assert_eq!(recipe.residency(), Residency::Deep);
     assert_eq!(recipe.recovery(), Recovery::Reconcile);
     assert_eq!(recipe.host_devices()["gpu0"].domain, "unified");
     assert_eq!(recipe.host_device_sharing(), Sharing::Shared);
@@ -1143,7 +1143,7 @@ fn canonical_reviewed_bytes_and_identity_matrix_are_literal() {
     let original = normalize_candidate_manifest(&candidate, &host).unwrap();
     assert_eq!(
         original.manifest_digest(),
-        "f7fafaa108d062fb62417ccef59a1088a158a51890c8af1915e3b331dca1b0e9"
+        "0d5c2e0938bc96b3d42ddbdd30fb28287a5d568b533333e0abfc529eb10d6f2d"
     );
     let canonical = include_bytes!("fixtures/candidate-vllm-canonical.json");
     assert_eq!(original.reviewed_json(), &canonical[..canonical.len() - 1]);

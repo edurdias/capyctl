@@ -17,7 +17,7 @@
       "recipe": "standard",
       "recovery": "reconcile",
       "request_deadline": "300s",
-      "residency": "warm",
+      "residency": "deep",
       "resources": {
         "cold": {
           "allocations": [
@@ -227,11 +227,11 @@
         "experimental_controls": true
       }
     },
-    "qualification_fingerprint": "faa5d521b8427650c9edaa0746590c69e79a9acf45af6943fc3a0e75eafebc9b",
+    "qualification_fingerprint": "61d272915d3bb8a7e35a27d93dc1bd537191a80ef3bf35c89d2d2cbf775bac9f",
     "recipe": "standard",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
-    "residency": "warm",
+    "residency": "deep",
     "resources": {
       "cold": {
         "allocations": [

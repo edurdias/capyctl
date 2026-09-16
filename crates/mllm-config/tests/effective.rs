@@ -1,6 +1,6 @@
 use mllm_config::effective::{
     binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, DomainMemory, Engine,
+    resolve_effective, DomainMemory, Engine, Residency,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
@@ -48,6 +48,42 @@ fn a_domain_without_declared_memory_is_rejected() {
         .remove("memory");
     let error = resolve_effective(&deployment, &host).expect_err("must be rejected");
     assert!(format!("{error}").contains("memory"), "{error}");
+}
+
+/// SPEC §6.2 distinguishes a host-backed park, which retains a weight backup in host
+/// RAM, from deep parking, which releases the weights. A single `warm` cannot say
+/// which, and the two differ in wake cost by several times and in host RAM by orders
+/// of magnitude, so the deployment names the one it wants.
+#[test]
+fn residency_names_which_park_the_deployment_asks_for() {
+    for (declared, expected) in [
+        ("restart_only", Residency::RestartOnly),
+        ("host_backed", Residency::HostBacked),
+        ("deep", Residency::Deep),
+    ] {
+        let (mut deployment, host) = fixture();
+        deployment["residency"] = declared.into();
+        // Task 4 refuses host_backed on a unified domain, which is what the lab host
+        // declares, so this asserts the vocabulary on a host that allows every tier.
+        let mut host = host;
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        let resolved = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
+        assert_eq!(resolved.residency, expected, "for {declared}");
+    }
+}
+
+/// `auto` is deliberately not adopted: choosing a tier at runtime is the fallback
+/// ladder ADR 0010 rejects, and SGLang cannot implement one because its memory-saver
+/// and weights-CPU-backup are startup flags.
+#[test]
+fn residency_auto_is_refused() {
+    let (mut deployment, host) = fixture();
+    deployment["residency"] = "auto".into();
+    assert!(
+        resolve_effective(&deployment, &host).is_err(),
+        "auto must not resolve"
+    );
 }
 
 #[test]

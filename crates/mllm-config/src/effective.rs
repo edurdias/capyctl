@@ -152,11 +152,31 @@ pub struct ModelIdentity {
     pub revision: String,
 }
 
+/// Which park a deployment asks for, per SPEC §6.2.
+///
+/// `auto` from the spec is deliberately absent: selecting a tier at runtime is a
+/// fallback ladder, and SGLang cannot implement one because its memory-saver and
+/// weights-CPU-backup are startup flags that a running engine cannot acquire.
+/// `deep_required` is absent for the same reason it is unnecessary — a declared tier
+/// the profile or host cannot deliver is already a validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Residency {
-    Warm,
+    /// Stop and initialize again. First-class behaviour, including for backends with
+    /// no qualified memory-release API.
     RestartOnly,
+    /// Weights retained in host RAM, KV dropped. Frees nothing where device and host
+    /// memory are one pool, which Task 5's host check refuses.
+    HostBacked,
+    /// Weights and KV released; weights re-read from the checkpoint on wake.
+    Deep,
+}
+
+impl Residency {
+    /// Whether this tier parks at all, as opposed to stopping and starting again.
+    pub fn parks(self) -> bool {
+        matches!(self, Self::HostBacked | Self::Deep)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,7 +654,7 @@ fn normalize_launch(
                     "invalid vLLM launch settings",
                 ));
             }
-            if residency == Residency::Warm && !value.enable_sleep_mode {
+            if residency.parks() && !value.enable_sleep_mode {
                 return Err(invalid(
                     "runtime_profiles.launch_settings.enable_sleep_mode",
                     "warm vLLM requires sleep mode",

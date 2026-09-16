@@ -1118,7 +1118,7 @@ fn validate_cases(
     let mut marker: Option<(&str, u32)> = None;
     // Work depends only on the bounded case count, never on an untrusted cycle.
     if !cases.len().is_multiple_of(5)
-        || (residency == Residency::Warm && cases.len() < 10)
+        || (residency.parks() && cases.len() < 10)
         || (residency == Residency::RestartOnly && cases.len() != 5)
     {
         return Err(invalid("cases", "residency cycle contract mismatch"));

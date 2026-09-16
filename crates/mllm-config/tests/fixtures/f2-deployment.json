@@ -3,7 +3,7 @@
     "schema_version": 1, "kind": "deployment", "name": "toy",
     "model": {"path": "/srv/models/toy", "content_fingerprint": "sha256:model", "revision": "r1"},
     "routes": ["toy"], "runtime_profile": "local", "runtime_profile_revision": 7,
-    "recipe": "standard", "residency": "warm", "recovery": "reconcile",
+    "recipe": "standard", "residency": "deep", "recovery": "reconcile",
     "devices": [{"id": "gpu0", "sharing": "shared"}],
     "resources": {
       "cold": {"allocations": [{"domain": "unified", "bytes": "10GiB", "host_kv_bytes": "1GiB"}], "devices": [{"id": "gpu0", "sharing": "shared"}]},
