@@ -41,3 +41,98 @@ fn refusals_name_the_missing_capability() {
         other => panic!("a missing capability is blocked, not {other:?}"),
     }
 }
+
+mod wait_terminal {
+    use super::*;
+    use mllm_domain::LifecycleState;
+    use mllm_store::deployments::OpState;
+
+    fn classify(
+        state: OpState,
+        error_code: Option<&str>,
+        observed: Option<LifecycleState>,
+        expired: bool,
+    ) -> Option<Result<LifecycleState, LifecycleFault>> {
+        CoordinatorLifecycle::classify(
+            "op-1",
+            state,
+            error_code.map(str::to_string),
+            observed,
+            expired,
+        )
+    }
+
+    /// Exhausting the caller's wait is uncertainty, never failure. The operation is
+    /// still running and the coordinator reconciles it; reporting failure would tell
+    /// a caller the activation did not happen while it still might.
+    #[test]
+    fn an_expired_wait_on_a_running_operation_is_uncertain() {
+        for state in [OpState::Pending, OpState::Running] {
+            match classify(state, None, Some(LifecycleState::Starting), true) {
+                Some(Err(LifecycleFault::Uncertain(message))) => {
+                    assert!(message.contains("still"), "{message}");
+                }
+                other => panic!("expected uncertainty for {state:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Before the wait expires, a running operation is not an outcome at all: the
+    /// caller keeps waiting rather than receiving a verdict.
+    #[test]
+    fn a_running_operation_yields_no_outcome_yet() {
+        for state in [OpState::Pending, OpState::Running] {
+            assert!(
+                classify(state, None, Some(LifecycleState::Starting), false).is_none(),
+                "{state:?} must keep waiting"
+            );
+        }
+    }
+
+    #[test]
+    fn a_succeeded_operation_reports_the_observed_state() {
+        match classify(OpState::Succeeded, None, Some(LifecycleState::Ready), false) {
+            Some(Ok(state)) => assert_eq!(state, LifecycleState::Ready),
+            other => panic!("expected the observed state, got {other:?}"),
+        }
+    }
+
+    /// Success with no readable observed state is a record that cannot be read, not
+    /// a state to report.
+    #[test]
+    fn success_without_an_observed_state_is_unavailable() {
+        assert!(matches!(
+            classify(OpState::Succeeded, None, None, false),
+            Some(Err(LifecycleFault::Unavailable(_)))
+        ));
+    }
+
+    #[test]
+    fn a_failed_operation_carries_its_code() {
+        match classify(OpState::Failed, Some("denied"), None, false) {
+            Some(Err(LifecycleFault::Failed(message))) => {
+                assert!(message.contains("denied"), "{message}")
+            }
+            other => panic!("expected a failure carrying its code, got {other:?}"),
+        }
+        match classify(OpState::Failed, None, None, false) {
+            Some(Err(LifecycleFault::Failed(message))) => {
+                assert!(message.contains("unknown"), "{message}")
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// A terminal outcome does not depend on the caller's patience.
+    #[test]
+    fn expiry_does_not_change_a_terminal_outcome() {
+        assert!(matches!(
+            classify(OpState::Succeeded, None, Some(LifecycleState::Ready), true),
+            Some(Ok(LifecycleState::Ready))
+        ));
+        assert!(matches!(
+            classify(OpState::Failed, Some("denied"), None, true),
+            Some(Err(LifecycleFault::Failed(_)))
+        ));
+    }
+}

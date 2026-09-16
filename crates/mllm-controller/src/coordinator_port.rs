@@ -29,6 +29,11 @@ const ACTIVATION_DEADLINE_MS: i64 = 10 * 60 * 1000;
 /// history can tell an automatic wake from a deliberate one.
 const ROUTER_PRINCIPAL: &str = "router";
 
+/// How long a caller waits for an accepted operation to reach a terminal state, and
+/// how often it re-reads. A caller giving up never cancels the operation.
+const TERMINAL_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+const TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub struct CoordinatorLifecycle {
     commands: CoordinatorCommands,
 }
@@ -54,6 +59,40 @@ impl CoordinatorLifecycle {
         self.commands
             .read(|store| store.get_deployment(deployment))?
             .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))
+    }
+
+    /// Decide an operation's outcome from what was read, separated from the reading
+    /// so every branch is reachable in a test without a database.
+    ///
+    /// `expired` means the caller's wait has run out, not that the operation has.
+    fn classify(
+        operation: &str,
+        state: mllm_store::deployments::OpState,
+        error_code: Option<String>,
+        observed: Option<LifecycleState>,
+        expired: bool,
+    ) -> Option<Result<LifecycleState, LifecycleFault>> {
+        use mllm_store::deployments::OpState;
+        match state {
+            OpState::Succeeded => Some(observed.ok_or_else(|| {
+                LifecycleFault::Unavailable(format!(
+                    "operation {operation} succeeded but its deployment has no observed state"
+                ))
+            })),
+            OpState::Failed => Some(Err(LifecycleFault::Failed(format!(
+                "operation {operation} failed with code {}",
+                error_code.unwrap_or_else(|| "unknown".into())
+            )))),
+            // Still running. Exhausting the caller's wait is uncertainty, never
+            // failure: the operation continues and the coordinator reconciles it.
+            OpState::Pending | OpState::Running if expired => {
+                Some(Err(LifecycleFault::Uncertain(format!(
+                    "operation {operation} has not reached a terminal state; it is still \
+                     running and the coordinator will reconcile it"
+                ))))
+            }
+            OpState::Pending | OpState::Running => None,
+        }
     }
 
     fn unsupported(what: &str) -> LifecycleFault {
@@ -113,13 +152,46 @@ impl LifecyclePort for CoordinatorLifecycle {
         ))
     }
 
+    /// Await a terminal state for an accepted operation.
+    ///
+    /// The coordinator's observers are typed per command and handed out at
+    /// acceptance, so there is nothing to look up by operation id; the durable
+    /// record is the shared truth and is what gets read here.
+    ///
+    /// Giving up does not cancel anything. The operation continues, and the
+    /// coordinator's own loop reconciles it — which is why exhausting the wait is
+    /// uncertainty rather than failure, and why nothing is aborted here. Treating it
+    /// as a failure would tell a caller the activation did not happen while it is
+    /// still running.
     async fn wait_terminal(
         &self,
-        _handle: &OperationHandle,
+        handle: &OperationHandle,
     ) -> Result<LifecycleState, LifecycleFault> {
-        // The coordinator's observers are typed per command and are handed out at
-        // acceptance, not looked up by operation id afterwards.
-        Err(Self::unsupported("await a terminal state by operation id"))
+        let deadline = std::time::Instant::now() + TERMINAL_WAIT;
+        loop {
+            let operation = handle.operation_id.0.clone();
+            let deployment = handle.deployment_id.clone();
+            let read = self
+                .commands
+                .read(move |store| {
+                    let row = store.get_operation(&operation)?;
+                    let observed =
+                        store.get_deployment(&deployment)?.map(|r| r.observed_state);
+                    Ok(row.map(|row| (row.state, row.error_code, observed)))
+                })?
+                .ok_or_else(|| LifecycleFault::NotFound(handle.operation_id.0.clone()))?;
+            let (state, error_code, observed) = read;
+            if let Some(outcome) = Self::classify(
+                &handle.operation_id.0,
+                state,
+                error_code,
+                observed,
+                std::time::Instant::now() >= deadline,
+            ) {
+                return outcome;
+            }
+            tokio::time::sleep(TERMINAL_POLL).await;
+        }
     }
 
     async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
