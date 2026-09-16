@@ -446,6 +446,9 @@ impl CoordinatorCommands {
     }
 
     /// Commit Stop using a service-resolved generation. History is observation only.
+    ///
+    /// The deployment stays eligible for on-demand activation, which is what SPEC
+    /// §6.3 requires of an idle eviction.
     pub fn stop(
         &self,
         principal: &str,
@@ -453,6 +456,44 @@ impl CoordinatorCommands {
         expected_revision: i64,
         key: &str,
         requested_deadline_ms: i64,
+    ) -> Result<OrdinaryStopReceipt, CoordinatorCommandError> {
+        self.stop_inner(
+            principal,
+            deployment_id,
+            expected_revision,
+            key,
+            requested_deadline_ms,
+            false,
+        )
+    }
+
+    /// An operator's Stop, which also suspends automatic activation (SPEC §6.3).
+    pub fn administrative_stop(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<OrdinaryStopReceipt, CoordinatorCommandError> {
+        self.stop_inner(
+            principal,
+            deployment_id,
+            expected_revision,
+            key,
+            requested_deadline_ms,
+            true,
+        )
+    }
+
+    fn stop_inner(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+        administrative: bool,
     ) -> Result<OrdinaryStopReceipt, CoordinatorCommandError> {
         let _permit = self
             .shared
@@ -490,18 +531,24 @@ impl CoordinatorCommands {
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(CoordinatorError::Stopped("worker is not admitting cleanup".into()).into());
         }
-        let receipt = owner
-            .store()
-            .accept_ordinary_stop_command(
-                owner.session(),
-                principal,
-                deployment_id,
-                expected_revision,
-                key,
-                (self.shared.clock)()?,
-                requested_deadline_ms,
-            )
-            .map_err(store_error)?;
+        let now = (self.shared.clock)()?;
+        let store = owner.store();
+        let accept = if administrative {
+            mllm_store::Store::accept_administrative_stop_command
+        } else {
+            mllm_store::Store::accept_ordinary_stop_command
+        };
+        let receipt = accept(
+            store,
+            owner.session(),
+            principal,
+            deployment_id,
+            expected_revision,
+            key,
+            now,
+            requested_deadline_ms,
+        )
+        .map_err(store_error)?;
         drop(owner);
         self.shared.wake.notify_one();
         Ok(receipt)

@@ -607,8 +607,40 @@ impl crate::Store {
         Ok(rows)
     }
 
-    /// Administrative suspension flag (T10): admin stop sets it; idle
-    /// eviction leaves it clear.
+    /// Whether an operator has stopped this deployment (T10, SPEC §6.3).
+    ///
+    /// Read only where automatic activation is decided. It is deliberately not the
+    /// `suspended` flag: that one means "eligible to proceed" everywhere in the
+    /// ordinary lifecycle, and setting it on a stop breaks the completion, replay
+    /// and expiry of the stop itself.
+    pub fn is_admin_stopped(&self, id: &str) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT admin_stopped FROM deployments WHERE id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(StoreError::from)
+    }
+
+    /// Clear or set the operator's stop intent outside an acceptance.
+    ///
+    /// An explicit Start uses this: SPEC §6.3 says a start enables the deployment,
+    /// so it must lift a previous administrative stop rather than be refused by it.
+    pub fn set_admin_stopped(&self, id: &str, stopped: bool) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE deployments SET admin_stopped = ?2 WHERE id = ?1",
+            params![id, stopped as i64],
+        )?;
+        if updated == 0 {
+            return Err(invalid_column("deployments"));
+        }
+        Ok(())
+    }
+
+    /// The F1 suspension flag. Nothing in production writes it; the ordinary
+    /// lifecycle reads it as an eligibility gate.
     pub fn set_suspended(&self, id: &str, suspended: bool) -> Result<(), StoreError> {
         let updated = self.conn.execute(
             "UPDATE deployments SET suspended = ?2 WHERE id = ?1",

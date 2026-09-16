@@ -396,6 +396,15 @@ host with several devices or across hosts.
    that triggers activation — it would fail fast rather than hold the client — so it
    is the owner's call, not a repair to make unattended.
 
+2. Stopping a deployment that was never started reports a conflict.
+   `accept_ordinary_cleanup_in_transaction` finds no unreleased runtime binding and
+   returns `LifecycleError::Conflict`, which reaches the caller as
+   `LifecycleFault::Conflict` — "your view is stale, re-read and retry". Re-reading
+   will not help: nothing was ever started, so this is an illegal transition and the
+   honest answer is a refusal. `LifecycleError` has no variant for that today;
+   `Disabled` is the closest and means something else. Pinned by
+   `standalone_lifecycle::stop_is_illegal_from_stopped` so a change is deliberate.
+
 ## Owner attention
 
 Execution capacity item: after Cleanup committed, fresh-worker creation for the

@@ -291,6 +291,14 @@ CREATE TABLE qualification_parked_status(
 );
 "#;
 
+/// SPEC §6.3 requires an administrative stop to suspend automatic activation, and
+/// requires an automatic idle stop not to. `suspended` cannot carry that intent: its
+/// nine readers all use it to mean "eligible to proceed", so writing it on a stop
+/// breaks completion, replay and expiry for the very operation that wrote it. This
+/// column carries the intent alone, and nothing else reads it.
+pub const SCHEMA_V11: &str =
+    "ALTER TABLE deployments ADD COLUMN admin_stopped INTEGER NOT NULL DEFAULT 0;";
+
 pub const SCHEMA_V9: &str = r#"
 CREATE TABLE owned_launch_associations(
   step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),

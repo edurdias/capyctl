@@ -171,11 +171,6 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
     }
     let e = decode_effective_snapshot(&p.effective_json)
         .map_err(|_| LifecycleError::CorruptStoredData)?;
-    if e.profile.engine != mllm_config::effective::Engine::Fake
-        || !e.profile.qualification_id.starts_with("qualified:")
-    {
-        return Err(LifecycleError::Unsupported);
-    }
     crate::managed_configuration::validate_revision_history(
         tx,
         &p.deployment_id,
@@ -184,10 +179,16 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
     )
     .map_err(|_| LifecycleError::CorruptStoredData)?;
     let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.step_json=?6 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?7 AND effective_json=?8 AND fingerprint=?9) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded') AND NOT EXISTS(SELECT 1 FROM qualification_runs WHERE deployment_id=?3) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1", params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,encode(p)?,p.revision,p.effective_json,e.qualification_fingerprint], |r|r.get(0))?;
+    // Re-derive the identity this binding must carry rather than matching the
+    // qualified spelling of it. A restart-only deployment is identified by its
+    // recipe and host, and cleanup is engine-agnostic anyway: it proves the
+    // recorded processes are gone, which is the same proof whatever started them.
+    let identity = super::binding_identity(tx, &e, &p.deployment_id)?;
     let b: BindingDto = decode(&p.binding_json)?;
     if !exact
         || b.version != 1
-        || format!("qualified:{}", b.qualification_id) != e.profile.qualification_id
+        || b.qualification_id != identity.id()
+        || b.payload != identity.payload()?
         || Some(&b.credential_ref) != e.profile.security.credential_ref.as_ref()
     {
         return Err(LifecycleError::CorruptStoredData);
@@ -512,7 +513,11 @@ impl crate::Store {
         )
     }
 
-    /// Resolve generation in the same acceptance transaction, after receipt lookup.
+    /// Stop for idleness: the deployment stays eligible for on-demand activation.
+    ///
+    /// SPEC §6.3 separates this from an administrative stop, and the difference is
+    /// the whole point: an idle eviction that suspended automatic activation would
+    /// leave a deployment permanently down because nobody happened to call it.
     #[allow(clippy::too_many_arguments)]
     pub fn accept_ordinary_stop_command(
         &self,
@@ -523,6 +528,41 @@ impl crate::Store {
         key: &str,
         now: i64,
         deadline: i64,
+    ) -> Result<OrdinaryStopReceipt, LifecycleError> {
+        self.accept_stop_command(s, principal, deployment, revision, key, now, deadline, false)
+    }
+
+    /// An operator's stop: automatic activation is suspended with it.
+    ///
+    /// SPEC §6.3 requires explicit stop behaviour to survive the next inference
+    /// request. The intent is recorded in the acceptance transaction, so a stop that
+    /// committed is never left activatable by a crash between the two writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_administrative_stop_command(
+        &self,
+        s: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        revision: i64,
+        key: &str,
+        now: i64,
+        deadline: i64,
+    ) -> Result<OrdinaryStopReceipt, LifecycleError> {
+        self.accept_stop_command(s, principal, deployment, revision, key, now, deadline, true)
+    }
+
+    /// Resolve generation in the same acceptance transaction, after receipt lookup.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_stop_command(
+        &self,
+        s: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        revision: i64,
+        key: &str,
+        now: i64,
+        deadline: i64,
+        administrative: bool,
     ) -> Result<OrdinaryStopReceipt, LifecycleError> {
         super::receipt::check_request(principal, deployment, revision, key, deadline)?;
         if now < 0 {
@@ -545,6 +585,14 @@ impl crate::Store {
         }
         let fence = super::receipt::command_fence(&tx, deployment, revision)?;
         super::check_managed_command_target(&tx, deployment)?;
+        // Written with the acceptance, never after it. A stop that committed while
+        // the intent did not would be undone by the next inference request.
+        if administrative {
+            tx.execute(
+                "UPDATE deployments SET admin_stopped=1 WHERE id=?1",
+                [deployment],
+            )?;
+        }
         if let Some(receipt) =
             super::unarmed_stop::accept(&tx, s, principal, &fence, key, now, deadline)?
         {

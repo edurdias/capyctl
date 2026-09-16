@@ -198,6 +198,42 @@ impl CoordinatorLifecycle {
             .read(|store| store.check_generation(deployment, observed))
     }
 
+    /// Accept a Stop against the deployment's current revision.
+    ///
+    /// `administrative` is the operator's intent from SPEC §6.3: it suspends
+    /// automatic activation, and an idle eviction leaves it clear.
+    fn stop(&self, deployment: &str, administrative: bool) -> Result<OperationHandle, LifecycleFault> {
+        let row = self.current(deployment)?;
+        let revision = self
+            .commands
+            .read(|store| store.current_revision(deployment))?
+            .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))?;
+        let key = Self::stop_key(deployment, revision, row.current_generation, administrative);
+        let deadline = self
+            .commands
+            .now_ms()?
+            .checked_add(ACTIVATION_WINDOW_MS)
+            .ok_or_else(|| LifecycleFault::Unavailable("clock overflow".into()))?;
+        let receipt = if administrative {
+            self.commands
+                .administrative_stop(ROUTER_PRINCIPAL, deployment, revision, &key, deadline)
+        } else {
+            self.commands
+                .stop(ROUTER_PRINCIPAL, deployment, revision, &key, deadline)
+        }?;
+        Ok(OperationHandle {
+            operation_id: mllm_domain::OperationId(receipt.operation_id().to_string()),
+            deployment_id: deployment.to_string(),
+        })
+    }
+
+    /// Distinct per runtime and per intent, so a retry of the same stop replays its
+    /// receipt while an operator's stop after an eviction is its own command.
+    fn stop_key(deployment: &str, revision: i64, generation: i64, administrative: bool) -> String {
+        let intent = if administrative { "admin" } else { "idle" };
+        format!("stop:{intent}:{deployment}:{revision}:{generation}")
+    }
+
     fn unsupported(what: &str) -> LifecycleFault {
         LifecycleFault::Blocked(format!(
             "the coordinator cannot {what} yet; refusing rather than performing a \
@@ -245,14 +281,9 @@ impl LifecyclePort for CoordinatorLifecycle {
         Err(Self::unsupported("observe engine work"))
     }
 
-    async fn idle_stop(&self, _deployment: &str) -> Result<OperationHandle, LifecycleFault> {
-        // The ordinary stop has no intent, so it cannot distinguish an eviction from
-        // an operator's stop. Performing one as the other would either strand an
-        // evicted deployment or let the next request undo a deliberate stop. Tracked
-        // as milestone A1b.
-        Err(Self::unsupported(
-            "stop for idleness without suspending the deployment",
-        ))
+    /// Stop an idle deployment, leaving it eligible for on-demand activation.
+    async fn idle_stop(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
+        self.stop(deployment, false)
     }
 
     /// Await a terminal state for an accepted operation.
@@ -303,15 +334,13 @@ impl LifecyclePort for CoordinatorLifecycle {
         // coordinator's start would otherwise clear nothing and start it anyway.
         if row.desired_state == LifecycleState::Stopped
             && row.observed_state == LifecycleState::Stopped
-        {
-            let suspended = self
+            && self
                 .commands
-                .read(|store| store.is_suspended(deployment))?;
-            if suspended {
-                return Err(LifecycleFault::Blocked(format!(
-                    "deployment {deployment} was explicitly stopped"
-                )));
-            }
+                .read(|store| store.is_admin_stopped(deployment))?
+        {
+            return Err(LifecycleFault::Blocked(format!(
+                "deployment {deployment} was explicitly stopped"
+            )));
         }
         // Commands fence on the effective revision, which is not the row's schema
         // version; confusing them yields a revision conflict rather than a clear
@@ -341,9 +370,17 @@ impl LifecyclePort for CoordinatorLifecycle {
         action: LifecycleAction,
     ) -> Result<OperationHandle, LifecycleFault> {
         match action {
-            LifecycleAction::Start => self.auto_activate(deployment).await,
-            // Every other transition is either absent from the ordinary lifecycle or
-            // depends on the stop intent that does not exist yet.
+            LifecycleAction::Start => {
+                // SPEC §6.3: a start enables the deployment. An operator asking for
+                // one is lifting their own earlier stop, so it is cleared rather
+                // than refused — unlike an inference request, which must not.
+                self.commands
+                    .read(|store| store.set_admin_stopped(deployment, false))?;
+                self.auto_activate(deployment).await
+            }
+            LifecycleAction::Stop => self.stop(deployment, true),
+            // Park is absent from the ordinary lifecycle; only the candidate path
+            // has one. It arrives with eviction in A1b.
             other => Err(Self::unsupported(&format!("perform {other:?}"))),
         }
     }

@@ -4,13 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -90,7 +90,11 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(stamps, (1..=10).collect::<Vec<_>>());
+        assert_eq!(
+            stamps,
+            (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>(),
+            "every migration is stamped once"
+        );
         assert!(conn
             .execute(
                 "INSERT INTO owned_launch_associations VALUES('missing','missing','missing','{}')",
@@ -123,6 +127,34 @@ mod tests {
         assert_eq!(count, 0);
         let foreign_keys:i64=conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('qualification_case_actions') WHERE on_delete='NO ACTION'",[],|r|r.get(0)).unwrap();
         assert_eq!(foreign_keys, 3);
+    }
+
+    /// An existing deployment keeps its rows and is not administratively stopped by
+    /// the upgrade. A migration that defaulted the flag the other way would suspend
+    /// automatic activation for every deployment already running.
+    #[test]
+    fn v11_preserves_rows_and_leaves_them_activatable() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?1)",
+                [(index + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('kept','kept','model','ready',1,0,1,1);").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let (name, stopped): (String, bool) = conn
+            .query_row(
+                "SELECT name,admin_stopped FROM deployments WHERE id='kept'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "kept");
+        assert!(!stopped, "an upgrade must not suspend what was running");
     }
 
     #[test]
