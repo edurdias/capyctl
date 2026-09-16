@@ -382,6 +382,20 @@ host with several devices or across hosts.
 6. Hardware: host-a has a single GB10, so no parallel topology can be qualified
    there. Tensor parallelism needs a multi-device host; multi-node needs two hosts.
 
+## Open questions
+
+1. A caller waits the full 600s bound to learn an operation is uncertain.
+   When `drive` fails after arming, the worker marks the lifecycle run `uncertain`
+   and pauses, holding the retained binding until an explicit Stop and a verified
+   cleanup. That is the proof-carrying model working as intended. But the
+   `operations` row stays `running`, and `CoordinatorLifecycle::classify` reads only
+   that row, so `wait_terminal` polls for the whole `TERMINAL_WAIT` (600s) before
+   reporting `Uncertain`. Observed on 2026-09-16: a regression run took 600.15s to
+   fail. The run state is durable and says `uncertain` immediately, so the caller
+   could be told at once. Changing it alters what the router does with a request
+   that triggers activation — it would fail fast rather than hold the client — so it
+   is the owner's call, not a repair to make unattended.
+
 ## Owner attention
 
 Execution capacity item: after Cleanup committed, fresh-worker creation for the
