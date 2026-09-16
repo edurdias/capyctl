@@ -55,13 +55,18 @@ The project is a fresh, standalone open-source controller, not a fork of an exis
 
 mllm owns routing, admission, deployment intent, reservations, lifecycle coordination, local supervision, and operational visibility. Engines own tokenization, kernels, batching, attention, tensor/pipeline distribution, and inference. Cache backends own KV serialization and block management.
 
-The initial product does not install drivers, compile kernels, download or quantize checkpoints implicitly, implement tensor transport, build a new KV storage format, or provide cloud placement, billing, training, a desktop marketplace, or high-availability consensus. Other tools may call mllm, but none is required to operate it. Ray and container runtimes are not mandatory mllm dependencies; an explicitly selected engine recipe or launcher may have its own requirements.
+The initial product does not install drivers, compile kernels, quantize checkpoints, download checkpoints implicitly ([ADR 0008](design/adr/0008-engine-installations-and-runtime-types.md) permits materializing an explicitly declared model source), implement tensor transport, build a new KV storage format, or provide cloud placement, billing, training, a desktop marketplace, or high-availability consensus. Other tools may call mllm, but none is required to operate it. Ray and container runtimes are not mandatory mllm dependencies; an explicitly selected engine recipe or launcher may have its own requirements.
 
 llama-swap and NVIDIA PAIR are reference projects, not dependencies or the implementation base. Do not position mllm merely as the first router with unloading or sleep. Any later integration must establish one lifecycle owner rather than letting two controllers manage the same engine.
 
 Do not turn one initialized base-model engine into an arbitrary different architecture by swapping a model name. Separate runtime configurations are separate deployments. Adapter-specific LoRA support or compatible weight-update use cases are later features, not a substitute for this ownership model.
 
 ## 2. Vocabulary and durable objects
+
+> **Amended by [ADR 0008](design/adr/0008-engine-installations-and-runtime-types.md).**
+> Engine family, engine installation, runtime type and model source are the terms of
+> record. "Runtime profile" below is the same object as an engine installation.
+> "Model recipe" narrows to an internal frozen artifact derived from a deployment.
 
 | Object | Meaning and identity |
 |---|---|
