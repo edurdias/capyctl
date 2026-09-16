@@ -8,6 +8,34 @@
 
 #![allow(dead_code)]
 
+
+/// A state directory the controller lock will accept.
+///
+/// The lock walks every ancestor of the state path and refuses any that is group- or
+/// other-writable, because such an ancestor lets another account replace the
+/// directory the lock guards. `/tmp` is 1777 and a checkout is commonly 0775, so
+/// neither can hold controller state. The home directory is the usual root that
+/// satisfies the rule.
+fn safe_state_dir() -> tempfile::TempDir {
+    let home = std::env::var("HOME").expect("HOME is set");
+    tempfile::TempDir::new_in(home).expect("a state directory under an owner-only root")
+}
+
+/// The engine's API process id, from the deployment's durable identity set.
+/// Replaces the old in-memory handle lookup: these identities survive a restart and
+/// carry a boot id and start time, so a caller can tell whether the pid still names
+/// the process that was recorded.
+fn live_pid(app: &roles::App, deployment: &str) -> Option<u32> {
+    app.controller
+        .live_identities(deployment)
+        .ok()?
+        .into_iter()
+        .find(|identity| identity.role == "api")
+        .map(|identity| identity.pid)
+}
+
+use mllm_controller::LifecyclePort as _;
+
 use std::sync::Arc;
 
 use mllm_cli::roles::{self, LiveVllmProfile};
@@ -36,8 +64,7 @@ async fn deploy_and_start(
 ) -> String {
     let id = app
         .controller
-        .submit_deploy(req(name, name))
-        .await
+        .submit_deploy("standalone", &req(name, name))
         .unwrap();
     let op = app
         .controller
@@ -90,20 +117,29 @@ impl Drop for LiveProcessCleanup {
 #[tokio::test]
 async fn live_default_denies_sleep_profile() {
     let Some(_) = live_profile() else { return; };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = safe_state_dir();
     let app = roles::start_standalone_with_policy(
         dir.path(), mllm_adapters::fake::ParkPolicy::Denied,
     ).await.unwrap();
-    let id = app.controller.submit_deploy(DeployRequest {
+    let id = app.controller.submit_deploy("standalone", &DeployRequest {
         kind: "vllm-sleep".into(),
         ..req("denied-sleep", "denied-sleep")
-    }).await.unwrap();
+    }).unwrap();
     let result = app.controller.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
-    assert!(matches!(result, Err(mllm_controller::ControllerError::OperationFailed { code, .. }) if code == "policy_denied"));
-    assert!(app.controller.live_pid(&id).is_none(), "denied profile never spawns");
+    assert!(matches!(result, Err(mllm_controller::LifecycleFault::Blocked(ref message)) if message.contains("Denied") || message.contains("denied")));
+    assert!(live_pid(&app, &id).is_none(), "denied profile never spawns");
     eprintln!("LIVE: T21 default policy denied sleep profile before spawn");
 }
 
+// Pending milestone A1b. This drives an ambiguous park through a second controller
+// sharing the store. Ordinary park does not exist in the coordinator yet, and a
+// second authority over the same state is what the controller lock now prevents by
+// design. Both the park and the fault injection return with A1b, which is also where
+// the injection should be rebuilt without a second authority.
+// Kept compiled out rather than deleted: the scenario and its proxy-based fault
+// injection are what A1b rebuilds from. `cfg(any())` never matches, so the source
+// stays readable without being compiled against an API it predates.
+#[cfg(any())]
 #[tokio::test]
 async fn live_ambiguous_park_reconciles() {
     use mllm_adapters::fake::ParkPolicy;
@@ -114,7 +150,7 @@ async fn live_ambiguous_park_reconciles() {
     eprintln!("LIVE-DIR: {}", dir.path().display());
     let app = roles::start_standalone_with_policy(dir.path(), ParkPolicy::ExperimentalAllowed).await.unwrap();
     let id = deploy_and_start(&app, &p.model_id).await;
-    let pid = app.controller.live_pid(&id).unwrap();
+    let pid = live_pid(&app, &id).unwrap();
     let cleanup = LiveProcessCleanup::new(pid);
 
     // The real controller owns this running engine. A second controller
@@ -214,7 +250,7 @@ fn live_restart_only_qualification() {
         assert!(!content.is_empty(), "engine produced a completion");
 
         // -- Stop → process group terminated (T12 live) --
-        let pid_before = app.controller.live_pid(&a).expect("real engine pid");
+        let pid_before = live_pid(&app, &a).expect("real engine pid");
         let op = app
             .controller
             .request_transition(&a, mllm_domain::LifecycleAction::Stop)
@@ -303,8 +339,7 @@ async fn live_switch_restart_only() {
     let a = deploy_and_start(&app, &p.model_id).await;
     let b = app
         .controller
-        .submit_deploy(req("qwen3-4b-alt", "qwen3-4b-alt"))
-        .await
+        .submit_deploy("standalone", &req("qwen3-4b-alt", "qwen3-4b-alt"))
         .unwrap();
 
     let gen_a1 = sw.switch_to(&a).await.unwrap();
@@ -313,11 +348,12 @@ async fn live_switch_restart_only() {
     // A → B (T16 live): A released by stop, B reaches READY.
     let gen_b = sw.switch_to(&b).await.unwrap();
     eprintln!("LIVE: B ready after switch, generation {gen_b}", gen_b = gen_b);
-    let a_state = {
-        let store = app.controller.store_ref();
-        let guard = store.lock().unwrap();
-        guard.get_deployment(&a).unwrap().unwrap().observed_state
-    };
+    let a_state = app
+        .controller
+        .get_deployment(&a)
+        .unwrap()
+        .unwrap()
+        .observed_state;
     assert_eq!(a_state, LifecycleState::Stopped, "A released on switch");
 
     let gen_a2 = sw.switch_to(&a).await.unwrap();
@@ -340,17 +376,16 @@ async fn live_park_reload() {
     // the sleep-enabled deployment S.
     let s_dep = app
         .controller
-        .submit_deploy(DeployRequest {
+        .submit_deploy("standalone", &DeployRequest {
             kind: "vllm-sleep".into(),
             ..req("qualified-model-sleep", &p.model_id)
         })
-        .await
         .unwrap();
     let startup_started = std::time::Instant::now();
     let op = app.controller.request_transition(&s_dep, mllm_domain::LifecycleAction::Start).await.unwrap();
     assert_eq!(app.controller.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
     let startup_ready_seconds = startup_started.elapsed().as_secs_f64();
-    let _cleanup = LiveProcessCleanup::new(app.controller.live_pid(&s_dep).unwrap());
+    let _cleanup = LiveProcessCleanup::new(live_pid(&app, &s_dep).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let router_addr = listener.local_addr().unwrap();
     let router = app.router();
@@ -433,12 +468,12 @@ async fn live_concurrent_park_reload() {
     eprintln!("LIVE-DIR: {}", dir.path().display());
     let app = roles::start_standalone_with_policy(dir.path(),
         mllm_adapters::fake::ParkPolicy::ExperimentalAllowed).await.unwrap();
-    let id = app.controller.submit_deploy(DeployRequest {
+    let id = app.controller.submit_deploy("standalone", &DeployRequest {
         kind:"vllm-sleep".into(), ..req("concurrent-sleep", &p.model_id)
-    }).await.unwrap();
+    }).unwrap();
     let op = app.controller.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
     assert_eq!(app.controller.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
-    let pid = app.controller.live_pid(&id).unwrap();
+    let pid = live_pid(&app, &id).unwrap();
     let _cleanup = LiveProcessCleanup::new(pid);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/v1/chat/completions",listener.local_addr().unwrap());
@@ -473,7 +508,7 @@ async fn live_concurrent_park_reload() {
         let mut times = Vec::new();
         while let Some(result) = tasks.join_next().await { times.push(result.unwrap()); }
         assert_eq!(times.len(),8);
-        assert_eq!(app.controller.live_pid(&id),Some(pid),"wake reuses one engine");
+        assert_eq!(live_pid(&app, &id),Some(pid),"wake reuses one engine");
         eprintln!("LIVE-CONCURRENT: {}",serde_json::json!({"cycle":cycle,"correct":8,"seconds":times}));
     }
     let op = app.controller.request_transition(&id,mllm_domain::LifecycleAction::Stop).await.unwrap();

@@ -184,6 +184,15 @@ impl CoordinatorCommands {
         })
     }
 
+    /// The coordinator's own clock reading.
+    ///
+    /// Callers that must express a deadline need the same clock the acceptance is
+    /// stamped with; deriving one independently lets a deadline be judged against a
+    /// different epoch than the one that records it.
+    pub fn now_ms(&self) -> Result<i64, crate::fault::LifecycleFault> {
+        (self.shared.clock)().map_err(Into::into)
+    }
+
     /// Accept a deployment durably and return what was accepted.
     ///
     /// Acceptance is idempotent on the caller's key: a response lost after the

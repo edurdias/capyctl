@@ -22,8 +22,10 @@ use crate::fault::LifecycleFault;
 use crate::operations::OperationHandle;
 use crate::port::LifecyclePort;
 
-/// How long a router-initiated activation may take before its receipt expires.
-const ACTIVATION_DEADLINE_MS: i64 = 10 * 60 * 1000;
+/// How long a router-initiated activation may take before its receipt expires. The
+/// store wants an absolute deadline on its own clock, so this window is added to the
+/// coordinator's reading rather than passed as a duration.
+const ACTIVATION_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 /// The principal a router-initiated activation acts as. Distinct from an operator so
 /// history can tell an automatic wake from a deliberate one.
@@ -292,13 +294,14 @@ impl LifecyclePort for CoordinatorLifecycle {
             .read(|store| store.current_revision(deployment))?
             .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))?;
         let key = Self::activation_key(deployment, revision, row.current_generation);
-        let receipt = self.commands.start(
-            ROUTER_PRINCIPAL,
-            deployment,
-            revision,
-            &key,
-            ACTIVATION_DEADLINE_MS,
-        )?;
+        let deadline = self
+            .commands
+            .now_ms()?
+            .checked_add(ACTIVATION_WINDOW_MS)
+            .ok_or_else(|| LifecycleFault::Unavailable("clock overflow".into()))?;
+        let receipt =
+            self.commands
+                .start(ROUTER_PRINCIPAL, deployment, revision, &key, deadline)?;
         Ok(OperationHandle {
             operation_id: mllm_domain::OperationId(receipt.operation_id().to_string()),
             deployment_id: deployment.to_string(),

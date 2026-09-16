@@ -8,12 +8,14 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use mllm_agent::Host;
 use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::schema::ConfigKind;
-use mllm_controller::Controller;
+use mllm_controller::coordinator::{CoordinatorOptions, OwnedCoordinator};
+use mllm_controller::{CoordinatorLifecycle, OwnedCoordinatorState, ProfileBindings};
+use crate::host_observation::{system_clock, HostMemoryObservation};
 use mllm_store::Store;
 
 use crate::grammar::Command;
@@ -28,7 +30,15 @@ pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 /// (not `Arc`) because `Store` is not `Sync` and F0 observes it from one
 /// thread; concurrent sharing comes with the F3 task architecture.
 pub struct App {
-    pub controller: Arc<Controller>,
+    /// The lifecycle authority. One coordinator owns the durable state behind the
+    /// controller lock, which is what makes a second authority impossible rather
+    /// than merely discouraged.
+    pub controller: Arc<CoordinatorLifecycle>,
+    /// The coordinator's owned task. Dropping it requests shutdown, so the app holds
+    /// it for as long as it serves.
+    _coordinator: OwnedCoordinator,
+    /// A separate read-only connection for direct observation in tests. It never
+    /// writes: the coordinator is the only writer.
     pub store: Rc<Store>,
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
@@ -60,6 +70,10 @@ pub enum StartError {
     Io(#[from] std::io::Error),
     #[error("credentials missing: refusing to serve without a generated api key")]
     MissingCredentials,
+    #[error("controller ownership: {0}")]
+    Ownership(#[from] mllm_controller::OwnedStateError),
+    #[error("coordinator: {0}")]
+    Coordinator(#[from] mllm_controller::coordinator::CoordinatorError),
 }
 
 impl From<StartError> for StructuredError {
@@ -145,7 +159,6 @@ async fn start_standalone_inner(
     );
     let db_path = state_dir.join("server").join("srv.sqlite3");
     let store = Rc::new(Store::open(&db_path)?);
-    let controller_store = Arc::new(Mutex::new(Store::open(&db_path)?));
     let api_key = match read_api_key(state_dir) {
         Some(k) => k,
         None if created_this_boot => "mllm-local".to_string(),
@@ -254,12 +267,22 @@ async fn start_standalone_inner(
         }
     };
 
-    let controller = Arc::new(Controller::new_with_policy(
-        controller_store.clone(),
-        adapter,
-        launcher,
-        policy,
-    ));
+    // The coordinator opens the durable state itself and holds the controller lock
+    // for as long as it runs, so nothing else may act as an authority over it.
+    let owner = Arc::new(std::sync::Mutex::new(OwnedCoordinatorState::open(
+        &state_dir.join("server"),
+    )?));
+    let coordinator = OwnedCoordinator::spawn_resolved(
+        owner,
+        Arc::new(HostMemoryObservation),
+        system_clock(),
+        CoordinatorOptions::default(),
+        Arc::new(ProfileBindings),
+    )?;
+    let controller = Arc::new(CoordinatorLifecycle::new(coordinator.commands()));
+    // The adapter and launcher built above now inform only the forwarding table;
+    // the coordinator resolves an adapter per binding from its frozen profile.
+    let _ = (adapter, launcher, policy);
     let deps = mllm_router::RouterDeps {
         controller: controller.clone(),
         forwards,
@@ -272,7 +295,7 @@ async fn start_standalone_inner(
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
     };
     let router = mllm_router::serve_router(deps.clone());
-    Ok(App { controller, store, router, deps, api_key })
+    Ok(App { controller, _coordinator: coordinator, store, router, deps, api_key })
 }
 
 fn live_vllm_sleep_flags(policy: mllm_adapters::fake::ParkPolicy) -> Vec<String> {
