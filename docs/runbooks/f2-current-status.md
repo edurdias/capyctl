@@ -209,8 +209,14 @@ not survive a restart. The whole F2 stack is reachable only from tests.
 - [ ] Engine-generic driver factory: read the declared engine, build an
       `AdapterSpec`, resolve, and prove cleanup with `verify_gone`. Additive beside
       `spawn_fake`.
-- [ ] Wire the coordinator into `roles.rs`; retire the handle map; resolve adapters
-      per binding.
+- [x] Wire the coordinator into `roles.rs`; retire the handle map; resolve adapters
+      per binding (`23e3f35`, `ffe6af6`, `8996065`).
+- [x] Accept an ordinary Start for a restart-only deployment (`d2a6117`). The start
+      validator asserted the fake-engine fixture's shape, so every Start was refused
+      as corrupt stored data and nothing could run at all.
+- [ ] Drive an accepted Start to Ready: launch the binding, probe it, settle the
+      operation. The command is accepted today and then `wait_terminal` never
+      returns, which is what keeps the three standalone tests ignored.
 - [ ] Remove the legacy authorities together, as the A2d plan requires: synthetic
       admission, empty-ledger checks, old reservation writers, router-owned eviction
       and in-memory release guards. Never two authorities at once.
