@@ -1,31 +1,18 @@
-//! What standalone mode declares about itself.
+//! The host policy and deployment document standalone publishes.
 //!
-//! The coordinator starts only a deployment it can qualify, and qualification is
-//! against an effective configuration: a host policy naming the engine installations
-//! this host offers, and a deployment naming the one it wants. Standalone previously
-//! declared no profiles at all, so nothing could be qualified — it hardcoded an
-//! adapter in the role wiring and never told the store the engine existed.
-//!
-//! These compose that declaration. The profile is the engine installation from
-//! ADR 0008: an engine family, an executable, a build fingerprint, and the security
-//! decisions the host has made about it.
-//!
-//! Resource limits are derived from what the host actually reports rather than
-//! guessed, because an invented ceiling is how a machine gets overcommitted.
+//! The profile is ADR 0008's engine installation. Limits derive from observed
+//! capacity rather than a configured guess, because an invented ceiling is how a
+//! host gets overcommitted.
 
 use serde_json::{json, Value};
 
-/// The single profile standalone registers. Named rather than anonymous so a second
-/// installation can be added later without the first becoming ambiguous.
+/// Named rather than anonymous so a second installation can be added later.
 pub const STANDALONE_PROFILE: &str = "local";
 
-/// The domain a standalone host accounts in. Unified is correct for the Spark-class
-/// hardware this runs on, where device and host memory are one physical pool.
+/// Unified: on this hardware device and host memory are one physical pool.
 const DOMAIN: &str = "unified";
 
-/// Fractions of observed capacity. Conservative on purpose: admission must fail
-/// before the host does, and a standalone host is also running everything else the
-/// user is doing.
+/// Conservative: admission must fail before the host does.
 const MANAGED_FRACTION: i64 = 50;
 const FREE_RESERVE_FRACTION: i64 = 20;
 const PARKED_FRACTION: i64 = 25;
@@ -55,17 +42,13 @@ pub fn host_policy(
                 "revision": 1,
                 "executable": executable,
                 "build_fingerprint": build_fingerprint,
-                // Standalone issues no qualification of its own: this names the
-                // evidence the profile was admitted under, and an unqualified
-                // profile is refused for warm use rather than silently downgraded.
                 "qualification_id": format!("standalone-{build_fingerprint}"),
                 "args": [],
                 "env": {},
                 "launch_settings": {"engine": engine},
                 "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
                 "security": {
-                    // The host's decision, not the adapter's: deep-park paths stay
-                    // denied unless this says otherwise (SPEC §9.1, T21).
+                    // SPEC §9.1/T21: the host's decision, not the adapter's.
                     "experimental_controls": experimental_controls,
                     "credential_ref": "secret://engine-key"
                 }
@@ -91,17 +74,16 @@ pub fn host_policy(
                 "max_pending_per_deployment": 64,
                 "max_pending_total": 256,
                 "max_buffered_bytes_total": "64MiB",
-                "request_deadline": "600s"
+                "request_deadline": "1800s"
             }
         }
     })
 }
 
-/// The deployment document for a request, naming the profile it runs on.
+/// The deployment document, naming the installation it runs on.
 ///
-/// Phase footprints are declared rather than inferred. A deployment that does not
-/// state what it needs at each phase cannot be admitted, because admission compares
-/// the transition's true peak against the ceiling rather than its steady state.
+/// Phase footprints are declared because admission compares a transition's peak
+/// against the ceiling, not its steady state.
 pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_bytes: i64) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
@@ -113,18 +95,16 @@ pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_b
         "kind": "deployment",
         "name": name,
         "routes": [route],
-        // The installation this deployment runs on. Named `runtime_profile` in the
-        // configuration schema; ADR 0008 calls the same object an engine
-        // installation, and the rename is tracked there rather than diverging here.
+        // ADR 0008 calls this an engine installation; the schema key still says
+        // runtime_profile, and the rename is tracked there.
         "runtime_profile": STANDALONE_PROFILE,
         "runtime_profile_revision": 1,
         "recipe": "standalone",
-        // Standalone issues no qualification of its own, and warm residency requires
-        // a qualified parking recipe. Restart-only is the honest declaration, and is
-        // the fallback SPEC §6.2 already describes for an unqualified deep-park path.
+        // SPEC §6.2's fallback: no qualification, so no warm parking.
         "residency": "restart_only",
         "recovery": "reconcile",
-        "request_deadline": "300s",
+        // Ordered: activation window <= deployment deadline <= host ceiling.
+        "request_deadline": "900s",
         "model": {
             "path": model_path,
             "content_fingerprint": format!("sha256:{name}"),
@@ -132,11 +112,9 @@ pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_b
         },
         "devices": devices,
         "resources": {
-            // Cold initialisation is the peak: loading costs more than serving.
             "cold":    {"allocations": allocation(20, 2), "devices": devices},
             "ready":   {"allocations": allocation(15, 2), "devices": devices},
             "parking": {"allocations": allocation(15, 2), "devices": devices},
-            // Parked retains residue without holding a device.
             "parked":  {"allocations": allocation(2, 0),  "devices": []},
             "wake":    {"allocations": allocation(20, 2), "devices": devices}
         }

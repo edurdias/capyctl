@@ -294,11 +294,11 @@ fn load(
     if effective_json != p.effective_json {
         return Err(LifecycleError::Conflict);
     }
-    let catalog = qualified_effective(tx, &e, &p.deployment_id)?;
+    let catalog = binding_identity(tx, &e, &p.deployment_id)?;
     let binding: BindingDto = decode(&p.binding_json)?;
     if binding.version != 1
-        || binding.qualification_id != catalog.qualification_id()
-        || binding.payload != catalog.binding_payload()?
+        || binding.qualification_id != catalog.id()
+        || binding.payload != catalog.payload()?
         || binding.credential_ref
             != e.profile
                 .security
@@ -408,6 +408,72 @@ pub struct QualifiedStart {
     pub joined: bool,
 }
 
+
+/// What a runtime binding is created and verified against.
+///
+/// Warm residency parks, so it must name a qualification. Restart-only never parks;
+/// SPEC §6.2 makes it first-class for backends with no qualified memory release.
+/// The runtime probe still gates readiness either way.
+enum BindingIdentity {
+    Qualified(Box<crate::candidate_creation::progression::catalog::QualificationReceipt>),
+    Declared { id: String, payload: String },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredBindingV1 {
+    version: u8,
+    kind: &'static str,
+    residency: &'static str,
+    recipe_fingerprint: String,
+    host: String,
+    hardware_fingerprint: String,
+    environment_fingerprint: String,
+}
+
+impl BindingIdentity {
+    fn id(&self) -> &str {
+        match self {
+            Self::Qualified(receipt) => receipt.qualification_id(),
+            Self::Declared { id, .. } => id,
+        }
+    }
+    fn payload(&self) -> Result<String, LifecycleError> {
+        match self {
+            Self::Qualified(receipt) => receipt.binding_payload(),
+            Self::Declared { payload, .. } => Ok(payload.clone()),
+        }
+    }
+}
+
+/// Resolve the identity for this deployment's residency.
+fn binding_identity(
+    tx: &Transaction<'_>,
+    e: &mllm_config::effective::EffectiveDeployment,
+    deployment: &str,
+) -> Result<BindingIdentity, LifecycleError> {
+    if e.residency == mllm_config::effective::Residency::RestartOnly {
+        // Bound to the recipe and host it was admitted against, so a change
+        // produces a different identity rather than reusing this binding.
+        let descriptor = DeclaredBindingV1 {
+            version: 1,
+            kind: "declared",
+            residency: "restart_only",
+            recipe_fingerprint: e.qualification_fingerprint.clone(),
+            host: e.host.name.clone(),
+            hardware_fingerprint: e.host.hardware_fingerprint.clone(),
+            environment_fingerprint: e.host.environment_fingerprint.clone(),
+        };
+        return Ok(BindingIdentity::Declared {
+            id: format!("declared:{}", e.qualification_fingerprint),
+            payload: encode(&descriptor)?,
+        });
+    }
+    Ok(BindingIdentity::Qualified(Box::new(qualified_effective(
+        tx, e, deployment,
+    )?)))
+}
+
 impl crate::Store {
     /// Clock-aware administrative start; only an actual Qualified Fake catalog
     /// and its verified source cleanup authorize a fresh managed binding.
@@ -453,7 +519,7 @@ impl crate::Store {
         }
         let (raw, e) = effective(tx, f)?;
         let catalog =
-            qualified_effective(tx, &e, &f.deployment_id).map_err(|error| match error {
+            binding_identity(tx, &e, &f.deployment_id).map_err(|error| match error {
                 LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
                     LifecycleError::Unsupported
                 }
@@ -499,7 +565,7 @@ impl crate::Store {
             .clone()
             .filter(|v| !v.trim().is_empty())
             .ok_or(LifecycleError::Conflict)?;
-        let payload = catalog.binding_payload()?;
+        let payload = catalog.payload()?;
         let mut reserved = None;
         for port in e.host.endpoint_port_range.start..=e.host.endpoint_port_range.end {
             let leased: bool = tx.query_row(
@@ -514,7 +580,7 @@ impl crate::Store {
                 id: binding_id.clone(),
                 fence: f.clone(),
                 incarnation: incarnation.clone(),
-                qualification_id: catalog.qualification_id().into(),
+                qualification_id: catalog.id().into(),
                 ownership: "managed".into(),
                 endpoint_host: "127.0.0.1".into(),
                 endpoint_port: port,

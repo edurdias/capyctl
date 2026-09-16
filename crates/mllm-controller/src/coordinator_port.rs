@@ -160,7 +160,7 @@ impl CoordinatorLifecycle {
         Ok(binding.map(|b| b.identities).unwrap_or_default())
     }
 
-    /// Publish the host's resource policy with the observations that justify it.
+    /// Publish the host's admission ceiling with its justifying observations.
     pub fn publish_resource_policy(
         &self,
         host: &mllm_config::effective::HostPolicy,
@@ -170,12 +170,10 @@ impl CoordinatorLifecycle {
         self.commands.import_resource_policy(host, observations, now)
     }
 
-    /// Create a deployment together with the effective configuration it will be
-    /// qualified against.
+    /// Create a deployment together with its effective configuration.
     ///
-    /// Replaces the bare-record path. A deployment created without a configuration
-    /// can be named but never started, because the coordinator starts only what it
-    /// can qualify, so the two are written together or not at all.
+    /// Written together or not at all: a deployment without one can be named but
+    /// never started.
     pub fn create_configuration(
         &self,
         principal: &str,

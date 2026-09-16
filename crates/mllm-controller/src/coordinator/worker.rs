@@ -184,11 +184,10 @@ impl CoordinatorCommands {
         })
     }
 
-    /// Publish the host's resource policy: the ceiling admission is judged against.
+    /// Publish the ceiling admission is judged against.
     ///
-    /// It is imported with the observations that justify it rather than on its own,
-    /// because a ceiling asserted without a reading of the machine is a guess, and a
-    /// guess is what lets a host be overcommitted.
+    /// Imported with its observations: a ceiling asserted without a reading of the
+    /// machine is a guess, and a guess is how a host gets overcommitted.
     pub fn import_resource_policy(
         &self,
         host: &mllm_config::effective::HostPolicy,
@@ -208,12 +207,10 @@ impl CoordinatorCommands {
         Ok(())
     }
 
-    /// Create a stopped managed configuration, which is how a deployment comes into
-    /// existence with an effective configuration to be qualified against.
+    /// Create a stopped managed configuration.
     ///
     /// This is deployment creation in this model: the record and its effective
-    /// revision are written together, so a deployment never exists in a state where
-    /// it can be named but not qualified.
+    /// revision are written together.
     pub fn create_managed_configuration(
         &self,
         principal: &str,
@@ -242,11 +239,8 @@ impl CoordinatorCommands {
             .map_err(Into::into)
     }
 
-    /// The coordinator's own clock reading.
-    ///
-    /// Callers that must express a deadline need the same clock the acceptance is
-    /// stamped with; deriving one independently lets a deadline be judged against a
-    /// different epoch than the one that records it.
+    /// The coordinator's own clock, so a deadline is judged against the same epoch
+    /// that records it.
     pub fn now_ms(&self) -> Result<i64, crate::fault::LifecycleFault> {
         (self.shared.clock)().map_err(Into::into)
     }
