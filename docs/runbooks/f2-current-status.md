@@ -331,6 +331,89 @@ Forward-looking dependency notes that remain live: `operation-read-dependencies.
 (A3), `ordinary-warm-composition-dependencies.md`, `no-effect-recovery-dependencies.md`
 and `candidate-terminal-api-dependencies.md` (A2d).
 
+## Live engine measurements — 2026-09-16, host-a
+
+GB10, driver 580.173.02, CUDA 13.0, kernel 6.17.0-1031-nvidia. SGLang 0.5.19 and
+vLLM 0.29.0, both on torch 2.13.0+cu130. All figures are engine-direct: mllm's
+router was not in the request path, so none of this is end-to-end evidence.
+
+Both engines ran eager with CUDA graphs disabled. These are pinned-profile
+comparisons, not tuned ones, and per `SPEC.md` T40 no speedup claim is made.
+
+### Concurrent serving
+
+Qwen3-4B on both engines simultaneously, ten concurrent requests, ten correct
+replies, 3.62 s wall clock, both processes healthy. Two 4B runtimes coexist in
+roughly 32 GiB of the 128 GiB unified pool.
+
+### Throughput, 27B, 413-token prompt
+
+| engine | conc | TTFT p50 | prefill tok/s | decode tok/s/req | agg out tok/s |
+|---|---|---|---|---|---|
+| SGLang | 1 | 0.610 | 677 | 4.72 | 4.6 |
+| vLLM | 1 | 0.562 | 734 | 4.54 | 4.5 |
+| SGLang | 4 | 0.524 | 788 | 4.58 | 18.1 |
+| vLLM | 4 | 1.623 | 254 | 4.40 | 16.8 |
+| SGLang | 16 | 29.696 | 13.9 | 4.47 | 35.2 |
+| vLLM | 16 | 4.245 | 97.3 | 3.82 | 54.2 |
+
+The concurrency-16 difference is a configuration artifact. SGLang ran with
+`--max-running-requests 8`, so sixteen requests queued behind eight slots; vLLM
+used its default sequence limit. At concurrency 1 and 4 the engines are within
+noise of each other. Do not cite the 16-way row as an engine comparison.
+
+### Park and restore
+
+| | 4B | 27B |
+|---|---|---|
+| release | 0.149 s | 0.677 s |
+| freed | 9.01 GiB | 61.96 GiB |
+| resume | 0.339 s | 1.967 s |
+| reload from disk | 56.8 s | 329.9 s |
+| flush | 0.002 s | 0.020 s |
+| probe | 0.091 s | 4.974 s |
+| restore total | 57.3 s | 336.9 s |
+| cold start | 69.3 s | 347.3 s |
+| warm saving | 17% | **3%** |
+
+Deep park's value on this hardware is capacity reclaim and identity retention, not
+latency. Release returns 61.96 GiB in 0.68 s while the process, port, binding and
+CUDA context survive, but the return path costs essentially a cold start because
+reload rereads every weight from disk. Reload is 98% of restore at 27B, and the
+saving shrinks as the model grows, because reload scales with weights while the
+initialization it avoids is fixed.
+
+Host-backed park inverts the trade and is unusable here. With
+`--enable-weights-cpu-backup`, resume alone restores usable weights in 0.58 s with
+no reload, but release frees only 1.09 GiB instead of 9.01 GiB, because on unified
+memory the host backup occupies the same physical pool as device memory. The backup
+costs a further 8 GiB, retained and stable across four cycles rather than leaking.
+At 27B the mode is infeasible outright: weights twice over is about 110 GiB against
+a 128 GiB pool.
+
+Residency policy therefore depends on memory topology, which `SPEC.md` §6.2 does not
+currently model. On discrete devices a host backup frees real VRAM and is strictly
+better; on unified memory the two modes are near-opposites and `auto` cannot choose
+without knowing which goal it serves.
+
+### Pressure switch
+
+SGLang held a 27B runtime at about 67 GiB resident. Deep park released 61.96 GiB in
+0.68 s while retaining the runtime, vLLM then cold-started the same checkpoint into
+the reclaimed space, and both processes coexisted throughout. vLLM could not have
+started otherwise: two resident 27B runtimes exceed the pool. The reverse switch
+stopped vLLM in 2.06 s and restored SGLang in 336.9 s.
+
+### Probe contract gap
+
+The exact-marker probe assumes a non-reasoning model. Qwen3.5 emits a reasoning
+trace, so `Reply with exactly OK` returns `'...Final only OK.\n</think>\n\nOK'`,
+and with a small token budget it truncates mid-thought and returns `length`. Both
+engine adapters validate readiness as content equal to `OK` with `finish_reason`
+`stop`, so a healthy reasoning runtime reads as unusable and every transition is
+blocked. The F2C correctness corpus shares the assumption. SGLang did not populate
+`reasoning_content` because no `--reasoning-parser` was configured.
+
 ## Tracked for later: naming and engine resolution
 
 [ADR 0008](../design/adr/0008-engine-installations-and-runtime-types.md) makes
