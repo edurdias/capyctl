@@ -235,21 +235,30 @@ embedded Fake engine**, which is what standalone declares when no live profile i
 configured. That is the first end-to-end evidence the project has, and it is not
 qualification of a native recipe (SPEC §18).
 
-The native half of the gate is still open, and the blocker is specific:
-`VllmAdapter` has no `execute_persisted`, so it inherits the trait default and
-answers `Unsupported` to the only call the ordinary lifecycle makes. SGLang has a
-complete one (`sglang/adapter.rs`), but `ProfileBindings` refuses to build an SGLang
-runtime because nothing resolves its admin credential or supplies a trusted
-observation socket. Both are read from the code, not from an observed run: no
-native start has been attempted since the cutover. Closing this is either giving
-vLLM a persisted control path or wiring SGLang's two prerequisites; neither is
-started.
+The native half of the gate is still open. The owner confirmed on 2026-09-16 that
+**both** engines are required, not one:
+
+- `VllmAdapter` has no `execute_persisted`, so it inherits the trait default and
+  answers `Unsupported` to the only call the ordinary lifecycle makes. It needs one
+  written: launch from the frozen profile, record process identities, probe
+  readiness.
+- SGLang has a complete `execute_persisted` (`sglang/adapter.rs`), but
+  `ProfileBindings` refuses to build the runtime because nothing resolves its admin
+  credential and no trusted observation socket is supplied. Those are two inputs to
+  wire, not lifecycle code to author. Where the admin credential comes from is an
+  owner decision and is not yet answered.
+
+Both are read from the code, not from an observed run: no native start has been
+attempted since the cutover.
 
 Park was originally part of this gate and has moved to A1b. The ordinary lifecycle
-has no park at all — only the candidate path does — and ordinary stop needs the
-suspension predicate split recorded below. Both belong with eviction rather than with
-the cutover. Until A1b lands, the CLI loses park and stop, which is the deliberate
-price of having one authority instead of two.
+has no park at all — only the candidate path does. Ordinary stop returned with
+`b52f729`, which split the suspension predicate; park has not.
+
+The owner confirmed on 2026-09-16 that parking is the product's premise, not an
+option: **one model parked while another serves, switching between them
+automatically, is the reason the box holds more than one model.** Anything that
+reduces eviction to stop-and-restart misses the point of the project.
 
 ### A1b — Implement eviction in the authority
 
@@ -273,17 +282,13 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       one operation, keyed by deployment, revision and generation.
 - [ ] Delete `SwitchEngine` and, with it, the two writes the router currently makes
       through the port.
-- [ ] Give the ordinary stop an intent, so an administrative stop suspends and an
-      idle eviction stays on-demand eligible. This is not a parameter addition: nine
-      store queries gate on `suspended=0`, six of them in the ordinary path, and
-      writing the flag breaks completion, replay and expiry after a stop. The
-      predicate currently does two jobs, meaning both "not administratively stopped"
-      and "eligible to proceed", and separating them is what makes idle stop
-      expressible. Attempted on 2026-09-16 and reverted: placing the write before
-      acceptance broke five tests because acceptance itself requires an unsuspended
-      deployment, and placing it after acceptance still broke three post-stop flows.
-      Until this lands, the coordinator must refuse idle stop rather than silently
-      performing an administrative one.
+- [x] Give the ordinary stop an intent (`b52f729`). Schema v11 adds `admin_stopped`,
+      carrying the operator's intent alone; `suspended` keeps its nine eligibility
+      readers untouched. This is what the earlier attempt could not do by writing
+      `suspended`, from either side of acceptance.
+- [ ] Implement ordinary park. The ordinary lifecycle has no park at all; only the
+      candidate path (`candidate_creation/warm.rs`) does. This is the premise of the
+      product and the largest remaining piece of A1b.
 
 Ported faithfully first, keeping the existing T16 and T19 tests as the contract. The
 semantics were written against F1's assumptions and deserve revisiting against the
@@ -404,6 +409,24 @@ host with several devices or across hosts.
    honest answer is a refusal. `LifecycleError` has no variant for that today;
    `Disabled` is the closest and means something else. Pinned by
    `standalone_lifecycle::stop_is_illegal_from_stopped` so a change is deliberate.
+
+3. How does a deployment become qualified to park? OPEN, owner decision.
+   Warm residency requires a qualification: a recorded proof that this exact recipe
+   on this exact host releases memory and restores, with the model generating
+   correctly afterwards (SPEC §8.4 — "Finding an endpoint is not qualification").
+   Parking is destructive, so the store refuses to bind a warm deployment without
+   one, which is why standalone declares `restart_only` today and cannot park at all.
+
+   The owner has said twice that users will not ask for a qualification, and that
+   parking is the product's premise. Both hold only if mllm earns the proof itself:
+   on a warm deployment's first start, run the park/restore cycle once against it,
+   record the evidence, and switch freely from then on. Nobody types `mllm qualify`.
+   The alternative — trusting a configuration flag that asserts the engine can park
+   — is what SPEC §8.4 forbids, and it ends with a model whose weights were
+   discarded and cannot be restored.
+
+   Not started. The mechanism of ordinary park is independent of this question and
+   can be built first; this decides only when a deployment is allowed to use it.
 
 ## Owner attention
 
