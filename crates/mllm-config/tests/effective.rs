@@ -1029,6 +1029,51 @@ fn typed_decode_errors_do_not_echo_supplied_secret_scalars() {
     assert_eq!(error.code, ConfigErrorCode::MissingRequired);
 }
 
+/// SGLang takes its park strategy as startup flags, so the declared tier has to
+/// reach them. They were constants, which meant a deployment asking for a
+/// host-backed park launched an engine that could only deep-park.
+#[test]
+fn sglang_launch_flags_follow_the_declared_tier() {
+    let expected = [
+        // (residency, memory_saver, cpu_weight_backup, weight_restore)
+        ("restart_only", false, false, "disk_reload"),
+        ("host_backed", true, true, "cpu_backup"),
+        ("deep", true, false, "disk_reload"),
+    ];
+    for (declared, memory_saver, cpu_weight_backup, weight_restore) in expected {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = declared.into();
+        // Same profile rewrite `ordinary_engine_compatibility_goldens` uses to point
+        // the lab host at SGLang.
+        let profile = &mut host["runtime_profiles"]["local"];
+        profile["engine"] = "sglang".into();
+        profile["args"] = serde_json::json!([]);
+        profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+        profile["launch_settings"] = serde_json::json!({
+            "engine": "sglang",
+            "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
+            "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500}
+        });
+        // host_backed needs a host whose pools are distinct; Task 4 refuses it here
+        // otherwise, and this test is about the flags, not the host check.
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        let resolved = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
+        let ProfileLaunchSettings::Sglang(settings) = &resolved.profile.launch_settings else {
+            panic!("expected SGLang launch settings for {declared}");
+        };
+        assert_eq!(settings.memory_saver, memory_saver, "memory_saver for {declared}");
+        assert_eq!(
+            settings.cpu_weight_backup, cpu_weight_backup,
+            "cpu_weight_backup for {declared}"
+        );
+        assert_eq!(
+            settings.weight_restore, weight_restore,
+            "weight_restore for {declared}"
+        );
+    }
+}
+
 #[test]
 fn strict_yaml_rejects_duplicate_nested_keys() {
     let yaml = include_str!("fixtures/f2-deployment.yaml");

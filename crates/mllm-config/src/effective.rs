@@ -765,6 +765,19 @@ fn normalize_launch(
                     "invalid SGLang requested budget",
                 ));
             }
+            // SGLang takes its park strategy at launch: --enable-memory-saver and
+            // --enable-weights-cpu-backup cannot be added to a running engine. The
+            // declared tier therefore has to reach the launch settings, unlike
+            // vLLM's level, which is a parameter of the sleep call.
+            let memory_saver = residency.parks();
+            let cpu_weight_backup = residency == Residency::HostBacked;
+            let weight_restore = if cpu_weight_backup {
+                // --enable-weights-cpu-backup, available since SGLang v0.5: weights
+                // are copied to pinned host memory on sleep and restored from there.
+                "cpu_backup"
+            } else {
+                "disk_reload"
+            };
             ProfileLaunchSettings::Sglang(SglangLaunchSettings {
                 recipe,
                 tensor_parallel_size: 1,
@@ -776,8 +789,8 @@ fn normalize_launch(
                 max_total_tokens: 4096,
                 prefill_cuda_graphs: false,
                 decode_cuda_graphs: false,
-                memory_saver: true,
-                cpu_weight_backup: false,
+                memory_saver,
+                cpu_weight_backup,
                 speculative_decoding: false,
                 lora: false,
                 trust_remote_code: false,
@@ -785,7 +798,7 @@ fn normalize_launch(
                 external_cache: false,
                 cpu_kv_offload: false,
                 native_grpc: false,
-                weight_restore: "disk_reload".into(),
+                weight_restore: weight_restore.into(),
                 requested_budget: budget,
             })
         }
