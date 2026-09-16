@@ -4,6 +4,7 @@ mod durable;
 mod ownership;
 pub mod group_observation;
 pub mod native_observation;
+pub mod process_absence;
 pub use exec::ExecLauncher;
 pub use durable::{
     AssociationError, DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation,
