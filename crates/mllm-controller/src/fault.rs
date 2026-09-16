@@ -14,6 +14,7 @@
 
 use mllm_adapters::traits::AdapterError;
 use mllm_store::lifecycle::LifecycleError;
+use mllm_store::managed_configuration::ManagedConfigurationError;
 use mllm_store::StoreError;
 
 use crate::coordinator::{CoordinatorCommandError, CoordinatorError};
@@ -153,6 +154,25 @@ impl From<CoordinatorCommandError> for LifecycleFault {
         match error {
             CoordinatorCommandError::Coordinator(inner) => inner.into(),
             CoordinatorCommandError::Lifecycle(inner) => inner.into(),
+        }
+    }
+}
+
+impl From<ManagedConfigurationError> for LifecycleFault {
+    fn from(error: ManagedConfigurationError) -> Self {
+        let text = error.to_string();
+        match error {
+            ManagedConfigurationError::Invalid => Self::Blocked(text),
+            ManagedConfigurationError::RuntimeRetained => Self::Blocked(text),
+            ManagedConfigurationError::StaleSession
+            | ManagedConfigurationError::IdempotencyConflict
+            | ManagedConfigurationError::RevisionConflict
+            | ManagedConfigurationError::RouteConflict
+            | ManagedConfigurationError::PolicyConflict => Self::Conflict(text),
+            // The stored configuration cannot be read, so nothing about this request
+            // was decided.
+            ManagedConfigurationError::CorruptStoredData
+            | ManagedConfigurationError::Sql(_) => Self::Unavailable(text),
         }
     }
 }

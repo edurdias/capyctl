@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json = "1"
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -19,7 +20,6 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = { workspace = true }
 mllm-domain = { workspace = true }
 

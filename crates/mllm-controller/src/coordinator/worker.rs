@@ -184,6 +184,40 @@ impl CoordinatorCommands {
         })
     }
 
+    /// Create a stopped managed configuration, which is how a deployment comes into
+    /// existence with an effective configuration to be qualified against.
+    ///
+    /// This is deployment creation in this model: the record and its effective
+    /// revision are written together, so a deployment never exists in a state where
+    /// it can be named but not qualified.
+    pub fn create_managed_configuration(
+        &self,
+        principal: &str,
+        key: &str,
+        request_json: &str,
+        trusted_host: &serde_json::Value,
+        now_ms: i64,
+    ) -> Result<
+        mllm_store::managed_configuration::ManagedConfigurationReceipt,
+        crate::fault::LifecycleFault,
+    > {
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
+        })?;
+        owner
+            .store()
+            .create_stopped_managed_configuration(
+                owner.session(),
+                principal,
+                key,
+                request_json,
+                trusted_host,
+                now_ms,
+            )
+            .map_err(Into::into)
+    }
+
     /// The coordinator's own clock reading.
     ///
     /// Callers that must express a deadline need the same clock the acceptance is
