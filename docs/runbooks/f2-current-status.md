@@ -217,7 +217,40 @@ not survive a restart. The whole F2 stack is reachable only from tests.
 
 **Gate:** one inference served through the router, and one park or restore driven by
 the coordinator, both on a real engine. That is the first end-to-end evidence the
-project has.
+project has. Pressure-driven switching is deliberately not part of this gate; it is
+A1b, because the capability does not exist yet in any authority.
+
+### A1b — Implement eviction in the authority
+
+Pressure-driven switching is not implemented in the product. `SwitchEngine` is the
+only implementation of drain-release-wake, it lives in the router, and production
+never constructs it: `mllm-cli/src/roles.rs` wires `WakeJoin` and `auto_activate`
+instead. Before the port extraction, `ready_deployments_excluding` had exactly one
+caller, `switch.rs`. `request_transition_inner` handles suspension flags and the
+preinitialize contract and never looks at another deployment.
+
+So when a request arrives for a deployment while another holds the exclusive pool,
+nothing releases the incumbent. The engines can perform the switch — that was
+measured on 2026-09-16 — but mllm has no way to ask for it. This is why the F2 exit
+gate's warm-switching criterion could only be demonstrated engine-direct.
+
+- [ ] Implement drain, release and wake in the lifecycle authority, taking
+      `SwitchEngine`'s semantics as the contract: close admission, bounded drain
+      grace, quiescence through the adapter, park or stop by qualification, and on
+      failure reopen the incumbent unsuspended and journal the failed switch.
+- [ ] Move the activation join to the authority so simultaneous arrivals collapse to
+      one operation, keyed by deployment, revision and generation.
+- [ ] Delete `SwitchEngine` and, with it, the two writes the router currently makes
+      through the port.
+
+Ported faithfully first, keeping the existing T16 and T19 tests as the contract. The
+semantics were written against F1's assumptions and deserve revisiting against the
+proof-carrying model, but that belongs in A3 rather than here, where it would rewrite
+the tests that define correct behaviour.
+
+**Gate:** a request for a deployment whose pool is held by another causes the
+authority to release the incumbent and serve the request, with no router involvement
+beyond asking.
 
 ### A2 — Extract the domain
 
