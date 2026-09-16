@@ -11,7 +11,7 @@ pub mod switch;
 pub use switch::WakeJoin;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -30,7 +30,6 @@ pub struct QueueLimits {
 
 #[derive(Clone)]
 pub struct RouterDeps {
-    pub store: Arc<Mutex<mllm_store::Store>>,
     /// The lifecycle authority, named by port rather than by implementation, so
     /// which authority runs is a wiring decision rather than a compile-time one.
     pub controller: Arc<dyn mllm_controller::LifecyclePort>,
@@ -93,8 +92,7 @@ async fn list_models(
     if !authorized(&headers, &state.deps) {
         return Err(err_json("unauthorized", "missing or invalid api key"));
     }
-    let store = state.deps.store.lock().unwrap();
-    let ids = store.list_enabled_route_ids().map_err(|e| {
+    let ids = state.deps.controller.list_enabled_route_ids().map_err(|e| {
         err_json("internal", &format!("store: {e}"))
     })?;
     let data: Vec<serde_json::Value> = ids

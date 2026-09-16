@@ -23,7 +23,6 @@ async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
     ));
     let inflight = Arc::new(InFlight::default());
     let deps = RouterDeps {
-        store: shared,
         controller: controller.clone(),
         forwards: HashMap::from([(
             "fake".to_string(),

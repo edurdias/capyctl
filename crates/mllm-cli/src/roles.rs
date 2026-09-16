@@ -261,7 +261,6 @@ async fn start_standalone_inner(
         policy,
     ));
     let deps = mllm_router::RouterDeps {
-        store: controller_store.clone(),
         controller: controller.clone(),
         forwards,
         limits: mllm_router::QueueLimits {

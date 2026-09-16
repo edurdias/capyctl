@@ -145,10 +145,8 @@ impl SwitchEngine {
     }
 
     async fn current_generation(&self, target: &str) -> Result<u64, SwitchError> {
-        let store = self.controller.store();
-        let gen = store
-            .lock()
-            .unwrap()
+        let gen = self
+            .controller
             .get_deployment(target)
             .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?
             .ok_or_else(|| SwitchError::Activation(target.into(), "vanished".into()))?
@@ -157,10 +155,9 @@ impl SwitchEngine {
     }
 
     async fn activate(&self, target: &str) -> Result<u64, SwitchError> {
-        let store = self.controller.store();
         let (target_state, target_observed) = {
-            let s = store.lock().unwrap();
-            let row = s
+            let row = self
+                .controller
                 .get_deployment(target)
                 .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?
                 .ok_or_else(|| SwitchError::Activation(target.into(), "vanished".into()))?;
@@ -174,11 +171,10 @@ impl SwitchEngine {
 
         // Step 1: any other READY deployment holds the pool — drain and
         // release it before B can start (one pool, exclusive residency).
-        let ready_others: Vec<String> = {
-            let s = store.lock().unwrap();
-            s.ready_deployments_excluding(target)
-                .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?
-        };
+        let ready_others: Vec<String> = self
+            .controller
+            .ready_deployments_excluding(target)
+            .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?;
         for a in ready_others {
             self.drain_and_release(&a).await?;
         }
@@ -202,7 +198,6 @@ impl SwitchEngine {
     /// failure: A reopens (not suspended, window preserved) and the failed
     /// switch is journaled (T16/T19 failure branch).
     async fn drain_and_release(&self, a: &str) -> Result<(), SwitchError> {
-        let store = self.controller.store();
         let deadline = Instant::now() + self.drain_grace;
         // Drain: the fake's observe_work is the quiescence oracle; real
         // engines' in-flight telemetry arrives via the adapter (F1 design
@@ -241,9 +236,8 @@ impl SwitchEngine {
             }
         }
         // Release A: park if qualified, else stop (restart-only fallback).
-        let deployment = store
-            .lock()
-            .unwrap()
+        let deployment = self
+            .controller
             .get_deployment(a)
             .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
         let observed = deployment.as_ref().map(|r| r.observed_state);
@@ -299,8 +293,7 @@ impl SwitchEngine {
         // A reopens with its window state preserved: not suspended, the
         // failed switch does not punish A. The event feeds SPEC §17's
         // failed-switches metric.
-        let store = self.controller.store();
-        let _ = store.lock().unwrap().set_suspended(a, false);
+        let _ = self.controller.clear_suspension(a);
         self.journal_switch_failed(a);
         SwitchError::DrainTimeout(a.to_string())
     }
@@ -311,15 +304,11 @@ impl SwitchEngine {
 
     fn journal_switch(&self, a: &str, evidence: &str) {
         // Journal on the deployment's latest operation (evidence-only).
-        let store = self.controller.store();
-        let op = store
-            .lock()
-            .unwrap()
-            .latest_operation(a)
-            .ok()
-            .flatten();
+        let op = self.controller.latest_operation(a).ok().flatten();
         if let Some(op) = op {
-            let _ = store.lock().unwrap().record_journal(Some("switch"), Some(&op.id), None, evidence);
+            let _ = self
+                .controller
+                .journal(Some("switch"), Some(&op.id), None, evidence);
         }
     }
 }

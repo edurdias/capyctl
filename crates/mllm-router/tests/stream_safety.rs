@@ -198,7 +198,6 @@ async fn ready_deps(pending: bool) -> (mllm_router::RouterDeps, String) {
     });
     (
         mllm_router::RouterDeps {
-            store,
             controller,
             forwards: std::collections::HashMap::from([("fake".into(), forward)]),
             limits: mllm_router::QueueLimits {

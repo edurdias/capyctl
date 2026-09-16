@@ -18,8 +18,8 @@ pub async fn resolve(
     model: &str,
 ) -> Result<(String, String), (StatusCode, Json<serde_json::Value>)> {
     let (deployment_id, kind, observed) = {
-        let store = deps.store.lock().unwrap();
-        let row = store
+        let row = deps
+            .controller
             .find_deployment_by_route(model)
             .map_err(|e| err("internal", &format!("store: {e}")))?
             .ok_or_else(|| {
@@ -40,9 +40,7 @@ pub async fn resolve(
         deps.activation_join
             .join(&deployment_id, || async {
                 let now_ready = deps
-                    .store
-                    .lock()
-                    .unwrap()
+                    .controller
                     .get_deployment(&deployment_id)
                     .ok()
                     .flatten()

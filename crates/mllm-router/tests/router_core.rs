@@ -28,7 +28,6 @@ async fn app() -> (
         Arc::new(mllm_adapters::fake::FakeLauncher::new()),
     ));
     let deps = RouterDeps {
-        store: shared.clone(),
         controller: controller.clone(),
         forwards: HashMap::from([("fake".to_string(), adapter)]),
         limits: QueueLimits { max_requests_per_deployment: 2, max_buffered_bytes_total: 1024 },
