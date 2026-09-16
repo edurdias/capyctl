@@ -187,26 +187,75 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
    gates, and perform authorized pressure-guarded native qualification after its
    prerequisites. CPU/Fake tests and source checks are not native qualification.
 
-## Next queued work
+## Work plan and review gates
 
 This runbook is the single status authority for F2. Per-slice progress notes and
-continuation summaries under `.superpowers/sdd/` were removed on 2026-09-15; the
-per-unit briefs and reports are archived under each slice's `archive/` directory.
+continuation summaries were removed on 2026-09-15; per-unit briefs and reports are
+archived under each slice's `archive/` directory.
 
-Queued units run serially. They share Store result and cleanup contracts and must
-not run concurrently.
+Review happens at the gates below, not after every task. Units inside a milestone
+run serially and are verified by focused TDD plus the core suite; no separate
+review pass runs between them.
+
+### M1 — Restore GPU availability on host-a (owner action required)
+
+- [x] Verify host reachability. SSH succeeds; `host-a.tailnet.ts.net`
+      resolves to `100.64.0.10` and port 22 is open. The earlier 2026-09-15
+      timeouts no longer reproduce.
+- [x] Diagnose GPU unavailability. `nvidia-smi` cannot reach the driver, no nvidia
+      modules are loaded, and no `/dev/nvidia*` nodes exist.
+- [ ] **Owner:** restore a kernel that has the GPU driver, then pin it. See the
+      kernel item under Owner attention.
+- [ ] Re-verify `nvidia-smi`, `/dev/nvidia*` and module load after the change.
+
+M1 blocks all live qualification. It does not block M2 or M3.
+
+### M2 — Real SGLang park, restore and reload (F2B)
+
+`crates/mllm-adapters/src/sglang/adapter.rs` currently returns
+`UnsupportedCapability` for `park`, `restore`, `reload_weights` and `render_plan`,
+and `check_readiness` always returns `Initializing`. SPEC §9.2 requires qualified
+release and restoration for a selected SGLang recipe, and the F2 exit gate depends
+on it. This is the milestone's largest unknown and is sequenced first.
+
+- [ ] Resolve the pinned SGLang memory-saver release/resume contract from the F2B
+      plan and `[S3]`; record the exact endpoints and preconditions.
+- [ ] Add failing adapter tests for release, resume, weight reload and their
+      failure and uncertainty paths.
+- [ ] Implement `park`, `restore` and `reload_weights` against that contract.
+- [ ] Implement `render_plan` and real `check_readiness` and `prepare_park`.
+- [ ] Report capabilities honestly; unqualified paths stay `Unsupported`.
+
+**Review gate 1** — at M2 completion, before any native work.
+
+### M3 — A3 trusted result capture and operation reads
+
+Serial units sharing Store result and cleanup contracts. They cannot run
+concurrently with each other.
 
 | Order | Packet | Exact base | State |
 |---|---|---|---|
-| 1 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/candidate-result-capture-queued-brief.md` | `eed70879a8d4ff8acae8f048474ed8a7d3e004e1` | Ready; base equals current HEAD |
+| 1 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/candidate-result-capture-queued-brief.md` | `eed7087` | Ready. Base is source-equivalent to HEAD; `972fe48` changed documentation only |
 | 2 | `.superpowers/sdd/2026-09-12-f2a3-management-and-configuration/operation-results-queued-brief.md` | UNSET | Blocked on unit 1; must reuse capture, not add a second format |
 
 Unit 1 covers trusted versioned result persistence and bounded observational reads.
-It does not add an HTTP route. Verify exact HEAD before editing either packet.
+It does not add an HTTP route.
 
-Forward-looking dependency notes that remain live:
-`operation-read-dependencies.md` (A3), `ordinary-warm-composition-dependencies.md`,
-`no-effect-recovery-dependencies.md` and `candidate-terminal-api-dependencies.md` (A2d).
+**Review gate 2** — at M3 completion.
+
+### M4 — Native qualification and consolidated review
+
+Requires M1, M2 and M3. Covers guarded native startup composition, the closed
+qualification program, both engines' persisted adapters, and the API-driven F2C
+runner.
+
+**Review gate 3** — final consolidated review across the whole branch, including
+the structural question of whether `candidate_creation/*` workflow logic belongs in
+`mllm-store`.
+
+Forward-looking dependency notes that remain live: `operation-read-dependencies.md`
+(A3), `ordinary-warm-composition-dependencies.md`, `no-effect-recovery-dependencies.md`
+and `candidate-terminal-api-dependencies.md` (A2d).
 
 ## Owner attention
 
@@ -246,11 +295,25 @@ the agent cannot certify or restore it. It remains excluded from reading,
 editing, formatting, tests and staging. The separately modified SDD Task 2 report
 also remains excluded and untouched by this continuation.
 
-Owner access item: read-only SSH connections to host-a timed out on port22
-at approximately 2026-09-15 11:56, 12:30, 13:26, 14:18, 15:16 and 16:08 UTC. No remote command executed
-in any attempt. Access remains unavailable from this session; restore reachability
-before native qualification. These observations do not identify the network or
-host cause. Local implementation continues without remote effects.
+Host access item: RESOLVED. The 2026-09-15 SSH timeouts no longer reproduce.
+A read-only check on 2026-09-16 connected successfully; `host-a.tailnet.ts.net`
+resolves to `100.64.0.10` over Tailscale and port 22 is open.
+
+Kernel and GPU driver item: OPEN, owner action required. host-a rebooted at
+2026-09-15 22:53 into kernel `7.0.0-1019-nvidia`, which has no GPU driver module.
+`modprobe -n -v nvidia` reports `FATAL: Module nvidia not found in directory
+/lib/modules/7.0.0-1019-nvidia`. No nvidia modules are loaded and no `/dev/nvidia*`
+nodes exist, so `nvidia-smi` fails. The previously booted kernel
+`6.17.0-1031-nvidia` still carries the complete stack: `nvidia.ko`, `nvidia-uvm.ko`,
+`nvidia-drm.ko`, `nvidia-modeset.ko` and `nvidia-peermem.ko`. Driver packages
+`nvidia-driver-580-open 580.173.02` remain installed. `GRUB_DEFAULT=0` selects the
+newest kernel, so the upgrade silently changed the boot target.
+
+Two owner options. Booting `6.17.0-1031-nvidia` and pinning it is the faster and
+more reversible one; building the 580-open driver for `7.0.0-1019-nvidia` through
+DKMS is the forward fix. Either way, pin the boot entry so a future kernel upgrade
+cannot silently remove GPU access again. The agent did not change drivers, modules,
+boot configuration or power state; all checks were read-only.
 
 No new approval is required for the current bounded implementation. Only
 host-a is authorized. The approved isolated SGLang environment and reviewed
