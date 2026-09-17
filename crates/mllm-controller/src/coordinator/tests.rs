@@ -399,7 +399,13 @@ async fn stale_observation_blocks_but_expired_queue_releases_unused_endpoint() {
             owner.clone(),
             Arc::new(Observations(observations)),
             Arc::new(move || Ok(clock_read.load(Ordering::SeqCst))),
-            CoordinatorOptions::default(),
+            // ADR 0011 decision 5: the denial is retried until the budget is
+            // spent. The cooldown is shortened so the test does not wait for the
+            // policy default.
+            CoordinatorOptions {
+                retry_cooldown: Duration::from_millis(20),
+                ..Default::default()
+            },
             Arc::new(move |_| Ok(test_driver(driver.clone()))),
         )
         .unwrap();
@@ -738,6 +744,9 @@ async fn current_policy_race_and_observation_timeout_deny_send() {
             Arc::new(|| Ok(1900)),
             CoordinatorOptions {
                 protocol_timeout: Duration::from_millis(200),
+                // The denial is retried until the budget is spent; the test does
+                // not wait for the policy default between attempts.
+                retry_cooldown: Duration::from_millis(20),
                 ..Default::default()
             },
             Arc::new(move |_| Ok(test_driver(driver.clone()))),
@@ -1458,6 +1467,180 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
             .unwrap()),
         InitializeStatus::Completed
     );
+}
+
+/// Wait for the worker to be admitting Initialize again, which it publishes by
+/// returning to Running.
+async fn running(worker: &OwnedCoordinator) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while worker.status() != WorkerStatus::Running {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker never resumed admitting Initialize");
+}
+
+/// How many Initialize steps this deployment has, and whether its admission is
+/// still open.
+fn steps(sql: &rusqlite::Connection, deployment_id: &str) -> (i64, bool) {
+    sql.query_row(
+        "SELECT (SELECT COUNT(*) FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+                 WHERE s.deployment_id=?1 AND o.kind='initialize'),
+                (SELECT admission_enabled=1 FROM deployments WHERE id=?1)",
+        [deployment_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// ADR 0011 decision 5: a failed attempt is retried, and the deployment is given
+/// up on only after the budget is spent. SPEC §13.2: the retry is counted against
+/// the exact configuration that failed, and the wait between attempts doubles. T20
+#[tokio::test]
+async fn a_failed_start_is_retried_until_the_budget_is_spent() {
+    let (dir, owner, fence, observations) = setup().await;
+    // The driver is never constructed, so this failure is known not to have
+    // landed: the step stays planned, holds no grant and produced no evidence.
+    let drives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = drives.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            max_attempts: 3,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(CoordinatorError::Service("injected recipe failure".into()))
+        }),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let start = w.start(&fence, 10000).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !steps(&sql, &fence.deployment_id).1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deployment never gave up");
+    // 20 ms before the second attempt and 40 ms before the third: a broken recipe
+    // does not burn the device in a tight loop.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(60),
+        "the cooldown did not double: {elapsed:?}"
+    );
+    assert_eq!(drives.load(Ordering::SeqCst), 3, "the budget was not spent");
+    let record = {
+        let o = owner.lock().unwrap();
+        o.store().attempts(&fence).unwrap()
+    };
+    assert_eq!(record.map(|r| r.attempts), Some(3));
+    // The coordinator itself is unaffected, and nothing was armed for a fourth
+    // attempt: one step, still planned, no grant, no evidence.
+    assert_eq!(w.status(), WorkerStatus::Running);
+    assert_eq!(steps(&sql, &fence.deployment_id).0, 1);
+    let durable: (String, bool, i64) = sql
+        .query_row(
+            "SELECT s.state,s.grant_id IS NULL,(SELECT COUNT(*) FROM lifecycle_evidence WHERE step_id=s.id) FROM lifecycle_steps s WHERE s.id=?1",
+            [start.step_id()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, ("planned".into(), true, 0));
+    // The give-up is durable: no further attempt is recorded after the budget.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(drives.load(Ordering::SeqCst), 3);
+    drop(start);
+    w.shutdown().await.unwrap();
+}
+
+/// Retrying an effect that may have landed can start a second engine while the
+/// first still holds memory. SPEC §13.2 and ADR 0011 decision 5: an uncertain
+/// attempt is not counted and not retried until the recorded processes are proven
+/// gone. T20
+#[tokio::test]
+async fn an_uncertain_attempt_is_not_retried_while_processes_remain() {
+    let (dir, owner, fence, observations) = setup().await;
+    // The launch association is recorded and then the reply is lost: the engine
+    // holds device memory and the outcome of the step is unknown.
+    let first = Gate::new(false);
+    *first.association.lock().unwrap() = Some(owner.clone());
+    first.lost_reply.store(true, Ordering::SeqCst);
+    let second = Gate::new(false);
+    second.release.add_permits(1);
+    let constructed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (uncertain, healthy) = (first.clone(), second.clone());
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            max_attempts: 3,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            Ok(test_driver(
+                if constructed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    uncertain.clone()
+                } else {
+                    healthy.clone()
+                },
+            ))
+        }),
+    )
+    .unwrap();
+    let start = w.start(&fence, 10000).unwrap();
+    first.entered().await;
+    first.release.add_permits(1);
+    assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
+    assert_eq!(
+        start.wait(Duration::from_secs(10)).await.unwrap(),
+        InitializeStatus::Uncertain
+    );
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    let attempts = |fence: &DeploymentFence| {
+        let o = owner.lock().unwrap();
+        o.store().attempts(fence).unwrap()
+    };
+    // Several cooldowns pass. Nothing is counted, nothing is retried, and the
+    // deployment's own admission stays open: this is a pause, not a failure.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(attempts(&fence), None, "an uncertain attempt was counted");
+    assert_eq!(steps(&sql, &fence.deployment_id), (1, true));
+    assert_eq!(first.calls.lock().unwrap().len(), 1);
+    // The explicit Stop drives cleanup, and only the gone-proof resolves it.
+    let stop = w.stop("owner", &fence, "uncertain-stop", 10000).unwrap();
+    assert_eq!(
+        stop.wait(Duration::from_secs(60)).await.unwrap(),
+        mllm_store::ordinary_lifecycle::cleanup::OrdinaryCleanupStatus::Completed
+    );
+    running(&w).await;
+    let next = DeploymentFence {
+        deployment_id: fence.deployment_id.clone(),
+        revision: stop.receipt().revision,
+        generation: stop.receipt().generation,
+    };
+    let fresh = w.start(&next, 10000).unwrap();
+    assert_eq!(
+        fresh.wait(Duration::from_secs(60)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    assert_eq!(steps(&sql, &fence.deployment_id).0, 2);
+    assert_eq!(attempts(&fence), None);
+    assert_eq!(attempts(&next), None);
+    drop(start);
+    w.shutdown().await.unwrap();
 }
 
 mod cleanup_evidence {

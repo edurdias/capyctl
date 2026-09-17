@@ -874,7 +874,13 @@ async fn a_failed_deployment_does_not_stop_the_others() {
         owner.clone(),
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
-        CoordinatorOptions::default(),
+        // ADR 0011 decision 5: the misconfigured deployment is retried until its
+        // budget is spent before its admission closes. The cooldown is shortened
+        // so the test does not wait for the policy default.
+        CoordinatorOptions {
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
         Arc::new(move |work| {
             // Only the first deployment's binding is ever misconfigured. The
             // driver is never even constructed for it.

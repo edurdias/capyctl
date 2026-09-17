@@ -67,6 +67,14 @@ pub struct CoordinatorOptions {
     pub poll_interval: Duration,
     pub protocol_timeout: Duration,
     pub max_observers: usize,
+    /// ADR 0011 decision 5: how many times one configuration is attempted before the
+    /// deployment is given up on. Policy, not a constant; host-published policy
+    /// supplies it when remote hosts exist (F3).
+    pub max_attempts: u32,
+    /// The wait before the first retry. Each later retry doubles it, so a broken
+    /// recipe does not burn a GPU in a tight loop and a transient failure does not
+    /// wait minutes.
+    pub retry_cooldown: Duration,
 }
 impl Default for CoordinatorOptions {
     fn default() -> Self {
@@ -74,6 +82,8 @@ impl Default for CoordinatorOptions {
             poll_interval: Duration::from_millis(100),
             protocol_timeout: Duration::from_secs(30),
             max_observers: 256,
+            max_attempts: 3,
+            retry_cooldown: Duration::from_secs(30),
         }
     }
 }
@@ -613,6 +623,10 @@ impl OwnedCoordinator {
             || options.protocol_timeout > Duration::from_secs(3600)
             || options.max_observers == 0
             || options.max_observers > 16384
+            || options.max_attempts == 0
+            || options.max_attempts > 16
+            || options.retry_cooldown.is_zero()
+            || options.retry_cooldown > Duration::from_secs(3600)
         {
             return Err(CoordinatorError::Invalid);
         }
@@ -1127,6 +1141,11 @@ async fn run(
                         }
                     })
                     .await;
+                // SPEC §13.2: only a step the store still reports as planned is a
+                // failure known not to have landed. Nothing was armed, so nothing
+                // can be running, and the same step is still there to be driven
+                // again. Every other outcome is retained, not retried.
+                let unlanded = matches!(status, Ok(InitializeStatus::Planned));
                 let outcome = match status {
                     Ok(InitializeStatus::ExpiredUnarmed) => {
                         shared.set_initializing(true);
@@ -1201,16 +1220,63 @@ async fn run(
                     shared.changed.notify_waiters();
                     continue;
                 }
-                // ADR 0011 decision 4: a deployment that fails closes its own
-                // admission, not the host's. Every other deployment keeps being
-                // served; only this one is no longer admitted until an operator
-                // or a later retry reopens it.
-                //
-                // The worker is admitting Initialize again before that closure is
-                // written, not after. An observer that watches for the closed
-                // deployment would otherwise see it closed and still be refused a
-                // start for a healthy one, which is the blast radius this removes.
+                // The worker is admitting Initialize again before anything about
+                // this deployment is written, not after. An observer that watches
+                // for the closed deployment would otherwise see it closed and still
+                // be refused a start for a healthy one, which is the blast radius
+                // this removes.
                 shared.set_initializing(true);
+                // SPEC §13.2 and ADR 0011 decision 5: a failure known not to have
+                // landed is retried. The attempt is counted against this exact
+                // configuration, and the deployment is given up on once the budget
+                // is spent. An uncertain outcome never reaches here: it pauses
+                // above and resolves through the gone-proof first.
+                if unlanded {
+                    let fence = work.fence().clone();
+                    let counting = shared.clone();
+                    let record = match shared
+                        .with_owner(move |owner| {
+                            let now = (counting.clock)()?;
+                            owner
+                                .store()
+                                .record_attempt(&fence, now)
+                                .map_err(|error| CoordinatorError::Service(error.to_string()))
+                        })
+                        .await
+                    {
+                        Ok(record) => record,
+                        Err(error) => {
+                            return WorkerStatus::Failed(format!(
+                                "{outcome:?}; attempt not recorded: {error}"
+                            ))
+                        }
+                    };
+                    if record.attempts < i64::from(shared.options.max_attempts) {
+                        // The step is still planned against its original
+                        // reservation, so the next poll rediscovers this exact
+                        // work. Nothing is released, no epoch advances and no
+                        // dispatch is replayed.
+                        let exponent = u32::try_from(record.attempts.saturating_sub(1))
+                            .unwrap_or(u32::MAX)
+                            .min(16);
+                        let wait = shared
+                            .options
+                            .retry_cooldown
+                            .saturating_mul(1u32.checked_shl(exponent).unwrap_or(u32::MAX));
+                        status_tx.send_replace(WorkerStatus::Running);
+                        shared.changed.notify_waiters();
+                        tokio::select! {
+                            _ = stop.changed() => {},
+                            _ = tokio::time::sleep(wait) => {},
+                        }
+                        continue;
+                    }
+                }
+                // ADR 0011 decision 4: the budget is spent, or the failure was not
+                // one that may be replayed. A deployment that is given up on closes
+                // its own admission, not the host's. Every other deployment keeps
+                // being served; only this one is no longer admitted until an
+                // operator reopens it.
                 let deployment_id = work.fence().deployment_id.clone();
                 if let Err(error) = shared
                     .with_owner(move |owner| {
