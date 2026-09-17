@@ -915,6 +915,9 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     let other = fixture::owned_source().await.other.clone();
     let failing_id = fence.deployment_id.clone();
     let gate = Gate::new(false);
+    // The healthy deployment's Initialize is allowed to finish; only the first
+    // deployment is misconfigured.
+    gate.release.add_permits(1);
     let driver = gate.clone();
     let w = OwnedCoordinator::spawn(
         owner.clone(),
@@ -954,15 +957,18 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     })
     .await
     .unwrap();
-    assert_eq!(
-        {
-            let o = owner.lock().unwrap();
-            o.store()
-                .qualified_initialize_status(o.session(), failing.step_id(), 1900)
-                .unwrap()
-        },
-        QualifiedInitializeStatus::Planned
-    );
+    // Read the durable state rather than the observer: a fenced status read
+    // requires an admitting deployment, and this one just closed its own
+    // admission. The step is still planned, holds no grant and produced no
+    // evidence, so nothing was executed for it.
+    let durable: (String, bool, i64, i64) = sql
+        .query_row(
+            "SELECT s.state,s.grant_id IS NULL,(SELECT COUNT(*) FROM lifecycle_evidence WHERE step_id=s.id),d.admission_enabled FROM lifecycle_steps s JOIN deployments d ON d.id=s.deployment_id WHERE s.id=?1",
+            [failing.step_id()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, ("planned".into(), true, 0, 0));
     // The coordinator itself is unaffected: it is still Running, not Stopped.
     assert_eq!(w.status(), WorkerStatus::Running);
     // A second, healthy deployment still starts and reaches Ready.

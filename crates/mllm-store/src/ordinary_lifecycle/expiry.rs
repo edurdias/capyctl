@@ -93,7 +93,11 @@ pub(super) fn expire_in_transaction(
         terminal(tx, session, p, e, now_ms)?;
         return Ok(false);
     }
-    current(tx, session, p, false)?;
+    // ADR 0011 decision 4: a deployment that fails closes its own admission. Its
+    // planned step still has to reach this deadline, so the release does not ask
+    // whether the deployment is still admitting. Every other condition is
+    // unchanged, and `no_effects` below still proves nothing was executed.
+    current_admitted(tx, session, p, false, false)?;
     if state != "planned" || now_ms < p.deadline_ms {
         return Err(LifecycleError::Conflict);
     }

@@ -431,38 +431,10 @@ async fn action_rejections_are_typed_before_any_new_receipt() {
         .await["error"]["code"],
         "runtime_retained"
     );
-    let body: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
-    ))
-    .unwrap();
-    let mut config = body["input"]["deployment"].clone();
-    config["name"] = json!("unqualified");
-    config["routes"] = json!(["unqualified"]);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/management/v1/deployments")
-        .header("authorization", format!("Bearer {MANAGEMENT}"))
-        .header("content-type", "application/json")
-        .header("idempotency-key", "unqualified")
-        .body(Body::from(
-            json!({"config":config,"activate":false}).to_string(),
-        ))
-        .unwrap();
-    let created = value(app.clone().oneshot(req).await.unwrap()).await;
-    assert_eq!(
-        value(
-            app.clone()
-                .oneshot(request(
-                    created["deployment_id"].as_str().unwrap(),
-                    "start",
-                    "start"
-                ))
-                .await
-                .unwrap()
-        )
-        .await["error"]["code"],
-        "unsupported_capability"
-    );
+    // A deployment whose profile named no qualification catalog entry was once
+    // refused here with unsupported_capability. ADR 0011 decision 1 removed that
+    // gate: every binding identity is now declared from the deployment's own
+    // effective configuration, so there is no such refusal to assert.
     let stop = value(
         app.clone()
             .oneshot(request(&id, "stop", "stop"))

@@ -20,12 +20,23 @@ pub enum QualifiedInitializePoll {
     Work(Box<QualifiedInitializeWork>),
 }
 
+/// The oldest planned step of this session, in durable acceptance order.
+///
+/// `admitted` selects what the caller is looking for. Work must come from a
+/// deployment that is still admitting; the deadline release must be able to see
+/// a step whose deployment has closed its own admission.
 fn next_plan(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,
+    admitted: bool,
 ) -> Result<Option<(Plan, EffectiveDeployment)>, LifecycleError> {
     let id: Option<String> = tx
         .query_row(
+            // ADR 0011 decision 4: a deployment whose admission is closed is
+            // closed for work. It must not be returned here, because the arm
+            // that would follow refuses it and one deployment's failure would
+            // again stop every other deployment on the host.
+            // SPEC §6.1 FAILED: admission closed.
             "SELECT s.id FROM lifecycle_steps s
          JOIN operations o ON o.id=s.operation_id
          JOIN lifecycle_runs r ON r.operation_id=o.id
@@ -34,8 +45,9 @@ fn next_plan(
            AND s.session_id=?1 AND r.session_id=?1
            AND d.revision=r.revision AND d.current_generation=r.generation
            AND d.desired_state='ready' AND d.suspended=0
+           AND (?2=0 OR d.admission_enabled=1)
          ORDER BY o.accepted_at,o.id LIMIT 1",
-            [session.id()],
+            params![session.id(), admitted],
             |row| row.get(0),
         )
         .optional()?;
@@ -46,11 +58,20 @@ fn next_plan(
         return Err(LifecycleError::CorruptStoredData);
     }
     let (plan, effective, state) = load(tx, &id)?;
-    current(tx, session, &plan, false)?;
+    current_admitted(tx, session, &plan, false, admitted)?;
     if state != "planned" {
         return Err(LifecycleError::Conflict);
     }
     Ok(Some((plan, effective)))
+}
+
+/// Whether this plan's deployment is still admitting work.
+fn admitting(tx: &Transaction<'_>, plan: &Plan) -> Result<bool, LifecycleError> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND admission_enabled=1)",
+        [&plan.deployment_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn prepare_work(
@@ -343,7 +364,7 @@ impl crate::Store {
     ) -> Result<Option<QualifiedInitializeWork>, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
-        let work = next_plan(&tx, session)?
+        let work = next_plan(&tx, session, true)?
             .map(|(plan, effective)| prepare_work(&tx, plan, effective))
             .transpose()?;
         tx.commit()?;
@@ -353,6 +374,12 @@ impl crate::Store {
     /// Inspect one oldest current planned operation and durably expire it before
     /// checking current launch policy. The release uses the same transaction-local
     /// exact no-effect validation as an explicit expired-step retry.
+    ///
+    /// The oldest step is read without the admission predicate, so that a
+    /// deployment which closed its own admission still reaches its deadline. If
+    /// that step has not expired yet it is not work, and the read is repeated
+    /// among the deployments that are still admitting.
+    // ADR 0011 decision 4: a failed deployment stops itself, not the host.
     pub fn next_qualified_initialize_or_expire(
         &self,
         session: &CoordinatorSession,
@@ -363,15 +390,29 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
-        let result = match next_plan(&tx, session)? {
+        let result = match next_plan(&tx, session, false)? {
             None => QualifiedInitializePoll::Idle,
             Some((plan, effective)) if now_ms >= plan.deadline_ms => {
                 expiry::expire_in_transaction(&tx, session, &plan, &effective, "planned", now_ms)?;
                 QualifiedInitializePoll::ExpiredUnarmed
             }
-            Some((plan, effective)) => {
+            Some((plan, effective)) if admitting(&tx, &plan)? => {
                 QualifiedInitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
             }
+            // SPEC §6.1 FAILED: admission closed. This step is neither work nor
+            // expired, and it must not starve any other deployment.
+            Some(_) => match next_plan(&tx, session, true)? {
+                None => QualifiedInitializePoll::Idle,
+                Some((plan, effective)) if now_ms >= plan.deadline_ms => {
+                    expiry::expire_in_transaction(
+                        &tx, session, &plan, &effective, "planned", now_ms,
+                    )?;
+                    QualifiedInitializePoll::ExpiredUnarmed
+                }
+                Some((plan, effective)) => {
+                    QualifiedInitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
+                }
+            },
         };
         tx.commit()?;
         Ok(result)

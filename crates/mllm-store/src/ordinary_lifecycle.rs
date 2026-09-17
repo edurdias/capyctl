@@ -248,8 +248,25 @@ fn current(
     p: &Plan,
     completed: bool,
 ) -> Result<(), LifecycleError> {
+    current_admitted(tx, s, p, completed, true)
+}
+
+/// The fenced check that a plan is still this session's current work.
+///
+/// `admitted` is whether the deployment must still be admitting. Every path that
+/// carries authority requires it. Only the deadline release of a step that never
+/// armed passes `false`, because a deployment that closed its own admission must
+/// still reach its deadline instead of holding a reservation for ever.
+// ADR 0011 decision 4: a deployment that fails closes its own admission.
+fn current_admitted(
+    tx: &Transaction<'_>,
+    s: &CoordinatorSession,
+    p: &Plan,
+    completed: bool,
+    admitted: bool,
+) -> Result<(), LifecycleError> {
     check_session(tx, s)?;
-    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='ready' AND suspended=0 AND admission_enabled=1)", params![p.deployment_id,p.revision,p.generation], |r|r.get(0))?;
+    let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='ready' AND suspended=0 AND (?4=0 OR admission_enabled=1))", params![p.deployment_id,p.revision,p.generation,admitted], |r|r.get(0))?;
     let claims: bool = tx.query_row("SELECT COUNT(*)=1 AND COALESCE(SUM(deployment_id=?2 AND revision=?3 AND generation=?4),0)=1 FROM lifecycle_claims WHERE operation_id=?1",params![p.operation_id,p.deployment_id,p.revision,p.generation],|r|r.get(0))?;
     if !valid || p.session_id != s.id() || (!completed && !claims) {
         return Err(LifecycleError::Stale);

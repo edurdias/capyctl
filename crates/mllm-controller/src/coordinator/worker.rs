@@ -1579,6 +1579,12 @@ async fn run(
                 // admission, not the host's. Every other deployment keeps being
                 // served; only this one is no longer admitted until an operator
                 // or a later retry reopens it.
+                //
+                // The worker is admitting Initialize again before that closure is
+                // written, not after. An observer that watches for the closed
+                // deployment would otherwise see it closed and still be refused a
+                // start for a healthy one, which is the blast radius this removes.
+                shared.set_initializing(true);
                 let deployment_id = work.fence().deployment_id.clone();
                 if let Err(error) = shared
                     .with_owner(move |owner| {
@@ -1593,7 +1599,6 @@ async fn run(
                         "{outcome:?}; failed to close the deployment's own admission: {error}"
                     ));
                 }
-                shared.set_initializing(true);
                 shared.changed.notify_waiters();
             }
         }
