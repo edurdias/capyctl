@@ -1,30 +1,19 @@
-//! Opt-in deterministic allocation state for the persisted qualification path.
+//! Deterministic lifecycle state for the Fake engine: persisted effects,
+//! cleanup and parked status.
 use crate::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
-use mllm_domain::completion::{
-    EffectObservation, Milestone, ObservationTerminal, ProcessIdentity, ResponseObservation,
-    SecurityControlObservation, SecurityEndpoint,
-};
+use mllm_domain::completion::{EffectObservation, Milestone, ProcessIdentity};
 
 #[derive(Clone, Copy, Debug)]
-pub enum QualificationFault {
+pub enum FakeFault {
     WrongProbeOutput,
     LostProbeReply,
     FailedProbe,
     MissingProbeFinish,
-    StreamMissingDone,
-    StreamAfterFinish,
-    CrossMarkerOutput,
-    UnauthorizedAdminExec,
-    UnauthorizedInferenceExec,
-    UnauthorizedHealthExec,
-    LostSecurityInferenceReply,
-    StreamDuplicateField,
-    StreamOverflow,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct QualificationState {
-    pub(super) fault: Option<QualificationFault>,
+pub(super) struct LifecycleState {
+    pub(super) fault: Option<FakeFault>,
     binding: Option<(String, String)>,
     deployment: Option<String>,
     members: Vec<ProcessIdentity>,
@@ -33,19 +22,12 @@ pub(super) struct QualificationState {
     cache: bool,
     quiesced: bool,
     unknown_work: bool,
-    runtime_credential: Option<Credential>,
-    admin_credential: Option<Credential>,
     work_sequence: u64,
     request_attempts: u64,
     control_attempts: u64,
     alive: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Credential {
-    Runtime,
-    Admin,
-}
-impl QualificationState {
+impl LifecycleState {
     pub(super) fn cleanup(
         &mut self,
         binding: &str,
@@ -107,7 +89,7 @@ impl QualificationState {
             incarnation: incarnation.into(),
             identities: actual,
             observed_at_ms,
-            receipt: "qualification-fake-v1:verified-api-and-worker-gone".into(),
+            receipt: "fake-lifecycle-v1:verified-api-and-worker-gone".into(),
         })
     }
     pub(super) fn activity(&self) -> (u64, u64, u64) {
@@ -116,141 +98,6 @@ impl QualificationState {
             self.control_attempts,
             self.work_sequence,
         )
-    }
-    fn authorize(
-        &self,
-        endpoint: SecurityEndpoint,
-        credential: Option<Credential>,
-    ) -> Result<(), u16> {
-        if matches!(
-            (self.fault, endpoint),
-            (
-                Some(QualificationFault::UnauthorizedAdminExec),
-                SecurityEndpoint::AdminControl
-            ) | (
-                Some(QualificationFault::UnauthorizedInferenceExec),
-                SecurityEndpoint::Inference
-            ) | (
-                Some(QualificationFault::UnauthorizedHealthExec),
-                SecurityEndpoint::HealthGeneration
-            ) | (
-                Some(QualificationFault::LostSecurityInferenceReply),
-                SecurityEndpoint::Inference
-            )
-        ) {
-            return Ok(());
-        }
-        if credential.is_none() {
-            return Err(401);
-        }
-        match endpoint {
-            SecurityEndpoint::AdminControl if credential == self.admin_credential => {
-                Ok(())
-            }
-            SecurityEndpoint::Inference if credential == self.runtime_credential => Ok(()),
-            _ => Err(403),
-        }
-    }
-    fn negative_check(
-        &mut self,
-        endpoint: SecurityEndpoint,
-    ) -> (ObservationTerminal, ResponseObservation) {
-        if endpoint == SecurityEndpoint::AdminControl {
-            self.control_attempts += 1;
-        } else {
-            self.request_attempts += 1;
-        }
-        let before = self.work_sequence;
-        let presented = match endpoint {
-            SecurityEndpoint::Inference => None,
-            _ => self.runtime_credential,
-        };
-        let status = match self.authorize(endpoint, presented) {
-            Err(status) => status,
-            Ok(()) => {
-                self.work_sequence += 1;
-                match endpoint {
-                    SecurityEndpoint::AdminControl => {
-                        self.allocations = false;
-                        self.weights = false;
-                        self.cache = false;
-                    }
-                    _ => {
-                        self.unknown_work = true;
-                    }
-                }
-                200
-            }
-        };
-        let no_work = before == self.work_sequence && !self.unknown_work;
-        let status = if matches!(
-            (self.fault, endpoint),
-            (
-                Some(QualificationFault::LostSecurityInferenceReply),
-                SecurityEndpoint::Inference
-            )
-        ) {
-            0
-        } else {
-            status
-        };
-        (
-            if status >= 400 && no_work {
-                ObservationTerminal::RejectedWithoutWork
-            } else {
-                ObservationTerminal::Uncertain
-            },
-            ResponseObservation::SecurityRejection {
-                endpoint,
-                status,
-                no_work,
-                separate_credentials: self.runtime_credential.is_some()
-                    && self.admin_credential.is_some()
-                    && self.runtime_credential != self.admin_credential,
-            },
-        )
-    }
-    pub(super) fn security_control(
-        &mut self,
-        command: &RuntimeCommand,
-    ) -> Result<SecurityControlObservation, RuntimeError> {
-        let identities = self.members(&command.context)?;
-        if command.action != RuntimeAction::Park
-            || command.context.completion_target.is_some()
-            || command.context.grant_id.is_none()
-        {
-            return Err(RuntimeError::Unsupported);
-        }
-        let (terminal, response) = self.negative_check(SecurityEndpoint::AdminControl);
-        Ok(SecurityControlObservation {
-            effect: EffectObservation {
-                token: command.context.token.clone(),
-                binding_id: command.context.binding_id.clone(),
-                incarnation: command.context.incarnation.clone(),
-                identities,
-                observed_at_ms: command.context.issued_at_ms,
-                receipt: format!(
-                    "qualification-fake-v1:negative-admin:{}",
-                    command.context.token.step_id
-                ),
-                facts: vec![],
-            },
-            terminal,
-            response,
-        })
-    }
-    pub(super) fn security_request(
-        &mut self,
-        context: &mllm_domain::completion::StepExecutionContext,
-        endpoint: SecurityEndpoint,
-        body: &serde_json::Value,
-    ) -> Result<(ObservationTerminal, ResponseObservation), RuntimeError> {
-        self.members(context)?;
-        let expected = serde_json::json!({"model":format!("candidate-{}",context.token.deployment_id),"messages":[{"role":"user","content":"Repeat exactly: MLLM_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
-        if endpoint == SecurityEndpoint::AdminControl || body != &expected {
-            return Err(RuntimeError::Unsupported);
-        }
-        Ok(self.negative_check(endpoint))
     }
     pub(super) fn members(
         &self,
@@ -287,7 +134,7 @@ impl QualificationState {
                 incarnation: c.incarnation.clone(),
                 identities,
                 observed_at_ms: c.issued_at_ms,
-                receipt: format!("qualification-fake-v1:parked-status:{}", c.token.step_id),
+                receipt: format!("fake-lifecycle-v1:parked-status:{}", c.token.step_id),
                 allocations: self.allocations,
                 weights: self.weights,
                 cache: self.cache,
@@ -325,26 +172,24 @@ impl QualificationState {
         self.quiesced = false;
         self.work_sequence += 1;
         match self.fault {
-            Some(QualificationFault::LostProbeReply) => {
+            Some(FakeFault::LostProbeReply) => {
                 self.unknown_work = true;
                 return Err(crate::traits::AdapterError::Uncertain(
-                    "qualification probe reply lost".into(),
+                    "lifecycle probe reply lost".into(),
                 ));
             }
-            Some(QualificationFault::FailedProbe) => {
+            Some(FakeFault::FailedProbe) => {
                 return Err(crate::traits::AdapterError::PolicyDenied);
             }
             _ => {}
         }
-        let content = if matches!(self.fault, Some(QualificationFault::WrongProbeOutput)) {
+        let content = if matches!(self.fault, Some(FakeFault::WrongProbeOutput)) {
             "wrong output"
-        } else if matches!(self.fault, Some(QualificationFault::CrossMarkerOutput)) {
-            "MLLM_ALPHA_71 MLLM_BETA_29"
         } else {
             content
         };
         let mut response = serde_json::json!({"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}]});
-        if matches!(self.fault, Some(QualificationFault::MissingProbeFinish)) {
+        if matches!(self.fault, Some(FakeFault::MissingProbeFinish)) {
             response["choices"][0]
                 .as_object_mut()
                 .unwrap()
@@ -368,29 +213,11 @@ impl QualificationState {
             .unwrap();
         let model = &response["model"];
         let (first, last) = content.split_at(content.len() / 2);
-        if matches!(self.fault, Some(QualificationFault::StreamOverflow)) {
-            for _ in 0..4097 {
-                on_chunk(serde_json::json!({"model":model,"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}).to_string());
-            }
-        }
         for text in [first, last] {
             let raw=serde_json::json!({"model":model,"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}).to_string();
-            on_chunk(
-                if matches!(self.fault, Some(QualificationFault::StreamDuplicateField)) {
-                    raw.replacen("\"model\":", "\"model\":\"wrong\",\"model\":", 1)
-                } else {
-                    raw
-                },
-            );
+            on_chunk(raw);
         }
         on_chunk(serde_json::json!({"model":model,"choices":[{"index":0,"delta":{},"finish_reason":response["choices"][0]["finish_reason"]}]}).to_string());
-        if matches!(self.fault, Some(QualificationFault::StreamAfterFinish)) {
-            on_chunk(serde_json::json!({"model":model,"choices":[{"index":0,"delta":{"content":"contamination"},"finish_reason":null}]}).to_string());
-        }
-        if matches!(self.fault, Some(QualificationFault::StreamMissingDone)) {
-            self.unknown_work = true;
-            return Ok(crate::traits::StreamEnded::BackendClosed);
-        }
         Ok(crate::traits::StreamEnded::Completed)
     }
     #[cfg(test)]
@@ -408,15 +235,14 @@ impl QualificationState {
     ) -> Result<EffectObservation, RuntimeError> {
         let c = &command.context;
         // Ordinary cold initialization explicitly includes a model-usability
-        // probe. Candidate child effects retain their separate probe protocol.
+        // probe. Retained child effects keep their separate probe protocol.
         // This dispatch shape recognizes scope; catalog authority stays in Store.
         //
-        // Scope is read from what the command is, not from how its qualification
-        // id is spelled. A candidate child effect acts on identities it retains
-        // and names no completion target; only an ordinary cold Initialize owns
-        // the launch and is asked to land on Ready. Requiring a `qualified:` id
-        // as well excluded every restart-only deployment, which carries a
-        // declared identity and is still an ordinary initialize.
+        // Scope is read from what the command is, not from any identity string.
+        // A retained child effect acts on identities it retains and names no
+        // completion target; only an ordinary cold Initialize owns the launch
+        // and is asked to land on Ready. A restart-only deployment still
+        // carries a declared identity and is still an ordinary initialize.
         let ordinary = command.action == RuntimeAction::Initialize
             && matches!(
                 c.identities,
@@ -460,13 +286,13 @@ impl QualificationState {
                     ProcessIdentity {
                         role: "api".into(),
                         pid: 71,
-                        boot_id: "qualification-fake-boot".into(),
+                        boot_id: "fake-lifecycle-boot".into(),
                         start_ticks: 100,
                     },
                     ProcessIdentity {
                         role: "worker-0".into(),
                         pid: 72,
-                        boot_id: "qualification-fake-boot".into(),
+                        boot_id: "fake-lifecycle-boot".into(),
                         start_ticks: 101,
                     },
                 ];
@@ -474,8 +300,6 @@ impl QualificationState {
                 self.alive = true;
                 self.weights = true;
                 self.cache = true;
-                self.runtime_credential = Some(Credential::Runtime);
-                self.admin_credential = Some(Credential::Admin);
                 vec![
                     Milestone::AllocationsRestored,
                     Milestone::WeightsUsable,
@@ -539,7 +363,7 @@ impl QualificationState {
             identities: self.members.clone(),
             observed_at_ms,
             receipt: format!(
-                "qualification-fake-v1:{:?}:{}",
+                "fake-lifecycle-v1:{:?}:{}",
                 command.action, c.token.step_id
             ),
             facts,
@@ -579,7 +403,7 @@ mod tests {
         }
     }
     #[test]
-    fn qualified_initialize_proves_ready_with_real_fake_probe() {
+    fn ordinary_initialize_proves_ready_with_real_fake_probe() {
         use mllm_domain::resources::{Allocation, PhaseFootprint, ResourcePhase};
         let mut c = command(RuntimeAction::Initialize, "ordinary");
         c.context.completion_target = Some(PhaseFootprint {
@@ -591,7 +415,7 @@ mod tests {
             }],
             devices: vec![],
         });
-        let mut state = QualificationState::default();
+        let mut state = LifecycleState::default();
         let result = state.execute(&c).unwrap();
         assert_eq!(
             result.facts,
@@ -605,12 +429,12 @@ mod tests {
         assert_eq!(state.activity(), (1, 1, 1));
         assert!(state.execute(&c).is_err());
         for fault in [
-            QualificationFault::WrongProbeOutput,
-            QualificationFault::LostProbeReply,
-            QualificationFault::FailedProbe,
-            QualificationFault::MissingProbeFinish,
+            FakeFault::WrongProbeOutput,
+            FakeFault::LostProbeReply,
+            FakeFault::FailedProbe,
+            FakeFault::MissingProbeFinish,
         ] {
-            let mut state = QualificationState {
+            let mut state = LifecycleState {
                 fault: Some(fault),
                 ..Default::default()
             };
@@ -626,7 +450,7 @@ mod tests {
     #[test]
     fn a_child_effect_is_not_an_ordinary_initialize() {
         let c = command(RuntimeAction::Initialize, "child");
-        let mut state = QualificationState::default();
+        let mut state = LifecycleState::default();
         let result = state.execute(&c).unwrap();
         assert!(
             !result.facts.contains(&Milestone::ModelUsable),
@@ -643,17 +467,17 @@ mod tests {
         };
         let now = Arc::new(AtomicI64::new(1300));
         let clock = now.clone();
-        let engine = FakeEngine::for_qualification_with_clock(Arc::new(move || {
+        let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || {
             Ok(clock.load(Ordering::SeqCst))
         }));
         let c = command(RuntimeAction::Initialize, "initialize");
         let initialized = engine.execute_persisted(&c).await.unwrap();
-        let activity=engine.qualification_activity().unwrap();
-        assert!(engine.qualification_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).is_err(),"inspection must not terminate live Fake members");
-        assert_eq!(engine.qualification_activity().unwrap(),activity);
+        let activity=engine.lifecycle_activity().unwrap();
+        assert!(engine.lifecycle_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).is_err(),"inspection must not terminate live Fake members");
+        assert_eq!(engine.lifecycle_activity().unwrap(),activity);
         now.store(1700, Ordering::SeqCst);
         let gone = engine
-            .qualification_cleanup_observed(
+            .lifecycle_cleanup_observed(
                 &initialized.binding_id,
                 &initialized.incarnation,
                 &initialized.identities,
@@ -662,11 +486,11 @@ mod tests {
         assert_eq!(gone.observed_at_ms, 1700);
         assert_eq!(gone.identities, initialized.identities);
         now.store(1800,Ordering::SeqCst);
-        let inspected=engine.qualification_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).unwrap();
+        let inspected=engine.lifecycle_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).unwrap();
         assert_eq!(inspected.observed_at_ms,1800);
         assert_eq!(inspected.identities,initialized.identities);
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let failed = FakeEngine::for_qualification_with_clock(Arc::new(move || {
+        let failed = FakeEngine::with_lifecycle_clock(Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(1300)
             } else {
@@ -675,7 +499,7 @@ mod tests {
         }));
         let identities = failed.execute_persisted(&c).await.unwrap().identities;
         assert!(failed
-            .qualification_cleanup_observed(
+            .lifecycle_cleanup_observed(
                 &c.context.binding_id,
                 &c.context.incarnation,
                 &identities
@@ -684,7 +508,7 @@ mod tests {
         // Failure to timestamp is after the control: read-only inspection sees
         // those exact members gone without another terminate operation.
         assert!(failed
-            .qualification_cleanup(
+            .lifecycle_cleanup(
                 &c.context.binding_id,
                 &c.context.incarnation,
                 &identities,
@@ -699,20 +523,20 @@ mod tests {
         use crate::{fake::FakeEngine, traits::EngineAdapter};
         use std::sync::Arc;
         let c = command(RuntimeAction::Initialize, "initialize");
-        let engine = FakeEngine::for_qualification_with_clock(Arc::new(|| Ok(1300)));
+        let engine = FakeEngine::with_lifecycle_clock(Arc::new(|| Ok(1300)));
         let result = engine.execute_persisted(&c).await.unwrap();
         assert_eq!(result.observed_at_ms, 1300);
         assert_ne!(result.observed_at_ms, c.context.issued_at_ms);
         assert!(!result.identities.is_empty());
         for now in [1199, 400000] {
-            let engine = FakeEngine::for_qualification_with_clock(Arc::new(move || Ok(now)));
+            let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || Ok(now)));
             assert!(matches!(
                 engine.execute_persisted(&c).await,
                 Err(RuntimeError::Uncertain(_))
             ));
             assert!(engine.execute_persisted(&c).await.is_err());
         }
-        let engine = FakeEngine::for_qualification_with_clock(Arc::new(|| {
+        let engine = FakeEngine::with_lifecycle_clock(Arc::new(|| {
             Err(RuntimeError::Uncertain("clock unavailable".into()))
         }));
         assert!(matches!(
@@ -723,7 +547,7 @@ mod tests {
 
     #[test]
     fn persisted_fake_restore_does_not_reload_invalidate_or_probe() {
-        let mut state = QualificationState::default();
+        let mut state = LifecycleState::default();
         let initialized = state
             .execute(&command(RuntimeAction::Initialize, "initialize"))
             .unwrap();

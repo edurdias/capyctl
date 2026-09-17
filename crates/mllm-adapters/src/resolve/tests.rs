@@ -24,7 +24,7 @@ fn every_family_maps_to_its_own_spec() {
     assert_eq!(fake().engine(), Engine::Fake);
 }
 
-/// A profile's identity — build fingerprint, reserved-flag policy, qualification
+/// A profile's identity — build fingerprint, reserved-flag policy, verification
 /// evidence — is only meaningful for the engine it names. Resolving a spec for a
 /// different family would attach that identity to the wrong control contract.
 #[test]

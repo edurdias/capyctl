@@ -33,7 +33,7 @@ pub enum AdapterSpec {
         model_id: String,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch it
-    /// was qualified against and the observer that supplies fresh evidence.
+    /// was verified against and the observer that supplies fresh evidence.
     Sglang {
         frozen: Box<NativeLaunch>,
         inference: String,
@@ -68,7 +68,7 @@ impl AdapterSpec {
 ///
 /// `declared` is the family recorded on the profile. A spec for a different family
 /// is rejected rather than quietly resolved, because the profile's identity — its
-/// build fingerprint, reserved-flag policy and qualification evidence — is only
+/// build fingerprint, reserved-flag policy and verification evidence — is only
 /// meaningful for the engine it names.
 pub fn resolve(
     declared: Engine,
@@ -99,7 +99,7 @@ pub fn resolve(
         } => Box::new(SglangAdapter::from_frozen(
             &frozen, inference, admin, observer,
         )?),
-        AdapterSpec::Fake { clock } => Box::new(FakeEngine::for_qualification_with_clock(clock)),
+        AdapterSpec::Fake { clock } => Box::new(FakeEngine::with_lifecycle_clock(clock)),
     })
 }
 

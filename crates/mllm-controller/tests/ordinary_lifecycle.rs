@@ -33,7 +33,7 @@ fn collect_cleanup(
         return Err(LifecycleError::Invalid);
     }
     engine
-        .qualification_cleanup(
+        .lifecycle_cleanup(
             &context.binding_id,
             &context.incarnation,
             &context.identities,
@@ -129,7 +129,7 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
         .store
         .qualified_initialize_execution(&f.session, &accepted.step_id)
         .unwrap();
-    let observation = FakeEngine::for_qualification()
+    let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,
             context: execution,
@@ -292,7 +292,7 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
             .unwrap(),
         ArmResult::AlreadyRecorded
     );
-    let observation = FakeEngine::for_qualification()
+    let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,
             context,
@@ -768,7 +768,7 @@ async fn started(
         .store
         .qualified_initialize_execution(&f.session, &start.step_id)
         .unwrap();
-    let fake = FakeEngine::for_qualification();
+    let fake = FakeEngine::with_lifecycle();
     let observation = fake
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,
@@ -953,7 +953,7 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
         .store
         .qualified_initialize_execution(&f.session, &fresh.step_id)
         .unwrap();
-    let observation = FakeEngine::for_qualification()
+    let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,
             context,
@@ -1240,7 +1240,7 @@ async fn ordinary_cleanup_unproven_lease_blocks_all_release_and_other_deployment
         .store
         .qualified_initialize_execution(&f.session, &start.step_id)
         .unwrap();
-    let observation = FakeEngine::for_qualification()
+    let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,
             context,
@@ -1745,7 +1745,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
             ),
         )
         .unwrap();
-    let fake = FakeEngine::for_qualification();
+    let fake = FakeEngine::with_lifecycle();
     let observation = fake
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,

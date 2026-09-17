@@ -244,39 +244,3 @@ pub struct ParkedStatusObservation {
     pub activity_before: (u64, u64, u64),
     pub activity_after: (u64, u64, u64),
 }
-
-/// How an observed control attempt ended. It records what the observer saw and
-/// never authorises a state change on its own.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ObservationTerminal {
-    Completed,
-    RejectedWithoutWork,
-    FailedTerminal,
-    Uncertain,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResponseObservation {
-    SecurityRejection {
-        endpoint: SecurityEndpoint,
-        status: u16,
-        no_work: bool,
-        separate_credentials: bool,
-    },
-    NoResponse,
-}
-
-/// Which engine surface an observation was taken against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SecurityEndpoint {
-    AdminControl,
-    Inference,
-    HealthGeneration,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SecurityControlObservation {
-    pub effect: EffectObservation,
-    pub terminal: ObservationTerminal,
-    pub response: ResponseObservation,
-}

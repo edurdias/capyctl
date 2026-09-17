@@ -53,7 +53,7 @@ struct Gate {
 impl Gate {
     fn new(panic: bool) -> Arc<Self> {
         Arc::new(Self {
-            engine: FakeEngine::for_qualification(),
+            engine: FakeEngine::with_lifecycle(),
             calls: Mutex::new(vec![]),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
@@ -176,7 +176,7 @@ fn test_driver(gate: Arc<Gate>) -> Arc<Driver> {
             let gate = cleanup.clone();
             Box::pin(async move {
                 gate.engine
-                    .qualification_cleanup(
+                    .lifecycle_cleanup(
                         &context.binding_id,
                         &context.incarnation,
                         &context.identities,
@@ -1407,7 +1407,7 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
             .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, now())
             .unwrap()
     });
-    let engine = FakeEngine::for_qualification_with_clock(Arc::new(move || Ok(now())));
+    let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || Ok(now())));
     let observation = engine
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,

@@ -17,11 +17,11 @@ use crate::vllm::http::{EngineHttp, HttpError};
 
 /// Bytes the adapter reports as retained after a level-2 park (buffers the
 /// engine keeps resident). F1: the live value is replaced by observed
-/// engine telemetry during Spark qualification (design §8 step 4).
+/// engine telemetry during Spark hardware verification (design §8 step 4).
 pub const LEVEL2_RETAINED_BYTES: i64 = 256;
 
 /// Deep-park level-2 residue mapping (documented; simulator-tier constant
-/// until live qualification measures real retention).
+/// until live hardware verification measures real retention).
 pub const fn level2_residue() -> i64 {
     LEVEL2_RETAINED_BYTES
 }

@@ -1,5 +1,5 @@
 //! Evidence observations for individual persisted controls. This adapter never
-//! grants permission, qualifies a recipe, commits a completion, or opens dispatch.
+//! grants permission, verifies a recipe, commits a completion, or opens dispatch.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -22,7 +22,7 @@ use super::{
 use crate::traits::*;
 
 /// Fresh facts from a trusted local collector, not an engine HTTP response.
-/// `quiesced` requires a qualified all-work barrier or confirmed terminal results
+/// `quiesced` requires a verified all-work barrier or confirmed terminal results
 /// for every registered request. Missing metrics must set `unknown_work`.
 #[derive(Clone, Debug)]
 pub struct SglangRuntimeObservation {
@@ -81,8 +81,8 @@ pub struct SglangAdapter {
 }
 
 impl SglangAdapter {
-    /// Construction validates a frozen shape; it is not candidate permission or
-    /// qualification. Only the coordinator may supply resolved credentials and
+    /// Construction validates a frozen shape; it is not runtime permission or
+    /// verification. Only the coordinator may supply resolved credentials and
     /// send the current persisted child command through `execute_persisted`.
     pub fn from_frozen(
         frozen: &NativeLaunch,

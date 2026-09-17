@@ -571,7 +571,7 @@ impl OwnedCoordinator {
                     ));
                 }
                 let clock = observation_clock.clone();
-                let engine = Arc::new(FakeEngine::for_qualification_with_clock(Arc::new(
+                let engine = Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(
                     move || {
                         clock().map_err(|_| {
                             mllm_adapters::traits::RuntimeError::Uncertain(
@@ -587,7 +587,7 @@ impl OwnedCoordinator {
                         let engine = cleanup.clone();
                         Box::pin(async move {
                             engine
-                                .qualification_cleanup_observed(
+                                .lifecycle_cleanup_observed(
                                     &context.binding_id,
                                     &context.incarnation,
                                     &context.identities,

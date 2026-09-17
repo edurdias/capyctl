@@ -47,9 +47,9 @@ pub struct MemberRef {
 pub struct EngineState {
     pub phase: Phase,
     pub retained_bytes: i64,
-    /// Engine build fingerprint captured at qualification/launch; adapters
-    /// that cannot observe it report `None` (F1 design §3: parked-state
-    /// observability contract).
+    /// Engine build fingerprint captured at launch; adapters that cannot
+    /// observe it report `None` (F1 design §3: parked-state observability
+    /// contract).
     pub build_fingerprint: Option<String>,
 }
 

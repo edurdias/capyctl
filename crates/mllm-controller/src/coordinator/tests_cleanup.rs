@@ -47,7 +47,7 @@ impl CleanupGate {
                     let mut evidence = gate
                         .init
                         .engine
-                        .qualification_cleanup(
+                        .lifecycle_cleanup(
                             &context.binding_id,
                             &context.incarnation,
                             &context.identities,
@@ -674,7 +674,7 @@ async fn stop_claim_handoff_waits_for_running_initialize_exit() {
                         calls.fetch_add(1, Ordering::SeqCst);
                         driver
                             .engine
-                            .qualification_cleanup(
+                            .lifecycle_cleanup(
                                 &context.binding_id,
                                 &context.incarnation,
                                 &context.identities,

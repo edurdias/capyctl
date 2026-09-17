@@ -1,5 +1,5 @@
 //! Shared, bounded text-chat transport. Terminal success is not lifecycle or
-//! qualification evidence; cancellation and partial output never prove idle.
+//! readiness evidence; cancellation and partial output never prove idle.
 use crate::traits::{AdapterError, ChatSink, DeliveryFailed, StreamEnded};
 use futures::StreamExt;
 use serde_json::{json, Value};

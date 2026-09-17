@@ -52,8 +52,8 @@ struct Knobs {
 /// the same engine share the adapter but hold independent member states —
 /// A parked must not make B unready).
 pub struct FakeEngine {
-    qualification_clock: Option<Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>>,
-    qualification: Mutex<Option<super::qualification::QualificationState>>,
+    lifecycle_clock: Option<Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>>,
+    lifecycle: Mutex<Option<super::lifecycle::LifecycleState>>,
     knobs: Mutex<Knobs>,
     states: Mutex<HashMap<String, MemberState>>,
     started_at: std::time::Instant,
@@ -68,8 +68,8 @@ impl std::fmt::Debug for FakeEngine {
 impl FakeEngine {
     pub fn new() -> Self {
         Self {
-            qualification_clock: None,
-            qualification: Mutex::new(None),
+            lifecycle_clock: None,
+            lifecycle: Mutex::new(None),
             knobs: Mutex::new(Knobs {
                 policy: ParkPolicy::default(),
                 startup_delay: None,
@@ -81,38 +81,37 @@ impl FakeEngine {
         }
     }
 
-    /// Opt in to the separate persisted qualification state machine.
-    pub fn for_qualification() -> Self {
+    /// Opt in to the separate persisted lifecycle state machine.
+    pub fn with_lifecycle() -> Self {
         let engine = Self::new();
-        *engine.qualification.lock().unwrap() =
-            Some(super::qualification::QualificationState::default());
+        *engine.lifecycle.lock().unwrap() = Some(super::lifecycle::LifecycleState::default());
         engine
     }
 
     /// Service composition may timestamp actual Fake milestones using a trusted
     /// clock. The deterministic fixture constructor preserves arm-time samples.
-    pub fn for_qualification_with_clock(
+    pub fn with_lifecycle_clock(
         clock: Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>,
     ) -> Self {
-        let mut engine = Self::for_qualification();
-        engine.qualification_clock = Some(clock);
+        let mut engine = Self::with_lifecycle();
+        engine.lifecycle_clock = Some(clock);
         engine
     }
 
-    /// Fault injection for the opt-in qualification runtime.
-    pub fn with_qualification_fault(self, fault: super::QualificationFault) -> Self {
-        if let Some(state) = self.qualification.lock().unwrap().as_mut() {
+    /// Fault injection for the opt-in lifecycle runtime.
+    pub fn with_fault(self, fault: super::FakeFault) -> Self {
+        if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             state.fault = Some(fault);
         }
         self
     }
 
     /// Read-only collector check against actual opt-in Fake membership.
-    pub fn qualification_members(
+    pub fn lifecycle_members(
         &self,
         context: &mllm_domain::completion::StepExecutionContext,
     ) -> Result<Vec<mllm_domain::completion::ProcessIdentity>, RuntimeError> {
-        self.qualification
+        self.lifecycle
             .lock()
             .unwrap()
             .as_ref()
@@ -120,7 +119,7 @@ impl FakeEngine {
             .members(context)
     }
     /// Executes one authorized Fake cleanup or inspects already terminated owned members.
-    pub fn qualification_cleanup(
+    pub fn lifecycle_cleanup(
         &self,
         binding: &str,
         incarnation: &str,
@@ -128,7 +127,7 @@ impl FakeEngine {
         terminate: bool,
         observed_at_ms: i64,
     ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
-        self.qualification
+        self.lifecycle
             .lock()
             .unwrap()
             .as_mut()
@@ -137,46 +136,35 @@ impl FakeEngine {
     }
     /// Service-owned cleanup samples the configured clock at the actual gone
     /// observation boundary. A clock failure after control remains uncertain.
-    pub fn qualification_cleanup_observed(
+    pub fn lifecycle_cleanup_observed(
         &self,
         binding: &str,
         incarnation: &str,
         identities: &[mllm_domain::completion::ProcessIdentity],
     ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
-        self.qualification_cleanup_mode_observed(binding, incarnation, identities, true)
+        self.lifecycle_cleanup_mode_observed(binding, incarnation, identities, true)
     }
     /// Preserve the persisted cleanup mode and sample time after the gone check.
-    pub fn qualification_cleanup_mode_observed(
+    pub fn lifecycle_cleanup_mode_observed(
         &self, binding: &str, incarnation: &str,
         identities: &[mllm_domain::completion::ProcessIdentity], terminate: bool,
     ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
         let clock = self
-            .qualification_clock
+            .lifecycle_clock
             .as_deref()
             .ok_or(RuntimeError::Unsupported)?;
-        self.qualification
+        self.lifecycle
             .lock()
             .unwrap()
             .as_mut()
             .ok_or(RuntimeError::Unsupported)?
             .cleanup_with_clock(binding, incarnation, identities, terminate, clock)
     }
-    pub fn qualification_security_control(
-        &self,
-        command: &RuntimeCommand,
-    ) -> Result<mllm_domain::completion::SecurityControlObservation, RuntimeError> {
-        self.qualification
-            .lock()
-            .unwrap()
-            .as_mut()
-            .ok_or(RuntimeError::Unsupported)?
-            .security_control(command)
-    }
-    pub fn qualification_parked_status(
+    pub fn parked_status(
         &self,
         context: &mllm_domain::completion::StepExecutionContext,
     ) -> Result<mllm_domain::completion::ParkedStatusObservation, RuntimeError> {
-        self.qualification
+        self.lifecycle
             .lock()
             .unwrap()
             .as_ref()
@@ -184,33 +172,14 @@ impl FakeEngine {
             .parked_status(context)
     }
     /// Read-only opt-in Fake activity: inference sends, control sends, work started.
-    pub fn qualification_activity(&self) -> Result<(u64, u64, u64), RuntimeError> {
+    pub fn lifecycle_activity(&self) -> Result<(u64, u64, u64), RuntimeError> {
         Ok(self
-            .qualification
+            .lifecycle
             .lock()
             .unwrap()
             .as_ref()
             .ok_or(RuntimeError::Unsupported)?
             .activity())
-    }
-    pub fn qualification_security_request(
-        &self,
-        context: &mllm_domain::completion::StepExecutionContext,
-        endpoint: mllm_domain::completion::SecurityEndpoint,
-        body: &serde_json::Value,
-    ) -> Result<
-        (
-            mllm_domain::completion::ObservationTerminal,
-            mllm_domain::completion::ResponseObservation,
-        ),
-        RuntimeError,
-    > {
-        self.qualification
-            .lock()
-            .unwrap()
-            .as_mut()
-            .ok_or(RuntimeError::Unsupported)?
-            .security_request(context, endpoint, body)
     }
 
     pub fn with_startup_delay(self, d: Duration) -> Self {
@@ -233,7 +202,7 @@ impl FakeEngine {
     }
 
     /// Mark subsequent parks ambiguous: the effect applies but the ack is
-    /// lost (qualification/ambiguity injection).
+    /// lost (ambiguity injection).
     pub fn set_ambiguous_park(&self) {
         self.knobs.lock().unwrap().ambiguous_park = true;
     }
@@ -301,12 +270,12 @@ impl EngineAdapter for FakeEngine {
         &self,
         command: &RuntimeCommand,
     ) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
-        self.qualification
+        self.lifecycle
             .lock()
             .unwrap()
             .as_mut()
             .ok_or(RuntimeError::Unsupported)?
-            .execute_with_clock(command, self.qualification_clock.as_deref())
+            .execute_with_clock(command, self.lifecycle_clock.as_deref())
     }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
         let st = self.member(member);
@@ -461,9 +430,9 @@ impl crate::traits::ChatForward for FakeEngine {
         body: &serde_json::Value,
         sink: &mut dyn crate::traits::ChatSink,
     ) -> Result<crate::traits::StreamEnded, AdapterError> {
-        // Qualification fault streams retain their explicit synchronous
+        // Lifecycle fault streams retain their explicit synchronous
         // collector contract. Never buffer that generator to fake async support.
-        if self.qualification.lock().unwrap().is_some() {
+        if self.lifecycle.lock().unwrap().is_some() {
             return Err(AdapterError::UnsupportedCapability);
         }
         let model = body["model"].as_str().unwrap_or("fake");
@@ -482,7 +451,7 @@ impl crate::traits::ChatForward for FakeEngine {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
-        if let Some(state) = self.qualification.lock().unwrap().as_mut() {
+        if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             return state.forward(body);
         }
         let model = body["model"].as_str().unwrap_or("fake").to_string();
@@ -498,7 +467,7 @@ impl crate::traits::ChatForward for FakeEngine {
         body: &serde_json::Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
     ) -> Result<crate::traits::StreamEnded, AdapterError> {
-        if let Some(state) = self.qualification.lock().unwrap().as_mut() {
+        if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             return state.stream(body, on_chunk);
         }
         let model = body["model"].as_str().unwrap_or("fake").to_string();
