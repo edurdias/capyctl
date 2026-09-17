@@ -1564,6 +1564,48 @@ async fn a_failed_start_is_retried_until_the_budget_is_spent() {
     w.shutdown().await.unwrap();
 }
 
+/// ADR 0011 decision 5, first row: a success is terminal and the attempts reset.
+/// A configuration that reached Ready must not carry the failures it took to get
+/// there into the next time it is started. T20
+#[tokio::test]
+async fn a_success_resets_the_attempt_budget() {
+    let (_dir, owner, fence, observations) = setup().await;
+    // The first two attempts fail before any driver exists; the third is healthy.
+    let gate = Gate::new(false);
+    gate.release.add_permits(1);
+    let driver = gate.clone();
+    let drives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            max_attempts: 3,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            if drives.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Err(CoordinatorError::Service("injected recipe failure".into()));
+            }
+            Ok(test_driver(driver.clone()))
+        }),
+    )
+    .unwrap();
+    let start = w.start(&fence, 10000).unwrap();
+    assert_eq!(
+        start.wait(Duration::from_secs(60)).await.unwrap(),
+        InitializeStatus::Completed
+    );
+    assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    let record = {
+        let o = owner.lock().unwrap();
+        o.store().attempts(&fence).unwrap()
+    };
+    assert_eq!(record, None, "the two failed attempts were not reset");
+    w.shutdown().await.unwrap();
+}
+
 /// Retrying an effect that may have landed can start a second engine while the
 /// first still holds memory. SPEC §13.2 and ADR 0011 decision 5: an uncertain
 /// attempt is not counted and not retried until the recorded processes are proven

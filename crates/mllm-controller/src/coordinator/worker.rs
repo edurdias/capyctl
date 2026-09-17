@@ -1104,7 +1104,26 @@ async fn run(
             .catch_unwind()
             .await;
         match result {
-            Ok(Ok(())) => shared.changed.notify_waiters(),
+            Ok(Ok(())) => {
+                // ADR 0011 decision 5: a success resets the budget. This
+                // configuration reached Ready, so the failures it took to get
+                // there must not count against the next time it is started.
+                let fence = work.fence().clone();
+                if let Err(error) = shared
+                    .with_owner(move |owner| {
+                        owner
+                            .store()
+                            .clear_attempts(&fence)
+                            .map_err(|error| CoordinatorError::Service(error.to_string()))
+                    })
+                    .await
+                {
+                    return WorkerStatus::Failed(format!(
+                        "reached Ready but the attempt budget was not reset: {error}"
+                    ));
+                }
+                shared.changed.notify_waiters();
+            }
             failure => {
                 shared.set_initializing(false);
                 let reason = match failure {

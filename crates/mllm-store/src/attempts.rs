@@ -37,6 +37,22 @@ impl crate::Store {
         self.attempts(fence)?.ok_or(StoreError::Conflict)
     }
 
+    /// Forget what this configuration has been charged.
+    ///
+    /// ADR 0011 decision 5: a success is terminal and resets the attempts. The
+    /// budget bounds how many times one configuration is attempted before it is
+    /// given up on, so a configuration that reached Ready must not carry its
+    /// earlier failures into the next time it is started. Only this configuration
+    /// is cleared; another generation's history is its own.
+    pub fn clear_attempts(&self, fence: &DeploymentFence) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM deployment_attempts
+             WHERE deployment_id=?1 AND revision=?2 AND generation=?3",
+            params![fence.deployment_id, fence.revision, fence.generation],
+        )?;
+        Ok(())
+    }
+
     /// What has been recorded against this configuration, if anything.
     pub fn attempts(&self, fence: &DeploymentFence) -> Result<Option<AttemptRecord>, StoreError> {
         self.conn
@@ -87,6 +103,34 @@ mod tests {
         let second = store.record_attempt(&fence(1), 2_500).unwrap();
         assert_eq!(second.attempts, 2);
         assert_eq!(second.last_attempt_ms, 2_500);
+    }
+
+    /// ADR 0011 decision 5: a success is terminal and resets the attempts, so the
+    /// next start of this configuration has its whole budget again. Another
+    /// generation's count is untouched.
+    #[test]
+    fn a_success_clears_only_its_own_configuration() {
+        let store = crate::Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute("INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('dep','dep','model','ready',1,0,1,1)", [])
+            .unwrap();
+        store.record_attempt(&fence(1), 1_000).unwrap();
+        store.record_attempt(&fence(1), 2_000).unwrap();
+        store.record_attempt(&fence(2), 2_500).unwrap();
+
+        store.clear_attempts(&fence(1)).unwrap();
+
+        assert!(store.attempts(&fence(1)).unwrap().is_none());
+        assert_eq!(store.attempts(&fence(2)).unwrap().unwrap().attempts, 1);
+        // Clearing what is already clear is not an error: the worker clears on
+        // every success, including the first.
+        store.clear_attempts(&fence(1)).unwrap();
+        assert_eq!(
+            store.record_attempt(&fence(1), 3_000).unwrap().attempts,
+            1,
+            "the budget starts again"
+        );
     }
 
     /// A new generation is a new configuration: it does not inherit the failures of
