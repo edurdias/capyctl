@@ -15,7 +15,6 @@ This index tracks that planning work; it is not an implementation or qualificati
 | [F2A2d coordinator integration](2026-09-12-f2a2d-coordinator-integration.md) | Written; integrated review corrected | Runtime/endpoint ownership, lifecycle steps, verified reductions, preparation, recovery, router cutover |
 | [F2A3 management/configuration](2026-09-12-f2a3-management-and-configuration.md) | Written; integrated review corrected | Strict effective schemas, authenticated API/CLI, revisions, snapshots/events, attachment |
 | [F2B SGLang](2026-09-12-f2b-sglang-adapter.md) | Written; integrated review corrected | Pinned adapter, readiness, qualified parking/restoration, cache/security contracts |
-| [F2C mixed-engine qualification](2026-09-12-f2c-mixed-engine-qualification.md) | Written; integrated review corrected | Numerical guardrails, selected recipes, repetitions, concurrency, warm switching and failures on host-a |
 
 The subdivision of F2A2 is for independently reviewable code and tests. It does not
 change the approved three-stage milestone or defer any required single-host capability.

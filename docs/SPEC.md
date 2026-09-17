@@ -11,7 +11,7 @@
 
 ## How to use this specification
 
-Read sections 1–5 for the product boundary, sections 6–13 for behavior and safety, and sections 14–19 for interfaces, configuration, and delivery. Section 20 defines acceptance tests. `AGENT_HANDOFF.md` is the companion entry point for a coding agent; this document is authoritative when summaries differ.
+Read sections 1–5 for the product boundary, sections 6–13 for behavior and safety, and sections 14–19 for interfaces, configuration, and delivery. Section 20 defines acceptance tests. `AGENTS.md` is the companion entry point for a coding agent; this document is authoritative when summaries differ.
 
 **MUST / MUST NOT** identify required behavior. **SHOULD** identifies a recommended default that may be changed with a documented architectural decision. Implementation language, internal libraries, numeric default tuning, and the illustrative YAML field names are baseline proposals, not claims of separately approved implementation details. The requirements and ownership boundaries are the established direction.
 
@@ -43,7 +43,7 @@ The project is a fresh, standalone open-source controller, not a fork of an exis
 | R05 | Use a lifecycle agent on every directly managed host; enable inference ingress only on API-facing members of an engine group. |
 | R06 | Deploy/start a model on an explicit host or host set through the control plane, without manually launching each engine. |
 | R07 | Distinguish attachment to an existing service from ownership of its lifecycle. |
-| R08 | Keep initialized engines parked where a complete release/restore path is qualified; otherwise use stop/start. |
+| R08 | Keep initialized engines parked where the declared residency tier can be delivered (ADR 0010, ADR 0011); otherwise use stop/start. |
 | R09 | Keep model parking and KV-cache offloading separate but coordinate their resource ownership and compatibility. |
 | R10 | Deployments request resources and select cache integrations; hosts enforce aggregate boundaries across all managed owners. |
 | R11 | Use action-first commands: `mllm <action> <resource>`. |
@@ -148,7 +148,7 @@ Host-name collisions do not authorize replacing an existing identity. Certificat
 
 A host may enroll before engines or checkpoints are installed. Track independently: enrolled identity, current connectivity, profile eligibility, and deployment readiness. Online does not mean eligible for every recipe.
 
-Host administrators register trusted runtime profiles, permitted devices and directories. The initial release does not silently install engines, execute discovered scripts, or download weights. `doctor host` performs approved non-destructive checks; destructive park/restore qualification is an explicit operation.
+Host administrators register trusted runtime profiles, permitted devices and directories. The initial release does not silently install engines, execute discovered scripts, or download weights. `doctor host` performs approved non-destructive checks; destructive park/restore verification is an explicit operation.
 
 The agent initiates its management connection; the server sends commands over that session. gRPC supports bidirectional streaming and TLS client authentication as protocol building blocks [S8, S9]. Retry with backoff; reconnect after reboot without creating another host record. First-time setup is server-first, but steady-state boot order is not constrained.
 
@@ -210,9 +210,9 @@ Any uncertain state -> RECONCILING -> verified state or FAILED
 
 **Host-backed park:** retain a weight backup in host RAM. Optional later policy with explicit accounting; never silently substituted for deep parking.
 
-**Restart-only:** stop and initialize again. This is first-class supported behavior, including backends without qualified memory-release APIs.
+**Restart-only:** stop and initialize again. This is first-class supported behavior, including backends without a verified memory-release API.
 
-A deployment declares exactly one residency — `restart_only`, `host_backed`, or `deep` — and there is no runtime ladder between them: the deployment states the tier it wants, and resolution either confirms the profile and host can deliver it or fails closed. `auto`, which formerly selected a tier at run time, is withdrawn (ADR 0010): a running SGLang engine cannot switch tiers, since its park flags are startup-only, and on the hardware in hand the choice is forced by the host's declared memory topology before launch anyway, so a runtime ladder would have nothing to choose between. `deep_required` is likewise withdrawn, because a declared `deep` residency already fails validation when deep parking is unavailable, by construction. `restart_only` prohibits sleep calls. Capability qualification does not override an operator's security restrictions. `host_backed` is refused at configuration time, not at first park, on a host domain declared to have device and host memory as one physical pool, since retaining a weight backup there would free nothing.
+A deployment declares exactly one residency — `restart_only`, `host_backed`, or `deep` — and there is no runtime ladder between them: the deployment states the tier it wants, and resolution either confirms the profile and host can deliver it or fails closed. `auto`, which formerly selected a tier at run time, is withdrawn (ADR 0010): a running SGLang engine cannot switch tiers, since its park flags are startup-only, and on the hardware in hand the choice is forced by the host's declared memory topology before launch anyway, so a runtime ladder would have nothing to choose between. `deep_required` is likewise withdrawn, because a declared `deep` residency already fails validation when deep parking is unavailable, by construction. `restart_only` prohibits sleep calls. Live verification of a tier does not override an operator's security restrictions. `host_backed` is refused at configuration time, not at first park, on a host domain declared to have device and host memory as one physical pool, since retaining a weight backup there would free nothing.
 
 ### 6.3 Command semantics
 
@@ -220,8 +220,8 @@ A deployment declares exactly one residency — `restart_only`, `host_backed`, o
 |---|---|
 | deploy model | Create a durable deployment. Default activation follows policy; `--activate` requests an initial activation. Updating an existing deployment requires an explicit revision-aware operation. |
 | start deployment | Enable it and request one transition to READY. Restore if parked, initialize if stopped. Not a permanent pin against future swaps. |
-| preinitialize deployment | Sequentially start, validate, and park; require qualified parking. Never evict live user work just to preinitialize. |
-| park deployment | Drain and perform qualified parking. Leave eligible for later on-demand activation; fail clearly if explicit parking is unsupported. |
+| preinitialize deployment | Sequentially start, validate, and park; park at the declared tier (ADR 0010). Never evict live user work just to preinitialize. |
+| park deployment | Drain and park at the declared tier. Leave eligible for later on-demand activation; fail clearly if explicit parking is unsupported. |
 | stop deployment | Suspend automatic activation, drain, and terminate engine workers. Preserve deployment identity and configured persistent storage. |
 | undeploy model | Remove route and deployment after authorized cleanup. Do not delete user-owned checkpoints or cache files implicitly. |
 | attach model | Register an existing service under attached ownership semantics. |
@@ -232,7 +232,7 @@ Automatic idle stop differs from administrative stop: idle eviction leaves the d
 
 Persist the deployment record and accepted operation transactionally before returning its ID. Default CLI stdout contains the deployment ID; diagnostics use stderr; structured output may include acceptance state. No `--wait` means submission returns after durable acceptance, not after readiness.
 
-`--wait` observes the same operation. CLI exit or watch timeout does not cancel it. Status exposes desired state, runtime state, latest operation and error, participants, reservation state, qualification, and conditions such as blocked or degraded. An on-demand STOPPED deployment can be a successful accepted deployment, not a failed startup.
+`--wait` observes the same operation. CLI exit or watch timeout does not cancel it. Status exposes desired state, runtime state, latest operation and error, participants, reservation state, and conditions such as blocked or degraded. An on-demand STOPPED deployment can be a successful accepted deployment, not a failed startup.
 
 Use idempotency keys for retries and revision/generation preconditions for mutations. A response lost after persistence must not produce another deployment on retry. Native engine calls are not assumed idempotent: reconcile ambiguous effects instead of blindly repeating a sleep/reload collective. A deployment ID is stable; operations and generations are distinct internal identities.
 
@@ -299,11 +299,11 @@ Remote stores require one shared resource identity and quota authority. Each hos
 
 ### 7.5 Enforcement and reclamation
 
-Distinguish admission enforcement, backend limits, supported OS/filesystem controls, and observation/recovery. A YAML value is not automatically a hard GPU-memory cap. Expose the enforcement level and qualification of each resource contract.
+Distinguish admission enforcement, backend limits, supported OS/filesystem controls, and observation/recovery. A YAML value is not automatically a hard GPU-memory cap. Expose the enforcement level and verification status of each resource contract.
 
 Adapters translate granted budgets to engine/cache settings with explicit units and scope. vLLM documents per-instance GPU utilization, per-GPU explicit KV bytes, and TP-group-wide offloading size [S5]. Normalize these before rendering commands. A group budget must not be multiplied accidentally by assigning it in full to every rank.
 
-Prefer fixed qualified allocations initially. Runtime resizing is supported only where a backend exposes safe semantics. Reclaim through backend eviction, release, or owned-service shutdown; never delete live store internals blindly. Reclamation completes only after verified release. Required caches block activation on failure; optional caches may use a separately validated cache-disabled path or recompute safely.
+Prefer fixed, verified allocations initially. Runtime resizing is supported only where a backend exposes safe semantics. Reclaim through backend eviction, release, or owned-service shutdown; never delete live store internals blindly. Reclamation completes only after verified release. Required caches block activation on failure; optional caches may use a separately validated cache-disabled path or recompute safely.
 
 ## 8. Runtime profiles and the engine/launcher contract
 
@@ -319,7 +319,7 @@ A managed profile supplies an executable and argument array, controlled environm
 
 A process that backgrounds children and exits without a durable ownership handle is invalid. Container/service launchers must track actual container/service identity; killing a CLI wrapper is not complete cleanup. A host script must not secretly launch remote ranks beyond the participating agents' ownership.
 
-Engine initialization may allocate substantial memory before readiness. Reservations and private endpoint settings must be in place before launch. Runtime executables, material scripts/configuration, environment identities, and checkpoints are fingerprinted; updates do not silently mutate active deployments or reuse old qualification results.
+Engine initialization may allocate substantial memory before readiness. Reservations and private endpoint settings must be in place before launch. Runtime executables, material scripts/configuration, environment identities, and checkpoints are fingerprinted; updates do not silently mutate active deployments or reuse a superseded binding identity. mllm validates a recipe's shape and the host's capacity to hold it; whether the recipe works is the user's responsibility (ADR 0011).
 
 ### 8.2 Parameter ownership
 
@@ -343,11 +343,10 @@ Preserve the original engine's supported arguments where possible. Do not place 
 
 Launch, terminate, owned-handle inspection, and exit reporting belong to the launcher. Reservation policy, retries, fallback, timeouts, and fairness belong to the controller. An adapter MUST NOT secretly start a competing process or acquire its own conflicting pool reservation.
 
-### 8.4 Capability qualification
+### 8.4 Withdrawn
 
-Track `unknown`, `qualified`, `unsupported`, and `disabled`, with reasons and evidence. Fingerprints include engine build, checkpoint revision, quantization, hardware/runtime, attention configuration, parallelism, drafter, cache integration, and relevant launch settings.
-
-Finding an endpoint is not qualification. Run explicit repeated A -> B -> A tests, usable-generation checks, tool-call checks where advertised, and physical resource observations. Qualify the full group and all drafters. Changes invalidate the affected evidence. Do not turn an unsupported SGLang/cache combination into a supported one by accepting YAML.
+Capability qualification was withdrawn by ADR 0011. The section number is kept so
+that references in §20 remain stable. Recipe ownership is stated in §8.1.
 
 ## 9. Engine-specific integration boundaries
 
@@ -357,16 +356,16 @@ Current vLLM documentation distinguishes level 1, which keeps a CPU weight backu
 
 The vLLM adapter wraps this in mllm admission and resource checks. Waking allocations alone is not successful restoration. A functioning plain restart-only deployment is the baseline before enabling this optimization.
 
-**Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It must be disabled unless host policy permits it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production qualification requires a separately reviewed supported control path or appropriate engine changes.
+**Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It must be disabled unless host policy permits it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production readiness requires a separately reviewed supported control path or appropriate engine changes.
 
 ### 9.2 SGLang immediately next
 
-SGLang documents memory-saver startup support, release/resume APIs, no ongoing requests before release, and disk-based weight updates. Releasing KV invalidates live cache contents [S3]. Qualify its actual release, retained-copy, and restoration behavior rather than assigning vLLM level numbers to it.
+SGLang documents memory-saver startup support, release/resume APIs, no ongoing requests before release, and disk-based weight updates. Releasing KV invalidates live cache contents [S3]. Verify its actual release, retained-copy, and restoration behavior on authorized hardware rather than assigning vLLM level numbers to it.
 
-Use the same controller, launcher, resource contracts, queues, and conformance tests. SGLang is not postponed behind a dashboard, plugin marketplace, or a general cluster scheduler. Restart-only support is valid when deep parking is not qualified.
+Use the same controller, launcher, resource contracts, queues, and conformance tests. SGLang is not postponed behind a dashboard, plugin marketplace, or a general cluster scheduler. Restart-only support is valid when the declared tier is `restart_only`.
 
-Restart-only is not sufficient to close F2: the owner requires qualified parking and
-restoration for a selected recipe of each engine, sequential preinitialization,
+Restart-only is not sufficient to close F2: the owner requires parking and
+restoration verified live on authorized hardware for a selected recipe of each engine, sequential preinitialization,
 concurrent serving when capacity permits, and repeated pressure-driven warm switching.
 Per-deployment ports, credentials, resource accounting, and management API/CLI wiring
 are F2 prerequisites. Unknown work is not proof of safe quiescence for parking; an
@@ -427,7 +426,7 @@ vLLM documents hierarchical offloading connectors and filesystem storage [S6]. S
 
 mllm retains cache configuration and namespaces, accounts for all owners, starts/stops explicitly owned cache services, and coordinates supported persistence barriers. Engines/connectors serialize, retrieve, index, and evict blocks. Cross-engine KV conversion is outside scope.
 
-Namespace isolation includes model/checkpoint revision, engine/layout, quantization, tokenizer/template effects, parallelism/rank, and security domain. Conservatively isolate by deployment until reuse is qualified. Public model aliases must not collapse incompatible caches. Secret-bearing prompts and KV are sensitive even when text is not logged.
+Namespace isolation includes model/checkpoint revision, engine/layout, quantization, tokenizer/template effects, parallelism/rank, and security domain. Conservatively isolate by deployment until reuse is verified. Public model aliases must not collapse incompatible caches. Secret-bearing prompts and KV are sensitive even when text is not logged.
 
 Persistent local caches need per-writer quotas and a filesystem-wide free-space reserve. Retention after stop/undeploy is explicit and visible; no silent data deletion. Shared services need reference counts or equivalent ownership protections so parking one client does not stop another client's cache.
 
@@ -449,7 +448,7 @@ Track PID plus start identity, process-tree/service/container handles, deploymen
 
 On server restart, reconcile desired state with agents before dispatch. On agent restart, inspect owned handles, verify current generations, and reconcile resources before accepting new transitions. On control-channel loss, preserve ownership, freeze new unsupervised transitions, and let existing work finish where the serving path remains available. Server/router failure may still break streams.
 
-On wake failure, keep admission closed. A bounded clean-restart fallback is allowed after verified cleanup and before inference dispatch. Repeated failures disable the profile's parking capability until requalification. On park failure, safely stop the owned group after drain if policy allows. Unexpected memory growth blocks new admission; no blind activation of the next model.
+On wake failure, keep admission closed. A bounded clean-restart fallback is allowed after verified cleanup and before inference dispatch. Repeated failures exhaust the deployment's attempt budget and leave it terminal `Failed` with its own admission closed (ADR 0011 decision 5). On park failure, safely stop the owned group after drain if policy allows. Unexpected memory growth blocks new admission; no blind activation of the next model.
 
 Controller command generations are not a substitute for physical fencing. Initial scope is one active controller with persistent state and local locking, not active-active failover. An agent cannot switch to another controller identity just because it has a similar hostname.
 
@@ -481,7 +480,6 @@ mllm join host --join-file host-a.join --config host.yaml
 mllm list hosts
 mllm inspect host host-a
 mllm doctor host host-a
-mllm qualify deployment dep_example
 
 # Submit and observe deployment intent.
 mllm deploy model --file deployment.yaml
@@ -506,7 +504,7 @@ mllm inspect config --role host --effective
 
 `deploy model` without `--wait` returns a deployment ID after durable acceptance. `--wait` waits for the specific accepted target operation, not forever for the deployment to remain ready. Machine-readable JSON and stable error codes are required; exact output layout can be finalized with the CLI tests. List/status commands do not activate models as a side effect.
 
-The management API is the source of semantics for CLI, future UI, and integrations. Required operations cover deployment creation/revision, inspection, lifecycle actions, inventory, invitation/enrollment, qualification, events, and effective configuration. Return structured errors such as invalid configuration, unauthorized profile, host unavailable, insufficient resources, queue full, unsupported capability, activation timeout, and unreconciled ownership. Exact HTTP paths and protobuf field numbers are to be frozen in the first implementation plan, not inferred from these command sketches.
+The management API is the source of semantics for CLI, future UI, and integrations. Required operations cover deployment creation/revision, inspection, lifecycle actions, inventory, invitation/enrollment, events, and effective configuration. Return structured errors such as invalid configuration, unauthorized profile, host unavailable, insufficient resources, queue full, unsupported capability, activation timeout, and unreconciled ownership. Exact HTTP paths and protobuf field numbers are to be frozen in the first implementation plan, not inferred from these command sketches.
 
 ## 15. Configuration model and generated defaults
 
@@ -520,7 +518,7 @@ The management API is the source of semantics for CLI, future UI, and integratio
 | Cache-service record | Unique physical allocation, backend identity, client quotas, lifetime and storage policy. | Duplicate per-client charging of the full service. |
 | CLI context | Selected management endpoint and credential reference. | A running service role. |
 
-Operator configuration is not mutable runtime state. Server/agent processes write identities, journals, reservations and qualification results separately; no continuous rewriting of administrator YAML. Creating a missing configuration during initialization/enrollment is an explicit documented exception.
+Operator configuration is not mutable runtime state. Server/agent processes write identities, journals, reservations and operational evidence separately; no continuous rewriting of administrator YAML. Creating a missing configuration during initialization/enrollment is an explicit documented exception.
 
 ### 15.2 No-config behavior
 
@@ -538,7 +536,7 @@ Creation must be atomic and owner-protected, with no clobber on concurrent start
 
 Defaults: local-only listeners with authentication; no public binding, no arbitrary script execution, no automatic engine installation/download, no large host-cache reservation or persistent storage writes until a deployment enables them. Discover inventory but do not execute detected engines merely because they are on PATH. Online enrollment is possible before any profile is eligible.
 
-`auto` budgets must resolve to finite, versioned, inspectable allocations before launch. Establish a deterministic conservative headroom policy in the implementation ADR; its exact tuned numbers are not inferred from example YAML. Missing recipe estimates require an explicit estimate or controlled qualification under a safe reservation, not unbounded startup. If a safe estimate cannot be established, block with a useful diagnostic. This specification does not authorize forced model loading merely to make a generated default appear turnkey.
+`auto` budgets must resolve to finite, versioned, inspectable allocations before launch. Establish a deterministic conservative headroom policy in the implementation ADR; its exact tuned numbers are not inferred from example YAML. Missing recipe estimates require an explicit estimate or controlled verification under a safe reservation, not unbounded startup. If a safe estimate cannot be established, block with a useful diagnostic. This specification does not authorize forced model loading merely to make a generated default appear turnkey.
 
 Material default changes affect new deployments only unless an explicit update is requested. Persist effective values, source/provenance, schema version, and profile revisions with each deployment. Hard constraints compose by intersection; exceeding a host ceiling is an error or queue condition, not silent shrinking.
 
@@ -703,7 +701,7 @@ engine_args:
   - "65536"
 ```
 
-`integration: none` disables an mllm-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be qualified.
+`integration: none` disables an mllm-managed external offload integration; it does not remove the engine's active attention KV or forbid native in-memory prefix caching. All private active allocations must fit the memory contract. These budgets do not assert that an unspecified checkpoint fits; the pinned recipe must be verified.
 
 ### 16.4 Two-host deployment with private host-cache and persistent storage
 
@@ -786,7 +784,7 @@ Relative paths in this example resolve against the configuration file, not an ar
 
 ## 17. Observability and benchmark evidence
 
-Record operation/generation IDs, state transitions, participant states, reservation decisions, cleanup evidence, qualification reasons, queue depth/bytes, activation progress, and failures. Status must distinguish configured capacity, granted reservation, observed use, and unknown observations. Protect high-cardinality metrics from unbounded user input.
+Record operation/generation IDs, state transitions, participant states, reservation decisions, cleanup evidence, queue depth/bytes, activation progress, and failures. Status must distinguish configured capacity, granted reservation, observed use, and unknown observations. Protect high-cardinality metrics from unbounded user input.
 
 Measure queue wait, drain time, park/stop duration, allocation/weight restoration, readiness time, request-to-first-token, total response latency, peak physical memory, retained cache/storage use, failed switches, and cache hit/reload behavior where observable. Report distributions and workload context, not a single best reload RPC.
 
@@ -802,9 +800,9 @@ These are implementation slices, not dates or time estimates. Each slice must le
 |---|---|---|
 | F0 — Contracts and foundation | Action-first CLI skeleton; strict config/default behavior; durable objects; resource ledger; abstract host/adapter/launcher contracts; fake engines and transport. | State, allocation, idempotency, and bootstrap/default tests pass without GPUs. |
 | F1 — First vLLM path | Standalone/local managed launch and attachment; streaming router; durable deployment submission; restart-only switching; explicitly gated deep parking. | Two profiles alternate safely; experimental park/reload validated where allowed; failures reconcile. |
-| F2 — Shared single-host foundation and SGLang | Close relevant vLLM/shared gaps; add SGLang, mandatory qualified parking, retained-runtime preinitialization, fit-based coexistence, and API/CLI contracts usable by a future UI. | Concurrent vLLM/SGLang serving and pressure-driven vLLM -> SGLang -> vLLM warm switching pass shared contracts and selected-recipe live qualification. No parallel controller implementation or silent cold-stop fallback. |
+| F2 — Shared single-host foundation and SGLang | Close relevant vLLM/shared gaps; add SGLang, declared-tier parking, retained-runtime preinitialization, fit-based coexistence, and API/CLI contracts usable by a future UI. | Concurrent vLLM/SGLang serving and pressure-driven vLLM -> SGLang -> vLLM warm switching pass shared contracts and live verification of the selected recipes on authorized hardware. No parallel controller implementation or silent cold-stop fallback. |
 | F3 — Remote host operation | Real invitation enrollment, persisted identity, outbound control stream, private ingress, multi-host ownership and recovery. | CLI-to-server deployment on remote hosts; reconnect, revocation, stale-command and orphan tests. Transport scaffolding may be exercised earlier in F0. |
-| F4 — Distributed and cache qualification | Named two-Spark group recipes; per-host release evidence; private and shared-cache combinations as supported. | A -> B -> A under worker failure, retained caches, and aggregate pressure; quota and persistence tests. |
+| F4 — Distributed and cache verification | Named two-Spark group recipes; per-host release evidence; private and shared-cache combinations as supported. | A -> B -> A under worker failure, retained caches, and aggregate pressure; quota and persistence tests. |
 | F5 — Broader packaging/backends | Supported service/container launchers, platform packages, compatible restart-only backends, selected API expansion. | Each advertised backend/platform has explicit supported tests and dependency documentation. |
 
 F2 must follow the first working vLLM slice rather than wait behind UI, marketplaces, broad scheduling, or every remote topology. Full remote and multi-node management remain product requirements with named gates, not accidental capabilities of a shell script.
@@ -815,7 +813,7 @@ Recommended module boundaries: domain/state, durable store, scheduler/accounting
 
 ### Fixed direction
 
-Fresh standalone product; multi-engine with vLLM then SGLang; one CLI for all roles; action-first grammar; external runtimes; explicit placement; durable deployment IDs; distinct attachment/ownership; agent on each directly managed host; ingress on API-facing members; aggregate host boundaries with deployment requests; independent cache ownership; safe generated defaults; qualified parking and restart fallback.
+Fresh standalone product; multi-engine with vLLM then SGLang; one CLI for all roles; action-first grammar; external runtimes; explicit placement; durable deployment IDs; distinct attachment/ownership; agent on each directly managed host; ingress on API-facing members; aggregate host boundaries with deployment requests; independent cache ownership; safe generated defaults; declared-tier parking and restart fallback.
 
 ### Baseline proposals to record before implementation
 
@@ -829,7 +827,7 @@ Fresh standalone product; multi-engine with vLLM then SGLang; one CLI for all ro
 | License | Open source; exact license not selected here. | Obtain explicit project-owner selection before publication; do not invent a license grant. |
 | Deployment updates | Revision-aware update/restart, no hot mutation. | Specify conflict handling and interruption behavior before adding update commands. |
 
-There are no approved engine-build versions or production-qualified Spark recipes in this specification. Qualification and the development-endpoint security issue are release gates, not missing details an agent can fill with confident assumptions.
+There are no approved engine-build versions or production-verified Spark recipes in this specification. Live verification on authorized hardware and the development-endpoint security issue are release gates, not missing details an agent can fill with confident assumptions.
 
 ## 20. Acceptance test matrix
 
@@ -850,7 +848,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T11 | Attached service | Routing works; no implicit sleep/kill/restart/adoption. |
 | T12 | Patched foreground wrapper | Native arguments preserved; signals/exit status and owned descendants handled. |
 | T13 | Detached or hidden remote launch | Invalid ownership rejected or managed by an explicit supported launcher. |
-| T14 | Reserved flags/profile change | Conflicts fail; effective config shows provenance; old qualification invalidated. |
+| T14 | Reserved flags/profile change | Conflicts fail; effective config shows provenance; a superseded binding identity is not reused. |
 | T15 | Simultaneous activation requests | Single activation operation and one group; no duplicate processes. |
 | T16 | A -> B -> A | Correct generations, model readiness, release evidence, and resource retention. |
 | T17 | Active streaming during swap | Drain honors completion/cancellation; no premature park or response replay. |
@@ -872,19 +870,19 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T33 | Controller/agent restart and PID reuse | Reconciliation from durable records; no arbitrary process adoption or killing. |
 | T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. |
 | T35 | KV persistence across park and restart | Observed hit/miss behavior correct; incompatible data never reused. |
-| T36 | Required versus optional cache outage | Required blocks; optional uses qualified fallback, not improvised live reconfiguration. |
+| T36 | Required versus optional cache outage | Required blocks; optional uses declared fallback, not improvised live reconfiguration. |
 | T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. |
 | T38 | Server crash with live inference | Honest request failure semantics; no exactly-once/resumable stream claim. |
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
 
-The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a qualified experimental deep-park path where permitted, and repeated recovery tests. The second proof adds mixed-engine concurrent serving when capacity permits, sequential preinitialization, and pressure-driven warm switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
+The first real-hardware proof is two managed deployments sharing one exclusive pool with correct restart-only service, a live-verified deep-park path where permitted, and repeated recovery tests. The second proof adds mixed-engine concurrent serving when capacity permits, sequential preinitialization, and pressure-driven warm switching without changing the controller model. Remote and two-Spark certification follow their explicit gates.
 
 ## 21. Revision history and source boundary
 
 ### Changes from revision 0.1
 
-Added standalone/remote role boundaries, per-host agents and head-only ingress, explicit deployment/attachment ownership, action-first CLI, control-plane deployment with durable IDs, host invitation enrollment, native/custom runtime contracts, aggregate resource-owner accounting, shared-cache capacity, default generation, and a traceable acceptance matrix. Replaced the previous combined host/deployment resource configuration. Remote control is now a first-class designed interface, with live qualification staged in delivery.
+Added standalone/remote role boundaries, per-host agents and head-only ingress, explicit deployment/attachment ownership, action-first CLI, control-plane deployment with durable IDs, host invitation enrollment, native/custom runtime contracts, aggregate resource-owner accounting, shared-cache capacity, default generation, and a traceable acceptance matrix. Replaced the previous combined host/deployment resource configuration. Remote control is now a first-class designed interface, with live verification staged in delivery.
 
 ### Sources
 
@@ -902,4 +900,4 @@ Original project source: Eduardo's `mllm-initial-design.md` revision 0.1 and the
 - **[S10]** vLLM, Parallelism and Scaling — API-facing and headless multi-node deployment: <https://docs.vllm.ai/en/latest/serving/parallelism_scaling/>.
 - **[S11]** SGLang, HiCache Best Practices — private host tiers and external storage scope: <https://docs.sglang.io/docs/advanced_features/hicache_best_practices>.
 
-**Handoff rule:** implement the declared contracts, report unsupported combinations, and retain qualification evidence. Do not convert design sketches, upstream endpoints, or previous conversational performance examples into claims of working functionality.
+**Handoff rule:** implement the declared contracts, report unsupported combinations, and retain operational evidence. Do not convert design sketches, upstream endpoints, or previous conversational performance examples into claims of working functionality.

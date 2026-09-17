@@ -264,3 +264,19 @@ fixture ties three test targets to the deleted tree (§4 splits it first); delet
 this lane removes the only machinery that ever produced native park evidence, which
 is accepted because that evidence judged recipes, and the machine-guarding part of it
 is the contract kept in `park.rs`.
+
+## 9. Amendments during planning
+
+1. The park contract moves to `crates/mllm-domain/src/park.rs` instead of
+   `crates/mllm-store/src/ordinary_lifecycle/park.rs`, because its rules are
+   inseparable from candidate SQL types and ADR 0009 puts database-free rules there.
+2. `qualification_id` is retired everywhere — host YAML key, effective-config field,
+   binding DTO field and `RuntimeBinding` field — not only as a token field.
+3. The Fake engine's qualification-named lifecycle simulation is kept and renamed
+   rather than deleted, stripped of its candidate-only cases.
+4. The retry budget and cooldown land on `CoordinatorOptions` with the ADR's
+   defaults now, since host-policy plumbing for them follows only when remote hosts
+   publish policy in F3.
+5. The private descriptor's `sglang_candidate_private_launch` tag and the
+   `candidate-{binding_id}` served-name rule stay as wire strings belonging to the
+   undesigned ordinary native launch.

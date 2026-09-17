@@ -212,7 +212,7 @@ explicitly terminates owned processes and disables automatic activation; subsequ
 requests cannot undo it. Undeploy removes the route and deployment only after
 authorized cleanup, without implicitly deleting checkpoints or user-owned caches.
 
-## 6. Failure, recovery, and engine qualification
+## 6. Failure, recovery, and engine verification
 
 An uncertain park/restore result enters reconciliation with admission closed. No
 blind repetition of a possibly applied engine operation is allowed. Failed states,
@@ -234,9 +234,10 @@ prerequisites, authentication, and acknowledgements must be checked against the
 pinned build during planning/qualification; endpoint availability alone is not
 evidence that parking is safe or weights are restored.
 
-Advertise capabilities as qualified, unknown, unsupported, or disabled, with reasons
-and evidence references. Security permission and technical qualification are separate
-checks. F2 cannot close by substituting restart-only for a missing qualified park path.
+Capability qualification was withdrawn by ADR 0011: mllm guards the host and the
+user owns the recipe. Security permission remains a separate check. F2 closes on
+declared-tier parking verified live on authorized hardware, not on a proof step per
+deployment.
 
 ## 7. Management API, CLI, and future UI
 
@@ -297,11 +298,11 @@ regressions and run the same controller/adapter contracts for both engines.
 | Q8 — Failure/recovery | Lost acknowledgements, failed restore/release, process loss, PID reuse, and local controller restart cannot falsely open readiness or release reservations; explicit fallback is visible |
 | Q9 — Product operations | API/CLI deployment and lifecycle tests, idempotent retry, wait/reconnect, effective configuration, stop suspension, attached ownership, and revision conflicts |
 | Q10 — Future-UI contract | Authorized snapshots/events, cursor replay and expiry/resnapshot, structured blocked reasons and supported actions, redacted credentials, bounded retention |
-| Q11 — Engine qualification | Pinned recipe for each engine passes readiness, parking, restoration, cache-correctness and security gates; unknown combinations remain unqualified |
+| Q11 — Engine verification | Pinned recipe for each engine passes readiness, parking, restoration, cache-correctness and security gates live on authorized hardware; unknown combinations remain unsupported |
 
 Start live testing with small models for repeatability. Use conservative constrained
 managed budgets to exercise pressure without deliberately exhausting physical memory.
-Larger model recipes are qualified separately; earlier 14B/27B smoke results are not
+Larger model recipes are verified separately; earlier 14B/27B smoke results are not
 post-fix streaming/concurrency or mixed-engine evidence. No specific larger recipe is
 promised to fit with another model until its entire transition sequence is measured.
 
@@ -315,8 +316,8 @@ and repetition counts must be fixed in the implementation plan before live runs.
 F2 closes only when all gates have automated evidence where feasible and the selected
 recipes have live evidence for preparation, concurrent serving, warm switching,
 pressure sequencing, request bursts, streaming, and representative failure/recovery.
-All remaining unsupported combinations must be explicit; qualifying one recipe does
-not qualify every model, engine version, or native engine feature.
+All remaining unsupported combinations must be explicit; verifying one recipe does
+not verify every model, engine version, or native engine feature.
 
 ## 9. Review and implementation boundary
 

@@ -2,8 +2,8 @@
 
 **Status:** Proposed (2026-09-16)
 **Amends:** `SPEC.md` §6.2 (a parking deployment no longer requires a qualified
-deep-park path) and §8.4 (capability qualification becomes a lab activity, not an
-admission gate). §13.2's recovery rules are adopted as written, not changed.
+deep-park path) and §8.4 (capability qualification leaves the product). §13.2's
+recovery rules are adopted as written, not changed.
 
 ## Context
 
@@ -85,9 +85,30 @@ The three validators that police a binding — `ordinary_lifecycle.rs:300`,
 `ordinary_lifecycle/receipt.rs:203`, `ordinary_lifecycle/cleanup.rs:190` — compare
 against whatever `binding_identity` returns and need no change.
 
-**2. Qualification remains, as a lab activity.** The candidate machinery is not
-deleted. It is what an operator uses to prove a new recipe deliberately, before
-trusting it. It stops being a toll gate on every deployment that wants to park.
+**2. Qualification is not an mllm concept and is removed.** mllm guards the host;
+the user owns the recipe. The concept exists in another product and was carried into
+this one by mistake. Nothing is relocated and no interface to another product is
+designed. Before launch mllm checks recipe shape (SPEC §8.2) and host fit
+(ADR 0007); it then launches and watches readiness. A recipe that does not work
+surfaces as failed attempts and, after the budget in decision 5, a terminal
+`Failed` deployment.
+
+That is about a third of this workspace — roughly 15,700 lines in the store, over half
+of it, plus 5,400 in the controller and 8,400 of controller tests. The store is
+described elsewhere as larger than the controller, management, adapters, router and
+scheduler combined, attributed to workflow logic following the transaction into it;
+half of it is machinery for a ceremony the product does not have.
+
+Three small types the ordinary lifecycle uses live in that module and move rather than
+go: `ArmResult`, `CleanupMode` and `CleanupExecutionContext`.
+
+What survives is what guards the machine: the park contract in
+`candidate_creation/warm.rs`, which is the only definition of "parked" in the
+repository (no allocations, weights or cache; quiesced; no unknown work; activity
+counters unmoved; no outstanding request lease; identities equal to the owned
+association; then milestone verification), the Fake engine's lifecycle simulation,
+and the native launch handoff. The design at
+`docs/superpowers/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
 
 **3. Park is an ordinary transition.** It gets no gate the other transitions do not
 have. A deployment declares its tier under ADR 0010; the engine either performs it or
@@ -109,8 +130,10 @@ continues serving every other deployment.
 
 **Budget: three attempts. Cooldown: 30s, doubling** — 30s, 60s, 120s. A broken recipe
 must not burn a GPU in a tight loop, and a transient failure should not wait minutes.
-Both are host policy fields with these defaults, not constants, because a host with
-slower storage may need a longer cooldown.
+Both are policy, not constants, because a host with slower storage may need a longer
+cooldown. They are coordinator options with these defaults today; the host-policy
+plumbing follows when remote hosts publish policy (F3), since the policy shape has
+one writer in `mllm-config`.
 
 Attempts are counted per deployment, revision and generation. A new revision is a new
 configuration and starts fresh; a retry of the same configuration does not.
@@ -134,8 +157,10 @@ failed step is a blast radius nobody chose.
 as its adapter can perform the control, which is the remaining native work rather than
 a policy decision.
 
-The catalog, the candidate runs, and `qualified_effective` keep working and keep their
-tests. They lose one caller.
+The catalog, the candidate runs and `qualified_effective` are deleted along with their
+tests. The 49 controller tests that fail once the gate is removed all assert one
+fixture's sanity check about a candidate run; they go with the concept rather than
+being repaired.
 
 A deployment in terminal `Failed` after three attempts needs an operator to act. This
 ADR does not define that action beyond the existing Start; a deliberate restart of a
@@ -154,3 +179,9 @@ memory is a scheduling question. This ADR only makes parking reachable.
 **The native adapters are untouched.** `VllmAdapter` has no `execute_persisted`, and
 `ProfileBindings` refuses SGLang for a missing admin credential and observation
 socket. Both block parking on a real engine regardless of this ADR.
+
+**The ordinary native launch is not designed here.** The handoff that renders a
+protected SGLang launch survives as `NativeLaunchHandoff`, sourced through a trait
+the application implements. Nothing implements it yet, `ProfileBindings` still
+refuses SGLang, and the private descriptor's `sglang_candidate_private_launch` tag
+and the served-name rule `candidate-{binding_id}` stay until that design.

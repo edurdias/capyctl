@@ -14,17 +14,16 @@ Request ownership is specified in the [F2A2c dispatch plan](superpowers/plans/20
 The [F2A2d coordinator integration plan](superpowers/plans/2026-09-12-f2a2d-coordinator-integration.md) connects lifecycle, runtime ownership, and routing.
 The [F2 planning index](superpowers/plans/2026-09-12-f2-planning-index.md) tracks written slices and remaining integration work.
 All eight F2 plans are written; integrated document review fixes have landed.
-CPU-only implementation has started. Live mixed-engine qualification remains pending.
-The design-package revision is not a software release or a hardware qualification claim.
+CPU-only implementation has started. Live mixed-engine verification remains pending.
+The design-package revision is not a software release or a hardware verification claim.
 
-Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning.
+Start with `AGENTS.md`, then `SPEC.md`.
 
 ## Contents
 
 | File | Purpose |
 |---|---|
 | `SPEC.md` | Consolidated architecture, requirements, interfaces, resource rules, configuration, milestones, and 40 acceptance scenarios. |
-| `AGENT_HANDOFF.md` | Coding-agent brief and implementation/verification boundaries. |
 | `examples/server.yaml` | Explicitly networked server configuration sketch. |
 | `examples/host.yaml` | Host aggregate boundaries and approved runtime profiles. |
 | `examples/deployment-single.yaml` | Single-host resource and lifecycle contract. |

@@ -55,6 +55,10 @@ Qualification becomes an authority on the one lifecycle rather than a second
 implementation of it. A candidate run is ordinary reconciliation under scoped
 authority that cannot promote itself.
 
+> Superseded by ADR 0011 (2026-09-17): qualification is not an mllm concept.
+> `candidate_creation` is deleted rather than collapsed; consequence 4 below is
+> discharged by that deletion.
+
 ## Consequences
 
 Sequenced so that each step leaves a working system and is independently reversible.
