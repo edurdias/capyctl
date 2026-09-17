@@ -5,7 +5,6 @@ mod receipt;
 pub mod unarmed_stop;
 pub mod worker;
 use crate::candidate_creation::initialize::ArmResult;
-use crate::candidate_creation::progression::catalog::qualified_effective;
 use crate::lifecycle::completion::{
     canonical_members, check_session, completion_value, decode, encode, fresh, identity_dtos,
     members,
@@ -294,7 +293,7 @@ fn load(
     if effective_json != p.effective_json {
         return Err(LifecycleError::Conflict);
     }
-    let catalog = binding_identity(tx, &e, &p.deployment_id)?;
+    let catalog = binding_identity(&e)?;
     let binding: BindingDto = decode(&p.binding_json)?;
     if binding.version != 1
         || binding.qualification_id != catalog.id()
@@ -411,11 +410,11 @@ pub struct QualifiedStart {
 
 /// What a runtime binding is created and verified against.
 ///
-/// Warm residency parks, so it must name a qualification. Restart-only never parks;
-/// SPEC §6.2 makes it first-class for backends with no qualified memory release.
-/// The runtime probe still gates readiness either way.
+/// ADR 0011 decision 1: every residency is identified this way, including one that
+/// parks. A qualification catalog entry used to be required for that case instead;
+/// nothing read it when a deployment parked or woke, and what it supplied was this
+/// same recipe and host information.
 enum BindingIdentity {
-    Qualified(Box<crate::candidate_creation::progression::catalog::QualificationReceipt>),
     Declared { id: String, payload: String },
 }
 
@@ -424,7 +423,7 @@ enum BindingIdentity {
 struct DeclaredBindingV1 {
     version: u8,
     kind: &'static str,
-    residency: &'static str,
+    residency: String,
     recipe_fingerprint: String,
     host: String,
     hardware_fingerprint: String,
@@ -434,44 +433,49 @@ struct DeclaredBindingV1 {
 impl BindingIdentity {
     fn id(&self) -> &str {
         match self {
-            Self::Qualified(receipt) => receipt.qualification_id(),
             Self::Declared { id, .. } => id,
         }
     }
     fn payload(&self) -> Result<String, LifecycleError> {
         match self {
-            Self::Qualified(receipt) => receipt.binding_payload(),
             Self::Declared { payload, .. } => Ok(payload.clone()),
         }
     }
 }
 
-/// Resolve the identity for this deployment's residency.
+/// A runtime's identity, derived from what it was admitted against.
+///
+/// ADR 0011 decision 1: every residency is identified this way. A changed recipe or
+/// a moved host yields a different identity, so a binding cannot be silently reused
+/// across either — which is the only property the lifecycle needs from an identity.
+/// Parking used to require a qualification catalog entry instead; nothing read it
+/// when parking, and what it supplied was this same recipe and host information.
 fn binding_identity(
-    tx: &Transaction<'_>,
     e: &mllm_config::effective::EffectiveDeployment,
-    deployment: &str,
 ) -> Result<BindingIdentity, LifecycleError> {
-    if !e.residency.parks() {
-        // Bound to the recipe and host it was admitted against, so a change
-        // produces a different identity rather than reusing this binding.
-        let descriptor = DeclaredBindingV1 {
-            version: 1,
-            kind: "declared",
-            residency: "restart_only",
-            recipe_fingerprint: e.qualification_fingerprint.clone(),
-            host: e.host.name.clone(),
-            hardware_fingerprint: e.host.hardware_fingerprint.clone(),
-            environment_fingerprint: e.host.environment_fingerprint.clone(),
-        };
-        return Ok(BindingIdentity::Declared {
-            id: format!("declared:{}", e.qualification_fingerprint),
-            payload: encode(&descriptor)?,
-        });
+    let descriptor = DeclaredBindingV1 {
+        version: 1,
+        kind: "declared",
+        residency: residency_name(e.residency).to_string(),
+        recipe_fingerprint: e.qualification_fingerprint.clone(),
+        host: e.host.name.clone(),
+        hardware_fingerprint: e.host.hardware_fingerprint.clone(),
+        environment_fingerprint: e.host.environment_fingerprint.clone(),
+    };
+    Ok(BindingIdentity::Declared {
+        id: format!("declared:{}", e.qualification_fingerprint),
+        payload: encode(&descriptor)?,
+    })
+}
+
+/// The serialized name of a residency, stable across refactors of the enum.
+fn residency_name(residency: mllm_config::effective::Residency) -> &'static str {
+    use mllm_config::effective::Residency;
+    match residency {
+        Residency::RestartOnly => "restart_only",
+        Residency::HostBacked => "host_backed",
+        Residency::Deep => "deep",
     }
-    Ok(BindingIdentity::Qualified(Box::new(qualified_effective(
-        tx, e, deployment,
-    )?)))
 }
 
 impl crate::Store {
@@ -519,7 +523,7 @@ impl crate::Store {
         }
         let (raw, e) = effective(tx, f)?;
         let catalog =
-            binding_identity(tx, &e, &f.deployment_id).map_err(|error| match error {
+            binding_identity(&e).map_err(|error| match error {
                 LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
                     LifecycleError::Unsupported
                 }
@@ -958,3 +962,6 @@ fn event(
         _ => LifecycleError::CorruptStoredData,
     })
 }
+
+#[cfg(test)]
+mod tests;

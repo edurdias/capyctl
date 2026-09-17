@@ -183,7 +183,7 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
     // qualified spelling of it. A restart-only deployment is identified by its
     // recipe and host, and cleanup is engine-agnostic anyway: it proves the
     // recorded processes are gone, which is the same proof whatever started them.
-    let identity = super::binding_identity(tx, &e, &p.deployment_id)?;
+    let identity = super::binding_identity(&e)?;
     let b: BindingDto = decode(&p.binding_json)?;
     if !exact
         || b.version != 1

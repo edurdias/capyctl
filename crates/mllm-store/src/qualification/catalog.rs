@@ -348,6 +348,11 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<Option<CatalogRecord>, Lifecyc
 }
 
 /// Transaction-scoped catalog authority for an independently validated managed revision.
+///
+/// ADR 0011 decision 2: qualification remains, as a lab activity an operator uses to
+/// prove a new recipe deliberately, before trusting it. It no longer gates the
+/// ordinary lifecycle (decision 1), so it currently has no caller in this crate.
+#[allow(dead_code)]
 pub(crate) fn qualified_effective(
     tx: &Transaction<'_>,
     effective: &mllm_config::effective::EffectiveDeployment,

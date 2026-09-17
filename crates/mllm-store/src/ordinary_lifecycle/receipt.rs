@@ -194,10 +194,9 @@ pub(super) fn historical_source(tx: &Transaction<'_>, p: &Plan) -> Result<(), Li
         _ => LifecycleError::CorruptStoredData,
     })?;
     // Re-derive the identity this binding must carry instead of matching one
-    // shape of it. A restart-only deployment is identified by its recipe and
-    // host, a warm one by its qualification, and hard-coding the qualified
-    // spelling here reported every other kind of deployment as corrupt.
-    let identity = super::binding_identity(tx, &e, &p.deployment_id)?;
+    // shape of it. ADR 0011 decision 1: every residency is identified the same
+    // way now, from its recipe and host, so no shape here needs special-casing.
+    let identity = super::binding_identity(&e)?;
     let binding: BindingDto = decode(&p.binding_json)?;
     if binding.version != 1
         || binding.qualification_id != identity.id()
