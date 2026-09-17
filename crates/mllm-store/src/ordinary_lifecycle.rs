@@ -4,7 +4,7 @@ mod expiry;
 mod receipt;
 pub mod unarmed_stop;
 pub mod worker;
-use crate::candidate_creation::initialize::ArmResult;
+use crate::lifecycle::ArmResult;
 use crate::lifecycle::completion::{
     canonical_members, check_session, completion_value, decode, encode, fresh, identity_dtos,
     members,

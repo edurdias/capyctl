@@ -3,7 +3,7 @@
 mod worker;
 pub use worker::*;
 
-use mllm_store::candidate_creation::initialize::ArmResult;
+use mllm_store::lifecycle::ArmResult;
 
 /// Inspect the result returned by the current persisted arm attempt.
 /// Reading an execution context or observing a recorded intent never permits send.

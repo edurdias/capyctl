@@ -23,11 +23,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ArmResult {
-    New { step_id: String },
-    AlreadyRecorded,
-}
+pub use crate::lifecycle::ArmResult;
 impl crate::Store {
     /// Trusted controller read of an armed candidate, never a grant of send authority.
     /// No management handler may project the returned paths or references.
@@ -38,9 +34,9 @@ impl crate::Store {
         s: &CoordinatorSession,
         id: &str,
         now_ms: i64,
-    ) -> std::result::Result<mllm_domain::launch::NativeCandidateLaunch, LifecycleError> {
+    ) -> std::result::Result<mllm_domain::launch::NativeLaunch, LifecycleError> {
         use mllm_domain::launch::{
-            NativeCandidateLaunch, NativeCandidateMetadata, NativeDeviceSelection,
+            NativeLaunch, NativeLaunchMetadata, NativeDeviceSelection,
             ProfileLaunchSettings,
         };
         if !super::ulid(id) {
@@ -112,10 +108,10 @@ impl crate::Store {
             .host_devices()
             .get(&selected.id)
             .ok_or(LifecycleError::CorruptStoredData)?;
-        let metadata = NativeCandidateMetadata {
+        let metadata = NativeLaunchMetadata {
             engine: "sglang".into(),
             recipe: settings.recipe.clone(),
-            source_revision: mllm_config::effective::candidate::NATIVE_SGLANG_SOURCE_REVISION
+            source_revision: mllm_config::effective::sglang::NATIVE_SGLANG_SOURCE_REVISION
                 .into(),
             checkpoint_revision: native.checkpoint_revision,
             binding_id: native.binding_id,
@@ -130,7 +126,7 @@ impl crate::Store {
                 memory_domain: device.domain.clone(),
             },
         };
-        let launch = NativeCandidateLaunch::from_frozen_store(
+        let launch = NativeLaunch::from_frozen_store(
             metadata,
             native.checkpoint_root,
             native.executable,

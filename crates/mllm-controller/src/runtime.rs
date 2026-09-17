@@ -159,7 +159,7 @@ pub struct NativeCandidateHandoff<'a> {
     session: &'a CoordinatorSession,
     step_id: String,
     fence: DeploymentFence,
-    frozen: mllm_domain::launch::NativeCandidateLaunch,
+    frozen: mllm_domain::launch::NativeLaunch,
     command: mllm_adapters::traits::RenderedCommand,
     descriptors: mllm_launchers::ProtectedLaunchDescriptors,
     now_ms: &'a dyn Fn() -> Result<i64, RuntimeError>,
@@ -183,11 +183,11 @@ impl<'a> NativeCandidateHandoff<'a> {
         step_id: &str,
         context: mllm_scheduler::residency::AdmissionContext<'_>,
         resolve: &dyn Fn(&str) -> Result<Vec<u8>, RuntimeError>,
-        preflight: &dyn Fn(&mllm_domain::launch::NativeCandidateLaunch) -> Result<(), RuntimeError>,
+        preflight: &dyn Fn(&mllm_domain::launch::NativeLaunch) -> Result<(), RuntimeError>,
         service: NativeCandidateService<'a>,
     ) -> Result<Option<Self>, RuntimeError> {
         use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
-        use mllm_store::candidate_creation::initialize::ArmResult;
+        use mllm_store::lifecycle::ArmResult;
         let ArmResult::New { step_id } = store
             .arm_step(session, step_id, context)
             .map_err(|_| native_error("candidate arm rejected"))?

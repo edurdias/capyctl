@@ -6,9 +6,7 @@ use serde_json::Value;
 
 const MAX_ENCODED: usize = 1 << 20;
 const DIGEST_DOMAIN: &[u8] = b"mllm.candidate-manifest.v1\0";
-pub const NATIVE_SGLANG_SOURCE_REVISION: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
-pub const NATIVE_CHECKPOINT_REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
-pub const NATIVE_SGLANG_RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+pub use super::sglang::{NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION};
 
 /// Public behavior only. Validation is informational and grants no launch authority.
 #[derive(Debug, Clone, PartialEq, Eq)]

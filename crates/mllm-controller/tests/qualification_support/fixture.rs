@@ -8,8 +8,7 @@ use mllm_domain::completion::OwnedLaunchReceipt;
 use mllm_domain::resources::{MemoryLimit, MemoryObservation};
 use mllm_scheduler::residency::AdmissionContext;
 use mllm_store::{
-    candidate_creation::initialize::ArmResult,
-    candidate_creation::progression::CandidateDispatchResult, Store,
+    candidate_creation::progression::CandidateDispatchResult, lifecycle::ArmResult, Store,
 };
 use serde_json::{json, Value};
 

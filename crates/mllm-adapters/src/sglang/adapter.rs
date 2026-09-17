@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use mllm_domain::{
     completion::{ExecutionIdentities, Milestone, ProcessIdentity, TransitionToken},
-    launch::NativeCandidateLaunch,
+    launch::NativeLaunch,
     qualification::EffectObservation,
 };
 
@@ -84,7 +84,7 @@ impl SglangAdapter {
     /// qualification. Only the coordinator may supply resolved credentials and
     /// send the current persisted child command through `execute_persisted`.
     pub fn from_frozen(
-        frozen: &NativeCandidateLaunch,
+        frozen: &NativeLaunch,
         inference: String,
         admin: String,
         observer: Arc<dyn SglangRuntimeObserver>,

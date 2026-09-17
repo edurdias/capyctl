@@ -72,9 +72,9 @@ pub struct NativeDeviceSelection {
     pub memory_domain: String,
 }
 
-/// Redacted native candidate description. Neither metadata nor its digest is send authority.
+/// Redacted native launch description. Neither metadata nor its digest is send authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeCandidateMetadata {
+pub struct NativeLaunchMetadata {
     pub engine: String,
     pub recipe: String,
     pub source_revision: String,
@@ -87,25 +87,25 @@ pub struct NativeCandidateMetadata {
     pub device: NativeDeviceSelection,
 }
 
-/// Trusted, process-local projection of a persisted candidate descriptor.
+/// Trusted, process-local projection of a persisted launch descriptor.
 ///
 /// Deliberately has no Debug, Display, or serialization implementation. Reading,
 /// constructing, or retaining this value does not authorize a send. The controller
 /// must separately own the current persisted arm's `New` outcome.
-pub struct NativeCandidateLaunch {
-    metadata: NativeCandidateMetadata,
+pub struct NativeLaunch {
+    metadata: NativeLaunchMetadata,
     checkpoint_root: String,
     executable: String,
     inference_credential_ref: String,
     admin_credential_ref: String,
     settings: SglangLaunchSettings,
 }
-impl NativeCandidateLaunch {
+impl NativeLaunch {
     /// Internal cross-crate bridge. Call only with a validated persisted store read;
     /// this constructor does not supply proof of persistence or launch authority.
     #[doc(hidden)]
     pub fn from_frozen_store(
-        metadata: NativeCandidateMetadata,
+        metadata: NativeLaunchMetadata,
         checkpoint_root: String,
         executable: String,
         inference_credential_ref: String,
@@ -121,7 +121,7 @@ impl NativeCandidateLaunch {
             settings,
         }
     }
-    pub fn metadata(&self) -> &NativeCandidateMetadata {
+    pub fn metadata(&self) -> &NativeLaunchMetadata {
         &self.metadata
     }
     /// Trusted launcher/adapter use only; never expose through a management DTO.

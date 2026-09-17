@@ -9,29 +9,12 @@ use crate::lifecycle::completion::{
 };
 use crate::lifecycle::{DeploymentFence, LifecycleError};
 use crate::lifecycle::{IdentityDto, insert_candidate_cleanup_run, validate_cleanup_run};
-use mllm_domain::completion::{CleanupEvidence, ProcessIdentity};
+use mllm_domain::completion::CleanupEvidence;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CleanupMode {
-    TerminateOwned,
-    InspectOwnedGone,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CleanupExecutionContext {
-    pub operation_id: String,
-    pub step_id: String,
-    pub binding_id: String,
-    pub incarnation: String,
-    pub fence: DeploymentFence,
-    pub identities: Vec<ProcessIdentity>,
-    pub issued_at_ms: i64,
-    pub deadline_ms: i64,
-    pub mode: CleanupMode,
-}
+pub use crate::ordinary_lifecycle::cleanup::{CleanupExecutionContext, CleanupMode};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateCleanupReceipt {
     deployment_id: String,

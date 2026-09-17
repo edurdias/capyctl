@@ -1466,7 +1466,7 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
 mod cleanup_evidence {
     use super::super::*;
     use mllm_domain::completion::ProcessIdentity;
-    use mllm_store::candidate_creation::cleanup::{CleanupExecutionContext, CleanupMode};
+    use mllm_store::ordinary_lifecycle::cleanup::{CleanupExecutionContext, CleanupMode};
 
     fn boot() -> String {
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id")

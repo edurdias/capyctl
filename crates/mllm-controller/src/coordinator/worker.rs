@@ -10,8 +10,8 @@ use mllm_domain::{
     resources::{MemoryLimit, MemoryObservation},
 };
 use mllm_store::{
-    candidate_creation::cleanup::CleanupExecutionContext,
     lifecycle::{DeploymentFence, LifecycleError},
+    ordinary_lifecycle::cleanup::CleanupExecutionContext,
     ordinary_lifecycle::cleanup::{OrdinaryCleanupReceipt, OrdinaryCleanupStatus},
     ordinary_lifecycle::unarmed_stop::OrdinaryStopReceipt,
     ordinary_lifecycle::worker::{
@@ -1822,7 +1822,7 @@ async fn drive_cleanup(
         || context.fence.revision != work.revision
         || context.fence.generation != work.generation
         || context.deadline_ms != work.deadline_ms
-        || context.mode != mllm_store::candidate_creation::cleanup::CleanupMode::TerminateOwned
+        || context.mode != mllm_store::ordinary_lifecycle::cleanup::CleanupMode::TerminateOwned
     {
         return Err(shared.fail("cleanup binding mismatch"));
     }

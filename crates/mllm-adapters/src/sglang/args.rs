@@ -7,10 +7,10 @@
 //! never resolves references, reads descriptors, or starts a process.
 
 use crate::traits::{RenderedCommand, RuntimeError};
-use mllm_config::effective::candidate::{
+use mllm_config::effective::sglang::{
     NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
 };
-use mllm_domain::launch::{NativeCandidateLaunch, SglangLaunchSettings};
+use mllm_domain::launch::{NativeLaunch, SglangLaunchSettings};
 use serde_json::{Value, json};
 use std::{fmt, path::Path};
 
@@ -65,7 +65,7 @@ pub struct SglangLaunch {
 }
 
 impl SglangLaunch {
-    pub fn from_frozen(frozen: &NativeCandidateLaunch) -> Result<Self, RuntimeError> {
+    pub fn from_frozen(frozen: &NativeLaunch) -> Result<Self, RuntimeError> {
         let m = frozen.metadata();
         let s = frozen.settings();
         let valid_reference = |value: &str| {

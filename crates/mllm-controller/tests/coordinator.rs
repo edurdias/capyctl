@@ -1,5 +1,5 @@
 use mllm_controller::coordinator::permits_send;
-use mllm_store::candidate_creation::initialize::ArmResult;
+use mllm_store::lifecycle::ArmResult;
 
 #[test]
 fn recorded_intent_is_not_replay_permission() {

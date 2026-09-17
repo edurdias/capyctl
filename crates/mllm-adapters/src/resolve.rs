@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use mllm_config::engine_policy::Engine;
-use mllm_domain::launch::NativeCandidateLaunch;
+use mllm_domain::launch::NativeLaunch;
 
 use crate::{
     fake::{FakeEngine, ParkPolicy},
@@ -35,7 +35,7 @@ pub enum AdapterSpec {
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch it
     /// was qualified against and the observer that supplies fresh evidence.
     Sglang {
-        frozen: Box<NativeCandidateLaunch>,
+        frozen: Box<NativeLaunch>,
         inference: String,
         admin: String,
         observer: Arc<dyn SglangRuntimeObserver>,

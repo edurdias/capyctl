@@ -2,7 +2,7 @@ use mllm_adapters::RuntimeError;
 use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
 use mllm_config::effective::candidate::validate_candidate_reviewed_snapshot;
 use mllm_domain::launch::{
-    NativeCandidateLaunch, NativeCandidateMetadata, SglangLaunchSettings, SglangRequestedBudget,
+    NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
 };
 use serde_json::{Value, json};
 
@@ -22,9 +22,9 @@ fn wrapper() -> &'static std::path::Path {
     })
 }
 
-fn metadata(index: u16) -> NativeCandidateMetadata {
+fn metadata(index: u16) -> NativeLaunchMetadata {
     let binding = format!("01K0000000000000000000{index:04}");
-    NativeCandidateMetadata {
+    NativeLaunchMetadata {
         engine: "sglang".into(),
         recipe: RECIPE.into(),
         source_revision: SOURCE.into(),
@@ -72,8 +72,8 @@ fn settings() -> SglangLaunchSettings {
     }
 }
 
-fn frozen(meta: NativeCandidateMetadata, config: SglangLaunchSettings) -> NativeCandidateLaunch {
-    NativeCandidateLaunch::from_frozen_store(
+fn frozen(meta: NativeLaunchMetadata, config: SglangLaunchSettings) -> NativeLaunch {
+    NativeLaunch::from_frozen_store(
         meta,
         CHECKPOINT.into(),
         "/opt/sglang/bin/python3".into(),
@@ -220,10 +220,10 @@ fn two_frozen_bindings_keep_distinct_endpoints_and_served_names() {
 #[test]
 fn frozen_device_selection_is_required_and_never_inferred_from_gpu_zero() {
     for mutate in [
-        |m: &mut NativeCandidateMetadata| m.device.host_id.clear(),
-        |m: &mut NativeCandidateMetadata| m.device.hardware_fingerprint.clear(),
-        |m: &mut NativeCandidateMetadata| m.device.device_id = "gpu 0".into(),
-        |m: &mut NativeCandidateMetadata| m.device.memory_domain = "../uma".into(),
+        |m: &mut NativeLaunchMetadata| m.device.host_id.clear(),
+        |m: &mut NativeLaunchMetadata| m.device.hardware_fingerprint.clear(),
+        |m: &mut NativeLaunchMetadata| m.device.device_id = "gpu 0".into(),
+        |m: &mut NativeLaunchMetadata| m.device.memory_domain = "../uma".into(),
     ] {
         let mut m = metadata(1);
         mutate(&mut m);
@@ -302,7 +302,7 @@ fn exact_budget_bounds_do_not_round_or_narrow_public_values() {
 
 #[test]
 fn ordinary_missing_and_malformed_candidate_metadata_is_rejected() {
-    let changes: &[fn(&mut NativeCandidateMetadata)] = &[
+    let changes: &[fn(&mut NativeLaunchMetadata)] = &[
         |m| m.engine = "vllm".into(),
         |m| m.recipe = "other".into(),
         |m| m.source_revision = "unverified".into(),
@@ -388,7 +388,7 @@ fn private_paths_references_and_errors_never_enter_public_command_data() {
             ADMIN_REF,
         ),
     ] {
-        let invalid = NativeCandidateLaunch::from_frozen_store(
+        let invalid = NativeLaunch::from_frozen_store(
             metadata(1),
             root.into(),
             executable.into(),

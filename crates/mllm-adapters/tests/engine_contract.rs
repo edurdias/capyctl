@@ -3,7 +3,7 @@ use mllm_adapters::sglang::{SglangAdapter, SglangRuntimeObservation, SglangRunti
 use mllm_adapters::RuntimeError;
 use mllm_adapters::{fake::ParkPolicy, vllm::VllmAdapter, ChatForward, StreamEnded};
 use mllm_domain::launch::{
-    NativeCandidateLaunch, NativeCandidateMetadata, SglangLaunchSettings, SglangRequestedBudget,
+    NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
 };
 use serde_json::{json, Value};
 const BINDING: &str = "01K00000000000000000000001";
@@ -156,9 +156,9 @@ impl SglangRuntimeObserver for Observer {
     }
 }
 
-fn frozen(endpoint: String) -> NativeCandidateLaunch {
-    NativeCandidateLaunch::from_frozen_store(
-        NativeCandidateMetadata {
+fn frozen(endpoint: String) -> NativeLaunch {
+    NativeLaunch::from_frozen_store(
+        NativeLaunchMetadata {
             binding_id: BINDING.into(),
             incarnation: INCARNATION.into(),
             endpoint,

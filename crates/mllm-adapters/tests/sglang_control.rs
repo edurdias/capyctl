@@ -18,7 +18,7 @@ use mllm_domain::{
         ExecutionIdentities, Milestone, ProcessIdentity, StepExecutionContext, TransitionToken,
     },
     launch::{
-        NativeCandidateLaunch, NativeCandidateMetadata, SglangLaunchSettings, SglangRequestedBudget,
+        NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
     },
 };
 use serde_json::{json, Value};
@@ -77,9 +77,9 @@ fn command(action: RuntimeAction, step: &str) -> RuntimeCommand {
     }
 }
 
-fn frozen(endpoint: String) -> NativeCandidateLaunch {
-    NativeCandidateLaunch::from_frozen_store(
-        NativeCandidateMetadata {
+fn frozen(endpoint: String) -> NativeLaunch {
+    NativeLaunch::from_frozen_store(
+        NativeLaunchMetadata {
             binding_id: BINDING.into(),
             incarnation: INCARNATION.into(),
             endpoint,

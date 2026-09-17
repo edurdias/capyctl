@@ -169,7 +169,7 @@ async fn cleanup_failures_keep_arm_accounting_instance_and_never_resend() {
                     .arm_ordinary_cleanup_with_context(o.session(), stop.step_id(), 1900)
                     .unwrap(),
                 (
-                    mllm_store::candidate_creation::initialize::ArmResult::AlreadyRecorded,
+                    mllm_store::lifecycle::ArmResult::AlreadyRecorded,
                     None
                 )
             );

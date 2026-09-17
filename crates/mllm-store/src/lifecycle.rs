@@ -166,6 +166,14 @@ pub struct DeploymentFence {
     pub generation: i64,
 }
 
+/// What a persisted arm returned. Only `New` permits a send; `AlreadyRecorded` is a
+/// replay and carries no authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArmResult {
+    New { step_id: String },
+    AlreadyRecorded,
+}
+
 pub(crate) fn insert_candidate_initialize_run(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,

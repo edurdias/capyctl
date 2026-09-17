@@ -2,15 +2,38 @@
 //! An arm permits one control only after the worker has awaited predecessor exit.
 use super::unarmed_stop::OrdinaryStopReceipt;
 use super::*;
-use crate::candidate_creation::cleanup::{CleanupExecutionContext, CleanupMode};
 use crate::events::OrdinaryCleanupTransition;
 use crate::lifecycle::completion::nonempty_receipt;
-use mllm_domain::completion::CleanupEvidence;
+use mllm_domain::completion::{CleanupEvidence, ProcessIdentity};
 use sha2::{Digest, Sha256};
 
 #[path = "cleanup_worker.rs"]
 mod worker;
 pub use worker::OrdinaryCleanupStatus;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupMode {
+    TerminateOwned,
+    /// A cleanup whose terminate already went out; only inspection follows.
+    /// The ordinary path does not yet arm this variant — SPEC §13.2 restart
+    /// recovery will. It stays because the spec requires it even without a
+    /// caller yet.
+    InspectOwnedGone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupExecutionContext {
+    pub operation_id: String,
+    pub step_id: String,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub fence: DeploymentFence,
+    pub identities: Vec<ProcessIdentity>,
+    pub issued_at_ms: i64,
+    pub deadline_ms: i64,
+    pub mode: CleanupMode,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
