@@ -22,7 +22,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-#[path = "../../mllm-controller/tests/qualification_support/fixture.rs"]
+#[path = "../../mllm-controller/tests/support/fixture.rs"]
 mod fixture;
 const MANAGEMENT: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";

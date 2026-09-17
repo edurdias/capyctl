@@ -8,12 +8,12 @@ use tower::ServiceExt;
 const MANAGEMENT: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 
-#[path = "../../mllm-controller/tests/qualification_support/fixture.rs"]
-mod qualification_fixture;
+#[path = "../../mllm-controller/tests/support/fixture.rs"]
+mod fixture;
 
 #[tokio::test]
 async fn unarmed_stop_writer_events_replay_to_sse_without_cleanup_epoch() {
-    let source = qualification_fixture::owned_source().await;
+    let source = fixture::owned_source().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stop.sqlite3");
     std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();
@@ -75,7 +75,7 @@ async fn unarmed_stop_writer_events_replay_to_sse_without_cleanup_epoch() {
 
 #[tokio::test]
 async fn expired_unarmed_writer_event_replays_and_stream_continues() {
-    let source = qualification_fixture::owned_source().await;
+    let source = fixture::owned_source().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("expiry.sqlite3");
     std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();

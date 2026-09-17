@@ -18,6 +18,9 @@ mod cleanup_tests;
 #[path = "../../tests/qualification_support/candidate_fixture.rs"]
 mod candidate_fixture;
 
+#[path = "../../tests/qualification_support/fixture.rs"]
+mod qualification_fixture;
+
 fn worker_candidate(
     owner: SharedCoordinatorState,
     observations: Vec<MemoryObservation>,
@@ -296,7 +299,7 @@ async fn candidate_uncertain_effect_commit_failure_panic_and_shutdown_never_adva
 
 #[test]
 fn candidate_discovery_and_send_reject_stale_policy_context_and_session() {
-    let f = fixture::fixture();
+    let f = qualification_fixture::fixture();
     let work = f
         .store
         .next_candidate_initialize(&f.session, 1200)
@@ -442,7 +445,7 @@ async fn candidate_binding_collision_preserves_original_immutable_instance() {
 fn candidate_discovery_and_history_classify_oversized_or_blob_records_as_corruption() {
     for target in ["discovery", "history"] {
         for encoding in ["blob", "oversized", "invalid-json"] {
-            let f = fixture::fixture();
+            let f = qualification_fixture::fixture();
             let column = if target == "discovery" {
                 "plan_json"
             } else {

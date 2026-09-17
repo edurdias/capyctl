@@ -12,7 +12,7 @@ mod start_command;
 #[path = "tests_candidate.rs"]
 mod candidate_tests;
 
-#[path = "../../tests/qualification_support/fixture.rs"]
+#[path = "../../tests/support/fixture.rs"]
 mod fixture;
 
 struct Observations(Vec<MemoryObservation>);
