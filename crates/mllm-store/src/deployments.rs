@@ -338,6 +338,25 @@ impl crate::Store {
         Ok(())
     }
 
+    /// Close or open one deployment's own admission.
+    ///
+    /// ADR 0011 decision 4: a failed deployment stops itself. The coordinator's
+    /// process-wide `accepting` flag is for shutdown; one deployment's bad
+    /// configuration or failed step must not touch it.
+    pub fn set_admission_enabled(&self, id: &str, enabled: bool) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE deployments
+             SET admission_enabled = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![id, enabled as i64],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+
     /// Append a journal entry (no inference bodies, ever — evidence only).
     pub fn record_journal(
         &self,

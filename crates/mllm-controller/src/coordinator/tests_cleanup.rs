@@ -905,3 +905,72 @@ async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
     );
     w.shutdown().await.unwrap();
 }
+
+/// ADR 0011 decision 4: a deployment that fails closes its own admission, not the
+/// host's. Before this, the worker returned on any failed step and the task closed
+/// admission for every deployment, so one bad configuration stopped everything.
+#[tokio::test]
+async fn a_failed_deployment_does_not_stop_the_others() {
+    let (dir, owner, fence, observations) = setup().await;
+    let other = fixture::owned_source().await.other.clone();
+    let failing_id = fence.deployment_id.clone();
+    let gate = Gate::new(false);
+    let driver = gate.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+        Arc::new(move |work| {
+            // Only the first deployment's binding is ever misconfigured. The
+            // driver is never even constructed for it.
+            if work.fence().deployment_id == failing_id {
+                return Err(CoordinatorError::Service(
+                    "injected qualification failure".into(),
+                ));
+            }
+            Ok(test_driver(driver.clone()))
+        }),
+    )
+    .unwrap();
+    let failing = w.start(&fence, 10000).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    // The failing deployment's own Initialize never arms; it stays Planned, and
+    // this deployment's own admission closes. Nothing about the host does.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let closed: bool = sql
+                .query_row(
+                    "SELECT admission_enabled=0 FROM deployments WHERE id=?1",
+                    [&fence.deployment_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if closed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        {
+            let o = owner.lock().unwrap();
+            o.store()
+                .qualified_initialize_status(o.session(), failing.step_id(), 1900)
+                .unwrap()
+        },
+        QualifiedInitializeStatus::Planned
+    );
+    // The coordinator itself is unaffected: it is still Running, not Stopped.
+    assert_eq!(w.status(), WorkerStatus::Running);
+    // A second, healthy deployment still starts and reaches Ready.
+    let healthy = w.start(&other, 10000).unwrap();
+    assert_eq!(
+        healthy.wait(Duration::from_secs(60)).await.unwrap(),
+        QualifiedInitializeStatus::Completed
+    );
+    assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    w.shutdown().await.unwrap();
+}

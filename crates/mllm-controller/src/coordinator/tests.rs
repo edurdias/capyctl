@@ -417,7 +417,28 @@ async fn stale_observation_blocks_but_expired_queue_releases_unused_endpoint() {
                 }
             }).await.unwrap();
         } else {
-            assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
+            // ADR 0011 decision 4: a stale observation denies only this
+            // deployment's own arm. The coordinator keeps running; only this
+            // deployment's admission closes.
+            let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let closed: bool = sql
+                        .query_row(
+                            "SELECT admission_enabled=0 FROM deployments WHERE id=?1",
+                            [&fence.deployment_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    if closed {
+                        break;
+                    }
+                    assert_eq!(w.status(), WorkerStatus::Running);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
         }
         assert!(gate.calls.lock().unwrap().is_empty());
         {
@@ -704,7 +725,7 @@ impl ServiceObservation for HeldObservation {
 #[tokio::test]
 async fn current_policy_race_and_observation_timeout_deny_send() {
     for timeout in [false, true] {
-        let (_dir, owner, fence, observations) = setup().await;
+        let (dir, owner, fence, observations) = setup().await;
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let source = Arc::new(HeldObservation {
@@ -745,7 +766,28 @@ async fn current_policy_race_and_observation_timeout_deny_send() {
                 .unwrap();
             release.add_permits(1);
         }
-        assert!(matches!(stopped(&w).await, WorkerStatus::Blocked { .. }));
+        // ADR 0011 decision 4: this denial is this deployment's own — a stale
+        // observation or a policy race for its own arm — so the coordinator
+        // keeps running and only this deployment's admission closes.
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let closed: bool = sql
+                    .query_row(
+                        "SELECT admission_enabled=0 FROM deployments WHERE id=?1",
+                        [&fence.deployment_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if closed {
+                    break;
+                }
+                assert_eq!(w.status(), WorkerStatus::Running);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(gate.calls.lock().unwrap().is_empty());
         assert!(owner
             .lock()
@@ -798,7 +840,7 @@ async fn clock_read_after_validation_preserves_arm_when_freshness_expires() {
 
 #[tokio::test]
 async fn stop_racing_completion_cannot_publish_ready() {
-    let (_dir, owner, fence, observations) = setup().await;
+    let (dir, owner, fence, observations) = setup().await;
     let gate = Gate::new(false);
     let w = worker(
         owner.clone(),
@@ -813,7 +855,29 @@ async fn stop_racing_completion_cannot_publish_ready() {
         o.store().fence_stop(o.session(), &fence, 10000).unwrap();
     }
     gate.release.add_permits(1);
-    assert!(matches!(stopped(&w).await, WorkerStatus::Failed(_)));
+    // ADR 0011 decision 4: the raced fence leaves this deployment's own binding
+    // retained with no tracked cleanup for it, so this deployment's admission
+    // closes — but that is this deployment's own accounting, not a process-wide
+    // fault, so the coordinator keeps running for every other deployment.
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let closed: bool = sql
+                .query_row(
+                    "SELECT admission_enabled=0 FROM deployments WHERE id=?1",
+                    [&fence.deployment_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if closed {
+                break;
+            }
+            assert_eq!(w.status(), WorkerStatus::Running);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         a.wait(Duration::from_secs(3)).await.unwrap(),
         QualifiedInitializeStatus::Superseded

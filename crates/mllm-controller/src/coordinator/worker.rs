@@ -1560,17 +1560,40 @@ async fn run(
                         "{reason}; durable arm retained if recorded: {error}"
                     )),
                 };
-                if !shared.accepting.load(Ordering::Acquire)
-                    || *stop.borrow()
-                    || !matches!(outcome, WorkerStatus::Uncertain { .. })
-                {
+                // Only a process-wide condition still halts the worker: closed
+                // global admission (poisoned mutex, corrupt store — store_error
+                // already closed it above) or requested shutdown.
+                if !shared.accepting.load(Ordering::Acquire) || *stop.borrow() {
                     return outcome;
                 }
-                // Keep the same session and retained instance for explicit Stop.
-                // No further Initialize is admitted or discovered until this
-                // exact retained binding has a committed verified cleanup.
-                status_tx.send_replace(outcome.clone());
-                paused = Some((work.binding_id().into(), outcome));
+                if matches!(outcome, WorkerStatus::Uncertain { .. }) {
+                    // Keep the same session and retained instance for explicit Stop.
+                    // No further Initialize is admitted or discovered until this
+                    // exact retained binding has a committed verified cleanup.
+                    status_tx.send_replace(outcome.clone());
+                    paused = Some((work.binding_id().into(), outcome));
+                    shared.changed.notify_waiters();
+                    continue;
+                }
+                // ADR 0011 decision 4: a deployment that fails closes its own
+                // admission, not the host's. Every other deployment keeps being
+                // served; only this one is no longer admitted until an operator
+                // or a later retry reopens it.
+                let deployment_id = work.fence().deployment_id.clone();
+                if let Err(error) = shared
+                    .with_owner(move |owner| {
+                        owner
+                            .store()
+                            .set_admission_enabled(&deployment_id, false)
+                            .map_err(|error| CoordinatorError::Service(error.to_string()))
+                    })
+                    .await
+                {
+                    return WorkerStatus::Failed(format!(
+                        "{outcome:?}; failed to close the deployment's own admission: {error}"
+                    ));
+                }
+                shared.set_initializing(true);
                 shared.changed.notify_waiters();
             }
         }
