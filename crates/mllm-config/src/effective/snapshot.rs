@@ -93,31 +93,10 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     )?;
     unit(&mut queue, "request_deadline_ms", "request_deadline", "ms")?;
     unit(&mut queue, "admission_window_ms", "admission_window", "ms")?;
-    let mut qualification = h["qualification_policy"].clone();
-    if !qualification.is_null() {
-        unit(
-            &mut qualification,
-            "max_run_duration_ms",
-            "max_run_duration",
-            "ms",
-        )?;
-        unit(
-            &mut qualification,
-            "max_cleanup_duration_ms",
-            "max_cleanup_duration",
-            "ms",
-        )?;
-        unit(
-            &mut qualification,
-            "max_request_body_bytes",
-            "max_request_body_bytes",
-            "B",
-        )?;
-    }
     let host = json!({
         "schema_version": 1, "kind":"host", "name":h["name"],
         "hardware_fingerprint":h["hardware_fingerprint"], "environment_fingerprint":h["environment_fingerprint"],
-        "runtime_profiles":{"snapshot":profile}, "qualification_policy":qualification,
+        "runtime_profiles":{"snapshot":profile},
         "resource_policy": {
             "domains":domains, "devices":h["devices"], "max_parked":h["max_parked"],
             "observation_ttl":quantity(&h["observation_ttl_ms"], "ms")?, "device_sharing":h["device_sharing"],

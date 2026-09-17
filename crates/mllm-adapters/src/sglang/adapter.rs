@@ -261,7 +261,6 @@ impl EngineAdapter for SglangAdapter {
                 &c.token.deployment_id,
                 &c.token.operation_id,
                 &c.token.step_id,
-                &c.token.qualification_id,
             ]
             .iter()
             .any(|value| value.is_empty())

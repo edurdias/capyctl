@@ -366,7 +366,7 @@ pub struct ReserveBinding {
     pub id: String,
     pub fence: DeploymentFence,
     pub incarnation: String,
-    pub qualification_id: String,
+    pub identity_id: String,
     pub ownership: String,
     pub endpoint_host: String,
     pub endpoint_port: u16,
@@ -380,7 +380,7 @@ pub struct StoredRuntimeBinding {
     pub deployment_id: String,
     pub revision: i64,
     pub incarnation: String,
-    pub qualification_id: String,
+    pub identity_id: String,
     pub ownership: String,
     pub endpoint: String,
     pub credential_ref: String,
@@ -392,7 +392,7 @@ pub struct StoredRuntimeBinding {
 #[serde(deny_unknown_fields)]
 pub(crate) struct BindingDto {
     pub(crate) version: u32,
-    pub(crate) qualification_id: String,
+    pub(crate) identity_id: String,
     pub(crate) endpoint: String,
     pub(crate) credential_ref: String,
     pub(crate) payload: String,
@@ -434,7 +434,7 @@ impl PreparedBinding {
             || request.fence.revision < 1
             || request.fence.generation < 1
             || !valid_text(&request.incarnation)
-            || !valid_text(&request.qualification_id)
+            || !valid_text(&request.identity_id)
             || !matches!(request.ownership.as_str(), "managed" | "attached")
             || request.endpoint_host != "127.0.0.1"
             || request.endpoint_port == 0
@@ -447,7 +447,7 @@ impl PreparedBinding {
             .map_err(|_| LifecycleError::Conflict)?;
         let json = serde_json::to_string(&BindingDto {
             version: 1,
-            qualification_id: request.qualification_id.clone(),
+            identity_id: request.identity_id.clone(),
             endpoint: format!("{}:{}", request.endpoint_host, request.endpoint_port),
             credential_ref: request.credential_ref.clone(),
             payload: request.binding_payload.clone(),
@@ -997,7 +997,7 @@ impl crate::Store {
             deployment_id: deployment_id.into(),
             revision,
             incarnation,
-            qualification_id: binding.qualification_id,
+            identity_id: binding.identity_id,
             ownership,
             endpoint: binding.endpoint,
             credential_ref: binding.credential_ref,
@@ -1530,7 +1530,7 @@ mod tests {
                 generation: 1,
             },
             incarnation: format!("incarnation-{deployment}"),
-            qualification_id: "qualified".into(),
+            identity_id: "qualified".into(),
             ownership: "managed".into(),
             endpoint_host: "127.0.0.1".into(),
             endpoint_port: port,
@@ -1583,7 +1583,7 @@ mod tests {
                     id: "binding-uncertain".into(),
                     fence: fence.clone(),
                     incarnation: "incarnation-uncertain".into(),
-                    qualification_id: "qualified".into(),
+                    identity_id: "qualified".into(),
                     ownership: "managed".into(),
                     endpoint_host: "127.0.0.1".into(),
                     endpoint_port: port,

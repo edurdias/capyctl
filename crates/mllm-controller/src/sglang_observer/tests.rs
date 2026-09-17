@@ -11,7 +11,6 @@ fn token() -> TransitionToken {
         generation: 1,
         operation_id: "op-1".into(),
         step_id: "step-1".into(),
-        qualification_id: "candidate:run-1".into(),
     }
 }
 

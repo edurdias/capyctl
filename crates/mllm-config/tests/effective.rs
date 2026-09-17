@@ -12,6 +12,21 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
     (all["deployment"].clone(), all["host"].clone())
 }
 
+/// ADR 0011: a runtime profile carries no qualification reference. A host file
+/// that still has the key is refused by the strict schema with the key named.
+#[test]
+fn a_runtime_profile_has_no_declared_identity_key() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["qualification_id"] = serde_json::json!("x");
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert!(error.to_string().contains("qualification_id"), "{error}");
+    host["runtime_profiles"]["local"]
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification_id");
+    resolve_effective(&deployment, &host).unwrap();
+}
+
 /// Set the topology of the lab host's only domain. Used here and by the host-check
 /// tests below (ADR 0010 decision 5).
 fn host_with_domain_memory(memory: &str) -> serde_json::Value {
@@ -183,269 +198,6 @@ fn ordinary_engine_compatibility_goldens() {
     }
 }
 
-fn qualification_policy() -> serde_json::Value {
-    serde_json::json!({
-        "revision": 1,
-        "allow_qualification_runs": true,
-        "allow_experimental_controls": false,
-        "allowed_manifest_digests": [
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            "0000000000000000000000000000000000000000000000000000000000000000"
-        ],
-        "max_run_duration": "24h",
-        "max_cleanup_duration": "1h",
-        "max_cases": 128,
-        "max_requests": 4096,
-        "max_request_body_bytes": "1MiB",
-        "max_input_tokens_per_request": 131072,
-        "max_output_tokens_per_request": 16384
-    })
-}
-
-#[test]
-fn qualification_policy_is_optional_and_normalized_without_authorizing_runs() {
-    let (deployment, host) = fixture();
-    let absent = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(absent.host.qualification_policy, None);
-
-    let mut host = host;
-    host["qualification_policy"] = qualification_policy();
-    let effective = resolve_effective(&deployment, &host).unwrap();
-    let policy = effective.host.qualification_policy.unwrap();
-    assert_eq!(policy.revision, 1);
-    assert!(policy.allow_qualification_runs);
-    assert!(!policy.allow_experimental_controls);
-    assert_eq!(policy.max_run_duration_ms, 86_400_000);
-    assert_eq!(policy.max_cleanup_duration_ms, 3_600_000);
-    assert_eq!(policy.max_request_body_bytes, 1 << 20);
-    assert!(policy
-        .allowed_manifest_digests
-        .windows(2)
-        .all(|w| w[0] < w[1]));
-}
-
-#[test]
-fn qualification_permissions_are_independent_and_empty_allowlist_is_deny_all() {
-    for permissions in [(false, false), (false, true), (true, false), (true, true)] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy["allow_qualification_runs"] = permissions.0.into();
-        policy["allow_experimental_controls"] = permissions.1.into();
-        policy["allowed_manifest_digests"] = serde_json::json!([]);
-        host["qualification_policy"] = policy;
-        let normalized = resolve_effective(&deployment, &host)
-            .unwrap()
-            .host
-            .qualification_policy
-            .unwrap();
-        assert_eq!(normalized.allow_qualification_runs, permissions.0);
-        assert_eq!(normalized.allow_experimental_controls, permissions.1);
-        assert!(normalized.allowed_manifest_digests.is_empty());
-    }
-}
-
-#[test]
-fn qualification_policy_bounds_and_digest_rules_fail_closed() {
-    let digest = "0".repeat(64);
-    let (deployment, mut host) = fixture();
-    let mut exact_digest_limit = qualification_policy();
-    exact_digest_limit["allowed_manifest_digests"] = serde_json::json!((0..1024)
-        .map(|value| format!("{value:064x}"))
-        .collect::<Vec<_>>());
-    host["qualification_policy"] = exact_digest_limit;
-    assert_eq!(
-        resolve_effective(&deployment, &host)
-            .unwrap()
-            .host
-            .qualification_policy
-            .unwrap()
-            .allowed_manifest_digests
-            .len(),
-        1024
-    );
-    for (field, value) in [
-        ("revision", serde_json::json!(0)),
-        ("max_run_duration", serde_json::json!("86400001ms")),
-        ("max_cleanup_duration", serde_json::json!("3600001ms")),
-        ("max_cases", serde_json::json!(129)),
-        ("max_requests", serde_json::json!(4097)),
-        ("max_request_body_bytes", serde_json::json!("1048577B")),
-        ("max_input_tokens_per_request", serde_json::json!(131073)),
-        ("max_output_tokens_per_request", serde_json::json!(16385)),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = value;
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
-    }
-    for bad in [
-        "A".repeat(64),
-        "0".repeat(63),
-        format!("{}g", "0".repeat(63)),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy["allowed_manifest_digests"] = serde_json::json!([bad]);
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err());
-    }
-    for digests in [vec![digest.clone(), digest], vec!["0".repeat(64); 1025]] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy["allowed_manifest_digests"] = serde_json::json!(digests);
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err());
-    }
-}
-
-#[test]
-fn qualification_policy_requires_complete_typed_bounded_input() {
-    for field in [
-        "revision",
-        "allow_qualification_runs",
-        "allow_experimental_controls",
-        "allowed_manifest_digests",
-        "max_run_duration",
-        "max_cleanup_duration",
-        "max_cases",
-        "max_requests",
-        "max_request_body_bytes",
-        "max_input_tokens_per_request",
-        "max_output_tokens_per_request",
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy.as_object_mut().unwrap().remove(field);
-        host["qualification_policy"] = policy;
-        let error = resolve_effective(&deployment, &host).unwrap_err();
-        assert_eq!(
-            error.code,
-            ConfigErrorCode::MissingRequired,
-            "{field}: {error:?}"
-        );
-        assert!(error.path.ends_with(field), "{field}: {error:?}");
-    }
-    for (field, value) in [
-        ("revision", serde_json::json!("secret-value")),
-        ("max_cases", serde_json::json!(-1)),
-        ("max_requests", serde_json::json!(18446744073709551615u64)),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = value;
-        host["qualification_policy"] = policy;
-        let error = resolve_effective(&deployment, &host).unwrap_err();
-        assert!(error.path.ends_with(field), "{error:?}");
-        assert!(!error.to_string().contains("secret-value"));
-    }
-    let (deployment, mut host) = fixture();
-    let mut policy = qualification_policy();
-    policy["unknown"] = serde_json::json!("secret-value");
-    host["qualification_policy"] = policy;
-    let error = resolve_effective(&deployment, &host).unwrap_err();
-    assert_eq!(error.code, ConfigErrorCode::UnknownField);
-    assert!(
-        error.path.ends_with("qualification_policy.unknown"),
-        "{error:?}"
-    );
-    assert!(!error.to_string().contains("secret-value"));
-}
-
-#[test]
-fn qualification_policy_rejects_zero_overflow_and_oversized_encoding() {
-    for field in [
-        "revision",
-        "max_cases",
-        "max_requests",
-        "max_input_tokens_per_request",
-        "max_output_tokens_per_request",
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = 0.into();
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
-    }
-    for (field, value) in [
-        ("max_run_duration", "0ms"),
-        ("max_cleanup_duration", "0ms"),
-        ("max_request_body_bytes", "0B"),
-        ("max_run_duration", "9223372036854775808ms"),
-        ("max_cleanup_duration", "9223372036854775808ms"),
-        ("max_request_body_bytes", "9223372036854775808B"),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = value.into();
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
-    }
-    let (deployment, mut host) = fixture();
-    let mut policy = qualification_policy();
-    policy["max_run_duration"] = format!("{}ms", "1".repeat(1 << 20)).into();
-    host["qualification_policy"] = policy;
-    let error = resolve_effective(&deployment, &host).unwrap_err();
-    assert!(error.to_string().contains("encoding exceeds 1MiB"));
-}
-
-#[test]
-fn qualification_policy_is_not_part_of_recipe_qualification_identity() {
-    let (deployment, host) = fixture();
-    let original = resolve_effective(&deployment, &host).unwrap();
-    let mut changed = host;
-    changed["qualification_policy"] = qualification_policy();
-    let changed = resolve_effective(&deployment, &changed).unwrap();
-    assert_eq!(
-        original.qualification_fingerprint,
-        changed.qualification_fingerprint
-    );
-    assert_ne!(
-        original.host.qualification_policy,
-        changed.host.qualification_policy
-    );
-}
-
-#[test]
-fn normalized_policy_exposes_shared_fail_closed_validation() {
-    let (deployment, mut host) = fixture();
-    host["qualification_policy"] = qualification_policy();
-    let policy = resolve_effective(&deployment, &host)
-        .unwrap()
-        .host
-        .qualification_policy
-        .unwrap();
-    assert!(policy.validate().is_ok());
-
-    let mut stale_or_forged = policy.clone();
-    stale_or_forged.max_requests = 4097;
-    assert!(stale_or_forged.validate().is_err());
-    let mut noncanonical = policy;
-    noncanonical.allowed_manifest_digests.reverse();
-    assert!(noncanonical.validate().is_err());
-}
-
-#[test]
-fn strict_yaml_accepts_only_complete_qualification_policy_shape() {
-    let yaml = "schema_version: 1\nkind: host\nname: h\nqualification_policy:\n  revision: 1\n  allow_qualification_runs: false\n  allow_experimental_controls: true\n  allowed_manifest_digests: []\n  max_run_duration: 24h\n  max_cleanup_duration: 60m\n  max_cases: 128\n  max_requests: 4096\n  max_request_body_bytes: 1024KiB\n  max_input_tokens_per_request: 131072\n  max_output_tokens_per_request: 16384\n";
-    assert!(parse_strict(ConfigKind::Host, yaml).is_ok());
-    assert_eq!(
-        parse_strict(ConfigKind::Host, &yaml.replace("  max_cases: 128\n", ""))
-            .unwrap_err()
-            .code,
-        ConfigErrorCode::MissingRequired
-    );
-    assert_eq!(
-        parse_strict(
-            ConfigKind::Host,
-            &yaml.replace("  max_cases: 128", "  surprise: 128")
-        )
-        .unwrap_err()
-        .code,
-        ConfigErrorCode::UnknownField
-    );
-}
-
 #[test]
 fn byte_parser_rejects_time_and_overflow() {
     assert_eq!(parse_bytes("1.5KiB").unwrap(), 1536);
@@ -468,10 +220,6 @@ fn resolves_complete_typed_configuration_without_claiming_qualification() {
     let effective = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(effective.profile.engine, Engine::Vllm);
     assert_eq!(
-        effective.profile.qualification_id,
-        "qualification-evidence-17"
-    );
-    assert_eq!(
         effective.resources.ready.allocations[0].bytes,
         8 * 1024 * 1024 * 1024
     );
@@ -481,7 +229,7 @@ fn resolves_complete_typed_configuration_without_claiming_qualification() {
         effective.profile.launch_settings,
         ProfileLaunchSettings::Vllm(_)
     ));
-    assert_eq!(effective.qualification_fingerprint.len(), 64);
+    assert_eq!(effective.recipe_fingerprint.len(), 64);
     assert!(!serde_json::to_string(&effective)
         .unwrap()
         .contains("secret-value"));
@@ -599,17 +347,17 @@ fn profile_revision_and_fingerprint_are_exact() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
     assert_ne!(
-        changed.qualification_fingerprint,
-        original.qualification_fingerprint
+        changed.recipe_fingerprint,
+        original.recipe_fingerprint
     );
 }
 
 #[test]
-fn owned_launch_setting_mutations_change_qualification_identity() {
+fn owned_launch_setting_mutations_change_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     for (pointer, value) in [
         (
             "/runtime_profiles/local/launch_settings/tensor_parallel_size",
@@ -647,13 +395,13 @@ fn owned_launch_setting_mutations_change_qualification_identity() {
         let mut changed_host = host.clone();
         *changed_host.pointer_mut(pointer).unwrap() = value;
         let changed = resolve_effective(&deployment, &changed_host).unwrap();
-        assert_ne!(original, changed.qualification_fingerprint, "{pointer}");
+        assert_ne!(original, changed.recipe_fingerprint, "{pointer}");
     }
     let mut restart = deployment.clone();
     restart["residency"] = "restart_only".into();
     let baseline = resolve_effective(&restart, &host)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     let mut changed_host = host;
     changed_host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] =
         false.into();
@@ -661,7 +409,7 @@ fn owned_launch_setting_mutations_change_qualification_identity() {
         baseline,
         resolve_effective(&restart, &changed_host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 }
 
@@ -670,7 +418,7 @@ fn qualification_dimensions_fail_to_alias() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     for (side, pointer, value) in [
         (
             "deployment",
@@ -736,7 +484,7 @@ fn qualification_dimensions_fail_to_alias() {
         };
         *target.pointer_mut(pointer).unwrap() = value;
         let changed = resolve_effective(&changed_deployment, &changed_host).unwrap();
-        assert_ne!(original, changed.qualification_fingerprint, "{pointer}");
+        assert_ne!(original, changed.recipe_fingerprint, "{pointer}");
     }
 
     let mut changed_deployment = deployment.clone();
@@ -747,7 +495,7 @@ fn qualification_dimensions_fail_to_alias() {
         original,
         resolve_effective(&changed_deployment, &changed_host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 
     let mut changed_deployment = deployment.clone();
@@ -759,7 +507,7 @@ fn qualification_dimensions_fail_to_alias() {
         original,
         resolve_effective(&changed_deployment, &host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 
     let mut auth_structure = host.clone();
@@ -769,7 +517,7 @@ fn qualification_dimensions_fail_to_alias() {
         original,
         resolve_effective(&deployment, &auth_structure)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 
     let mut restart = deployment.clone();
@@ -778,13 +526,13 @@ fn qualification_dimensions_fail_to_alias() {
     controls["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
     let enabled = resolve_effective(&restart, &controls)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     controls["runtime_profiles"]["local"]["security"]["experimental_controls"] = false.into();
     assert_ne!(
         enabled,
         resolve_effective(&restart, &controls)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 }
 
@@ -826,7 +574,7 @@ fn unsupported_launch_mutations_fail_closed() {
 }
 
 #[test]
-fn equivalent_byte_units_have_identical_qualification_identity() {
+fn equivalent_byte_units_have_identical_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
     let mut equivalent = host;
@@ -834,8 +582,8 @@ fn equivalent_byte_units_have_identical_qualification_identity() {
         ["kv_cache_bytes"] = "4096MiB".into();
     let normalized = resolve_effective(&deployment, &equivalent).unwrap();
     assert_eq!(
-        original.qualification_fingerprint,
-        normalized.qualification_fingerprint
+        original.recipe_fingerprint,
+        normalized.recipe_fingerprint
     );
 }
 
@@ -851,8 +599,8 @@ fn equivalent_resource_units_have_identical_normalized_controls() {
         ResourceControls::from_host(&normalized.host)
     );
     assert_eq!(
-        original.qualification_fingerprint,
-        normalized.qualification_fingerprint
+        original.recipe_fingerprint,
+        normalized.recipe_fingerprint
     );
 }
 
@@ -878,11 +626,11 @@ fn parsed_host_uses_shared_resource_validation_during_resolution() {
 }
 
 #[test]
-fn binding_dimensions_change_binding_not_qualification_identity() {
+fn binding_dimensions_change_binding_not_recipe_identity() {
     let (deployment, host) = fixture();
     let qualification = resolve_effective(&deployment, &host)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     let base = binding_fingerprint("127.0.0.1:8100", "toy", "secret://a", "inc-1");
     for changed in [
         binding_fingerprint("127.0.0.1:8101", "toy", "secret://a", "inc-1"),
@@ -896,7 +644,7 @@ fn binding_dimensions_change_binding_not_qualification_identity() {
         qualification,
         resolve_effective(&deployment, &host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 }
 
@@ -909,8 +657,8 @@ fn resolved_snapshot_isolated_from_later_profile_edits() {
     let later = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(bytes, serde_json::to_vec(&snapshot).unwrap());
     assert_ne!(
-        snapshot.qualification_fingerprint,
-        later.qualification_fingerprint
+        snapshot.recipe_fingerprint,
+        later.recipe_fingerprint
     );
 }
 
@@ -961,15 +709,15 @@ fn sglang_recipe_expands_to_exact_normalized_settings() {
 }
 
 #[test]
-fn credential_reference_values_do_not_change_qualification_identity() {
+fn credential_reference_values_do_not_change_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
     let mut edited = host;
     edited["runtime_profiles"]["local"]["security"]["credential_ref"] = "secret://rotated".into();
     let rotated = resolve_effective(&deployment, &edited).unwrap();
     assert_eq!(
-        original.qualification_fingerprint,
-        rotated.qualification_fingerprint
+        original.recipe_fingerprint,
+        rotated.recipe_fingerprint
     );
     assert_eq!(
         original.profile.security.credential_ref.as_deref(),
@@ -1024,8 +772,8 @@ fn resolver_rejects_secret_device_and_unrecognized_environment_names() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
     assert_ne!(
-        changed.qualification_fingerprint,
-        original.qualification_fingerprint
+        changed.recipe_fingerprint,
+        original.recipe_fingerprint
     );
 }
 

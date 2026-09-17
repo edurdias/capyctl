@@ -1334,7 +1334,6 @@ async fn drive(
         || context.token.deployment_id != work.fence().deployment_id
         || context.token.revision != work.fence().revision
         || context.token.generation != work.fence().generation
-        || context.token.qualification_id != work.effective().profile.qualification_id
         || context.deadline_ms != work.deadline_ms()
         || context.launch_settings.as_ref() != Some(&work.effective().profile.launch_settings)
     {

@@ -108,7 +108,6 @@ impl Plan {
                 generation: self.generation,
                 operation_id: self.operation_id.clone(),
                 step_id: self.step_id.clone(),
-                qualification_id: effective.profile.qualification_id.clone(),
             },
             binding_id: self.binding_id.clone(),
             incarnation: self.incarnation.clone(),
@@ -177,7 +176,7 @@ fn effective(
     let effective =
         decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
     let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='managed_configuration_create' AND state='succeeded')", [&fence.deployment_id], |r| r.get(0))?;
-    if !managed || fingerprint != effective.qualification_fingerprint {
+    if !managed || fingerprint != effective.recipe_fingerprint {
         return Err(LifecycleError::Conflict);
     }
     let consistent: bool = tx.query_row(
@@ -311,11 +310,11 @@ fn load(
     if effective_json != p.effective_json {
         return Err(LifecycleError::Conflict);
     }
-    let catalog = binding_identity(&e)?;
+    let identity = binding_identity(&e)?;
     let binding: BindingDto = decode(&p.binding_json)?;
     if binding.version != 1
-        || binding.qualification_id != catalog.id()
-        || binding.payload != catalog.payload()?
+        || binding.identity_id != identity.id()
+        || binding.payload != identity.payload()?
         || binding.credential_ref
             != e.profile
                 .security
@@ -475,13 +474,13 @@ fn binding_identity(
         version: 1,
         kind: "declared",
         residency: residency_name(e.residency).to_string(),
-        recipe_fingerprint: e.qualification_fingerprint.clone(),
+        recipe_fingerprint: e.recipe_fingerprint.clone(),
         host: e.host.name.clone(),
         hardware_fingerprint: e.host.hardware_fingerprint.clone(),
         environment_fingerprint: e.host.environment_fingerprint.clone(),
     };
     Ok(BindingIdentity::Declared {
-        id: format!("declared:{}", e.qualification_fingerprint),
+        id: format!("declared:{}", e.recipe_fingerprint),
         payload: encode(&descriptor)?,
     })
 }
@@ -540,7 +539,7 @@ impl crate::Store {
             check_managed_command_target(tx, &f.deployment_id)?;
         }
         let (raw, e) = effective(tx, f)?;
-        let catalog =
+        let identity =
             binding_identity(&e).map_err(|error| match error {
                 LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
                     LifecycleError::Unsupported
@@ -587,7 +586,7 @@ impl crate::Store {
             .clone()
             .filter(|v| !v.trim().is_empty())
             .ok_or(LifecycleError::Conflict)?;
-        let payload = catalog.payload()?;
+        let payload = identity.payload()?;
         let mut reserved = None;
         for port in e.host.endpoint_port_range.start..=e.host.endpoint_port_range.end {
             let leased: bool = tx.query_row(
@@ -602,7 +601,7 @@ impl crate::Store {
                 id: binding_id.clone(),
                 fence: f.clone(),
                 incarnation: incarnation.clone(),
-                qualification_id: catalog.id().into(),
+                identity_id: identity.id().into(),
                 ownership: "managed".into(),
                 endpoint_host: "127.0.0.1".into(),
                 endpoint_port: port,

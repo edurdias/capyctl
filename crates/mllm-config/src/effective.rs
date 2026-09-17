@@ -141,7 +141,7 @@ pub struct EffectiveDeployment {
     pub request_deadline_ms: i64,
     pub profile: RuntimeProfile,
     pub host: HostPolicy,
-    pub qualification_fingerprint: String,
+    pub recipe_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,7 +221,6 @@ pub struct RuntimeProfile {
     pub revision: u64,
     pub executable: String,
     pub build_fingerprint: String,
-    pub qualification_id: String,
     pub args: Vec<String>,
     pub launch_settings: ProfileLaunchSettings,
     pub env: BTreeMap<String, String>,
@@ -256,73 +255,6 @@ pub struct HostPolicy {
     pub endpoint_port_range: PortRange,
     pub planner_max_states: u32,
     pub queue: QueuePolicy,
-    pub qualification_policy: Option<QualificationPolicy>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct QualificationPolicy {
-    pub revision: i64,
-    pub allow_qualification_runs: bool,
-    pub allow_experimental_controls: bool,
-    pub allowed_manifest_digests: Vec<String>,
-    pub max_run_duration_ms: i64,
-    pub max_cleanup_duration_ms: i64,
-    pub max_cases: u32,
-    pub max_requests: u32,
-    pub max_request_body_bytes: i64,
-    pub max_input_tokens_per_request: u32,
-    pub max_output_tokens_per_request: u32,
-}
-
-impl QualificationPolicy {
-    /// Revalidates normalized policy data before a persistence boundary.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        let encoding_len = serde_json::to_vec(self)
-            .map_err(|_| invalid("qualification_policy", "policy could not be encoded"))?
-            .len();
-        if encoding_len > 1 << 20
-            || self.revision <= 0
-            || self.allowed_manifest_digests.len() > 1_024
-            || self.max_cases == 0
-            || self.max_cases > 128
-            || self.max_requests == 0
-            || self.max_requests > 4_096
-            || self.max_input_tokens_per_request == 0
-            || self.max_input_tokens_per_request > 131_072
-            || self.max_output_tokens_per_request == 0
-            || self.max_output_tokens_per_request > 16_384
-            || !(1..=86_400_000).contains(&self.max_run_duration_ms)
-            || !(1..=3_600_000).contains(&self.max_cleanup_duration_ms)
-            || !(1..=(1 << 20)).contains(&self.max_request_body_bytes)
-        {
-            return Err(invalid(
-                "qualification_policy",
-                "qualification policy exceeds bounded positive limits",
-            ));
-        }
-        if self.allowed_manifest_digests.iter().any(|digest| {
-            digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        }) {
-            return Err(invalid(
-                "qualification_policy.allowed_manifest_digests",
-                "manifest digest must be canonical lowercase SHA-256 hex",
-            ));
-        }
-        if self
-            .allowed_manifest_digests
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        {
-            return Err(invalid(
-                "qualification_policy.allowed_manifest_digests",
-                "manifest digests must be sorted and distinct",
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Whether a domain's device memory and host memory are one physical pool.
@@ -417,24 +349,8 @@ struct HostInput {
     environment_fingerprint: String,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
-    qualification_policy: Option<RawQualificationPolicy>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawQualificationPolicy {
-    revision: i64,
-    allow_qualification_runs: bool,
-    allow_experimental_controls: bool,
-    allowed_manifest_digests: Vec<String>,
-    max_run_duration: String,
-    max_cleanup_duration: String,
-    max_cases: u32,
-    max_requests: u32,
-    max_request_body_bytes: String,
-    max_input_tokens_per_request: u32,
-    max_output_tokens_per_request: u32,
-}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHostPolicy {
@@ -546,24 +462,11 @@ struct RawProfile {
     revision: u64,
     executable: String,
     build_fingerprint: String,
-    #[serde(default)]
-    qualification_id: MissingAwareQualification,
     args: Vec<String>,
     launch_settings: RawLaunchSettings,
     env: BTreeMap<String, String>,
     security: Security,
     log_policy: RawLogPolicy,
-}
-#[derive(Clone, Default)]
-enum MissingAwareQualification {
-    #[default]
-    Missing,
-    Present(Option<String>),
-}
-impl<'de> Deserialize<'de> for MissingAwareQualification {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Option::<String>::deserialize(deserializer).map(Self::Present)
-    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -651,33 +554,6 @@ fn decode<T: for<'de> Deserialize<'de>>(
         };
         ConfigError::new(code, error_path, safe_detail)
     })
-}
-
-fn normalize_qualification_policy(
-    raw: Option<RawQualificationPolicy>,
-) -> Result<Option<QualificationPolicy>, ConfigError> {
-    let Some(mut raw) = raw else {
-        return Ok(None);
-    };
-    raw.allowed_manifest_digests.sort();
-    let max_run_duration_ms = parse_duration_ms(&raw.max_run_duration)?;
-    let max_cleanup_duration_ms = parse_duration_ms(&raw.max_cleanup_duration)?;
-    let max_request_body_bytes = parse_bytes(&raw.max_request_body_bytes)?;
-    let policy = QualificationPolicy {
-        revision: raw.revision,
-        allow_qualification_runs: raw.allow_qualification_runs,
-        allow_experimental_controls: raw.allow_experimental_controls,
-        allowed_manifest_digests: raw.allowed_manifest_digests,
-        max_run_duration_ms,
-        max_cleanup_duration_ms,
-        max_cases: raw.max_cases,
-        max_requests: raw.max_requests,
-        max_request_body_bytes,
-        max_input_tokens_per_request: raw.max_input_tokens_per_request,
-        max_output_tokens_per_request: raw.max_output_tokens_per_request,
-    };
-    policy.validate()?;
-    Ok(Some(policy))
 }
 
 fn normalize_launch(
@@ -836,32 +712,12 @@ pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
 ) -> Result<EffectiveDeployment, ConfigError> {
-    if host
-        .get("qualification_policy")
-        .is_some_and(|policy| serde_json::to_vec(policy).is_ok_and(|bytes| bytes.len() > 1 << 20))
-    {
-        return Err(invalid(
-            "host.qualification_policy",
-            "qualification policy encoding exceeds 1MiB",
-        ));
-    }
     let d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode(host, "host")?;
     if d.schema_version != 1 || d.kind != "deployment" {
         return Err(invalid(
             "schema_version",
             "schema version 1 and deployment kind required",
-        ));
-    }
-    if h.runtime_profiles.values().any(|profile| {
-        !matches!(
-            profile.qualification_id,
-            MissingAwareQualification::Present(Some(_))
-        )
-    }) {
-        return Err(invalid(
-            "runtime_profiles.qualification_id",
-            "qualification reference is required for ordinary host resolution",
         ));
     }
     if d.name.is_empty() {
@@ -877,15 +733,6 @@ pub fn resolve_effective(
         .runtime_profiles
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
-    let qualification_id = match &raw_profile.qualification_id {
-        MissingAwareQualification::Present(Some(value)) if !value.is_empty() => value.clone(),
-        _ => {
-            return Err(invalid(
-                "runtime_profiles.qualification_id",
-                "selected qualification reference must be nonempty",
-            ))
-        }
-    };
     let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
     let host = core::normalize_host(h)?;
     let recipe = core::NormalizedRecipe {
@@ -909,7 +756,7 @@ pub fn resolve_effective(
             .unwrap_or(host.queue.request_deadline_ms),
     };
     core::validate_recipe(&recipe, &host)?;
-    let qualification_fingerprint = core::qualification_fingerprint(&recipe, &profile, &host)?;
+    let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,
         name: d.name,
@@ -926,7 +773,6 @@ pub fn resolve_effective(
             revision: profile.revision,
             executable: profile.executable,
             build_fingerprint: profile.build_fingerprint,
-            qualification_id,
             args: profile.args,
             launch_settings: profile.launch_settings,
             env: profile.env,
@@ -934,7 +780,7 @@ pub fn resolve_effective(
             log_policy: profile.log_policy,
         },
         host,
-        qualification_fingerprint,
+        recipe_fingerprint,
     })
 }
 

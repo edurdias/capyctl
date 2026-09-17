@@ -201,7 +201,7 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
         &p.effective_json,
     )
     .map_err(|_| LifecycleError::CorruptStoredData)?;
-    let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.step_json=?6 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?7 AND effective_json=?8 AND fingerprint=?9) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded') AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1", params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,encode(p)?,p.revision,p.effective_json,e.qualification_fingerprint], |r|r.get(0))?;
+    let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.step_json=?6 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?7 AND effective_json=?8 AND fingerprint=?9) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded') AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1", params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,encode(p)?,p.revision,p.effective_json,e.recipe_fingerprint], |r|r.get(0))?;
     // Re-derive the identity this binding must carry rather than matching the
     // qualified spelling of it. A restart-only deployment is identified by its
     // recipe and host, and cleanup is engine-agnostic anyway: it proves the
@@ -210,7 +210,7 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
     let b: BindingDto = decode(&p.binding_json)?;
     if !exact
         || b.version != 1
-        || b.qualification_id != identity.id()
+        || b.identity_id != identity.id()
         || b.payload != identity.payload()?
         || Some(&b.credential_ref) != e.profile.security.credential_ref.as_ref()
     {

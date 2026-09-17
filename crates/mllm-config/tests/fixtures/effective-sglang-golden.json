@@ -155,7 +155,6 @@
             "max_file_bytes": "16MiB",
             "retained_files": 3
           },
-          "qualification_id": "qualification-evidence-17",
           "revision": 7,
           "security": {
             "admin_credential_ref": "secret://admin-key",
@@ -195,7 +194,6 @@
       "name": "lab",
       "observation_ttl_ms": 2000,
       "planner_max_states": 4096,
-      "qualification_policy": null,
       "queue": {
         "admission_window_ms": 2000,
         "max_buffered_bytes_total": 67108864,
@@ -249,7 +247,6 @@
         "max_file_bytes": 16777216,
         "retained_files": 3
       },
-      "qualification_id": "qualification-evidence-17",
       "revision": 7,
       "security": {
         "admin_credential_ref": "secret://admin-key",
@@ -257,8 +254,8 @@
         "experimental_controls": true
       }
     },
-    "qualification_fingerprint": "1008bc93bf285b157d3db54551731b14d13e9e528d21e9f4a136572bb0f2224b",
     "recipe": "standard",
+    "recipe_fingerprint": "1008bc93bf285b157d3db54551731b14d13e9e528d21e9f4a136572bb0f2224b",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
     "residency": "deep",

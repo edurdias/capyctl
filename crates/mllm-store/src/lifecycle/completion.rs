@@ -107,7 +107,6 @@ struct TokenDto {
     generation: i64,
     operation_id: String,
     step_id: String,
-    qualification_id: String,
 }
 impl From<&TransitionToken> for TokenDto {
     fn from(t: &TransitionToken) -> Self {
@@ -117,7 +116,6 @@ impl From<&TransitionToken> for TokenDto {
             generation: t.generation,
             operation_id: t.operation_id.clone(),
             step_id: t.step_id.clone(),
-            qualification_id: t.qualification_id.clone(),
         }
     }
 }
@@ -170,7 +168,6 @@ pub(crate) fn completion_value(e: &CompletionEvidence) -> Result<CompletionEvide
             &e.token.deployment_id,
             &e.token.operation_id,
             &e.token.step_id,
-            &e.token.qualification_id,
         ]
         .iter()
         .any(|s| s.len() > 4096)

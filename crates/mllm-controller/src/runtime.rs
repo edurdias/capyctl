@@ -24,7 +24,7 @@ pub struct RuntimeBinding {
     pub deployment_id: String,
     pub revision: i64,
     pub incarnation: String,
-    pub qualification_id: String,
+    pub identity_id: String,
     pub recipe: RecipeFootprints,
     pub ownership: RuntimeOwnership,
     pub endpoint: String,

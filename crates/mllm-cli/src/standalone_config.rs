@@ -42,7 +42,6 @@ pub fn host_policy(
                 "revision": 1,
                 "executable": executable,
                 "build_fingerprint": build_fingerprint,
-                "qualification_id": format!("standalone-{build_fingerprint}"),
                 "args": [],
                 "env": {},
                 "launch_settings": {"engine": engine},

@@ -248,7 +248,7 @@ impl crate::Store {
                 params![route, receipt.deployment_id],
             )?;
         }
-        tx.execute("INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) VALUES(?1,?2,?3,?4)",params![receipt.deployment_id,revision,effective_json,effective.qualification_fingerprint])?;
+        tx.execute("INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) VALUES(?1,?2,?3,?4)",params![receipt.deployment_id,revision,effective_json,effective.recipe_fingerprint])?;
         persist_receipt(
             &tx,
             principal,

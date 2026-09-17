@@ -180,7 +180,6 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         .resource_policy
         .planner_max_states
         .unwrap_or(DEFAULT_PLANNER_STATES);
-    let qualification_policy = normalize_qualification_policy(h.qualification_policy)?;
     let host = HostPolicy {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
@@ -193,7 +192,6 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         endpoint_port_range: h.resource_policy.endpoint_port_range,
         planner_max_states,
         queue,
-        qualification_policy,
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)
@@ -339,14 +337,14 @@ pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), Conf
     Ok(())
 }
 
-pub(super) fn qualification_fingerprint(
+pub(super) fn recipe_fingerprint(
     d: &NormalizedRecipe,
     profile: &NormalizedProfile,
     host: &HostPolicy,
 ) -> Result<String, ConfigError> {
     let resources = &d.resources;
     #[derive(Serialize)]
-    struct Qualification<'a> {
+    struct Recipe<'a> {
         model: &'a ModelIdentity,
         recipe: &'a str,
         residency: Residency,
@@ -369,7 +367,7 @@ pub(super) fn qualification_fingerprint(
         hardware_fingerprint: &'a str,
         environment_fingerprint: &'a str,
     }
-    let material = Qualification {
+    let material = Recipe {
         model: &d.model,
         recipe: &d.recipe,
         residency: d.residency,
@@ -392,8 +390,8 @@ pub(super) fn qualification_fingerprint(
         hardware_fingerprint: &host.hardware_fingerprint,
         environment_fingerprint: &host.environment_fingerprint,
     };
-    let qualification_fingerprint = hex::encode(Sha256::digest(
+    let recipe_fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&material).map_err(|e| invalid("fingerprint", e.to_string()))?,
     ));
-    Ok(qualification_fingerprint)
+    Ok(recipe_fingerprint)
 }

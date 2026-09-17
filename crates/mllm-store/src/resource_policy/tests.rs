@@ -43,7 +43,6 @@ fn host() -> HostPolicy {
             request_deadline_ms: 600_000,
             admission_window_ms: 2_000,
         },
-        qualification_policy: None,
     }
 }
 

@@ -223,20 +223,10 @@ async fn scoped_stop_resolves_generation_and_replays_after_worker_shutdown() {
     config["name"] = serde_json::json!("ordinary");
     config["routes"] = serde_json::json!(["ordinary-replaced"]);
     let mut host = golden["input"]["host"].clone();
-    let effective: String = sql
-        .query_row(
-            "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1 AND revision=1",
-            [&fence.deployment_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let effective = mllm_config::effective::decode_effective_snapshot(&effective).unwrap();
     host["runtime_profiles"]["local"]["build_fingerprint"] =
         serde_json::json!("qualification-fake-v1");
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
         serde_json::json!("secret://another-admin");
-    host["runtime_profiles"]["local"]["qualification_id"] =
-        serde_json::json!(effective.profile.qualification_id);
     {
         let o = owner.lock().unwrap();
         o.store()

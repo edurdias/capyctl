@@ -46,7 +46,6 @@ pub struct TransitionToken {
     pub generation: i64,
     pub operation_id: String,
     pub step_id: String,
-    pub qualification_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -157,7 +156,6 @@ pub fn verify_completion(
     if token.deployment_id.is_empty()
         || token.operation_id.is_empty()
         || token.step_id.is_empty()
-        || token.qualification_id.is_empty()
         || token.revision < 1
         || token.generation < 1
         || expected.issued_at_ms < 0

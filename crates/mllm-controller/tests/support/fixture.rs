@@ -123,8 +123,8 @@ pub(crate) fn managed(f: &Fixture, name: &str) -> mllm_store::lifecycle::Deploym
 }
 
 /// One stopped managed deployment, created through the ordinary writer. The
-/// profile still carries a declared qualification identifier because the host
-/// schema still has the field; nothing reads it as evidence.
+/// binding it produces derives its identity from the recipe and host alone
+/// (ADR 0011 decision 1); nothing here declares one separately.
 pub(crate) fn managed_edit(
     f: &Fixture,
     name: &str,
@@ -138,7 +138,6 @@ pub(crate) fn managed_edit(
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
         json!("secret://another-admin");
-    host["runtime_profiles"]["local"]["qualification_id"] = json!("declared:test");
     let mut deployment = source["input"]["deployment"].clone();
     deployment["name"] = json!(name);
     deployment["routes"] = json!([name]);

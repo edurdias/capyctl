@@ -758,7 +758,7 @@ async fn earlier_other_cleanup_does_not_hide_running_initialize_successor() {
 
 #[tokio::test]
 async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
-    let (dir, owner, fence, observations) = setup().await;
+    let (_dir, owner, fence, observations) = setup().await;
     let w = OwnedCoordinator::spawn_fake(
         owner.clone(),
         Arc::new(Observations(observations)),
@@ -805,22 +805,11 @@ async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
         .unwrap();
         let mut config = golden["input"]["deployment"].clone();
         let mut host = golden["input"]["host"].clone();
-        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
-        let raw: String = sql
-            .query_row(
-                "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1",
-                [&fence.deployment_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let original = mllm_config::effective::decode_effective_snapshot(&raw).unwrap();
         config["name"] = json!("ordinary");
         config["routes"] = json!(["ordinary-replaced"]);
         host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
         host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
             json!("secret://another-admin");
-        host["runtime_profiles"]["local"]["qualification_id"] =
-            json!(original.profile.qualification_id);
         let o = owner.lock().unwrap();
         let replacement = o
             .store()

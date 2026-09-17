@@ -137,7 +137,6 @@ mod tests {
             endpoint_port_range: context.endpoint_port_range,
             planner_max_states: controls.planner_max_states,
             queue: controls.queue,
-            qualification_policy: None,
         }
     }
 

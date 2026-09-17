@@ -8,7 +8,6 @@ fn fixture() -> (CompletionExpectation, CompletionEvidence) {
         generation: 7,
         operation_id: "op-a".into(),
         step_id: "park-a-1".into(),
-        qualification_id: "qualified-recipe-a".into(),
     };
     let identities = vec![
         ProcessIdentity {
@@ -74,11 +73,8 @@ fn stale_tokens_do_not_release_resources() {
     let mut changed = evidence.clone();
     changed.token.operation_id.push('x');
     invalid.push(changed);
-    let mut changed = evidence.clone();
-    changed.token.deployment_id.push('x');
-    invalid.push(changed);
     let mut changed = evidence;
-    changed.token.qualification_id.push('x');
+    changed.token.deployment_id.push('x');
     invalid.push(changed);
     for changed in invalid {
         assert_eq!(

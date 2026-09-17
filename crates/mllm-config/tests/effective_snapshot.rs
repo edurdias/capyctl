@@ -17,7 +17,7 @@ fn normalized_snapshot_revalidates_settings_and_fingerprint() {
             effective
         );
         for (pointer, replacement) in [
-            ("/qualification_fingerprint", json!("forged")),
+            ("/recipe_fingerprint", json!("forged")),
             ("/profile/executable", json!("relative")),
             ("/resources/cold/allocations/0/bytes", json!(-1)),
             ("/host/hardware_fingerprint", json!("different")),

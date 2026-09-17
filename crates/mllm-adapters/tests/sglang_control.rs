@@ -63,7 +63,6 @@ fn command(action: RuntimeAction, step: &str) -> RuntimeCommand {
                 generation: 1,
                 operation_id: "operation".into(),
                 step_id: step.into(),
-                qualification_id: "qualification".into(),
             },
             binding_id: BINDING.into(),
             incarnation: INCARNATION.into(),

@@ -564,7 +564,6 @@ mod tests {
                     generation: 1,
                     operation_id: "operation".into(),
                     step_id: step.into(),
-                    qualification_id: "candidate:run".into(),
                 },
                 binding_id: "binding".into(),
                 incarnation: "incarnation".into(),
@@ -583,7 +582,6 @@ mod tests {
     fn qualified_initialize_proves_ready_with_real_fake_probe() {
         use mllm_domain::resources::{Allocation, PhaseFootprint, ResourcePhase};
         let mut c = command(RuntimeAction::Initialize, "ordinary");
-        c.context.token.qualification_id = "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
         c.context.completion_target = Some(PhaseFootprint {
             phase: ResourcePhase::Ready,
             allocations: vec![Allocation {
@@ -620,25 +618,14 @@ mod tests {
             assert!(state.allocations);
             assert!(state.alive);
         }
-        // A restart-only deployment is identified by its recipe rather than by a
-        // qualification, and it is still an ordinary cold initialize.
-        for id in ["declared:recipe-fingerprint", "candidate:run", ""] {
-            c.context.token.qualification_id = id.into();
-            let result = QualificationState::default().execute(&c).unwrap();
-            assert!(
-                result.facts.contains(&Milestone::ModelUsable),
-                "an ordinary initialize proves the model usable whatever its id says"
-            );
-        }
     }
 
-    /// Scope is read from the command, not from its qualification id. A candidate
+    /// Scope is read from the command, not from any identity string. A candidate
     /// child effect acts on identities it retains and names no completion target,
     /// so it keeps its own probe protocol and never takes the ordinary path.
     #[test]
     fn a_child_effect_is_not_an_ordinary_initialize() {
-        let mut c = command(RuntimeAction::Initialize, "child");
-        c.context.token.qualification_id = "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+        let c = command(RuntimeAction::Initialize, "child");
         let mut state = QualificationState::default();
         let result = state.execute(&c).unwrap();
         assert!(

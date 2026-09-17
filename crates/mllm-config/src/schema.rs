@@ -196,7 +196,6 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("revision", SCALAR),
         ("executable", SCALAR),
         ("build_fingerprint", SCALAR),
-        ("qualification_id", SCALAR),
         ("args", FieldSpec::Seq(&SCALAR)),
         ("launch_settings", FieldSpec::Struct(LAUNCH_SETTINGS)),
         ("env", FieldSpec::MapOf(&SCALAR)),
@@ -206,19 +205,6 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("max_file_bytes", BYTES), ("retained_files", SCALAR)]),
         ),
     ]);
-    const QUALIFICATION_POLICY_FIELDS: &[(&str, FieldSpec)] = &[
-        ("revision", SCALAR),
-        ("allow_qualification_runs", SCALAR),
-        ("allow_experimental_controls", SCALAR),
-        ("allowed_manifest_digests", FieldSpec::Seq(&SCALAR)),
-        ("max_run_duration", DURATION),
-        ("max_cleanup_duration", DURATION),
-        ("max_cases", SCALAR),
-        ("max_requests", SCALAR),
-        ("max_request_body_bytes", BYTES),
-        ("max_input_tokens_per_request", SCALAR),
-        ("max_output_tokens_per_request", SCALAR),
-    ];
     // Standalone `server:`/`host:` blocks mirror the generated standalone
     // shape minus `kind` (the wrapper document already carries the kind).
     const STANDALONE_SERVER: &[(&str, FieldSpec)] = &[
@@ -259,10 +245,6 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("environment_fingerprint", SCALAR),
                 ("resource_policy", FieldSpec::Struct(F2_RESOURCE_POLICY)),
                 ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
-                (
-                    "qualification_policy",
-                    FieldSpec::RequiredStruct(QUALIFICATION_POLICY_FIELDS),
-                ),
             ],
         },
         ConfigKind::Deployment => &KindSchema {

@@ -335,9 +335,6 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
     wrong.token.revision += 1;
     mutations.push(wrong);
     let mut wrong = evidence.clone();
-    wrong.token.qualification_id = "qualified:01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
-    mutations.push(wrong);
-    let mut wrong = evidence.clone();
     wrong.identities[1].start_ticks += 1;
     mutations.push(wrong);
     let mut wrong = evidence.clone();
@@ -920,22 +917,11 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
     .unwrap();
     let mut config = golden["input"]["deployment"].clone();
     let mut host = golden["input"]["host"].clone();
-    let raw: String = f
-        .sql
-        .query_row(
-            "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1",
-            [&fence.deployment_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let original = mllm_config::effective::decode_effective_snapshot(&raw).unwrap();
     config["name"] = json!("ordinary");
     config["routes"] = json!(["ordinary-replaced"]);
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
         json!("secret://another-admin");
-    host["runtime_profiles"]["local"]["qualification_id"] =
-        json!(original.profile.qualification_id);
     let replaced = f
         .store
         .replace_stopped_managed_configuration(
@@ -1857,8 +1843,6 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
         json!("secret://another-admin");
-    host["runtime_profiles"]["local"]["qualification_id"] =
-        json!(effective.profile.qualification_id);
     let replaced = store
         .replace_stopped_managed_configuration(
             &session,
@@ -2191,16 +2175,11 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
         "../../mllm-config/tests/fixtures/effective-fake-golden.json"
     ))
     .unwrap();
-    let effective: Value = serde_json::from_str(&plan).unwrap();
-    let effective: Value =
-        serde_json::from_str(effective["effective_json"].as_str().unwrap()).unwrap();
     let mut config = golden["input"]["deployment"].clone();
     let mut host = golden["input"]["host"].clone();
     config["name"] = json!("ordinary");
     config["routes"] = json!(["ordinary-expired-replaced"]);
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
-    host["runtime_profiles"]["local"]["qualification_id"] =
-        effective["profile"]["qualification_id"].clone();
     store
         .replace_stopped_managed_configuration(
             &session,
@@ -2828,14 +2807,6 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
         "../../mllm-config/tests/fixtures/effective-fake-golden.json"
     ))
     .unwrap();
-    let raw: String = sql
-        .query_row(
-            "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1",
-            [id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let effective: Value = serde_json::from_str(&raw).unwrap();
     let mut config = golden["input"]["deployment"].clone();
     let mut host = golden["input"]["host"].clone();
     config["name"] = json!("ordinary");
@@ -2843,8 +2814,6 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
     host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
         json!("secret://another-admin");
-    host["runtime_profiles"]["local"]["qualification_id"] =
-        effective["profile"]["qualification_id"].clone();
     store
         .replace_stopped_managed_configuration(
             &session,

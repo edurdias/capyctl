@@ -199,7 +199,7 @@ pub(super) fn historical_source(tx: &Transaction<'_>, p: &Plan) -> Result<(), Li
     let identity = super::binding_identity(&e)?;
     let binding: BindingDto = decode(&p.binding_json)?;
     if binding.version != 1
-        || binding.qualification_id != identity.id()
+        || binding.identity_id != identity.id()
         || binding.payload != identity.payload()?
         || Some(&binding.credential_ref) != e.profile.security.credential_ref.as_ref()
     {
@@ -215,7 +215,7 @@ pub(super) fn historical_source(tx: &Transaction<'_>, p: &Plan) -> Result<(), Li
     .map_err(historical_error)?;
     let exact: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?6 AND effective_json=?9 AND fingerprint=?10) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded')",
-        params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,p.effective_json,e.qualification_fingerprint], |row| row.get(0))?;
+        params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,p.effective_json,e.recipe_fingerprint], |row| row.get(0))?;
     if !exact {
         return Err(LifecycleError::CorruptStoredData);
     }

@@ -63,9 +63,9 @@ fn a_parking_deployment_gets_a_declared_identity() {
         .unwrap();
     let binding: BindingDto = decode(&binding_json).unwrap();
     assert!(
-        binding.qualification_id.starts_with("declared:"),
+        binding.identity_id.starts_with("declared:"),
         "expected a declared identity, got {}",
-        binding.qualification_id
+        binding.identity_id
     );
     // `DeclaredBindingV1::kind` is `&'static str`, so it is only ever serialized,
     // never deserialized back through the crate's `decode` helper (which requires
