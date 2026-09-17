@@ -9,9 +9,6 @@ mod cleanup;
 #[path = "tests_start_command.rs"]
 mod start_command;
 
-#[path = "tests_candidate.rs"]
-mod candidate_tests;
-
 #[path = "../../tests/support/fixture.rs"]
 mod fixture;
 

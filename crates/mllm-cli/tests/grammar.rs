@@ -45,7 +45,7 @@ fn init_targets() {
 }
 
 #[test]
-fn invite_join_inspect_doctor_qualify() {
+fn invite_join_inspect_doctor() {
     let invite = parse(["mllm", "invite", "host", "--name", "host-a"]).unwrap();
     assert!(matches!(invite, Command::Invite{name} if name == "host-a"));
 
@@ -63,8 +63,6 @@ fn invite_join_inspect_doctor_qualify() {
 
     assert!(matches!(parse(["mllm", "doctor", "host", "host-a"]),
         Ok(Command::Doctor{host}) if host == "host-a"));
-    assert!(matches!(parse(["mllm", "qualify", "deployment", "dep_example"]),
-        Ok(Command::Qualify{deployment}) if deployment == "dep_example"));
 }
 
 #[test]

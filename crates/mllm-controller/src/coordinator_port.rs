@@ -379,8 +379,8 @@ impl LifecyclePort for CoordinatorLifecycle {
                 self.auto_activate(deployment).await
             }
             LifecycleAction::Stop => self.stop(deployment, true),
-            // Park is absent from the ordinary lifecycle; only the candidate path
-            // has one. It arrives with eviction in A1b.
+            // Park is absent from the ordinary lifecycle. It arrives with
+            // eviction in A1b.
             other => Err(Self::unsupported(&format!("perform {other:?}"))),
         }
     }

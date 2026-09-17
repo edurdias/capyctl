@@ -233,39 +233,6 @@ impl SnapshotSource for SharedConfigurationSource {
             .map_err(|_| SnapshotUnavailable)
     }
 }
-impl crate::candidates::CandidateSource for SharedConfigurationSource {
-    fn create_candidate(
-        &self,
-        key: &str,
-        command_json: &str,
-    ) -> Result<mllm_store::candidate_creation::CandidateCreationReceipt, ConfigurationFailure>
-    {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| ConfigurationFailure::Internal)?;
-        let now = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| ConfigurationFailure::Internal)?
-                .as_millis(),
-        )
-        .map_err(|_| ConfigurationFailure::Internal)?;
-        // Store composes current policy only after checking historical receipts.
-        // No startup policy import or fresh coordinator session is permitted here.
-        state
-            .store()
-            .create_candidate_run(
-                state.session(),
-                &self.principal,
-                key,
-                command_json,
-                &self.trusted_host,
-                now,
-            )
-            .map_err(Into::into)
-    }
-}
 impl EventSource for SharedConfigurationSource {
     fn events_after(&self, after: Option<&str>, limit: usize) -> Result<EventPage, EventReadError> {
         self.state

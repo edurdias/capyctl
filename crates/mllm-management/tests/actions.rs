@@ -510,7 +510,7 @@ async fn invalid_action_wires_and_credentials_do_not_mutate_owned_state() {
 #[tokio::test]
 // Deliberately hold the service mutex to test requests waiting in spawn_blocking.
 #[allow(clippy::await_holding_lock)]
-async fn actions_share_capacity_with_configuration_and_candidates_and_retain_cancelled_work() {
+async fn actions_share_capacity_with_configuration_and_retain_cancelled_work() {
     let (_dir, owner, worker, id, app) = setup().await;
     let guard = owner.lock().unwrap();
     let first = tokio::spawn(app.clone().oneshot(request(&id, "cancelled-1", "start")));
@@ -520,13 +520,10 @@ async fn actions_share_capacity_with_configuration_and_candidates_and_retain_can
     second.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     assert!(second.await.unwrap_err().is_cancelled());
-    for (path, body) in [
-        (
-            "/management/v1/deployments",
-            json!({"config":{},"activate":false}),
-        ),
-        ("/management/v1/qualification-runs", json!({})),
-    ] {
+    for (path, body) in [(
+        "/management/v1/deployments",
+        json!({"config":{},"activate":false}),
+    )] {
         let mut req = request(&id, "capacity", "start");
         *req.uri_mut() = path.parse().unwrap();
         *req.body_mut() = Body::from(body.to_string());

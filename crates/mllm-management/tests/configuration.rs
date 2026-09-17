@@ -248,21 +248,8 @@ impl mllm_management::configuration::ConfigurationSource for RejectingSource {
         }
     }
 }
-impl mllm_management::candidates::CandidateSource for RejectingSource {
-    fn create_candidate(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<
-        mllm_store::candidate_creation::CandidateCreationReceipt,
-        mllm_management::configuration::ConfigurationFailure,
-    > {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(mllm_management::configuration::ConfigurationFailure::Internal)
-    }
-}
 fn rejecting_app(source: Arc<RejectingSource>) -> axum::Router {
-    mllm_management::candidate_acceptance_router(
+    configuration_router(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
         source,
     )
@@ -488,19 +475,19 @@ async fn cancelled_requests_retain_command_capacity_until_blocking_work_finishes
     assert_eq!(response.status(), 429);
     assert_eq!(json_response(response).await["error"]["code"], "queue_full");
     assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-    // Candidate commands share the same capacity; separate route budgets would
-    // permit unbounded growth as management actions are added.
-    let candidate = router
+    // Every command route shares the same capacity; separate route budgets would
+    // permit unbounded growth as management commands are added.
+    let replacement = router
         .clone()
         .oneshot(request(
-            "POST",
-            "/management/v1/qualification-runs",
+            "PUT",
+            "/management/v1/deployments/01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "overflow",
-            json!({}),
+            json!({"expected_revision":1,"config":{}}),
         ))
         .await
         .unwrap();
-    assert_eq!(candidate.status(), 429);
+    assert_eq!(replacement.status(), 429);
     assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
     // Read capacity is independent: the snapshot provider's closed error is 500,
     // not the command queue's 429.

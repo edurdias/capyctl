@@ -36,8 +36,6 @@ use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 #[path = "tests.rs"]
 mod tests;
 
-#[path = "candidate.rs"]
-mod candidate;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum CoordinatorError {
@@ -96,9 +94,6 @@ pub enum WorkerStatus {
 }
 
 struct Shared {
-    // Ordering: candidate_poll, then owner. Store jobs never take candidate_poll.
-    candidate_poll: Mutex<()>,
-    active_candidate: Mutex<Option<Arc<candidate::Cancellation>>>,
     clock: ServiceClock,
     wake: Notify,
     changed: Notify,
@@ -109,8 +104,6 @@ struct Shared {
     observers: Arc<Semaphore>,
     store_jobs: Arc<Semaphore>,
     retained: Mutex<BTreeMap<String, Arc<Driver>>>,
-    retained_candidates: Mutex<BTreeMap<String, Arc<candidate::CandidateDriver>>>,
-    candidate_requests: Mutex<std::collections::VecDeque<candidate::InferenceCommand>>,
     options: CoordinatorOptions,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
@@ -131,13 +124,6 @@ pub struct OwnedCoordinator {
 #[derive(Clone)]
 pub struct CoordinatorCommands {
     shared: Arc<Shared>,
-}
-
-#[derive(Clone, Copy)]
-pub enum CandidateLifecycleAction {
-    Initialize,
-    Park,
-    Restore,
 }
 
 /// Preserve Store rejection categories for the service's command boundary.
@@ -263,181 +249,6 @@ impl CoordinatorCommands {
             crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
         })?;
         owner.store().accept_deployment(request).map_err(Into::into)
-    }
-
-    /// Blocking acceptance observer. The owned queue keeps its capacity permit
-    /// and command after a caller timeout; only the worker may obtain a New grant.
-    pub fn candidate_inference(
-        &self,
-        principal: &str,
-        run: &str,
-        expected_revision: i64,
-        key: &str,
-        body: &str,
-    ) -> Result<
-        mllm_store::candidate_creation::progression::CandidateInferenceReceipt,
-        CoordinatorCommandError,
-    > {
-        let permit = self
-            .shared
-            .observers
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| CoordinatorError::Busy)?;
-        let owner = self
-            .shared
-            .owner
-            .lock()
-            .map_err(|_| CoordinatorError::Service("ownership mutex poisoned".into()))?;
-        let store_error = |error: LifecycleError| {
-            if matches!(
-                error,
-                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
-            ) {
-                self.shared.fail_locked(&owner, error.to_string());
-            }
-            CoordinatorCommandError::Lifecycle(error)
-        };
-        if let Some(receipt) = owner
-            .store()
-            .candidate_inference_command_receipt(
-                owner.session(),
-                principal,
-                run,
-                expected_revision,
-                key,
-                body,
-            )
-            .map_err(store_error)?
-        {
-            return Ok(receipt);
-        }
-        if !self.shared.accepting.load(Ordering::Acquire)
-            || !self.shared.initializing.load(Ordering::Acquire)
-        {
-            return Err(CoordinatorError::Stopped(
-                "worker is not admitting candidate inference".into(),
-            )
-            .into());
-        }
-        let work = owner
-            .store()
-            .candidate_inference_work(
-                owner.session(),
-                principal,
-                run,
-                expected_revision,
-                (self.shared.clock)()?,
-            )
-            .map_err(store_error)?;
-        let (reply, receive) = std::sync::mpsc::sync_channel(1);
-        self.shared
-            .candidate_requests
-            .lock()
-            .map_err(|_| CoordinatorError::Service("candidate command queue poisoned".into()))?
-            .push_back(candidate::InferenceCommand {
-                work,
-                expected_revision,
-                key: key.into(),
-                body: body.into(),
-                operation_id: None,
-                reply: Some(reply),
-                _permit: permit,
-            });
-        drop(owner);
-        self.shared.wake.notify_one();
-        receive
-            .recv_timeout(self.shared.options.protocol_timeout)
-            .map_err(|error| match error {
-                std::sync::mpsc::RecvTimeoutError::Timeout => CoordinatorError::CallerTimeout,
-                std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                    CoordinatorError::Stopped("candidate acceptance observer closed".into())
-                }
-            })?
-    }
-    /// Accept only the closed V3 Fake Initialize action for an authenticated run.
-    pub fn initialize_candidate(
-        &self,
-        principal: &str,
-        run: &str,
-        expected_revision: i64,
-        key: &str,
-        deadline_ms: i64,
-    ) -> Result<
-        mllm_store::candidate_creation::progression::CandidateActionReceipt,
-        CoordinatorCommandError,
-    > {
-        self.candidate_action(principal, run, expected_revision, key, deadline_ms, CandidateLifecycleAction::Initialize)
-    }
-
-    pub fn candidate_action(
-        &self,
-        principal: &str,
-        run: &str,
-        expected_revision: i64,
-        key: &str,
-        deadline_ms: i64,
-        action: CandidateLifecycleAction,
-    ) -> Result<mllm_store::candidate_creation::progression::CandidateActionReceipt, CoordinatorCommandError> {
-        let _permit = self
-            .shared
-            .observers
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| CoordinatorError::Busy)?;
-        let owner = self.shared.owner.lock().map_err(|error| {
-            drop(error);
-            self.shared.fail("ownership mutex poisoned")
-        })?;
-        let store_error = |error: LifecycleError| {
-            if matches!(
-                error,
-                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
-            ) {
-                self.shared.fail_locked(&owner, error.to_string());
-            }
-            CoordinatorCommandError::Lifecycle(error)
-        };
-        let action = match action {
-            CandidateLifecycleAction::Initialize => "initialize",
-            CandidateLifecycleAction::Park => "park",
-            CandidateLifecycleAction::Restore => "restore",
-        };
-        let text = serde_json::json!({"expected_revision":expected_revision,"action":action,"deadline_ms":deadline_ms}).to_string();
-        if let Some(receipt) = owner
-            .store()
-            .candidate_action_command_receipt(owner.session(), principal, run, key, &text)
-            .map_err(store_error)?
-        {
-            return Ok(receipt);
-        }
-        if !self.shared.accepting.load(Ordering::Acquire)
-            || !self.shared.initializing.load(Ordering::Acquire)
-        {
-            return Err(
-                CoordinatorError::Stopped("worker is not admitting Initialize".into()).into(),
-            );
-        }
-        let snapshot = owner.store().candidate_run_snapshot(principal, run)
-            .map_err(|error| store_error(mllm_store::candidate_creation::initialize::CandidateInitializeError::from(error).into()))?
-            .ok_or(LifecycleError::NotFound)?;
-        if snapshot.receipt().revision() != expected_revision {
-            return Err(LifecycleError::RevisionConflict.into());
-        }
-        let receipt = owner
-            .store()
-            .accept_candidate_action(
-                owner.session(),
-                principal,
-                run,
-                key,
-                &text,
-                (self.shared.clock)()?,
-            )
-            .map_err(store_error)?;
-        drop(owner);
-        self.shared.wake.notify_one();
-        Ok(receipt)
     }
 
     /// Verify composition uses the worker's exact owned Store and session.
@@ -796,25 +607,6 @@ impl OwnedCoordinator {
         options: CoordinatorOptions,
         factory: DriverFactory,
     ) -> Result<Self, CoordinatorError> {
-        let candidate_clock = clock.clone();
-        Self::spawn_with_candidate_factory(
-            owner,
-            observations,
-            clock,
-            options,
-            factory,
-            Arc::new(move || Ok(candidate::CandidateDriver::fake(candidate_clock.clone()))),
-        )
-    }
-
-    fn spawn_with_candidate_factory(
-        owner: SharedCoordinatorState,
-        observations: Arc<dyn ServiceObservation>,
-        clock: ServiceClock,
-        options: CoordinatorOptions,
-        factory: DriverFactory,
-        candidate_factory: candidate::CandidateFactory,
-    ) -> Result<Self, CoordinatorError> {
         if options.poll_interval.is_zero()
             || options.poll_interval > Duration::from_secs(1)
             || options.protocol_timeout.is_zero()
@@ -834,8 +626,6 @@ impl OwnedCoordinator {
             ));
         }
         let shared = Arc::new(Shared {
-            candidate_poll: Mutex::new(()),
-            active_candidate: Mutex::new(None),
             owner,
             clock,
             wake: Notify::new(),
@@ -847,34 +637,24 @@ impl OwnedCoordinator {
             observers: Arc::new(Semaphore::new(options.max_observers)),
             store_jobs: Arc::new(Semaphore::new(options.max_observers + 1)),
             retained: Mutex::new(BTreeMap::new()),
-            retained_candidates: Mutex::new(BTreeMap::new()),
-            candidate_requests: Mutex::new(std::collections::VecDeque::new()),
             options,
         });
         let (stop, stop_rx) = watch::channel(false);
         let (status_tx, status) = watch::channel(WorkerStatus::Running);
         let task_shared = shared.clone();
         let task = tokio::spawn(async move {
-            let mut cleanup_stop = stop_rx.clone();
             let result = AssertUnwindSafe(run(
                 task_shared.clone(),
                 observations,
                 factory,
-                candidate_factory,
                 stop_rx,
                 &status_tx,
             ))
             .catch_unwind()
             .await;
-            let mut status = result.unwrap_or_else(|_| {
+            let status = result.unwrap_or_else(|_| {
                 WorkerStatus::Failed("worker panicked; durable arm retained".into())
             });
-            if matches!(status, WorkerStatus::Uncertain { .. }) && task_shared.cleanup_accepting.load(Ordering::Acquire) && !*cleanup_stop.borrow() {
-                task_shared.close_normal_admission();
-                status_tx.send_replace(status.clone());
-                task_shared.changed.notify_waiters();
-                status = candidate::cleanup::recover(&task_shared, &mut cleanup_stop, &status_tx, status).await;
-            }
             task_shared.close_admission();
             status_tx.send_replace(status.clone());
             task_shared.changed.notify_waiters();
@@ -1101,21 +881,12 @@ impl CleanupObserver {
 }
 
 impl Shared {
-    fn close_normal_admission(&self) {
-        let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
-        self.accepting.store(false, Ordering::Release);
-        self.candidate_requests.lock().unwrap_or_else(|error|error.into_inner()).clear();
-    }
     fn close_admission(&self) {
         // Serialize closure with the entire command lookup/check/commit boundary.
         // Recover a poisoned guard only to close admission, never to access Store.
         let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
         self.accepting.store(false, Ordering::Release);
         self.cleanup_accepting.store(false, Ordering::Release);
-        self.candidate_requests
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
     }
 
     fn set_initializing(&self, initializing: bool) {
@@ -1167,19 +938,6 @@ impl Shared {
         .await
     }
 
-    async fn read_without_clock<T: Send + 'static>(
-        self: &Arc<Self>,
-        action: impl FnOnce(&crate::ownership::OwnedCoordinatorState) -> Result<T, LifecycleError>
-            + Send
-            + 'static,
-    ) -> Result<T, CoordinatorError> {
-        let shared = self.clone();
-        self.with_owner(move |owner| {
-            action(owner).map_err(|error| shared.store_error(owner, error))
-        })
-        .await
-    }
-
     async fn with_owner<T: Send + 'static>(
         self: &Arc<Self>,
         action: impl FnOnce(&crate::ownership::OwnedCoordinatorState) -> Result<T, CoordinatorError>
@@ -1212,7 +970,6 @@ async fn run(
     shared: Arc<Shared>,
     observations: Arc<dyn ServiceObservation>,
     factory: DriverFactory,
-    candidate_factory: candidate::CandidateFactory,
     mut stop: watch::Receiver<bool>,
     status_tx: &watch::Sender<WorkerStatus>,
 ) -> WorkerStatus {
@@ -1223,11 +980,6 @@ async fn run(
         }
         if !shared.accepting.load(Ordering::Acquire) {
             return WorkerStatus::Failed("service stopped accepting work".into());
-        }
-        match candidate::cleanup::next(&shared, &mut stop).await {
-            Ok(true) => { shared.changed.notify_waiters(); continue; }
-            Ok(false) => {},
-            Err(status) => return status,
         }
         // This loop owns the sole Initialize task. Reaching discovery means
         // that task has exited, including any pre-arm observation future.
@@ -1306,132 +1058,6 @@ async fn run(
                 _ = tokio::time::sleep(shared.options.poll_interval) => {},
             }
             continue;
-        }
-        let request = match shared.candidate_requests.lock() {
-            Ok(mut queue) => queue.pop_front(),
-            Err(_) => return WorkerStatus::Failed("candidate command queue poisoned".into()),
-        };
-        if let Some(mut request) = request {
-            let request_run = request.work.run_id.clone();
-            let request_principal = request.work.principal.clone();
-            let outcome = AssertUnwindSafe(candidate::scoped(&shared, &request_principal, &request_run, candidate::drive_inference(
-                &shared,
-                &mut request,
-                observations.as_ref(),
-                &mut stop,
-            )))
-            .catch_unwind()
-            .await;
-            match outcome {
-                Ok(Ok(())) => {
-                    // Only cancelled admission lacks a response on a successful
-                    // drive. Failures retain their existing service error path.
-                    request.respond(Err(LifecycleError::Conflict.into()));
-                    shared.changed.notify_waiters();
-                    continue;
-                }
-                failure => {
-                    let reason = match failure {
-                        Ok(Err(e)) => e.to_string(),
-                        _ => "candidate request panicked; durable lease retained".into(),
-                    };
-                    return match request.operation_id {
-                        Some(operation_id) => WorkerStatus::Uncertain {
-                            operation_id,
-                            reason,
-                        },
-                        None => WorkerStatus::Failed(reason),
-                    };
-                }
-            }
-        }
-        let security = match shared
-            .read(|owner, now| owner.store().next_candidate_security(owner.session(), now))
-            .await
-        {
-            Ok(work) => work,
-            Err(error) => return WorkerStatus::Failed(error.to_string()),
-        };
-        if let Some(work) = security {
-            let mut operation_id = None;
-            let result = AssertUnwindSafe(candidate::scoped(&shared, &work.principal, &work.run_id, candidate::drive_security(
-                &shared,
-                &work,
-                observations.as_ref(),
-                &mut stop,
-                &mut operation_id,
-            )))
-            .catch_unwind()
-            .await;
-            match result {
-                Ok(Ok(())) => {
-                    shared.changed.notify_waiters();
-                    continue;
-                }
-                failure => {
-                    let reason = match failure {
-                        Ok(Err(error)) => error.to_string(),
-                        _ => "candidate Security panicked; durable authority retained".into(),
-                    };
-                    return match operation_id {
-                        Some(operation_id) => WorkerStatus::Uncertain { operation_id, reason },
-                        None => WorkerStatus::Failed(reason),
-                    };
-                }
-            }
-        }
-        let warm = match shared.read(|owner, now| owner.store().next_candidate_warm(owner.session(), now)).await {
-            Ok(work) => work,
-            Err(error) => return WorkerStatus::Failed(error.to_string()),
-        };
-        if let Some(work) = warm {
-            let result = AssertUnwindSafe(candidate::scoped(&shared, &work.principal, &work.run_id, candidate::drive_warm(&shared, &work, observations.as_ref(), &mut stop))).catch_unwind().await;
-            match result {
-                Ok(Ok(())) => { shared.changed.notify_waiters(); continue; }
-                failure => return WorkerStatus::Uncertain {
-                    operation_id: work.operation_id,
-                    reason: match failure { Ok(Err(error)) => error.to_string(), _ => "candidate warm child panicked; durable arm retained".into() },
-                },
-            }
-        }
-        let candidate = match shared
-            .read(|owner, now| {
-                owner
-                    .store()
-                    .next_candidate_initialize(owner.session(), now)
-            })
-            .await
-        {
-            Ok(work) => work,
-            Err(error) => return WorkerStatus::Failed(error.to_string()),
-        };
-        if let Some(work) = candidate {
-            let result = AssertUnwindSafe(candidate::scoped(&shared, &work.principal, &work.run_id, candidate::drive(
-                &shared,
-                &work,
-                observations.as_ref(),
-                &candidate_factory,
-                &mut stop,
-            )))
-            .catch_unwind()
-            .await;
-            match result {
-                Ok(Ok(())) => {
-                    shared.changed.notify_waiters();
-                    continue;
-                }
-                failure => {
-                    let reason = match failure {
-                        Ok(Err(error)) => error.to_string(),
-                        _ => "candidate effect panicked; durable arm retained".into(),
-                    };
-                    // No automatic retry or later child follows a lost result.
-                    return WorkerStatus::Uncertain {
-                        operation_id: work.operation_id,
-                        reason,
-                    };
-                }
-            }
         }
         let work = match shared
             .read(|owner, now| {

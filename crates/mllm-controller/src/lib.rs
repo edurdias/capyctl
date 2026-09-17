@@ -14,7 +14,6 @@ pub mod ownership;
 pub mod port;
 pub mod runtime;
 pub mod sequence;
-pub mod qualification;
 pub mod sglang_observer;
 
 pub use mllm_domain::LifecycleAction;

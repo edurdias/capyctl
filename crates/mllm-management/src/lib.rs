@@ -1,7 +1,7 @@
 //! Preparatory management boundaries. Not the complete A3 API.
 //!
-//! Optional mutations accept stopped configurations, candidate runs, and owned
-//! Start/Stop commands. No listener or inference routes are composed here.
+//! Optional mutations accept stopped configurations and owned Start/Stop
+//! commands. No listener or inference routes are composed here.
 //! The trusted service must resolve independent credentials and
 //! mount this router ONLY on its separate loopback (or TLS) management listener.
 use axum::{
@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 pub mod actions;
-pub mod candidates;
 pub mod configuration;
 mod credentials;
 pub mod events;
@@ -101,7 +100,6 @@ struct AppState {
     streams: Arc<Semaphore>,
     event_options: events::EventStreamOptions,
     configuration: Option<Arc<dyn configuration::ConfigurationSource>>,
-    candidates: Option<Arc<dyn candidates::CandidateSource>>,
     actions: Option<Arc<dyn actions::ActionSource>>,
     commands_in_flight: Arc<Semaphore>,
 }
@@ -120,7 +118,6 @@ pub fn snapshot_router(
         streams: Arc::new(Semaphore::new(0)),
         event_options: events::EventStreamOptions::default(),
         configuration: None,
-        candidates: None,
         actions: None,
         commands_in_flight: Arc::new(Semaphore::new(0)),
     });
@@ -152,7 +149,6 @@ pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSour
         streams: Arc::new(Semaphore::new(options.max_streams)),
         event_options: options,
         configuration: None,
-        candidates: None,
         actions: None,
         commands_in_flight: Arc::new(Semaphore::new(0)),
     });
@@ -176,44 +172,14 @@ pub fn configuration_router<
         streams: Arc::new(Semaphore::new(options.max_streams)),
         event_options: options,
         configuration: Some(source),
-        candidates: None,
         actions: None,
         commands_in_flight: Arc::new(Semaphore::new(2)),
     });
     routes(state, true)
 }
 
-/// Adds durable candidate creation to the stopped configuration boundary. This
-/// remains preparatory: no run actions, inference, runtime execution or listener.
-pub fn candidate_acceptance_router<
-    T: SnapshotSource
-        + events::EventSource
-        + configuration::ConfigurationSource
-        + candidates::CandidateSource,
->(
-    credentials: ManagementCredentials,
-    source: Arc<T>,
-) -> Router {
-    let options = events::EventStreamOptions::default();
-    routes(
-        Arc::new(AppState {
-            credentials,
-            source: source.clone(),
-            reads: Arc::new(Semaphore::new(2)),
-            events: Some(source.clone()),
-            streams: Arc::new(Semaphore::new(options.max_streams)),
-            event_options: options,
-            configuration: Some(source.clone()),
-            candidates: Some(source),
-            actions: None,
-            commands_in_flight: Arc::new(Semaphore::new(2)),
-        }),
-        true,
-    )
-}
-
-/// Compose Start/Stop and candidate Initialize with the same owned snapshot,
-/// configuration and candidate authority. Retain OwnedCoordinator outside this router.
+/// Compose Start and Stop with the same owned snapshot and configuration
+/// authority. Retain OwnedCoordinator outside this router.
 pub fn lifecycle_router(
     credentials: ManagementCredentials,
     source: Arc<actions::OwnedActionSource>,
@@ -228,7 +194,6 @@ pub fn lifecycle_router(
             streams: Arc::new(Semaphore::new(options.max_streams)),
             event_options: options,
             configuration: Some(source.clone()),
-            candidates: Some(source.clone()),
             actions: Some(source),
             commands_in_flight: Arc::new(Semaphore::new(2)),
         }),
@@ -239,19 +204,10 @@ pub fn lifecycle_router(
 fn routes(state: Arc<AppState>, include_events: bool) -> Router {
     let router = Router::new().route("/management/v1/snapshot", get(snapshot).head(method_denied));
     let router = if state.actions.is_some() {
-        router
-            .route(
-                "/management/v1/deployments/{id}/actions",
-                axum::routing::post(actions::accept),
-            )
-            .route(
-                "/management/v1/qualification-runs/{id}/actions",
-                axum::routing::post(actions::accept_candidate),
-            )
-            .route(
-                "/management/v1/qualification-runs/{id}/inference",
-                axum::routing::post(actions::accept_candidate_inference),
-            )
+        router.route(
+            "/management/v1/deployments/{id}/actions",
+            axum::routing::post(actions::accept),
+        )
     } else {
         router
     };
@@ -273,14 +229,6 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
                 "/management/v1/deployments/{id}",
                 axum::routing::put(configuration::accept),
             )
-    } else {
-        router
-    };
-    let router = if state.candidates.is_some() {
-        router.route(
-            "/management/v1/qualification-runs",
-            axum::routing::post(candidates::accept),
-        )
     } else {
         router
     };

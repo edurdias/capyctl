@@ -60,7 +60,6 @@ pub enum Command {
     List { resource: ListResource },
     Inspect { resource: Resource, id: Option<String>, effective: bool },
     Doctor { host: String },
-    Qualify { deployment: String },
     Deploy { file: Option<PathBuf>, activate: bool, wait: bool },
     Status { deployment: String, watch: bool },
     Lifecycle { action: LifecycleAction, deployment: String },
@@ -90,7 +89,6 @@ impl Command {
                 }
             }
             Command::Doctor { host } => format!("doctor host {host}"),
-            Command::Qualify { deployment } => format!("qualify deployment {deployment}"),
             Command::Deploy { .. } => "deploy model".to_string(),
             Command::Status { deployment, watch } => {
                 let tail = if *watch { " --watch" } else { "" };
@@ -141,10 +139,6 @@ enum CliCommand {
     Doctor {
         resource: HostWord,
         host: String,
-    },
-    Qualify {
-        resource: DeploymentWord,
-        deployment: String,
     },
     Deploy { #[command(subcommand)] resource: DeployArgs },
     Status { #[command(subcommand)] resource: StatusArgs },
@@ -277,7 +271,6 @@ impl From<CliCommand> for Command {
                 },
             },
             CliCommand::Doctor { host, .. } => Command::Doctor { host },
-            CliCommand::Qualify { deployment, .. } => Command::Qualify { deployment },
             CliCommand::Deploy { resource } => match resource {
                 DeployArgs::Model { file, activate, wait } => {
                     Command::Deploy { file, activate, wait }
