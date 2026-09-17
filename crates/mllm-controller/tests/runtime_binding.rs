@@ -17,6 +17,10 @@ struct NativeFixture {
     session: mllm_store::dispatch::CoordinatorSession,
     deployment: String,
     step: String,
+    binding: String,
+    incarnation: String,
+    endpoint: String,
+    root: std::path::PathBuf,
     observations: Vec<mllm_domain::resources::MemoryObservation>,
     limits: Vec<mllm_domain::resources::MemoryLimit>,
     ttl: i64,
@@ -24,43 +28,25 @@ struct NativeFixture {
     _directory: tempfile::TempDir,
 }
 
+/// An ordinary managed deployment whose qualified initialize has been accepted.
+/// No candidate run takes part: the frozen descriptor comes from the test source.
 impl NativeFixture {
     fn new() -> Self {
-        use mllm_config::effective::{
-            candidate::validate_candidate_reviewed_snapshot_text, resolve_effective,
-        };
+        use mllm_config::effective::resolve_effective;
         use mllm_domain::resources::{MemoryLimit, MemoryObservation};
         use serde_json::{Value, json};
-        let ordinary: Value = serde_json::from_str(include_str!(
-            "../../mllm-config/tests/fixtures/effective-sglang-golden.json"
-        ))
-        .unwrap();
-        let mut host = ordinary["input"]["host"].clone();
-        let mut manifest: Value = serde_json::from_str(include_str!(
-            "../../mllm-config/tests/fixtures/candidate-sglang.json"
-        ))
-        .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        manifest["effective_recipe"]["model"]["path"] = json!(root.to_str().unwrap());
-        manifest["effective_recipe"]["model"]["revision"] =
-            json!("cdbee75f17c01a7cc42f958dc650907174af0554");
-        manifest["effective_recipe"]["resolved_profile"]["build_fingerprint"] =
-            json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
-        host["runtime_profiles"]["local"]["build_fingerprint"] =
-            json!("fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1");
-        manifest["limits"]["max_run_duration_ms"] = json!(600000);
-        manifest["limits"]["max_cleanup_duration_ms"] = json!(60000);
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = socket.local_addr().unwrap().port();
-        drop(socket);
-        host["resource_policy"]["endpoint_port_range"] = json!({"start":port,"end":port});
-        let reviewed = validate_candidate_reviewed_snapshot_text(&manifest.to_string()).unwrap();
-        host["qualification_policy"] = json!({"revision":1,"allow_qualification_runs":true,"allow_experimental_controls":true,"allowed_manifest_digests":[reviewed.manifest_digest()],"max_run_duration":"600s","max_cleanup_duration":"60s","max_cases":128,"max_requests":4096,"max_request_body_bytes":"1MiB","max_input_tokens_per_request":131072,"max_output_tokens_per_request":16384});
-        let policy = resolve_effective(&ordinary["input"]["deployment"], &host)
-            .unwrap()
-            .host;
-        let store = Store::open(&directory.path().join("native.db")).unwrap();
+        let source: Value = serde_json::from_str(include_str!(
+            "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        ))
+        .unwrap();
+        let host = source["input"]["host"].clone();
+        let mut deployment = source["input"]["deployment"].clone();
+        deployment["name"] = json!("ordinary");
+        deployment["routes"] = json!(["ordinary"]);
+        let policy = resolve_effective(&deployment, &host).unwrap().host;
+        let store = Store::open(&root.join("native.db")).unwrap();
         let session = store.begin_coordinator_session().unwrap();
         let observations: Vec<_> = policy
             .domains
@@ -75,21 +61,30 @@ impl NativeFixture {
         store
             .import_resource_policy(&session, &policy, &observations, 1000)
             .unwrap();
-        store
-            .import_qualification_policy(&session, &policy)
-            .unwrap();
-        let command = json!({"host_id":"lab","expected_host_revision":1,"recipe_digest":reviewed.manifest_digest(),"manifest":manifest,"deadline_ms":500000,"allow_owned_abort_cleanup":true}).to_string();
-        let created = store
-            .create_candidate_run(&session, "owner", "create", &command, &host, 1000)
-            .unwrap();
-        let init = store
-            .accept_candidate_initialize(
+        let receipt = store
+            .create_stopped_managed_configuration(
                 &session,
                 "owner",
-                created.run_id(),
-                "init",
-                r#"{"expected_revision":1,"action":"initialize","deadline_ms":400000}"#,
-                1100,
+                "ordinary",
+                &json!({ "config": deployment }).to_string(),
+                &host,
+                1000,
+            )
+            .unwrap();
+        let fence = DeploymentFence {
+            deployment_id: receipt.deployment_id.clone(),
+            revision: receipt.revision,
+            generation: receipt.generation,
+        };
+        let accepted = store
+            .accept_qualified_start(&session, &fence, 1100, 300000)
+            .unwrap();
+        let connection = rusqlite::Connection::open(root.join("native.db")).unwrap();
+        let (incarnation, endpoint): (String, String) = connection
+            .query_row(
+                "SELECT incarnation,json_extract(binding_json,'$.endpoint') FROM runtime_bindings WHERE id=?1",
+                [&accepted.binding_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         let resource = store.resource_policy("lab").unwrap().unwrap();
@@ -108,8 +103,12 @@ impl NativeFixture {
         Self {
             store,
             session,
-            deployment: created.deployment_id().into(),
-            step: init.step_id().into(),
+            deployment: fence.deployment_id,
+            step: accepted.step_id,
+            binding: accepted.binding_id,
+            incarnation,
+            endpoint,
+            root,
             observations,
             limits,
             ttl: resource.controls.observation_ttl_ms,
@@ -128,29 +127,121 @@ impl NativeFixture {
         )
     }
 
-    fn revoke(&self) {
-        let connection =
-            rusqlite::Connection::open(self._directory.path().join("native.db")).unwrap();
-        connection.execute("UPDATE host_qualification_policies SET policy_json=json_set(policy_json,'$.state.policy.allow_qualification_runs',json('false'))", []).unwrap();
+    fn sql(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.root.join("native.db")).unwrap()
+    }
+
+    /// A frozen descriptor for this deployment's accepted initialize. The store
+    /// holds none; the digest distinguishes one descriptor from another.
+    fn descriptor(&self, digest: &str) -> mllm_domain::launch::NativeLaunch {
+        use mllm_config::effective::sglang::{
+            NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
+        };
+        use mllm_domain::launch::{
+            NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings,
+            SglangRequestedBudget,
+        };
+        NativeLaunch::from_frozen_store(
+            NativeLaunchMetadata {
+                engine: "sglang".into(),
+                recipe: NATIVE_SGLANG_RECIPE.into(),
+                source_revision: NATIVE_SGLANG_SOURCE_REVISION.into(),
+                checkpoint_revision: NATIVE_CHECKPOINT_REVISION.into(),
+                binding_id: self.binding.clone(),
+                incarnation: self.incarnation.clone(),
+                endpoint: format!("http://{}", self.endpoint),
+                served_name: format!("candidate-{}", self.binding),
+                rendered_settings_digest: digest.into(),
+                device: NativeDeviceSelection {
+                    host_id: "lab".into(),
+                    hardware_fingerprint: "hw-01".into(),
+                    device_id: "gpu0".into(),
+                    memory_domain: "unified".into(),
+                },
+            },
+            self.root.to_str().unwrap().into(),
+            "/usr/bin/python3".into(),
+            "secret://engine-key".into(),
+            "secret://admin-key".into(),
+            SglangLaunchSettings {
+                recipe: NATIVE_SGLANG_RECIPE.into(),
+                tensor_parallel_size: 1,
+                data_parallel_size: 1,
+                tokenizer_workers: 1,
+                model_dtype: "bfloat16".into(),
+                context_tokens: 4096,
+                max_running_requests: 8,
+                max_total_tokens: 4096,
+                prefill_cuda_graphs: false,
+                decode_cuda_graphs: false,
+                memory_saver: true,
+                cpu_weight_backup: false,
+                speculative_decoding: false,
+                lora: false,
+                trust_remote_code: false,
+                disaggregation: false,
+                external_cache: false,
+                cpu_kv_offload: false,
+                native_grpc: false,
+                weight_restore: "disk_reload".into(),
+                requested_budget: SglangRequestedBudget {
+                    kv_cache_bytes: 1_i64 << 30,
+                    static_memory_fraction_bps: 9000,
+                },
+            },
+        )
+    }
+
+    fn source(&self) -> FixedSource {
+        FixedSource(std::sync::Mutex::new(Some(self.descriptor(FIRST_DIGEST))))
     }
 
     fn assert_retained(&self) {
-        let connection =
-            rusqlite::Connection::open(self._directory.path().join("native.db")).unwrap();
-        let retained: (String, String, i64, i64, i64, i64) = connection.query_row("SELECT b.state,b.identities_json,d.admission_enabled,d.dispatch_enabled,(SELECT COUNT(*) FROM endpoint_leases),(SELECT COUNT(*) FROM resource_grants) FROM runtime_bindings b JOIN deployments d ON d.id=b.deployment_id", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
-        assert_eq!(retained, ("uncertain".into(), "[]".into(), 0, 0, 1, 1));
+        let retained: (String, String, i64, i64, i64, i64) = self.sql().query_row("SELECT b.state,b.identities_json,d.admission_enabled,d.dispatch_enabled,(SELECT COUNT(*) FROM endpoint_leases),(SELECT COUNT(*) FROM resource_grants) FROM runtime_bindings b JOIN deployments d ON d.id=b.deployment_id", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+        // The accepted start enables admission; dispatch stays closed until the
+        // initialize completes, and neither lease nor grant may be released here.
+        assert_eq!(retained, ("uncertain".into(), "[]".into(), 1, 0, 1, 1));
     }
 }
 
-fn native_service() -> mllm_controller::runtime::NativeCandidateService<'static> {
+const FIRST_DIGEST: &str = "1f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a7988";
+const SECOND_DIGEST: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+/// The application's descriptor source. It must answer with the same value for
+/// the same step; answering with another one must stop the handoff.
+struct FixedSource(std::sync::Mutex<Option<mllm_domain::launch::NativeLaunch>>);
+
+impl FixedSource {
+    fn replace(&self, launch: mllm_domain::launch::NativeLaunch) {
+        *self.0.lock().unwrap() = Some(launch);
+    }
+}
+
+impl mllm_controller::runtime::NativeLaunchSource for FixedSource {
+    fn frozen(
+        &self,
+        _: &mllm_store::dispatch::CoordinatorSession,
+        _: &str,
+        _: i64,
+    ) -> Result<mllm_domain::launch::NativeLaunch, RuntimeError> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RuntimeError::Uncertain("no descriptor".into()))
+    }
+}
+
+fn native_service(source: &FixedSource) -> mllm_controller::runtime::NativeLaunchService<'_> {
     static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    mllm_controller::runtime::NativeCandidateService {
+    mllm_controller::runtime::NativeLaunchService {
         wrapper: PATH.get_or_init(|| {
             std::path::Path::new("/usr/bin/true")
                 .canonicalize()
                 .unwrap()
         }),
         now_ms: &|| Ok(1200),
+        source,
     }
 }
 
@@ -163,23 +254,25 @@ fn resolve_native_credential(reference: &str) -> Result<Vec<u8>, RuntimeError> {
 }
 
 #[test]
-fn native_candidate_policy_revoked_during_preflight_rejects_handoff() {
+fn native_launch_source_change_during_preflight_rejects_handoff() {
     let fixture = NativeFixture::new();
-    let result = mllm_controller::runtime::NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let result = mllm_controller::runtime::NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| {
-            fixture.revoke();
+            source.replace(fixture.descriptor(SECOND_DIGEST));
             Ok(())
         },
-        native_service(),
+        native_service(&source),
     );
-    assert!(
-        result.is_err(),
-        "revoked policy still produced a launch handoff"
+    assert_eq!(
+        result.err(),
+        Some(RuntimeError::Uncertain("handoff changed".into())),
+        "a changed descriptor still produced a launch handoff"
     );
     assert_eq!(
         fixture.store.resource_snapshot().unwrap().owners[&fixture.deployment].phase,
@@ -189,12 +282,13 @@ fn native_candidate_policy_revoked_during_preflight_rejects_handoff() {
 }
 
 #[test]
-fn native_candidate_deadline_advanced_during_callbacks_rejects_handoff() {
+fn native_launch_deadline_advanced_during_callbacks_rejects_handoff() {
     for during_preflight in [true, false] {
         let fixture = NativeFixture::new();
+        let source = fixture.source();
         let now = std::cell::Cell::new(1200);
         let clock = || Ok(now.get());
-        let result = mllm_controller::runtime::NativeCandidateHandoff::arm(
+        let result = mllm_controller::runtime::NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
@@ -211,39 +305,44 @@ fn native_candidate_deadline_advanced_during_callbacks_rejects_handoff() {
                 }
                 Ok(())
             },
-            mllm_controller::runtime::NativeCandidateService {
+            mllm_controller::runtime::NativeLaunchService {
                 now_ms: &clock,
-                ..native_service()
+                ..native_service(&source)
             },
         );
-        assert!(result.is_err(), "expired callbacks produced handoff");
+        assert_eq!(
+            result.err(),
+            Some(RuntimeError::Uncertain("handoff is stale".into())),
+            "expired callbacks produced handoff"
+        );
         fixture.assert_retained();
     }
 }
 
 #[test]
-fn native_candidate_revocation_and_deadline_are_checked_before_spawn_and_acknowledgement() {
+fn native_launch_change_and_deadline_are_checked_before_spawn_and_acknowledgement() {
     use mllm_launchers::LaunchAssociation;
-    for revoke in [true, false] {
+    for changed in [true, false] {
         let fixture = NativeFixture::new();
+        let source = fixture.source();
         let now = std::cell::Cell::new(1200);
         let clock = || Ok(now.get());
-        let handoff = mllm_controller::runtime::NativeCandidateHandoff::arm(
+        let handoff = mllm_controller::runtime::NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
             &|_| Ok(()),
-            mllm_controller::runtime::NativeCandidateService {
+            mllm_controller::runtime::NativeLaunchService {
                 now_ms: &clock,
-                ..native_service()
+                ..native_service(&source)
             },
         )
         .unwrap()
         .unwrap();
-        if revoke {
-            fixture.revoke();
+        if changed {
+            source.replace(fixture.descriptor(SECOND_DIGEST));
         } else {
             now.set(400000);
         }
@@ -255,22 +354,27 @@ fn native_candidate_revocation_and_deadline_are_checked_before_spawn_and_acknowl
                 start_ticks: 100,
             })
             .unwrap_err();
-        assert!(format!("{error:?}").contains("candidate handoff is stale"));
+        assert!(format!("{error:?}").contains("handoff is stale"));
         let error = handoff
             .spawn(&mllm_launchers::DurableSpawn::new())
             .err()
             .unwrap();
         assert_eq!(
             error,
-            RuntimeError::Uncertain("candidate handoff is stale".into())
+            RuntimeError::Uncertain(if changed {
+                "handoff changed".into()
+            } else {
+                "handoff is stale".into()
+            })
         );
         fixture.assert_retained();
     }
 }
 
 #[test]
-fn native_candidate_clock_failure_is_redacted_and_retains_reservations() {
+fn native_launch_clock_failure_is_redacted_and_retains_reservations() {
     let fixture = NativeFixture::new();
+    let source = fixture.source();
     let calls = std::cell::Cell::new(0);
     let clock = || {
         calls.set(calls.get() + 1);
@@ -280,29 +384,26 @@ fn native_candidate_clock_failure_is_redacted_and_retains_reservations() {
             Err(RuntimeError::Uncertain("private-clock-detail".into()))
         }
     };
-    let error = mllm_controller::runtime::NativeCandidateHandoff::arm(
+    let error = mllm_controller::runtime::NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        mllm_controller::runtime::NativeCandidateService {
+        mllm_controller::runtime::NativeLaunchService {
             now_ms: &clock,
-            ..native_service()
+            ..native_service(&source)
         },
     )
     .err()
     .unwrap();
-    assert_eq!(
-        error,
-        RuntimeError::Uncertain("candidate clock unavailable".into())
-    );
+    assert_eq!(error, RuntimeError::Uncertain("clock unavailable".into()));
     fixture.assert_retained();
 }
 
 #[test]
-fn native_candidate_wrapper_permissions_rechecked_before_spawn_and_acknowledgement() {
+fn native_launch_wrapper_permissions_rechecked_before_spawn_and_acknowledgement() {
     use mllm_launchers::LaunchAssociation;
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
@@ -311,16 +412,17 @@ fn native_candidate_wrapper_permissions_rechecked_before_spawn_and_acknowledgeme
     std::fs::write(&path, b"# Never executed by handoff tests.\n").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let fixture = NativeFixture::new();
-    let handoff = mllm_controller::runtime::NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let handoff = mllm_controller::runtime::NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        mllm_controller::runtime::NativeCandidateService {
+        mllm_controller::runtime::NativeLaunchService {
             wrapper: &path,
-            ..native_service()
+            ..native_service(&source)
         },
     )
     .unwrap()
@@ -348,17 +450,18 @@ fn native_candidate_wrapper_permissions_rechecked_before_spawn_and_acknowledgeme
 }
 
 #[test]
-fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_closed() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_closed() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     let fixture = NativeFixture::new();
-    let handoff = NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let handoff = NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        native_service(),
+        native_service(&source),
     )
     .unwrap()
     .unwrap();
@@ -368,7 +471,7 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         &command.argv[1..4],
         [
             "-IS",
-            native_service().wrapper.to_str().unwrap(),
+            native_service(&source).wrapper.to_str().unwrap(),
             "--public-settings-json"
         ]
     );
@@ -377,7 +480,7 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         "private-inference-token",
         "private-admin-token",
         "secret://",
-        fixture._directory.path().to_str().unwrap(),
+        fixture.root.to_str().unwrap(),
     ] {
         assert!(!text.contains(private));
     }
@@ -387,17 +490,14 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
     .unwrap();
     assert_eq!(private["schema_version"], 2);
     assert_eq!(private["kind"], "sglang_candidate_private_launch");
-    assert_eq!(
-        private["checkpoint_root"],
-        fixture._directory.path().to_str().unwrap()
-    );
+    assert_eq!(private["checkpoint_root"], fixture.root.to_str().unwrap());
     assert_eq!(
         private["public_settings"],
         serde_json::from_str::<serde_json::Value>(&command.argv[4]).unwrap()
     );
     let execution = fixture
         .store
-        .candidate_initialize_execution(&fixture.session, &fixture.step)
+        .qualified_initialize_execution(&fixture.session, &fixture.step)
         .unwrap();
     assert_eq!(
         private["launch_scope"],
@@ -427,14 +527,14 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         b"private-admin-token"
     );
     assert!(
-        NativeCandidateHandoff::arm(
+        NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
             fixture.context(),
             &|_| panic!("replay resolved credentials"),
             &|_| panic!("replay preflight"),
-            native_service(),
+            native_service(&source),
         )
         .unwrap()
         .is_none()
@@ -443,13 +543,18 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
         RuntimeBindings::default().binding(&fixture.deployment, 1),
         Err(RuntimeError::Missing)
     ));
-    assert!(fixture.store.runtime_binding(&fixture.deployment).is_err());
+    let stored = fixture
+        .store
+        .runtime_binding(&fixture.deployment)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, "uncertain");
+    assert!(stored.identities.is_empty());
     assert_eq!(
         fixture.store.resource_snapshot().unwrap().owners[&fixture.deployment].phase,
         ResourcePhase::Cold
     );
-    let connection =
-        rusqlite::Connection::open(fixture._directory.path().join("native.db")).unwrap();
+    let connection = fixture.sql();
     let flags: (i64, i64) = connection
         .query_row(
             "SELECT admission_enabled,dispatch_enabled FROM deployments WHERE id=?1",
@@ -457,7 +562,7 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(flags, (0, 0));
+    assert_eq!(flags, (1, 0));
     for table in ["runtime_bindings", "lifecycle_steps", "management_events"] {
         let mut statement = connection
             .prepare(&format!("SELECT * FROM {table}"))
@@ -478,14 +583,14 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
     }
     drop(handoff);
     assert!(
-        NativeCandidateHandoff::arm(
+        NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
             &|_| Ok(()),
-            native_service(),
+            native_service(&source),
         )
         .unwrap()
         .is_none()
@@ -493,11 +598,12 @@ fn native_candidate_handoff_is_single_use_secret_free_and_ordinary_dispatch_stay
 }
 
 #[test]
-fn native_candidate_preflight_failure_consumes_authority_without_handoff_or_secret_error() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_preflight_failure_consumes_authority_without_handoff_or_secret_error() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     let fixture = NativeFixture::new();
+    let source = fixture.source();
     let checked = std::cell::Cell::new(false);
-    let result = NativeCandidateHandoff::arm(
+    let result = NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
@@ -507,20 +613,20 @@ fn native_candidate_preflight_failure_consumes_authority_without_handoff_or_secr
             checked.set(true);
             Err(RuntimeError::Uncertain("private-checkpoint-secret".into()))
         },
-        native_service(),
+        native_service(&source),
     );
     let error = result.err().unwrap();
     assert!(checked.get());
     assert!(!format!("{error:?}").contains("private-checkpoint-secret"));
     assert!(
-        NativeCandidateHandoff::arm(
+        NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
             &|_| Ok(()),
-            native_service(),
+            native_service(&source),
         )
         .unwrap()
         .is_none()
@@ -532,17 +638,18 @@ fn native_candidate_preflight_failure_consumes_authority_without_handoff_or_secr
 }
 
 #[test]
-fn native_candidate_stale_session_cannot_spawn_prepared_handoff() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_stale_session_cannot_spawn_prepared_handoff() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     let fixture = NativeFixture::new();
-    let handoff = NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let handoff = NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        native_service(),
+        native_service(&source),
     )
     .unwrap()
     .unwrap();
@@ -552,17 +659,18 @@ fn native_candidate_stale_session_cannot_spawn_prepared_handoff() {
 }
 
 #[test]
-fn native_candidate_stale_generation_cannot_spawn_prepared_handoff() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_stale_generation_cannot_spawn_prepared_handoff() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     let fixture = NativeFixture::new();
-    let handoff = NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let handoff = NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        native_service(),
+        native_service(&source),
     )
     .unwrap()
     .unwrap();
@@ -571,23 +679,23 @@ fn native_candidate_stale_generation_cannot_spawn_prepared_handoff() {
 }
 
 #[test]
-fn native_candidate_changed_binding_cannot_spawn_prepared_handoff() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_changed_binding_cannot_spawn_prepared_handoff() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     let fixture = NativeFixture::new();
-    let handoff = NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let handoff = NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        native_service(),
+        native_service(&source),
     )
     .unwrap()
     .unwrap();
-    let connection =
-        rusqlite::Connection::open(fixture._directory.path().join("native.db")).unwrap();
-    connection
+    fixture
+        .sql()
         .execute(
             "UPDATE runtime_bindings SET incarnation=?1",
             [ulid::Ulid::new().to_string()],
@@ -597,23 +705,23 @@ fn native_candidate_changed_binding_cannot_spawn_prepared_handoff() {
 }
 
 #[test]
-fn native_candidate_ambiguous_api_association_retains_endpoint_grant_and_closed_dispatch() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_ambiguous_api_association_retains_endpoint_grant_and_closed_dispatch() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     use mllm_launchers::LaunchAssociation;
     let fixture = NativeFixture::new();
-    let handoff = NativeCandidateHandoff::arm(
+    let source = fixture.source();
+    let handoff = NativeLaunchHandoff::arm(
         &fixture.store,
         &fixture.session,
         &fixture.step,
         fixture.context(),
         &resolve_native_credential,
         &|_| Ok(()),
-        native_service(),
+        native_service(&source),
     )
     .unwrap()
     .unwrap();
-    let connection =
-        rusqlite::Connection::open(fixture._directory.path().join("native.db")).unwrap();
+    let connection = fixture.sql();
     connection.execute_batch("CREATE TRIGGER fail_api BEFORE UPDATE OF identities_json ON runtime_bindings BEGIN SELECT RAISE(ABORT,'private-association-detail'); END;").unwrap();
     let error = handoff
         .persist_api_identity(&mllm_domain::completion::ProcessIdentity {
@@ -624,17 +732,16 @@ fn native_candidate_ambiguous_api_association_retains_endpoint_grant_and_closed_
         })
         .unwrap_err();
     assert!(!format!("{error:?}").contains("private-association-detail"));
-    let retained: (String,String,i64,i64,i64,i64) = connection.query_row("SELECT b.state,b.identities_json,d.admission_enabled,d.dispatch_enabled,(SELECT COUNT(*) FROM endpoint_leases),(SELECT COUNT(*) FROM resource_grants) FROM runtime_bindings b JOIN deployments d ON d.id=b.deployment_id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
-    assert_eq!(retained, ("uncertain".into(), "[]".into(), 0, 0, 1, 1));
+    fixture.assert_retained();
     assert!(
-        NativeCandidateHandoff::arm(
+        NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
             fixture.context(),
             &resolve_native_credential,
             &|_| Ok(()),
-            native_service(),
+            native_service(&source),
         )
         .unwrap()
         .is_none()
@@ -642,31 +749,32 @@ fn native_candidate_ambiguous_api_association_retains_endpoint_grant_and_closed_
 }
 
 #[test]
-fn native_candidate_invalid_credentials_never_create_handoff_or_retry() {
-    use mllm_controller::runtime::NativeCandidateHandoff;
+fn native_launch_invalid_credentials_never_create_handoff_or_retry() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
     for secret in [b"duplicate-token".as_slice(), b"invalid\nsecret", b""] {
         let fixture = NativeFixture::new();
+        let source = fixture.source();
         assert!(
-            NativeCandidateHandoff::arm(
+            NativeLaunchHandoff::arm(
                 &fixture.store,
                 &fixture.session,
                 &fixture.step,
                 fixture.context(),
                 &|_| Ok(secret.to_vec()),
                 &|_| Ok(()),
-                native_service(),
+                native_service(&source),
             )
             .is_err()
         );
         assert!(
-            NativeCandidateHandoff::arm(
+            NativeLaunchHandoff::arm(
                 &fixture.store,
                 &fixture.session,
                 &fixture.step,
                 fixture.context(),
                 &resolve_native_credential,
                 &|_| Ok(()),
-                native_service(),
+                native_service(&source),
             )
             .unwrap()
             .is_none()

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use mllm_adapters::traits::{ChatForward, EngineAdapter, RuntimeAction};
 use mllm_domain::completion::ProcessIdentity;
+use mllm_domain::launch::NativeLaunch;
 use mllm_domain::resources::RecipeFootprints;
 use mllm_launchers::{AssociationError, DurableSpawn, DurableSpawnOutcome, LaunchAssociation};
 use mllm_store::dispatch::CoordinatorSession;
@@ -151,28 +152,54 @@ impl LaunchAssociation for StoreAssociation<'_> {
     }
 }
 
+/// Where an armed ordinary initialize's frozen native launch comes from. The store
+/// holds no descriptor for it (the candidate rows that did are gone); the
+/// application supplies one and must return the same value on every call for the
+/// same step, or the handoff refuses to send.
+pub trait NativeLaunchSource: Send + Sync {
+    fn frozen(
+        &self,
+        session: &CoordinatorSession,
+        step_id: &str,
+        now_ms: i64,
+    ) -> Result<NativeLaunch, RuntimeError>;
+}
+
+/// Renders and spawns a protected native launch for an armed ordinary initialize.
+///
+/// Native entrypoint denials stay closed (AGENTS.md): this type opens nothing.
+/// `ProfileBindings` still refuses SGLang, and nothing implements
+/// `NativeLaunchSource` in production until the ordinary native launch is designed.
+///
 /// One controller-local launch capability, created only by a fresh persisted arm.
 /// It cannot be cloned, serialized, or inserted into ordinary runtime bindings.
 /// Dropping it consumes the attempt without permitting a later replay to spawn.
-pub struct NativeCandidateHandoff<'a> {
+pub struct NativeLaunchHandoff<'a> {
     store: &'a mllm_store::Store,
     session: &'a CoordinatorSession,
     step_id: String,
     fence: DeploymentFence,
-    frozen: mllm_domain::launch::NativeLaunch,
+    frozen: NativeLaunch,
     command: mllm_adapters::traits::RenderedCommand,
     descriptors: mllm_launchers::ProtectedLaunchDescriptors,
     now_ms: &'a dyn Fn() -> Result<i64, RuntimeError>,
+    source: &'a dyn NativeLaunchSource,
+    token: mllm_domain::completion::TransitionToken,
+    binding_id: String,
+    incarnation: String,
+    issued_at_ms: i64,
+    deadline_ms: i64,
 }
 
-/// Trusted service dependencies; never populated from candidate or request data.
+/// Trusted service dependencies; never populated from request data.
 /// The clock must read current service time on every invocation, not cache arm time.
-pub struct NativeCandidateService<'a> {
+pub struct NativeLaunchService<'a> {
     pub wrapper: &'a std::path::Path,
     pub now_ms: &'a dyn Fn() -> Result<i64, RuntimeError>,
+    pub source: &'a dyn NativeLaunchSource,
 }
 
-impl<'a> NativeCandidateHandoff<'a> {
+impl<'a> NativeLaunchHandoff<'a> {
     /// Called by the trusted coordinator, never a management/router request.
     /// `preflight` must verify the pinned checkpoint and engine contract without
     /// starting an engine. `resolve` is the service-owned credential provider.
@@ -183,39 +210,39 @@ impl<'a> NativeCandidateHandoff<'a> {
         step_id: &str,
         context: mllm_scheduler::residency::AdmissionContext<'_>,
         resolve: &dyn Fn(&str) -> Result<Vec<u8>, RuntimeError>,
-        preflight: &dyn Fn(&mllm_domain::launch::NativeLaunch) -> Result<(), RuntimeError>,
-        service: NativeCandidateService<'a>,
+        preflight: &dyn Fn(&NativeLaunch) -> Result<(), RuntimeError>,
+        service: NativeLaunchService<'a>,
     ) -> Result<Option<Self>, RuntimeError> {
         use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
         use mllm_store::lifecycle::ArmResult;
-        let ArmResult::New { step_id } = store
-            .arm_step(session, step_id, context)
-            .map_err(|_| native_error("candidate arm rejected"))?
-        else {
+        let (armed, execution) = store
+            .arm_qualified_initialize_with_context(session, step_id, context)
+            .map_err(|_| native_error("arm rejected"))?;
+        let ArmResult::New { step_id } = armed else {
             return Ok(None);
         };
-        let frozen = store
-            .candidate_native_launch(
-                session,
-                &step_id,
-                (service.now_ms)().map_err(|_| native_error("candidate clock unavailable"))?,
-            )
-            .map_err(|_| native_error("candidate descriptor unavailable"))?;
-        let execution = store
-            .candidate_initialize_execution(session, &step_id)
-            .map_err(|_| native_error("candidate execution unavailable"))?;
+        // Only this arm's own transaction returns a context; a replay never does.
+        let Some(execution) = execution else {
+            return Err(native_error("arm returned no execution context"));
+        };
+        let now = (service.now_ms)().map_err(|_| native_error("clock unavailable"))?;
+        let frozen = service
+            .source
+            .frozen(session, &step_id, now)
+            .map_err(|_| native_error("descriptor unavailable"))?;
         let launch = SglangLaunch::from_frozen(&frozen)?;
         let root = std::path::Path::new(frozen.checkpoint_root());
         if !root.is_dir() || root.canonicalize().ok().as_deref() != Some(root) {
-            return Err(native_error("candidate checkpoint root unavailable"));
+            return Err(native_error("checkpoint root unavailable"));
         }
-        preflight(&frozen).map_err(|_| native_error("candidate preflight failed"))?;
+        preflight(&frozen).map_err(|_| native_error("preflight failed"))?;
         let inference = resolve(frozen.inference_credential_ref())
-            .map_err(|_| native_error("candidate credential resolution failed"))?;
+            .map_err(|_| native_error("credential resolution failed"))?;
         let admin = resolve(frozen.admin_credential_ref())
-            .map_err(|_| native_error("candidate credential resolution failed"))?;
+            .map_err(|_| native_error("credential resolution failed"))?;
         let private = serde_json::to_vec(&serde_json::json!({
             "schema_version": 2,
+            // Wire contract with runtime/sglang_entry.py; renamed with the ordinary native launch design.
             "kind": "sglang_candidate_private_launch",
             "checkpoint_root": frozen.checkpoint_root(),
             "public_settings": launch.public_metadata(),
@@ -232,10 +259,10 @@ impl<'a> NativeCandidateHandoff<'a> {
                 "deadline_ms": execution.deadline_ms,
             },
         }))
-        .map_err(|_| native_error("candidate descriptor encoding failed"))?;
+        .map_err(|_| native_error("descriptor encoding failed"))?;
         let descriptors =
             mllm_launchers::ProtectedLaunchDescriptors::new(&private, &inference, &admin)
-                .map_err(|_| native_error("candidate descriptor creation failed"))?;
+                .map_err(|_| native_error("descriptor creation failed"))?;
         let [launch_fd, inference_fd, admin_fd] = descriptors.numbers();
         let command = launch.render_for_launcher(
             ProtectedDescriptorFds::for_launcher(
@@ -250,7 +277,7 @@ impl<'a> NativeCandidateHandoff<'a> {
             session,
             step_id,
             fence: DeploymentFence {
-                deployment_id: execution.token.deployment_id,
+                deployment_id: execution.token.deployment_id.clone(),
                 revision: execution.token.revision,
                 generation: execution.token.generation,
             },
@@ -258,6 +285,12 @@ impl<'a> NativeCandidateHandoff<'a> {
             command,
             descriptors,
             now_ms: service.now_ms,
+            source: service.source,
+            token: execution.token,
+            binding_id: execution.binding_id,
+            incarnation: execution.incarnation,
+            issued_at_ms: execution.issued_at_ms,
+            deadline_ms: execution.deadline_ms,
         };
         // A provider may take time or lose the coordinator session. Revalidate
         // after all external work, as well as immediately before process creation.
@@ -280,21 +313,18 @@ impl<'a> NativeCandidateHandoff<'a> {
                 &self.descriptors,
                 &self,
             )
-            .map_err(|_| native_error("candidate launch uncertain"))
+            .map_err(|_| native_error("launch uncertain"))
     }
 
     fn validate_current(&self) -> Result<(), RuntimeError> {
         mllm_adapters::sglang::SglangLaunch::validate_wrapper_path(std::path::Path::new(
             &self.command.argv[2],
         ))?;
+        let now = (self.now_ms)().map_err(|_| native_error("clock unavailable"))?;
         let current = self
-            .store
-            .candidate_native_launch(
-                self.session,
-                &self.step_id,
-                (self.now_ms)().map_err(|_| native_error("candidate clock unavailable"))?,
-            )
-            .map_err(|_| native_error("candidate handoff is stale"))?;
+            .source
+            .frozen(self.session, &self.step_id, now)
+            .map_err(|_| native_error("handoff is stale"))?;
         if current.metadata() != self.frozen.metadata()
             || current.settings() != self.frozen.settings()
             || current.checkpoint_root() != self.frozen.checkpoint_root()
@@ -302,16 +332,32 @@ impl<'a> NativeCandidateHandoff<'a> {
             || current.inference_credential_ref() != self.frozen.inference_credential_ref()
             || current.admin_credential_ref() != self.frozen.admin_credential_ref()
         {
-            return Err(native_error("candidate handoff changed"));
+            return Err(native_error("handoff changed"));
+        }
+        // The arm's own execution context is the authority for what may still be
+        // sent. Re-reading it proves the step, its binding and its fence are the
+        // ones this handoff was built from, and that the deadline has not passed.
+        let execution = self
+            .store
+            .qualified_initialize_execution(self.session, &self.step_id)
+            .map_err(|_| native_error("handoff is stale"))?;
+        if execution.token != self.token
+            || execution.binding_id != self.binding_id
+            || execution.incarnation != self.incarnation
+            || execution.deadline_ms != self.deadline_ms
+            || now < self.issued_at_ms
+            || now >= self.deadline_ms
+        {
+            return Err(native_error("handoff is stale"));
         }
         Ok(())
     }
 }
 
-impl LaunchAssociation for NativeCandidateHandoff<'_> {
+impl LaunchAssociation for NativeLaunchHandoff<'_> {
     fn persist_api_identity(&self, identity: &ProcessIdentity) -> Result<(), AssociationError> {
         self.validate_current()
-            .map_err(|_| AssociationError::Uncertain("candidate handoff is stale".into()))?;
+            .map_err(|_| AssociationError::Uncertain("handoff is stale".into()))?;
         self.store
             .record_api_identity(
                 self.session,
@@ -319,7 +365,7 @@ impl LaunchAssociation for NativeCandidateHandoff<'_> {
                 &self.frozen.metadata().binding_id,
                 identity,
             )
-            .map_err(|_| AssociationError::Uncertain("candidate API association uncertain".into()))
+            .map_err(|_| AssociationError::Uncertain("API association uncertain".into()))
     }
 }
 

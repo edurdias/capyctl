@@ -92,6 +92,10 @@ pub struct NativeLaunchMetadata {
 /// Deliberately has no Debug, Display, or serialization implementation. Reading,
 /// constructing, or retaining this value does not authorize a send. The controller
 /// must separately own the current persisted arm's `New` outcome.
+///
+/// `Clone` exists so an application-supplied source can hand out the same frozen
+/// value on every call. Copying it still authorizes nothing.
+#[derive(Clone)]
 pub struct NativeLaunch {
     metadata: NativeLaunchMetadata,
     checkpoint_root: String,
