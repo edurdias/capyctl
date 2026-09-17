@@ -194,9 +194,11 @@ builder's opinion. After any Initialize error on a native builder:
 2. `terminate_owned`, then `verify_gone`.
 3. **Proven gone.** New store transition
    `release_failed_launch(session, step_id, evidence, now)`, one transaction: the step
-   becomes `failed`, the binding `released`, the endpoint lease and resource grant are
-   released, the claim is dropped, and the evidence is written. This is a release with
-   verified evidence, so the working agreement's invariant holds. The coordinator journals
+   becomes `cancelled` and its lifecycle run and operation `failed` (the schema's step
+   states have no failed value and its run states do, so no migration is needed), the
+   binding becomes `released`, the endpoint lease and resource grant are released, the
+   claim is dropped, and the gone evidence is written to `lifecycle_evidence`. This is a
+   release with verified evidence, so the working agreement's invariant holds. The coordinator journals
    the builder's reason with the engine log tail (SPEC §17), closes that deployment's
    admission, and the status reads `Closed`. No retry. Other deployments are untouched.
 4. **Not provable.** `Uncertain` pause with the reservation retained, as today. An
