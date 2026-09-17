@@ -636,6 +636,28 @@ impl crate::Store {
         controls
             .validate(&current.context)
             .map_err(|_| ResourcePolicyError::Invalid)?;
+        // SPEC §6.2 / ADR 0010 decision 5: a domain's memory topology is a declared
+        // hardware fact, unlike every other field of ResourceControls, which is an
+        // operator-tunable limit an update may freely change. It is not moved into
+        // the immutable ResourceContext here — that would change what a revision
+        // conflict means and touch persistence, more than this fix should carry —
+        // but it must still behave as immutable: reject a change to it the same way
+        // a context change is rejected, rather than silently admitting it. Otherwise
+        // a host_backed deployment already qualified against a distinct domain could
+        // have that domain flip to unified underneath it, and its next park would
+        // report success while freeing nothing. A domain new to the incoming
+        // controls is not a change; a domain's absence is already governed by the
+        // membership check in `controls.validate` above.
+        for (id, domain) in &controls.domains {
+            if current
+                .controls
+                .domains
+                .get(id)
+                .is_some_and(|previous| previous.memory != domain.memory)
+            {
+                return Err(ResourcePolicyError::RevisionConflict);
+            }
+        }
         validate_observations(
             &current.context,
             controls,

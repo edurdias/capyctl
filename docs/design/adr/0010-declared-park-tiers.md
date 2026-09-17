@@ -1,6 +1,6 @@
 # ADR 0010 — Declared park tiers
 
-**Status:** Proposed (2026-09-16)
+**Status:** Accepted (2026-09-16)
 **Amends:** `SPEC.md` section 6.2 (residency vocabulary). Sections 8.4, 9.1, 9.2 and
 13.2 are unchanged and are the authority for everything this document relies on.
 

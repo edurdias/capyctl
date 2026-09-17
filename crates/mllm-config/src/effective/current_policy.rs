@@ -1,8 +1,8 @@
 //! Pure composition of persisted resource controls into trusted local configuration.
-use super::{core, decode, invalid, HostInput};
+use super::{compose_resource_policy, core, decode, invalid, HostInput};
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::ConfigError;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// Canonical command identity without mutable host/profile resolution. A replay
 /// supplies its original resolved deadline, not the current host default. This
@@ -81,53 +81,12 @@ pub fn compose_current_resource_controls(
         ));
     }
     controls.validate(context)?;
-    let domains: Map<String, Value> = controls
-        .domains
-        .iter()
-        .map(|(id, domain)| {
-            let mut value = json!({
-                "managed_limit": format!("{}B", domain.managed_limit),
-                "free_reserve": format!("{}B", domain.free_reserve),
-                // SPEC §6.2: a domain's memory topology is a declared hardware fact,
-                // not a runtime control, but it is required on every domain, so it
-                // must round-trip through composition like the other required fields.
-                "memory": domain.memory,
-            });
-            if let Some(bytes) = domain.host_kv_limit {
-                value["host_kv_limit"] = json!(format!("{bytes}B"));
-            }
-            if let Some(bytes) = domain.parked_limit {
-                value["parked_limit"] = json!(format!("{bytes}B"));
-            }
-            (id.clone(), value)
-        })
-        .collect();
-    let devices: Map<String, Value> = context
-        .device_domains
-        .iter()
-        .map(|(id, domain)| {
-            (
-                id.clone(),
-                json!({"domain": domain, "sharing": controls.device_sharing_overrides[id]}),
-            )
-        })
-        .collect();
+    // This must go through the one writer of the `resource_policy` shape,
+    // `compose_resource_policy`, rather than build its own JSON: a second
+    // hand-written composer of the same shape previously existed here, drifted
+    // from the typed one, and defeated the compile-time guarantee that adding a
+    // required field to `RawDomain` etc. cannot be silently omitted.
     let mut composed = trusted_host.clone();
-    composed["resource_policy"] = json!({
-        "domains": domains,
-        "devices": devices,
-        "max_parked": controls.max_parked,
-        "observation_ttl": format!("{}ms", controls.observation_ttl_ms),
-        "device_sharing": controls.device_sharing,
-        "endpoint_port_range": context.endpoint_port_range,
-        "planner_max_states": controls.planner_max_states,
-        "queue": {
-            "max_pending_per_deployment": controls.queue.max_pending_per_deployment,
-            "max_pending_total": controls.queue.max_pending_total,
-            "max_buffered_bytes_total": format!("{}B", controls.queue.max_buffered_bytes_total),
-            "request_deadline": format!("{}ms", controls.queue.request_deadline_ms),
-            "admission_window": format!("{}ms", controls.queue.admission_window_ms),
-        },
-    });
+    composed["resource_policy"] = compose_resource_policy(controls, context);
     Ok(composed)
 }

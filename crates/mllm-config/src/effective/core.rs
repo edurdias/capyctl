@@ -258,9 +258,9 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
             // domain's device and host memory are one pool, that allocates from the
             // pool it is supposed to free, so the park succeeds and releases nothing.
             // The failure is otherwise silent, which is why it is refused here rather
-            // than at first park. Every phase is checked, not just one: a deployment
-            // whose `ready` phase names a distinct domain but whose `wake` phase names
-            // a unified one is still broken.
+            // than at first park. Every phase is checked, not just one, because this
+            // check should not depend on another validator's guarantee (elsewhere in
+            // this module) that every phase names the same domain set.
             if d.residency == Residency::HostBacked && domain.memory == DomainMemory::Unified {
                 return Err(invalid(
                     "residency",

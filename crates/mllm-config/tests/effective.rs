@@ -12,7 +12,8 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
     (all["deployment"].clone(), all["host"].clone())
 }
 
-/// Set the topology of the lab host's only domain. Used by this task and Task 4.
+/// Set the topology of the lab host's only domain. Used here and by the host-check
+/// tests below (ADR 0010 decision 5).
 fn host_with_domain_memory(memory: &str) -> serde_json::Value {
     let (_, mut host) = fixture();
     host["resource_policy"]["domains"]["unified"]["memory"] = memory.into();
@@ -63,8 +64,9 @@ fn residency_names_which_park_the_deployment_asks_for() {
     ] {
         let (mut deployment, host) = fixture();
         deployment["residency"] = declared.into();
-        // Task 4 refuses host_backed on a unified domain, which is what the lab host
-        // declares, so this asserts the vocabulary on a host that allows every tier.
+        // ADR 0010 decision 5 refuses host_backed on a unified domain, which is what
+        // the lab host declares, so this asserts the vocabulary on a host that
+        // allows every tier.
         let mut host = host;
         host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
         let resolved = resolve_effective(&deployment, &host)
@@ -114,10 +116,41 @@ fn deep_parking_resolves_on_a_unified_domain() {
 fn residency_auto_is_refused() {
     let (mut deployment, host) = fixture();
     deployment["residency"] = "auto".into();
-    assert!(
-        resolve_effective(&deployment, &host).is_err(),
-        "auto must not resolve"
-    );
+    let error = resolve_effective(&deployment, &host).expect_err("auto must not resolve");
+    assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination, "{error:?}");
+    assert_eq!(error.path, "deployment.residency", "{error:?}");
+}
+
+/// ADR 0010 decision 3 widened the vLLM sleep-mode gate from `residency ==
+/// Residency::Warm` to `residency.parks()`, so both parking tiers require it, not
+/// only one. Narrowing the condition back to `Residency::Deep` alone would pass the
+/// rest of the suite, so this asserts both tiers explicitly and on the field path,
+/// not merely that resolution fails for some reason.
+#[test]
+fn a_parking_vllm_profile_without_sleep_mode_is_rejected() {
+    for residency in ["host_backed", "deep"] {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = residency.into();
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
+        let error = resolve_effective(&deployment, &host)
+            .expect_err(&format!("{residency} without sleep mode must be rejected"));
+        assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination, "{residency}: {error:?}");
+        assert_eq!(
+            error.path, "runtime_profiles.launch_settings.enable_sleep_mode",
+            "{residency}: {error:?}"
+        );
+    }
+}
+
+/// `restart_only` never parks, so it has nothing to gate on sleep mode: SPEC §6.2
+/// keeps restart-only first-class even for engines without a qualified release API.
+#[test]
+fn restart_only_vllm_profile_is_accepted_without_sleep_mode() {
+    let (mut deployment, mut host) = fixture();
+    deployment["residency"] = "restart_only".into();
+    host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
+    resolve_effective(&deployment, &host).expect("restart_only does not require sleep mode");
 }
 
 #[test]
@@ -1088,8 +1121,8 @@ fn sglang_launch_flags_follow_the_declared_tier() {
             "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
             "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500}
         });
-        // host_backed needs a host whose pools are distinct; Task 4 refuses it here
-        // otherwise, and this test is about the flags, not the host check.
+        // host_backed needs a host whose pools are distinct; ADR 0010 decision 5
+        // refuses it otherwise, and this test is about the flags, not the host check.
         host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
         let resolved = resolve_effective(&deployment, &host)
             .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));

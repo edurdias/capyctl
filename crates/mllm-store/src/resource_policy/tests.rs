@@ -180,6 +180,64 @@ fn update_replays_exact_result_conflicts_on_changed_body_and_scopes_principal() 
     ));
 }
 
+// SPEC §6.2 / ADR 0010 decision 5: a domain's memory topology is a declared
+// hardware fact. Nothing else in ResourceControls carries that character — every
+// other field is an operator-tunable limit an update may freely change — so only
+// `memory` is compared here.
+#[test]
+fn update_rejects_a_domain_topology_change_as_a_revision_conflict() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+
+    let mut flipped = ResourceControls::from_host(&host());
+    flipped.domains.get_mut("system").unwrap().memory = DomainMemory::Unified;
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "flip",
+            &flipped,
+            &observations(),
+            11_000,
+        ),
+        Err(ResourcePolicyError::RevisionConflict)
+    ));
+    // The rejected update must not have advanced the ledger epoch or revision:
+    // uncertainty must retain accounting rather than silently applying part of a
+    // rejected write.
+    assert_eq!(store.resource_snapshot().unwrap().epoch, 1);
+}
+
+#[test]
+fn update_leaving_a_domain_topology_unchanged_still_succeeds() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &host(), &observations(), 11_000)
+        .unwrap();
+
+    let mut unchanged = ResourceControls::from_host(&host());
+    unchanged.max_parked = 1;
+    let updated = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "leave-alone",
+            &unchanged,
+            &observations(),
+            11_000,
+        )
+        .unwrap();
+    assert_eq!(updated.revision, 2);
+}
+
 #[test]
 fn lowering_limits_retains_all_owners_and_reports_each_overcommit_category() {
     let store = crate::Store::open_in_memory().unwrap();

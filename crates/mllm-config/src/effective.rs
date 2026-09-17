@@ -166,7 +166,7 @@ pub enum Residency {
     /// no qualified memory-release API.
     RestartOnly,
     /// Weights retained in host RAM, KV dropped. Frees nothing where device and host
-    /// memory are one pool, which Task 5's host check refuses.
+    /// memory are one pool, which the host check refuses (ADR 0010 decision 5).
     HostBacked,
     /// Weights and KV released; weights re-read from the checkpoint on wake.
     Deep,
@@ -731,7 +731,7 @@ fn normalize_launch(
             if residency.parks() && !value.enable_sleep_mode {
                 return Err(invalid(
                     "runtime_profiles.launch_settings.enable_sleep_mode",
-                    "warm vLLM requires sleep mode",
+                    "a parking vLLM deployment requires sleep mode",
                 ));
             }
             ProfileLaunchSettings::Vllm(value)

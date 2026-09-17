@@ -212,7 +212,7 @@ Any uncertain state -> RECONCILING -> verified state or FAILED
 
 **Restart-only:** stop and initialize again. This is first-class supported behavior, including backends without qualified memory-release APIs.
 
-`auto` selects a qualified and security-permitted deep-park path, otherwise restart-only. `deep_required` fails validation if deep parking is unavailable. `restart_only` prohibits sleep calls. Capability qualification does not override an operator's security restrictions.
+A deployment declares exactly one residency — `restart_only`, `host_backed`, or `deep` — and there is no runtime ladder between them: the deployment states the tier it wants, and resolution either confirms the profile and host can deliver it or fails closed. `auto`, which formerly selected a tier at run time, is withdrawn (ADR 0010): a running SGLang engine cannot switch tiers, since its park flags are startup-only, and on the hardware in hand the choice is forced by the host's declared memory topology before launch anyway, so a runtime ladder would have nothing to choose between. `deep_required` is likewise withdrawn, because a declared `deep` residency already fails validation when deep parking is unavailable, by construction. `restart_only` prohibits sleep calls. Capability qualification does not override an operator's security restrictions. `host_backed` is refused at configuration time, not at first park, on a host domain declared to have device and host memory as one physical pool, since retaining a weight backup there would free nothing.
 
 ### 6.3 Command semantics
 
