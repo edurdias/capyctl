@@ -50,7 +50,7 @@ fn a_parking_deployment_gets_a_declared_identity() {
     // ADR 0011: there is no catalog to consult. A parking deployment gets its
     // binding from the ordinary path alone.
     store
-        .accept_qualified_start(&session, &fence, 100, 100_100)
+        .accept_start(&session, &fence, 100, 100_100)
         .expect("a parking deployment must get a binding");
 
     let binding_json: String = store

@@ -28,7 +28,7 @@ struct NativeFixture {
     _directory: tempfile::TempDir,
 }
 
-/// An ordinary managed deployment whose qualified initialize has been accepted.
+/// An ordinary managed deployment whose initialize has been accepted.
 /// No candidate run takes part: the frozen descriptor comes from the test source.
 impl NativeFixture {
     fn new() -> Self {
@@ -77,7 +77,7 @@ impl NativeFixture {
             generation: receipt.generation,
         };
         let accepted = store
-            .accept_qualified_start(&session, &fence, 1100, 300000)
+            .accept_start(&session, &fence, 1100, 300000)
             .unwrap();
         let connection = rusqlite::Connection::open(root.join("native.db")).unwrap();
         let (incarnation, endpoint): (String, String) = connection
@@ -497,7 +497,7 @@ fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_c
     );
     let execution = fixture
         .store
-        .qualified_initialize_execution(&fixture.session, &fixture.step)
+        .initialize_execution(&fixture.session, &fixture.step)
         .unwrap();
     assert_eq!(
         private["launch_scope"],

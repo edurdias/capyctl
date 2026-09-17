@@ -63,7 +63,7 @@ impl crate::Store {
     /// Fail only a current, expired, unarmed ordinary Initialize. This is not
     /// cleanup authority: any evidence of an arm or effects denies release.
     /// Exact terminal retries are read-only and require the same current fence.
-    pub fn expire_unarmed_qualified_initialize(
+    pub fn expire_unarmed_initialize(
         &self,
         session: &CoordinatorSession,
         step_id: &str,

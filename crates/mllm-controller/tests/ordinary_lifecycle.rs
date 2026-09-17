@@ -11,8 +11,8 @@ use mllm_domain::resources::{MemoryLimit, MemoryObservation, ResourcePhase};
 use mllm_scheduler::residency::AdmissionContext;
 use mllm_store::lifecycle::{ArmResult, DeploymentFence, LifecycleError};
 use mllm_store::ordinary_lifecycle::cleanup::{CleanupExecutionContext, CleanupMode};
-use mllm_store::ordinary_lifecycle::worker::QualifiedInitializeStatus;
-use mllm_store::ordinary_lifecycle::QualifiedStart;
+use mllm_store::ordinary_lifecycle::worker::InitializeStatus;
+use mllm_store::ordinary_lifecycle::Start;
 use mllm_store::Store;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,7 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
     let fence = fixture::managed(&f, "ordinary");
     let accepted = f
         .store
-        .accept_qualified_start(&f.session, &fence, 1800, 10000)
+        .accept_start(&f.session, &fence, 1800, 10000)
         .unwrap();
     let mut context = f.admission();
     context.now_ms = 1900;
@@ -127,7 +127,7 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
     ));
     let execution = f
         .store
-        .qualified_initialize_execution(&f.session, &accepted.step_id)
+        .initialize_execution(&f.session, &accepted.step_id)
         .unwrap();
     let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
@@ -193,7 +193,7 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
 }
 
 #[tokio::test]
-async fn ordinary_initialize_actual_catalog_to_ready() {
+async fn ordinary_initialize_to_ready() {
     let f = fixture::fixture();
     let fence = fixture::managed(&f, "ordinary");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -206,7 +206,7 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
             std::thread::spawn(move || {
                 let store = Store::open(&path).unwrap();
                 barrier.wait();
-                store.accept_qualified_start(&session, &target, 1800, 10000)
+                store.accept_start(&session, &target, 1800, 10000)
             })
         })
         .collect();
@@ -221,7 +221,7 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
         .clone();
     let joined = f
         .store
-        .accept_qualified_start(&f.session, &fence, 1801, 20000)
+        .accept_start(&f.session, &fence, 1801, 20000)
         .unwrap();
     assert!(joined.joined);
     assert_eq!(accepted.operation_id, joined.operation_id);
@@ -242,7 +242,7 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
     );
     let before = full_counts(&f.sql);
     let epoch_before = f.store.resource_snapshot().unwrap().epoch;
-    f.sql.execute_batch("CREATE TRIGGER ordinary_arm_failure BEFORE UPDATE OF state ON lifecycle_steps WHEN NEW.state='armed' AND json_extract(NEW.step_json,'$.kind')='qualified_initialize' BEGIN SELECT RAISE(ABORT,'ordinary arm failure'); END;").unwrap();
+    f.sql.execute_batch("CREATE TRIGGER ordinary_arm_failure BEFORE UPDATE OF state ON lifecycle_steps WHEN NEW.state='armed' AND json_extract(NEW.step_json,'$.kind')='initialize' BEGIN SELECT RAISE(ABORT,'ordinary arm failure'); END;").unwrap();
     assert!(
         f.store
             .arm_step(&f.session, &accepted.step_id, admission)
@@ -262,7 +262,7 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
     ));
     let context = f
         .store
-        .qualified_initialize_execution(&f.session, &accepted.step_id)
+        .initialize_execution(&f.session, &accepted.step_id)
         .unwrap();
     assert_eq!(
         results.iter().filter(|r| r.is_ok()).count(),
@@ -368,7 +368,7 @@ async fn ordinary_initialize_actual_catalog_to_ready() {
     f.sql
         .execute("DELETE FROM request_leases WHERE id='ordinary-unknown'", [])
         .unwrap();
-    f.sql.execute_batch("CREATE TRIGGER ordinary_completion_failure BEFORE INSERT ON lifecycle_evidence WHEN NEW.step_id IN (SELECT id FROM lifecycle_steps WHERE json_extract(step_json,'$.kind')='qualified_initialize') BEGIN SELECT RAISE(ABORT,'ordinary completion failure'); END;").unwrap();
+    f.sql.execute_batch("CREATE TRIGGER ordinary_completion_failure BEFORE INSERT ON lifecycle_evidence WHEN NEW.step_id IN (SELECT id FROM lifecycle_steps WHERE json_extract(step_json,'$.kind')='initialize') BEGIN SELECT RAISE(ABORT,'ordinary completion failure'); END;").unwrap();
     assert!(
         f.store
             .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
@@ -410,11 +410,11 @@ async fn worker_selects_oldest_current_generation_without_adopting_superseded_wo
     let second = fixture::managed_edit(&f, "second", |_, _| {});
     let a = f
         .store
-        .accept_qualified_start(&f.session, &first, 1800, 10000)
+        .accept_start(&f.session, &first, 1800, 10000)
         .unwrap();
     let b = f
         .store
-        .accept_qualified_start(&f.session, &second, 1801, 10001)
+        .accept_start(&f.session, &second, 1801, 10001)
         .unwrap();
     // Control only acceptance ordering; all authorization/evidence came through writers.
     f.sql
@@ -431,7 +431,7 @@ async fn worker_selects_oldest_current_generation_without_adopting_superseded_wo
         .unwrap();
     assert_eq!(
         f.store
-            .next_qualified_initialize(&f.session)
+            .next_initialize(&f.session)
             .unwrap()
             .unwrap()
             .operation_id(),
@@ -440,7 +440,7 @@ async fn worker_selects_oldest_current_generation_without_adopting_superseded_wo
     f.store.fence_stop(&f.session, &first, 10000).unwrap();
     assert_eq!(
         f.store
-            .next_qualified_initialize(&f.session)
+            .next_initialize(&f.session)
             .unwrap()
             .unwrap()
             .operation_id(),
@@ -451,7 +451,7 @@ async fn worker_selects_oldest_current_generation_without_adopting_superseded_wo
     assert!(f.store.resource_snapshot().unwrap().owners.is_empty());
     // A new coordinator may inspect/reconcile the reservations, never silently adopt them.
     let next = f.store.begin_coordinator_session().unwrap();
-    assert!(f.store.next_qualified_initialize(&next).unwrap().is_none());
+    assert!(f.store.next_initialize(&next).unwrap().is_none());
     assert_eq!(f.scalar("SELECT COUNT(*) FROM endpoint_leases"), 2);
 }
 
@@ -460,19 +460,19 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     let f = fixture::fixture();
     assert!(
         f.store
-            .next_qualified_initialize(&f.session)
+            .next_initialize(&f.session)
             .unwrap()
             .is_none()
     );
     let fence = fixture::managed(&f, "ordinary");
     let accepted = f
         .store
-        .accept_qualified_start(&f.session, &fence, 1800, 10000)
+        .accept_start(&f.session, &fence, 1800, 10000)
         .unwrap();
     let before = full_counts(&f.sql);
     let work = f
         .store
-        .next_qualified_initialize(&f.session)
+        .next_initialize(&f.session)
         .unwrap()
         .unwrap();
     assert_eq!(work.operation_id(), accepted.operation_id);
@@ -497,7 +497,7 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
             [&accepted.step_id],
         )
         .unwrap();
-    assert!(f.store.next_qualified_initialize(&f.session).is_err());
+    assert!(f.store.next_initialize(&f.session).is_err());
     f.sql
         .execute(
             "UPDATE lifecycle_steps SET step_json=?2 WHERE id=?1",
@@ -506,7 +506,7 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
         .unwrap();
     assert!(
         f.store
-            .mark_qualified_initialize_uncertain(&f.session, &accepted.step_id, 1900)
+            .mark_initialize_uncertain(&f.session, &accepted.step_id, 1900)
             .is_err()
     );
     let mut admission = f.admission();
@@ -519,15 +519,15 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     ));
     assert!(
         f.store
-            .next_qualified_initialize(&f.session)
+            .next_initialize(&f.session)
             .unwrap()
             .is_none()
     );
     let charged = f.store.resource_snapshot().unwrap();
-    f.sql.execute_batch("CREATE TRIGGER uncertain_event_failure BEFORE INSERT ON management_events WHEN NEW.kind='qualified_initialize_uncertain' BEGIN SELECT RAISE(ABORT,'uncertain event failure'); END;").unwrap();
+    f.sql.execute_batch("CREATE TRIGGER uncertain_event_failure BEFORE INSERT ON management_events WHEN NEW.kind='initialize_uncertain' BEGIN SELECT RAISE(ABORT,'uncertain event failure'); END;").unwrap();
     assert!(
         f.store
-            .mark_qualified_initialize_uncertain(&f.session, &accepted.step_id, 10001)
+            .mark_initialize_uncertain(&f.session, &accepted.step_id, 10001)
             .is_err()
     );
     assert_eq!(
@@ -544,12 +544,12 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
         .unwrap();
     assert!(
         f.store
-            .mark_qualified_initialize_uncertain(&f.session, &accepted.step_id, 10001)
+            .mark_initialize_uncertain(&f.session, &accepted.step_id, 10001)
             .unwrap()
     );
     assert!(
         !f.store
-            .mark_qualified_initialize_uncertain(&f.session, &accepted.step_id, 10002)
+            .mark_initialize_uncertain(&f.session, &accepted.step_id, 10002)
             .unwrap()
     );
     assert_eq!(f.store.resource_snapshot().unwrap(), charged);
@@ -561,7 +561,7 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     assert_eq!(f.scalar("SELECT COUNT(*) FROM endpoint_leases"), 1);
     assert_eq!(
         f.scalar(
-            "SELECT COUNT(*) FROM management_events WHERE kind='qualified_initialize_uncertain'"
+            "SELECT COUNT(*) FROM management_events WHERE kind='initialize_uncertain'"
         ),
         1
     );
@@ -572,10 +572,10 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
         ArmResult::AlreadyRecorded
     );
     let session = f.store.begin_coordinator_session().unwrap();
-    assert!(f.store.next_qualified_initialize(&f.session).is_err());
+    assert!(f.store.next_initialize(&f.session).is_err());
     assert!(
         f.store
-            .mark_qualified_initialize_uncertain(&session, &accepted.step_id, 10003)
+            .mark_initialize_uncertain(&session, &accepted.step_id, 10003)
             .is_err()
     );
     assert_eq!(f.store.resource_snapshot().unwrap(), charged);
@@ -665,7 +665,7 @@ async fn owned_worker_initializes_once_for_joined_and_dropped_observers() {
         );
         let context = state
             .store()
-            .qualified_initialize_execution(state.session(), &step)
+            .initialize_execution(state.session(), &step)
             .unwrap();
         assert_eq!(context.deadline_ms, 10000);
     }
@@ -750,14 +750,14 @@ async fn started(
 ) -> (
     CleanupFixture,
     DeploymentFence,
-    QualifiedStart,
+    Start,
     FakeEngine,
     CompletionEvidence,
 ) {
     let (f, fence) = cleanup_fixture().await;
     let start = f
         .store
-        .accept_qualified_start(&f.session, &fence, 1800, 10000)
+        .accept_start(&f.session, &fence, 1800, 10000)
         .unwrap();
     let mut admission = f.admission();
     admission.now_ms = 1900;
@@ -766,7 +766,7 @@ async fn started(
         .unwrap();
     let context = f
         .store
-        .qualified_initialize_execution(&f.session, &start.step_id)
+        .initialize_execution(&f.session, &start.step_id)
         .unwrap();
     let fake = FakeEngine::with_lifecycle();
     let observation = fake
@@ -864,7 +864,7 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
     );
     assert!(
         f.store
-            .qualified_initialize_execution(&f.session, &start.step_id)
+            .initialize_execution(&f.session, &start.step_id)
             .is_err()
     );
     let (arm, context) = f
@@ -941,7 +941,7 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
     };
     let fresh = f
         .store
-        .accept_qualified_start(&f.session, &next, 2200, 10000)
+        .accept_start(&f.session, &next, 2200, 10000)
         .unwrap();
     assert_ne!(fresh.binding_id, start.binding_id);
     let mut admission = f.admission();
@@ -951,7 +951,7 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
         .unwrap();
     let context = f
         .store
-        .qualified_initialize_execution(&f.session, &fresh.step_id)
+        .initialize_execution(&f.session, &fresh.step_id)
         .unwrap();
     let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
@@ -1044,7 +1044,7 @@ async fn ordinary_cleanup_armed_and_uncertain_handoff_settles_only_after_verifie
         let (f, fence, start, fake, evidence) = started(false).await;
         if uncertain {
             f.store
-                .mark_qualified_initialize_uncertain(&f.session, &start.step_id, 2000)
+                .mark_initialize_uncertain(&f.session, &start.step_id, 2000)
                 .unwrap();
         }
         let stop = f
@@ -1231,14 +1231,14 @@ async fn ordinary_cleanup_unproven_lease_blocks_all_release_and_other_deployment
     let other = fixture::owned_source().await.other.clone();
     let start = f
         .store
-        .accept_qualified_start(&f.session, &other, 1800, 10000)
+        .accept_start(&f.session, &other, 1800, 10000)
         .unwrap();
     f.store
         .arm_step(&f.session, &start.step_id, f.admission())
         .unwrap();
     let context = f
         .store
-        .qualified_initialize_execution(&f.session, &start.step_id)
+        .initialize_execution(&f.session, &start.step_id)
         .unwrap();
     let observation = FakeEngine::with_lifecycle()
         .execute_persisted(&RuntimeCommand {
@@ -1353,7 +1353,7 @@ async fn ordinary_cleanup_missing_ownership_and_unarmed_reservations_stay_retain
     let (f, fence) = cleanup_fixture().await;
     let start = f
         .store
-        .accept_qualified_start(&f.session, &fence, 1800, 10000)
+        .accept_start(&f.session, &fence, 1800, 10000)
         .unwrap();
     let before = full_counts(&f.sql);
     assert!(
@@ -1617,25 +1617,25 @@ async fn start_receipt_faults_are_atomic_and_historical_corruption_is_rejected()
         ("command_receipts", "NEW.idempotency_key='start'"),
         (
             "management_events",
-            "NEW.kind='qualified_initialize_accepted'",
+            "NEW.kind='initialize_accepted'",
         ),
     ] {
         sql.execute_batch(&format!("CREATE TRIGGER fail_start BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'start rollback'); END;")).unwrap();
         let before = counts(&sql);
         assert!(matches!(
-            store.accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000),
+            store.accept_start_command(&session, "owner", id, 1, "start", 1800, 10000),
             Err(LifecycleError::Sql(_))
         ));
         assert_eq!(counts(&sql), before);
         sql.execute_batch("DROP TRIGGER fail_start").unwrap();
     }
     let accepted = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 10000)
         .unwrap();
     sql.execute_batch("CREATE TRIGGER fail_join BEFORE INSERT ON command_receipts WHEN NEW.idempotency_key='join' BEGIN SELECT RAISE(ABORT,'join rollback'); END;").unwrap();
     let before_join = counts(&sql);
     assert!(matches!(
-        store.accept_qualified_start_command(&session, "owner", id, 1, "join", 1801, 20000),
+        store.accept_start_command(&session, "owner", id, 1, "join", 1801, 20000),
         Err(LifecycleError::Sql(_))
     ));
     assert_eq!(counts(&sql), before_join);
@@ -1680,7 +1680,7 @@ async fn start_receipt_faults_are_atomic_and_historical_corruption_is_rejected()
             .unwrap_or_else(|error| panic!("{corruption}: {error}"));
         assert!(
             matches!(
-                corrupted_store.accept_qualified_start_command(
+                corrupted_store.accept_start_command(
                     &session, "owner", id, 1, "start", 90000, 10000
                 ),
                 Err(LifecycleError::CorruptStoredData)
@@ -1690,7 +1690,7 @@ async fn start_receipt_faults_are_atomic_and_historical_corruption_is_rejected()
     }
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&session, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         accepted
     );
@@ -1702,10 +1702,10 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     let source = fixture::owned_source().await;
     let id = &source.fence.deployment_id;
     let receipt = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 10000)
         .unwrap();
     let joined = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "join", 1801, 11000)
+        .accept_start_command(&session, "owner", id, 1, "join", 1801, 11000)
         .unwrap();
     assert!(joined.joined());
     let raw: String = sql
@@ -1750,7 +1750,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
         .execute_persisted(&RuntimeCommand {
             action: RuntimeAction::Initialize,
             context: store
-                .qualified_initialize_execution(&session, receipt.step_id())
+                .initialize_execution(&session, receipt.step_id())
                 .unwrap(),
         })
         .await
@@ -1787,12 +1787,12 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     let ready = counts(&sql);
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&session, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         receipt
     );
     assert!(store
-        .accept_qualified_start_command(&session, "owner", id, 1, "new-ready", 2000, 10000)
+        .accept_start_command(&session, "owner", id, 1, "new-ready", 2000, 10000)
         .is_err());
     assert_eq!(counts(&sql), ready);
     let stop = store
@@ -1801,13 +1801,13 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     let stopping = counts(&sql);
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&session, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         receipt
     );
     assert_eq!(counts(&sql), stopping);
     assert!(matches!(
-        store.accept_qualified_start_command(&session, "owner", id, 1, "stop", 2000, 10000),
+        store.accept_start_command(&session, "owner", id, 1, "stop", 2000, 10000),
         Err(LifecycleError::IdempotencyConflict)
     ));
     let (_, context) = store
@@ -1827,7 +1827,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     let stopped = counts(&sql);
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&session, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         receipt
     );
@@ -1881,18 +1881,18 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     let before = counts(&sql);
     assert_eq!(
         store
-            .accept_qualified_start_command(&current, "owner", id, 1, "join", 90000, 11000)
+            .accept_start_command(&current, "owner", id, 1, "join", 90000, 11000)
             .unwrap(),
         joined
     );
     assert_eq!(
         store
-            .accept_qualified_start_command(&current, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&current, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         receipt
     );
     assert!(store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &current,
             "owner",
             id,
@@ -1933,7 +1933,7 @@ async fn start_receipt_concurrent_same_key_has_one_acceptance() {
             std::thread::spawn(move || {
                 barrier.wait();
                 store
-                    .accept_qualified_start_command(&session, "owner", &id, 1, "race", 1800, 10000)
+                    .accept_start_command(&session, "owner", &id, 1, "race", 1800, 10000)
                     .unwrap()
             })
         })
@@ -1950,7 +1950,7 @@ async fn start_receipt_concurrent_same_key_has_one_acceptance() {
         [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
     );
     assert!(store
-        .qualified_initialize_execution(&session, receipts[0].step_id())
+        .initialize_execution(&session, receipts[0].step_id())
         .is_err());
 }
 
@@ -1962,7 +1962,7 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
     let before = counts(&sql);
     let epoch = store.resource_snapshot().unwrap().epoch;
     let accepted = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 10000)
         .unwrap();
     assert!(!accepted.joined());
     assert_eq!(
@@ -1986,7 +1986,7 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
     assert_eq!(store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&session, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         accepted
     );
@@ -2004,7 +2004,7 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
         ("owner", id.as_str(), 1, "new-expired", 1800, 1800),
     ] {
         assert!(matches!(
-            store.accept_qualified_start_command(
+            store.accept_start_command(
                 &session, principal, target, revision, key, now, deadline
             ),
             Err(LifecycleError::Invalid)
@@ -2012,7 +2012,7 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
     }
     assert_eq!(counts(&sql), after);
     let joined = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "join", 1801, 20000)
+        .accept_start_command(&session, "owner", id, 1, "join", 1801, 20000)
         .unwrap();
     assert!(joined.joined());
     assert_eq!(joined.operation_id(), accepted.operation_id());
@@ -2031,17 +2031,17 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
     assert_eq!(store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "join", 90000, 20000)
+            .accept_start_command(&session, "owner", id, 1, "join", 90000, 20000)
             .unwrap(),
         joined
     );
     let principal = store
-        .accept_qualified_start_command(&session, "another", id, 1, "start", 1802, 11000)
+        .accept_start_command(&session, "another", id, 1, "start", 1802, 11000)
         .unwrap();
     assert!(principal.joined());
     assert_eq!(principal.operation_id(), accepted.operation_id());
     let other = store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &session,
             "owner",
             &source.other.deployment_id,
@@ -2059,7 +2059,7 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
         (2, "stale", 10000),
     ] {
         let error = store
-            .accept_qualified_start_command(&session, "owner", id, revision, key, 1802, deadline)
+            .accept_start_command(&session, "owner", id, revision, key, 1802, deadline)
             .unwrap_err();
         if key == "stale" {
             assert!(matches!(error, LifecycleError::RevisionConflict));
@@ -2074,12 +2074,12 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
     assert_eq!(counts(&sql), fixed);
     let current = store.begin_coordinator_session().unwrap();
     assert!(matches!(
-        store.accept_qualified_start_command(&session, "owner", id, 1, "start", 1802, 10000),
+        store.accept_start_command(&session, "owner", id, 1, "start", 1802, 10000),
         Err(LifecycleError::Stale)
     ));
     assert_eq!(
         store
-            .accept_qualified_start_command(&current, "owner", id, 1, "start", 90000, 10000)
+            .accept_start_command(&current, "owner", id, 1, "start", 90000, 10000)
             .unwrap(),
         accepted
     );
@@ -2095,7 +2095,7 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     let source = fixture::owned_source().await;
     let id = &source.fence.deployment_id;
     let receipt = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "expiry", 1800, 1901)
+        .accept_start_command(&session, "owner", id, 1, "expiry", 1800, 1901)
         .unwrap();
     let plan: String = sql
         .query_row(
@@ -2107,12 +2107,12 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     let before = counts(&sql);
     let ledger = store.resource_snapshot().unwrap();
     assert!(store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1900)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1900)
         .is_err());
     assert_eq!(counts(&sql), before);
-    sql.execute_batch("CREATE TRIGGER expiry_failure BEFORE INSERT ON management_events WHEN NEW.kind='qualified_initialize_expired_unarmed' BEGIN SELECT RAISE(ABORT,'expiry rollback'); END;").unwrap();
+    sql.execute_batch("CREATE TRIGGER expiry_failure BEFORE INSERT ON management_events WHEN NEW.kind='initialize_expired_unarmed' BEGIN SELECT RAISE(ABORT,'expiry rollback'); END;").unwrap();
     assert!(matches!(
-        store.expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1901),
+        store.expire_unarmed_initialize(&session, receipt.step_id(), 1901),
         Err(LifecycleError::Sql(_))
     ));
     assert_eq!(counts(&sql), before);
@@ -2122,13 +2122,13 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     );
     assert_eq!(
         store
-            .qualified_initialize_status(&session, receipt.step_id(), 1900)
+            .initialize_status(&session, receipt.step_id(), 1900)
             .unwrap(),
-        QualifiedInitializeStatus::Planned
+        InitializeStatus::Planned
     );
     sql.execute_batch("DROP TRIGGER expiry_failure").unwrap();
     assert!(store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1901)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1901)
         .unwrap());
     assert_eq!(
         terminal(&sql, receipt.step_id()),
@@ -2146,13 +2146,13 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     assert_eq!(state, ("stopped".into(), "stopped".into(), false, false));
     assert_eq!(
         store
-            .qualified_initialize_status(&session, receipt.step_id(), 1901)
+            .initialize_status(&session, receipt.step_id(), 1901)
             .unwrap(),
-        QualifiedInitializeStatus::ExpiredUnarmed
+        InitializeStatus::ExpiredUnarmed
     );
     let ended = counts(&sql);
     assert!(!store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1902)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1902)
         .unwrap());
     assert_eq!(counts(&sql), ended);
     assert_eq!(
@@ -2166,7 +2166,7 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     );
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "expiry", 90000, 1901)
+            .accept_start_command(&session, "owner", id, 1, "expiry", 90000, 1901)
             .unwrap(),
         receipt
     );
@@ -2194,18 +2194,18 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     let replaced = counts(&sql);
     assert_eq!(
         store
-            .qualified_initialize_status(&session, receipt.step_id(), 2001)
+            .initialize_status(&session, receipt.step_id(), 2001)
             .unwrap(),
-        QualifiedInitializeStatus::Superseded
+        InitializeStatus::Superseded
     );
     assert_eq!(
         store
-            .accept_qualified_start_command(&session, "owner", id, 1, "expiry", 90000, 1901)
+            .accept_start_command(&session, "owner", id, 1, "expiry", 90000, 1901)
             .unwrap(),
         receipt
     );
     assert!(store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 2001)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 2001)
         .is_err());
     assert_eq!(counts(&sql), replaced);
 }
@@ -2215,7 +2215,7 @@ async fn expired_unarmed_rejects_contradictions_and_stale_ownership_without_rele
     let (store, session, sql, _dir) = start_fixture().await;
     let source = fixture::owned_source().await;
     let receipt = store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &session,
             "owner",
             &source.fence.deployment_id,
@@ -2252,17 +2252,17 @@ async fn expired_unarmed_rejects_contradictions_and_stale_ownership_without_rele
         corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
         corrupt.execute_batch(corruption).unwrap_or_else(|e|panic!("{corruption}: {e}"));
         let before = counts(&corrupt);
-        assert!(reopened.expire_unarmed_qualified_initialize(&session,receipt.step_id(),1901).is_err(),"{corruption}");
+        assert!(reopened.expire_unarmed_initialize(&session,receipt.step_id(),1901).is_err(),"{corruption}");
         assert_eq!(counts(&corrupt),before,"{corruption}");
         assert_eq!(corrupt.query_row("SELECT state FROM runtime_bindings WHERE id=?1",[receipt.binding_id()],|r|r.get::<_,String>(0)).unwrap(),"reserved");
     }
     let current = store.begin_coordinator_session().unwrap();
     let before = counts(&sql);
     assert!(store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1901)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1901)
         .is_err());
     assert!(store
-        .expire_unarmed_qualified_initialize(&current, receipt.step_id(), 1901)
+        .expire_unarmed_initialize(&current, receipt.step_id(), 1901)
         .is_err());
     assert_eq!(counts(&sql), before);
 }
@@ -2307,7 +2307,7 @@ async fn expired_unarmed_and_arm_serialize_on_independent_connections() {
     let (store, session, sql, dir) = start_fixture().await;
     let source = fixture::owned_source().await;
     let receipt = store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &session,
             "owner",
             &source.fence.deployment_id,
@@ -2326,7 +2326,7 @@ async fn expired_unarmed_and_arm_serialize_on_independent_connections() {
     let observations = source.observations.clone();
     let arm = std::thread::spawn(move || {
         arm_barrier.wait();
-        arm_store.arm_qualified_initialize_with_context(
+        arm_store.arm_initialize_with_context(
             &arm_session,
             &arm_step,
             AdmissionContext::new(&observations, &limits, 1900, ttl, max_parked),
@@ -2337,7 +2337,7 @@ async fn expired_unarmed_and_arm_serialize_on_independent_connections() {
     let expire_step = receipt.step_id().to_owned();
     let expiry = std::thread::spawn(move || {
         barrier.wait();
-        expire_store.expire_unarmed_qualified_initialize(&expire_session, &expire_step, 1901)
+        expire_store.expire_unarmed_initialize(&expire_session, &expire_step, 1901)
     });
     let armed = arm.join().unwrap();
     let expired = expiry.join().unwrap();
@@ -2354,7 +2354,7 @@ async fn expired_unarmed_and_arm_serialize_on_independent_connections() {
             "uncertain"
         );
         assert!(store
-            .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 2000)
+            .expire_unarmed_initialize(&session, receipt.step_id(), 2000)
             .is_err());
         assert_eq!(store.resource_snapshot().unwrap(), retained);
     } else {
@@ -2372,7 +2372,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
     let (store, session, sql, _dir) = start_fixture().await;
     let source = fixture::owned_source().await;
     let receipt = store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &session,
             "owner",
             &source.fence.deployment_id,
@@ -2384,7 +2384,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
         .unwrap();
     let (limits, ttl, max_parked) = limits(&store, &sql, &source.fence.deployment_id);
     store
-        .arm_qualified_initialize_with_context(
+        .arm_initialize_with_context(
             &session,
             receipt.step_id(),
             AdmissionContext::new(&source.observations, &limits, 1900, ttl, max_parked),
@@ -2393,7 +2393,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
     let before = counts(&sql);
     let retained = store.resource_snapshot().unwrap();
     assert!(store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1901)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1901)
         .is_err());
     assert_eq!(counts(&sql), before);
     assert_eq!(store.resource_snapshot().unwrap(), retained);
@@ -2416,7 +2416,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
     );
 
     let receipt = store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &session,
             "owner",
             &source.other.deployment_id,
@@ -2427,7 +2427,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
         )
         .unwrap();
     store
-        .expire_unarmed_qualified_initialize(&session, receipt.step_id(), 1901)
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1901)
         .unwrap();
     // A failed row alone must never be treated as a successful exact retry.
     for corruption in [
@@ -2444,7 +2444,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
         let corrupt = rusqlite::Connection::open(path).unwrap();
         corrupt.execute(corruption,[receipt.operation_id()]).unwrap();
         let before = counts(&corrupt);
-        assert!(reopened.expire_unarmed_qualified_initialize(&session,receipt.step_id(),1902).is_err(),"{corruption}");
+        assert!(reopened.expire_unarmed_initialize(&session,receipt.step_id(),1902).is_err(),"{corruption}");
         assert_eq!(counts(&corrupt),before);
     }
 }
@@ -2455,7 +2455,7 @@ async fn unarmed_stop_rejects_nontext_history_as_internal_corruption() {
     let source = fixture::owned_source().await;
     let id = &source.fence.deployment_id;
     store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 10000)
         .unwrap();
     let stop = store
         .accept_ordinary_stop_command(&session, "owner", id, 1, "stop", 1900, 10000)
@@ -2481,7 +2481,7 @@ async fn unarmed_stop_serializes_with_arm_and_expiry_on_independent_connections(
         let source = fixture::owned_source().await;
         let id = source.fence.deployment_id.clone();
         let start = store
-            .accept_qualified_start_command(&session, "owner", &id, 1, "start", 1800, 1901)
+            .accept_start_command(&session, "owner", &id, 1, "start", 1800, 1901)
             .unwrap();
         let (limits, ttl, max_parked) = limits(&store, &sql, &id);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -2494,7 +2494,7 @@ async fn unarmed_stop_serializes_with_arm_and_expiry_on_independent_connections(
             other_barrier.wait();
             if competing_arm {
                 other
-                    .arm_qualified_initialize_with_context(
+                    .arm_initialize_with_context(
                         &other_session,
                         &other_step,
                         AdmissionContext::new(&observations, &limits, 1900, ttl, max_parked),
@@ -2502,7 +2502,7 @@ async fn unarmed_stop_serializes_with_arm_and_expiry_on_independent_connections(
                     .map(|_| ())
             } else {
                 other
-                    .expire_unarmed_qualified_initialize(&other_session, &other_step, 1901)
+                    .expire_unarmed_initialize(&other_session, &other_step, 1901)
                     .map(|_| ())
             }
         });
@@ -2561,7 +2561,7 @@ async fn unarmed_stop_terminal_history_rejects_contradictions() {
     let source = fixture::owned_source().await;
     let id = &source.fence.deployment_id;
     let start = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 10000)
         .unwrap();
     let stop = store
         .accept_ordinary_stop_command(&session, "owner", id, 1, "stop", 1900, 10000)
@@ -2643,7 +2643,7 @@ async fn unarmed_stop_contradictions_fail_closed_at_acceptance_and_completion() 
     let source = fixture::owned_source().await;
     let id = &source.fence.deployment_id;
     let start = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 10000)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 10000)
         .unwrap();
     for accepted in [false, true] {
         let stop = accepted.then(|| {
@@ -2738,7 +2738,7 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
     let source = fixture::owned_source().await;
     let id = &source.fence.deployment_id;
     let start = store
-        .accept_qualified_start_command(&session, "owner", id, 1, "start", 1800, 1901)
+        .accept_start_command(&session, "owner", id, 1, "start", 1800, 1901)
         .unwrap();
     for (table, condition) in [
         ("command_receipts", "NEW.idempotency_key='stop'"),
@@ -2762,7 +2762,7 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
     let ledger = store.resource_snapshot().unwrap();
     let before = state(&sql);
     assert!(store
-        .expire_unarmed_qualified_initialize(&session, start.step_id(), 1901)
+        .expire_unarmed_initialize(&session, start.step_id(), 1901)
         .is_err());
     assert_eq!(state(&sql), before);
     for (key, action) in [("start", "stop"), ("stop", "start")] {
@@ -2772,7 +2772,7 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
                 .unwrap_err()
         } else {
             store
-                .accept_qualified_start_command(&session, "owner", id, 1, key, 1900, 10000)
+                .accept_start_command(&session, "owner", id, 1, key, 1900, 10000)
                 .unwrap_err()
         };
         assert!(matches!(error, LifecycleError::IdempotencyConflict));
@@ -2826,11 +2826,11 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
         )
         .unwrap();
     let replacement = store
-        .accept_qualified_start_command(&session, "owner", id, 2, "replacement", 2000, 10000)
+        .accept_start_command(&session, "owner", id, 2, "replacement", 2000, 10000)
         .unwrap();
     let (limits, ttl, max_parked) = limits(&store, &sql, id);
     store
-        .arm_qualified_initialize_with_context(
+        .arm_initialize_with_context(
             &session,
             replacement.step_id(),
             AdmissionContext::new(&source.observations, &limits, 2000, ttl, max_parked),
@@ -2854,9 +2854,9 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
     assert_eq!(store.resource_snapshot().unwrap(), retained);
     assert_eq!(
         store
-            .qualified_initialize_status(&session, start.step_id(), 2000)
+            .initialize_status(&session, start.step_id(), 2000)
             .unwrap(),
-        mllm_store::ordinary_lifecycle::worker::QualifiedInitializeStatus::Superseded
+        mllm_store::ordinary_lifecycle::worker::InitializeStatus::Superseded
     );
     let new_session = store.begin_coordinator_session().unwrap();
     assert_eq!(
@@ -2880,7 +2880,7 @@ async fn unarmed_stop_rejects_armed_predecessor_history_before_release() {
     let (store, session, sql, _dir) = start_fixture().await;
     let source = fixture::owned_source().await;
     store
-        .accept_qualified_start_command(
+        .accept_start_command(
             &session,
             "owner",
             &source.fence.deployment_id,
@@ -2947,7 +2947,7 @@ async fn ordinary_rejects_revision_history_and_route_tampering() {
     let before = full_counts(&f.sql);
     assert!(
         f.store
-            .accept_qualified_start(&f.session, &fence, 1800, 10000)
+            .accept_start(&f.session, &fence, 1800, 10000)
             .is_err()
     );
     assert_eq!(full_counts(&f.sql), before);
@@ -2966,7 +2966,7 @@ async fn ordinary_rejects_revision_history_and_route_tampering() {
     let before = full_counts(&f.sql);
     assert!(
         f.store
-            .accept_qualified_start(&f.session, &fence, 1800, 10000)
+            .accept_start(&f.session, &fence, 1800, 10000)
             .is_err()
     );
     assert_eq!(full_counts(&f.sql), before);

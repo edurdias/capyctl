@@ -1,5 +1,5 @@
 use super::*;
-use mllm_store::ordinary_lifecycle::QualifiedStartReceipt;
+use mllm_store::ordinary_lifecycle::StartReceipt;
 use std::sync::atomic::AtomicUsize;
 
 #[tokio::test]
@@ -58,9 +58,9 @@ async fn unarmed_stop_waits_for_old_observation_and_worker_completes_later_work(
         );
         assert_eq!(
             o.store()
-                .qualified_initialize_status(o.session(), start.step_id(), 1900)
+                .initialize_status(o.session(), start.step_id(), 1900)
                 .unwrap(),
-            QualifiedInitializeStatus::Superseded
+            InitializeStatus::Superseded
         );
     }
     release.add_permits(2);
@@ -88,9 +88,9 @@ async fn unarmed_stop_waits_for_old_observation_and_worker_completes_later_work(
         );
         assert_eq!(
             o.store()
-                .qualified_initialize_status(o.session(), start.step_id(), 1900)
+                .initialize_status(o.session(), start.step_id(), 1900)
                 .unwrap(),
-            QualifiedInitializeStatus::Superseded
+            InitializeStatus::Superseded
         );
     }
     assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
@@ -123,16 +123,16 @@ fn command_worker(
     .unwrap()
 }
 
-async fn completed(owner: &SharedCoordinatorState, receipt: &QualifiedStartReceipt) {
+async fn completed(owner: &SharedCoordinatorState, receipt: &StartReceipt) {
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let status = {
                 let o = owner.lock().unwrap();
                 o.store()
-                    .qualified_initialize_status(o.session(), receipt.step_id(), 1900)
+                    .initialize_status(o.session(), receipt.step_id(), 1900)
                     .unwrap()
             };
-            if status == QualifiedInitializeStatus::Completed {
+            if status == InitializeStatus::Completed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

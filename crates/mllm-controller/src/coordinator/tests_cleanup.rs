@@ -142,7 +142,7 @@ async fn cleanup_failures_keep_arm_accounting_instance_and_never_resend() {
         let start = w.start(&fence, 10000).unwrap();
         assert_eq!(
             start.wait(Duration::from_secs(60)).await.unwrap(),
-            QualifiedInitializeStatus::Completed
+            InitializeStatus::Completed
         );
         let stop = w.stop("owner", &fence, "failure", 10000).unwrap();
         gate.entered().await;
@@ -625,7 +625,7 @@ async fn stop_after_associated_initialize_uncertainty_keeps_original_worker() {
     assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
     assert_eq!(
         start.wait(Duration::from_secs(10)).await.unwrap(),
-        QualifiedInitializeStatus::Uncertain
+        InitializeStatus::Uncertain
     );
     assert!(w.start(&fence, 10000).is_err());
     assert!(OwnedCoordinator::spawn_fake(
@@ -736,7 +736,7 @@ async fn earlier_other_cleanup_does_not_hide_running_initialize_successor() {
     let a = w.start(&fence, 10000).unwrap();
     assert_eq!(
         a.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::Completed
+        InitializeStatus::Completed
     );
     let b = w.start(&other, 10000).unwrap();
     second.entered().await;
@@ -769,7 +769,7 @@ async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
     let start = w.start(&fence, 10000).unwrap();
     assert_eq!(
         start.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::Completed
+        InitializeStatus::Completed
     );
     let stop = w.stop("owner", &fence, "stop-once", 10000).unwrap();
     let receipt = stop.receipt().clone();
@@ -832,7 +832,7 @@ async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
     let fresh = w.start(&next, 10000).unwrap();
     assert_eq!(
         fresh.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::Completed
+        InitializeStatus::Completed
     );
     assert!(!w
         .shared
@@ -926,7 +926,7 @@ async fn a_failed_deployment_does_not_stop_the_others() {
     let healthy = w.start(&other, 10000).unwrap();
     assert_eq!(
         healthy.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::Completed
+        InitializeStatus::Completed
     );
     assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
     w.shutdown().await.unwrap();

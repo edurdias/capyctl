@@ -1,4 +1,4 @@
-//! Qualified Fake cold initialization from a frozen managed configuration.
+//! Ordinary Fake cold initialization from a frozen managed configuration.
 pub mod cleanup;
 mod expiry;
 mod receipt;
@@ -28,7 +28,7 @@ use mllm_domain::resources::{
     Allocation, DeviceClaim, MemoryLimit, PhaseFootprint, ResourcePhase, Sharing,
 };
 use mllm_scheduler::residency::AdmissionContext;
-pub use receipt::QualifiedStartReceipt;
+pub use receipt::StartReceipt;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +54,7 @@ struct Plan {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
-    QualifiedInitialize,
+    Initialize,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,7 +148,7 @@ fn phase(p: &mllm_config::effective::PhaseFootprint, phase: ResourcePhase) -> Ph
 }
 
 pub(crate) fn is_ordinary(tx: &Transaction<'_>, id: &str) -> Result<bool, LifecycleError> {
-    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='qualified_initialize')", [id], |r| r.get(0))?)
+    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='initialize')", [id], |r| r.get(0))?)
 }
 
 // ADR 0011: every managed deployment is ordinary; there is no other kind.
@@ -369,7 +369,7 @@ fn validate_local(
         "cancelled" if run == "failed" => "failed",
         _ => return Err(LifecycleError::Conflict),
     };
-    let operation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind='qualified_initialize' AND state=?3 AND error_code IS ?4)",params![p.operation_id,p.deployment_id,expected_operation,cancelled.then_some(expiry::ERROR_CODE)],|r|r.get(0))?;
+    let operation: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND deployment_id=?2 AND kind='initialize' AND state=?3 AND error_code IS ?4)",params![p.operation_id,p.deployment_id,expected_operation,cancelled.then_some(expiry::ERROR_CODE)],|r|r.get(0))?;
     if !valid || !operation {
         return Err(LifecycleError::CorruptStoredData);
     }
@@ -417,7 +417,7 @@ fn validate_local(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QualifiedStart {
+pub struct Start {
     pub operation_id: String,
     pub step_id: String,
     pub binding_id: String,
@@ -496,39 +496,39 @@ fn residency_name(residency: mllm_config::effective::Residency) -> &'static str 
 }
 
 impl crate::Store {
-    /// Clock-aware administrative start; only an actual Qualified Fake catalog
+    /// Clock-aware administrative start; only an actual Fake catalog
     /// and its verified source cleanup authorize a fresh managed binding.
-    pub fn accept_qualified_start(
+    pub fn accept_start(
         &self,
         s: &CoordinatorSession,
         f: &DeploymentFence,
         now: i64,
         deadline: i64,
-    ) -> Result<QualifiedStart, LifecycleError> {
+    ) -> Result<Start, LifecycleError> {
         if now < 0 || deadline <= now {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let accepted =
-            Self::accept_qualified_start_in_transaction(&tx, s, f, now, deadline, false)?;
+            Self::accept_start_in_transaction(&tx, s, f, now, deadline, false)?;
         tx.commit()?;
         Ok(accepted)
     }
 
-    fn accept_qualified_start_in_transaction(
+    fn accept_start_in_transaction(
         tx: &Transaction<'_>,
         s: &CoordinatorSession,
         f: &DeploymentFence,
         now: i64,
         deadline: i64,
         detailed: bool,
-    ) -> Result<QualifiedStart, LifecycleError> {
-        let existing: Option<String> = tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=?1 AND r.revision=?2 AND r.generation=?3 AND r.state IN ('queued','running','uncertain') AND o.kind='qualified_initialize'",params![f.deployment_id,f.revision,f.generation],|r|r.get(0)).optional()?;
+    ) -> Result<Start, LifecycleError> {
+        let existing: Option<String> = tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=?1 AND r.revision=?2 AND r.generation=?3 AND r.state IN ('queued','running','uncertain') AND o.kind='initialize'",params![f.deployment_id,f.revision,f.generation],|r|r.get(0)).optional()?;
         if let Some(id) = existing {
             let (p, _, _) = load(tx, &id)?;
             current(tx, s, &p, false)?;
-            return Ok(QualifiedStart {
+            return Ok(Start {
                 operation_id: p.operation_id,
                 step_id: p.step_id,
                 binding_id: p.binding_id,
@@ -548,7 +548,7 @@ impl crate::Store {
             })?;
         let controls = policy_checked(tx, &e, detailed)?.controls;
         let outstanding: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='qualified_initialize' AND r.state NOT IN ('succeeded','failed')",
+            "SELECT COUNT(*) FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='initialize' AND r.state NOT IN ('succeeded','failed')",
             [], |row| row.get(0),
         )?;
         if outstanding >= i64::from(controls.queue.max_pending_total) {
@@ -556,7 +556,7 @@ impl crate::Store {
                 return Err(LifecycleError::QueueFull);
             }
             return Err(LifecycleError::Rejected(
-                "qualified initialization queue full".into(),
+                "initialization queue full".into(),
             ));
         }
         if deadline
@@ -630,7 +630,7 @@ impl crate::Store {
         )?;
         let p = Plan {
             version: 1,
-            kind: Kind::QualifiedInitialize,
+            kind: Kind::Initialize,
             operation_id: operation_id.clone(),
             step_id: step_id.clone(),
             deployment_id: f.deployment_id.clone(),
@@ -645,7 +645,7 @@ impl crate::Store {
             deadline_ms: deadline,
             execution: None,
         };
-        tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'qualified_initialize','pending')",params![operation_id,f.deployment_id])?;
+        tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'initialize','pending')",params![operation_id,f.deployment_id])?;
         crate::lifecycle::insert_initialize_run(tx, s, f, &operation_id, deadline)?;
         tx.execute("INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) VALUES(?1,?2,?3,?4)",params![f.deployment_id,operation_id,f.revision,f.generation])?;
         tx.execute("INSERT INTO lifecycle_steps(id,operation_id,ordinal,deployment_id,binding_id,session_id,state,step_json) VALUES(?1,?2,0,?3,?4,?5,'planned',?6)",params![step_id,operation_id,f.deployment_id,binding_id,s.id(),encode(&p)?])?;
@@ -654,7 +654,7 @@ impl crate::Store {
             [&f.deployment_id],
         )?;
         event(tx, s, &p, Transition::Accepted, None)?;
-        Ok(QualifiedStart {
+        Ok(Start {
             operation_id,
             step_id,
             binding_id,
@@ -662,7 +662,7 @@ impl crate::Store {
         })
     }
     /// Reading or cloning context never authorizes replay; only ArmResult::New does.
-    pub fn qualified_initialize_execution(
+    pub fn initialize_execution(
         &self,
         s: &CoordinatorSession,
         id: &str,
@@ -797,7 +797,7 @@ fn association(tx: &Transaction<'_>, p: &Plan) -> Result<Option<Association>, Li
     )?;
     let identities: Vec<IdentityDto> = decode(&stored)?;
     if a.version != 1
-        || a.kind != "qualified_owned_launch"
+        || a.kind != "owned_launch"
         || a.step_id != p.step_id
         || a.session_id != p.session_id
         || a.binding_id != p.binding_id
@@ -827,7 +827,7 @@ pub(crate) fn record_launch(
     }
     let supplied = Association {
         version: 1,
-        kind: "qualified_owned_launch".into(),
+        kind: "owned_launch".into(),
         step_id: id.into(),
         session_id: s.id().into(),
         binding_id: r.binding_id.clone(),
@@ -973,7 +973,7 @@ pub(crate) fn complete(
     event(tx, s, &p, Transition::Ready, Some(epoch))
 }
 
-use crate::events::QualifiedLifecycleTransition as Transition;
+use crate::events::LifecycleTransition as Transition;
 fn event(
     tx: &Transaction<'_>,
     s: &CoordinatorSession,
@@ -989,7 +989,7 @@ fn event(
     };
     append_event(
         tx,
-        &EventMetadata::QualifiedLifecycleRecorded {
+        &EventMetadata::LifecycleRecorded {
             transition,
             operation_id: id(&p.operation_id)?,
             deployment_id: id(&p.deployment_id)?,

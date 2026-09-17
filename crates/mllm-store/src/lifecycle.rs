@@ -783,7 +783,7 @@ impl crate::Store {
     }
 
     /// Administrative start: callers must authorize administration before invoking this method.
-    pub fn accept_start(
+    pub fn accept_administrative_start(
         &self,
         session: &CoordinatorSession,
         target: &DeploymentFence,
@@ -1028,7 +1028,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let target = fence(&store, "uncertain");
         let session = store.begin_coordinator_session().unwrap();
-        let run = store.accept_start(&session, &target, 100).unwrap();
+        let run = store.accept_administrative_start(&session, &target, 100).unwrap();
         store
             .conn
             .execute("UPDATE lifecycle_runs SET state='uncertain'", [])
@@ -1056,8 +1056,8 @@ mod tests {
         let b = fence(&store, "b");
         let c = fence(&store, "c");
         let session = store.begin_coordinator_session().unwrap();
-        let first = store.accept_start(&session, &a, 100).unwrap();
-        let second = store.accept_start(&session, &b, 100).unwrap();
+        let first = store.accept_administrative_start(&session, &a, 100).unwrap();
+        let second = store.accept_administrative_start(&session, &b, 100).unwrap();
         store
             .claim_sequence(
                 &session,
@@ -1124,7 +1124,7 @@ mod tests {
         let a = fence(&store, "restore");
         let b = fence(&store, "victim");
         let session = store.begin_coordinator_session().unwrap();
-        let old = store.accept_start(&session, &a, 100).unwrap();
+        let old = store.accept_administrative_start(&session, &a, 100).unwrap();
         store
             .claim_sequence(
                 &session,
@@ -1368,8 +1368,8 @@ mod tests {
         let a = fence(&store, "a");
         let b = fence(&store, "b");
         let session = store.begin_coordinator_session().unwrap();
-        let first = store.accept_start(&session, &a, 100).unwrap();
-        let second = store.accept_start(&session, &b, 100).unwrap();
+        let first = store.accept_administrative_start(&session, &a, 100).unwrap();
+        let second = store.accept_administrative_start(&session, &b, 100).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = [(first, [a.clone(), b.clone()]), (second, [b, a])]
             .into_iter()
@@ -1461,7 +1461,7 @@ mod tests {
             store.accept_activation(&session, &target, 100),
             Err(LifecycleError::Disabled)
         ));
-        let run = store.accept_start(&session, &target, 100).unwrap();
+        let run = store.accept_administrative_start(&session, &target, 100).unwrap();
         store
             .conn
             .execute("UPDATE lifecycle_runs SET state='uncertain'", [])
@@ -1478,7 +1478,7 @@ mod tests {
             .execute("UPDATE deployments SET suspended=1", [])
             .unwrap();
         assert!(matches!(
-            store.accept_start(&session, &target, 100),
+            store.accept_administrative_start(&session, &target, 100),
             Err(LifecycleError::Disabled)
         ));
         store
@@ -1489,12 +1489,12 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            store.accept_start(&session, &target, 100),
+            store.accept_administrative_start(&session, &target, 100),
             Err(LifecycleError::Disabled)
         ));
         let _next = store.begin_coordinator_session().unwrap();
         assert!(matches!(
-            store.accept_start(&session, &target, 100),
+            store.accept_administrative_start(&session, &target, 100),
             Err(LifecycleError::Stale)
         ));
     }

@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QualifiedInitializeStatus {
+pub enum InitializeStatus {
     Planned,
     Armed,
     Completed,
@@ -14,10 +14,10 @@ pub enum QualifiedInitializeStatus {
 
 /// One bounded discovery result. Expiry is committed before this is returned;
 /// work still requires a fresh arm before any execution.
-pub enum QualifiedInitializePoll {
+pub enum InitializePoll {
     Idle,
     ExpiredUnarmed,
-    Work(Box<QualifiedInitializeWork>),
+    Work(Box<InitializeWork>),
 }
 
 /// The oldest planned step of this session, in durable acceptance order.
@@ -41,7 +41,7 @@ fn next_plan(
          JOIN operations o ON o.id=s.operation_id
          JOIN lifecycle_runs r ON r.operation_id=o.id
          JOIN deployments d ON d.id=s.deployment_id
-         WHERE o.kind='qualified_initialize' AND s.state='planned'
+         WHERE o.kind='initialize' AND s.state='planned'
            AND s.session_id=?1 AND r.session_id=?1
            AND d.revision=r.revision AND d.current_generation=r.generation
            AND d.desired_state='ready' AND d.suspended=0
@@ -78,11 +78,11 @@ fn prepare_work(
     tx: &Transaction<'_>,
     plan: Plan,
     effective: EffectiveDeployment,
-) -> Result<QualifiedInitializeWork, LifecycleError> {
+) -> Result<InitializeWork, LifecycleError> {
     let policy = policy(tx, &effective)?;
     let binding = decode(&plan.binding_json)?;
     let fence = plan.fence();
-    Ok(QualifiedInitializeWork {
+    Ok(InitializeWork {
         plan,
         effective,
         policy,
@@ -93,7 +93,7 @@ fn prepare_work(
 
 /// Frozen, validated input for driver construction; never permission to execute.
 /// Only the result of a fresh `arm_step` grants that permission.
-pub struct QualifiedInitializeWork {
+pub struct InitializeWork {
     plan: Plan,
     effective: EffectiveDeployment,
     policy: ResourcePolicySnapshot,
@@ -101,7 +101,7 @@ pub struct QualifiedInitializeWork {
     fence: DeploymentFence,
 }
 
-impl QualifiedInitializeWork {
+impl InitializeWork {
     pub fn operation_id(&self) -> &str {
         &self.plan.operation_id
     }
@@ -137,7 +137,7 @@ impl QualifiedInitializeWork {
 impl crate::Store {
     /// The exact frozen context from this arm's full source validation. A replay
     /// never returns a context. No provenance proof survives into another command.
-    pub fn arm_qualified_initialize_with_context(
+    pub fn arm_initialize_with_context(
         &self,
         session: &CoordinatorSession,
         step_id: &str,
@@ -151,12 +151,12 @@ impl crate::Store {
     }
 
     /// A fenced durable observer read. It conveys no send or release authority.
-    pub fn qualified_initialize_status(
+    pub fn initialize_status(
         &self,
         session: &CoordinatorSession,
         step_id: &str,
         now_ms: i64,
-    ) -> Result<QualifiedInitializeStatus, LifecycleError> {
+    ) -> Result<InitializeStatus, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
         if ulid::Ulid::from_string(step_id).is_err() || now_ms < 0 {
@@ -166,7 +166,7 @@ impl crate::Store {
         // Validate the bounded local relationships without recursively proving
         // the source suite on every observer poll. Arm and completion still do.
         let (raw, state, operation, binding, run_state, operation_state): (String, String, String, String, String, String) = tx.query_row(
-            "SELECT s.step_json,s.state,s.operation_id,s.binding_id,r.state,o.state FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='qualified_initialize' AND s.session_id=?2 AND r.session_id=?2 AND r.deployment_id=s.deployment_id",
+            "SELECT s.step_json,s.state,s.operation_id,s.binding_id,r.state,o.state FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='initialize' AND s.session_id=?2 AND r.session_id=?2 AND r.deployment_id=s.deployment_id",
             params![step_id,session.id()],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         ).optional()?.ok_or(LifecycleError::Stale)?;
@@ -191,14 +191,14 @@ impl crate::Store {
                 params![plan.deployment_id,plan.revision,plan.generation], |r| r.get(0),
             )?;
             if !same_terminal_fence {
-                return Ok(QualifiedInitializeStatus::Superseded);
+                return Ok(InitializeStatus::Superseded);
             }
             let (plan, effective, _) = load(&tx, step_id)?;
             expiry::terminal(&tx, session, &plan, &effective, now_ms)?;
-            return Ok(QualifiedInitializeStatus::ExpiredUnarmed);
+            return Ok(InitializeStatus::ExpiredUnarmed);
         }
         match current(&tx, session, &plan, state == "completed") {
-            Err(LifecycleError::Stale) => return Ok(QualifiedInitializeStatus::Superseded),
+            Err(LifecycleError::Stale) => return Ok(InitializeStatus::Superseded),
             other => other?,
         }
         let consistent = match state.as_str() {
@@ -302,18 +302,18 @@ impl crate::Store {
             }
         }
         Ok(match state.as_str() {
-            "planned" if now_ms >= plan.deadline_ms => QualifiedInitializeStatus::Expired,
-            "planned" => QualifiedInitializeStatus::Planned,
-            "armed" => QualifiedInitializeStatus::Armed,
-            "completed" => QualifiedInitializeStatus::Completed,
-            "uncertain" => QualifiedInitializeStatus::Uncertain,
+            "planned" if now_ms >= plan.deadline_ms => InitializeStatus::Expired,
+            "planned" => InitializeStatus::Planned,
+            "armed" => InitializeStatus::Armed,
+            "completed" => InitializeStatus::Completed,
+            "uncertain" => InitializeStatus::Uncertain,
             _ => return Err(LifecycleError::CorruptStoredData),
         })
     }
 
     /// Final validation of a previously fresh arm, never replay permission.
     /// The caller must also read its clock after this potentially expensive read.
-    pub fn revalidate_qualified_initialize_send(
+    pub fn revalidate_initialize_send(
         &self,
         session: &CoordinatorSession,
         step_id: &str,
@@ -358,10 +358,10 @@ impl crate::Store {
     /// order. Expired work is returned explicitly, not silently skipped. A worker
     /// must not arm it, and this read does not free its reserved endpoint.
     /// Superseded generations and prior sessions require explicit reconciliation.
-    pub fn next_qualified_initialize(
+    pub fn next_initialize(
         &self,
         session: &CoordinatorSession,
-    ) -> Result<Option<QualifiedInitializeWork>, LifecycleError> {
+    ) -> Result<Option<InitializeWork>, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
         let work = next_plan(&tx, session, true)?
@@ -380,37 +380,37 @@ impl crate::Store {
     /// that step has not expired yet it is not work, and the read is repeated
     /// among the deployments that are still admitting.
     // ADR 0011 decision 4: a failed deployment stops itself, not the host.
-    pub fn next_qualified_initialize_or_expire(
+    pub fn next_initialize_or_expire(
         &self,
         session: &CoordinatorSession,
         now_ms: i64,
-    ) -> Result<QualifiedInitializePoll, LifecycleError> {
+    ) -> Result<InitializePoll, LifecycleError> {
         if now_ms < 0 {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
         let result = match next_plan(&tx, session, false)? {
-            None => QualifiedInitializePoll::Idle,
+            None => InitializePoll::Idle,
             Some((plan, effective)) if now_ms >= plan.deadline_ms => {
                 expiry::expire_in_transaction(&tx, session, &plan, &effective, "planned", now_ms)?;
-                QualifiedInitializePoll::ExpiredUnarmed
+                InitializePoll::ExpiredUnarmed
             }
             Some((plan, effective)) if admitting(&tx, &plan)? => {
-                QualifiedInitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
+                InitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
             }
             // SPEC §6.1 FAILED: admission closed. This step is neither work nor
             // expired, and it must not starve any other deployment.
             Some(_) => match next_plan(&tx, session, true)? {
-                None => QualifiedInitializePoll::Idle,
+                None => InitializePoll::Idle,
                 Some((plan, effective)) if now_ms >= plan.deadline_ms => {
                     expiry::expire_in_transaction(
                         &tx, session, &plan, &effective, "planned", now_ms,
                     )?;
-                    QualifiedInitializePoll::ExpiredUnarmed
+                    InitializePoll::ExpiredUnarmed
                 }
                 Some((plan, effective)) => {
-                    QualifiedInitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
+                    InitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
                 }
             },
         };
@@ -422,7 +422,7 @@ impl crate::Store {
     /// endpoint. May run after the deadline. Exact retries append no second event.
     /// A stale session or superseded fence is rejected without touching newer work;
     /// the original durable arm remains sufficient for conservative recovery.
-    pub fn mark_qualified_initialize_uncertain(
+    pub fn mark_initialize_uncertain(
         &self,
         session: &CoordinatorSession,
         step_id: &str,

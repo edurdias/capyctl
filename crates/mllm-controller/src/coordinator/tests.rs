@@ -260,7 +260,7 @@ async fn dropped_waiters_and_caller_timeout_do_not_cancel_or_hold_store() {
                 let o = owned.lock().unwrap();
                 assert_eq!(
                     o.store()
-                        .qualified_initialize_execution(o.session(), &step)
+                        .initialize_execution(o.session(), &step)
                         .unwrap()
                         .deadline_ms,
                     10000
@@ -277,9 +277,9 @@ async fn dropped_waiters_and_caller_timeout_do_not_cancel_or_hold_store() {
             let done = {
                 let o = owner.lock().unwrap();
                 o.store()
-                    .qualified_initialize_status(o.session(), &step, 1900)
+                    .initialize_status(o.session(), &step, 1900)
                     .unwrap()
-                    == QualifiedInitializeStatus::Completed
+                    == InitializeStatus::Completed
             };
             if done {
                 break;
@@ -313,7 +313,7 @@ async fn timeout_and_panic_retain_peak_and_never_stop_or_continue() {
         assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
         assert_eq!(
             a.wait(Duration::from_secs(10)).await.unwrap(),
-            QualifiedInitializeStatus::Uncertain
+            InitializeStatus::Uncertain
         );
         assert_peak(&owner, &fence);
         assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
@@ -346,7 +346,7 @@ async fn shutdown_joins_effect_before_ownership_can_be_reacquired() {
     let restarted = crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap();
     assert!(restarted
         .store()
-        .next_qualified_initialize(restarted.session())
+        .next_initialize(restarted.session())
         .unwrap()
         .is_none());
     assert_eq!(gate.calls.lock().unwrap().len(), 1);
@@ -366,7 +366,7 @@ async fn missing_notification_is_recovered_by_durable_poll() {
     {
         let o = owner.lock().unwrap();
         o.store()
-            .accept_qualified_start(o.session(), &fence, 1900, 10000)
+            .accept_start(o.session(), &fence, 1900, 10000)
             .unwrap();
     }
     gate.entered().await;
@@ -382,7 +382,7 @@ async fn stale_observation_blocks_but_expired_queue_releases_unused_endpoint() {
         {
             let o = owner.lock().unwrap();
             o.store()
-                .accept_qualified_start(o.session(), &fence, 1800, 1901)
+                .accept_start(o.session(), &fence, 1800, 1901)
                 .unwrap();
         }
         if expired {
@@ -407,7 +407,7 @@ async fn stale_observation_blocks_but_expired_queue_releases_unused_endpoint() {
             let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
             tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
-                    let failed: bool = sql.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='qualified_initialize' AND state='failed')", [&fence.deployment_id], |r| r.get(0)).unwrap();
+                    let failed: bool = sql.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='initialize' AND state='failed')", [&fence.deployment_id], |r| r.get(0)).unwrap();
                     if failed { break; }
                     assert_eq!(w.status(), WorkerStatus::Running);
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -460,11 +460,11 @@ async fn expired_unarmed_worker_skips_driver_and_continues_later_queued_work() {
         let o = owner.lock().unwrap();
         let expired = o
             .store()
-            .accept_qualified_start(o.session(), &fence, 1800, 1900)
+            .accept_start(o.session(), &fence, 1800, 1900)
             .unwrap();
         let later = o
             .store()
-            .accept_qualified_start(o.session(), &source.other, 1801, 10000)
+            .accept_start(o.session(), &source.other, 1801, 10000)
             .unwrap();
         (expired, later)
     };
@@ -490,9 +490,9 @@ async fn expired_unarmed_worker_skips_driver_and_continues_later_queued_work() {
         let o = owner.lock().unwrap();
         assert_eq!(
             o.store()
-                .qualified_initialize_status(o.session(), &expired.step_id, 1900)
+                .initialize_status(o.session(), &expired.step_id, 1900)
                 .unwrap(),
-            QualifiedInitializeStatus::ExpiredUnarmed
+            InitializeStatus::ExpiredUnarmed
         );
         assert!(o
             .store()
@@ -506,10 +506,10 @@ async fn expired_unarmed_worker_skips_driver_and_continues_later_queued_work() {
             let status = {
                 let o = owner.lock().unwrap();
                 o.store()
-                    .qualified_initialize_status(o.session(), &later.step_id, 1900)
+                    .initialize_status(o.session(), &later.step_id, 1900)
                     .unwrap()
             };
-            if status == QualifiedInitializeStatus::Completed {
+            if status == InitializeStatus::Completed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -550,7 +550,7 @@ async fn expired_unarmed_during_observation_is_rechecked_before_driver_or_arm() 
     release.add_permits(1);
     assert_eq!(
         observer.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::ExpiredUnarmed
+        InitializeStatus::ExpiredUnarmed
     );
     {
         let o = owner.lock().unwrap();
@@ -586,7 +586,7 @@ async fn expired_unarmed_after_driver_validation_never_arms_or_executes() {
     let observer = w.start(&fence, 10000).unwrap();
     assert_eq!(
         observer.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::ExpiredUnarmed
+        InitializeStatus::ExpiredUnarmed
     );
     assert!(gate.calls.lock().unwrap().is_empty());
     {
@@ -608,7 +608,7 @@ async fn expired_unarmed_discovery_does_not_require_current_launch_policy() {
     {
         let o = owner.lock().unwrap();
         o.store()
-            .accept_qualified_start(o.session(), &fence, 1800, 1900)
+            .accept_start(o.session(), &fence, 1800, 1900)
             .unwrap();
         let policy = o.store().resource_policy("lab").unwrap().unwrap();
         let mut revoked = policy.controls;
@@ -640,7 +640,7 @@ async fn expired_unarmed_discovery_does_not_require_current_launch_policy() {
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let failed: bool = sql.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='qualified_initialize' AND state='failed')", [&fence.deployment_id], |r| r.get(0)).unwrap();
+            let failed: bool = sql.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='initialize' AND state='failed')", [&fence.deployment_id], |r| r.get(0)).unwrap();
             if failed { break; }
             assert_eq!(w.status(),WorkerStatus::Running);
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -877,7 +877,7 @@ async fn stop_racing_completion_cannot_publish_ready() {
     .unwrap();
     assert_eq!(
         a.wait(Duration::from_secs(3)).await.unwrap(),
-        QualifiedInitializeStatus::Superseded
+        InitializeStatus::Superseded
     );
     assert_peak(&owner, &fence);
     assert_eq!(gate.calls.lock().unwrap().len(), 1);
@@ -1028,7 +1028,7 @@ async fn real_elapsed_service_clock_bounds_provenance_before_send() {
         started.elapsed(),
         w.status()
     );
-    assert_eq!(status, QualifiedInitializeStatus::Completed);
+    assert_eq!(status, InitializeStatus::Completed);
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     let (issued, observed): (i64, i64) = sql.query_row(
         "SELECT json_extract(s.step_json,'$.execution.issued_at_ms'),json_extract(a.association_json,'$.observed_at_ms') FROM lifecycle_steps s JOIN owned_launch_associations a ON a.step_id=s.id WHERE s.id=?1",
@@ -1047,7 +1047,7 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
     let o = owner.lock().unwrap();
     let accepted = o
         .store()
-        .accept_qualified_start(o.session(), &fence, 1800, 10000)
+        .accept_start(o.session(), &fence, 1800, 10000)
         .unwrap();
     let policy = o.store().resource_policy("lab").unwrap().unwrap();
     let limits: Vec<_> = policy
@@ -1073,23 +1073,23 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
     };
     let (arm, context) = o
         .store()
-        .arm_qualified_initialize_with_context(o.session(), &accepted.step_id, admission())
+        .arm_initialize_with_context(o.session(), &accepted.step_id, admission())
         .unwrap();
     assert!(permits_send(&arm));
     let context = context.unwrap();
     let (retry, no_context) = o
         .store()
-        .arm_qualified_initialize_with_context(o.session(), &accepted.step_id, admission())
+        .arm_initialize_with_context(o.session(), &accepted.step_id, admission())
         .unwrap();
     assert!(!permits_send(&retry));
     assert!(no_context.is_none());
     assert!(o
         .store()
-        .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, 1900)
+        .revalidate_initialize_send(o.session(), &accepted.step_id, &context, 1900)
         .is_ok());
     assert!(o
         .store()
-        .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, 10000)
+        .revalidate_initialize_send(o.session(), &accepted.step_id, &context, 10000)
         .is_err());
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     // Named negative injections after arm. Each failed validation is read-only.
@@ -1126,7 +1126,7 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
         sql.execute(mutation, [&accepted.step_id]).unwrap();
         assert!(
             o.store()
-                .revalidate_qualified_initialize_send(
+                .revalidate_initialize_send(
                     o.session(),
                     &accepted.step_id,
                     &context,
@@ -1138,7 +1138,7 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
         sql.execute(restore, [&accepted.step_id]).unwrap();
         assert!(
             o.store()
-                .revalidate_qualified_initialize_send(
+                .revalidate_initialize_send(
                     o.session(),
                     &accepted.step_id,
                     &context,
@@ -1161,7 +1161,7 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
         .unwrap();
     assert!(o
         .store()
-        .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, 1900)
+        .revalidate_initialize_send(o.session(), &accepted.step_id, &context, 1900)
         .is_err());
 }
 
@@ -1178,7 +1178,7 @@ async fn completed_observer_rejects_binding_identity_and_evidence_corruption() {
     let a = w.start(&fence, 10000).unwrap();
     assert_eq!(
         a.wait(Duration::from_secs(60)).await.unwrap(),
-        QualifiedInitializeStatus::Completed
+        InitializeStatus::Completed
     );
     {
         let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
@@ -1209,16 +1209,16 @@ async fn completed_observer_rejects_binding_identity_and_evidence_corruption() {
             sql.execute(update, [a.step_id(), corrupt]).unwrap();
             assert!(
                 o.store()
-                    .qualified_initialize_status(o.session(), a.step_id(), 1900)
+                    .initialize_status(o.session(), a.step_id(), 1900)
                     .is_err(),
                 "{update}"
             );
             sql.execute(update, [a.step_id(), &original]).unwrap();
             assert_eq!(
                 o.store()
-                    .qualified_initialize_status(o.session(), a.step_id(), 1900)
+                    .initialize_status(o.session(), a.step_id(), 1900)
                     .unwrap(),
-                QualifiedInitializeStatus::Completed
+                InitializeStatus::Completed
             );
         }
     }
@@ -1232,7 +1232,7 @@ async fn restart_with_an_armed_step_never_resends_it() {
         let o = owner.lock().unwrap();
         let accepted = o
             .store()
-            .accept_qualified_start(o.session(), &fence, 1800, 10000)
+            .accept_start(o.session(), &fence, 1800, 10000)
             .unwrap();
         let p = o.store().resource_policy("lab").unwrap().unwrap();
         let limits: Vec<_> = p
@@ -1361,13 +1361,13 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
     });
     let accepted = stage(&owner, "acceptance", |o| {
         o.store()
-            .accept_qualified_start(o.session(), &fence, now(), 30000)
+            .accept_start(o.session(), &fence, now(), 30000)
             .unwrap()
     });
     stage(&owner, "discovery", |o| {
         assert!(o
             .store()
-            .next_qualified_initialize(o.session())
+            .next_initialize(o.session())
             .unwrap()
             .is_some());
     });
@@ -1387,7 +1387,7 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
     }
     let (arm, context) = stage(&owner, "arm-and-context", |o| {
         o.store()
-            .arm_qualified_initialize_with_context(
+            .arm_initialize_with_context(
                 o.session(),
                 &accepted.step_id,
                 mllm_scheduler::residency::AdmissionContext::new(
@@ -1404,7 +1404,7 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
     let context = context.unwrap();
     stage(&owner, "pre-send-local-fences", |o| {
         o.store()
-            .revalidate_qualified_initialize_send(o.session(), &accepted.step_id, &context, now())
+            .revalidate_initialize_send(o.session(), &accepted.step_id, &context, now())
             .unwrap()
     });
     let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || Ok(now())));
@@ -1454,9 +1454,9 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
     assert_eq!(
         stage(&owner, "observer-local-proof", |o| o
             .store()
-            .qualified_initialize_status(o.session(), &accepted.step_id, now())
+            .initialize_status(o.session(), &accepted.step_id, now())
             .unwrap()),
-        QualifiedInitializeStatus::Completed
+        InitializeStatus::Completed
     );
 }
 

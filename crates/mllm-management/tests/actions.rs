@@ -228,7 +228,7 @@ async fn operation(owner: &Arc<Mutex<OwnedCoordinatorState>>, id: &str) {
     .unwrap();
 }
 #[tokio::test]
-async fn authenticated_actions_start_and_stop_the_owned_qualified_fake() {
+async fn authenticated_actions_start_and_stop_the_owned_fake() {
     let (dir, owner, worker, id, app) = setup().await;
     let response = app
         .clone()
@@ -679,7 +679,7 @@ async fn store_failure_is_redacted_and_closes_new_command_admission() {
     );
     assert_eq!(
         sql.query_row(
-            "SELECT COUNT(*) FROM operations WHERE kind='qualified_initialize'",
+            "SELECT COUNT(*) FROM operations WHERE kind='initialize'",
             [],
             |r| r.get::<_, i64>(0)
         )

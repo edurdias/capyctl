@@ -254,7 +254,7 @@ pub(super) fn accept(
     now: i64,
     deadline: i64,
 ) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
-    let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND o.kind='qualified_initialize' AND b.state!='released' AND s.state='planned'",[&f.deployment_id],|r|r.get(0)).optional()?;
+    let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND o.kind='initialize' AND b.state!='released' AND s.state='planned'",[&f.deployment_id],|r|r.get(0)).optional()?;
     let Some(id) = id else { return Ok(None) };
     let (original, e, state) = load(tx, &id)?;
     super::current(tx, s, &original, false)?;

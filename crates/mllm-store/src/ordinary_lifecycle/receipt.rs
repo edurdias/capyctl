@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct QualifiedStartReceipt {
+pub struct StartReceipt {
     operation_id: String,
     deployment_id: String,
     step_id: String,
@@ -17,7 +17,7 @@ pub struct QualifiedStartReceipt {
     joined: bool,
 }
 
-impl QualifiedStartReceipt {
+impl StartReceipt {
     pub fn operation_id(&self) -> &str {
         &self.operation_id
     }
@@ -77,7 +77,7 @@ struct StoredReceipt {
     request_hash: String,
     requested_deadline_ms: i64,
     accepted_identity: String,
-    receipt: QualifiedStartReceipt,
+    receipt: StartReceipt,
 }
 
 fn scope(deployment: &str) -> String {
@@ -150,7 +150,7 @@ fn historical(tx: &Transaction<'_>, stored: &StoredReceipt) -> Result<(), Lifecy
         || p.generation < 1
         || p.accepted_at_ms < 0
         || p.deadline_ms <= p.accepted_at_ms
-        || *r != QualifiedStartReceipt::from_plan(&p, r.joined)
+        || *r != StartReceipt::from_plan(&p, r.joined)
         || stored.accepted_identity != accepted_identity(&p, r.joined)?
     {
         return Err(LifecycleError::CorruptStoredData);
@@ -214,7 +214,7 @@ pub(super) fn historical_source(tx: &Transaction<'_>, p: &Plan) -> Result<(), Li
     )
     .map_err(historical_error)?;
     let exact: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?6 AND effective_json=?9 AND fingerprint=?10) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded')",
+        "SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND o.kind='initialize' AND o.deployment_id=?3) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?4 AND deployment_id=?3 AND revision=?6 AND incarnation=?7 AND ownership='managed' AND binding_json=?8) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?6 AND effective_json=?9 AND fingerprint=?10) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded')",
         params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,p.revision,p.incarnation,p.binding_json,p.effective_json,e.recipe_fingerprint], |row| row.get(0))?;
     if !exact {
         return Err(LifecycleError::CorruptStoredData);
@@ -229,7 +229,7 @@ fn lookup_in_transaction(
     expected_revision: i64,
     key: &str,
     requested_deadline: i64,
-) -> Result<Option<QualifiedStartReceipt>, LifecycleError> {
+) -> Result<Option<StartReceipt>, LifecycleError> {
     check_request(
         principal,
         deployment,
@@ -301,7 +301,7 @@ impl crate::Store {
     /// Read an exact scoped receipt in a read-only transaction. Current session
     /// validation precedes history lookup, including when the receipt is absent.
     /// Historical validation never grants execution or performs new acceptance.
-    pub fn qualified_start_command_receipt(
+    pub fn start_command_receipt(
         &self,
         session: &CoordinatorSession,
         principal: &str,
@@ -309,7 +309,7 @@ impl crate::Store {
         expected_revision: i64,
         key: &str,
         requested_deadline: i64,
-    ) -> Result<Option<QualifiedStartReceipt>, LifecycleError> {
+    ) -> Result<Option<StartReceipt>, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
         lookup_in_transaction(
@@ -326,7 +326,7 @@ impl crate::Store {
     /// committed history before checking today's deployment or qualification.
     /// The caller must use the normal arm path to obtain any execution authority.
     #[allow(clippy::too_many_arguments)]
-    pub fn accept_qualified_start_command(
+    pub fn accept_start_command(
         &self,
         session: &CoordinatorSession,
         principal: &str,
@@ -335,7 +335,7 @@ impl crate::Store {
         key: &str,
         now: i64,
         requested_deadline: i64,
-    ) -> Result<QualifiedStartReceipt, LifecycleError> {
+    ) -> Result<StartReceipt, LifecycleError> {
         check_request(
             principal,
             deployment,
@@ -364,7 +364,7 @@ impl crate::Store {
             return Err(LifecycleError::Invalid);
         }
         let fence = command_fence(&tx, deployment, expected_revision)?;
-        let accepted = Self::accept_qualified_start_in_transaction(
+        let accepted = Self::accept_start_in_transaction(
             &tx,
             session,
             &fence,
@@ -373,7 +373,7 @@ impl crate::Store {
             true,
         )?;
         let p = historical_plan(&tx, &accepted.step_id)?;
-        let receipt = QualifiedStartReceipt::from_plan(&p, accepted.joined);
+        let receipt = StartReceipt::from_plan(&p, accepted.joined);
         let stored = StoredReceipt {
             version: 1,
             method: "POST".into(),

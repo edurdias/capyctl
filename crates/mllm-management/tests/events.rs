@@ -20,7 +20,7 @@ async fn unarmed_stop_writer_events_replay_to_sse_without_cleanup_epoch() {
     let writer = Store::open(&path).unwrap();
     let session = writer.begin_coordinator_session().unwrap();
     writer
-        .accept_qualified_start(&session, &source.fence, 1800, 10000)
+        .accept_start(&session, &source.fence, 1800, 10000)
         .unwrap();
     let cursor = writer.snapshot().unwrap().cursor.to_string();
     let stop = writer
@@ -82,11 +82,11 @@ async fn expired_unarmed_writer_event_replays_and_stream_continues() {
     let writer = Store::open(&path).unwrap();
     let session = writer.begin_coordinator_session().unwrap();
     let accepted = writer
-        .accept_qualified_start(&session, &source.fence, 1800, 1900)
+        .accept_start(&session, &source.fence, 1800, 1900)
         .unwrap();
     let cursor = writer.snapshot().unwrap().cursor.to_string();
     writer
-        .expire_unarmed_qualified_initialize(&session, &accepted.step_id, 1900)
+        .expire_unarmed_initialize(&session, &accepted.step_id, 1900)
         .unwrap();
     let app = read_only_router(
         ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
@@ -104,7 +104,7 @@ async fn expired_unarmed_writer_event_replays_and_stream_continues() {
     let mut body = response.into_body().into_data_stream();
     let first = next(&mut body).await;
     assert!(
-        first.contains("event: qualified_initialize_expired_unarmed\n"),
+        first.contains("event: initialize_expired_unarmed\n"),
         "{first}"
     );
     assert!(first.contains(&format!("\"operation_id\":\"{}\"", accepted.operation_id)));
@@ -677,17 +677,17 @@ async fn cancelled_preflight_retains_workers_and_sanitizes_provider_failure() {
 }
 
 #[tokio::test]
-async fn qualified_lifecycle_events_enforce_transition_and_commit_epoch() {
+async fn initialize_lifecycle_events_enforce_transition_and_commit_epoch() {
     for (kind, transition) in [
-        ("qualified_initialize_accepted", "accepted"),
-        ("qualified_initialize_armed", "armed"),
+        ("initialize_accepted", "accepted"),
+        ("initialize_armed", "armed"),
         (
-            "qualified_owned_launch_associated",
+            "owned_launch_associated",
             "owned_launch_associated",
         ),
-        ("qualified_ready_committed", "ready"),
-        ("qualified_initialize_uncertain", "uncertain"),
-        ("qualified_initialize_expired_unarmed", "expired_unarmed"),
+        ("ready_committed", "ready"),
+        ("initialize_uncertain", "uncertain"),
+        ("initialize_expired_unarmed", "expired_unarmed"),
         ("ordinary_cleanup_accepted", "cleanup_accepted"),
         ("ordinary_cleanup_armed", "cleanup_armed"),
         ("ordinary_cleanup_completed", "cleanup_completed"),

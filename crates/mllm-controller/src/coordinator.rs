@@ -1,4 +1,4 @@
-//! Owned, qualified Fake initialization. Production consumer cutover is pending.
+//! Owned Fake initialization. Production consumer cutover is pending.
 
 mod worker;
 pub use worker::*;

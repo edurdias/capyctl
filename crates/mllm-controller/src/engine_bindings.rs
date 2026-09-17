@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use mllm_adapters::resolve::AdapterSpec;
 use mllm_config::engine_policy::Engine;
-use mllm_store::ordinary_lifecycle::worker::QualifiedInitializeWork;
+use mllm_store::ordinary_lifecycle::worker::InitializeWork;
 
 use crate::coordinator::{CoordinatorError, EngineBindings, ServiceClock};
 
@@ -39,7 +39,7 @@ impl ProfileBindings {
 }
 
 impl EngineBindings for ProfileBindings {
-    fn spec(&self, work: &QualifiedInitializeWork) -> Result<AdapterSpec, CoordinatorError> {
+    fn spec(&self, work: &InitializeWork) -> Result<AdapterSpec, CoordinatorError> {
         let effective = work.effective();
         let profile = &effective.profile;
         match profile.engine {

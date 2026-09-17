@@ -15,9 +15,9 @@ use mllm_store::{
     ordinary_lifecycle::cleanup::{OrdinaryCleanupReceipt, OrdinaryCleanupStatus},
     ordinary_lifecycle::unarmed_stop::OrdinaryStopReceipt,
     ordinary_lifecycle::worker::{
-        QualifiedInitializePoll, QualifiedInitializeStatus, QualifiedInitializeWork,
+        InitializePoll, InitializeStatus, InitializeWork,
     },
-    ordinary_lifecycle::QualifiedStartReceipt,
+    ordinary_lifecycle::StartReceipt,
 };
 use std::{
     collections::BTreeMap,
@@ -374,7 +374,7 @@ impl CoordinatorCommands {
         expected_revision: i64,
         key: &str,
         requested_deadline_ms: i64,
-    ) -> Result<QualifiedStartReceipt, CoordinatorCommandError> {
+    ) -> Result<StartReceipt, CoordinatorCommandError> {
         // Synchronous admission holds one existing observer slot only until the
         // receipt returns. There is no task or unbounded queue per command.
         let _permit = self
@@ -399,7 +399,7 @@ impl CoordinatorCommands {
         };
         if let Some(receipt) = owner
             .store()
-            .qualified_start_command_receipt(
+            .start_command_receipt(
                 owner.session(),
                 principal,
                 deployment_id,
@@ -420,7 +420,7 @@ impl CoordinatorCommands {
         }
         let receipt = owner
             .store()
-            .accept_qualified_start_command(
+            .accept_start_command(
                 owner.session(),
                 principal,
                 deployment_id,
@@ -445,12 +445,12 @@ struct Driver {
     cleanup: Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>,
 }
 /// Supplies what the lifecycle must not know: resolved credentials and the frozen
-/// launch plan a binding was qualified against. Implemented by the application,
+/// launch plan a binding was admitted against. Implemented by the application,
 /// which owns credential storage.
 pub trait EngineBindings: Send + Sync {
     fn spec(
         &self,
-        work: &QualifiedInitializeWork,
+        work: &InitializeWork,
     ) -> Result<mllm_adapters::resolve::AdapterSpec, CoordinatorError>;
 }
 
@@ -483,7 +483,7 @@ fn observed_gone(
 }
 
 type DriverFactory =
-    Arc<dyn Fn(&QualifiedInitializeWork) -> Result<Arc<Driver>, CoordinatorError> + Send + Sync>;
+    Arc<dyn Fn(&InitializeWork) -> Result<Arc<Driver>, CoordinatorError> + Send + Sync>;
 
 impl OwnedCoordinator {
     pub fn commands(&self) -> CoordinatorCommands {
@@ -499,7 +499,7 @@ impl OwnedCoordinator {
     /// plans; `bindings` supplies those, so credential handling stays outside the
     /// lifecycle. Resolution then rejects a spec whose family differs from the one
     /// the runtime profile declares, because a profile's fingerprint, reserved-flag
-    /// policy and qualification evidence are only meaningful for the engine it names.
+    /// policy and operational evidence are only meaningful for the engine it names.
     ///
     /// Cleanup is proved the same way for every family: the recorded identities must
     /// be observed gone. An engine's own report that it shut down is not evidence
@@ -543,7 +543,7 @@ impl OwnedCoordinator {
         )
     }
 
-    /// First bounded lane: qualified Fake only. Construction has no engine I/O,
+    /// First bounded lane: Fake only. Construction has no engine I/O,
     /// and uses the immutable validated binding, never a profile lookup.
     pub fn spawn_fake(
         owner: SharedCoordinatorState,
@@ -693,7 +693,7 @@ impl OwnedCoordinator {
         }
         let accepted = owner
             .store()
-            .accept_qualified_start(owner.session(), fence, (self.shared.clock)()?, deadline_ms)
+            .accept_start(owner.session(), fence, (self.shared.clock)()?, deadline_ms)
             .map_err(|error| self.shared.store_error(&owner, error))?;
         drop(owner);
         self.shared.wake.notify_one();
@@ -790,7 +790,7 @@ impl InitializeObserver {
     pub async fn wait(
         &self,
         caller_timeout: Duration,
-    ) -> Result<QualifiedInitializeStatus, CoordinatorError> {
+    ) -> Result<InitializeStatus, CoordinatorError> {
         tokio::time::timeout(caller_timeout, async {
             loop {
                 let step = self.step_id.clone();
@@ -799,14 +799,14 @@ impl InitializeObserver {
                     .read(move |owner, now| {
                         owner
                             .store()
-                            .qualified_initialize_status(owner.session(), &step, now)
+                            .initialize_status(owner.session(), &step, now)
                     })
                     .await?;
                 if !matches!(
                     status,
-                    QualifiedInitializeStatus::Planned
-                        | QualifiedInitializeStatus::Armed
-                        | QualifiedInitializeStatus::Expired
+                    InitializeStatus::Planned
+                        | InitializeStatus::Armed
+                        | InitializeStatus::Expired
                 ) {
                     return Ok(status);
                 }
@@ -1063,16 +1063,16 @@ async fn run(
             .read(|owner, now| {
                 owner
                     .store()
-                    .next_qualified_initialize_or_expire(owner.session(), now)
+                    .next_initialize_or_expire(owner.session(), now)
             })
             .await
         {
-            Ok(QualifiedInitializePoll::Work(work)) => work,
-            Ok(QualifiedInitializePoll::ExpiredUnarmed) => {
+            Ok(InitializePoll::Work(work)) => work,
+            Ok(InitializePoll::ExpiredUnarmed) => {
                 shared.changed.notify_waiters();
                 continue;
             }
-            Ok(QualifiedInitializePoll::Idle) => {
+            Ok(InitializePoll::Idle) => {
                 tokio::select! {
                     _ = stop.changed() => {},
                     _ = shared.wake.notified() => {},
@@ -1103,41 +1103,41 @@ async fn run(
                         // Keep observation and annotation under the exact owned
                         // lock. Stop cannot transfer the claim between these
                         // transactions and strand its frozen predecessor.
-                        let status = owner.store().qualified_initialize_status(
+                        let status = owner.store().initialize_status(
                             owner.session(),
                             &status_step,
                             now,
                         )?;
-                        if status == QualifiedInitializeStatus::Expired {
-                            owner.store().expire_unarmed_qualified_initialize(
+                        if status == InitializeStatus::Expired {
+                            owner.store().expire_unarmed_initialize(
                                 owner.session(),
                                 &status_step,
                                 now,
                             )?;
-                            Ok(QualifiedInitializeStatus::ExpiredUnarmed)
-                        } else if status == QualifiedInitializeStatus::Armed {
-                            owner.store().mark_qualified_initialize_uncertain(
+                            Ok(InitializeStatus::ExpiredUnarmed)
+                        } else if status == InitializeStatus::Armed {
+                            owner.store().mark_initialize_uncertain(
                                 owner.session(),
                                 &status_step,
                                 now,
                             )?;
-                            Ok(QualifiedInitializeStatus::Uncertain)
+                            Ok(InitializeStatus::Uncertain)
                         } else {
                             Ok(status)
                         }
                     })
                     .await;
                 let outcome = match status {
-                    Ok(QualifiedInitializeStatus::ExpiredUnarmed) => {
+                    Ok(InitializeStatus::ExpiredUnarmed) => {
                         shared.set_initializing(true);
                         shared.changed.notify_waiters();
                         continue;
                     }
-                    Ok(QualifiedInitializeStatus::Uncertain) => WorkerStatus::Uncertain {
+                    Ok(InitializeStatus::Uncertain) => WorkerStatus::Uncertain {
                         operation_id,
                         reason,
                     },
-                    Ok(QualifiedInitializeStatus::Superseded) => {
+                    Ok(InitializeStatus::Superseded) => {
                         // Stop can transfer the claim while Initialize is still
                         // running. Its frozen predecessor must remain unchanged;
                         // validate the actual successor instead of annotating
@@ -1175,7 +1175,7 @@ async fn run(
                             )),
                         }
                     }
-                    Ok(QualifiedInitializeStatus::Planned | QualifiedInitializeStatus::Expired) => {
+                    Ok(InitializeStatus::Planned | InitializeStatus::Expired) => {
                         WorkerStatus::Blocked {
                             operation_id,
                             reason,
@@ -1252,7 +1252,7 @@ fn fresh(observations: &[MemoryObservation], now: i64, ttl: i64) -> bool {
 
 async fn drive(
     shared: &Arc<Shared>,
-    work: &QualifiedInitializeWork,
+    work: &InitializeWork,
     source: &dyn ServiceObservation,
     factory: &DriverFactory,
     stop: &mut watch::Receiver<bool>,
@@ -1297,7 +1297,7 @@ async fn drive(
     remaining(shared, work.deadline_ms())?;
     let (result, context) = shared
         .read(move |owner, now| {
-            owner.store().arm_qualified_initialize_with_context(
+            owner.store().arm_initialize_with_context(
                 owner.session(),
                 &step,
                 mllm_scheduler::residency::AdmissionContext::new(
@@ -1343,7 +1343,7 @@ async fn drive(
     let expected = context.clone();
     let ttl = shared
         .read(move |owner, now| {
-            owner.store().revalidate_qualified_initialize_send(
+            owner.store().revalidate_initialize_send(
                 owner.session(),
                 &step,
                 &expected,

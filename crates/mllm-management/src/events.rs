@@ -393,12 +393,12 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             "ledger_epoch",
             "session_epoch",
         ],
-        "qualified_initialize_accepted"
-        | "qualified_initialize_armed"
-        | "qualified_owned_launch_associated"
-        | "qualified_ready_committed"
-        | "qualified_initialize_uncertain"
-        | "qualified_initialize_expired_unarmed"
+        "initialize_accepted"
+        | "initialize_armed"
+        | "owned_launch_associated"
+        | "ready_committed"
+        | "initialize_uncertain"
+        | "initialize_expired_unarmed"
         | "ordinary_cleanup_accepted"
         | "ordinary_cleanup_armed"
         | "ordinary_unarmed_stop_accepted"
@@ -416,13 +416,13 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if input.len() != fields.len() + 1 {
         return Err(Failure::Internal);
     }
-    let qualified_transition = match event.kind.as_str() {
-        "qualified_initialize_accepted" => Some("accepted"),
-        "qualified_initialize_armed" => Some("armed"),
-        "qualified_owned_launch_associated" => Some("owned_launch_associated"),
-        "qualified_ready_committed" => Some("ready"),
-        "qualified_initialize_uncertain" => Some("uncertain"),
-        "qualified_initialize_expired_unarmed" => Some("expired_unarmed"),
+    let transition_kind = match event.kind.as_str() {
+        "initialize_accepted" => Some("accepted"),
+        "initialize_armed" => Some("armed"),
+        "owned_launch_associated" => Some("owned_launch_associated"),
+        "ready_committed" => Some("ready"),
+        "initialize_uncertain" => Some("uncertain"),
+        "initialize_expired_unarmed" => Some("expired_unarmed"),
         "ordinary_cleanup_accepted" => Some("cleanup_accepted"),
         "ordinary_cleanup_armed" => Some("cleanup_armed"),
         "ordinary_cleanup_completed" => Some("cleanup_completed"),
@@ -430,7 +430,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         "ordinary_unarmed_stop_completed" => Some("unarmed_stop_completed"),
         _ => None,
     };
-    if let Some(transition) = qualified_transition {
+    if let Some(transition) = transition_kind {
         let epoch = input.get("committed_epoch").ok_or(Failure::Internal)?;
         if matches!(transition, "ready" | "cleanup_completed") == epoch.is_null()
             || epoch.as_u64() == Some(0)
@@ -448,7 +448,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             }
             value.clone()
         } else if field == "transition" {
-            if value.as_str() != qualified_transition {
+            if value.as_str() != transition_kind {
                 return Err(Failure::Internal);
             }
             value.clone()

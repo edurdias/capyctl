@@ -216,7 +216,7 @@ impl<'a> NativeLaunchHandoff<'a> {
         use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
         use mllm_store::lifecycle::ArmResult;
         let (armed, execution) = store
-            .arm_qualified_initialize_with_context(session, step_id, context)
+            .arm_initialize_with_context(session, step_id, context)
             .map_err(|_| native_error("arm rejected"))?;
         let ArmResult::New { step_id } = armed else {
             return Ok(None);
@@ -339,7 +339,7 @@ impl<'a> NativeLaunchHandoff<'a> {
         // ones this handoff was built from, and that the deadline has not passed.
         let execution = self
             .store
-            .qualified_initialize_execution(self.session, &self.step_id)
+            .initialize_execution(self.session, &self.step_id)
             .map_err(|_| native_error("handoff is stale"))?;
         if execution.token != self.token
             || execution.binding_id != self.binding_id

@@ -80,8 +80,8 @@ pub(crate) enum EventMetadata {
         committed_epoch: Option<u64>,
     },
     #[serde(rename = "1")]
-    QualifiedLifecycleRecorded {
-        transition: QualifiedLifecycleTransition,
+    LifecycleRecorded {
+        transition: LifecycleTransition,
         operation_id: EventOperationId,
         deployment_id: EventOperationId,
         step_id: EventOperationId,
@@ -116,7 +116,7 @@ pub(crate) enum EventMetadata {
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum QualifiedLifecycleTransition {
+pub(crate) enum LifecycleTransition {
     Accepted,
     Armed,
     OwnedLaunchAssociated,
@@ -169,13 +169,13 @@ impl EventMetadata {
                 OrdinaryCleanupTransition::Armed => "ordinary_cleanup_armed",
                 OrdinaryCleanupTransition::Completed => "ordinary_cleanup_completed",
             },
-            Self::QualifiedLifecycleRecorded { transition, .. } => match transition {
-                QualifiedLifecycleTransition::Accepted => "qualified_initialize_accepted",
-                QualifiedLifecycleTransition::Armed => "qualified_initialize_armed",
-                QualifiedLifecycleTransition::OwnedLaunchAssociated => "qualified_owned_launch_associated",
-                QualifiedLifecycleTransition::Ready => "qualified_ready_committed",
-                QualifiedLifecycleTransition::Uncertain => "qualified_initialize_uncertain",
-                QualifiedLifecycleTransition::ExpiredUnarmed => "qualified_initialize_expired_unarmed",
+            Self::LifecycleRecorded { transition, .. } => match transition {
+                LifecycleTransition::Accepted => "initialize_accepted",
+                LifecycleTransition::Armed => "initialize_armed",
+                LifecycleTransition::OwnedLaunchAssociated => "owned_launch_associated",
+                LifecycleTransition::Ready => "ready_committed",
+                LifecycleTransition::Uncertain => "initialize_uncertain",
+                LifecycleTransition::ExpiredUnarmed => "initialize_expired_unarmed",
             },
             Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
@@ -188,7 +188,7 @@ impl EventMetadata {
         match self {
             Self::UnarmedStopRecorded { operation_id, deployment_id, .. }
             | Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::QualifiedLifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
+            Self::LifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CoordinatorSessionStarted { .. } => (None, None),
             Self::HostResourcePolicyBootstrapped { .. } => (None, None),
