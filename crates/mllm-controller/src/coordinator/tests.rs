@@ -1497,6 +1497,7 @@ fn steps(sql: &rusqlite::Connection, deployment_id: &str) -> (i64, bool) {
 /// ADR 0011 decision 5: a failed attempt is retried, and the deployment is given
 /// up on only after the budget is spent. SPEC §13.2: the retry is counted against
 /// the exact configuration that failed, and the wait between attempts doubles. T20
+// T20
 #[tokio::test]
 async fn a_failed_start_is_retried_until_the_budget_is_spent() {
     let (dir, owner, fence, observations) = setup().await;
@@ -1545,6 +1546,28 @@ async fn a_failed_start_is_retried_until_the_budget_is_spent() {
         o.store().attempts(&fence).unwrap()
     };
     assert_eq!(record.map(|r| r.attempts), Some(3));
+    // SPEC §17: failures are recorded. Every counted attempt and the give-up
+    // itself name this deployment and why it failed.
+    let journal = {
+        let o = owner.lock().unwrap();
+        o.store().journal_evidence(start.operation_id()).unwrap()
+    };
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|entry| entry
+                .contains(&format!("deployment {}: ", fence.deployment_id))
+                && entry.contains("injected recipe failure"))
+            .count(),
+        4,
+        "three attempts and one give-up were not journaled: {journal:?}"
+    );
+    assert!(
+        journal
+            .iter()
+            .any(|entry| entry.contains("gave up: ")),
+        "the give-up was not journaled: {journal:?}"
+    );
     // The coordinator itself is unaffected, and nothing was armed for a fourth
     // attempt: one step, still planned, no grant, no evidence.
     assert_eq!(w.status(), WorkerStatus::Running);
@@ -1567,6 +1590,7 @@ async fn a_failed_start_is_retried_until_the_budget_is_spent() {
 /// ADR 0011 decision 5, first row: a success is terminal and the attempts reset.
 /// A configuration that reached Ready must not carry the failures it took to get
 /// there into the next time it is started. T20
+// T20
 #[tokio::test]
 async fn a_success_resets_the_attempt_budget() {
     let (_dir, owner, fence, observations) = setup().await;
@@ -1610,6 +1634,7 @@ async fn a_success_resets_the_attempt_budget() {
 /// first still holds memory. SPEC §13.2 and ADR 0011 decision 5: an uncertain
 /// attempt is not counted and not retried until the recorded processes are proven
 /// gone. T20
+// T20
 #[tokio::test]
 async fn an_uncertain_attempt_is_not_retried_while_processes_remain() {
     let (dir, owner, fence, observations) = setup().await;
@@ -1683,6 +1708,208 @@ async fn an_uncertain_attempt_is_not_retried_while_processes_remain() {
     assert_eq!(attempts(&next), None);
     drop(start);
     w.shutdown().await.unwrap();
+}
+
+/// ADR 0011 decision 4: a deployment that gave up closes its own admission, and
+/// an operator must still be able to stop it. Its start observer is told that it
+/// is closed, not that it was superseded by somebody else's work. T20
+// T20
+#[tokio::test]
+async fn a_given_up_deployment_reads_closed_and_can_still_be_stopped() {
+    let (dir, owner, fence, observations) = setup().await;
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            max_attempts: 1,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Arc::new(move |_| Err(CoordinatorError::Service("injected recipe failure".into()))),
+    )
+    .unwrap();
+    let start = w.start(&fence, 10000).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !steps(&sql, &fence.deployment_id).1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deployment never gave up");
+    // The step is still planned, well inside its deadline, and the deployment is
+    // no longer admitting. That is a closed deployment, not a superseded one.
+    let status = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .initialize_status(o.session(), start.step_id(), 1900)
+            .unwrap()
+    };
+    assert_eq!(status, InitializeStatus::Closed);
+    let receipt = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .accept_ordinary_stop_command(
+                o.session(),
+                "owner",
+                &fence.deployment_id,
+                fence.revision,
+                "stop",
+                1900,
+                10000,
+            )
+            .expect("an operator Stop of a given-up deployment was refused")
+    };
+    // The Stop that was accepted is the unarmed one: the step never armed, so
+    // cleanup releases exactly what the planned step held and nothing more.
+    let unarmed = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .unarmed_stop_for_predecessor(o.session(), start.step_id())
+            .unwrap()
+    };
+    assert_eq!(
+        unarmed.map(|r| r.operation_id),
+        Some(receipt.operation_id.clone())
+    );
+    drop(start);
+    w.shutdown().await.unwrap();
+}
+
+/// ADR 0011 decision 5: retries happen within the start command's deadline. A
+/// deadline that arrives before the budget is spent is terminal for that start:
+/// no second attempt is made, and the step still expires through the ordinary
+/// deadline path. T20
+// T20
+#[tokio::test]
+async fn a_deadline_reached_before_the_budget_is_terminal_for_that_start() {
+    let (dir, owner, fence, observations) = setup().await;
+    let clock = Arc::new(AtomicI64::new(1900));
+    let read_clock = clock.clone();
+    let drives = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = drives.clone();
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(move || Ok(read_clock.load(Ordering::SeqCst))),
+        CoordinatorOptions {
+            max_attempts: 3,
+            // The budget could never be spent inside a 500 ms start window.
+            retry_cooldown: Duration::from_secs(30),
+            ..Default::default()
+        },
+        Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(CoordinatorError::Service("injected recipe failure".into()))
+        }),
+    )
+    .unwrap();
+    let observer = w.start(&fence, 2400).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !steps(&sql, &fence.deployment_id).1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deadline did not close the deployment's admission");
+    // One attempt, no cooldown sleep, and the budget deliberately unspent.
+    assert_eq!(drives.load(Ordering::SeqCst), 1);
+    let record = {
+        let o = owner.lock().unwrap();
+        o.store().attempts(&fence).unwrap()
+    };
+    assert_eq!(record.map(|r| r.attempts), Some(1));
+    let journal = {
+        let o = owner.lock().unwrap();
+        o.store().journal_evidence(observer.operation_id()).unwrap()
+    };
+    assert!(
+        journal
+            .iter()
+            .any(|entry| entry.contains("deadline reached before the budget was spent")),
+        "the terminal deadline was not journaled: {journal:?}"
+    );
+    // The closed deployment still reaches its deadline: nothing is held for ever.
+    clock.store(2400, Ordering::SeqCst);
+    assert_eq!(
+        observer.wait(Duration::from_secs(60)).await.unwrap(),
+        InitializeStatus::ExpiredUnarmed
+    );
+    {
+        let o = owner.lock().unwrap();
+        assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+        assert!(o
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_none());
+    }
+    w.shutdown().await.unwrap();
+}
+
+/// ADR 0011 decision 4: a closed deployment reaches its own deadline. An expired
+/// step must not wait behind an older closed step whose deadline is later, or its
+/// endpoint lease and reservation are held past the deadline for someone else's
+/// reason. T20
+// T20
+#[tokio::test]
+async fn an_expired_step_does_not_wait_behind_an_older_closed_step() {
+    let (_dir, owner, _fence, _observations) = setup().await;
+    let source = fixture::owned_source().await;
+    let o = owner.lock().unwrap();
+    // The older acceptance has the later deadline; the younger one has already
+    // passed its own. Both deployments closed their own admission.
+    let older = o
+        .store()
+        .accept_start(o.session(), &source.fence, 1800, 3000)
+        .unwrap();
+    let younger = o
+        .store()
+        .accept_start(o.session(), &source.other, 1801, 2000)
+        .unwrap();
+    for id in [&source.fence.deployment_id, &source.other.deployment_id] {
+        o.store().set_admission_enabled(id, false).unwrap();
+    }
+    assert!(matches!(
+        o.store()
+            .next_initialize_or_expire(o.session(), 2500)
+            .unwrap(),
+        InitializePoll::ExpiredUnarmed
+    ));
+    assert_eq!(
+        o.store()
+            .initialize_status(o.session(), &younger.step_id, 2500)
+            .unwrap(),
+        InitializeStatus::ExpiredUnarmed
+    );
+    // The older step keeps its reservation: its own deadline has not arrived.
+    assert_eq!(
+        o.store()
+            .initialize_status(o.session(), &older.step_id, 2500)
+            .unwrap(),
+        InitializeStatus::Closed
+    );
+    assert_eq!(
+        o.store()
+            .runtime_binding(&source.fence.deployment_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "reserved"
+    );
+    assert!(o
+        .store()
+        .runtime_binding(&source.other.deployment_id)
+        .unwrap()
+        .is_none());
 }
 
 mod cleanup_evidence {

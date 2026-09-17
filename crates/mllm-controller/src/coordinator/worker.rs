@@ -1130,6 +1130,11 @@ async fn run(
                     Ok(Err(error)) => error.to_string(),
                     _ => "worker step panicked".into(),
                 };
+                // SPEC §17: failures are recorded. The match below moves `reason`
+                // into the outcome, so keep a copy for the journal.
+                let recorded_reason = reason.clone();
+                let deployment_id = work.fence().deployment_id.clone();
+                let journal_operation = work.operation_id().to_owned();
                 let status_step = step_id.clone();
                 let status = shared
                     .read(move |owner, now| {
@@ -1213,16 +1218,34 @@ async fn run(
                             )),
                         }
                     }
-                    Ok(InitializeStatus::Planned | InitializeStatus::Expired) => {
-                        WorkerStatus::Blocked {
-                            operation_id,
-                            reason,
-                        }
-                    }
+                    // ADR 0011 decision 4: a deployment that already closed its own
+                    // admission is blocked on that closure, not superseded by
+                    // someone else's work.
+                    Ok(
+                        InitializeStatus::Planned
+                        | InitializeStatus::Expired
+                        | InitializeStatus::Closed,
+                    ) => WorkerStatus::Blocked {
+                        operation_id,
+                        reason,
+                    },
                     Ok(_) => WorkerStatus::Failed(format!("{reason}; superseded work retained")),
-                    Err(error) => WorkerStatus::Failed(format!(
-                        "{reason}; durable arm retained if recorded: {error}"
-                    )),
+                    Err(error) => {
+                        // SPEC §17: failures are recorded. This branch may leave an
+                        // armed step behind while the worker keeps running, so the
+                        // reason must survive even though the annotation did not.
+                        journal_failure(
+                            &shared,
+                            &deployment_id,
+                            &journal_operation,
+                            "attempt_not_annotated",
+                            &format!("{recorded_reason}; durable arm retained if recorded: {error}"),
+                        )
+                        .await;
+                        WorkerStatus::Failed(format!(
+                            "{reason}; durable arm retained if recorded: {error}"
+                        ))
+                    }
                 };
                 // Only a process-wide condition still halts the worker: closed
                 // global admission (poisoned mutex, corrupt store — store_error
@@ -1250,16 +1273,33 @@ async fn run(
                 // configuration, and the deployment is given up on once the budget
                 // is spent. An uncertain outcome never reaches here: it pauses
                 // above and resolves through the gone-proof first.
+                let mut closing = format!("gave up: {recorded_reason}");
                 if unlanded {
                     let fence = work.fence().clone();
                     let counting = shared.clone();
+                    let attempt_operation = journal_operation.clone();
+                    // SPEC §17: failures are recorded. The attempt and the reason
+                    // it failed are written in the same transaction, so a counted
+                    // attempt is never left without an explanation.
+                    let attempt_evidence =
+                        format!("deployment {deployment_id}: attempt failed: {recorded_reason}");
                     let record = match shared
                         .with_owner(move |owner| {
                             let now = (counting.clock)()?;
-                            owner
+                            let record = owner
                                 .store()
                                 .record_attempt(&fence, now)
-                                .map_err(|error| CoordinatorError::Service(error.to_string()))
+                                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+                            owner
+                                .store()
+                                .record_journal(
+                                    None,
+                                    Some(&attempt_operation),
+                                    Some("attempt_failed"),
+                                    &attempt_evidence,
+                                )
+                                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+                            Ok(record)
                         })
                         .await
                     {
@@ -1282,26 +1322,57 @@ async fn run(
                             .options
                             .retry_cooldown
                             .saturating_mul(1u32.checked_shl(exponent).unwrap_or(u32::MAX));
-                        status_tx.send_replace(WorkerStatus::Running);
-                        shared.changed.notify_waiters();
-                        tokio::select! {
-                            _ = stop.changed() => {},
-                            _ = tokio::time::sleep(wait) => {},
+                        // ADR 0011 decision 5: retries happen within the start
+                        // command's deadline. Sleeping past it would only hand the
+                        // step to the expiry path mid-cooldown, so a deadline that
+                        // arrives before the budget is spent is terminal for this
+                        // start and the deployment closes its own admission now.
+                        let now = match (shared.clock)() {
+                            Ok(now) => now,
+                            Err(error) => {
+                                return WorkerStatus::Failed(format!(
+                                    "{outcome:?}; retry cooldown could not be bounded: {error}"
+                                ))
+                            }
+                        };
+                        let left = work.deadline_ms().saturating_sub(now);
+                        let left = Duration::from_millis(u64::try_from(left).unwrap_or(0));
+                        if left > wait {
+                            status_tx.send_replace(WorkerStatus::Running);
+                            shared.changed.notify_waiters();
+                            tokio::select! {
+                                _ = stop.changed() => {},
+                                _ = tokio::time::sleep(wait.min(left)) => {},
+                            }
+                            continue;
                         }
-                        continue;
+                        closing = format!(
+                            "deadline reached before the budget was spent: {recorded_reason}"
+                        );
                     }
                 }
-                // ADR 0011 decision 4: the budget is spent, or the failure was not
-                // one that may be replayed. A deployment that is given up on closes
-                // its own admission, not the host's. Every other deployment keeps
-                // being served; only this one is no longer admitted until an
-                // operator reopens it.
-                let deployment_id = work.fence().deployment_id.clone();
+                // ADR 0011 decision 4: the budget is spent, the deadline arrived
+                // first, or the failure was not one that may be replayed. A
+                // deployment that is given up on closes its own admission, not the
+                // host's. Every other deployment keeps being served; only this one
+                // is no longer admitted until an operator reopens it.
+                let closed_deployment = deployment_id.clone();
+                let closing_operation = journal_operation.clone();
                 if let Err(error) = shared
                     .with_owner(move |owner| {
                         owner
                             .store()
-                            .set_admission_enabled(&deployment_id, false)
+                            .set_admission_enabled(&closed_deployment, false)
+                            .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+                        // SPEC §17: failures are recorded.
+                        owner
+                            .store()
+                            .record_journal(
+                                None,
+                                Some(&closing_operation),
+                                Some("given_up"),
+                                &format!("deployment {closed_deployment}: {closing}"),
+                            )
                             .map_err(|error| CoordinatorError::Service(error.to_string()))
                     })
                     .await
@@ -1314,6 +1385,31 @@ async fn run(
             }
         }
     }
+}
+
+/// Append one journal entry naming the deployment and why its attempt failed.
+///
+/// SPEC §17: failures are recorded. The journal is evidence only: it releases
+/// nothing, advances no epoch and replays no dispatch, so a journal that cannot
+/// be written must not turn a recorded failure into a different outcome.
+async fn journal_failure(
+    shared: &Arc<Shared>,
+    deployment_id: &str,
+    operation_id: &str,
+    state: &str,
+    reason: &str,
+) {
+    let evidence = format!("deployment {deployment_id}: {reason}");
+    let operation = operation_id.to_owned();
+    let state = state.to_owned();
+    let _ = shared
+        .with_owner(move |owner| {
+            owner
+                .store()
+                .record_journal(None, Some(&operation), Some(&state), &evidence)
+                .map_err(|error| CoordinatorError::Service(error.to_string()))
+        })
+        .await;
 }
 
 fn remaining(shared: &Shared, deadline: i64) -> Result<Duration, CoordinatorError> {

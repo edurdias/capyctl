@@ -252,6 +252,7 @@ mod tests {
 
     /// A later effect is armed only if every earlier effect committed the exact
     /// facts expected, in time order, at strictly increasing epochs. T20
+    // T20
     #[test]
     fn predecessors_must_have_committed_in_order() {
         let drained = CommittedEffect {
@@ -312,6 +313,7 @@ mod tests {
     /// The parked predicate: nothing resident, nothing running, same processes,
     /// no work leased, observed after the park committed. Any one failing means
     /// the deployment is not parked, whatever the engine reported. T20
+    // T20
     #[test]
     fn parked_requires_every_condition() {
         assert_eq!(verify_parked(&parked(), &owned()), Ok(()));

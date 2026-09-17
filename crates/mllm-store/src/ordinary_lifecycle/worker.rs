@@ -8,6 +8,11 @@ pub enum InitializeStatus {
     Completed,
     Uncertain,
     Superseded,
+    /// The step is still planned, but its deployment closed its own admission.
+    /// It is not superseded work: it is a deployment that gave up and now waits
+    /// for its deadline or for an operator Stop.
+    // ADR 0011 decision 4: a failed deployment stops itself, not the host.
+    Closed,
     Expired,
     ExpiredUnarmed,
 }
@@ -61,6 +66,54 @@ fn next_plan(
     current_admitted(tx, session, &plan, false, admitted)?;
     if state != "planned" {
         return Err(LifecycleError::Conflict);
+    }
+    Ok(Some((plan, effective)))
+}
+
+/// The planned step of this session with the earliest deadline that has already
+/// passed, whether or not its deployment is still admitting.
+///
+/// Expiry is a release, not work, so the admission predicate is left out: a
+/// deployment that closed its own admission must still reach its deadline. The
+/// order is by deadline and not by acceptance, so that a step whose deadline has
+/// passed never waits behind an older step whose deadline has not. The run's
+/// `deadline_ms` is the plan's own deadline; `validate_initialize_run` proves the
+/// two agree, and the check below refuses the pair if they ever disagree.
+// ADR 0011 decision 4: a failed deployment stops itself, not the host.
+fn next_expired_plan(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+    now_ms: i64,
+) -> Result<Option<(Plan, EffectiveDeployment)>, LifecycleError> {
+    let id: Option<String> = tx
+        .query_row(
+            "SELECT s.id FROM lifecycle_steps s
+         JOIN operations o ON o.id=s.operation_id
+         JOIN lifecycle_runs r ON r.operation_id=o.id
+         JOIN deployments d ON d.id=s.deployment_id
+         WHERE o.kind='initialize' AND s.state='planned'
+           AND s.session_id=?1 AND r.session_id=?1
+           AND d.revision=r.revision AND d.current_generation=r.generation
+           AND d.desired_state='ready' AND d.suspended=0
+           AND r.deadline_ms<=?2
+         ORDER BY r.deadline_ms,o.accepted_at,o.id LIMIT 1",
+            params![session.id(), now_ms],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    if id.len() != 26 {
+        return Err(LifecycleError::CorruptStoredData);
+    }
+    let (plan, effective, state) = load(tx, &id)?;
+    current_admitted(tx, session, &plan, false, false)?;
+    if state != "planned" {
+        return Err(LifecycleError::Conflict);
+    }
+    if now_ms < plan.deadline_ms {
+        return Err(LifecycleError::CorruptStoredData);
     }
     Ok(Some((plan, effective)))
 }
@@ -198,7 +251,22 @@ impl crate::Store {
             return Ok(InitializeStatus::ExpiredUnarmed);
         }
         match current(&tx, session, &plan, state == "completed") {
-            Err(LifecycleError::Stale) => return Ok(InitializeStatus::Superseded),
+            // ADR 0011 decision 4: a deployment that gave up closes its own
+            // admission. Its planned step is not superseded work, and telling a
+            // waiting operator that it was superseded is wrong. Re-read without
+            // the admission predicate and report the closure as itself.
+            Err(LifecycleError::Stale) => {
+                let closed = state == "planned"
+                    && !admitting(&tx, &plan)?
+                    && current_admitted(&tx, session, &plan, false, false).is_ok();
+                return Ok(match (closed, now_ms >= plan.deadline_ms) {
+                    // Past its deadline it is expiring work like any other, and
+                    // the release path must still see it that way.
+                    (true, true) => InitializeStatus::Expired,
+                    (true, false) => InitializeStatus::Closed,
+                    _ => InitializeStatus::Superseded,
+                });
+            }
             other => other?,
         }
         let consistent = match state.as_str() {
@@ -371,14 +439,16 @@ impl crate::Store {
         Ok(work)
     }
 
-    /// Inspect one oldest current planned operation and durably expire it before
-    /// checking current launch policy. The release uses the same transaction-local
-    /// exact no-effect validation as an explicit expired-step retry.
+    /// Durably expire every planned step whose deadline has passed, oldest
+    /// deadline first, and only then look for work. The release uses the same
+    /// transaction-local exact no-effect validation as an explicit expired-step
+    /// retry, so nothing is released without evidence that the step never armed.
     ///
-    /// The oldest step is read without the admission predicate, so that a
-    /// deployment which closed its own admission still reaches its deadline. If
-    /// that step has not expired yet it is not work, and the read is repeated
-    /// among the deployments that are still admitting.
+    /// Expiry is read without the admission predicate, so that a deployment which
+    /// closed its own admission still reaches its deadline, and it is ordered by
+    /// deadline rather than by acceptance, so that an expired step never waits
+    /// behind an older step whose deadline is later. Work is then read among the
+    /// deployments that are still admitting.
     // ADR 0011 decision 4: a failed deployment stops itself, not the host.
     pub fn next_initialize_or_expire(
         &self,
@@ -390,29 +460,22 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
-        let result = match next_plan(&tx, session, false)? {
-            None => InitializePoll::Idle,
-            Some((plan, effective)) if now_ms >= plan.deadline_ms => {
-                expiry::expire_in_transaction(&tx, session, &plan, &effective, "planned", now_ms)?;
-                InitializePoll::ExpiredUnarmed
-            }
-            Some((plan, effective)) if admitting(&tx, &plan)? => {
-                InitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
-            }
-            // SPEC §6.1 FAILED: admission closed. This step is neither work nor
-            // expired, and it must not starve any other deployment.
-            Some(_) => match next_plan(&tx, session, true)? {
+        let mut expired = false;
+        while let Some((plan, effective)) = next_expired_plan(&tx, session, now_ms)? {
+            expiry::expire_in_transaction(&tx, session, &plan, &effective, "planned", now_ms)?;
+            expired = true;
+        }
+        let result = if expired {
+            InitializePoll::ExpiredUnarmed
+        } else {
+            // SPEC §6.1 FAILED: admission closed. A closed deployment's step is
+            // neither work nor expired, and it must not starve any other one.
+            match next_plan(&tx, session, true)? {
                 None => InitializePoll::Idle,
-                Some((plan, effective)) if now_ms >= plan.deadline_ms => {
-                    expiry::expire_in_transaction(
-                        &tx, session, &plan, &effective, "planned", now_ms,
-                    )?;
-                    InitializePoll::ExpiredUnarmed
-                }
                 Some((plan, effective)) => {
                     InitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
                 }
-            },
+            }
         };
         tx.commit()?;
         Ok(result)

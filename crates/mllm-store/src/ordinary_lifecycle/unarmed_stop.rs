@@ -257,7 +257,12 @@ pub(super) fn accept(
     let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND o.kind='initialize' AND b.state!='released' AND s.state='planned'",[&f.deployment_id],|r|r.get(0)).optional()?;
     let Some(id) = id else { return Ok(None) };
     let (original, e, state) = load(tx, &id)?;
-    super::current(tx, s, &original, false)?;
+    // ADR 0011 decision 4: a deployment that gave up closes its own admission.
+    // An operator Stop of that deployment must still be accepted, or the
+    // reservation and the endpoint lease are held until the original deadline
+    // with no recourse. The `no_effects_with_successor` proof below still shows
+    // that the step never armed, exactly as the deadline release does.
+    super::current_admitted(tx, s, &original, false, false)?;
     if original.fence() != *f
         || state != "planned"
         || now < original.accepted_at_ms
