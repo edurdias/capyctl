@@ -299,6 +299,20 @@ CREATE TABLE qualification_parked_status(
 pub const SCHEMA_V11: &str =
     "ALTER TABLE deployments ADD COLUMN admin_stopped INTEGER NOT NULL DEFAULT 0;";
 
+/// ADR 0011 decision 5: a deployment's failed attempts are counted against the exact
+/// configuration that failed. A new revision is a new configuration and starts fresh,
+/// so the key is the fence rather than the deployment alone.
+pub const SCHEMA_V12: &str = r#"
+CREATE TABLE deployment_attempts(
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  attempts INTEGER NOT NULL CHECK(attempts >= 0),
+  last_attempt_ms INTEGER NOT NULL CHECK(last_attempt_ms >= 0),
+  PRIMARY KEY(deployment_id, revision, generation)
+);
+"#;
+
 pub const SCHEMA_V9: &str = r#"
 CREATE TABLE owned_launch_associations(
   step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),

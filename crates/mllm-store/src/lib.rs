@@ -2,6 +2,7 @@
 //! migrations, transactional deployment acceptance with derived
 //! idempotency, and owner-only file permissions.
 
+pub mod attempts;
 pub mod candidate_creation;
 pub mod deployments;
 pub mod dispatch;

@@ -4,13 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -155,6 +155,31 @@ mod tests {
             .unwrap();
         assert_eq!(name, "kept");
         assert!(!stopped, "an upgrade must not suspend what was running");
+    }
+
+    /// An existing deployment keeps its rows and starts with no attempts recorded.
+    #[test]
+    fn v12_adds_attempts_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?1)",
+                [(index + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('kept','kept','model','ready',1,0,1,1);").unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let name: String = conn
+            .query_row("SELECT name FROM deployments WHERE id='kept'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "kept");
+        let attempts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deployment_attempts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0, "an upgrade records no attempts against anything");
     }
 
     #[test]
