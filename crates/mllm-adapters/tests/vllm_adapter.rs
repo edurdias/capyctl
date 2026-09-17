@@ -83,6 +83,7 @@ async fn readiness_requires_served_model_not_liveness() {
     assert!(matches!(a.check_readiness(&member()).await.unwrap(), Readiness::Ready));
 }
 
+// T21: SPEC §9.1 security gate — deep-park stays denied without host-policy opt-in.
 #[tokio::test]
 async fn park_denied_by_default_without_engine_call() {
     let (addr, st) = spawn_mock().await;

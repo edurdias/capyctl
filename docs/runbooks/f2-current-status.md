@@ -6,6 +6,30 @@ not per task. Focused TDD and integration verification continue throughout.
 
 ## Recent committed work
 
+- `dc5a3c1`: a success resets the attempt budget.
+- `0a0a3ee`: retry a failed deployment three times with a 30 s doubling cooldown,
+  added through `CoordinatorOptions`.
+- `49f8bde`: the ordinary path's types, methods, operation kind and event kinds
+  lose the qualified prefix.
+- `0556375`: the Fake engine's lifecycle simulation renamed under its own name
+  (`fake/lifecycle.rs`, `FakeFault`).
+- `9530811`: retired `qualification_id` — the host YAML key, profile field and
+  token, and bindings renamed to `identity_id` and `recipe_fingerprint`.
+- `92fdeee`: deleted the store/config/domain qualification modules; schema v13
+  drops ten tables and removes the negative identity guards.
+- `9c8f68a`: deleted the candidate lanes, management routes and the CLI qualify
+  verb.
+- `1f13d4f`: a closed deployment offers no work; a planned step still expires.
+- `f42e84d`: an ordinary test fixture that never runs a candidate suite
+  (`tests/support/fixture.rs`).
+- `bf4b042`: `NativeLaunchHandoff` is sourced through a `NativeLaunchSource`
+  trait.
+- `6b2e073`: moved `ArmResult`, cleanup types, SGLang pins and native launch
+  types out of the candidate module.
+- `57247ae`: the domain park contract as pure rules (`mllm-domain/src/park.rs`).
+- `df19a46`: qualification is not an mllm concept (ADR 0011 decision 2; SPEC
+  §8.4 withdrawn).
+- `1761f07`: a failed deployment closes its own admission, not the host's.
 - `c6915fd`: the A1 gate on the Fake engine — deploy, start, and one inference
   served through the router, with the coordinator as the sole authority.
 - `d2a6117`: a start binding is identified by what it is, not by one spelling, so
@@ -73,80 +97,19 @@ clean transport completion and binding provenance remain runner obligations.
 
 The F2C phase-margin calculation now uses checked integer arithmetic for
 `peak + max(2 GiB, ceil(peak/4))`. It rejects overflow instead of saturating or
-wrapping. This numerical helper does not establish attribution, qualify a recipe
+wrapping. This numerical helper does not establish attribution, verify a recipe
 or reduce any reservation; missing attribution keeps the conservative grant.
 Its pressure-case helper selects the smallest whole-GiB ceiling covering every
 supplied intermediate charged demand while denying direct wake. It rejects an
-empty or unsafe interval. Actual qualified attribution, complete ledger totals
+empty or unsafe interval. Actual verified attribution, complete ledger totals
 and planner feasibility remain caller obligations, not numerical assumptions.
 
-Owned Fake candidate Initialize and its mandatory Ready probe pass root integration.
-Authenticated run-scoped submission returns the original durable acceptance
-envelope. The same retained instance executes each separately armed child; trusted
-terminal clocks, policy/session checks and durable leases govern completion.
-Caller loss cannot cancel or replay accepted work. Uncertainty retains accounting;
-ordinary gates stay closed and no qualification is issued.
-
-Run-scoped candidate inference also passes root integration. Strict authenticated
-requests enter a bounded owned queue; expected revision and immutable scope bind
-atomically to the original V3 request grant. Only a new grant sends through the
-original retained Fake runtime. Caller loss and exact retries cannot replay it;
-uncertain outcomes retain leases and the full conservative grant. All four closed
-Fake corpus requests complete through HTTP without opening ordinary gates.
-Internal Security progression now also passes root integration. After all four
-baseline results, the same retained Fake performs the fixed unauthorized control
-check and two unauthorized endpoint checks. Each child requires a new durable arm,
-fresh observations, exact current authority and final clock/shutdown fences.
-Previously armed work never restores send permission; uncertainty retains leases
-and the full grant and stops later children. The service control collector samples
-its clock after the actual terminal observation. Discovery rejects malformed,
-non-text and oversized records before allocating them. No public Security action
-is added. Remaining actions and public operation-result reads remain open.
-These Fake cases do not replace the native F2C corpus.
-
-Owned candidate Park/Restore now use the original retained Fake through the
-authenticated action endpoint. Park separates Drain, Park and read-only parked
-status; Restore separates allocation restore, weight reload, cache invalidation
-and the required Ready probe. Post-wake inference uses the validated Restore
-anchor without replaying baseline Security. Full conservative grants remain
-retained and ordinary gates remain closed. Each child requires a new durable arm;
-current policy, leases, pressure and final clock/shutdown fences govern sending.
-Public operation-result reads remain separate work.
-
-The owned candidate Finish service now uses an explicitly versioned deadline-bound
-catalog/receipt record while preserving legacy V3 history. It reuses the exact
-complete Fake suite evaluator, atomically records qualification and checks clocks
-after evaluation and immediately before commit. Expiry or regression rolls back
-all writes. Exact-key retries preserve the original operation; a new service key
-after completion conflicts. Current-session completion can validate immutable
-older-session evidence without reconstructing a runtime. All candidate accounting
-and identities remain retained; ordinary use still requires verified cleanup and
-a fresh independent binding. This does not qualify a native recipe.
-
-Candidate Abort now has strict owned submission and atomic versioned history.
-It closes an eligible run without releasing grants, leases, endpoints or runtime
-identity and without inventing a completion epoch. Run-scoped cancellation and
-Store arm/completion fences prevent later work or late success from promoting the
-run. Exact retries preserve the original operation; a new key cannot rewrite a
-terminal run or passed catalog. The original driver is retained inside a newly
-armed Initialize job even if its awaiting future is cancelled.
-The durable Abort event replays through authenticated SSE with exact IDs and a
-positive string session epoch. Strict projection rejects expanded or corrupt
-payloads; exact retries emit no duplicate event and live delivery continues.
-
-Associated candidate Cleanup now passes root integration through the original
-retained Fake runtime. The single worker waits for its predecessor future to exit
-and sends only after a new durable arm and exact current-context validation.
-Frozen cleanup permission and a separate bounded deadline remain usable after
-run expiry. Verified exact-membership gone evidence atomically settles leases,
-releases ownership/endpoints/binding and advances the completion epoch once.
-Unverified outcomes retain accounting; missing association or retained runtime
-remains unsupported and never triggers reconstruction. After candidate uncertainty,
-normal admission stays closed while an explicit Cleanup-only lane remains live.
-Idle discovery is clock-free; acceptance, arm, send and completion retain their
-trusted clock fences. Exact receipts and validated missing-result inference history
-survive verified Cleanup without fabricated response content. Ordinary routing and
-native qualification remain gated; public result capture/reads are still open.
+The candidate pipeline these paragraphs used to describe in detail — Initialize,
+run-scoped inference, Park/Restore, Finish, Abort, Cleanup, and the qualification
+ceremony that gated them — is deleted (ADR 0011; Tasks 7–9 of the qualification-
+removal plan, commits `9c8f68a`, `92fdeee`). Narrating its internal mechanics here
+would describe code that no longer exists; see "Recent committed work" above for
+the deletion commits and the A1b entry below for what replaced it.
 
 Authenticated Start and Stop HTTP submission now passes root integration
 verification. The optional lifecycle router shares the existing owned state,
@@ -177,19 +140,13 @@ only after a new durable cleanup arm. Unverified outcomes retain authority.
    terminalization, missing-association cleanup and restart reconciliation.
    Expiry and explicit Stop for never-armed Initialize are implemented. Other
    no-spawn states and missing-association/restart recovery remain open.
-2. Complete owned candidate execution and API actions/inference, durable router
-   accounting, management read models/policy/attachments/listener, and CLI cutover.
-   Retire legacy authority only at the joint integration gate.
-3. Complete guarded native startup composition: explicit child descriptor transfer,
-   complete process enrollment, installed-source/device/allocator verification,
-   scheduler observer attachment, and protected authentication/control composition.
-   The closed native qualification program and both engines' persisted adapters
-   also remain required; the current qualification program supports Fake only.
-4. Complete the API-driven F2C runner, protected manifest/artifacts, trusted host
-   inventory, pressure-abort wiring, correctness corpus and scenario reports.
-5. Run the consolidated review, fix required findings, satisfy remaining F1/M1
-   gates, and perform authorized pressure-guarded native qualification after its
-   prerequisites. CPU/Fake tests and source checks are not native qualification.
+2. Ordinary park (drain, park, parked accounting, wake) is not designed; the
+   contract it must satisfy is `mllm-domain/src/park.rs`. The ordinary native
+   launch is not designed; `NativeLaunchHandoff` waits on a `NativeLaunchSource`
+   implementation, `ProfileBindings` refuses SGLang, and the private descriptor
+   tag `sglang_candidate_private_launch` and the served-name rule
+   `candidate-{binding_id}` are leftovers of that design. Native parking is
+   blocked on both engines regardless: `VllmAdapter` has no `execute_persisted`.
 
 ## Milestones and review gates
 
@@ -233,7 +190,7 @@ coordinator as the sole lifecycle authority, on a real engine.
 `crates/mllm-cli/tests/a1_gate.rs` is that gate as one test and it passes **on the
 embedded Fake engine**, which is what standalone declares when no live profile is
 configured. That is the first end-to-end evidence the project has, and it is not
-qualification of a native recipe (SPEC §18).
+verification of a native recipe (SPEC §18).
 
 The native half of the gate is still open. The owner confirmed on 2026-09-16 that
 **both** engines are required, not one:
@@ -252,8 +209,9 @@ Both are read from the code, not from an observed run: no native start has been
 attempted since the cutover.
 
 Park was originally part of this gate and has moved to A1b. The ordinary lifecycle
-has no park at all — only the candidate path does. Ordinary stop returned with
-`b52f729`, which split the suspension predicate; park has not.
+has no park at all; the candidate path that formerly had one is deleted (ADR 0011).
+Ordinary stop returned with `b52f729`, which split the suspension predicate;
+park has not.
 
 The owner confirmed on 2026-09-16 that parking is the product's premise, not an
 option: **one model parked while another serves, switching between them
@@ -276,7 +234,7 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
 
 - [ ] Implement drain, release and wake in the lifecycle authority, taking
       `SwitchEngine`'s semantics as the contract: close admission, bounded drain
-      grace, quiescence through the adapter, park or stop by qualification, and on
+      grace, quiescence through the adapter, park or stop by declared tier, and on
       failure reopen the incumbent unsuspended and journal the failed switch.
 - [ ] Move the activation join to the authority so simultaneous arrivals collapse to
       one operation, keyed by deployment, revision and generation.
@@ -291,9 +249,16 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       memory topology; a host-backed park is refused at configuration time on a
       one-pool domain; SGLang's startup flags follow the declared tier. This makes
       the choice expressible and checkable. It does not implement park.
-- [ ] Implement ordinary park. The ordinary lifecycle has no park at all; only the
-      candidate path (`candidate_creation/warm.rs`) does. This is the premise of the
-      product and the largest remaining piece of A1b.
+- [x] Remove qualification (ADR 0011). mllm guards the host; the user owns the
+      recipe. The candidate and qualification subsystem is deleted, schema v13
+      drops its tables, the park contract survives as pure domain rules, a
+      failed deployment closes its own admission and is retried three times
+      with a doubling cooldown before it is given up on, and an uncertain
+      attempt still resolves through the gone-proof first. CPU and Fake tests
+      are not verification of any native recipe.
+- [ ] Implement ordinary park. The ordinary lifecycle has no park at all; the
+      candidate path that formerly had one is deleted. This is the premise of
+      the product and the largest remaining piece of A1b.
 
 Ported faithfully first, keeping the existing T16 and T19 tests as the contract. The
 semantics were written against F1's assumptions and deserve revisiting against the
@@ -331,14 +296,7 @@ edit. The proof set gates the commit, not the call.
 
 ### A4 — Collapse the second lifecycle
 
-`candidate_creation` and `ordinary_lifecycle` are two state machines over the same
-transitions, differing in authority rather than meaning.
-
-- [ ] One planner with an `Authority` parameter; a candidate run becomes ordinary
-      reconciliation under scoped authority that cannot promote itself.
-
-**Gate:** one planner, one set of transition rules, and the consolidated review
-across the whole branch.
+Discharged by deletion (ADR 0011).
 
 ## Tracked for later: naming and engine resolution
 
@@ -380,16 +338,16 @@ host with several devices or across hosts.
    defines an engine group as the complete runtime realization of one deployment
    across processes and hosts, and §11 requires a group launch plan carrying member
    identities, rank roles, peer addresses and rendezvous data.
-4. Multi-rank release and resume acknowledgement is unqualified. Per the F2B plan,
+4. Multi-rank release and resume acknowledgement is unverified. Per the F2B plan,
    SGLang's release and resume await their communicators, and a success reply from
    the tokenizer manager does not prove every rank released. A partial release that
    reads as success would be exactly the unevidenced release `SPEC.md` §6.1 forbids.
-   The 2026-09-16 qualification proved the single-rank path only.
+   The 2026-09-16 verification proved the single-rank path only.
 5. `NativeResidencyObserver` now fails closed when allocations span more than one
    device, because summing mapped bytes across devices cannot distinguish a fully
    restored group from one restored rank. Per-rank evidence, and cross-host
    aggregation for a multi-node group, remain unimplemented.
-6. Hardware: host-a has a single GB10, so no parallel topology can be qualified
+6. Hardware: host-a has a single GB10, so no parallel topology can be verified
    there. Tensor parallelism needs a multi-device host; multi-node needs two hosts.
 
 ## Open questions
@@ -415,25 +373,7 @@ host with several devices or across hosts.
    `Disabled` is the closest and means something else. Pinned by
    `standalone_lifecycle::stop_is_illegal_from_stopped` so a change is deliberate.
 
-3. How does a deployment become qualified to park? OPEN, owner decision.
-   Warm residency requires a qualification: a recorded proof that this exact recipe
-   on this exact host releases memory and restores, with the model generating
-   correctly afterwards (SPEC §8.4 — "Finding an endpoint is not qualification").
-   Parking is destructive, so the store refuses to bind a warm deployment without
-   one, which is why standalone declares `restart_only` today and cannot park at all.
-
-   The owner has said twice that users will not ask for a qualification, and that
-   parking is the product's premise. Both hold only if mllm earns the proof itself:
-   on a warm deployment's first start, run the park/restore cycle once against it,
-   record the evidence, and switch freely from then on. Nobody types `mllm qualify`.
-   The alternative — trusting a configuration flag that asserts the engine can park
-   — is what SPEC §8.4 forbids, and it ends with a model whose weights were
-   discarded and cannot be restored.
-
-   Not started. The mechanism of ordinary park is independent of this question and
-   can be built first; this decides only when a deployment is allowed to use it.
-
-4. A resource policy written before ADR 0010 cannot be read back.
+3. A resource policy written before ADR 0010 cannot be read back.
    `StoredPolicy.version` stayed at `1` when `StoredDomain` gained a required
    `memory` field, so a policy row written before that change now fails to decode as
    `CorruptStoredPolicy`, and `import_resource_policy` does not overwrite it — it
@@ -444,30 +384,49 @@ host with several devices or across hosts.
    against a state directory created before 2026-09-16, delete the directory** — the
    host policy is republished at every boot.
 
-5. One test fails between a third and two thirds of the time, on an idle machine.
-   `qualification_progression::ordinary_cleanup_races_ready_completion_and_duplicate_accept_and_arm`
-   fails with `Sql(SqliteFailure(DatabaseBusy, "database is locked"))` at
-   `qualification_support/ordinary_cleanup.rs:820`. The test deliberately races three
-   connections against one SQLite file — two threads calling
-   `accept_ordinary_cleanup` and one calling `complete_step` — and asserts the two
-   cleanup receipts are identical. When a racing connection loses the lock instead of
-   serialising behind it, the `unwrap` panics.
+4. Retry cooldown sleeps inside the single worker loop. When a deployment fails
+   and is waiting out its doubling cooldown before the next attempt, the worker
+   sleeps in place, which blocks it from discovering and advancing any other
+   deployment for up to 30 s per wait. This is accepted for A1b standalone,
+   where one worker and one deployment are the common case, but it will not
+   scale past that. The fix shape is a not-before time read from
+   `deployment_attempts.last_attempt_ms` and checked at poll time instead of a
+   blocking sleep, so the worker keeps discovering other deployments while one
+   waits out its cooldown.
 
-   Measured on 2026-09-16, single test, idle machine, 32 CPUs: 2 of 3 runs failed at
-   `d3e5b8e`, and 1 of 3 failed at `e8b943e`, which predates the ADR 0010 work. It is
-   therefore **not** a regression from that work, and it is not specific to
-   multi-crate runs.
+5. Admission closure is the only give-up signal after the attempt budget is
+   exhausted; nothing records why the deployment gave up. A caller who finds
+   the deployment closed cannot distinguish a budget exhaustion from any other
+   reason admission might close, and no failure category or last-error text is
+   retained alongside the closure.
 
-   Earlier in the same session this was recorded as "passes when run alone" on the
-   strength of two isolated passes. That inference was wrong: a test failing about
-   half the time passes alone often enough to look green. Treat any single green run
-   of this test as no evidence either way.
+6. Fingerprint drift between an effective configuration snapshot and the
+   current host is not checked at deployment start. The refusals that used to
+   catch a stale or mismatched recipe came from the deleted qualification
+   catalog and judged the recipe, not host capacity; nothing replaced that
+   check when the catalog was removed, so a start can proceed against a
+   snapshot that no longer matches the host it targets.
 
-   The test is not currently useful as a gate — it cannot distinguish a real
-   regression from its own lock contention. Fixing it means giving the racing
-   connections a `busy_timeout`, or asserting that one of the two racers may lose the
-   lock, rather than that both must win. Until then, a failure here needs the
-   assertion read: `DatabaseBusy` is the known mode, and anything else is new.
+7. The dispatch seam — grant, close, finish and pending dispatch, and
+   `request_leases` — has no production issuer. Router dispatch ownership (the
+   F2A2c plan) is the intended one and has not landed. Ordinary tests use the
+   seam directly today to exercise the request-lease guards, which is useful
+   coverage but not evidence that anything in production calls it.
+
+8. Two SGLang wire kinds, `sglang_candidate_launch` and
+   `sglang_candidate_private_launch`, and the served-name rule
+   `candidate-{binding_id}`, stay in place until the ordinary native launch is
+   designed. They are leftovers of the deleted candidate path's launch
+   plumbing, not a naming choice for the ordinary path.
+
+9. `crates/mllm-controller/src/sequence.rs`'s planner still keeps a
+   `qualified_park`/`qualified_restore`/`qualified_initialize` eligibility
+   vocabulary inherited from the legacy F1 `Controller` lineage. This plan did
+   not touch it; renaming it is work for the park ADR that wires ordinary park
+   against the `mllm-domain/src/park.rs` contract. The legacy
+   `crates/mllm-controller/src/operations.rs` `Controller` itself is untouched
+   by this plan and remains slated for retirement at the A2d gate, per the
+   milestones section above.
 
 ## Owner attention
 
@@ -498,7 +457,7 @@ seven collected JSON, eight streamed-data, five SSE framing, five timing, seven 
 protected-storage tests.
 The full Cargo harness count includes the three pressure-ceiling tests.
 All-target Clippy also passes for these five crates with warnings denied.
-None is native qualification evidence.
+None is native verification evidence.
 
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier
@@ -531,5 +490,5 @@ No new approval is required for the current bounded implementation. Only
 host-a is authorized. The approved isolated SGLang environment and reviewed
 observer patch do not authorize changing existing engine environments, drivers,
 rebooting, or accessing host-b. Both native entrypoint denials remain closed;
-there has been no model load or native qualification in these slices. Build and
+there has been no model load or native verification in these slices. Build and
 live-effect gates remain explicit rather than inferred from passing CPU tests.
