@@ -3,15 +3,12 @@
 //! idempotency, and owner-only file permissions.
 
 pub mod attempts;
-pub mod candidate_creation;
 pub mod deployments;
 pub mod dispatch;
 pub mod events;
 pub mod lifecycle;
 pub mod managed_configuration;
 pub mod migrations;
-pub mod qualification_policy;
-pub mod qualification;
 pub mod ordinary_lifecycle;
 pub mod resource_ledger;
 pub mod residency;
@@ -135,12 +132,12 @@ mod tests {
         let s2 = Store::open(&path).unwrap();
         drop(s2);
         drop(s);
-        for candidate in [
+        for sidecar in [
             format!("{}-wal", path.display()),
             format!("{}-shm", path.display()),
         ] {
-            if let Ok(meta) = fs::metadata(&candidate) {
-                assert_eq!(meta.permissions().mode() & 0o077, 0, "{candidate}");
+            if let Ok(meta) = fs::metadata(&sidecar) {
+                assert_eq!(meta.permissions().mode() & 0o077, 0, "{sidecar}");
             }
         }
     }

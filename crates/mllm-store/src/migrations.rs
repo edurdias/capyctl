@@ -4,13 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -79,8 +79,8 @@ mod tests {
             UPDATE resource_ledger_meta SET epoch=19;").unwrap();
         apply(&conn).unwrap();
         apply(&conn).unwrap();
-        let tables:i64=conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('owned_launch_associations','candidate_cleanup_actions')",[],|r|r.get(0)).unwrap();
-        assert_eq!(tables, 2);
+        let tables:i64=conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='owned_launch_associations'",[],|r|r.get(0)).unwrap();
+        assert_eq!(tables, 1);
         let state:(i64,i64,i64,String,i64)=conn.query_row("SELECT revision,current_generation,(SELECT epoch FROM resource_ledger_meta),(SELECT incarnation FROM event_meta),(SELECT retained_after FROM event_meta) FROM deployments WHERE id='retained'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
         assert_eq!(state, (3, 7, 19, "known-incarnation".into(), 12));
         let stamps: Vec<i64> = conn
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_preserves_existing_database_and_adds_permanent_case_keys() {
+    fn v8_preserves_existing_database() {
         let conn = Connection::open_in_memory().unwrap();
         for (index, sql) in MIGRATIONS.iter().take(7).enumerate() {
             conn.execute_batch(sql).unwrap();
@@ -119,14 +119,6 @@ mod tests {
         apply(&conn).unwrap();
         let retained:(String,i64)=conn.query_row("SELECT name,(SELECT epoch FROM resource_ledger_meta) FROM deployments WHERE id='retained'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(retained, ("retained".into(), 7));
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM qualification_case_actions", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 0);
-        let foreign_keys:i64=conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('qualification_case_actions') WHERE on_delete='NO ACTION'",[],|r|r.get(0)).unwrap();
-        assert_eq!(foreign_keys, 3);
     }
 
     /// An existing deployment keeps its rows and is not administratively stopped by
@@ -290,10 +282,6 @@ mod tests {
             "command_receipts",
             "effective_revisions",
             "host_resource_policies",
-            "host_qualification_policies",
-            "qualification_runs",
-            "qualifications",
-            "qualification_evidence_refs",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -328,5 +316,67 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!((first.0, first.2), (1, 0));
         assert_eq!(first.1.len(), 26);
+    }
+
+    /// ADR 0011: the qualification tables are dropped. A v12 store with rows in the
+    /// surviving tables keeps them; none of the dropped tables remain.
+    #[test]
+    fn v13_drops_qualification_tables_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(12).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?1)",
+                [(index + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('kept','kept','model','ready',1,0,1,1);",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let name: String = conn
+            .query_row("SELECT name FROM deployments WHERE id='kept'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "kept");
+        for table in [
+            "qualification_evidence_refs",
+            "qualification_ready_probes",
+            "qualification_request_attempts",
+            "qualification_request_results",
+            "qualification_case_actions",
+            "qualification_parked_status",
+            "candidate_cleanup_actions",
+            "qualifications",
+            "qualification_runs",
+            "host_qualification_policies",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!present, "{table} must be dropped");
+        }
+        for table in [
+            "owned_launch_associations",
+            "request_leases",
+            "deployment_attempts",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(present, "{table} must stay");
+        }
     }
 }

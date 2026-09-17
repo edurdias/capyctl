@@ -4,7 +4,6 @@ pub mod lifecycle;
 pub mod resources;
 pub mod completion;
 pub mod launch;
-pub mod qualification;
 pub mod park;
 
 pub use error::TransitionError;

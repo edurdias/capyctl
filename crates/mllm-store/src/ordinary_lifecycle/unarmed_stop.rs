@@ -166,7 +166,7 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<(StopPlan, String), LifecycleE
     if !unarmed_history {
         return Err(LifecycleError::CorruptStoredData);
     }
-    let source_run = crate::lifecycle::validate_candidate_initialize_run(
+    let source_run = crate::lifecycle::validate_initialize_run(
         tx,
         &original.fence(),
         &original.operation_id,

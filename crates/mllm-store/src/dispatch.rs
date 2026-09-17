@@ -90,23 +90,6 @@ pub(crate) fn check_session(
     Ok(())
 }
 
-/// Verified disappearance may settle old sessions only for the single-binding candidate lane.
-pub(crate) fn settle_verified_candidate_cleanup(
-    tx: &rusqlite::Transaction<'_>,
-    deployment: &str,
-    binding: &str,
-) -> Result<(), crate::lifecycle::LifecycleError> {
-    let exact:bool=tx.query_row("SELECT COUNT(*)=1 AND COALESCE(SUM(id=?2),0)=1 FROM runtime_bindings WHERE deployment_id=?1",params![deployment,binding],|r|r.get(0))?;
-    if !exact {
-        return Err(crate::lifecycle::LifecycleError::Conflict);
-    }
-    tx.execute(
-        "DELETE FROM request_leases WHERE deployment_id=?1",
-        [deployment],
-    )?;
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct DispatchRequest<'a> {
     pub deployment_id: &'a str,
@@ -126,9 +109,6 @@ pub struct DispatchTicket {
     session_id: String,
 }
 impl DispatchTicket {
-    pub(crate) fn candidate(id: String, deployment_id: String, revision: i64, generation: i64, session_id: String) -> Self {
-        Self { id, deployment_id, revision, generation, session_id }
-    }
     pub fn id(&self) -> &str {
         &self.id
     }

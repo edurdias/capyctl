@@ -201,7 +201,7 @@ fn source(tx: &Transaction<'_>, p: &Plan) -> Result<EffectiveDeployment, Lifecyc
         &p.effective_json,
     )
     .map_err(|_| LifecycleError::CorruptStoredData)?;
-    let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.step_json=?6 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?7 AND effective_json=?8 AND fingerprint=?9) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded') AND NOT EXISTS(SELECT 1 FROM qualification_runs WHERE deployment_id=?3) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1", params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,encode(p)?,p.revision,p.effective_json,e.qualification_fingerprint], |r|r.get(0))?;
+    let exact: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.step_json=?6 AND o.kind='qualified_initialize' AND o.deployment_id=?3) AND EXISTS(SELECT 1 FROM effective_revisions WHERE deployment_id=?3 AND revision=?7 AND effective_json=?8 AND fingerprint=?9) AND EXISTS(SELECT 1 FROM operations WHERE deployment_id=?3 AND kind='managed_configuration_create' AND state='succeeded') AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1", params![p.step_id,p.operation_id,p.deployment_id,p.binding_id,p.session_id,encode(p)?,p.revision,p.effective_json,e.qualification_fingerprint], |r|r.get(0))?;
     // Re-derive the identity this binding must carry rather than matching the
     // qualified spelling of it. A restart-only deployment is identified by its
     // recipe and host, and cleanup is engine-agnostic anyway: it proves the
@@ -484,7 +484,7 @@ fn retained(
         [&original.step_id],
         |r| r.get(0),
     )?;
-    let run = crate::lifecycle::validate_candidate_initialize_run(
+    let run = crate::lifecycle::validate_initialize_run(
         tx,
         &original.fence(),
         &original.operation_id,
@@ -858,6 +858,48 @@ fn command_lookup(
         return Err(LifecycleError::CorruptStoredData);
     }
     Ok(Some(receipt.into()))
+}
+
+impl crate::Store {
+    /// ADR 0011: the only cleanup an mllm store completes is an ordinary one.
+    pub fn complete_cleanup(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+        e: &CleanupEvidence,
+        now: i64,
+        ttl: i64,
+    ) -> Result<(), LifecycleError> {
+        self.complete_cleanup_with_clock(s, id, e, ttl, || Ok(now))
+    }
+
+    /// The clock is read only once the stored kind is known, so a caller that must
+    /// consult a slow source pays for it on the path that will use the reading.
+    pub fn complete_cleanup_with_clock(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+        e: &CleanupEvidence,
+        ttl: i64,
+        mut clock: impl FnMut() -> Result<i64, LifecycleError>,
+    ) -> Result<(), LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        check_session(&tx, s)?;
+        let kind: Option<String> = tx
+            .query_row(
+                "SELECT o.kind FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if kind.as_deref() != Some("ordinary_cleanup") {
+            return Err(LifecycleError::Unsupported);
+        }
+        let now = clock()?;
+        complete(&tx, s, id, e, now, ttl)?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 pub(crate) fn complete(

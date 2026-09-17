@@ -1,4 +1,4 @@
-//! Private normalization shared by ordinary deployments and candidate manifests.
+//! Private normalization shared by the ordinary deployment paths.
 
 use super::*;
 

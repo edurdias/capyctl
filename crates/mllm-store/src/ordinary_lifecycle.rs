@@ -152,8 +152,9 @@ pub(crate) fn is_ordinary(tx: &Transaction<'_>, id: &str) -> Result<bool, Lifecy
     Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND o.kind='qualified_initialize')", [id], |r| r.get(0))?)
 }
 
+// ADR 0011: every managed deployment is ordinary; there is no other kind.
 fn check_managed_command_target(tx: &Transaction<'_>, id: &str) -> Result<(), LifecycleError> {
-    let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments d JOIN operations o ON o.deployment_id=d.id WHERE d.id=?1 AND d.kind='model' AND o.kind='managed_configuration_create' AND o.state='succeeded') AND NOT EXISTS(SELECT 1 FROM qualification_runs WHERE deployment_id=?1)", [id], |r| r.get(0))?;
+    let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments d JOIN operations o ON o.deployment_id=d.id WHERE d.id=?1 AND d.kind='model' AND o.kind='managed_configuration_create' AND o.state='succeeded')", [id], |r| r.get(0))?;
     if !managed {
         return Err(LifecycleError::Unsupported);
     }
@@ -175,7 +176,7 @@ fn effective(
     .map_err(|_| LifecycleError::CorruptStoredData)?;
     let effective =
         decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
-    let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='managed_configuration_create' AND state='succeeded') AND NOT EXISTS(SELECT 1 FROM qualification_runs WHERE deployment_id=?1)", [&fence.deployment_id], |r| r.get(0))?;
+    let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='managed_configuration_create' AND state='succeeded')", [&fence.deployment_id], |r| r.get(0))?;
     if !managed || fingerprint != effective.qualification_fingerprint {
         return Err(LifecycleError::Conflict);
     }
@@ -346,7 +347,7 @@ fn validate_local(
     {
         return Err(LifecycleError::CorruptStoredData);
     }
-    let run = crate::lifecycle::validate_candidate_initialize_run(
+    let run = crate::lifecycle::validate_initialize_run(
         tx,
         &p.fence(),
         &p.operation_id,
@@ -646,7 +647,7 @@ impl crate::Store {
             execution: None,
         };
         tx.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'qualified_initialize','pending')",params![operation_id,f.deployment_id])?;
-        crate::lifecycle::insert_candidate_initialize_run(tx, s, f, &operation_id, deadline)?;
+        crate::lifecycle::insert_initialize_run(tx, s, f, &operation_id, deadline)?;
         tx.execute("INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) VALUES(?1,?2,?3,?4)",params![f.deployment_id,operation_id,f.revision,f.generation])?;
         tx.execute("INSERT INTO lifecycle_steps(id,operation_id,ordinal,deployment_id,binding_id,session_id,state,step_json) VALUES(?1,?2,0,?3,?4,?5,'planned',?6)",params![step_id,operation_id,f.deployment_id,binding_id,s.id(),encode(&p)?])?;
         tx.execute(
@@ -672,6 +673,31 @@ impl crate::Store {
         let (p, e, state) = load(&tx, id)?;
         current(&tx, s, &p, state == "completed")?;
         p.context(&e)
+    }
+}
+
+impl crate::Store {
+    /// Records one spawn attempt and its conservative grant atomically. Only `New`
+    /// may lead to a later send.
+    ///
+    /// ADR 0011: the only armed step an mllm store knows is an ordinary initialize.
+    pub fn arm_step(
+        &self,
+        s: &CoordinatorSession,
+        id: &str,
+        context: AdmissionContext<'_>,
+    ) -> Result<ArmResult, LifecycleError> {
+        if id.parse::<ulid::Ulid>().is_ok_and(|v| v.to_string() == id) {
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            check_session(&tx, s)?;
+            if is_ordinary(&tx, id)? {
+                let result = arm(&tx, s, id, context)?;
+                tx.commit()?;
+                return Ok(result);
+            }
+            return Err(LifecycleError::Unsupported);
+        }
+        Err(LifecycleError::Invalid)
     }
 }
 

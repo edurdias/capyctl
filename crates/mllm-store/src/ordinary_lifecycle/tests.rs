@@ -47,19 +47,11 @@ fn a_parking_deployment_gets_a_declared_identity() {
         generation: receipt.generation,
     };
 
-    // No candidate qualification run has ever executed against this store, so the
-    // catalog is empty. The ordinary path must not need a row here.
-    let no_catalog: bool = store
-        .conn
-        .query_row("SELECT NOT EXISTS(SELECT 1 FROM qualifications)", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert!(no_catalog);
-
+    // ADR 0011: there is no catalog to consult. A parking deployment gets its
+    // binding from the ordinary path alone.
     store
         .accept_qualified_start(&session, &fence, 100, 100_100)
-        .expect("a parking deployment must get a binding without a qualification catalog entry");
+        .expect("a parking deployment must get a binding");
 
     let binding_json: String = store
         .conn

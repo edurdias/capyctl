@@ -87,7 +87,7 @@ impl EngineAdapter for Gate {
     async fn execute_persisted(
         &self,
         command: &RuntimeCommand,
-    ) -> Result<mllm_domain::qualification::EffectObservation, RuntimeError> {
+    ) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
         self.calls.lock().unwrap().push(command.action);
         self.active.store(true, Ordering::SeqCst);
         let _active = Active(&self.active);

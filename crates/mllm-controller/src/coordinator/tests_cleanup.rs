@@ -448,44 +448,6 @@ async fn cleanup_final_clock_expiry_denies_control_after_valid_store_check() {
 }
 
 #[tokio::test]
-async fn cleanup_uses_frozen_authority_after_policy_revocation() {
-    let (dir, owner, fence, observations) = setup().await;
-    let w = OwnedCoordinator::spawn_fake(
-        owner.clone(),
-        Arc::new(Observations(observations)),
-        Arc::new(|| Ok(1900)),
-        CoordinatorOptions::default(),
-    )
-    .unwrap();
-    let start = w.start(&fence, 10000).unwrap();
-    start.wait(Duration::from_secs(60)).await.unwrap();
-    {
-        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
-        let raw: String = sql
-            .query_row(
-                "SELECT effective_json FROM effective_revisions WHERE deployment_id=?1",
-                [&fence.deployment_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let mut host = mllm_config::effective::decode_effective_snapshot(&raw)
-            .unwrap()
-            .host;
-        host.qualification_policy = None;
-        let o = owner.lock().unwrap();
-        o.store()
-            .import_qualification_policy(o.session(), &host)
-            .unwrap();
-    }
-    let stop = w.stop("owner", &fence, "revoked", 10000).unwrap();
-    assert_eq!(
-        stop.wait(Duration::from_secs(60)).await.unwrap(),
-        OrdinaryCleanupStatus::Completed
-    );
-    w.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn cleanup_observer_rejects_corrupt_terminal_evidence_epoch_and_released_binding() {
     let (dir, owner, fence, observations) = setup().await;
     let w = OwnedCoordinator::spawn_fake(

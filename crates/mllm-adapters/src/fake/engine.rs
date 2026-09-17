@@ -164,7 +164,7 @@ impl FakeEngine {
     pub fn qualification_security_control(
         &self,
         command: &RuntimeCommand,
-    ) -> Result<mllm_domain::qualification::CandidateSecurityControlObservation, RuntimeError> {
+    ) -> Result<mllm_domain::completion::SecurityControlObservation, RuntimeError> {
         self.qualification
             .lock()
             .unwrap()
@@ -175,7 +175,7 @@ impl FakeEngine {
     pub fn qualification_parked_status(
         &self,
         context: &mllm_domain::completion::StepExecutionContext,
-    ) -> Result<mllm_domain::qualification::CandidateParkedStatusObservation, RuntimeError> {
+    ) -> Result<mllm_domain::completion::ParkedStatusObservation, RuntimeError> {
         self.qualification
             .lock()
             .unwrap()
@@ -196,12 +196,12 @@ impl FakeEngine {
     pub fn qualification_security_request(
         &self,
         context: &mllm_domain::completion::StepExecutionContext,
-        endpoint: mllm_domain::qualification::CandidateSecurityEndpoint,
+        endpoint: mllm_domain::completion::SecurityEndpoint,
         body: &serde_json::Value,
     ) -> Result<
         (
-            mllm_domain::qualification::CandidateTerminal,
-            mllm_domain::qualification::CandidateResponseObservation,
+            mllm_domain::completion::ObservationTerminal,
+            mllm_domain::completion::ResponseObservation,
         ),
         RuntimeError,
     > {
@@ -300,7 +300,7 @@ impl EngineAdapter for FakeEngine {
     async fn execute_persisted(
         &self,
         command: &RuntimeCommand,
-    ) -> Result<mllm_domain::qualification::EffectObservation, RuntimeError> {
+    ) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
         self.qualification
             .lock()
             .unwrap()

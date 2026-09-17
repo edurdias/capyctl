@@ -9,9 +9,10 @@ use std::{
 
 use async_trait::async_trait;
 use mllm_domain::{
-    completion::{ExecutionIdentities, Milestone, ProcessIdentity, TransitionToken},
+    completion::{
+        EffectObservation, ExecutionIdentities, Milestone, ProcessIdentity, TransitionToken,
+    },
     launch::NativeLaunch,
-    qualification::EffectObservation,
 };
 
 use super::{

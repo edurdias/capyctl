@@ -1,10 +1,8 @@
 //! Opt-in deterministic allocation state for the persisted qualification path.
 use crate::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
-use mllm_domain::completion::{Milestone, ProcessIdentity};
-use mllm_domain::qualification::EffectObservation;
-use mllm_domain::qualification::{
-    CandidateResponseObservation, CandidateSecurityControlObservation, CandidateSecurityEndpoint,
-    CandidateTerminal,
+use mllm_domain::completion::{
+    EffectObservation, Milestone, ObservationTerminal, ProcessIdentity, ResponseObservation,
+    SecurityControlObservation, SecurityEndpoint,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -121,23 +119,23 @@ impl QualificationState {
     }
     fn authorize(
         &self,
-        endpoint: CandidateSecurityEndpoint,
+        endpoint: SecurityEndpoint,
         credential: Option<Credential>,
     ) -> Result<(), u16> {
         if matches!(
             (self.fault, endpoint),
             (
                 Some(QualificationFault::UnauthorizedAdminExec),
-                CandidateSecurityEndpoint::AdminControl
+                SecurityEndpoint::AdminControl
             ) | (
                 Some(QualificationFault::UnauthorizedInferenceExec),
-                CandidateSecurityEndpoint::Inference
+                SecurityEndpoint::Inference
             ) | (
                 Some(QualificationFault::UnauthorizedHealthExec),
-                CandidateSecurityEndpoint::HealthGeneration
+                SecurityEndpoint::HealthGeneration
             ) | (
                 Some(QualificationFault::LostSecurityInferenceReply),
-                CandidateSecurityEndpoint::Inference
+                SecurityEndpoint::Inference
             )
         ) {
             return Ok(());
@@ -146,25 +144,25 @@ impl QualificationState {
             return Err(401);
         }
         match endpoint {
-            CandidateSecurityEndpoint::AdminControl if credential == self.admin_credential => {
+            SecurityEndpoint::AdminControl if credential == self.admin_credential => {
                 Ok(())
             }
-            CandidateSecurityEndpoint::Inference if credential == self.runtime_credential => Ok(()),
+            SecurityEndpoint::Inference if credential == self.runtime_credential => Ok(()),
             _ => Err(403),
         }
     }
     fn negative_check(
         &mut self,
-        endpoint: CandidateSecurityEndpoint,
-    ) -> (CandidateTerminal, CandidateResponseObservation) {
-        if endpoint == CandidateSecurityEndpoint::AdminControl {
+        endpoint: SecurityEndpoint,
+    ) -> (ObservationTerminal, ResponseObservation) {
+        if endpoint == SecurityEndpoint::AdminControl {
             self.control_attempts += 1;
         } else {
             self.request_attempts += 1;
         }
         let before = self.work_sequence;
         let presented = match endpoint {
-            CandidateSecurityEndpoint::Inference => None,
+            SecurityEndpoint::Inference => None,
             _ => self.runtime_credential,
         };
         let status = match self.authorize(endpoint, presented) {
@@ -172,7 +170,7 @@ impl QualificationState {
             Ok(()) => {
                 self.work_sequence += 1;
                 match endpoint {
-                    CandidateSecurityEndpoint::AdminControl => {
+                    SecurityEndpoint::AdminControl => {
                         self.allocations = false;
                         self.weights = false;
                         self.cache = false;
@@ -189,7 +187,7 @@ impl QualificationState {
             (self.fault, endpoint),
             (
                 Some(QualificationFault::LostSecurityInferenceReply),
-                CandidateSecurityEndpoint::Inference
+                SecurityEndpoint::Inference
             )
         ) {
             0
@@ -198,11 +196,11 @@ impl QualificationState {
         };
         (
             if status >= 400 && no_work {
-                CandidateTerminal::RejectedWithoutWork
+                ObservationTerminal::RejectedWithoutWork
             } else {
-                CandidateTerminal::Uncertain
+                ObservationTerminal::Uncertain
             },
-            CandidateResponseObservation::SecurityRejection {
+            ResponseObservation::SecurityRejection {
                 endpoint,
                 status,
                 no_work,
@@ -215,7 +213,7 @@ impl QualificationState {
     pub(super) fn security_control(
         &mut self,
         command: &RuntimeCommand,
-    ) -> Result<CandidateSecurityControlObservation, RuntimeError> {
+    ) -> Result<SecurityControlObservation, RuntimeError> {
         let identities = self.members(&command.context)?;
         if command.action != RuntimeAction::Park
             || command.context.completion_target.is_some()
@@ -223,8 +221,8 @@ impl QualificationState {
         {
             return Err(RuntimeError::Unsupported);
         }
-        let (terminal, response) = self.negative_check(CandidateSecurityEndpoint::AdminControl);
-        Ok(CandidateSecurityControlObservation {
+        let (terminal, response) = self.negative_check(SecurityEndpoint::AdminControl);
+        Ok(SecurityControlObservation {
             effect: EffectObservation {
                 token: command.context.token.clone(),
                 binding_id: command.context.binding_id.clone(),
@@ -244,12 +242,12 @@ impl QualificationState {
     pub(super) fn security_request(
         &mut self,
         context: &mllm_domain::completion::StepExecutionContext,
-        endpoint: CandidateSecurityEndpoint,
+        endpoint: SecurityEndpoint,
         body: &serde_json::Value,
-    ) -> Result<(CandidateTerminal, CandidateResponseObservation), RuntimeError> {
+    ) -> Result<(ObservationTerminal, ResponseObservation), RuntimeError> {
         self.members(context)?;
         let expected = serde_json::json!({"model":format!("candidate-{}",context.token.deployment_id),"messages":[{"role":"user","content":"Repeat exactly: MLLM_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
-        if endpoint == CandidateSecurityEndpoint::AdminControl || body != &expected {
+        if endpoint == SecurityEndpoint::AdminControl || body != &expected {
             return Err(RuntimeError::Unsupported);
         }
         Ok(self.negative_check(endpoint))
@@ -279,11 +277,11 @@ impl QualificationState {
     pub(super) fn parked_status(
         &self,
         c: &mllm_domain::completion::StepExecutionContext,
-    ) -> Result<mllm_domain::qualification::CandidateParkedStatusObservation, RuntimeError> {
+    ) -> Result<mllm_domain::completion::ParkedStatusObservation, RuntimeError> {
         let before = self.activity();
         let identities = self.members(c)?;
         Ok(
-            mllm_domain::qualification::CandidateParkedStatusObservation {
+            mllm_domain::completion::ParkedStatusObservation {
                 token: c.token.clone(),
                 binding_id: c.binding_id.clone(),
                 incarnation: c.incarnation.clone(),

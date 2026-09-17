@@ -282,7 +282,7 @@ impl Fixture {
         self.server.requests.lock().unwrap().clone()
     }
 }
-fn uncertain(result: Result<mllm_domain::qualification::EffectObservation, RuntimeError>) {
+fn uncertain(result: Result<mllm_domain::completion::EffectObservation, RuntimeError>) {
     assert!(
         matches!(result, Err(RuntimeError::Uncertain(_))),
         "{result:?}"

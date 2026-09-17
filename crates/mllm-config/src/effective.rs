@@ -1,6 +1,5 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
-pub mod candidate;
 pub mod sglang;
 mod core;
 mod current_policy;

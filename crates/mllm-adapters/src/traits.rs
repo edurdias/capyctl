@@ -167,7 +167,7 @@ pub trait EngineAdapter: Send + Sync {
     async fn execute_persisted(
         &self,
         _command: &RuntimeCommand,
-    ) -> Result<mllm_domain::qualification::EffectObservation, RuntimeError> {
+    ) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
         Err(RuntimeError::Unsupported)
     }
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError>;

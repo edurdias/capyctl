@@ -1,7 +1,7 @@
 //! Ordinary lifecycle coverage: qualified start receipts, initialize, unarmed
 //! stop, deadline expiry and ordinary cleanup, all against managed deployments
 //! created by the ordinary writers. These tests were ported out of the deleted
-//! qualification support directory; no candidate run takes part in any of them.
+//! qualification support directory; ADR 0011 removed that concept entirely.
 use mllm_adapters::{fake::FakeEngine, traits::EngineAdapter};
 use mllm_controller::{RuntimeAction, RuntimeCommand};
 use mllm_controller::coordinator::{CoordinatorOptions, OwnedCoordinator, ServiceObservation};
@@ -1870,8 +1870,8 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
             2200,
         )
         .unwrap();
-    // Ordinary Starts retain their existing resource-sharing policy gate;
-    // candidate-run policy removal does not revoke an already-qualified recipe.
+    // Ordinary Starts retain their existing resource-sharing policy gate; a host
+    // policy change does not revoke an already-frozen recipe.
     let snapshot = store
         .resource_policy(&effective.host.name)
         .unwrap()
@@ -2268,12 +2268,12 @@ async fn expired_unarmed_rejects_contradictions_and_stale_ownership_without_rele
         let copy = tempfile::tempdir().unwrap();
         let path = copy.path().join("corrupt.sqlite3");
         sql.execute("VACUUM INTO ?1",[path.to_str().unwrap()]).unwrap();
-        let candidate = Store::open(&path).unwrap();
+        let reopened = Store::open(&path).unwrap();
         let corrupt = rusqlite::Connection::open(&path).unwrap();
         corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
         corrupt.execute_batch(corruption).unwrap_or_else(|e|panic!("{corruption}: {e}"));
         let before = counts(&corrupt);
-        assert!(candidate.expire_unarmed_qualified_initialize(&session,receipt.step_id(),1901).is_err(),"{corruption}");
+        assert!(reopened.expire_unarmed_qualified_initialize(&session,receipt.step_id(),1901).is_err(),"{corruption}");
         assert_eq!(counts(&corrupt),before,"{corruption}");
         assert_eq!(corrupt.query_row("SELECT state FROM runtime_bindings WHERE id=?1",[receipt.binding_id()],|r|r.get::<_,String>(0)).unwrap(),"reserved");
     }
@@ -2461,11 +2461,11 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
         let copy = tempfile::tempdir().unwrap();
         let path = copy.path().join("terminal.sqlite3");
         sql.execute("VACUUM INTO ?1",[path.to_str().unwrap()]).unwrap();
-        let candidate = Store::open(&path).unwrap();
+        let reopened = Store::open(&path).unwrap();
         let corrupt = rusqlite::Connection::open(path).unwrap();
         corrupt.execute(corruption,[receipt.operation_id()]).unwrap();
         let before = counts(&corrupt);
-        assert!(candidate.expire_unarmed_qualified_initialize(&session,receipt.step_id(),1902).is_err(),"{corruption}");
+        assert!(reopened.expire_unarmed_qualified_initialize(&session,receipt.step_id(),1902).is_err(),"{corruption}");
         assert_eq!(counts(&corrupt),before);
     }
 }
@@ -2488,9 +2488,9 @@ async fn unarmed_stop_rejects_nontext_history_as_internal_corruption() {
         "UPDATE operations SET kind=printf('%1048577s','x') WHERE id=?1",
     ] {
         let copy=tempfile::tempdir().unwrap();let path=copy.path().join("corrupt.sqlite3");sql.execute("VACUUM INTO ?1",[path.to_str().unwrap()]).unwrap();
-        let candidate=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();corrupt.execute(corruption,[&stop.operation_id]).unwrap();
+        let reopened=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();corrupt.execute(corruption,[&stop.operation_id]).unwrap();
         let before=state(&corrupt);
-        assert!(matches!(candidate.accept_ordinary_stop_command(&session,"owner",id,1,"stop",1900,10000),Err(LifecycleError::CorruptStoredData)),"{corruption}");
+        assert!(matches!(reopened.accept_ordinary_stop_command(&session,"owner",id,1,"stop",1900,10000),Err(LifecycleError::CorruptStoredData)),"{corruption}");
         assert_eq!(state(&corrupt),before);
     }
 }
@@ -2610,11 +2610,11 @@ async fn unarmed_stop_terminal_history_rejects_contradictions() {
         "INSERT INTO lifecycle_steps SELECT 'extra-step',operation_id,1,deployment_id,binding_id,session_id,'planned',step_json,NULL FROM lifecycle_steps WHERE operation_id='$STOP'",
     ] {
         let copy=tempfile::tempdir().unwrap();let path=copy.path().join("corrupt.sqlite3");sql.execute("VACUUM INTO ?1",[path.to_str().unwrap()]).unwrap();
-        let candidate=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let reopened=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
         corrupt.execute_batch(&corruption.replace("$SOURCE",start.operation_id()).replace("$STOP",&stop.operation_id)).unwrap();
         let before=state(&corrupt);
-        assert!(candidate.complete_unarmed_stop(&session,&stop.step_id).is_err(),"{corruption}");
-        assert!(matches!(candidate.accept_ordinary_stop_command(&session,"owner",id,1,"stop",90000,10000),Err(LifecycleError::CorruptStoredData)),"{corruption}");
+        assert!(reopened.complete_unarmed_stop(&session,&stop.step_id).is_err(),"{corruption}");
+        assert!(matches!(reopened.accept_ordinary_stop_command(&session,"owner",id,1,"stop",90000,10000),Err(LifecycleError::CorruptStoredData)),"{corruption}");
         assert_eq!(state(&corrupt),before,"{corruption}");
     }
 }
@@ -2702,11 +2702,11 @@ async fn unarmed_stop_contradictions_fail_closed_at_acceptance_and_completion() 
         ] {
             let copy=tempfile::tempdir().unwrap();let path=copy.path().join("corrupt.sqlite3");
             sql.execute("VACUUM INTO ?1",[path.to_str().unwrap()]).unwrap();
-            let candidate=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();
+            let reopened=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();
             corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
             corrupt.execute_batch(&corruption.replace("$SOURCE",start.operation_id())).unwrap();
             let before=state(&corrupt);
-            let denied=if let Some(stop)=&stop {candidate.complete_unarmed_stop(&session,&stop.step_id).is_err()}else {candidate.accept_ordinary_stop_command(&session,"owner",id,1,"stop",1900,10000).is_err()};
+            let denied=if let Some(stop)=&stop {reopened.complete_unarmed_stop(&session,&stop.step_id).is_err()}else {reopened.accept_ordinary_stop_command(&session,"owner",id,1,"stop",1900,10000).is_err()};
             assert!(denied,"accepted={accepted}: {corruption}");
             assert_eq!(state(&corrupt),before,"accepted={accepted}: {corruption}");
         }
@@ -2727,9 +2727,9 @@ async fn unarmed_stop_contradictions_fail_closed_at_acceptance_and_completion() 
         "INSERT INTO lifecycle_steps SELECT 'extra-stop',operation_id,1,deployment_id,binding_id,session_id,'planned',step_json,NULL FROM lifecycle_steps WHERE operation_id=?1",
     ] {
         let copy=tempfile::tempdir().unwrap();let path=copy.path().join("corrupt.sqlite3");sql.execute("VACUUM INTO ?1",[path.to_str().unwrap()]).unwrap();
-        let candidate=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();corrupt.execute(corruption,[&stop.operation_id]).unwrap();
+        let reopened=Store::open(&path).unwrap();let corrupt=rusqlite::Connection::open(path).unwrap();corrupt.execute_batch("PRAGMA foreign_keys=OFF").unwrap();corrupt.execute(corruption,[&stop.operation_id]).unwrap();
         let before=state(&corrupt);
-        assert!(candidate.complete_unarmed_stop(&session,&stop.step_id).is_err(),"{corruption}");
+        assert!(reopened.complete_unarmed_stop(&session,&stop.step_id).is_err(),"{corruption}");
         assert_eq!(state(&corrupt),before);
     }
     let current = store.begin_coordinator_session().unwrap();

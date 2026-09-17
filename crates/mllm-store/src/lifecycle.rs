@@ -174,7 +174,7 @@ pub enum ArmResult {
     AlreadyRecorded,
 }
 
-pub(crate) fn insert_candidate_initialize_run(
+pub(crate) fn insert_initialize_run(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,
     target: &DeploymentFence,
@@ -196,23 +196,6 @@ pub(crate) fn insert_candidate_initialize_run(
     Ok(())
 }
 
-pub(crate) fn insert_candidate_cleanup_run(
-    tx: &Transaction<'_>,
-    session: &CoordinatorSession,
-    target: &DeploymentFence,
-    operation: &str,
-    deadline: i64,
-) -> Result<(), LifecycleError> {
-    insert_owned_cleanup_run(
-        tx,
-        session,
-        target,
-        operation,
-        deadline,
-        "candidate_cleanup",
-    )
-}
-
 pub(crate) fn insert_owned_cleanup_run(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,
@@ -221,7 +204,7 @@ pub(crate) fn insert_owned_cleanup_run(
     deadline: i64,
     kind: &str,
 ) -> Result<(), LifecycleError> {
-    if !matches!(kind, "candidate_cleanup" | "ordinary_cleanup" | "ordinary_unarmed_stop") {
+    if !matches!(kind, "ordinary_cleanup" | "ordinary_unarmed_stop") {
         return Err(LifecycleError::Invalid);
     }
     fenced(tx, session, target)?;
@@ -273,11 +256,6 @@ pub(crate) fn validate_cleanup_run(
     if let Some(id) = predecessor {
         let h = &plan.handoffs[0];
         let previous = run_record(tx, id)?;
-        let v3: bool = tx.query_row(
-            "SELECT kind='candidate_action_v3' FROM operations WHERE id=?1",
-            [id],
-            |r| r.get(0),
-        )?;
         if h.predecessor_operation_id != id
             || h.claims.len() != 1
             || h.claims[0].deployment_id != target.deployment_id
@@ -287,8 +265,7 @@ pub(crate) fn validate_cleanup_run(
             || previous.target.deployment_id != target.deployment_id
             || previous.target.revision != target.revision
             || h.claims[0].current_generation != target.generation
-            || (!v3 && h.steps.len() != 1)
-            || (v3 && !(3..=5).contains(&h.steps.len()))
+            || h.steps.len() != 1
         {
             return Err(LifecycleError::CorruptStoredData);
         }
@@ -300,8 +277,7 @@ pub(crate) fn validate_cleanup_run(
             if step != &history.id
                 || dep != &target.deployment_id
                 || dep != &history.deployment_id
-                || !(matches!(history.state.as_str(), "planned" | "armed" | "uncertain")
-                    || (v3 && history.state == "completed"))
+                || !matches!(history.state.as_str(), "planned" | "armed" | "uncertain")
             {
                 return Err(LifecycleError::CorruptStoredData);
             }
@@ -310,50 +286,8 @@ pub(crate) fn validate_cleanup_run(
     Ok(run.state)
 }
 
-/// Original ordered step states from the actual first cleanup handoff. The V3
-/// reader uses them only to validate historical envelopes, never to restore SQL
-/// state or infer that a cancelled effect succeeded.
-pub(crate) fn candidate_handoff_states(
-    tx: &Transaction<'_>,
-    run: &str,
-    predecessor: &str,
-) -> Result<Option<Vec<(String, String)>>, LifecycleError> {
-    let operation:Option<String>=tx.query_row("SELECT operation_id FROM candidate_cleanup_actions WHERE run_id=?1 AND predecessor_cleanup_operation_id IS NULL",[run],|r|r.get(0)).optional()?;
-    let Some(operation) = operation else {
-        return Ok(None);
-    };
-    let r = run_record(tx, &operation)?;
-    let p: StoredPlan = completion::decode(&r.plan_json)?;
-    if p.handoffs.len() != 1 || p.handoffs[0].predecessor_operation_id != predecessor {
-        return Ok(None);
-    }
-    let deadline = tx.query_row(
-        "SELECT deadline_ms FROM lifecycle_runs WHERE operation_id=?1",
-        [&operation],
-        |r| r.get(0),
-    )?;
-    validate_cleanup_run(
-        tx,
-        &r.target,
-        &operation,
-        &r.session_id,
-        deadline,
-        Some(predecessor),
-    )?;
-    Ok(Some(
-        p.handoffs
-            .into_iter()
-            .next()
-            .unwrap()
-            .steps
-            .into_iter()
-            .map(|s| (s.id, s.state))
-            .collect(),
-    ))
-}
-
-/// Only the immutable single-member candidate plan; caller fences current session separately.
-pub(crate) fn validate_candidate_initialize_run(
+/// Only the immutable single-member plan; caller fences current session separately.
+pub(crate) fn validate_initialize_run(
     tx: &Transaction<'_>,
     target: &DeploymentFence,
     operation_id: &str,
@@ -466,25 +400,20 @@ pub(crate) struct BindingDto {
 
 pub(crate) enum DecodedBinding {
     V1,
-    Candidate(crate::candidate_creation::CandidateBindingV2),
 }
 
+/// ADR 0011: the only binding an mllm store writes is version 1. Anything else is
+/// not a binding this store produced.
 pub(crate) fn decode_binding(json: &str) -> Result<DecodedBinding, LifecycleError> {
     if json.len() > MAX_DTO_BYTES {
         return Err(LifecycleError::Invalid);
     }
-    // Untagged decoding tries strict DTOs independently, preserving duplicate rejection.
-    if let Ok(binding) = serde_json::from_str::<BindingDto>(json) {
-        if binding.version == 1 {
-            return Ok(DecodedBinding::V1);
-        }
-    }
-    let candidate: crate::candidate_creation::CandidateBindingV2 =
+    let binding: BindingDto =
         serde_json::from_str(json).map_err(|_| LifecycleError::Invalid)?;
-    if candidate.version != 2 {
+    if binding.version != 1 {
         return Err(LifecycleError::Invalid);
     }
-    Ok(DecodedBinding::Candidate(candidate))
+    Ok(DecodedBinding::V1)
 }
 
 pub(crate) struct PreparedBinding {
@@ -539,62 +468,6 @@ impl PreparedBinding {
         })
     }
 
-    pub(crate) fn prepare_candidate(
-        tx: &Transaction<'_>,
-        descriptor: &crate::candidate_creation::DescriptorV1,
-        run_id: &str,
-        id: &str,
-        incarnation: &str,
-        range: &mllm_config::effective::PortRange,
-    ) -> Result<Self, crate::candidate_creation::CandidateCreationError> {
-        use crate::candidate_creation::{CandidateBindingV2, CandidateCreationError};
-        for port in range.start..=range.end {
-            let leased: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM endpoint_leases WHERE host='127.0.0.1' AND port=?1)",
-                [port],
-                |r| r.get(0),
-            )?;
-            if leased {
-                continue;
-            }
-            let listener = match TcpListener::bind(("127.0.0.1", port)) {
-                Ok(listener) => listener,
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
-                Err(_) => return Err(CandidateCreationError::EndpointUnavailable),
-            };
-            let json = serde_json::to_string(&CandidateBindingV2 {
-                version: 2,
-                qualification_id: format!("candidate:{run_id}"),
-                endpoint: format!("127.0.0.1:{port}"),
-                descriptor: descriptor.reference(),
-                auth: descriptor.credential_refs.clone(),
-            })
-            .map_err(|_| CandidateCreationError::InvalidCommand)?;
-            if json.len() > MAX_DTO_BYTES {
-                return Err(CandidateCreationError::InvalidCommand);
-            }
-            return Ok(Self {
-                _listener: listener,
-                id: id.into(),
-                fence: DeploymentFence {
-                    deployment_id: descriptor.deployment_id.clone(),
-                    revision: descriptor.revision,
-                    generation: descriptor.generation,
-                },
-                incarnation: incarnation.into(),
-                ownership: "managed".into(),
-                host: "127.0.0.1".into(),
-                port,
-                json,
-            });
-        }
-        Err(CandidateCreationError::EndpointUnavailable)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn port(&self) -> u16 {
-        self.port
-    }
 }
 
 pub(crate) fn insert_prepared_binding(

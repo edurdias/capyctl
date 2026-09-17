@@ -313,6 +313,24 @@ CREATE TABLE deployment_attempts(
 );
 "#;
 
+/// ADR 0011: qualification is not an mllm concept. The tables that held candidate
+/// runs, their catalog, evidence, probes, budgets and parked-status records are
+/// dropped in foreign-key order. Nothing wrote them outside tests; a v12 store from
+/// this branch has no rows in them. State directories older than 2026-09-16 must
+/// already be deleted for the resource-policy shape, so no data path is preserved.
+pub const SCHEMA_V13: &str = r#"
+DROP TABLE qualification_evidence_refs;
+DROP TABLE qualification_ready_probes;
+DROP TABLE qualification_request_results;
+DROP TABLE qualification_request_attempts;
+DROP TABLE qualification_case_actions;
+DROP TABLE qualification_parked_status;
+DROP TABLE candidate_cleanup_actions;
+DROP TABLE qualifications;
+DROP TABLE qualification_runs;
+DROP TABLE host_qualification_policies;
+"#;
+
 pub const SCHEMA_V9: &str = r#"
 CREATE TABLE owned_launch_associations(
   step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),

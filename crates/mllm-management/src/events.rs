@@ -378,36 +378,11 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     }
     let fields: &[&str] = match event.kind.as_str() {
         "coordinator_session_started" => &["session_epoch"],
-        "candidate_abort_accepted" => &[
-            "operation_id",
-            "deployment_id",
-            "run_id",
-            "session_epoch",
-        ],
         "managed_configuration_accepted" => &[
             "operation_id",
             "deployment_id",
             "revision",
             "generation",
-            "session_epoch",
-        ],
-        "candidate_initialize_armed" | "candidate_initialize_accepted" => &[
-            "operation_id",
-            "deployment_id",
-            "run_id",
-            "step_id",
-            "revision",
-            "generation",
-            "session_epoch",
-        ],
-        "candidate_run_accepted" => &[
-            "operation_id",
-            "deployment_id",
-            "run_id",
-            "revision",
-            "generation",
-            "resource_policy_revision",
-            "qualification_policy_revision",
             "session_epoch",
         ],
         "host_resource_policy_bootstrapped" => &["revision", "ledger_epoch", "session_epoch"],
@@ -418,20 +393,7 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             "ledger_epoch",
             "session_epoch",
         ],
-        "host_qualification_policy_changed" => &[
-            "change_kind",
-            "previous_revision",
-            "current_revision",
-            "session_epoch",
-        ],
-        "candidate_qualification_finished"
-        | "candidate_owned_launch_associated"
-        | "candidate_ready_completed"
-        | "candidate_park_completed"
-        | "candidate_cleanup_accepted"
-        | "candidate_cleanup_armed"
-        | "candidate_cleanup_completed"
-        | "qualified_initialize_accepted"
+        "qualified_initialize_accepted"
         | "qualified_initialize_armed"
         | "qualified_owned_launch_associated"
         | "qualified_ready_committed"
@@ -486,31 +448,14 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             }
             value.clone()
         } else if field == "transition" {
-            if value.as_str()
-                != qualified_transition.or_else(|| event.kind.strip_prefix("candidate_"))
-            {
+            if value.as_str() != qualified_transition {
                 return Err(Failure::Internal);
             }
             value.clone()
-        } else if field == "change_kind" {
-            if !matches!(
-                value.as_str(),
-                Some("imported" | "updated" | "removed" | "readded")
-            ) {
-                return Err(Failure::Internal);
-            }
-            value.clone()
-        } else if value.is_null()
-            && (field == "committed_epoch"
-                || (field == "previous_revision"
-                    && event.kind == "host_qualification_policy_changed"))
-        {
+        } else if value.is_null() && field == "committed_epoch" {
             Value::Null
         } else {
             let number = value.as_u64().ok_or(Failure::Internal)?;
-            if event.kind == "candidate_abort_accepted" && field == "session_epoch" && number == 0 {
-                return Err(Failure::Internal);
-            }
             if !matches!(field, "committed_epoch" | "ledger_epoch") && number > i64::MAX as u64 {
                 return Err(Failure::Internal);
             }

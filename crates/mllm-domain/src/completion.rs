@@ -216,3 +216,69 @@ pub fn verify_completion(
         valid_until_ms: expiry,
     })
 }
+
+/// Observation data shared with trusted collectors. These values confer no authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectObservation {
+    pub token: TransitionToken,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<ProcessIdentity>,
+    pub observed_at_ms: i64,
+    pub receipt: String,
+    pub facts: Vec<Milestone>,
+}
+
+/// Local parked-state observation; no engine command or inference request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedStatusObservation {
+    pub token: TransitionToken,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<ProcessIdentity>,
+    pub observed_at_ms: i64,
+    pub receipt: String,
+    pub allocations: bool,
+    pub weights: bool,
+    pub cache: bool,
+    pub quiesced: bool,
+    pub unknown_work: bool,
+    pub activity_before: (u64, u64, u64),
+    pub activity_after: (u64, u64, u64),
+}
+
+/// How an observed control attempt ended. It records what the observer saw and
+/// never authorises a state change on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservationTerminal {
+    Completed,
+    RejectedWithoutWork,
+    FailedTerminal,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponseObservation {
+    SecurityRejection {
+        endpoint: SecurityEndpoint,
+        status: u16,
+        no_work: bool,
+        separate_credentials: bool,
+    },
+    NoResponse,
+}
+
+/// Which engine surface an observation was taken against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecurityEndpoint {
+    AdminControl,
+    Inference,
+    HealthGeneration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityControlObservation {
+    pub effect: EffectObservation,
+    pub terminal: ObservationTerminal,
+    pub response: ResponseObservation,
+}

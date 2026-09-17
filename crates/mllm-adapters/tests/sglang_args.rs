@@ -1,6 +1,5 @@
 use mllm_adapters::RuntimeError;
 use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
-use mllm_config::effective::candidate::validate_candidate_reviewed_snapshot;
 use mllm_domain::launch::{
     NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
 };
@@ -431,60 +430,3 @@ fn launcher_descriptors_must_be_distinct_nonstandard_and_exact_native_integers()
     assert_eq!(command.argv[6], "2147483647");
 }
 
-#[test]
-fn reserved_aliases_and_mutable_profile_arguments_are_rejected_before_freezing() {
-    let mut baseline: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/candidate-sglang.json"
-    ))
-    .unwrap();
-    baseline["effective_recipe"]["model"]["revision"] = REVISION.into();
-    baseline["effective_recipe"]["resolved_profile"]["build_fingerprint"] = SOURCE.into();
-    let validate = |value: &Value| {
-        validate_candidate_reviewed_snapshot(value).and_then(|snapshot| {
-            snapshot.native_launch_metadata(Some(INFERENCE_REF), Some(ADMIN_REF))
-        })
-    };
-    assert!(validate(&baseline).is_ok());
-    let flags = [
-        "--model-path",
-        "--model",
-        "--host",
-        "--port",
-        "--served-model-name",
-        "--tp",
-        "--tp-size",
-        "--tensor-parallel-size",
-        "--dp",
-        "--dp-size",
-        "--data-parallel-size",
-        "--tokenizer-worker-num",
-        "--dtype",
-        "--context-length",
-        "--max-running-requests",
-        "--max-total-tokens",
-        "--mem-fraction-static",
-        "--enable-memory-saver",
-        "--enable-memory-saver-cpu-backup",
-        "--api-key",
-        "--admin-api-key",
-        "--disable-cuda-graph",
-        "--enable-lora",
-        "--trust-remote-code",
-        "--arbitrary-engine-option",
-    ];
-    for flag in flags {
-        for alias in [
-            flag.to_string(),
-            format!("--{}", flag[2..].replace('-', "_")),
-            format!("{flag}=value"),
-            flag.to_uppercase(),
-        ] {
-            let mut candidate = baseline.clone();
-            candidate["effective_recipe"]["resolved_profile"]["args"] = json!([alias]);
-            assert!(
-                validate(&candidate).is_err(),
-                "mutable profile argument admitted"
-            );
-        }
-    }
-}

@@ -62,13 +62,6 @@ pub(crate) enum EventWriteError {
 #[serde(tag = "version")]
 pub(crate) enum EventMetadata {
     #[serde(rename = "1")]
-    CandidateAbortAccepted {
-        operation_id: EventOperationId,
-        deployment_id: EventOperationId,
-        run_id: EventOperationId,
-        session_epoch: i64,
-    },
-    #[serde(rename = "1")]
     UnarmedStopRecorded {
         transition: UnarmedStopTransition,
         operation_id: EventOperationId,
@@ -104,54 +97,7 @@ pub(crate) enum EventMetadata {
         session_epoch: i64,
     },
     #[serde(rename = "1")]
-    CandidateLifecycleRecorded {
-        transition: CandidateLifecycleTransition,
-        operation_id: EventOperationId,
-        deployment_id: EventOperationId,
-        step_id: EventOperationId,
-        session_epoch: i64,
-        committed_epoch: Option<u64>,
-    },
-    #[serde(rename = "1")]
-    CandidateInitializeArmed {
-        operation_id: EventOperationId,
-        deployment_id: EventOperationId,
-        run_id: EventOperationId,
-        step_id: EventOperationId,
-        revision: i64,
-        generation: i64,
-        session_epoch: i64,
-    },
-    #[serde(rename = "1")]
-    CandidateInitializeAccepted {
-        operation_id: EventOperationId,
-        deployment_id: EventOperationId,
-        run_id: EventOperationId,
-        step_id: EventOperationId,
-        revision: i64,
-        generation: i64,
-        session_epoch: i64,
-    },
-    #[serde(rename = "1")]
-    CandidateRunAccepted {
-        operation_id: EventOperationId,
-        deployment_id: EventOperationId,
-        run_id: EventOperationId,
-        revision: i64,
-        generation: i64,
-        resource_policy_revision: i64,
-        qualification_policy_revision: i64,
-        session_epoch: i64,
-    },
-    #[serde(rename = "1")]
     CoordinatorSessionStarted { session_epoch: i64 },
-    #[serde(rename = "1")]
-    HostQualificationPolicyChanged {
-        change_kind: HostQualificationPolicyChangeKind,
-        previous_revision: Option<i64>,
-        current_revision: i64,
-        session_epoch: i64,
-    },
     #[serde(rename = "1")]
     HostResourcePolicyBootstrapped {
         revision: i64,
@@ -198,30 +144,6 @@ pub(crate) enum UnarmedStopTransition {
 }
 #[derive(Clone)]
 pub(crate) struct EventOperationId(String);
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CandidateLifecycleTransition {
-    QualificationFinished,
-    OwnedLaunchAssociated,
-    ReadyCompleted,
-    ParkCompleted,
-    CleanupAccepted,
-    CleanupArmed,
-    CleanupCompleted,
-}
-impl CandidateLifecycleTransition {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::QualificationFinished => "candidate_qualification_finished",
-            Self::OwnedLaunchAssociated => "candidate_owned_launch_associated",
-            Self::ReadyCompleted => "candidate_ready_completed",
-            Self::ParkCompleted => "candidate_park_completed",
-            Self::CleanupAccepted => "candidate_cleanup_accepted",
-            Self::CleanupArmed => "candidate_cleanup_armed",
-            Self::CleanupCompleted => "candidate_cleanup_completed",
-        }
-    }
-}
 impl EventOperationId {
     pub(crate) fn generated(value: ulid::Ulid) -> Self {
         Self(value.to_string())
@@ -235,18 +157,9 @@ impl Serialize for EventOperationId {
         serializer.serialize_str(&self.0)
     }
 }
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum HostQualificationPolicyChangeKind {
-    Imported,
-    Updated,
-    Removed,
-    Readded,
-}
 impl EventMetadata {
     fn kind(&self) -> &'static str {
         match self {
-            Self::CandidateAbortAccepted { .. } => "candidate_abort_accepted",
             Self::UnarmedStopRecorded { transition, .. } => match transition {
                 UnarmedStopTransition::Accepted => "ordinary_unarmed_stop_accepted",
                 UnarmedStopTransition::Completed => "ordinary_unarmed_stop_completed",
@@ -265,12 +178,7 @@ impl EventMetadata {
                 QualifiedLifecycleTransition::ExpiredUnarmed => "qualified_initialize_expired_unarmed",
             },
             Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
-            Self::CandidateLifecycleRecorded { transition, .. } => transition.kind(),
-            Self::CandidateInitializeArmed { .. } => "candidate_initialize_armed",
-            Self::CandidateInitializeAccepted { .. } => "candidate_initialize_accepted",
-            Self::CandidateRunAccepted { .. } => "candidate_run_accepted",
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
-            Self::HostQualificationPolicyChanged { .. } => "host_qualification_policy_changed",
             Self::HostResourcePolicyBootstrapped { .. } => "host_resource_policy_bootstrapped",
             Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
         }
@@ -278,33 +186,11 @@ impl EventMetadata {
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
-            Self::CandidateAbortAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::UnarmedStopRecorded { operation_id, deployment_id, .. }
             | Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::QualifiedLifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::CandidateLifecycleRecorded {
-                operation_id,
-                deployment_id,
-                ..
-            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::CandidateInitializeArmed {
-                operation_id,
-                deployment_id,
-                ..
-            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::CandidateInitializeAccepted {
-                operation_id,
-                deployment_id,
-                ..
-            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::CandidateRunAccepted {
-                operation_id,
-                deployment_id,
-                ..
-            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CoordinatorSessionStarted { .. } => (None, None),
-            Self::HostQualificationPolicyChanged { .. } => (None, None),
             Self::HostResourcePolicyBootstrapped { .. } => (None, None),
             Self::HostResourcePolicyUpdated { operation_id, .. } => {
                 (None, Some(operation_id.as_str()))
@@ -490,54 +376,6 @@ mod tests {
             assert_eq!(result.is_ok(),valid);
             assert_eq!(tx.query_row("SELECT COUNT(*) FROM management_events",[],|r|r.get::<_,i64>(0)).unwrap(),i64::from(valid));
         }
-    }
-    #[test]
-    fn candidate_acceptance_payload_is_bounded_and_maps_generated_identities() {
-        use super::*;
-        let operation = ulid::Ulid::new();
-        let deployment = ulid::Ulid::new();
-        let run = ulid::Ulid::new();
-        let event = EventMetadata::CandidateRunAccepted {
-            operation_id: EventOperationId::generated(operation),
-            deployment_id: EventOperationId::generated(deployment),
-            run_id: EventOperationId::generated(run),
-            revision: i64::MAX,
-            generation: i64::MAX,
-            resource_policy_revision: i64::MAX,
-            qualification_policy_revision: i64::MAX,
-            session_epoch: i64::MAX,
-        };
-        let json = serialize_bounded(&event).unwrap();
-        assert!(json.len() < 512);
-        assert_eq!(
-            event.identifiers(),
-            (
-                Some(deployment.to_string().as_str()),
-                Some(operation.to_string().as_str())
-            )
-        );
-        let fields: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            fields
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            [
-                "deployment_id",
-                "generation",
-                "operation_id",
-                "qualification_policy_revision",
-                "resource_policy_revision",
-                "revision",
-                "run_id",
-                "session_epoch",
-                "version"
-            ]
-        );
-        assert_eq!(fields["run_id"], run.to_string());
-        assert_eq!(event.kind(), "candidate_run_accepted");
     }
     use super::*;
     use crate::Store;
