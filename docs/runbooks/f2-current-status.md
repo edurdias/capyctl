@@ -253,8 +253,10 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       recipe. The candidate and qualification subsystem is deleted, schema v13
       drops its tables, the park contract survives as pure domain rules, a
       failed deployment closes its own admission and is retried three times
-      with a doubling cooldown before it is given up on, and an uncertain
-      attempt still resolves through the gone-proof first. CPU and Fake tests
+      with a doubling cooldown before it is given up on, within the start
+      command's deadline, and an uncertain attempt still resolves through the
+      gone-proof first — an explicit Stop drives that cleanup and the Start
+      that follows is a new generation with a fresh budget. CPU and Fake tests
       are not verification of any native recipe.
 - [ ] Implement ordinary park. The ordinary lifecycle has no park at all; the
       candidate path that formerly had one is deleted. This is the premise of
@@ -394,13 +396,28 @@ host with several devices or across hosts.
    blocking sleep, so the worker keeps discovering other deployments while one
    waits out its cooldown.
 
-5. Admission closure is the only give-up signal after the attempt budget is
-   exhausted; nothing records why the deployment gave up. A caller who finds
-   the deployment closed cannot distinguish a budget exhaustion from any other
-   reason admission might close, and no failure category or last-error text is
-   retained alongside the closure.
+5. The give-up reason is recorded in the journal but not in the deployment's
+   own state. Every counted attempt and the give-up itself now write a
+   `journal_entries` row naming the deployment and the reason, in the same
+   owned transaction that counts the attempt or closes the admission, and the
+   observer reports a planned step of a closed deployment as `Closed` rather
+   than `Superseded`. What is still missing is a failure category or
+   last-error text on the deployment row itself, so a caller reading only
+   `deployments` still cannot tell a budget exhaustion from any other reason
+   admission might be closed.
 
-6. Fingerprint drift between an effective configuration snapshot and the
+6. Stored kind strings of the ordinary path were renamed in the same change
+   without a data migration; a v12 state directory that holds lifecycle
+   history is recreated, as the design keeps no compatibility. `operations.kind`
+   went from `qualified_initialize` to `initialize`, the owned-launch
+   association tag from `qualified_owned_launch` to `owned_launch`, the
+   management event kinds from `qualified_*` to `initialize_*`, and the plan's
+   own tag with them. Schema v13 drops tables and rewrites none of these, so a
+   pre-v13 directory carrying lifecycle rows fails to decode rather than
+   upgrading. **Delete such a directory**; the host policy is republished at
+   every boot.
+
+7. Fingerprint drift between an effective configuration snapshot and the
    current host is not checked at deployment start. The refusals that used to
    catch a stale or mismatched recipe came from the deleted qualification
    catalog and judged the recipe, not host capacity; nothing replaced that

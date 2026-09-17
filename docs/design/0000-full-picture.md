@@ -4,7 +4,7 @@
 **Authoritative source:** [`../SPEC.md`](../SPEC.md) revision 0.2. This document records
 decisions and structure around that spec; it never overrides it. Where summaries differ,
 `SPEC.md` wins.
-**Companion brief:** [`../AGENT_HANDOFF.md`](../AGENT_HANDOFF.md).
+**Companion brief:** [`../../AGENTS.md`](../../AGENTS.md).
 
 ## 1. Purpose and boundary
 

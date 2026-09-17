@@ -318,6 +318,10 @@ CREATE TABLE deployment_attempts(
 /// dropped in foreign-key order. Nothing wrote them outside tests; a v12 store from
 /// this branch has no rows in them. State directories older than 2026-09-16 must
 /// already be deleted for the resource-policy shape, so no data path is preserved.
+///
+/// Stored kind strings of the ordinary path were renamed in the same change without
+/// a data migration; a v12 state directory that holds lifecycle history is recreated,
+/// as the design keeps no compatibility.
 pub const SCHEMA_V13: &str = r#"
 DROP TABLE qualification_evidence_refs;
 DROP TABLE qualification_ready_probes;

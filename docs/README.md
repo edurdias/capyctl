@@ -29,7 +29,6 @@ Start with `AGENTS.md`, then `SPEC.md`.
 | `examples/deployment-single.yaml` | Single-host resource and lifecycle contract. |
 | `examples/deployment-multinode.yaml` | Two-host resource contract with a private host-cache tier. |
 | `examples/standalone.yaml` | Embedded local server/host shape with safe unresolved defaults. |
-| `DOCUMENT_CHECKS.txt` | Results of document and example consistency checks, not software or hardware tests. |
 
 Revision 0.2 supersedes `mllm-initial-design.md` revision 0.1 and incorporates the subsequent design decisions. The old file is not repeated in the bundle to avoid conflicting instructions.
 
