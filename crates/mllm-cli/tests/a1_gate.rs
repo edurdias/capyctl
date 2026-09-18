@@ -12,26 +12,26 @@
 //! when no live profile is configured. Passing it is not qualification of a native
 //! recipe and must never be reported as one (SPEC §18).
 
-use mllm_controller::LifecyclePort as _;
+mod support;
 
-/// A state directory the controller lock will accept. The lock refuses any
-/// group- or other-writable ancestor, which rules out `/tmp` and a checkout.
-fn safe_state_dir() -> tempfile::TempDir {
-    let home = std::env::var("HOME").expect("HOME is set");
-    tempfile::TempDir::new_in(home).expect("a state directory under an owner-only root")
-}
+use mllm_config::effective::ModelSource;
+use mllm_controller::LifecyclePort as _;
+use support::{boot, safe_state_dir, stub_engine};
 
 #[tokio::test]
 async fn standalone_deploys_starts_and_serves_one_inference() {
     let dir = safe_state_dir();
-    let app = mllm_cli::roles::start_standalone(dir.path())
-        .await
-        .expect("standalone boots");
+    let app = boot(dir.path()).await;
 
     // Deploy through the path the CLI uses: a managed configuration, which is what
     // gives the coordinator an effective revision to admit and start against.
     let id = app
-        .deploy("gate-m", "/models/gate-m")
+        .deploy(
+            "gate-m",
+            ModelSource::Local {
+                path: "/models/gate-m".into(),
+            },
+        )
         .expect("standalone creates its own deployment");
 
     let started = app
@@ -80,6 +80,13 @@ async fn standalone_deploys_starts_and_serves_one_inference() {
             .contains(&"gate-m".to_string()),
         "a ready deployment offers its route"
     );
+
+    // The engine at the address the launch recorded. The embedded Fake answers in
+    // process and listens on nothing, while dispatch now goes to the endpoint the
+    // coordinator recorded for this launch (SPEC §3), so the gate stands one up
+    // there — which is also what proves the router forwards to that address rather
+    // than to anything it held from boot.
+    let engine = stub_engine(&app.controller, &id).await;
 
     // Serve over the real listener, as a user reaches it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -130,8 +137,9 @@ async fn standalone_deploys_starts_and_serves_one_inference() {
         .send()
         .await
         .expect("the listener answers");
-    assert_eq!(chat.status(), 200, "one inference is served");
+    let status = chat.status();
     let completion: serde_json::Value = chat.json().await.unwrap();
+    assert_eq!(status, 200, "one inference is served: {completion}");
     assert!(
         completion["choices"][0]["message"]["content"]
             .as_str()
@@ -140,4 +148,5 @@ async fn standalone_deploys_starts_and_serves_one_inference() {
     );
 
     served.abort();
+    engine.abort();
 }

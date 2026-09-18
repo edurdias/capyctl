@@ -85,10 +85,9 @@ impl ProfileBindings {
                 "the frozen profile declares vLLM but carries another family's launch settings",
             ));
         };
-        let endpoint: reqwest::Url = work
-            .endpoint()
-            .parse()
-            .map_err(|_| Self::refuse(format!("endpoint is not a URL: {}", work.endpoint())))?;
+        let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
+            Self::refuse(format!("endpoint names no address: {}", work.endpoint()))
+        })?;
         let port = endpoint
             .port()
             .ok_or_else(|| Self::refuse("the leased endpoint names no port"))?;
@@ -154,9 +153,11 @@ impl EngineBindings for ProfileBindings {
         let profile = &effective.profile;
         match profile.engine {
             Engine::Vllm => {
-                let endpoint = work.endpoint().parse().map_err(|_| {
+                // The frozen binding records the authority the lease reserved, not a
+                // URL; the adapter talks HTTP to it over loopback (Spec §3).
+                let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
                     CoordinatorError::Service(format!(
-                        "frozen binding endpoint is not a URL: {}",
+                        "frozen binding endpoint names no address: {}",
                         work.endpoint()
                     ))
                 })?;

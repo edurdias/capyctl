@@ -6,21 +6,25 @@
 //! suspended activation would leave a deployment down until an operator noticed.
 //! The two commands differ only in that intent, so they are tested together.
 
+mod support;
+
+use mllm_config::effective::ModelSource;
 use mllm_controller::LifecyclePort as _;
 use mllm_domain::{LifecycleAction, LifecycleState};
-
-fn safe_state_dir() -> tempfile::TempDir {
-    let home = std::env::var("HOME").expect("HOME is set");
-    tempfile::TempDir::new_in(home).expect("a state directory under an owner-only root")
-}
+use support::{boot, safe_state_dir};
 
 /// Boot standalone and bring one deployment to Ready.
 async fn ready() -> (tempfile::TempDir, mllm_cli::roles::App, String) {
     let dir = safe_state_dir();
-    let app = mllm_cli::roles::start_standalone(dir.path())
-        .await
-        .expect("standalone boots");
-    let id = app.deploy("intent-m", "/models/intent-m").expect("deployed");
+    let app = boot(dir.path()).await;
+    let id = app
+        .deploy(
+            "intent-m",
+            ModelSource::Local {
+                path: "/models/intent-m".into(),
+            },
+        )
+        .expect("deployed");
     settle(&app, &id, LifecycleAction::Start, LifecycleState::Ready).await;
     (dir, app, id)
 }

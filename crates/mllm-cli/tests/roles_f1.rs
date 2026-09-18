@@ -1,35 +1,31 @@
-//! F1 roles wiring: `start_standalone` boots the embedded graph and serves
+//! F1 roles wiring: `start_standalone_with` boots the embedded graph and serves
 //! the router; the CLI deploy path submits + activates through the
 //! controller; status reads without activating.
 
+mod support;
 
-
-/// A state directory the controller lock will accept.
-///
-/// The lock walks every ancestor of the state path and refuses any that is group- or
-/// other-writable, because such an ancestor lets another account replace the
-/// directory the lock guards. `/tmp` is 1777 and a checkout is commonly 0775, so
-/// neither can hold controller state. The home directory is the usual root that
-/// satisfies the rule.
-fn safe_state_dir() -> tempfile::TempDir {
-    let home = std::env::var("HOME").expect("HOME is set");
-    tempfile::TempDir::new_in(home).expect("a state directory under an owner-only root")
-}
-
+use mllm_config::effective::ModelSource;
 use mllm_controller::LifecyclePort as _;
-use mllm_cli::roles;
+use support::{boot, safe_state_dir, stub_engine};
 
 #[tokio::test]
 async fn standalone_boots_and_serves_router() {
     let dir = safe_state_dir();
-    let app = roles::start_standalone(dir.path()).await.unwrap();
+    let app = boot(dir.path()).await;
     // The App carries a servable router (F1: the router listener is the
     // standalone role's inference surface, 127.0.0.1-only).
     let router = app.router();
     let _ = router; // servable; full serve loop covered by run_standalone
 
     // Deploy through the controller (the CLI deploy path) and activate.
-    let id = app.deploy("wired-m", "/models/wired-m").unwrap();
+    let id = app
+        .deploy(
+            "wired-m",
+            ModelSource::Local {
+                path: "/models/wired-m".into(),
+            },
+        )
+        .unwrap();
     let op = app
         .controller
         .request_transition(&id, mllm_domain::LifecycleAction::Start)
@@ -38,29 +34,40 @@ async fn standalone_boots_and_serves_router() {
     let state = app.controller.wait_terminal(&op).await.unwrap();
     assert_eq!(state, mllm_domain::LifecycleState::Ready);
 
-    // Chat dispatch through the wired router deps reaches the fake engine.
+    // Dispatch resolves the forwarder from what the launch recorded, so the engine
+    // has to be at that address for the wiring to be exercised at all.
+    let engine = stub_engine(&app.controller, &id).await;
     let resp = app
         .deps()
         .forwards
-        .get("model")
-        .unwrap()
+        .forwarder(&id)
+        .expect("a ready deployment has a forwarder")
         .forward_chat(&serde_json::json!({"model": "wired-m", "messages": []}))
         .await
         .unwrap();
     assert!(resp["choices"][0]["message"]["content"].is_string());
+    engine.abort();
 }
 
 #[tokio::test]
 async fn router_serves_models_and_chat_over_http() {
     let dir = safe_state_dir();
-    let app = roles::start_standalone(dir.path()).await.unwrap();
-    let id = app.deploy("http-m", "/models/http-m").unwrap();
+    let app = boot(dir.path()).await;
+    let id = app
+        .deploy(
+            "http-m",
+            ModelSource::Local {
+                path: "/models/http-m".into(),
+            },
+        )
+        .unwrap();
     let op = app
         .controller
         .request_transition(&id, mllm_domain::LifecycleAction::Start)
         .await
         .unwrap();
     app.controller.wait_terminal(&op).await.unwrap();
+    let engine = stub_engine(&app.controller, &id).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -89,4 +96,5 @@ async fn router_serves_models_and_chat_over_http() {
     assert_eq!(chat.status(), 200);
     let body: serde_json::Value = chat.json().await.unwrap();
     assert!(body["choices"][0]["message"]["content"].is_string());
+    engine.abort();
 }

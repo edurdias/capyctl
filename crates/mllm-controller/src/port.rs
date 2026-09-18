@@ -201,3 +201,47 @@ impl LifecyclePort for Controller {
         Controller::request_transition(self, deployment, action).await.map_err(Into::into)
     }
 }
+
+/// The URL of a runtime that recorded its endpoint.
+///
+/// Spec §3: a binding records the authority it leased — `127.0.0.1:8100` — because
+/// what it leases is a port, not a scheme. Everything that speaks to the engine
+/// needs a URL, and every engine this project launches is reached over loopback
+/// HTTP, so the scheme is supplied in one place rather than guessed by each caller.
+/// An endpoint that already names a scheme is taken as written, so an attached
+/// runtime someone else recorded is not rewritten.
+pub fn engine_url(recorded: &str) -> Option<reqwest::Url> {
+    if recorded.contains("://") {
+        return recorded.parse().ok();
+    }
+    format!("http://{recorded}").parse().ok()
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::engine_url;
+
+    /// The form the store actually records. Parsing it as a URL fails, which is
+    /// what made a launched engine unreachable.
+    #[test]
+    fn a_leased_socket_address_becomes_a_loopback_url() {
+        let url = engine_url("127.0.0.1:8100").expect("a leased authority is addressable");
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.port(), Some(8100));
+    }
+
+    /// An endpoint that already names a scheme is not rewritten.
+    #[test]
+    fn a_recorded_url_is_taken_as_written() {
+        let url = engine_url("http://127.0.0.1:9100").expect("a URL is a URL");
+        assert_eq!(url.port(), Some(9100));
+    }
+
+    /// Nothing addressable is nothing to send to, and inventing a default would
+    /// point a request at whatever happens to be listening.
+    #[test]
+    fn an_endpoint_that_names_no_host_is_refused() {
+        assert!(engine_url("").is_none());
+    }
+}

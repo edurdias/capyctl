@@ -1,33 +1,76 @@
-//! Role wiring for the F0 exit gate: `start standalone` boots the
-//! embedded server+host graph in-process (no enrollment, no listeners —
-//! F3 wires real transports) and returns an [`App`] handle over the
-//! controller and the durable store. Every other parsed action still
-//! reports a structured not-yet-implemented diagnostic.
+//! Role wiring for standalone: `start standalone` boots the embedded
+//! server+host graph in-process against the engine installation this host
+//! actually has, and returns an [`App`] handle over the controller and the
+//! durable store. Every other parsed action still reports a structured
+//! not-yet-implemented diagnostic.
+//!
+//! The installation arrives through an [`EngineProvider`] rather than being
+//! assembled here. Standalone used to build a vLLM adapter and an exec launcher
+//! from environment variables and then discard both, because the coordinator
+//! resolves an adapter per binding from the frozen profile; what the environment
+//! is actually for is saying which engine this host has, and that is all the
+//! provider reports.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use mllm_agent::Host;
 use mllm_config::defaults::{resolve_startup, LoadOutcome};
+use mllm_config::effective::ModelSource;
+use mllm_config::engine_policy::Engine;
 use mllm_config::schema::ConfigKind;
-use mllm_controller::coordinator::{CoordinatorOptions, OwnedCoordinator, ServiceObservation as _};
+use mllm_controller::coordinator::{
+    CoordinatorOptions, EngineBindings, OwnedCoordinator, ServiceClock, ServiceObservation as _,
+    ToolsFactory,
+};
 use mllm_controller::{CoordinatorLifecycle, OwnedCoordinatorState, ProfileBindings};
-use crate::host_observation::{system_clock, HostMemoryObservation};
+use mllm_launchers::DurableProcessLaunch;
+use mllm_store::secrets::SecretsKey;
 use mllm_store::Store;
 
-use crate::grammar::Command;
+use crate::host_observation::{system_clock, HostMemoryObservation};
+
+use crate::grammar::Command as CliCommand;
 use crate::output::{ExitCode, StructuredError};
 
+/// The provider seam lives in the controller, so a test double can implement it
+/// without depending on this binary. It is re-exported here because this is where
+/// standalone is wired.
+pub use mllm_controller::engine_provider::{EngineInstallation, EngineProvider, ProviderError};
+
 pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
+
+/// The engine's executable. Required: a host with no engine cannot serve.
+const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
+/// The directory model weights live under (Spec §7). Required for the same reason:
+/// a guessed store resolves relative paths somewhere the operator never named.
+const MODELS_ROOT: &str = "MLLM_MODELS_ROOT";
+const KV_CACHE_BYTES: &str = "MLLM_KV_CACHE_BYTES";
+const ENGINE_ARGS: &str = "MLLM_ENGINE_ARGS";
+const ENGINE_FINGERPRINT: &str = "MLLM_ENGINE_FINGERPRINT";
+const DEEP_PARK: &str = "MLLM_DEEP_PARK";
+const TRUST_REMOTE_CODE: &str = "MLLM_TRUST_REMOTE_CODE";
+const RUNTIME_DIR: &str = "MLLM_RUNTIME_DIR";
+
+/// A conservative KV grant for a unified-memory host: the ledger's deployment
+/// budget bounds the engine's pool, and a smaller grant keeps two engines from
+/// overcommitting the domain during a stop-start overlap.
+const DEFAULT_KV_CACHE: &str = "16GiB";
+/// vLLM's startup check requires the model's context to fit the KV pool, and a
+/// modern checkpoint's default context would demand far more than the grant.
+const DEFAULT_ENGINE_ARGS: &str = "--max-model-len 4096";
+/// How long `<engine> --version` is given before the probe is a refusal. A version
+/// print that takes longer than this is not a healthy installation.
+const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A booted standalone deployment graph: the controller operation engine
 /// plus the durable store it runs against. Tests and the CLI drive
 /// lifecycle through `controller`; the store is a separate connection to
 /// the same WAL-backed file for direct observation. It is an `Rc`
-/// (not `Arc`) because `Store` is not `Sync` and F0 observes it from one
+/// (not `Arc`) because `Store` is not `Sync` and standalone observes it from one
 /// thread; concurrent sharing comes with the F3 task architecture.
 pub struct App {
     /// The lifecycle authority. One coordinator owns the durable state behind the
@@ -40,11 +83,15 @@ pub struct App {
     /// A separate read-only connection for direct observation in tests. It never
     /// writes: the coordinator is the only writer.
     pub store: Rc<Store>,
-    /// The engine installation this host published, and the capacity its limits were
-    /// derived from. Deployments are qualified against this, so it is kept rather
-    /// than recomposed per request — recomposing risks declaring one thing at boot
-    /// and a different thing at deploy.
-    engine_declaration: (String, String, bool, i64),
+    /// The engine installation this host published. Deployments are qualified
+    /// against it, so it is kept rather than recomposed per request — recomposing
+    /// risks declaring one thing at boot and a different thing at deploy.
+    installation: EngineInstallation,
+    /// The environment fingerprint published with the installation, kept for the
+    /// same reason.
+    environment_fingerprint: String,
+    /// Observed host capacity the published limits were derived from.
+    capacity_bytes: i64,
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     deps: mllm_router::RouterDeps,
@@ -70,17 +117,18 @@ impl App {
     /// it will be qualified against, because the coordinator starts only what it can
     /// qualify. Creating a bare record first — which is what the previous path did —
     /// produces a deployment that can be named and never run.
-    pub fn deploy(&self, name: &str, model_path: &str) -> Result<String, StartError> {
-        let (engine, executable, experimental, capacity) = &self.engine_declaration;
+    pub fn deploy(&self, name: &str, source: ModelSource) -> Result<String, StartError> {
         let host = crate::standalone_config::host_policy(
-            engine,
-            executable,
-            "standalone-1",
-            *experimental,
-            *capacity,
+            &self.installation,
+            &self.environment_fingerprint,
+            self.capacity_bytes,
         );
-        let deployment =
-            crate::standalone_config::deployment_document(name, name, model_path, *capacity);
+        let deployment = crate::standalone_config::deployment_document(
+            name,
+            name,
+            &source,
+            self.capacity_bytes,
+        );
         let receipt = self
             .controller
             .create_configuration(
@@ -104,6 +152,11 @@ pub enum StartError {
     Io(#[from] std::io::Error),
     #[error("credentials missing: refusing to serve without a generated api key")]
     MissingCredentials,
+    /// Spec §8: no engine installation, no boot. The message names what was
+    /// expected, because a host that cannot start an engine should say why rather
+    /// than come up serving nothing.
+    #[error("no engine installation: {0}")]
+    NoEngineInstallation(String),
     #[error("controller ownership: {0}")]
     Ownership(#[from] mllm_controller::OwnedStateError),
     #[error("coordinator: {0}")]
@@ -112,10 +165,19 @@ pub enum StartError {
     Deploy(String),
 }
 
+impl From<ProviderError> for StartError {
+    fn from(error: ProviderError) -> Self {
+        match error {
+            ProviderError::NoEngineInstallation(what) => StartError::NoEngineInstallation(what),
+        }
+    }
+}
+
 impl From<StartError> for StructuredError {
     fn from(err: StartError) -> Self {
         let code = match err {
             StartError::Config(_) => "invalid_config",
+            StartError::NoEngineInstallation(_) => "invalid_config",
             _ => "internal",
         };
         StructuredError {
@@ -125,39 +187,288 @@ impl From<StartError> for StructuredError {
     }
 }
 
-/// Boot the embedded standalone graph (SPEC §15.2 no-config matrix):
-/// resolve the startup config (generating the standalone default on
-/// first start), open the server store, and run the embedded host
-/// (fake engine + fake launcher, deep-park policy denied by default)
-/// against a controller bound to the same state directory.
-pub async fn start_standalone(state_dir: &Path) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, mllm_adapters::fake::ParkPolicy::Disabled).await
+/// The engine installation this host declares through its environment.
+///
+/// Spec §7: everything the published host table needs is stated here, so what a
+/// deployment is qualified against is what the operator configured. Nothing is
+/// invented: without an executable and a model store there is no installation, and
+/// standalone refuses to boot rather than come up unable to run anything.
+pub struct EnvEngineProvider;
+
+impl EnvEngineProvider {
+    pub fn new() -> Self {
+        Self
+    }
 }
 
-/// Boot with an explicit host deep-park policy (the Spark qualification
-/// flow opts in for the isolated experimental profile).
+impl Default for EnvEngineProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A variable's value, or `None` when it is unset or empty. An empty value is not a
+/// setting: it is the shape a mistyped export leaves behind.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn no_installation(what: impl Into<String>) -> ProviderError {
+    ProviderError::NoEngineInstallation(what.into())
+}
+
+impl EngineProvider for EnvEngineProvider {
+    fn installation(&self) -> Result<EngineInstallation, ProviderError> {
+        let executable = PathBuf::from(env_value(ENGINE_BIN).ok_or_else(|| {
+            no_installation(format!(
+                "this host declares no engine: set {ENGINE_BIN} to the engine's \
+                 executable and {MODELS_ROOT} to the directory its weights live under"
+            ))
+        })?);
+        let models_root = PathBuf::from(env_value(MODELS_ROOT).ok_or_else(|| {
+            no_installation(format!(
+                "this host names no model store: set {MODELS_ROOT} to the directory \
+                 weights live under (the engine itself comes from {ENGINE_BIN})"
+            ))
+        })?);
+        if !models_root.is_dir() {
+            return Err(no_installation(format!(
+                "{MODELS_ROOT} is not a directory: {}",
+                models_root.display()
+            )));
+        }
+        // Spec §3: deep park is available unless the host switches it off, and
+        // sleep mode is what makes it possible, so the two move together.
+        let deep_park = env_value(DEEP_PARK).is_none_or(|value| value != "off");
+        let trust_remote_code = env_value(TRUST_REMOTE_CODE).is_some_and(|value| value == "1");
+        let build_fingerprint = match env_value(ENGINE_FINGERPRINT) {
+            Some(declared) => declared,
+            None => probe_fingerprint(&executable)?,
+        };
+        let kv_cache_bytes =
+            env_value(KV_CACHE_BYTES).unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
+        let args = env_value(ENGINE_ARGS)
+            .unwrap_or_else(|| DEFAULT_ENGINE_ARGS.to_string())
+            .split(' ')
+            .filter(|argument| !argument.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Ok(EngineInstallation {
+            engine: Engine::Vllm,
+            executable,
+            build_fingerprint,
+            // Spec §7: the whole family block, not a fragment. The utilization gate
+            // is set low because the explicit KV grant is what sizes the pool, and
+            // the gate must still pass when the previous deployment's memory has
+            // not yet been released by the operating system.
+            launch_settings: serde_json::json!({
+                "engine": "vllm",
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "enable_sleep_mode": deep_park,
+                "kv_cache_dtype": "auto",
+                "block_size_tokens": 16,
+                "cpu_offload_bytes": "0B",
+                "requested_budget": {
+                    "kv_cache_bytes": kv_cache_bytes,
+                    "swap_space_bytes": "0B",
+                    "gpu_utilization_pct": 10
+                }
+            }),
+            deep_park,
+            trust_remote_code,
+            models_root,
+            runtime_dir: runtime_dir()?,
+            args,
+        })
+    }
+
+    fn bindings(
+        &self,
+        clock: ServiceClock,
+        log_dir: PathBuf,
+        runtime_dir: PathBuf,
+    ) -> Arc<dyn EngineBindings> {
+        Arc::new(ProfileBindings::new(clock, log_dir, runtime_dir))
+    }
+
+    fn tools_factory(&self) -> ToolsFactory {
+        // Spec §3: the builder owns the processes it launches, and the association
+        // it is given is what records their identities before they can run.
+        Arc::new(|association| Arc::new(DurableProcessLaunch::new(association)))
+    }
+}
+
+/// Where mllm's own guard middleware lives.
+///
+/// Spec §3: the guard is imported by the engine over `PYTHONPATH`, so a directory
+/// that does not contain it is not a runtime directory. The checkout layout is the
+/// default because standalone is run from one; an installed layout names its own.
+fn runtime_dir() -> Result<PathBuf, ProviderError> {
+    let dir = match env_value(RUNTIME_DIR) {
+        Some(declared) => PathBuf::from(declared),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("runtime"),
+    };
+    if !dir.join("mllm_vllm_guard.py").is_file() {
+        return Err(no_installation(format!(
+            "{} holds no mllm_vllm_guard.py, so the engine's control routes could \
+             not be guarded; set {RUNTIME_DIR} to mllm's runtime directory",
+            dir.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// What the installed engine says it is.
+///
+/// The fingerprint pins the recipe, so it has to come from the installation rather
+/// than from a constant that would keep claiming the same build after an upgrade.
+/// A probe that fails or hangs is a refusal: an engine that cannot print its own
+/// version is not one this host should publish.
+fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
+    let mut child = Command::new(executable)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            no_installation(format!(
+                "{} could not be run to read its version ({error}); set \
+                 {ENGINE_FINGERPRINT} if this host publishes one another way",
+                executable.display()
+            ))
+        })?;
+    let deadline = Instant::now() + FINGERPRINT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(no_installation(format!(
+                    "{} did not print its version within {} seconds",
+                    executable.display(),
+                    FINGERPRINT_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => {
+                return Err(no_installation(format!(
+                    "the version probe for {} could not be waited on: {error}",
+                    executable.display()
+                )))
+            }
+        }
+    };
+    let mut printed = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        // The child has exited, so this reads what it left in the pipe and returns.
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut printed);
+    }
+    let fingerprint = printed.trim().to_owned();
+    if !status.success() || fingerprint.is_empty() {
+        return Err(no_installation(format!(
+            "{} printed no version, so there is nothing to pin this recipe to; set \
+             {ENGINE_FINGERPRINT} to publish one explicitly",
+            executable.display()
+        )));
+    }
+    Ok(fingerprint)
+}
+
+/// The embedded Fake, as an installation, for the tests that have not moved to the
+/// testkit yet.
+///
+/// It is not `#[cfg(test)]` because the integration tests are separate crates and
+/// cannot see this crate's test configuration. It leaves the product with the Fake
+/// engine (Task 13 removes it, together with this helper).
+#[doc(hidden)]
+pub fn fake_provider() -> Arc<dyn EngineProvider> {
+    Arc::new(FakeProvider)
+}
+
+#[doc(hidden)]
+struct FakeProvider;
+
+impl EngineProvider for FakeProvider {
+    fn installation(&self) -> Result<EngineInstallation, ProviderError> {
+        Ok(EngineInstallation {
+            engine: Engine::Fake,
+            executable: PathBuf::from("/bin/true"),
+            build_fingerprint: "fake-v1".into(),
+            launch_settings: serde_json::json!({"engine": "fake"}),
+            deep_park: false,
+            trust_remote_code: false,
+            // The Fake reads no weights, so its store only has to be a real
+            // absolute directory for the host policy to be valid.
+            models_root: std::env::temp_dir(),
+            runtime_dir: std::env::temp_dir(),
+            args: Vec::new(),
+        })
+    }
+
+    fn bindings(
+        &self,
+        clock: ServiceClock,
+        log_dir: PathBuf,
+        runtime_dir: PathBuf,
+    ) -> Arc<dyn EngineBindings> {
+        // The Fake arm of the shared bindings, so the test path resolves a spec the
+        // same way the product does rather than through a second implementation.
+        Arc::new(ProfileBindings::new(clock, log_dir, runtime_dir))
+    }
+
+    fn tools_factory(&self) -> ToolsFactory {
+        // A Fake driver is given no tools, so this is never called; it must still
+        // be a factory that produces something rather than a panic.
+        Arc::new(|association| Arc::new(DurableProcessLaunch::new(association)))
+    }
+}
+
+/// Boot the embedded standalone graph (SPEC §15.2 no-config matrix) against the
+/// engine installation this host's environment declares.
+pub async fn start_standalone(state_dir: &Path) -> Result<App, StartError> {
+    start_standalone_inner(state_dir, Arc::new(EnvEngineProvider::new())).await
+}
+
+/// Boot against an explicit provider, which is how a test supplies an installation
+/// it controls instead of one the environment happens to name.
+pub async fn start_standalone_with(
+    state_dir: &Path,
+    provider: Arc<dyn EngineProvider>,
+) -> Result<App, StartError> {
+    start_standalone_inner(state_dir, provider).await
+}
+
+/// Compatibility shim for the owner's untracked live test, which this branch may
+/// not edit.
+///
+/// The deep-park policy is no longer a boot argument: Spec §3 makes it the host's
+/// switch, read from `MLLM_DEEP_PARK` with the rest of the installation, so the
+/// argument is accepted and ignored. Remove this together with the test that calls
+/// it.
 pub async fn start_standalone_with_policy(
     state_dir: &Path,
-    policy: mllm_adapters::fake::ParkPolicy,
+    _policy: mllm_adapters::ParkPolicy,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, policy).await
+    start_standalone(state_dir).await
 }
 
-type AdapterParts = (
-    Arc<dyn mllm_adapters::traits::EngineAdapter>,
-    Arc<dyn mllm_adapters::traits::Launcher>,
-    HashMap<String, Arc<dyn mllm_adapters::traits::ChatForward>>,
-);
-
-/// Live vLLM profile for the Spark qualification (F1 design §8): the
-/// standalone role drives the REAL vLLM adapter over the REAL exec
-/// launcher. F1 qualification wiring via documented env vars; F2 replaces
-/// this with the profile schema.
+/// Compatibility shim for the same test: the qualification profile it reads from
+/// the environment.
+///
+/// Standalone no longer builds an adapter from these — the coordinator resolves one
+/// per binding from the frozen profile, and the installation comes from
+/// [`EnvEngineProvider`]. Nothing in the product reads this type; it exists so the
+/// owner's live test keeps compiling, and it goes when that test is updated.
 #[derive(Debug, Clone)]
 pub struct LiveVllmProfile {
     pub engine_bin: PathBuf,
-    /// Extra PATH entries the engine needs at runtime (venv bin: e.g. the
-    /// JIT compile step needs the venv's `ninja`).
+    /// Extra PATH entries the engine needs at runtime (the venv's bin directory).
     pub engine_path_extra: Option<PathBuf>,
     pub model_path: String,
     pub model_id: String,
@@ -166,23 +477,22 @@ pub struct LiveVllmProfile {
 }
 
 impl LiveVllmProfile {
-    /// Read from the qualification environment (documented in the runbook).
+    /// Read from the qualification environment, or `None` when it names no profile.
     pub fn from_env() -> Option<Self> {
-        let engine_bin = std::env::var("MLLM_VLLM_BIN").ok()?;
         Some(Self {
-            engine_path_extra: std::env::var("MLLM_ENGINE_PATH").ok().map(PathBuf::from),
-            engine_bin: engine_bin.into(),
-            model_path: std::env::var("MLLM_MODEL_PATH").ok()?,
-            model_id: std::env::var("MLLM_MODEL_ID").ok()?,
-            port: std::env::var("MLLM_PORT").ok()?.parse().ok()?,
-            fingerprint: std::env::var("MLLM_ENGINE_FINGERPRINT").unwrap_or_else(|_| "live-capture".into()),
+            engine_path_extra: env_value("MLLM_ENGINE_PATH").map(PathBuf::from),
+            engine_bin: PathBuf::from(env_value(ENGINE_BIN)?),
+            model_path: env_value("MLLM_MODEL_PATH")?,
+            model_id: env_value("MLLM_MODEL_ID")?,
+            port: env_value("MLLM_PORT")?.parse().ok()?,
+            fingerprint: env_value(ENGINE_FINGERPRINT).unwrap_or_else(|| "live-capture".into()),
         })
     }
 }
 
 async fn start_standalone_inner(
     state_dir: &Path,
-    policy: mllm_adapters::fake::ParkPolicy,
+    provider: Arc<dyn EngineProvider>,
 ) -> Result<App, StartError> {
     // Fail-closed credentials (SPEC §15.2): the generated api key lives in
     // the protected credentials file. The hardcoded fallback exists ONLY
@@ -201,179 +511,79 @@ async fn start_standalone_inner(
         None => return Err(StartError::MissingCredentials),
     };
 
-    // Live profile: the REAL vLLM adapter + REAL exec launcher (F1 design
-    // §8; the profile carries the pinned build's fingerprint).
-    let (adapter, launcher, forwards): AdapterParts = match LiveVllmProfile::from_env() {
-        Some(p) => {
-            let base: reqwest::Url = format!("http://127.0.0.1:{}", p.port)
-                .parse()
-                .map_err(|e| StartError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-            let launch = mllm_adapters::vllm::args::PlanInputVllm {
-                engine_bin: p.engine_bin.to_string_lossy().to_string(),
-                model_path: p.model_path.clone(),
-                port: p.port,
-                // Spec §3: mllm renders --served-model-name itself now
-                // (the qualification args below no longer carry it).
-                served_model_name: p.model_id.clone(),
-                tensor_parallel_size: 1,
-                pipeline_parallel_size: 1,
-                kv_cache_dtype: "auto".into(),
-                block_size_tokens: 16,
-                cpu_offload_bytes: 0,
-                // Conservative KV grant for the unified-memory Spark: the
-                // ledger's deployment budget bounds the engine's KV pool
-                // (activation peak stays well inside the managed limit).
-                granted: mllm_adapters::vllm::args::GrantedBudget {
-                    // 16 GiB KV grant: the qualification drives 8-token
-                    // completions, so a large pool is not needed — and a
-                    // smaller grant keeps two engine instances from
-                    // overcommitting the 130 GiB unified domain during the
-                    // stop→start overlap of a switch (freeze observed live
-                    // with 64 GiB, 2026-09-12).
-                    kv_cache_bytes: Some(16 * 1024 * 1024 * 1024),
-                    // The utilization gate must pass when the OS has not yet
-                    // fully released the previous deployment's memory: the
-                    // explicit KV grant sizes the pool (vLLM 0.29 live
-                    // capture), so the utilization gate is set low.
-                    gpu_utilization_pct: Some(10),
-                    ..Default::default()
-                },
-                engine_path_extra: p.engine_path_extra.clone().map(|p| p.to_string_lossy().to_string()),
-                engine_log: Some(
-                    state_dir
-                        .join("engine.log")
-                        .to_string_lossy()
-                        .to_string(),
-                ),
-                // The served model id must match the deployment's route id
-                // (readiness = /v1/models lists the served id); vLLM
-                // otherwise serves the checkpoint filesystem path.
-                engine_args: vec![
-                    "--host".into(),
-                    "127.0.0.1".into(),
-                    "--served-model-name".into(),
-                    p.model_id.clone(),
-                    // Cap the context: vLLM's startup check requires the
-                    // model's max context to fit the KV pool — the model's
-                    // 262K default would demand far more than the grant.
-                    // The qualification drives 8-token completions.
-                    "--max-model-len".into(),
-                    "4096".into(),
-                ],
-                // Development/sleep flags render only under the opt-in
-                // (profile-level gate, F1 design §7): the isolated
-                // experimental session boots with sleep mode enabled.
-                sleep_flags: live_vllm_sleep_flags(policy),
-                api_key: None,
-                runtime_dir: std::env::var("MLLM_RUNTIME_DIR").ok(),
-            };
-            let adapter = Arc::new(
-                mllm_adapters::vllm::VllmAdapter::new(
-                    base,
-                    None,
-                    p.fingerprint,
-                    policy,
-                    p.model_id.clone(),
-                )
-                .with_launch(launch),
-            );
-            let launcher: Arc<dyn mllm_adapters::traits::Launcher> =
-                Arc::new(mllm_launchers::ExecLauncher::new());
-            let fwd = adapter.clone() as Arc<dyn mllm_adapters::traits::ChatForward>;
-            (
-                adapter.clone() as Arc<dyn mllm_adapters::traits::EngineAdapter>,
-                launcher,
-                // Dispatch resolves by deployment kind; stock and sleep
-                // profiles share this adapter. Keep the model-id alias for
-                // direct adapter qualification as well.
-                HashMap::from([
-                    ("model".to_string(), fwd.clone()),
-                    ("vllm-sleep".to_string(), fwd.clone()),
-                    (p.model_id.clone(), fwd),
-                ]),
-            )
-        }
-        None => {
-            let fake = Arc::new(mllm_adapters::fake::FakeEngine::new());
-            let host = Host::new();
-            let fwd = fake.clone() as Arc<dyn mllm_adapters::traits::ChatForward>;
-            (
-                host.adapter(),
-                host.launcher(),
-                HashMap::from([
-                    ("model".to_string(), fwd),
-                    (
-                        "attached".to_string(),
-                        Arc::new(mllm_router::chat::NoForward)
-                            as Arc<dyn mllm_adapters::traits::ChatForward>,
-                    ),
-                ]),
-            )
-        }
-    };
+    // Spec §8: what this host publishes about its engine is what it has. There is
+    // no fallback installation: a host with none refuses to boot rather than come
+    // up serving an engine nobody configured.
+    let installation = provider.installation()?;
+    let environment_fingerprint = format!("standalone-{}", installation.build_fingerprint);
+    let capacity_bytes = mllm_agent::memory::read_host_memory()
+        .map(|sample| sample.memory.capacity_bytes)
+        .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
 
-    // What this host publishes about its engine. Derived from the live profile when
-    // one is configured, otherwise the embedded fake, and from observed capacity
-    // rather than a configured guess.
-    let engine_declaration = {
-        let (engine, executable) = match LiveVllmProfile::from_env() {
-            Some(p) => ("vllm".to_string(), p.engine_bin.to_string_lossy().to_string()),
-            None => ("fake".to_string(), "/bin/true".to_string()),
-        };
-        let capacity = mllm_agent::memory::read_host_memory()
-            .map(|sample| sample.memory.capacity_bytes)
-            .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
-        (
-            engine,
-            executable,
-            policy == mllm_adapters::fake::ParkPolicy::Enabled,
-            capacity,
-        )
-    };
     // The host's own accounting units, resolved before anything can observe or be
     // admitted against them. The coordinator's observation source is named by these,
     // so it has to exist before the coordinator does.
     let declared_host = {
-        let (engine, executable, experimental, capacity) = &engine_declaration;
         let host = crate::standalone_config::host_policy(
-            engine,
-            executable,
-            "standalone-1",
-            *experimental,
-            *capacity,
+            &installation,
+            &environment_fingerprint,
+            capacity_bytes,
         );
         let probe = crate::standalone_config::deployment_document(
             "policy-probe",
             "policy-probe",
-            "/dev/null",
-            *capacity,
+            &ModelSource::Local {
+                path: "/dev/null".into(),
+            },
+            capacity_bytes,
         );
         mllm_config::effective::resolve_effective(&probe, &host)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
             .host
     };
 
+    // Spec §3: the identity key that seals every per-launch engine key lives in a
+    // file beside the database, not in it, and it has to outlive the process or a
+    // restart could not authenticate against an engine it left running.
+    let secrets = SecretsKey::load_or_create(&state_dir.join("identity").join("secrets.key"))?;
     // The coordinator opens the durable state itself and holds the controller lock
     // for as long as it runs, so nothing else may act as an authority over it.
-    let owner = Arc::new(std::sync::Mutex::new(OwnedCoordinatorState::open(
-        &state_dir.join("server"),
-    )?));
+    let owner = Arc::new(std::sync::Mutex::new(
+        OwnedCoordinatorState::open_with_secrets(&state_dir.join("server"), secrets)?,
+    ));
+    let options = CoordinatorOptions {
+        // Spec §4: a cold start reads weights off disk, which this project measured
+        // taking a minute on a small model; the protocol bound would give up on a
+        // healthy engine mid-load.
+        initialize_timeout: Duration::from_secs(900),
+        // Spec §5: what a terminated process group is given before it is killed.
+        terminate_grace: Duration::from_secs(15),
+        ..Default::default()
+    };
+    let bindings = provider.bindings(
+        system_clock(),
+        state_dir.join("logs"),
+        installation.runtime_dir.clone(),
+    );
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner,
         Arc::new(HostMemoryObservation::new(
             declared_host.domains.keys().cloned(),
         )),
         system_clock(),
-        CoordinatorOptions::default(),
-        Arc::new(ProfileBindings::new(system_clock())),
+        options,
+        bindings,
+        provider.tools_factory(),
     )?;
     let controller = Arc::new(CoordinatorLifecycle::new(coordinator.commands()));
-    // The adapter and launcher built above now inform only the forwarding table;
-    // the coordinator resolves an adapter per binding from its frozen profile.
-    let _ = (adapter, launcher);
     let deps = mllm_router::RouterDeps {
         controller: controller.clone(),
-        forwards,
+        // Spec §3: a leased port and a per-launch key belong to one launch, so the
+        // forwarder is built from what the coordinator recorded for the launch that
+        // is running rather than from a table assembled at boot.
+        forwards: Arc::new(mllm_router::forwarders::LiveForwarders::new(
+            controller.clone(),
+        )),
         limits: mllm_router::QueueLimits {
             max_requests_per_deployment: 32,
             max_buffered_bytes_total: 64 * 1024 * 1024,
@@ -397,21 +607,17 @@ async fn start_standalone_inner(
             .publish_resource_policy(&declared_host, &observations)
             .map_err(|error| StartError::Deploy(error.to_string()))?;
     }
-    Ok(App { controller, _coordinator: coordinator, store, engine_declaration, router, deps, api_key })
-}
-
-fn live_vllm_sleep_flags(policy: mllm_adapters::fake::ParkPolicy) -> Vec<String> {
-    if policy == mllm_adapters::fake::ParkPolicy::Enabled {
-        // The deep-park lab profile uses eager checkpoint loading to avoid
-        // mmap-backed tensor copies during weight restoration on Spark.
-        vec![
-            "--enable-sleep-mode".into(),
-            "--safetensors-load-strategy".into(),
-            "eager".into(),
-        ]
-    } else {
-        Vec::new()
-    }
+    Ok(App {
+        controller,
+        _coordinator: coordinator,
+        store,
+        installation,
+        environment_fingerprint,
+        capacity_bytes,
+        router,
+        deps,
+        api_key,
+    })
 }
 
 /// Read the generated API key from the protected credentials file (F0's
@@ -423,25 +629,6 @@ fn read_api_key(state_dir: &Path) -> Option<String> {
         .find_map(|l| l.strip_prefix("api_key: ").map(str::to_string))
 }
 
-pub fn dispatch(command: &Command) -> Result<Infallible, StructuredError> {
+pub fn dispatch(command: &CliCommand) -> Result<Infallible, StructuredError> {
     Err(StructuredError::not_yet_implemented(&command.label()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::live_vllm_sleep_flags;
-    use mllm_adapters::fake::ParkPolicy;
-
-    #[test]
-    fn deep_park_lab_profile_enables_eager_weight_loading() {
-        assert_eq!(
-            live_vllm_sleep_flags(ParkPolicy::Enabled),
-            ["--enable-sleep-mode", "--safetensors-load-strategy", "eager"],
-        );
-    }
-
-    #[test]
-    fn denied_profile_has_no_sleep_or_loader_override() {
-        assert!(live_vllm_sleep_flags(ParkPolicy::Disabled).is_empty());
-    }
 }

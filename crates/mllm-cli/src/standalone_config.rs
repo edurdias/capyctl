@@ -1,9 +1,13 @@
 //! The host policy and deployment document standalone publishes.
 //!
-//! The profile is ADR 0008's engine installation. Limits derive from observed
-//! capacity rather than a configured guess, because an invented ceiling is how a
-//! host gets overcommitted.
+//! The profile is ADR 0008's engine installation, and it is now the installation the
+//! provider actually found rather than a shape invented here. Limits derive from
+//! observed capacity rather than a configured guess, because an invented ceiling is
+//! how a host gets overcommitted.
 
+use mllm_config::effective::ModelSource;
+use mllm_config::engine_policy::Engine;
+use mllm_controller::EngineInstallation;
 use serde_json::{json, Value};
 
 /// Named rather than anonymous so a second installation can be added later.
@@ -18,37 +22,56 @@ const FREE_RESERVE_FRACTION: i64 = 20;
 const PARKED_FRACTION: i64 = 25;
 const HOST_KV_FRACTION: i64 = 10;
 
-/// The host policy standalone publishes, including the one engine installation it
-/// offers and the limits it will admit against.
+/// The name the published table uses for an engine family.
+fn engine_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Vllm => "vllm",
+        Engine::Sglang => "sglang",
+        Engine::Fake => "fake",
+    }
+}
+
+/// The host policy standalone publishes: the one engine installation it offers, the
+/// store its weights live under, and the limits it will admit against.
 ///
-/// `capacity_bytes` is the host's observed total, not a configured guess.
+/// Spec §7: the published table states the installation's own launch settings, the
+/// flags its profile passes, whether deep park is available on it, and where models
+/// are kept. Every one of those comes from the installation the provider found, so
+/// what is published and what would be launched cannot disagree.
+///
+/// `environment_fingerprint` names the surrounding environment the installation was
+/// found in; `capacity_bytes` is the host's observed total, not a configured guess.
 pub fn host_policy(
-    engine: &str,
-    executable: &str,
-    build_fingerprint: &str,
-    experimental_controls: bool,
+    installation: &EngineInstallation,
+    environment_fingerprint: &str,
     capacity_bytes: i64,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
+    let engine = engine_name(installation.engine);
     json!({
         "schema_version": 1,
         "kind": "host",
         "name": "standalone",
         "hardware_fingerprint": format!("standalone-{engine}"),
-        "environment_fingerprint": build_fingerprint,
+        "environment_fingerprint": environment_fingerprint,
+        // Spec §7: a relative model path resolves against this, so the host states
+        // it rather than having a directory guessed for it.
+        "model_store": {"path": installation.models_root.to_string_lossy()},
         "runtime_profiles": {
             STANDALONE_PROFILE: {
                 "engine": engine,
                 "revision": 1,
-                "executable": executable,
-                "build_fingerprint": build_fingerprint,
-                "args": [],
+                "executable": installation.executable.to_string_lossy(),
+                "build_fingerprint": installation.build_fingerprint,
+                "args": installation.args,
                 "env": {},
-                "launch_settings": {"engine": engine},
+                "launch_settings": installation.launch_settings,
                 "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
                 "security": {
                     // SPEC §9.1/T21: the host's decision, not the adapter's.
-                    "experimental_controls": experimental_controls,
+                    "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
+                    // Spec §3: executing checkpoint-supplied Python is opt-in.
+                    "trust_remote_code": installation.trust_remote_code,
                     "credential_ref": "secret://engine-key"
                 }
             }
@@ -82,11 +105,20 @@ pub fn host_policy(
     })
 }
 
-/// The deployment document, naming the installation it runs on.
+/// The deployment document, naming the installation it runs on and where its
+/// weights come from.
+///
+/// Spec §7: the model is stated as a source rather than a bare path, so a fetched
+/// checkpoint is expressible in the same document that a local one is.
 ///
 /// Phase footprints are declared because admission compares a transition's peak
 /// against the ceiling, not its steady state.
-pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_bytes: i64) -> Value {
+pub fn deployment_document(
+    name: &str,
+    route: &str,
+    source: &ModelSource,
+    capacity_bytes: i64,
+) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
     let allocation = |percent: i64, kv: i64| {
@@ -109,7 +141,7 @@ pub fn deployment_document(name: &str, route: &str, model_path: &str, capacity_b
         // Ordered: activation window <= deployment deadline <= host ceiling.
         "request_deadline": "900s",
         "model": {
-            "path": model_path,
+            "source": source,
             "content_fingerprint": format!("sha256:{name}"),
             "revision": "r1"
         },

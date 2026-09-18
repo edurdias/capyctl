@@ -314,8 +314,18 @@ impl LifecyclePort for CoordinatorLifecycle {
                      so there is no name to address its engine by"
                 ))
             })?;
+        // The binding recorded the authority it leased; a caller needs a URL to send
+        // to, and forming it here is what keeps every caller from guessing a scheme.
+        let endpoint = crate::port::engine_url(&binding.endpoint)
+            .ok_or_else(|| {
+                LifecycleFault::Conflict(format!(
+                    "deployment {deployment} recorded an endpoint that names no                      address: {}",
+                    binding.endpoint
+                ))
+            })?
+            .to_string();
         Ok(Some(RuntimeEndpoint {
-            endpoint: binding.endpoint,
+            endpoint,
             served_model,
             engine_key,
             incarnation: binding.incarnation,
