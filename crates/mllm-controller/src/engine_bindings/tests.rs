@@ -8,9 +8,10 @@ use serde_json::{json, Value};
 /// Builds a real `InitializeWork` for a vLLM deployment by driving the actual
 /// store lifecycle: `ProfileBindings::spec` reads the binding's own frozen
 /// profile (Spec §3), so a fixture assembled any other way would not exercise
-/// the path production actually takes. `deep_park` is either `"enabled"` or
-/// `"disabled"`, written into the host's runtime profile before admission.
-fn vllm_work(deep_park: &str) -> InitializeWork {
+/// the path production actually takes. `deep_park` is `"enabled"` or
+/// `"disabled"` written into the host's runtime profile before admission, or
+/// `None` for a host file that does not mention the switch at all.
+fn vllm_work(deep_park: Option<&str>) -> InitializeWork {
     let store = Store::open_in_memory().expect("open in-memory store");
     let session = store
         .begin_coordinator_session()
@@ -21,9 +22,19 @@ fn vllm_work(deep_park: &str) -> InitializeWork {
     ))
     .expect("fixture JSON parses");
     let mut host = source["input"]["host"].clone();
-    host["runtime_profiles"]["local"]["security"]["deep_park"] = json!(deep_park);
+    match deep_park {
+        Some(value) => {
+            host["runtime_profiles"]["local"]["security"]["deep_park"] = json!(value);
+        }
+        None => {
+            host["runtime_profiles"]["local"]["security"]
+                .as_object_mut()
+                .expect("the fixture profile carries a security section")
+                .remove("deep_park");
+        }
+    }
     let mut deployment = source["input"]["deployment"].clone();
-    if deep_park == "disabled" {
+    if deep_park == Some("disabled") {
         // SPEC §3: a parking residency on a profile that disables deep park is
         // refused at admission (`core.rs`'s `UnsupportedCombination`), so the
         // disabled fixture asks for the residency deep park does not gate.
@@ -79,10 +90,11 @@ fn bindings() -> ProfileBindings {
 }
 
 /// Spec §3: a host that disables deep park launches without sleep mode and
-/// with vLLM's own development mode off, whatever the profile asked for. T21
+/// with vLLM's own development mode off, whatever the profile asked for.
+// T21
 #[test]
 fn a_disabled_profile_launches_without_sleep_flags() {
-    let work = vllm_work("disabled");
+    let work = vllm_work(Some("disabled"));
     let spec = bindings().spec(&work).expect("vllm spec builds");
     let AdapterSpec::Vllm { policy, launch, .. } = spec else {
         panic!("fixture profile declares vllm");
@@ -102,10 +114,11 @@ fn a_disabled_profile_launches_without_sleep_flags() {
 }
 
 /// Spec §3: the default profile launches ready to park, in vLLM's development
-/// mode, with the sleep/eager-load flags that mode needs. T21
+/// mode, with the sleep/eager-load flags that mode needs.
+// T21
 #[test]
-fn an_enabled_profile_launches_with_sleep_mode_by_default() {
-    let work = vllm_work("enabled");
+fn an_enabled_profile_launches_with_sleep_mode() {
+    let work = vllm_work(Some("enabled"));
     let spec = bindings().spec(&work).expect("vllm spec builds");
     let AdapterSpec::Vllm { policy, launch, .. } = spec else {
         panic!("fixture profile declares vllm");
@@ -115,6 +128,31 @@ fn an_enabled_profile_launches_with_sleep_mode_by_default() {
     assert!(
         !launch.sleep_flags.is_empty(),
         "deep_park enabled with sleep mode requested must render sleep flags"
+    );
+    let rendered = render_command(&launch).expect("plan renders");
+    assert_eq!(
+        rendered.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str),
+        Some("1")
+    );
+}
+
+/// Spec §3 and the owner's 2026-09-17 decision: deep park is on by default and a
+/// host opts out, so a host file that never mentions the switch launches ready to
+/// park. The enabled case above writes the value; only this one proves the
+/// schema's own default.
+// T21
+#[test]
+fn a_profile_that_does_not_mention_deep_park_launches_with_it_enabled() {
+    let work = vllm_work(None);
+    let spec = bindings().spec(&work).expect("vllm spec builds");
+    let AdapterSpec::Vllm { policy, launch, .. } = spec else {
+        panic!("the fixture profile declares vllm");
+    };
+    assert_eq!(policy, ParkPolicy::Enabled);
+    let launch = launch.expect("an owned vllm binding carries a launch plan");
+    assert!(
+        !launch.sleep_flags.is_empty(),
+        "an unmentioned deep park is an enabled one"
     );
     let rendered = render_command(&launch).expect("plan renders");
     assert_eq!(

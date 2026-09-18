@@ -423,7 +423,8 @@ mod tests {
     /// SPEC §10: an engine forwarder relays inference and nothing else. The paths
     /// refused below are real engine surfaces — sleep and wake, weight reload,
     /// collective RPC, tokenisation — and each one is engine control, which belongs
-    /// to the lifecycle authority rather than to whoever can reach the router. T19
+    /// to the lifecycle authority rather than to whoever can reach the router.
+    // T19
     #[test]
     fn a_forwarder_reaches_the_chat_and_model_paths_and_refuses_every_other() {
         let base: reqwest::Url = "http://127.0.0.1:8000".parse().unwrap();

@@ -118,6 +118,23 @@ Scenario L3 is what holds this true over time: it asserts that an unkeyed `POST`
 carrying the key the launch minted is answered. A regression that dropped the
 middleware would leave those routes open and L3 would fail.
 
+### What L3 asserts in place of the forwarder allowlist drive
+
+Spec §9 specifies one more thing for L3: that the per-deployment forwarder refuses
+an upstream path outside its chat and models allowlist, driven directly rather than
+through the router's route table. The scenario as committed asserts something
+different. It sends `/metrics` through the router and reads the 404 the route table
+returns, and the argument for that being sufficient is structural: `ChatForward`
+carries no path at all, so the only upstream a forwarder can express is the one
+`upstream` builds, and a forwarder driven directly has no path argument to refuse.
+The allowlist is pinned by a unit test over `upstream` instead
+(`crates/mllm-adapters/src/forward.rs`, T19).
+
+That argument is sound, but it is a different proof from the one the spec names, so
+the evidence table above should not be read as covering a drive that was never run.
+If the forwarder ever gains a path argument, this substitution stops holding and
+the scenario has to drive it.
+
 ### What run 1 must confirm about L9
 
 L9 was specified as a readiness deadline: a healthy engine still loading when its

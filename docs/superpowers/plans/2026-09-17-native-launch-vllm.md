@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Only host `host-a` is authorized for live work. Never access `host-b`. Only Task 15 touches the host, through `scripts/live/run-on-spark.sh`, which refuses any other host name.
-- Do not change engine environments, drivers, or reboot hosts. Nothing under `runtime/` is edited.
+- Do not change engine environments, drivers, or reboot hosts: nothing installed on the host is modified. mllm's own `runtime/` directory in this repository is in scope, and Task 7a creates `runtime/mllm_vllm_guard.py` there.
 - Excluded files, never read, edited, formatted, tested or staged: `crates/mllm-cli/tests/live_interactive.rs` and `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`. `AGENTS.md` is untracked and not this plan's.
 - One status document: `docs/runbooks/f2-current-status.md`. Hardware evidence goes in `docs/runbooks/spark-live-f2.md` (Task 15 creates it). No progress or continuation files under `docs/`.
 - Prose in documents, doc comments and commit messages is normal English. Cite the governing requirement inline, e.g. `// SPEC §13.3: local-only is not unauthenticated`. Tag tests with acceptance-matrix identifiers as a comment line directly above the test attribute, e.g. `// T10`.

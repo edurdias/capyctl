@@ -61,8 +61,9 @@ pub fn fake_installation() -> EngineInstallation {
         executable: PathBuf::from("/bin/true"),
         build_fingerprint: "fake-v1".into(),
         launch_settings: crate::vllm_launch_settings_json(),
-        // SPEC §9.1, T21: deep park stays closed unless a host opts in, and a test
-        // host has no more standing to open it than any other.
+        // SPEC §9.1, T21: this test host opts out of deep park; the product
+        // default is enabled (owner decision 2026-09-17). Opting out is what keeps
+        // a Fake-driven launch from rendering flags no Fake honours.
         deep_park: false,
         trust_remote_code: false,
         models_root: models_root(),

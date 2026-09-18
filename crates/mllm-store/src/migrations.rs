@@ -382,6 +382,7 @@ mod tests {
 
     /// Spec §3: an existing deployment and its binding keep their rows, and the new
     /// `engine_secrets` table exists for the encrypted-key path to use.
+    // T39
     #[test]
     fn v14_adds_engine_secrets_and_preserves_rows() {
         let conn = Connection::open_in_memory().unwrap();

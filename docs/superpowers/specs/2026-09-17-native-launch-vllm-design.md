@@ -470,7 +470,10 @@ fingerprint is a hash of the directory manifest, every file's relative path, siz
 modification time, computed at first deploy: seconds on any checkpoint size, and it
 detects a swapped or edited file though not a byte-identical rewrite that preserves
 timestamps, which the owner accepted. It replaces the placeholder standalone writes
-today. The builder receives a resolved absolute path and
+today. Amended after the S1 review: S1 landed the source shape and the resolution
+rules, not the manifest hash, so standalone still writes the placeholder and the
+hash lands with materialization in S1b. The status runbook carries this as an open
+item. The builder receives a resolved absolute path and
 never sees the source. Materialization is slice S1b.
 
 ## 8. The Fake engine leaves the product

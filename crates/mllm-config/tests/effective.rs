@@ -885,6 +885,7 @@ fn strict_yaml_rejects_duplicate_nested_keys() {
 /// asks to park. Refusing at resolution is the only place the contradiction is
 /// visible; accepted, it would surface as a park that never happens under memory
 /// pressure, long after the deployment was admitted.
+// T21
 #[test]
 fn deep_park_disabled_with_parking_residency_is_refused() {
     for residency in ["host_backed", "deep"] {
@@ -912,6 +913,7 @@ fn deep_park_disabled_with_parking_residency_is_refused() {
 /// Spec §3: omitting the switch keeps parking available. A host file written
 /// before the rename from `experimental_controls` must not silently lose the
 /// capability it already had.
+// T21
 #[test]
 fn deep_park_defaults_to_enabled() {
     let (deployment, mut host) = fixture();
@@ -928,6 +930,7 @@ fn deep_park_defaults_to_enabled() {
 /// Spec §3: `--trust-remote-code` makes the engine execute Python that arrived with
 /// the checkpoint. It stays on the approved argument list, so the only thing that
 /// stops it being passed by habit is the host's own switch.
+// T21
 #[test]
 fn trust_remote_code_arg_needs_the_host_switch() {
     let (deployment, mut host) = fixture();
@@ -953,6 +956,7 @@ fn trust_remote_code_arg_needs_the_host_switch() {
 /// local model path means "inside it". An absolute path is taken as written, even
 /// outside the store: which directories may hold weights is the operator's
 /// decision, and confining them would stop a host serving a checkpoint it has.
+// T14
 #[test]
 fn model_store_is_required_and_local_paths_resolve_against_it() {
     let (deployment, mut host) = fixture();
@@ -1003,6 +1007,7 @@ fn model_store_is_required_and_local_paths_resolve_against_it() {
 /// Spec §7: the resolver validates the shape of a remote source and stops. It
 /// performs no fetch, so it can name no local path; a caller that needs one is
 /// told so rather than handed a guessed cache directory.
+// T14
 #[test]
 fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
     let with_source = |source: serde_json::Value| {
@@ -1059,6 +1064,7 @@ fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
 /// requested KV cache larger than that reservation would hand the engine a grant
 /// nothing accounted for. The overrun would otherwise appear much later, as an
 /// out-of-memory kill on a deployment that had already been accepted.
+// T14
 #[test]
 fn requested_kv_above_ready_allocation_is_refused() {
     // The lab fixture's Ready phase allocates 8GiB.
@@ -1091,6 +1097,7 @@ fn requested_kv_above_ready_allocation_is_refused() {
 /// Spec §7: `model: { path }` predates `source` and keeps working, meaning exactly
 /// a local source. Stating both is refused rather than resolved by precedence,
 /// because a file that says two different things about its weights is a mistake.
+// T14
 #[test]
 fn legacy_model_path_is_a_local_source() {
     let (deployment, host) = fixture();

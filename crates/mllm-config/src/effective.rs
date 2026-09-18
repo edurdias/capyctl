@@ -279,8 +279,11 @@ pub struct RuntimeProfile {
 ///
 /// It replaces `experimental_controls`, which asked an operator to accept
 /// "experiments" in general and then gated one specific thing. This names the
-/// capability being switched, and defaults to enabled so that a host file written
-/// before the rename keeps parking rather than silently losing it.
+/// capability being switched, and defaults to enabled so a new host file may omit
+/// the switch entirely and still park (owner decision, 2026-09-17: on by default,
+/// a host opts out). A file written before the rename is not carried over: it
+/// still carries `experimental_controls`, and `Security` denies unknown fields, so
+/// it is refused by name rather than silently reinterpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeepPark {

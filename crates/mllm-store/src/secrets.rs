@@ -22,11 +22,34 @@ pub struct SecretsKey([u8; 32]);
 impl SecretsKey {
     /// Loads the identity key from `path`, creating a fresh random one, owner-only
     /// (mode 0600), the first time the file does not exist.
+    ///
+    /// Spec §3: the identity key is owner-only, and that holds for a file this
+    /// process did not create as much as for one it did. A key readable by anyone
+    /// else is refused rather than used, the same way `Store::open` refuses a
+    /// loosely permissioned database. A file of the wrong length is corrupt data,
+    /// not a lifecycle conflict, so it is reported as such: every other caller
+    /// reads `Conflict` as "the request clashes with store state".
     pub fn load_or_create(path: &Path) -> Result<Self, StoreError> {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "identity key {} is mode {:o}; it must be readable by its owner only",
+                        path.display(),
+                        mode & 0o777
+                    ),
+                )));
+            }
+        }
         if let Ok(bytes) = std::fs::read(path) {
-            let key: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| StoreError::Conflict)?;
+            let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("identity key {} is not 32 bytes", path.display()),
+                ))
+            })?;
             return Ok(Self(key));
         }
         let mut key = [0u8; 32];
@@ -181,6 +204,9 @@ mod tests {
     use super::*;
 
     /// A key round-trips only under the same identity key and the same row identity.
+    /// SPEC §13.3: a sealed engine key is bound to the row it was sealed for, so
+    /// a row moved to another binding does not open.
+    // T37
     #[test]
     fn engine_key_round_trips_and_is_bound_to_its_row() {
         let dir = tempfile::tempdir().unwrap();
@@ -205,6 +231,10 @@ mod tests {
         assert!(store.engine_key("b2", "inc1").is_err());
     }
 
+    /// SPEC §13.3 credential handling, and T02: the local identity key is created
+    /// once and read back, never regenerated over a live one.
+    // T37
+    // T02
     #[test]
     fn the_identity_key_file_is_owner_only_and_stable() {
         let dir = tempfile::tempdir().unwrap();
@@ -216,5 +246,30 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// Spec §3: an identity key that somebody else can read is refused, and a file
+    /// that is not a key is corrupt data rather than a lifecycle conflict.
+    // T37
+    #[test]
+    fn a_readable_or_malformed_identity_key_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let loose = dir.path().join("loose.key");
+        std::fs::write(&loose, [0u8; 32]).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = SecretsKey::load_or_create(&loose).unwrap_err();
+        let StoreError::Io(io) = error else {
+            panic!("a group-readable key is an ownership failure, not a conflict");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let short = dir.path().join("short.key");
+        std::fs::write(&short, [0u8; 16]).unwrap();
+        std::fs::set_permissions(&short, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = SecretsKey::load_or_create(&short).unwrap_err();
+        let StoreError::Io(io) = error else {
+            panic!("a wrong-length key is invalid data, not a conflict");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidData);
     }
 }

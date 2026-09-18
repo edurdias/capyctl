@@ -144,6 +144,7 @@ pub(super) fn armed_ordinary() -> (Store, CoordinatorSession, DeploymentFence, S
 
 /// Spec §3: the durable launcher records the API identity before the engine runs.
 /// Recording the completed launch must accept that, and only that, prior content.
+// T15
 #[test]
 fn record_launch_accepts_the_api_identity_the_association_wrote() {
     let (store, session, fence, execution) = armed_ordinary();
@@ -165,6 +166,7 @@ fn record_launch_accepts_the_api_identity_the_association_wrote() {
 }
 
 /// A binding holding a different identity than the receipt's API process is refused.
+// T15
 #[test]
 fn record_launch_refuses_a_mismatched_prior_identity() {
     let (store, session, fence, execution) = armed_ordinary();
@@ -186,6 +188,7 @@ fn record_launch_refuses_a_mismatched_prior_identity() {
 
 /// Spec §4: a tensor-parallel launch has several workers. The store accepts api plus
 /// worker-0..worker-N and still refuses a set without a worker.
+// T16
 #[test]
 fn canonical_members_accepts_many_workers_and_refuses_none() {
     let api = identity("api", 10);

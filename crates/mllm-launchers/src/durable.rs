@@ -403,6 +403,7 @@ mod tests {
 
     /// An identity that could not be read is never persisted, and the child that
     /// could not be identified is disposed of rather than left blocked on its gate.
+    // T12
     #[test]
     fn unknown_api_identity_is_gated_and_disposed_of() {
         let dir = tempfile::tempdir().unwrap();
@@ -438,6 +439,7 @@ mod tests {
 
     /// The engine's output lands in the file the plan names, not in /dev/null, so a
     /// launch failure can be read afterwards (SPEC §13.2: evidence, not guesswork).
+    // T12
     #[test]
     fn child_output_is_written_to_the_engine_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -478,6 +480,7 @@ mod tests {
     /// A child whose identity is never recorded is not left blocked on its gate:
     /// the launcher closes the gate, signals the group and reaps it, so no engine
     /// command ever runs unattributed.
+    // T15
     #[test]
     fn an_unreleased_child_is_disposed_of_before_the_error_returns() {
         let dir = tempfile::tempdir().unwrap();

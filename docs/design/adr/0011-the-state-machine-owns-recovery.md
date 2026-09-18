@@ -178,9 +178,12 @@ is the implementation work that follows.
 **Eviction policy is not decided here.** Which deployment to park when another needs
 memory is a scheduling question. This ADR only makes parking reachable.
 
-**The native adapters are untouched.** `VllmAdapter` has no `execute_persisted`, and
-`ProfileBindings` refuses SGLang for a missing admin credential and observation
-socket. Both block parking on a real engine regardless of this ADR.
+**The native adapters are only partly built.** The vLLM Initialize path landed in
+S1: `VllmAdapter` implements `execute_persisted`, and the coordinator launches a
+real engine through it. SGLang is still refused by `ProfileBindings` for a missing
+admin credential and observation socket, and stays refused until S3. Parking on a
+real engine is S2 work in either case; this ADR removes its gate and does not
+build it.
 
 **The ordinary native launch is not designed here.** The handoff that renders a
 protected SGLang launch survives as `NativeLaunchHandoff`, sourced through a trait

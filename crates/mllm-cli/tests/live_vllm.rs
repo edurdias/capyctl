@@ -422,10 +422,14 @@ async fn l1_to_l5_cycle() {
         .find(|identity| identity.role == "api")
         .expect("the api process is recorded");
     let argv = engine_argv(api.pid);
+    // Every launch setting the plan renders unconditionally. `--cpu-offload-gb` is
+    // not among them: the standalone profile asks for 0B of CPU offload, and the
+    // plan omits the flag at zero rather than rendering a no-op.
     for flag in [
         "--host",
         "--served-model-name",
         "--tensor-parallel-size",
+        "--pipeline-parallel-size",
         "--kv-cache-dtype",
         "--block-size",
     ] {

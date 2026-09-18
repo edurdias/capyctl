@@ -307,6 +307,8 @@ mod tests {
     /// step is cancelled, the run and the operation fail, the binding, lease, grant
     /// and claim are released, the engine key row is deleted, and the deployment
     /// keeps the ready state its owner asked for.
+    // T30
+    // T34
     #[test]
     fn a_failed_launch_is_released_with_evidence() {
         let (mut store, session, fence, execution) = armed_ordinary();
@@ -425,6 +427,7 @@ mod tests {
 
     /// Spec §6 step 1: when no identity was ever recorded, that is itself the
     /// evidence, and the identity set offered must be empty in the same way.
+    // T30
     #[test]
     fn a_never_released_launch_is_released_with_an_empty_identity_set() {
         let (store, session, fence, execution) = armed_ordinary();
@@ -452,6 +455,7 @@ mod tests {
 
     /// Spec §6: an empty recorded set is matched only by an empty evidence set. A
     /// release that names a process the binding never recorded proves nothing.
+    // T32
     #[test]
     fn evidence_naming_an_unrecorded_process_is_refused() {
         let (store, session, _, execution) = armed_ordinary();
@@ -473,6 +477,7 @@ mod tests {
     }
 
     /// Spec §6: the evidence's identity set must equal what was recorded.
+    // T32
     #[test]
     fn mismatched_identities_are_refused() {
         let (store, session, fence, execution) = armed_ordinary();
@@ -500,6 +505,7 @@ mod tests {
     /// Spec §6: a deadline-triggered failure can only be observed gone after that
     /// deadline, so evidence past it is accepted while the ttl still holds the
     /// observation to a bounded age.
+    // T32
     #[test]
     fn evidence_after_the_step_deadline_is_accepted_when_fresh() {
         let (store, session, _, execution) = armed_ordinary();
@@ -533,6 +539,7 @@ mod tests {
 
     /// The ttl a caller offers must be the one the host's policy sets, so that a
     /// looser window cannot be smuggled in with the evidence.
+    // T32
     #[test]
     fn a_ttl_that_is_not_the_hosts_is_refused() {
         let (store, session, _, execution) = armed_ordinary();

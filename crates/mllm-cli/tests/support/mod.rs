@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use axum::response::IntoResponse as _;
+
 /// A state directory the controller lock will accept.
 ///
 /// The lock walks every ancestor of the state path and refuses any that is group- or
@@ -52,15 +54,38 @@ pub async fn stub_engine(
         url.port().expect("the endpoint names a port")
     );
     let served = runtime.served_model.clone();
+    // Spec §3: the forwarder sends the per-launch key on every request, and a real
+    // engine guards every `/v1` route with it. The stub enforces the same thing, so
+    // a forwarder that stopped sending the key fails here on CPU instead of on the
+    // host.
+    let expected = runtime
+        .engine_key
+        .clone()
+        .map(|key| format!("Bearer {key}"));
+    let authorized = move |headers: &axum::http::HeaderMap| -> bool {
+        let Some(expected) = &expected else {
+            return true;
+        };
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|presented| presented == expected)
+    };
     let models = {
         let served = served.clone();
-        axum::routing::get(move || {
+        let authorized = authorized.clone();
+        axum::routing::get(move |headers: axum::http::HeaderMap| {
             let served = served.clone();
+            let authorized = authorized.clone();
             async move {
+                if !authorized(&headers) {
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
                 axum::Json(serde_json::json!({
                     "object": "list",
                     "data": [{"id": served, "object": "model"}]
                 }))
+                .into_response()
             }
         })
     };
@@ -69,9 +94,13 @@ pub async fn stub_engine(
     // in rather than with a single completion object.
     let chat = {
         let served = served.clone();
-        axum::routing::post(move || {
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
             let served = served.clone();
+            let authorized = authorized.clone();
             async move {
+                if !authorized(&headers) {
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
                 let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
                     serde_json::json!({
                         "id": "stub-1",
@@ -93,6 +122,7 @@ pub async fn stub_engine(
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                     body,
                 )
+                    .into_response()
             }
         })
     };

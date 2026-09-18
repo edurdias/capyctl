@@ -232,6 +232,7 @@ fn sleep_flags_render_only_when_profile_gated_in() {
 
 /// Spec §3: mllm owns the listener address and the served name; profiles
 /// cannot set them.
+// T14
 #[test]
 fn render_emits_host_and_served_name() {
     let cmd = render_command(&plan()).unwrap();
@@ -240,6 +241,7 @@ fn render_emits_host_and_served_name() {
 }
 
 /// Spec §3: every validated launch setting reaches the engine.
+// T14
 #[test]
 fn render_emits_the_five_launch_settings() {
     let mut p = plan();
@@ -265,6 +267,7 @@ fn render_emits_the_five_launch_settings() {
 
 /// Spec §3: a positive CPU-offload budget below 1 GiB would silently round
 /// to zero, so it is refused instead.
+// T14
 #[test]
 fn cpu_offload_below_one_gib_is_invalid() {
     let mut p = plan();
@@ -277,6 +280,7 @@ fn cpu_offload_below_one_gib_is_invalid() {
 
 /// Spec §3: development mode always comes with mllm's guard, and only
 /// then; without a runtime dir it cannot be rendered at all.
+// T21
 #[test]
 fn dev_mode_renders_the_guard_middleware() {
     let mut p = plan();
@@ -311,6 +315,7 @@ fn dev_mode_renders_the_guard_middleware() {
 }
 
 /// Spec §3: the key never reaches argv even if a caller sets it on the plan.
+// T37
 #[test]
 fn render_never_emits_api_key() {
     let mut p = plan();
@@ -325,6 +330,7 @@ fn render_never_emits_api_key() {
 /// Spec §3/§8.2: `fingerprint_of`'s redaction path still compiles and still
 /// redacts defensively, even though `render_command` itself never emits
 /// `--api-key` on argv any more.
+// T37
 #[test]
 fn fingerprint_still_redacts_api_key_if_present() {
     let cmd = RenderedCommand {
@@ -343,6 +349,7 @@ fn fingerprint_still_redacts_api_key_if_present() {
 
 /// Spec §3: engine output is quoted into errors and journals, so the three
 /// shapes a credential takes in it are blanked before it travels.
+// T37
 #[test]
 fn redaction_blanks_the_credential_shapes_engine_output_carries() {
     let text = mllm_adapters::vllm::args::redact_text(

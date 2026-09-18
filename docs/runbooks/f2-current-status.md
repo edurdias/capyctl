@@ -282,7 +282,14 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       recreated, because the model-source shape changed the recipe fingerprint;
       vLLM 0.29 authenticates only `/v1`, `/v2`, `/inference` and `/cohere`, so
       `runtime/mllm_vllm_guard.py` covers the remaining development routes
-      itself and L3 holds that true; S1r (restart re-attach) is next. What
+      itself and L3 holds that true; the manifest-hash fingerprint for a
+      `local` model source is deferred to S1b, so standalone still writes the
+      placeholder `sha256:<name>` and the spec is amended to say so; whether a
+      parking residency with `enable_sleep_mode` false and `deep_park` enabled
+      should be refused or defined as restart-only parking is a question for
+      the S2 ADR, since such a profile resolves today and S2's park would call
+      `/sleep` on an engine started without `--enable-sleep-mode`; S1r (restart
+      re-attach) is next. What
       this establishes is vLLM 0.29 with qwen3-4b-instruct on this host and
       nothing about parking, SGLang, re-attach or other builds. CPU and
       Fake-engine tests here are a pre-check, never the claim that a native
