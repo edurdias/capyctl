@@ -140,6 +140,31 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
             if presence(api) == Presence::Alive {
                 signal_group(api.pid, nix::sys::signal::Signal::SIGKILL)?;
             }
+            // Spec §5 escalates per identity, not only per group. A leader that
+            // died during grace can no longer be signalled through, so a worker
+            // still holding device memory would otherwise never receive the
+            // group's SIGKILL. Everything recorded has had SIGTERM and the whole
+            // grace window by now, so the second signal follows immediately
+            // rather than opening another grace window: a stop stays within
+            // grace plus the proof window, which is what the coordinator
+            // validates its protocol timeout against.
+            signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
+            signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
+            if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
+                return Ok(());
+            }
+        } else {
+            // The head crashed and left its workers behind. There is no leader to
+            // signal the group through, but each recorded identity carries a boot
+            // id and start ticks that `presence` has just matched, so naming them
+            // one by one kills exactly the launch's own processes and nothing
+            // else. Refusing here instead would pause an operator over a state
+            // mllm can prove and end.
+            signal_recorded(identities, nix::sys::signal::Signal::SIGTERM)?;
+            if self.settled(identities, api, Instant::now() + grace, 200)? {
+                return Ok(());
+            }
+            signal_recorded(identities, nix::sys::signal::Signal::SIGKILL)?;
             if self.settled(identities, api, Instant::now() + KILL_PROOF_WINDOW, 100)? {
                 return Ok(());
             }
@@ -163,6 +188,11 @@ impl DurableProcessLaunch {
     /// Poll until every recorded process is proven gone and the group itself is
     /// empty, or the deadline passes. Both halves are required: a recorded process
     /// may exit while a worker it started keeps running in the same group.
+    /// An observation that fails here is "not settled yet", not a verdict. A
+    /// hidden `/proc` entry on a busy host, or unrelated process churn, would
+    /// otherwise end the stop early and report uncertainty for a state the next
+    /// poll would have proven. Only the final match after the proof window turns
+    /// an observation failure into Uncertain.
     fn settled(
         &self,
         identities: &[ProcessIdentity],
@@ -172,13 +202,40 @@ impl DurableProcessLaunch {
     ) -> Result<bool, RuntimeError> {
         while Instant::now() < deadline {
             let gone = verify_gone(identities) == GoneProof::AllGone;
-            if gone && self.observe_group(api)?.is_empty() {
+            if gone && self.observe_group(api).is_ok_and(|group| group.is_empty()) {
                 return Ok(true);
             }
             std::thread::sleep(Duration::from_millis(poll_millis));
         }
         Ok(false)
     }
+}
+
+/// Signal each recorded process that is alive at this moment, by pid.
+///
+/// SPEC §13.2: `presence` has just matched boot id and start ticks, so a reused
+/// pid reads as Gone and is never signalled. A process that exits between the
+/// check and the signal is not an error; the proof that the launch is over is the
+/// absence check afterwards, never the signal's return value.
+fn signal_recorded(
+    identities: &[ProcessIdentity],
+    signal: nix::sys::signal::Signal,
+) -> Result<(), RuntimeError> {
+    for identity in identities {
+        if presence(identity) != Presence::Alive {
+            continue;
+        }
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(identity.pid as i32), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => {
+                return Err(uncertain(format!(
+                    "signal to pid {} failed: {error}",
+                    identity.pid
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Signal the whole group the leader started, the way `ExecLauncher` does: the
@@ -232,6 +289,40 @@ mod tests {
         tool.terminate_owned(&members, Duration::from_secs(2))
             .unwrap();
         assert_eq!(tool.present(&api), Presence::Gone);
+        assert!(tool.observe_group(&api).unwrap().is_empty());
+    }
+
+    /// Spec §5: escalation is per recorded identity, not only per group. The head
+    /// crashing with a worker still holding device memory used to end in an
+    /// operator pause with the device held, because a group can only be signalled
+    /// through a leader that is still alive. Each survivor carries a verified boot
+    /// id and start ticks, so it is nameable and killable on its own.
+    // T31
+    #[test]
+    fn a_worker_that_outlives_its_leader_is_still_terminated() {
+        let tool = DurableProcessLaunch::new(Arc::new(Accept));
+        let api = tool.spawn_durable("outlives", &sleeper(60)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let members = tool.observe_group(&api).unwrap();
+        assert!(members.len() >= 2, "{members:?}");
+        // End the leader alone. Its workers keep running in the group it started.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(api.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tool.present(&api) != Presence::Gone && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tool.present(&api), Presence::Gone, "the leader ended");
+        assert!(
+            !tool.observe_group(&api).unwrap().is_empty(),
+            "a worker outlived the leader"
+        );
+
+        tool.terminate_owned(&members, Duration::from_millis(200))
+            .unwrap();
         assert!(tool.observe_group(&api).unwrap().is_empty());
     }
 

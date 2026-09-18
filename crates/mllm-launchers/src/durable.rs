@@ -283,14 +283,27 @@ impl DurableSpawn {
         };
         match association.persist_api_identity(&identity) {
             Ok(()) => {
-                let retained = self
+                let mut retained = self
                     .retained
                     .lock()
                     .unwrap()
                     .remove(incarnation)
                     .expect("spawned child remains retained through association");
-                nix::unistd::write(&retained.write_gate, b"x")
-                    .map_err(|error| DurableSpawnError::Spawn(error.to_string()))?;
+                if let Err(error) = nix::unistd::write(&retained.write_gate, b"x") {
+                    // The store already holds an api identity for this child, and
+                    // the realistic cause of this failure is that the gated shell
+                    // died before reading. Returning without reaping would leave a
+                    // zombie, which `presence` reads as Alive because its
+                    // `/proc/<pid>/stat` is still there with matching start ticks:
+                    // the failure path would then poll a dead process through
+                    // grace and pause the operator over it. Uncertainty must be
+                    // real rather than manufactured.
+                    drop(retained.write_gate);
+                    let _ = retained.child.wait();
+                    return Err(DurableSpawnError::Spawn(format!(
+                        "{error}; the gated child was reaped and never reached exec"
+                    )));
+                }
                 detach_reaper(retained);
                 Ok(DurableSpawnOutcome::Uncertain {
                     handle,

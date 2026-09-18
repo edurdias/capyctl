@@ -87,7 +87,14 @@ pub fn observe_process_group(
 /// and keep holding device memory. So the leaderless case is answered by scanning
 /// for processes still in the group, not by assuming it is empty. A member that
 /// started before the recorded leader cannot be one of its workers and is left
-/// out, which keeps a reused pid's unrelated group from being reported as ours.
+/// out, which excludes an older group that happens to carry this pid.
+///
+/// It does not exclude the other direction: if the pid is reused after our leader
+/// exits by an unrelated process that becomes a group leader, that group's members
+/// all started later and are reported here. Nothing is signalled on the strength of
+/// that, because a recorded identity is what `terminate_owned` signals; the effect
+/// is that the group reads as non-empty and the release is refused. Fail-closed,
+/// and never a kill of something that is not ours.
 pub fn observe_process_group_or_empty(
     expected_api: &ProcessIdentity,
 ) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
@@ -123,8 +130,11 @@ pub fn scan_group_by_pgid(
     }
     let mounts = read_bounded("/proc/mounts", MAX_METADATA_BYTES)?;
     check_mounts(&mounts)?;
+    // The host rebooted between the caller reading the boot id and this scan.
+    // Nothing about the expected identity is wrong, so this is the observation
+    // changing underneath us, which is what the caller retries.
     if read_boot()? != boot {
-        return Err(GroupObservationError::ApiIdentity);
+        return Err(GroupObservationError::Changed);
     }
     let facts = list_pids()?.into_iter().filter_map(|pid| {
         match read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES) {
