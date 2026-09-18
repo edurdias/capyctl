@@ -2597,4 +2597,80 @@ mod native {
         .unwrap();
         w.shutdown().await.unwrap();
     }
+
+    /// Spec §3: the router must reach the engine the coordinator launched. The
+    /// engine answers to the `--served-model-name` the plan rendered, and the
+    /// forwarder rewrites every request's model to whatever `runtime_endpoint`
+    /// reports, so the two have to be the same string for a deployment that serves
+    /// aliases as well as its own name. Both now read the frozen revision's route
+    /// list; the store used to order that list by route text instead, which named
+    /// a different route as soon as the two orders differed.
+    // T19
+    #[tokio::test]
+    async fn the_endpoint_names_the_model_the_plan_launched() {
+        use crate::coordinator_port::CoordinatorLifecycle;
+        use crate::engine_bindings::ProfileBindings;
+        use crate::port::LifecyclePort;
+        use mllm_adapters::resolve::AdapterSpec;
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = mllm_testkit::fixture::fixture();
+        // Written in an order that is not the alphabetical one, which is the case
+        // the two reads used to disagree on.
+        let fence = mllm_testkit::fixture::managed_edit(&f, "aliased", |deployment, _| {
+            deployment["routes"] = serde_json::json!(["zeta", "alpha"]);
+        });
+        f.store
+            .accept_start(&f.session, &fence, 1100, 300_000)
+            .unwrap();
+        let work = f
+            .store
+            .next_initialize(&f.session)
+            .unwrap()
+            .expect("an accepted start plans initialize work");
+        let spec = ProfileBindings::new(
+            std::path::PathBuf::from("/tmp/mllm-test-logs"),
+            std::path::PathBuf::from("/tmp/mllm-test-runtime"),
+        )
+        .spec(&work)
+        .expect("the fixture profile is vllm");
+        let AdapterSpec::Vllm { launch, .. } = spec else {
+            panic!("the fixture profile declares vllm");
+        };
+        let launched = launch
+            .expect("an owned vllm binding carries a launch plan")
+            .served_model_name;
+
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("srv.sqlite3");
+        f.sql
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = Arc::new(Mutex::new(
+            crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
+        // The gate is never released, so the step stays armed and its binding
+        // retained for the read; the launch itself is not what this test measures.
+        let gate = Gate::new(false);
+        let w = worker(
+            owner,
+            f.observations.clone(),
+            gate.clone(),
+            CoordinatorOptions::default(),
+        );
+        let endpoint = CoordinatorLifecycle::new(w.commands())
+            .runtime_endpoint(&fence.deployment_id)
+            .unwrap()
+            .expect("the accepted start retains a binding");
+
+        assert_eq!(
+            endpoint.served_model, launched,
+            "the router addresses the engine by the name it was launched with"
+        );
+        assert_eq!(endpoint.served_model, "alpha");
+        gate.release.add_permits(16);
+        w.shutdown().await.unwrap();
+    }
 }

@@ -534,16 +534,64 @@ impl crate::Store {
     /// differ as soon as one carries aliases, which is exactly when guessing would
     /// send an engine a model name it does not serve.
     ///
-    /// Read from `deployment_routes` rather than by decoding the frozen snapshot.
-    /// The two are the same list: every lifecycle step refuses to proceed unless
-    /// this table matches the effective revision's routes exactly, so the table is
-    /// the cheaper read of the same fact — and decoding a snapshot re-resolves the
-    /// model against the host's store, which is work a request path should not do.
+    /// Read by decoding the frozen revision's `routes` array, which is the same
+    /// JSON the launch plan renders `--served-model-name` from, so the router and
+    /// the engine cannot disagree about the name. `deployment_routes` cannot answer
+    /// this: its rows carry no ordinal, so the only order a query can impose on
+    /// them is route text, which is the configured order only by accident. Only the
+    /// `routes` field is decoded; nothing here re-resolves the model against the
+    /// host's store, which is work a request path should not do.
     ///
-    /// A deployment created before managed configuration keeps its single route in
-    /// the column on its own row, so both forms are read. An unknown deployment
-    /// yields an empty list.
+    /// A deployment created before managed configuration has no frozen revision and
+    /// keeps its single route in the column on its own row, so both forms are read.
+    /// An unknown deployment yields an empty list.
     pub fn effective_routes(&self, deployment_id: &str) -> Result<Vec<String>, StoreError> {
+        let frozen: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT e.effective_json FROM deployments d \
+                 JOIN effective_revisions e \
+                   ON e.deployment_id=d.id AND e.revision=d.revision \
+                 WHERE d.id=?1",
+                params![deployment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(effective_json) = frozen {
+            let effective: serde_json::Value =
+                serde_json::from_str(&effective_json).map_err(|e| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "deployment {deployment_id} has an undecodable frozen revision: {e}"
+                        ),
+                    ))
+                })?;
+            let routes = effective
+                .get("routes")
+                .and_then(serde_json::Value::as_array)
+                .map(|routes| {
+                    routes
+                        .iter()
+                        .map(|route| route.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "deployment {deployment_id} froze a revision without a routes list"
+                        ),
+                    ))
+                })?
+                .ok_or_else(|| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("deployment {deployment_id} froze a route that is not a string"),
+                    ))
+                })?;
+            return Ok(routes);
+        }
         let legacy: Option<Option<String>> = self
             .conn
             .query_row(
@@ -552,15 +600,7 @@ impl crate::Store {
                 |row| row.get(0),
             )
             .optional()?;
-        let routes = self
-            .conn
-            .prepare("SELECT route FROM deployment_routes WHERE deployment_id=?1 ORDER BY route")?
-            .query_map(params![deployment_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if routes.is_empty() {
-            return Ok(legacy.flatten().into_iter().collect());
-        }
-        Ok(routes)
+        Ok(legacy.flatten().into_iter().collect())
     }
 
     /// All enabled route ids for `/v1/models` (F1 design §5): enabled
@@ -960,6 +1000,60 @@ mod tests {
                 "a closed or suspended deployment offers no route"
             );
         }
+    }
+
+    /// SPEC §3: the engine is launched to answer to the frozen revision's first
+    /// route, so the name the router addresses it by has to come from that same
+    /// list in that same order. `deployment_routes` carries no ordinal, so a query
+    /// over it can only order by route text; here that would name "alpha" and every
+    /// request would reach an engine serving "zeta".
+    // T19
+    #[test]
+    fn the_served_name_is_the_frozen_revisions_first_route_not_the_alphabetical_one() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("ordered", "ordered")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) \
+                 VALUES(?1,1,?2,'fp')",
+                params![&id, r#"{"routes":["zeta","alpha"]}"#],
+            )
+            .unwrap();
+        for route in ["alpha", "zeta"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO deployment_routes(route,deployment_id) VALUES(?1,?2)",
+                    params![route, &id],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.effective_routes(&id).unwrap(),
+            vec!["zeta".to_string(), "alpha".to_string()],
+            "the frozen revision's order is preserved"
+        );
+    }
+
+    /// A deployment that predates managed configuration has no frozen revision and
+    /// keeps its one route in the column, which is still the answer.
+    // T19
+    #[test]
+    fn a_legacy_deployment_without_a_frozen_revision_still_reports_its_route() {
+        let store = Store::open_in_memory().unwrap();
+        let mut request = req("legacy", "legacy");
+        request.route_model_id = Some("legacy-route".to_string());
+        let accepted = store.accept_deployment(request).unwrap();
+        assert_eq!(
+            store
+                .effective_routes(&accepted.deployment_id.to_string())
+                .unwrap(),
+            vec!["legacy-route".to_string()]
+        );
+        assert!(store.effective_routes("missing").unwrap().is_empty());
     }
 
     #[test]
