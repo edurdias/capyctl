@@ -958,6 +958,12 @@ pub(crate) fn complete(
         "DELETE FROM endpoint_leases WHERE binding_id=?1",
         [&p.receipt.binding_id],
     )?)?;
+    // Spec §3: the encrypted engine key does not outlive the binding it was issued
+    // for. A row may not exist yet (Task 9 wires the writer), so this is not `one`.
+    tx.execute(
+        "DELETE FROM engine_secrets WHERE binding_id=?1",
+        [&p.receipt.binding_id],
+    )?;
     one(tx.execute(
         "UPDATE runtime_bindings SET state='released' WHERE id=?1 AND state='uncertain'",
         [&p.receipt.binding_id],

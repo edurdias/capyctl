@@ -14,6 +14,7 @@ pub mod resource_ledger;
 pub mod residency;
 pub mod resource_policy;
 pub mod schema;
+pub mod secrets;
 pub mod snapshot;
 
 use std::fs;
@@ -44,6 +45,10 @@ pub enum StoreError {
 /// File-backed or in-memory (for tests) durable store.
 pub struct Store {
     pub(crate) conn: Connection,
+    // Spec §3: the identity key that seals engine keys at rest. Absent until the
+    // caller installs one with `set_secrets_key`; engine-key reads and writes fail
+    // closed (`StoreError::Conflict`) until then.
+    pub(crate) secrets: Option<secrets::SecretsKey>,
 }
 
 impl Store {
@@ -61,7 +66,7 @@ impl Store {
         set_pragmas(&conn)?;
         migrations::apply(&conn)?;
         set_owner_only(path)?;
-        Ok(Store { conn })
+        Ok(Store { conn, secrets: None })
     }
 
     /// In-memory store with the same schema and pragmas.
@@ -69,7 +74,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         set_pragmas(&conn)?;
         migrations::apply(&conn)?;
-        Ok(Store { conn })
+        Ok(Store { conn, secrets: None })
     }
 }
 

@@ -335,6 +335,18 @@ DROP TABLE qualification_runs;
 DROP TABLE host_qualification_policies;
 "#;
 
+// Spec §3: the per-launch engine key, encrypted at rest with XChaCha20-Poly1305 under
+// the identity key file, with binding id and incarnation as associated data so a row
+// copied between bindings does not authenticate. Deleted when the binding releases.
+pub const SCHEMA_V14: &str = r#"
+CREATE TABLE engine_secrets(
+  binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
+  incarnation TEXT NOT NULL,
+  nonce BLOB NOT NULL CHECK(length(nonce)=24),
+  ciphertext BLOB NOT NULL
+);
+"#;
+
 pub const SCHEMA_V9: &str = r#"
 CREATE TABLE owned_launch_associations(
   step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),

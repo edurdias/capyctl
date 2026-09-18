@@ -4,13 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -378,5 +378,49 @@ mod tests {
                 .unwrap();
             assert!(present, "{table} must stay");
         }
+    }
+
+    /// Spec §3: an existing deployment and its binding keep their rows, and the new
+    /// `engine_secrets` table exists for the encrypted-key path to use.
+    #[test]
+    fn v14_adds_engine_secrets_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?1)",
+                [(index + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('kept','kept','model','ready',1,0,1,1);
+            INSERT INTO runtime_bindings VALUES('binding','kept',1,'incarnation','managed','{}','[]','reserved');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let name: String = conn
+            .query_row("SELECT name FROM deployments WHERE id='kept'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "kept");
+        let binding: String = conn
+            .query_row(
+                "SELECT id FROM runtime_bindings WHERE id='binding'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding, "binding");
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='engine_secrets')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(present, "engine_secrets must exist");
     }
 }
