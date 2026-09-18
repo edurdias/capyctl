@@ -20,9 +20,17 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
             unit(allocation, "host_kv_bytes", "host_kv_bytes", "B")?;
         }
     }
+    // `resolved_path` is derived from the source and the host's model store, so the
+    // rebuilt deployment states the source only and resolution happens again. The
+    // exact-equality check below is what proves the snapshot's claim matched.
+    let mut model = value["model"].clone();
+    model
+        .as_object_mut()
+        .ok_or_else(|| invalid("snapshot.model", "model required"))?
+        .remove("resolved_path");
     let deployment = json!({
         "schema_version": value["schema_version"], "kind": "deployment",
-        "name": value["name"], "model": value["model"], "routes": value["routes"],
+        "name": value["name"], "model": model, "routes": value["routes"],
         "runtime_profile": "snapshot", "runtime_profile_revision": value["profile"]["revision"],
         "recipe": value["recipe"], "residency": value["residency"], "recovery": value["recovery"],
         "devices": value["selected_devices"], "resources": resources,
@@ -96,6 +104,7 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     let host = json!({
         "schema_version": 1, "kind":"host", "name":h["name"],
         "hardware_fingerprint":h["hardware_fingerprint"], "environment_fingerprint":h["environment_fingerprint"],
+        "model_store": {"path": h["model_store"]},
         "runtime_profiles":{"snapshot":profile},
         "resource_policy": {
             "domains":domains, "devices":h["devices"], "max_parked":h["max_parked"],

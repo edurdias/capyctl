@@ -80,22 +80,37 @@ pub(super) fn normalize_profile(
             "environment name is not allowlisted",
         )
     })?;
+    // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
+    // with the checkpoint. The flag stays on the approved list because there are
+    // models that need it, but a profile may only pass it where the host has said
+    // so in as many words.
+    if !raw_profile.security.trust_remote_code
+        && raw_profile
+            .args
+            .iter()
+            .any(|argument| normalize_option_name(argument) == "--trust-remote-code")
+    {
+        return Err(invalid(
+            "runtime_profiles.security.trust_remote_code",
+            "`--trust-remote-code` executes code shipped with the checkpoint; it \
+             requires security.trust_remote_code: true on this profile",
+        ));
+    }
+    // Spec §3: a host may switch deep park off. A deployment that asks to park on
+    // such a profile is refused here rather than launched and then found unable to
+    // park, which would surface only under memory pressure.
+    if raw_profile.security.deep_park == DeepPark::Disabled && residency.parks() {
+        return Err(invalid(
+            "runtime_profiles.security.deep_park",
+            "a parking deployment cannot run on a profile that disables deep park; \
+             set deep_park: enabled or residency: restart_only",
+        ));
+    }
     let launch_settings = normalize_launch(
         raw_profile.launch_settings.clone(),
         raw_profile.engine,
         residency,
     )?;
-    let uses_experimental_controls = match &launch_settings {
-        ProfileLaunchSettings::Vllm(settings) => settings.enable_sleep_mode,
-        ProfileLaunchSettings::Sglang(settings) => settings.memory_saver,
-        ProfileLaunchSettings::Fake(_) => false,
-    };
-    if uses_experimental_controls && !raw_profile.security.experimental_controls {
-        return Err(invalid(
-            "runtime_profiles.security.experimental_controls",
-            "launch settings require explicit experimental controls policy",
-        ));
-    }
     let profile = NormalizedProfile {
         engine: raw_profile.engine,
         revision: raw_profile.revision,
@@ -113,6 +128,124 @@ pub(super) fn normalize_profile(
     Ok(profile)
 }
 
+/// Resolve a deployment's `model` block into its identity.
+///
+/// Spec §7: `path` and `source` are two spellings of the same thing and exactly
+/// one may appear. `store` is the host's model store, or `None` where no host is
+/// in hand — a command fingerprint is computed from the document alone, so it
+/// resolves nothing and every `resolved_path` is `None` there.
+///
+/// An absolute local path is used as written, including one that leaves the store.
+/// That is deliberate: the operator writing the host file decides where weights
+/// may live, and confining paths to the store would stop a host from serving a
+/// checkpoint it already has elsewhere.
+pub(super) fn normalize_model(
+    raw: RawModel,
+    store: Option<&Path>,
+) -> Result<ModelIdentity, ConfigError> {
+    let source = match (raw.path, raw.source) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "model",
+                "state either `path` or `source`, not both",
+            ))
+        }
+        (None, None) => return Err(invalid("model", "a model source is required")),
+        (Some(path), None) => ModelSource::Local { path },
+        (None, Some(source)) => source,
+    };
+    match &source {
+        ModelSource::Local { path } => {
+            if path.is_empty() {
+                return Err(invalid("model.source.path", "must not be empty"));
+            }
+        }
+        ModelSource::HuggingFace {
+            repo,
+            revision,
+            locked_commit,
+        } => {
+            if repo.is_empty() {
+                return Err(invalid("model.source.repo", "must not be empty"));
+            }
+            for (path, value) in [
+                ("model.source.revision", revision),
+                ("model.source.locked_commit", locked_commit),
+            ] {
+                if value.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid(path, "must not be empty when stated"));
+                }
+            }
+        }
+        ModelSource::Http { url, sha256 } => {
+            // Spec §7: weights fetched over plain HTTP could be replaced in flight,
+            // and a digest is the only thing that makes the fetch reproducible, so
+            // both are required rather than recommended.
+            if !url.starts_with("https://") || url.len() <= "https://".len() {
+                return Err(invalid("model.source.url", "must be an https:// URL"));
+            }
+            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid(
+                    "model.source.sha256",
+                    "must be 64 hexadecimal characters",
+                ));
+            }
+        }
+    }
+    let resolved_path = match (&source, store) {
+        (ModelSource::Local { path }, Some(store)) => {
+            let candidate = Path::new(path);
+            let resolved = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                store.join(candidate)
+            };
+            Some(
+                resolved
+                    .to_str()
+                    .ok_or_else(|| invalid("model.source.path", "must be valid UTF-8"))?
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    };
+    Ok(ModelIdentity {
+        source,
+        resolved_path,
+        content_fingerprint: raw.content_fingerprint,
+        revision: raw.revision,
+    })
+}
+
+/// Spec §3: admission reserves the Ready footprint before the engine starts. A
+/// requested KV cache larger than that reservation would hand the engine a grant
+/// nothing accounted for, and the overrun would appear as an out-of-memory kill
+/// well after the deployment was accepted.
+pub(super) fn validate_requested_budget(
+    settings: &ProfileLaunchSettings,
+    resources: &RecipeFootprints,
+) -> Result<(), ConfigError> {
+    let requested = match settings {
+        ProfileLaunchSettings::Vllm(s) => s.requested_budget.kv_cache_bytes,
+        ProfileLaunchSettings::Sglang(s) => s.requested_budget.kv_cache_bytes,
+        ProfileLaunchSettings::Fake(_) => return Ok(()),
+    };
+    // The Ready phase may name one allocation per domain; the KV cache is spread
+    // across them, so the bound is their total.
+    let ready = resources
+        .ready
+        .allocations
+        .iter()
+        .fold(0_i64, |total, a| total.saturating_add(a.bytes));
+    if requested > ready {
+        return Err(invalid(
+            "runtime_profiles.launch_settings.requested_budget",
+            "requested KV exceeds the Ready allocation admission accounts for",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
     if h.schema_version != 1 || h.kind != "host" {
         return Err(invalid("host", "schema version 1 and host kind required"));
@@ -125,6 +258,12 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         if value.is_empty() {
             return Err(invalid(path, "must not be empty"));
         }
+    }
+    // Spec §7: the store anchors every relative model path, so it has to be a
+    // place, not a fragment that means something different per working directory.
+    let model_store = PathBuf::from(h.model_store.path);
+    if !model_store.is_absolute() {
+        return Err(invalid("host.model_store.path", "must be absolute"));
     }
     let mut domains = BTreeMap::new();
     for (name, raw) in h.resource_policy.domains {
@@ -184,6 +323,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
         environment_fingerprint: h.environment_fingerprint,
+        model_store,
         domains,
         devices: h.resource_policy.devices,
         max_parked,
@@ -283,7 +423,6 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
 
 pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), ConfigError> {
     for (path, value) in [
-        ("model.path", &d.model.path),
         ("model.content_fingerprint", &d.model.content_fingerprint),
         ("model.revision", &d.model.revision),
         ("recipe", &d.recipe),
@@ -292,9 +431,9 @@ pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), Conf
             return Err(invalid(path, "must not be empty"));
         }
     }
-    if !Path::new(&d.model.path).is_absolute() {
-        return Err(invalid("model.path", "must be absolute"));
-    }
+    // The model source itself is checked by `normalize_model`, which is the only
+    // way a `ModelIdentity` is built; there is no absolute-path rule left here
+    // because a relative local path is legal and resolves against the host store.
     let resources = &d.resources;
     domain::validate_recipe(&domain::RecipeFootprints {
         cold: domain_phase(&resources.cold, domain::ResourcePhase::Cold),
@@ -360,7 +499,8 @@ pub(super) fn recipe_fingerprint(
         args: &'a [String],
         launch_settings: &'a ProfileLaunchSettings,
         env: &'a BTreeMap<String, String>,
-        experimental_controls: bool,
+        deep_park: DeepPark,
+        trust_remote_code: bool,
         runtime_auth: bool,
         admin_auth: bool,
         log_policy: &'a LogPolicy,
@@ -383,7 +523,8 @@ pub(super) fn recipe_fingerprint(
         args: &profile.args,
         launch_settings: &profile.launch_settings,
         env: &profile.env,
-        experimental_controls: profile.security.experimental_controls,
+        deep_park: profile.security.deep_park,
+        trust_remote_code: profile.security.trust_remote_code,
         runtime_auth: profile.security.credential_ref.is_some(),
         admin_auth: profile.security.admin_credential_ref.is_some(),
         log_policy: &profile.log_policy,

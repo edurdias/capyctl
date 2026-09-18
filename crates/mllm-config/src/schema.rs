@@ -136,11 +136,29 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("parked", PHASE),
         ("wake", PHASE),
     ];
-    const MODEL: &[(&str, FieldSpec)] = &[
+    // Spec §7: a deployment names where its weights come from. The union of every
+    // variant's keys is listed once; which subset is legal is decided by the tagged
+    // `ModelSource` in `effective.rs`, so a `repo` on an `http` source is refused
+    // there rather than being silently ignored here.
+    const MODEL_SOURCE: FieldSpec = FieldSpec::Struct(&[
+        ("type", SCALAR),
         ("path", SCALAR),
+        ("repo", SCALAR),
+        ("revision", SCALAR),
+        ("locked_commit", SCALAR),
+        ("url", SCALAR),
+        ("sha256", SCALAR),
+    ]);
+    const MODEL: &[(&str, FieldSpec)] = &[
+        // Spec §7: `path` predates `source` and still means a local source.
+        ("path", SCALAR),
+        ("source", MODEL_SOURCE),
         ("content_fingerprint", SCALAR),
         ("revision", SCALAR),
     ];
+    // Spec §7: the directory a host keeps model weights under. A host states it
+    // once; a deployment's relative local path is resolved against it.
+    const MODEL_STORE: FieldSpec = FieldSpec::RequiredStruct(&[("path", SCALAR)]);
     const DOMAIN: FieldSpec = FieldSpec::Struct(&[
         ("managed_limit", BYTES),
         ("free_reserve", BYTES),
@@ -170,7 +188,12 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("queue", FieldSpec::Struct(QUEUE)),
     ];
     const SECURITY: &[(&str, FieldSpec)] = &[
-        ("experimental_controls", SCALAR),
+        // Spec §3: `deep_park` replaces `experimental_controls`. It is a switch over
+        // one named capability rather than a blanket "I accept experiments", and it
+        // defaults to enabled, so omitting it keeps parking available.
+        ("deep_park", SCALAR),
+        // Spec §3: executing checkpoint-supplied Python is opt-in per host.
+        ("trust_remote_code", SCALAR),
         ("credential_ref", SCALAR),
         ("admin_credential_ref", SCALAR),
     ];
@@ -217,6 +240,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("name", SCALAR),
         ("state_dir", SCALAR),
         ("connection", SCALAR),
+        // Spec §7: allowed here so a standalone document can carry the store the
+        // host block is translated into; the generated default does not set one yet.
+        ("model_store", MODEL_STORE),
         ("resource_policy", FieldSpec::Struct(RESOURCE_POLICY)),
         // Emitted empty by the generator; empty allowlist accepts `{}`
         // only until profile shapes are specified.
@@ -235,11 +261,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             ],
         },
         ConfigKind::Host => &KindSchema {
-            required: &["schema_version", "kind", "name"],
+            // Spec §7: the model store is required, not defaulted. Guessing a
+            // directory would make a relative model path resolve somewhere the
+            // operator never named.
+            required: &["schema_version", "kind", "name", "model_store"],
             fields: &[
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
+                ("model_store", MODEL_STORE),
                 ("listeners", LISTENERS),
                 ("hardware_fingerprint", SCALAR),
                 ("environment_fingerprint", SCALAR),

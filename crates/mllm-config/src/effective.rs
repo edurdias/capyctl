@@ -7,7 +7,7 @@ mod snapshot;
 pub use snapshot::decode_effective_snapshot;
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
 
-use crate::engine_policy::{validate_profile_args, validate_profile_env};
+use crate::engine_policy::{normalize_option_name, validate_profile_args, validate_profile_env};
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
 use mllm_domain::launch::{
@@ -18,7 +18,7 @@ use mllm_domain::resources as domain;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn invalid(path: impl Into<String>, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
@@ -144,12 +144,59 @@ pub struct EffectiveDeployment {
     pub recipe_fingerprint: String,
 }
 
+/// Where a deployment's weights come from, per SPEC §7.
+///
+/// Only `Local` names a file the host already holds. `HuggingFace` and `Http`
+/// describe a fetch that a later slice performs; the resolver validates their
+/// shape and stops there, because a resolver that reached the network would make
+/// validating a configuration depend on a remote service being up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelSource {
+    /// A path on the host. Relative paths resolve against the host's model store;
+    /// an absolute path is taken as written.
+    Local { path: String },
+    /// A Hugging Face repository. `revision` is a branch or tag; `locked_commit`
+    /// is the immutable commit a fetch must end up at.
+    #[serde(rename = "huggingface")]
+    HuggingFace {
+        repo: String,
+        #[serde(default)]
+        revision: Option<String>,
+        #[serde(default)]
+        locked_commit: Option<String>,
+    },
+    /// An archive over HTTPS, pinned by content digest.
+    Http { url: String, sha256: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelIdentity {
-    pub path: String,
+    pub source: ModelSource,
+    /// The absolute local path the source resolves to, or `None` where it does not
+    /// resolve to one yet. Read it through [`ModelIdentity::require_resolved_path`]
+    /// rather than unwrapping, so a caller that needs a real file fails closed.
+    pub resolved_path: Option<String>,
     pub content_fingerprint: String,
     pub revision: String,
+}
+
+impl ModelIdentity {
+    /// The local path, or `NotMaterializable` for a source that has none.
+    ///
+    /// SPEC §13.3: a launch needs a directory on disk. Anything that cannot name
+    /// one must refuse rather than invent a cache location.
+    pub fn require_resolved_path(&self) -> Result<&str, ConfigError> {
+        self.resolved_path.as_deref().ok_or_else(|| {
+            ConfigError::new(
+                ConfigErrorCode::NotMaterializable,
+                "model.source",
+                "this model source names no local path; only a local source \
+                 resolves to one before the fetcher lands",
+            )
+        })
+    }
 }
 
 /// Which park a deployment asks for, per SPEC §6.2.
@@ -228,10 +275,35 @@ pub struct RuntimeProfile {
     pub log_policy: LogPolicy,
 }
 
+/// Whether this profile may park at all, per SPEC §3.
+///
+/// It replaces `experimental_controls`, which asked an operator to accept
+/// "experiments" in general and then gated one specific thing. This names the
+/// capability being switched, and defaults to enabled so that a host file written
+/// before the rename keeps parking rather than silently losing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepPark {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+impl DeepPark {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Security {
-    pub experimental_controls: bool,
+    #[serde(default)]
+    pub deep_park: DeepPark,
+    /// Whether this profile may run an engine flag that executes Python shipped
+    /// inside a checkpoint. SPEC §3: off unless the host says otherwise.
+    #[serde(default)]
+    pub trust_remote_code: bool,
     pub credential_ref: Option<String>,
     pub admin_credential_ref: Option<String>,
 }
@@ -247,6 +319,10 @@ pub struct HostPolicy {
     pub name: String,
     pub hardware_fingerprint: String,
     pub environment_fingerprint: String,
+    /// Absolute directory this host keeps model weights under. SPEC §7: a relative
+    /// local model path is resolved against it, so it is required rather than
+    /// defaulted — a guessed directory would resolve paths somewhere unnamed.
+    pub model_store: PathBuf,
     pub domains: BTreeMap<String, DomainPolicy>,
     pub devices: BTreeMap<String, DevicePolicy>,
     pub max_parked: u32,
@@ -306,7 +382,7 @@ struct DeploymentInput {
     schema_version: u32,
     kind: String,
     name: String,
-    model: ModelIdentity,
+    model: RawModel,
     routes: Vec<String>,
     runtime_profile: String,
     runtime_profile_revision: u64,
@@ -317,6 +393,26 @@ struct DeploymentInput {
     resources: RawRecipe,
     request_deadline: Option<String>,
 }
+/// A deployment's `model` block as written. SPEC §7 accepts two spellings: the
+/// original `path`, and `source`, which can also name a remote origin. Exactly one
+/// of them must be present, so a file cannot state a path and a source that differ.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModel {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    source: Option<ModelSource>,
+    content_fingerprint: String,
+    revision: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelStore {
+    path: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRecipe {
@@ -347,6 +443,7 @@ struct HostInput {
     name: String,
     hardware_fingerprint: String,
     environment_fingerprint: String,
+    model_store: RawModelStore,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
 }
@@ -604,12 +701,11 @@ fn normalize_launch(
                     "invalid vLLM launch settings",
                 ));
             }
-            if residency.parks() && !value.enable_sleep_mode {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.enable_sleep_mode",
-                    "a parking vLLM deployment requires sleep mode",
-                ));
-            }
+            // Spec §3: sleep mode is no longer refused here when the deployment
+            // parks. The effective sleep behaviour is `enable_sleep_mode &&
+            // deep_park == Enabled`, derived where the launch is rendered; a
+            // profile that declares a parking residency with sleep mode off is a
+            // profile that will restart instead, not a configuration error.
             ProfileLaunchSettings::Vllm(value)
         }
         RawLaunchSettings::Sglang {
@@ -736,7 +832,7 @@ pub fn resolve_effective(
     let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
     let host = core::normalize_host(h)?;
     let recipe = core::NormalizedRecipe {
-        model: d.model,
+        model: core::normalize_model(d.model, Some(&host.model_store))?,
         recipe: d.recipe,
         residency: d.residency,
         recovery: d.recovery,
@@ -756,6 +852,7 @@ pub fn resolve_effective(
             .unwrap_or(host.queue.request_deadline_ms),
     };
     core::validate_recipe(&recipe, &host)?;
+    core::validate_requested_budget(&profile.launch_settings, &recipe.resources)?;
     let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,

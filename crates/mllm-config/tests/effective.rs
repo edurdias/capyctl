@@ -1,6 +1,6 @@
 use mllm_config::effective::{
     binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, DomainMemory, Engine, Residency,
+    resolve_effective, DeepPark, DomainMemory, Engine, ModelSource, Residency,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
@@ -136,25 +136,21 @@ fn residency_auto_is_refused() {
     assert_eq!(error.path, "deployment.residency", "{error:?}");
 }
 
-/// ADR 0010 decision 3 widened the vLLM sleep-mode gate from `residency ==
-/// Residency::Warm` to `residency.parks()`, so both parking tiers require it, not
-/// only one. Narrowing the condition back to `Residency::Deep` alone would pass the
-/// rest of the suite, so this asserts both tiers explicitly and on the field path,
-/// not merely that resolution fails for some reason.
+/// Spec §3: sleep mode stopped being a precondition of a parking residency. The
+/// rendered launch derives its sleep behaviour from `enable_sleep_mode &&
+/// deep_park == Enabled`, so a profile with sleep mode off describes a deployment
+/// that restarts instead of parking, which is a supported configuration rather
+/// than a rejected one. The switch that does refuse a parking deployment is
+/// `deep_park`, asserted separately below.
 #[test]
-fn a_parking_vllm_profile_without_sleep_mode_is_rejected() {
+fn a_parking_vllm_profile_resolves_without_sleep_mode() {
     for residency in ["host_backed", "deep"] {
         let (mut deployment, mut host) = fixture();
         deployment["residency"] = residency.into();
         host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
         host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
-        let error = resolve_effective(&deployment, &host)
-            .expect_err(&format!("{residency} without sleep mode must be rejected"));
-        assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination, "{residency}: {error:?}");
-        assert_eq!(
-            error.path, "runtime_profiles.launch_settings.enable_sleep_mode",
-            "{residency}: {error:?}"
-        );
+        resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{residency} must resolve: {error}"));
     }
 }
 
@@ -527,7 +523,7 @@ fn qualification_dimensions_fail_to_alias() {
     let enabled = resolve_effective(&restart, &controls)
         .unwrap()
         .recipe_fingerprint;
-    controls["runtime_profiles"]["local"]["security"]["experimental_controls"] = false.into();
+    controls["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
     assert_ne!(
         enabled,
         resolve_effective(&restart, &controls)
@@ -894,4 +890,242 @@ fn strict_yaml_rejects_duplicate_nested_keys() {
     let yaml = include_str!("fixtures/f2-deployment.yaml");
     let error = parse_strict(ConfigKind::Deployment, yaml).unwrap_err();
     assert_eq!(error.code, ConfigErrorCode::DuplicateKey);
+}
+
+/// Spec §3: a host that switches deep park off must not accept a deployment that
+/// asks to park. Refusing at resolution is the only place the contradiction is
+/// visible; accepted, it would surface as a park that never happens under memory
+/// pressure, long after the deployment was admitted.
+#[test]
+fn deep_park_disabled_with_parking_residency_is_refused() {
+    for residency in ["host_backed", "deep"] {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = residency.into();
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+        let error = resolve_effective(&deployment, &host)
+            .expect_err("a parking residency on a disabled profile is refused");
+        assert_eq!(
+            error.path, "runtime_profiles.security.deep_park",
+            "{residency}: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("deep_park"), "{residency}: {text}");
+        assert!(text.contains("restart_only"), "{residency}: {text}");
+    }
+    // The same host accepts the deployment that never parks.
+    let (mut deployment, mut host) = fixture();
+    deployment["residency"] = "restart_only".into();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+    resolve_effective(&deployment, &host).expect("restart_only does not park");
+}
+
+/// Spec §3: omitting the switch keeps parking available. A host file written
+/// before the rename from `experimental_controls` must not silently lose the
+/// capability it already had.
+#[test]
+fn deep_park_defaults_to_enabled() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]
+        .as_object_mut()
+        .expect("security is an object")
+        .remove("deep_park");
+    let effective = resolve_effective(&deployment, &host).expect("the default resolves");
+    assert_eq!(effective.profile.security.deep_park, DeepPark::Enabled);
+    assert!(effective.profile.security.deep_park.is_enabled());
+    assert_eq!(effective.residency, Residency::Deep);
+}
+
+/// Spec §3: `--trust-remote-code` makes the engine execute Python that arrived with
+/// the checkpoint. It stays on the approved argument list, so the only thing that
+/// stops it being passed by habit is the host's own switch.
+#[test]
+fn trust_remote_code_arg_needs_the_host_switch() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--trust-remote-code"]);
+    let error =
+        resolve_effective(&deployment, &host).expect_err("the flag without the switch is refused");
+    assert_eq!(
+        error.path, "runtime_profiles.security.trust_remote_code",
+        "{error:?}"
+    );
+
+    host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
+    let effective = resolve_effective(&deployment, &host).expect("the switch permits the flag");
+    assert!(effective.profile.security.trust_remote_code);
+
+    // The switch on its own changes nothing about a profile that does not pass it.
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
+    resolve_effective(&deployment, &host).expect("an unused switch is harmless");
+}
+
+/// Spec §7: a host declares the directory its weights live under, and a relative
+/// local model path means "inside it". An absolute path is taken as written, even
+/// outside the store: which directories may hold weights is the operator's
+/// decision, and confining them would stop a host serving a checkpoint it has.
+#[test]
+fn model_store_is_required_and_local_paths_resolve_against_it() {
+    let (deployment, mut host) = fixture();
+    host.as_object_mut()
+        .expect("host is an object")
+        .remove("model_store");
+    let error = resolve_effective(&deployment, &host).expect_err("the store is required");
+    assert_eq!(error.code, ConfigErrorCode::MissingRequired, "{error:?}");
+
+    let (deployment, mut host) = fixture();
+    host["model_store"]["path"] = "relative/store".into();
+    let error = resolve_effective(&deployment, &host).expect_err("the store must be absolute");
+    assert_eq!(error.path, "host.model_store.path", "{error:?}");
+
+    for (declared, expected) in [
+        ("qwen3-4b", "/srv/models/qwen3-4b"),
+        ("/anywhere/x", "/anywhere/x"),
+    ] {
+        let (mut deployment, host) = fixture();
+        let model = deployment["model"].as_object_mut().expect("model object");
+        model.remove("path");
+        model.insert(
+            "source".into(),
+            serde_json::json!({"type": "local", "path": declared}),
+        );
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
+        assert_eq!(
+            effective.model.source,
+            ModelSource::Local {
+                path: declared.into()
+            },
+            "{declared}"
+        );
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(expected),
+            "{declared}"
+        );
+        assert_eq!(
+            effective.model.require_resolved_path().unwrap(),
+            expected,
+            "{declared}"
+        );
+    }
+}
+
+/// Spec §7: the resolver validates the shape of a remote source and stops. It
+/// performs no fetch, so it can name no local path; a caller that needs one is
+/// told so rather than handed a guessed cache directory.
+#[test]
+fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
+    let with_source = |source: serde_json::Value| {
+        let (mut deployment, host) = fixture();
+        let model = deployment["model"].as_object_mut().expect("model object");
+        model.remove("path");
+        model.insert("source".into(), source);
+        (deployment, host)
+    };
+    let digest = "a".repeat(64);
+
+    for source in [
+        serde_json::json!({"type": "huggingface", "repo": "Qwen/Qwen3-4B"}),
+        serde_json::json!({
+            "type": "huggingface", "repo": "Qwen/Qwen3-4B",
+            "revision": "main", "locked_commit": "cafe1234"
+        }),
+        serde_json::json!({"type": "http", "url": "https://example.test/w.tar", "sha256": digest}),
+    ] {
+        let (deployment, host) = with_source(source.clone());
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{source} must resolve: {error}"));
+        assert_eq!(effective.model.resolved_path, None, "{source}");
+        let error = effective
+            .model
+            .require_resolved_path()
+            .expect_err("a remote source has no local path");
+        assert_eq!(error.code, ConfigErrorCode::NotMaterializable, "{source}");
+    }
+
+    // An omitted revision is legal; an empty one is not, and neither is a plain
+    // HTTP URL or a digest that is not 64 hexadecimal characters.
+    for source in [
+        serde_json::json!({"type": "huggingface", "repo": ""}),
+        serde_json::json!({"type": "huggingface", "repo": "r", "revision": ""}),
+        serde_json::json!({"type": "http", "url": "http://example.test/w.tar", "sha256": digest}),
+        serde_json::json!({"type": "http", "url": "https://example.test/w.tar", "sha256": "abc"}),
+        serde_json::json!({
+            "type": "http", "url": "https://example.test/w.tar",
+            "sha256": "z".repeat(64)
+        }),
+        serde_json::json!({"type": "local", "path": ""}),
+        serde_json::json!({"type": "s3", "path": "/w"}),
+    ] {
+        let (deployment, host) = with_source(source.clone());
+        assert!(
+            resolve_effective(&deployment, &host).is_err(),
+            "{source} must be refused"
+        );
+    }
+}
+
+/// Spec §3: admission reserves the Ready footprint before the engine starts, so a
+/// requested KV cache larger than that reservation would hand the engine a grant
+/// nothing accounted for. The overrun would otherwise appear much later, as an
+/// out-of-memory kill on a deployment that had already been accepted.
+#[test]
+fn requested_kv_above_ready_allocation_is_refused() {
+    // The lab fixture's Ready phase allocates 8GiB.
+    let (deployment, mut host) = fixture();
+    let budget = &mut host["runtime_profiles"]["local"]["launch_settings"]["requested_budget"];
+    budget["kv_cache_bytes"] = "8GiB".into();
+    resolve_effective(&deployment, &host).expect("a request equal to the allocation is accepted");
+
+    host["runtime_profiles"]["local"]["launch_settings"]["requested_budget"]["kv_cache_bytes"] =
+        "9GiB".into();
+    let error = resolve_effective(&deployment, &host).expect_err("9GiB exceeds the 8GiB Ready");
+    assert_eq!(
+        error.path, "runtime_profiles.launch_settings.requested_budget",
+        "{error:?}"
+    );
+
+    // The same bound applies to SGLang, which states its budget differently.
+    let (deployment, mut host) = fixture();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = "sglang".into();
+    profile["args"] = serde_json::json!([]);
+    profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+    profile["launch_settings"] = serde_json::json!({
+        "engine": "sglang", "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
+        "requested_budget": {"kv_cache_bytes": "9GiB", "static_memory_fraction_bps": 7500}
+    });
+    assert!(resolve_effective(&deployment, &host).is_err(), "sglang");
+}
+
+/// Spec §7: `model: { path }` predates `source` and keeps working, meaning exactly
+/// a local source. Stating both is refused rather than resolved by precedence,
+/// because a file that says two different things about its weights is a mistake.
+#[test]
+fn legacy_model_path_is_a_local_source() {
+    let (deployment, host) = fixture();
+    let effective = resolve_effective(&deployment, &host).expect("the legacy spelling resolves");
+    assert_eq!(
+        effective.model.source,
+        ModelSource::Local {
+            path: "/srv/models/toy".into()
+        }
+    );
+    assert_eq!(
+        effective.model.resolved_path.as_deref(),
+        Some("/srv/models/toy")
+    );
+
+    let (mut deployment, host) = fixture();
+    deployment["model"]["source"] = serde_json::json!({"type": "local", "path": "/other"});
+    let error = resolve_effective(&deployment, &host).expect_err("both spellings is a mistake");
+    assert_eq!(error.path, "model", "{error:?}");
+
+    let (mut deployment, host) = fixture();
+    deployment["model"]
+        .as_object_mut()
+        .expect("model object")
+        .remove("path");
+    assert!(resolve_effective(&deployment, &host).is_err(), "neither");
 }

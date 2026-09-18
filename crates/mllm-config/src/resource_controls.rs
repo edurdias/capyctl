@@ -123,6 +123,7 @@ mod tests {
             name: context.host_id,
             hardware_fingerprint: "hardware-secret-owner".into(),
             environment_fingerprint: "environment-secret-owner".into(),
+            model_store: "/srv/models".into(),
             domains: controls.domains,
             devices: BTreeMap::from([(
                 "gpu0".into(),

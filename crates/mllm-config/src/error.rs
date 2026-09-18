@@ -23,6 +23,12 @@ pub enum ConfigErrorCode {
     ContradictoryConnection,
     #[error("schema version / kind mismatch")]
     SchemaVersion,
+    /// The named model source has no local path yet. SPEC §13.3 keeps fetching
+    /// out of the resolver: only a local source names a file the host already
+    /// holds, so asking a `huggingface` or `http` source where its weights are
+    /// is answered with this rather than with a guessed cache location.
+    #[error("model source is not materializable")]
+    NotMaterializable,
     /// Filesystem/OS-level failures: unreadable files, missing paths
     /// (including an explicit config path that does not exist), failed
     /// atomic writes, unreadable OS entropy. Callers distinguishing

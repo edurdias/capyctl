@@ -30,7 +30,9 @@ pub fn deployment_command_fingerprint(
         return Err(invalid("routes", "duplicate route"));
     }
     let recipe = core::NormalizedRecipe {
-        model: input.model,
+        // No host is in hand here, so nothing is resolved against a model store:
+        // a command's identity must depend on the command alone.
+        model: core::normalize_model(input.model, None)?,
         recipe: input.recipe,
         residency: input.residency,
         recovery: input.recovery,

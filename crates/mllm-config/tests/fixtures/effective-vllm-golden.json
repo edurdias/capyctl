@@ -101,6 +101,9 @@
       "environment_fingerprint": "env-01",
       "hardware_fingerprint": "hw-01",
       "kind": "host",
+      "model_store": {
+        "path": "/srv/models"
+      },
       "name": "lab",
       "resource_policy": {
         "device_sharing": "shared",
@@ -167,7 +170,7 @@
           "revision": 7,
           "security": {
             "credential_ref": "secret://engine-key",
-            "experimental_controls": true
+            "deep_park": "enabled"
           }
         }
       },
@@ -199,6 +202,7 @@
       "environment_fingerprint": "env-01",
       "hardware_fingerprint": "hw-01",
       "max_parked": 16,
+      "model_store": "/srv/models",
       "name": "lab",
       "observation_ttl_ms": 2000,
       "planner_max_states": 4096,
@@ -212,8 +216,12 @@
     },
     "model": {
       "content_fingerprint": "sha256:model",
-      "path": "/srv/models/toy",
-      "revision": "r1"
+      "resolved_path": "/srv/models/toy",
+      "revision": "r1",
+      "source": {
+        "path": "/srv/models/toy",
+        "type": "local"
+      }
     },
     "name": "toy",
     "profile": {
@@ -249,11 +257,12 @@
       "security": {
         "admin_credential_ref": null,
         "credential_ref": "secret://engine-key",
-        "experimental_controls": true
+        "deep_park": "enabled",
+        "trust_remote_code": false
       }
     },
     "recipe": "standard",
-    "recipe_fingerprint": "d1aa844beb6830c02eaf8edf93b322e40e5faff2045b23bcc4c0f1ad21c7e2c2",
+    "recipe_fingerprint": "751975f79429dadf0676247ee9a5c46c656bc07b374011841123128ad58871ce",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
     "residency": "deep",
