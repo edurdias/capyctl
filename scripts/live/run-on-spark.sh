@@ -10,7 +10,14 @@ set -euo pipefail
 HOST=host-a
 [ "${1:-$HOST}" = "$HOST" ] || { echo "only $HOST is authorized" >&2; exit 2; }
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-ssh -o BatchMode=yes "$HOST" 'if pgrep -af "sglang.launch_server|vllm serve|EngineCore" ; then echo "another engine is on the box; refusing" >&2; exit 3; fi'
+# The pattern is written so it cannot match its own text. The pre-flight arrives on
+# the box as `bash -c '... pgrep -af "..." ...'`, and over a Tailscale SSH the
+# tailscaled wrapper carries the same string, so a plain pattern matched the command
+# that was asking the question and refused on an empty box. Bracketing one character
+# of each alternative leaves the regex meaning unchanged while the literal argv it
+# appears in no longer matches it. The grep filter drops the remaining wrappers, so
+# what is printed is engines and nothing else.
+ssh -o BatchMode=yes "$HOST" 'if pgrep -af "sglang[.]launch_server|vllm[ ]serve|Engine[C]ore|sglang::scheduler" | grep -vE "pgrep|tailscaled|bash -c"; then echo "another engine is on the box; refusing" >&2; exit 3; fi'
 rsync -az --delete --exclude target --exclude .git --exclude .superpowers ./ "$HOST:~/mllm-f2/"
 ssh -o BatchMode=yes "$HOST" bash -s <<'REMOTE'
 set -euo pipefail

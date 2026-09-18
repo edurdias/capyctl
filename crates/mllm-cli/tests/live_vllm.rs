@@ -121,6 +121,40 @@ fn pid_exists(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Every process whose argv names a running engine, as `(pid, argv)`.
+///
+/// The obvious way to ask this is `pgrep -af "vllm serve"`, and the obvious way is
+/// wrong: pgrep matches its pattern against the argv of every process including the
+/// shell that is asking, so the question answers itself and reports an engine on an
+/// empty host. Reading `/proc` and skipping this process asks the same question with
+/// nothing that can match its own text.
+fn engine_processes() -> Vec<(u32, String)> {
+    let mine = std::process::id();
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == mine {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let argv = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if ["vllm serve", "EngineCore", "sglang.launch_server"]
+            .iter()
+            .any(|marker| argv.contains(marker))
+        {
+            found.push((pid, argv.trim().to_string()));
+        }
+    }
+    found
+}
+
 /// Every local address a socket is listening on, as `(hex address, port)`.
 ///
 /// Parsed from `/proc/net/tcp` and `/proc/net/tcp6` rather than shelled out to
@@ -609,6 +643,14 @@ async fn l1_to_l5_cycle() {
             .iter()
             .any(|(_, port)| *port == engine_port),
         "the engine's port is still listening after the stop"
+    );
+    // Stronger than the recorded pids being gone: a process the launch never
+    // recorded would survive that check and is exactly what an incomplete group
+    // teardown leaves behind.
+    let survivors = engine_processes();
+    assert!(
+        survivors.is_empty(),
+        "an engine process outlived the stop: {survivors:?}"
     );
 
     // L5: the restart is a new launch, not a resumed one.
