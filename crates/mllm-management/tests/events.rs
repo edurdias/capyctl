@@ -8,8 +8,7 @@ use tower::ServiceExt;
 const MANAGEMENT: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 
-#[path = "../../mllm-controller/tests/support/fixture.rs"]
-mod fixture;
+use mllm_testkit::fixture;
 
 #[tokio::test]
 async fn unarmed_stop_writer_events_replay_to_sse_without_cleanup_epoch() {

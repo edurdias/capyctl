@@ -22,8 +22,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-#[path = "../../mllm-controller/tests/support/fixture.rs"]
-mod fixture;
+use mllm_testkit::fixture;
 const MANAGEMENT: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 struct Observations(Vec<MemoryObservation>);
@@ -58,7 +57,7 @@ async fn setup_with_observations(
     std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let owner = Arc::new(Mutex::new(OwnedCoordinatorState::open(dir.path()).unwrap()));
-    let worker = OwnedCoordinator::spawn_fake(
+    let worker = mllm_testkit::spawn_fake_coordinator(
         owner.clone(),
         observations.unwrap_or_else(|| Arc::new(Observations(source.observations.clone()))),
         Arc::new(|| Ok::<_, CoordinatorError>(1900)),
@@ -66,7 +65,7 @@ async fn setup_with_observations(
     )
     .unwrap();
     let host: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let configuration = Arc::new(
@@ -632,7 +631,7 @@ async fn composed_sources_reject_mismatched_owned_state_and_stale_sessions() {
     let (_dir, owner, worker, id, app) = setup().await;
     let (_other_dir, other, other_worker, _, _) = setup().await;
     let host: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let source = Arc::new(

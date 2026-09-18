@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mllm_adapters::fake::FakeEngine;
+use mllm_testkit::FakeEngine;
 use mllm_adapters::traits::RenderedCommand;
 use mllm_controller::{
     DurableRuntimeSupervisor, RuntimeAction, RuntimeBinding, RuntimeBindings, RuntimeError,
@@ -38,7 +38,7 @@ impl NativeFixture {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let source: Value = serde_json::from_str(include_str!(
-            "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+            "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
         ))
         .unwrap();
         let host = source["input"]["host"].clone();

@@ -22,6 +22,7 @@ async-stream = "0.3"
 async-trait = { workspace = true }
 
 [dev-dependencies]
+mllm-testkit = { workspace = true }
 async-trait = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 futures = { workspace = true }

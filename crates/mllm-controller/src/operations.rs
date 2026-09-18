@@ -1,6 +1,6 @@
 //! The controller operation engine (design §5): submits deployments
 //! transactionally (via mllm-store), executes lifecycle transitions
-//! against engine/launcher participants (the fake pair in F0), records
+//! against the engine and launcher participants it is given, records
 //! evidence in `journal_entries`, and moves the observed state strictly
 //! through the legal transition table (mllm-domain).
 //!
@@ -67,7 +67,7 @@ pub const EMBEDDED_HOST_ID: &str = "embedded-local";
 /// (vLLM on GB10: ~1-3 min cold); 10 minutes covers cold init while the
 /// bound keeps a wedged activation a timeout, not a hang (T20).
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
-/// Readiness-poll interval (fake readiness is immediate; real engines
+/// Readiness-poll interval (a test engine answers immediately; real engines
 /// poll this often until their own deadline).
 const READINESS_POLL: Duration = Duration::from_millis(10);
 /// Grace given to a terminating engine process.
@@ -245,13 +245,11 @@ pub struct Controller {
     handles: Arc<Mutex<HashMap<String, OwnedHandle>>>,
     /// Host deep-park policy (F1 design §7): the opt-in gates the
     /// experimental profile itself, not just park/reload operations.
-    park_policy: mllm_adapters::fake::ParkPolicy,
+    park_policy: mllm_adapters::ParkPolicy,
     /// Park depth for managed parks: level 2 (deep) under the opt-in —
     /// level 1 frees nothing on unified-memory hosts (design finding);
     /// level 1 for restart-only hosts.
     park_level: mllm_adapters::ParkLevel,
-    /// The embedded fake engine handle (qualification/ambiguity injection).
-    embedded_fake: Option<Arc<mllm_adapters::fake::FakeEngine>>,
     /// Bound on how long `wait_terminal` waits for a terminal operation
     /// state (`OPERATION_TIMEOUT` by default; shortened by tests to
     /// exercise the timeout branch deterministically).
@@ -264,14 +262,14 @@ impl Controller {
         adapter: Arc<dyn EngineAdapter>,
         launcher: Arc<dyn Launcher>,
     ) -> Self {
-        Self::new_with_policy(store, adapter, launcher, mllm_adapters::fake::ParkPolicy::Disabled)
+        Self::new_with_policy(store, adapter, launcher, mllm_adapters::ParkPolicy::Disabled)
     }
 
     pub fn new_with_policy(
         store: Arc<Mutex<Store>>,
         adapter: Arc<dyn EngineAdapter>,
         launcher: Arc<dyn Launcher>,
-        park_policy: mllm_adapters::fake::ParkPolicy,
+        park_policy: mllm_adapters::ParkPolicy,
     ) -> Self {
         Self {
             store,
@@ -281,12 +279,11 @@ impl Controller {
             host_id: EMBEDDED_HOST_ID.to_string(),
             handles: Arc::new(Mutex::new(HashMap::new())),
             park_policy,
-            park_level: if park_policy == mllm_adapters::fake::ParkPolicy::Enabled {
+            park_level: if park_policy == mllm_adapters::ParkPolicy::Enabled {
                 mllm_adapters::ParkLevel::Two
             } else {
                 mllm_adapters::ParkLevel::One
             },
-            embedded_fake: None,
             operation_timeout: OPERATION_TIMEOUT,
         }
     }
@@ -296,13 +293,6 @@ impl Controller {
     /// timeout branch deterministically).
     pub fn with_operation_timeout(mut self, d: Duration) -> Self {
         self.operation_timeout = d;
-        self
-    }
-
-    /// Attach the embedded fake engine handle (ambiguity injection for the
-    /// qualification suite).
-    pub fn with_embedded_fake(mut self, fake: Arc<mllm_adapters::fake::FakeEngine>) -> Self {
-        self.embedded_fake = Some(fake);
         self
     }
 
@@ -448,7 +438,7 @@ impl Controller {
                     .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?
             };
             let qualified = kind == "vllm-sleep"
-                && self.park_policy == mllm_adapters::fake::ParkPolicy::Enabled;
+                && self.park_policy == mllm_adapters::ParkPolicy::Enabled;
             if !qualified {
                 return Err(ControllerError::OperationFailed {
                     op: "preinitialize".to_string(),
@@ -480,7 +470,7 @@ impl Controller {
                 .get_deployment(deployment)?
                 .map(|r| r.kind)
                 .unwrap_or_default();
-            if kind == "vllm-sleep" && self.park_policy != mllm_adapters::fake::ParkPolicy::Enabled {
+            if kind == "vllm-sleep" && self.park_policy != mllm_adapters::ParkPolicy::Enabled {
                 let op = OperationId(format!("op-{}", ulid::Ulid::new()));
                 store.record_operation(NewOperation {
                     id: op.clone(),
@@ -1050,16 +1040,6 @@ impl Controller {
         self.adapter.observe_work(&member).await
     }
 
-    /// Test/qualification hook: mark the embedded fake engine's parks as
-    /// ambiguous (effect applied, ack lost). Only available when the
-    /// adapter is the fake; real adapters inject ambiguity at the engine.
-    pub fn fake_engine(&self) -> Option<Arc<mllm_adapters::fake::FakeEngine>> {
-        // Downcast through the shared adapter slot is not possible on
-        // Arc<dyn EngineAdapter> without Any; the agent supplies the fake
-        // handle separately. This helper exists for the embedded host.
-        self.embedded_fake.clone()
-    }
-
     /// Router-path auto-activation (T10): wakes an on-demand-eligible
     /// deployment, but NEVER undoes an administrative stop — a suspended
     /// deployment rejects activation here.
@@ -1103,7 +1083,7 @@ impl Controller {
 mod tests {
     use super::*;
     use mllm_adapters::Phase;
-    use mllm_adapters::fake::{FakeEngine, FakeLauncher};
+    use mllm_testkit::{FakeEngine, FakeLauncher};
 
     fn controller(engine: FakeEngine) -> (Controller, Arc<FakeEngine>, Arc<FakeLauncher>) {
         let engine = Arc::new(engine);
@@ -1338,7 +1318,7 @@ mod tests {
             store,
             Arc::new(NeverReadyAdapter),
             Arc::new(FakeLauncher::new()),
-            mllm_adapters::fake::ParkPolicy::Disabled,
+            mllm_adapters::ParkPolicy::Disabled,
         )
         .with_operation_timeout(Duration::from_millis(150));
         let dep = c.submit_deploy(req("never-ready-m")).await.unwrap();

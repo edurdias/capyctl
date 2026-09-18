@@ -1,12 +1,12 @@
-//! A deterministic fake engine implementing [`crate::traits::EngineAdapter`].
+//! A deterministic fake engine implementing [`mllm_adapters::traits::EngineAdapter`].
 //!
 //! The fake is the executable spec of the behavioral contracts the real F1/F2
 //! adapters must honor: slow startup (liveness is not readiness), park levels
 //! with distinct memory-retention signatures, ambiguous outcomes (effect
 //! applied, ack lost), the deep-park policy gate, and crash injection.
 
-use crate::policy::ParkPolicy;
-use crate::traits::*;
+use mllm_adapters::traits::*;
+use mllm_adapters::ParkPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,7 +43,7 @@ struct Knobs {
 /// A parked must not make B unready).
 pub struct FakeEngine {
     lifecycle_clock: Option<Arc<dyn Fn() -> Result<i64, RuntimeError> + Send + Sync>>,
-    lifecycle: Mutex<Option<super::lifecycle::LifecycleState>>,
+    lifecycle: Mutex<Option<crate::lifecycle::LifecycleState>>,
     knobs: Mutex<Knobs>,
     states: Mutex<HashMap<String, MemberState>>,
     started_at: std::time::Instant,
@@ -74,7 +74,7 @@ impl FakeEngine {
     /// Opt in to the separate persisted lifecycle state machine.
     pub fn with_lifecycle() -> Self {
         let engine = Self::new();
-        *engine.lifecycle.lock().unwrap() = Some(super::lifecycle::LifecycleState::default());
+        *engine.lifecycle.lock().unwrap() = Some(crate::lifecycle::LifecycleState::default());
         engine
     }
 
@@ -89,7 +89,7 @@ impl FakeEngine {
     }
 
     /// Fault injection for the opt-in lifecycle runtime.
-    pub fn with_fault(self, fault: super::FakeFault) -> Self {
+    pub fn with_fault(self, fault: crate::FakeFault) -> Self {
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             state.fault = Some(fault);
         }
@@ -414,12 +414,12 @@ impl EngineAdapter for FakeEngine {
 }
 
 #[async_trait]
-impl crate::traits::ChatForward for FakeEngine {
+impl mllm_adapters::traits::ChatForward for FakeEngine {
     async fn forward_chat_stream_async(
         &self,
         body: &serde_json::Value,
-        sink: &mut dyn crate::traits::ChatSink,
-    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+        sink: &mut dyn mllm_adapters::traits::ChatSink,
+    ) -> Result<mllm_adapters::traits::StreamEnded, AdapterError> {
         // Lifecycle fault streams retain their explicit synchronous
         // collector contract. Never buffer that generator to fake async support.
         if self.lifecycle.lock().unwrap().is_some() {
@@ -435,7 +435,7 @@ impl crate::traits::ChatForward for FakeEngine {
             }
         }
         // This ordinary fake generates no external work to reconcile.
-        Ok(crate::traits::StreamEnded::Completed)
+        Ok(mllm_adapters::traits::StreamEnded::Completed)
     }
     async fn forward_chat(
         &self,
@@ -456,7 +456,7 @@ impl crate::traits::ChatForward for FakeEngine {
         &self,
         body: &serde_json::Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
-    ) -> Result<crate::traits::StreamEnded, AdapterError> {
+    ) -> Result<mllm_adapters::traits::StreamEnded, AdapterError> {
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
             return state.stream(body, on_chunk);
         }
@@ -465,6 +465,6 @@ impl crate::traits::ChatForward for FakeEngine {
             r#"{{"id":"fake-stream","model":"{model}","choices":[{{"delta":{{"content":"hel"}}}}]}}"#
         ));
         on_chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#.to_string());
-        Ok(crate::traits::StreamEnded::Completed)
+        Ok(mllm_adapters::traits::StreamEnded::Completed)
     }
 }

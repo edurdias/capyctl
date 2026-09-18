@@ -1,4 +1,3 @@
-pub mod fake;
 pub mod forward;
 pub mod sglang;
 pub mod resolve;
@@ -7,6 +6,16 @@ pub mod traits;
 pub mod vllm;
 
 pub use policy::ParkPolicy;
+
+/// Where the park policy used to live, kept as a path only.
+///
+/// The Fake engine and the fake launcher left this crate for `mllm-testkit`; the
+/// owner's untracked live test still spells the policy's old location, and this
+/// branch may not edit that file. Nothing else may use this path.
+#[doc(hidden)]
+pub mod fake {
+    pub use crate::policy::ParkPolicy;
+}
 pub use traits::*;
 
 #[cfg(test)]

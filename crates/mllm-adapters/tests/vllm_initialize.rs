@@ -503,11 +503,41 @@ async fn a_context_that_is_not_an_owned_vllm_launch_is_unsupported() {
     ));
 
     let mut other_family = initialize_command(30_000);
-    other_family.context.launch_settings = Some(ProfileLaunchSettings::Fake(
-        mllm_domain::launch::FakeLaunchSettings,
-    ));
+    other_family.context.launch_settings =
+        Some(ProfileLaunchSettings::Sglang(sglang_settings()));
     assert!(matches!(
         adapter.execute_persisted(&other_family).await,
         Err(RuntimeError::Unsupported)
     ));
+}
+
+/// Another family's launch settings, for the check that a vLLM builder refuses a
+/// command carrying a plan it was never verified against.
+fn sglang_settings() -> mllm_domain::launch::SglangLaunchSettings {
+    mllm_domain::launch::SglangLaunchSettings {
+        recipe: "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1".into(),
+        tensor_parallel_size: 1,
+        data_parallel_size: 1,
+        tokenizer_workers: 1,
+        model_dtype: "bfloat16".into(),
+        context_tokens: 4096,
+        max_running_requests: 8,
+        max_total_tokens: 4096,
+        prefill_cuda_graphs: false,
+        decode_cuda_graphs: false,
+        memory_saver: true,
+        cpu_weight_backup: false,
+        speculative_decoding: false,
+        lora: false,
+        trust_remote_code: false,
+        disaggregation: false,
+        external_cache: false,
+        cpu_kv_offload: false,
+        native_grpc: false,
+        weight_restore: "disk_reload".into(),
+        requested_budget: mllm_domain::launch::SglangRequestedBudget {
+            kv_cache_bytes: 4_294_967_296,
+            static_memory_fraction_bps: 7500,
+        },
+    }
 }

@@ -45,7 +45,6 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     )?;
     let settings = &mut profile["launch_settings"];
     match settings["engine"].as_str() {
-        Some("fake") => {}
         Some("vllm") => {
             unit(settings, "cpu_offload_bytes", "cpu_offload_bytes", "B")?;
             unit(

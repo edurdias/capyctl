@@ -170,11 +170,11 @@ async fn ready_deps(pending: bool) -> (mllm_router::RouterDeps, String) {
     let store = Arc::new(std::sync::Mutex::new(
         mllm_store::Store::open_in_memory().unwrap(),
     ));
-    let fake = Arc::new(mllm_adapters::fake::FakeEngine::new());
+    let fake = Arc::new(mllm_testkit::FakeEngine::new());
     let controller = Arc::new(mllm_controller::Controller::new(
         store.clone(),
         fake,
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     let id = controller
         .submit_deploy(mllm_controller::DeployRequest {

@@ -285,11 +285,11 @@ impl EngineProvider for EnvEngineProvider {
 
     fn bindings(
         &self,
-        clock: ServiceClock,
+        _clock: ServiceClock,
         log_dir: PathBuf,
         runtime_dir: PathBuf,
     ) -> Arc<dyn EngineBindings> {
-        Arc::new(ProfileBindings::new(clock, log_dir, runtime_dir))
+        Arc::new(ProfileBindings::new(log_dir, runtime_dir))
     }
 
     fn tools_factory(&self) -> ToolsFactory {
@@ -378,55 +378,6 @@ fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
         )));
     }
     Ok(fingerprint)
-}
-
-/// The embedded Fake, as an installation, for the tests that have not moved to the
-/// testkit yet.
-///
-/// It is not `#[cfg(test)]` because the integration tests are separate crates and
-/// cannot see this crate's test configuration. It leaves the product with the Fake
-/// engine (Task 13 removes it, together with this helper).
-#[doc(hidden)]
-pub fn fake_provider() -> Arc<dyn EngineProvider> {
-    Arc::new(FakeProvider)
-}
-
-#[doc(hidden)]
-struct FakeProvider;
-
-impl EngineProvider for FakeProvider {
-    fn installation(&self) -> Result<EngineInstallation, ProviderError> {
-        Ok(EngineInstallation {
-            engine: Engine::Fake,
-            executable: PathBuf::from("/bin/true"),
-            build_fingerprint: "fake-v1".into(),
-            launch_settings: serde_json::json!({"engine": "fake"}),
-            deep_park: false,
-            trust_remote_code: false,
-            // The Fake reads no weights, so its store only has to be a real
-            // absolute directory for the host policy to be valid.
-            models_root: std::env::temp_dir(),
-            runtime_dir: std::env::temp_dir(),
-            args: Vec::new(),
-        })
-    }
-
-    fn bindings(
-        &self,
-        clock: ServiceClock,
-        log_dir: PathBuf,
-        runtime_dir: PathBuf,
-    ) -> Arc<dyn EngineBindings> {
-        // The Fake arm of the shared bindings, so the test path resolves a spec the
-        // same way the product does rather than through a second implementation.
-        Arc::new(ProfileBindings::new(clock, log_dir, runtime_dir))
-    }
-
-    fn tools_factory(&self) -> ToolsFactory {
-        // A Fake driver is given no tools, so this is never called; it must still
-        // be a factory that produces something rather than a panic.
-        Arc::new(|association| Arc::new(DurableProcessLaunch::new(association)))
-    }
 }
 
 /// Boot the embedded standalone graph (SPEC §15.2 no-config matrix) against the

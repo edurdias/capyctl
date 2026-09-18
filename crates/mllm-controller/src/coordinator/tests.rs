@@ -9,8 +9,7 @@ mod cleanup;
 #[path = "tests_start_command.rs"]
 mod start_command;
 
-#[path = "../../tests/support/fixture.rs"]
-mod fixture;
+use mllm_testkit::{fixture, FakeEngine};
 
 struct Observations(Vec<MemoryObservation>);
 impl ServiceObservation for Observations {
@@ -157,6 +156,57 @@ impl EngineAdapter for Gate {
     ) -> Result<CancellationOutcome, AdapterError> {
         Err(AdapterError::UnsupportedCapability)
     }
+}
+
+/// A coordinator that drives the Fake engine on every binding.
+///
+/// This is what `OwnedCoordinator::spawn_fake` was before the Fake left the
+/// product: the driver factory is the seam, and the engine behind it now comes
+/// from the testkit. Passing here is never qualification of an engine recipe.
+fn spawn_fake(
+    owner: SharedCoordinatorState,
+    observations: Arc<dyn ServiceObservation>,
+    clock: ServiceClock,
+    options: CoordinatorOptions,
+) -> Result<OwnedCoordinator, CoordinatorError> {
+    let observation_clock = clock.clone();
+    OwnedCoordinator::spawn(
+        owner,
+        observations,
+        clock,
+        options,
+        Arc::new(move |work| {
+            if work.endpoint().is_empty() || work.credential_ref().is_empty() {
+                return Err(CoordinatorError::Service(
+                    "frozen binding lacks an endpoint or credential reference".into(),
+                ));
+            }
+            let clock = observation_clock.clone();
+            let engine = Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(move || {
+                clock().map_err(|_| {
+                    RuntimeError::Uncertain("service observation clock failed".into())
+                })
+            })));
+            let cleanup = engine.clone();
+            Ok(Arc::new(Driver {
+                engine,
+                cleanup: Arc::new(move |context| {
+                    let engine = cleanup.clone();
+                    Box::pin(async move {
+                        engine
+                            .lifecycle_cleanup_observed(
+                                &context.binding_id,
+                                &context.incarnation,
+                                &context.identities,
+                            )
+                            .map_err(|e| CoordinatorError::Service(e.to_string()))
+                    })
+                }),
+                // The Fake launches nothing, so there is nothing to terminate.
+                tools: None,
+            }))
+        }),
+    )
 }
 
 fn worker(
@@ -701,7 +751,7 @@ async fn a_second_worker_cannot_claim_the_same_owned_session() {
         Gate::new(false),
         CoordinatorOptions::default(),
     );
-    assert!(OwnedCoordinator::spawn_fake(
+    assert!(spawn_fake(
         owner,
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
@@ -1026,7 +1076,7 @@ async fn real_elapsed_service_clock_bounds_provenance_before_send() {
             })
         }
     }
-    let w = OwnedCoordinator::spawn_fake(
+    let w = spawn_fake(
         owner,
         Arc::new(FreshSource(clock.clone())),
         clock,
@@ -1182,7 +1232,7 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
 #[tokio::test]
 async fn completed_observer_rejects_binding_identity_and_evidence_corruption() {
     let (dir, owner, fence, observations) = setup().await;
-    let w = OwnedCoordinator::spawn_fake(
+    let w = spawn_fake(
         owner.clone(),
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
@@ -2029,61 +2079,9 @@ mod cleanup_evidence {
 /// the host and never here.
 mod native {
     use super::*;
-    use mllm_domain::completion::{Presence, ProcessIdentity};
-
-    /// A builder's process tools, scripted. It launches nothing: these tests drive
-    /// the director's decisions, and every one of them is about what mllm does with
-    /// processes it has already recorded.
-    struct ScriptedTool {
-        terminations: Mutex<Vec<Vec<ProcessIdentity>>>,
-        refusal: Option<String>,
-    }
-    impl ScriptedTool {
-        fn proving() -> Arc<Self> {
-            Arc::new(Self {
-                terminations: Mutex::new(Vec::new()),
-                refusal: None,
-            })
-        }
-        /// Tools that signal and then cannot prove the group gone.
-        fn unprovable() -> Arc<Self> {
-            Arc::new(Self {
-                terminations: Mutex::new(Vec::new()),
-                refusal: Some("a recorded process could not be proven gone".into()),
-            })
-        }
-        fn terminations(&self) -> Vec<Vec<ProcessIdentity>> {
-            self.terminations.lock().unwrap().clone()
-        }
-    }
-    impl OwnedProcessLaunch for ScriptedTool {
-        fn spawn_durable(
-            &self,
-            _: &str,
-            _: &RenderedCommand,
-        ) -> Result<ProcessIdentity, RuntimeError> {
-            Err(RuntimeError::Uncertain(
-                "the scripted tool starts no process".into(),
-            ))
-        }
-        fn present(&self, _: &ProcessIdentity) -> Presence {
-            Presence::Gone
-        }
-        fn observe_group(&self, _: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
-            Ok(Vec::new())
-        }
-        fn terminate_owned(
-            &self,
-            identities: &[ProcessIdentity],
-            _: Duration,
-        ) -> Result<(), RuntimeError> {
-            self.terminations.lock().unwrap().push(identities.to_vec());
-            match &self.refusal {
-                Some(reason) => Err(RuntimeError::Uncertain(reason.clone())),
-                None => Ok(()),
-            }
-        }
-    }
+    // The scripted tools live in the testkit: a real process would make these
+    // decisions depend on the host the suite happens to run on.
+    use mllm_testkit::ScriptedTool;
 
     /// A driver for a builder that owns its processes: the real cleanup closure and
     /// the tools the failure path terminates with.
@@ -2447,7 +2445,7 @@ mod native {
     async fn terminate_grace_must_fit_protocol_timeout() {
         let (_dir, owner, _fence, observations) = setup().await;
         let spawn = |options| {
-            OwnedCoordinator::spawn_fake(
+            spawn_fake(
                 owner.clone(),
                 Arc::new(Observations(observations.clone())),
                 Arc::new(|| Ok(1900)),

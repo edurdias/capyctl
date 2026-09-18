@@ -1,6 +1,6 @@
 //! Deterministic lifecycle state for the Fake engine: persisted effects,
 //! cleanup and parked status.
-use crate::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
+use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
 use mllm_domain::completion::{EffectObservation, Milestone, ProcessIdentity};
 
 #[derive(Clone, Copy, Debug)]
@@ -12,8 +12,8 @@ pub enum FakeFault {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct LifecycleState {
-    pub(super) fault: Option<FakeFault>,
+pub(crate) struct LifecycleState {
+    pub(crate) fault: Option<FakeFault>,
     binding: Option<(String, String)>,
     deployment: Option<String>,
     members: Vec<ProcessIdentity>,
@@ -28,7 +28,7 @@ pub(super) struct LifecycleState {
     alive: bool,
 }
 impl LifecycleState {
-    pub(super) fn cleanup(
+    pub(crate) fn cleanup(
         &mut self,
         binding: &str,
         incarnation: &str,
@@ -44,7 +44,7 @@ impl LifecycleState {
         })
     }
 
-    pub(super) fn cleanup_with_clock(
+    pub(crate) fn cleanup_with_clock(
         &mut self,
         binding: &str,
         incarnation: &str,
@@ -92,14 +92,14 @@ impl LifecycleState {
             receipt: "fake-lifecycle-v1:verified-api-and-worker-gone".into(),
         })
     }
-    pub(super) fn activity(&self) -> (u64, u64, u64) {
+    pub(crate) fn activity(&self) -> (u64, u64, u64) {
         (
             self.request_attempts,
             self.control_attempts,
             self.work_sequence,
         )
     }
-    pub(super) fn members(
+    pub(crate) fn members(
         &self,
         context: &mllm_domain::completion::StepExecutionContext,
     ) -> Result<Vec<ProcessIdentity>, RuntimeError> {
@@ -121,7 +121,7 @@ impl LifecycleState {
         }
         Ok(actual)
     }
-    pub(super) fn parked_status(
+    pub(crate) fn parked_status(
         &self,
         c: &mllm_domain::completion::StepExecutionContext,
     ) -> Result<mllm_domain::completion::ParkedStatusObservation, RuntimeError> {
@@ -145,41 +145,41 @@ impl LifecycleState {
             },
         )
     }
-    pub(super) fn forward(
+    pub(crate) fn forward(
         &mut self,
         body: &serde_json::Value,
-    ) -> Result<serde_json::Value, crate::traits::AdapterError> {
+    ) -> Result<serde_json::Value, mllm_adapters::traits::AdapterError> {
         self.request_attempts += 1;
         if !self.allocations || !self.weights || !self.cache {
-            return Err(crate::traits::AdapterError::PolicyDenied);
+            return Err(mllm_adapters::traits::AdapterError::PolicyDenied);
         }
         let model = format!(
             "candidate-{}",
             self.deployment
                 .as_deref()
-                .ok_or(crate::traits::AdapterError::UnsupportedCombination)?
+                .ok_or(mllm_adapters::traits::AdapterError::UnsupportedCombination)?
         );
         let content = match body["messages"][0]["content"].as_str() {
             Some("Repeat exactly: MLLM_READY_13") => "MLLM_READY_13",
             Some("Repeat exactly: MLLM_ALPHA_71") => "MLLM_ALPHA_71",
             Some("Repeat exactly: MLLM_BETA_29") => "MLLM_BETA_29",
-            _ => return Err(crate::traits::AdapterError::PolicyDenied),
+            _ => return Err(mllm_adapters::traits::AdapterError::PolicyDenied),
         };
         let expected = serde_json::json!({"model":model,"messages":[{"role":"user","content":format!("Repeat exactly: {content}")}],"temperature":0,"max_tokens":16,"stream":false});
         if body != &expected {
-            return Err(crate::traits::AdapterError::PolicyDenied);
+            return Err(mllm_adapters::traits::AdapterError::PolicyDenied);
         }
         self.quiesced = false;
         self.work_sequence += 1;
         match self.fault {
             Some(FakeFault::LostProbeReply) => {
                 self.unknown_work = true;
-                return Err(crate::traits::AdapterError::Uncertain(
+                return Err(mllm_adapters::traits::AdapterError::Uncertain(
                     "lifecycle probe reply lost".into(),
                 ));
             }
             Some(FakeFault::FailedProbe) => {
-                return Err(crate::traits::AdapterError::PolicyDenied);
+                return Err(mllm_adapters::traits::AdapterError::PolicyDenied);
             }
             _ => {}
         }
@@ -197,13 +197,13 @@ impl LifecycleState {
         }
         Ok(response)
     }
-    pub(super) fn stream(
+    pub(crate) fn stream(
         &mut self,
         body: &serde_json::Value,
         on_chunk: &mut (dyn FnMut(String) + Send),
-    ) -> Result<crate::traits::StreamEnded, crate::traits::AdapterError> {
+    ) -> Result<mllm_adapters::traits::StreamEnded, mllm_adapters::traits::AdapterError> {
         if body["stream"] != true {
-            return Err(crate::traits::AdapterError::PolicyDenied);
+            return Err(mllm_adapters::traits::AdapterError::PolicyDenied);
         }
         let mut nonstream = body.clone();
         nonstream["stream"] = serde_json::json!(false);
@@ -218,17 +218,17 @@ impl LifecycleState {
             on_chunk(raw);
         }
         on_chunk(serde_json::json!({"model":model,"choices":[{"index":0,"delta":{},"finish_reason":response["choices"][0]["finish_reason"]}]}).to_string());
-        Ok(crate::traits::StreamEnded::Completed)
+        Ok(mllm_adapters::traits::StreamEnded::Completed)
     }
     #[cfg(test)]
-    pub(super) fn execute(
+    pub(crate) fn execute(
         &mut self,
         command: &RuntimeCommand,
     ) -> Result<EffectObservation, RuntimeError> {
         self.execute_with_clock(command, None)
     }
 
-    pub(super) fn execute_with_clock(
+    pub(crate) fn execute_with_clock(
         &mut self,
         command: &RuntimeCommand,
         clock: Option<&(dyn Fn() -> Result<i64, RuntimeError> + Send + Sync)>,
@@ -274,10 +274,12 @@ impl LifecycleState {
         }
         let mut facts = match command.action {
             RuntimeAction::Initialize if self.binding.is_none() => {
-                if !matches!(
-                    c.launch_settings,
-                    Some(mllm_domain::launch::ProfileLaunchSettings::Fake(_))
-                ) {
+                // Spec §4: an Initialize carries the frozen launch the deployment
+                // was admitted against. The Fake starts no process, so it reads
+                // nothing out of those settings and accepts whichever family they
+                // name; a command carrying none is still refused, because the
+                // coordinator would then be arming a binding with no plan behind it.
+                if c.launch_settings.is_none() {
                     return Err(RuntimeError::Unsupported);
                 }
                 self.binding = Some((c.binding_id.clone(), c.incarnation.clone()));
@@ -374,7 +376,7 @@ impl LifecycleState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::RuntimeAction;
+    use mllm_adapters::traits::RuntimeAction;
     use mllm_domain::completion::{
         ExecutionIdentities, Milestone, StepExecutionContext, TransitionToken,
     };
@@ -396,9 +398,7 @@ mod tests {
                 identities: ExecutionIdentities::OwnedLaunch,
                 completion_target: None,
                 grant_id: Some("grant".into()),
-                launch_settings: Some(mllm_domain::launch::ProfileLaunchSettings::Fake(
-                    mllm_domain::launch::FakeLaunchSettings,
-                )),
+                launch_settings: Some(crate::vllm_launch_settings()),
             },
         }
     }
@@ -460,7 +460,8 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_samples_its_own_observation_clock_after_control() {
-        use crate::{fake::FakeEngine, traits::EngineAdapter};
+        use crate::FakeEngine;
+        use mllm_adapters::traits::EngineAdapter;
         use std::sync::{
             atomic::{AtomicI64, Ordering},
             Arc,
@@ -520,7 +521,8 @@ mod tests {
 
     #[tokio::test]
     async fn service_clock_timestamps_actual_fake_effect_and_failure_is_uncertain() {
-        use crate::{fake::FakeEngine, traits::EngineAdapter};
+        use crate::FakeEngine;
+        use mllm_adapters::traits::EngineAdapter;
         use std::sync::Arc;
         let c = command(RuntimeAction::Initialize, "initialize");
         let engine = FakeEngine::with_lifecycle_clock(Arc::new(|| Ok(1300)));

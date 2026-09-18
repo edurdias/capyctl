@@ -456,7 +456,7 @@ async fn cleanup_final_clock_expiry_denies_control_after_valid_store_check() {
 #[tokio::test]
 async fn cleanup_observer_rejects_corrupt_terminal_evidence_epoch_and_released_binding() {
     let (dir, owner, fence, observations) = setup().await;
-    let w = OwnedCoordinator::spawn_fake(
+    let w = spawn_fake(
         owner.clone(),
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
@@ -634,7 +634,7 @@ async fn stop_after_associated_initialize_uncertainty_keeps_original_worker() {
         InitializeStatus::Uncertain
     );
     assert!(w.start(&fence, 10000).is_err());
-    assert!(OwnedCoordinator::spawn_fake(
+    assert!(spawn_fake(
         owner.clone(),
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
@@ -766,7 +766,7 @@ async fn earlier_other_cleanup_does_not_hide_running_initialize_successor() {
 #[tokio::test]
 async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
     let (_dir, owner, fence, observations) = setup().await;
-    let w = OwnedCoordinator::spawn_fake(
+    let w = spawn_fake(
         owner.clone(),
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
@@ -807,7 +807,7 @@ async fn owned_start_ready_stop_releases_and_replays_original_receipt() {
     let next = {
         use serde_json::{json, Value};
         let golden: Value = serde_json::from_str(include_str!(
-            "../../../mllm-config/tests/fixtures/effective-fake-golden.json"
+            "../../../mllm-config/tests/fixtures/effective-vllm-golden.json"
         ))
         .unwrap();
         let mut config = golden["input"]["deployment"].clone();

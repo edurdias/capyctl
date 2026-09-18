@@ -21,6 +21,7 @@ http-body-util = "0.1"
 
 [dev-dependencies]
 mllm-adapters.workspace = true
+mllm-testkit.workspace = true
 mllm-scheduler.workspace = true
 mllm-domain.workspace = true
 tempfile.workspace = true

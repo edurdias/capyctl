@@ -6,15 +6,15 @@
 use std::sync::{Arc, Mutex};
 
 use mllm_controller::{Controller, DeployRequest};
-use mllm_adapters::fake::ParkPolicy;
+use mllm_adapters::ParkPolicy;
 use mllm_store::Store;
 
 fn controller(policy: ParkPolicy) -> (Arc<Controller>, Arc<Mutex<Store>>) {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let c = Arc::new(Controller::new_with_policy(
         store.clone(),
-        Arc::new(mllm_adapters::fake::FakeEngine::new()),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeEngine::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
         policy,
     ));
     (c, store)

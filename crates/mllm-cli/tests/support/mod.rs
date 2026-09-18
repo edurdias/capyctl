@@ -18,13 +18,13 @@ pub fn safe_state_dir() -> tempfile::TempDir {
     tempfile::TempDir::new_in(home).expect("a state directory under an owner-only root")
 }
 
-/// Boot standalone on the embedded Fake installation.
+/// Boot standalone on the testkit's Fake installation.
 ///
 /// Passing the installation in is what keeps these tests from depending on whatever
 /// engine the developer's environment happens to name. Passing this one is not
 /// qualification of a native recipe and must never be reported as one (SPEC §18).
 pub async fn boot(state_dir: &std::path::Path) -> mllm_cli::roles::App {
-    mllm_cli::roles::start_standalone_with(state_dir, mllm_cli::roles::fake_provider())
+    mllm_cli::roles::start_standalone_with(state_dir, mllm_testkit::fake_provider())
         .await
         .expect("standalone boots")
 }

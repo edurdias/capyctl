@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 mllm-domain = { workspace = true }
-mllm-adapters = { workspace = true }
 mllm-scheduler = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

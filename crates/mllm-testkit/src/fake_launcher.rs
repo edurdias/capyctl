@@ -1,10 +1,10 @@
-//! A deterministic fake [`crate::traits::Launcher`] with PID-reuse injection.
+//! A deterministic fake [`mllm_adapters::traits::Launcher`] with PID-reuse injection.
 //!
 //! `with_pid_reuse()` makes the next spawn after a terminate reuse the same
 //! PID with a new start identity — exactly the hazard the boot-unique
 //! `start_identity` field exists to detect.
 
-use crate::traits::*;
+use mllm_adapters::traits::*;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;

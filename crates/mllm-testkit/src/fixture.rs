@@ -8,16 +8,16 @@ use mllm_scheduler::residency::AdmissionContext;
 use mllm_store::Store;
 use serde_json::{json, Value};
 
-pub(crate) struct OwnedFixtureSource {
-    pub(crate) dir: tempfile::TempDir,
-    pub(crate) fence: mllm_store::lifecycle::DeploymentFence,
-    pub(crate) other: mllm_store::lifecycle::DeploymentFence,
-    pub(crate) observations: Vec<MemoryObservation>,
+pub struct OwnedFixtureSource {
+    pub dir: tempfile::TempDir,
+    pub fence: mllm_store::lifecycle::DeploymentFence,
+    pub other: mllm_store::lifecycle::DeploymentFence,
+    pub observations: Vec<MemoryObservation>,
 }
 
 /// Reuse an immutable SQLite image only in tests. Every row in it was written by
 /// the real writers below; each caller opens an independent copy.
-pub(crate) async fn owned_source() -> &'static OwnedFixtureSource {
+pub async fn owned_source() -> &'static OwnedFixtureSource {
     static SOURCE: tokio::sync::OnceCell<OwnedFixtureSource> = tokio::sync::OnceCell::const_new();
     SOURCE
         .get_or_init(|| async {
@@ -41,19 +41,19 @@ pub(crate) async fn owned_source() -> &'static OwnedFixtureSource {
         .await
 }
 
-pub(crate) struct Fixture {
-    pub(crate) store: Store,
-    pub(crate) session: mllm_store::dispatch::CoordinatorSession,
-    pub(crate) observations: Vec<MemoryObservation>,
-    pub(crate) limits: Vec<MemoryLimit>,
-    pub(crate) ttl: i64,
-    pub(crate) max_parked: usize,
-    pub(crate) sql: rusqlite::Connection,
-    pub(crate) _dir: tempfile::TempDir,
+pub struct Fixture {
+    pub store: Store,
+    pub session: mllm_store::dispatch::CoordinatorSession,
+    pub observations: Vec<MemoryObservation>,
+    pub limits: Vec<MemoryLimit>,
+    pub ttl: i64,
+    pub max_parked: usize,
+    pub sql: rusqlite::Connection,
+    pub _dir: tempfile::TempDir,
 }
 
 impl Fixture {
-    pub(crate) fn admission(&self) -> AdmissionContext<'_> {
+    pub fn admission(&self) -> AdmissionContext<'_> {
         AdmissionContext::new(
             &self.observations,
             &self.limits,
@@ -62,19 +62,19 @@ impl Fixture {
             self.max_parked,
         )
     }
-    pub(crate) fn scalar(&self, sql: &str) -> i64 {
+    pub fn scalar(&self, sql: &str) -> i64 {
         self.sql.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 }
 
 /// A store whose only durable state is the host's imported resource policy.
-pub(crate) fn fixture() -> Fixture {
+pub fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ordinary.db");
     let store = Store::open(&path).unwrap();
     let session = store.begin_coordinator_session().unwrap();
     let source: Value = serde_json::from_str(include_str!(
-        "../../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let policy = resolve_effective(&source["input"]["deployment"], &source["input"]["host"])
@@ -118,20 +118,20 @@ pub(crate) fn fixture() -> Fixture {
     }
 }
 
-pub(crate) fn managed(f: &Fixture, name: &str) -> mllm_store::lifecycle::DeploymentFence {
+pub fn managed(f: &Fixture, name: &str) -> mllm_store::lifecycle::DeploymentFence {
     managed_edit(f, name, |_, _| {})
 }
 
 /// One stopped managed deployment, created through the ordinary writer. The
 /// binding it produces derives its identity from the recipe and host alone
 /// (ADR 0011 decision 1); nothing here declares one separately.
-pub(crate) fn managed_edit(
+pub fn managed_edit(
     f: &Fixture,
     name: &str,
     edit: impl FnOnce(&mut Value, &mut Value),
 ) -> mllm_store::lifecycle::DeploymentFence {
     let source: Value = serde_json::from_str(include_str!(
-        "../../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let mut host = source["input"]["host"].clone();

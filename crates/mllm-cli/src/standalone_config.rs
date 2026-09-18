@@ -27,7 +27,6 @@ fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Vllm => "vllm",
         Engine::Sglang => "sglang",
-        Engine::Fake => "fake",
     }
 }
 

@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 #[test]
 fn normalized_snapshot_revalidates_settings_and_fingerprint() {
     for fixture in [
-        include_str!("fixtures/effective-fake-golden.json"),
         include_str!("fixtures/effective-vllm-golden.json"),
         include_str!("fixtures/effective-sglang-golden.json"),
     ] {

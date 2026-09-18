@@ -10,7 +10,6 @@
 //! plausible placeholders would produce a runtime that looks configured and is not.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use mllm_adapters::resolve::AdapterSpec;
 use mllm_adapters::vllm::args::{GrantedBudget, PlanInputVllm};
@@ -19,7 +18,7 @@ use mllm_config::engine_policy::Engine;
 use mllm_domain::launch::{ProfileLaunchSettings, VllmLaunchSettings};
 use mllm_store::ordinary_lifecycle::worker::InitializeWork;
 
-use crate::coordinator::{CoordinatorError, EngineBindings, ServiceClock};
+use crate::coordinator::{CoordinatorError, EngineBindings};
 
 /// The startup flags that put vLLM into the development mode its park controls
 /// live behind, with the eager checkpoint loader this project qualified on Spark:
@@ -40,23 +39,20 @@ fn sleep_flags(settings: &VllmLaunchSettings, deep_park_enabled: bool) -> Vec<St
 
 /// Builds adapter specs from frozen bindings.
 pub struct ProfileBindings {
-    clock: ServiceClock,
     log_dir: PathBuf,
     runtime_dir: PathBuf,
 }
 
 impl ProfileBindings {
-    /// The clock is the service's own. The Fake family stamps the milestones it
-    /// observes with it, so evidence is dated by the authority that reads it back
-    /// rather than by whatever the adapter could reach for itself.
-    ///
     /// `log_dir` is where the launcher writes each engine's own output, and
     /// `runtime_dir` holds mllm's guard middleware. Neither is part of the frozen
     /// effective configuration, because both are properties of this installation
     /// rather than of the deployment that was admitted.
-    pub fn new(clock: ServiceClock, log_dir: PathBuf, runtime_dir: PathBuf) -> Self {
+    ///
+    /// Nothing else is taken: every other input to a launch comes from the frozen
+    /// profile the deployment was admitted against.
+    pub fn new(log_dir: PathBuf, runtime_dir: PathBuf) -> Self {
         Self {
-            clock,
             log_dir,
             runtime_dir,
         }
@@ -190,18 +186,6 @@ impl EngineBindings for ProfileBindings {
                     // driver factory seals it under the binding before the builder
                     // is handed it.
                     engine_key: Some(hex::encode(mllm_store::secrets::new_engine_key())),
-                })
-            }
-            Engine::Fake => {
-                let clock = self.clock.clone();
-                Ok(AdapterSpec::Fake {
-                    clock: Arc::new(move || {
-                        clock().map_err(|_| {
-                            mllm_adapters::traits::RuntimeError::Uncertain(
-                                "service observation clock failed".into(),
-                            )
-                        })
-                    }),
                 })
             }
             Engine::Sglang => Err(Self::missing(

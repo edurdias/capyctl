@@ -13,8 +13,8 @@ fn controller() -> (Arc<Controller>, Arc<Mutex<Store>>) {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let c = Arc::new(Controller::new(
         store.clone(),
-        Arc::new(mllm_adapters::fake::FakeEngine::new()),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeEngine::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     (c, store)
 }
@@ -89,8 +89,8 @@ async fn generation_survives_new_controller_over_same_store() {
     // Fresh controller over the same store: generations continue (never reset).
     let c2 = Controller::new(
         store.clone(),
-        Arc::new(mllm_adapters::fake::FakeEngine::new()),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeEngine::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     );
     let op2 = c2
         .request_transition(&id, mllm_domain::LifecycleAction::Stop)

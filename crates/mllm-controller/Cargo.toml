@@ -24,6 +24,7 @@ mllm-launchers = { path = "../mllm-launchers" }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+mllm-testkit = { workspace = true }
 rusqlite = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }

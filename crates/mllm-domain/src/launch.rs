@@ -7,7 +7,6 @@ use serde::Serialize;
 pub enum ProfileLaunchSettings {
     Vllm(VllmLaunchSettings),
     Sglang(SglangLaunchSettings),
-    Fake(FakeLaunchSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,9 +57,6 @@ pub struct SglangRequestedBudget {
     pub kv_cache_bytes: i64,
     pub static_memory_fraction_bps: u16,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FakeLaunchSettings;
 
 /// Reviewed logical placement, not an observed CUDA index or physical UUID.
 /// Native startup must independently resolve and corroborate this selection.

@@ -20,7 +20,7 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         engine,
         executable: executable.into(),
         build_fingerprint: "fp-1".into(),
-        launch_settings: serde_json::json!({"engine": "fake"}),
+        launch_settings: mllm_testkit::vllm_launch_settings_json(),
         deep_park: false,
         trust_remote_code: false,
         models_root: "/srv/models".into(),
@@ -38,11 +38,11 @@ fn local(path: &str) -> ModelSource {
 /// every start refuse.
 #[test]
 fn the_host_declares_exactly_one_engine_installation() {
-    let host = host_policy(&installed(Engine::Fake, "/bin/true"), "env-1", CAPACITY);
+    let host = host_policy(&installed(Engine::Vllm, "/bin/true"), "env-1", CAPACITY);
     let profiles = host["runtime_profiles"].as_object().expect("profiles object");
     assert_eq!(profiles.len(), 1, "one installation, named not anonymous");
     let profile = &profiles[STANDALONE_PROFILE];
-    assert_eq!(profile["engine"], "fake");
+    assert_eq!(profile["engine"], "vllm");
     assert_eq!(profile["executable"], "/bin/true");
     assert_eq!(profile["build_fingerprint"], "fp-1");
 }
@@ -88,7 +88,7 @@ fn the_published_host_names_the_store_its_weights_live_under() {
 /// overcommitted, so a larger machine must yield larger limits.
 #[test]
 fn limits_scale_with_observed_capacity() {
-    let installation = installed(Engine::Fake, "/bin/true");
+    let installation = installed(Engine::Vllm, "/bin/true");
     let small = host_policy(&installation, "env-1", 16 << 30);
     let large = host_policy(&installation, "env-1", 128 << 30);
     let managed = |h: &Value| {
@@ -108,7 +108,7 @@ fn limits_scale_with_observed_capacity() {
 /// twice. Asserted on the produced policy, not on the constants that built it.
 #[test]
 fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
-    let host = host_policy(&installed(Engine::Fake, "/bin/true"), "env-1", CAPACITY);
+    let host = host_policy(&installed(Engine::Vllm, "/bin/true"), "env-1", CAPACITY);
     let bytes = |field: &str| {
         host["resource_policy"]["domains"][DOMAIN][field]
             .as_str()
@@ -193,7 +193,7 @@ fn the_deployment_states_its_model_source() {
 /// a host-backed park refusable rather than silently useless.
 #[test]
 fn the_published_host_declares_one_memory_pool() {
-    let host = host_policy(&installed(Engine::Fake, "/bin/true"), "env-1", 1 << 40);
+    let host = host_policy(&installed(Engine::Vllm, "/bin/true"), "env-1", 1 << 40);
     assert_eq!(
         host["resource_policy"]["domains"]["unified"]["memory"],
         "unified"

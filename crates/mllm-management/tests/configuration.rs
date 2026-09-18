@@ -31,7 +31,7 @@ fn fixture() -> (
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state = OwnedCoordinatorState::open(directory.path()).unwrap();
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let config = fixture["input"]["deployment"].clone();

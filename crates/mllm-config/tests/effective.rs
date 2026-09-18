@@ -166,24 +166,19 @@ fn restart_only_vllm_profile_is_accepted_without_sleep_mode() {
 
 #[test]
 fn ordinary_engine_compatibility_goldens() {
-    for engine in ["vllm", "sglang", "fake"] {
+    for engine in ["vllm", "sglang"] {
         let (deployment, mut host) = fixture();
         let profile = &mut host["runtime_profiles"]["local"];
         if engine != "vllm" {
             profile["engine"] = engine.into();
             profile["args"] = serde_json::json!([]);
-            profile["launch_settings"] = if engine == "sglang" {
-                profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
-                serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}})
-            } else {
-                serde_json::json!({"engine":"fake"})
-            };
+            profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+            profile["launch_settings"] = serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}});
         }
         let effective = resolve_effective(&deployment, &host).unwrap();
         let golden: serde_json::Value = serde_json::from_str(match engine {
             "vllm" => include_str!("fixtures/effective-vllm-golden.json"),
-            "sglang" => include_str!("fixtures/effective-sglang-golden.json"),
-            _ => include_str!("fixtures/effective-fake-golden.json"),
+            _ => include_str!("fixtures/effective-sglang-golden.json"),
         })
         .unwrap();
         assert_eq!(
@@ -564,8 +559,10 @@ fn unsupported_launch_mutations_fail_closed() {
         *host.pointer_mut(pointer).unwrap() = value;
         assert!(resolve_effective(&deployment, &host).is_err(), "{pointer}");
     }
+    // A profile that declares one family and carries another family's launch
+    // settings is refused: the block is closed per family (Spec §7).
     let (deployment, mut host) = fixture();
-    host["runtime_profiles"]["local"]["launch_settings"]["engine"] = "fake".into();
+    host["runtime_profiles"]["local"]["launch_settings"]["engine"] = "sglang".into();
     assert!(resolve_effective(&deployment, &host).is_err());
 }
 
@@ -775,21 +772,13 @@ fn resolver_rejects_secret_device_and_unrecognized_environment_names() {
 
 #[test]
 fn engines_without_reviewed_argument_allowlists_accept_only_empty_args() {
-    for engine in ["sglang", "fake"] {
-        let (deployment, mut host) = fixture();
-        host["runtime_profiles"]["local"]["engine"] = engine.into();
-        host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--max-model-len", "4096"]);
-        host["runtime_profiles"]["local"]["launch_settings"] = if engine == "sglang" {
-            serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}})
-        } else {
-            serde_json::json!({"engine":"fake"})
-        };
-        if engine == "sglang" {
-            host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
-                "secret://admin".into();
-        }
-        assert!(resolve_effective(&deployment, &host).is_err(), "{engine}");
-    }
+    let engine = "sglang";
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["engine"] = engine.into();
+    host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--max-model-len", "4096"]);
+    host["runtime_profiles"]["local"]["launch_settings"] = serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}});
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
+    assert!(resolve_effective(&deployment, &host).is_err(), "{engine}");
 }
 
 #[test]

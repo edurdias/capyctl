@@ -641,6 +641,7 @@ dependencies = [
  "libc",
  "mllm-adapters",
  "mllm-agent",
+ "mllm-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -1052,6 +1053,7 @@ dependencies = [
  "harness",
  "mllm-config",
  "mllm-domain",
+ "mllm-testkit",
  "reqwest",
  "serde",
  "serde_json",
@@ -1064,7 +1066,6 @@ name = "mllm-agent"
 version = "0.1.0"
 dependencies = [
  "hex",
- "mllm-adapters",
  "mllm-domain",
  "mllm-scheduler",
  "sha2",
@@ -1086,6 +1087,7 @@ dependencies = [
  "mllm-launchers",
  "mllm-router",
  "mllm-store",
+ "mllm-testkit",
  "reqwest",
  "serde_json",
  "tempfile",
@@ -1122,6 +1124,7 @@ dependencies = [
  "mllm-launchers",
  "mllm-scheduler",
  "mllm-store",
+ "mllm-testkit",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1171,6 +1174,7 @@ dependencies = [
  "mllm-domain",
  "mllm-scheduler",
  "mllm-store",
+ "mllm-testkit",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1206,6 +1210,7 @@ dependencies = [
  "mllm-controller",
  "mllm-domain",
  "mllm-store",
+ "mllm-testkit",
  "reqwest",
  "serde",
  "serde_json",
@@ -1240,6 +1245,23 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ulid",
+]
+
+[[package]]
+name = "mllm-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mllm-adapters",
+ "mllm-config",
+ "mllm-controller",
+ "mllm-domain",
+ "mllm-scheduler",
+ "mllm-store",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

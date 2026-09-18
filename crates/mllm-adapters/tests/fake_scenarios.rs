@@ -3,7 +3,8 @@
 //! Each test encodes one behavioral contract from the design that the real
 //! F1/F2 adapters must also honor; the fake engine is the executable spec.
 
-use mllm_adapters::fake::{FakeEngine, FakeLauncher, ParkPolicy};
+use mllm_adapters::ParkPolicy;
+use mllm_testkit::{FakeEngine, FakeLauncher};
 use mllm_adapters::{
     AdapterError, CancellationOutcome, EngineAdapter, Launcher, MemberRef, Phase, Readiness,
     RenderedCommand, RequestRef,
@@ -24,7 +25,7 @@ fn cmd() -> RenderedCommand {
 
 /// The fake engine's retained-buffer byte count at park level 2
 /// (weights and KV cache discarded, only buffers remain).
-const BUFFER_RESIDUE: i64 = mllm_adapters::fake::BUFFER_RESIDUE;
+const BUFFER_RESIDUE: i64 = mllm_testkit::BUFFER_RESIDUE;
 
 #[tokio::test]
 async fn slow_startup_liveness_is_not_readiness() {

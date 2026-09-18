@@ -1,4 +1,5 @@
-use mllm_adapters::fake::{FakeEngine, ParkPolicy};
+use mllm_adapters::ParkPolicy;
+use mllm_testkit::FakeEngine;
 use mllm_adapters::{EngineAdapter, MemberRef, ParkLevel};
 
 fn member() -> MemberRef {

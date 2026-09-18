@@ -228,7 +228,6 @@ pub(super) fn validate_requested_budget(
     let requested = match settings {
         ProfileLaunchSettings::Vllm(s) => s.requested_budget.kv_cache_bytes,
         ProfileLaunchSettings::Sglang(s) => s.requested_budget.kv_cache_bytes,
-        ProfileLaunchSettings::Fake(_) => return Ok(()),
     };
     // The Ready phase may name one allocation per domain; the KV cache is spread
     // across them, so the bound is their total.

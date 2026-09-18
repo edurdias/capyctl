@@ -7,7 +7,7 @@ use tower::ServiceExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use mllm_adapters::fake::FakeEngine;
+use mllm_testkit::FakeEngine;
 use mllm_controller::Controller;
 use mllm_router::forwarders::StaticForwarders;
 use mllm_router::{QueueLimits, RouterDeps};
@@ -26,7 +26,7 @@ async fn app() -> (
     let controller = Arc::new(Controller::new(
         shared.clone(),
         fake.clone() as Arc<dyn mllm_adapters::EngineAdapter>,
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     let deps = RouterDeps {
         controller: controller.clone(),

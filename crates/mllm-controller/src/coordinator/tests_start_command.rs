@@ -216,7 +216,7 @@ async fn scoped_stop_resolves_generation_and_replays_after_worker_shutdown() {
     .await
     .unwrap();
     let golden: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let mut config = golden["input"]["deployment"].clone();

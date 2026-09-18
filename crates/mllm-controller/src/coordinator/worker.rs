@@ -1,10 +1,8 @@
 use super::permits_send;
 use crate::ownership::SharedCoordinatorState;
 use futures::FutureExt;
-use mllm_adapters::{
-    fake::FakeEngine,
-    traits::{EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand},
-};
+use mllm_adapters::traits::{EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand};
+use mllm_config::engine_policy::Engine;
 use mllm_launchers::{AssociationError, LaunchAssociation};
 use mllm_domain::{
     completion::{CleanupEvidence, CompletionEvidence, OwnedLaunchReceipt},
@@ -516,6 +514,30 @@ pub trait EngineBindings: Send + Sync {
         &self,
         work: &InitializeWork,
     ) -> Result<mllm_adapters::resolve::AdapterSpec, CoordinatorError>;
+
+    /// The adapter one frozen binding is driven through.
+    ///
+    /// Resolution is the whole of it in production: the spec is built against the
+    /// family the profile declares, and a spec for any other family is refused
+    /// rather than quietly resolved. The step is a method rather than a fixed call
+    /// so that a test can drive the lifecycle against an engine it controls without
+    /// the coordinator gaining a second lane; everything before this point — the
+    /// frozen plan, the stored per-launch key, the process tools — is the same work
+    /// the product does.
+    fn adapter(
+        &self,
+        declared: Engine,
+        spec: mllm_adapters::resolve::AdapterSpec,
+        tools: Arc<dyn OwnedProcessLaunch>,
+    ) -> Result<Arc<dyn EngineAdapter>, CoordinatorError> {
+        Ok(Arc::from(
+            mllm_adapters::resolve::resolve(declared, spec, Some(tools)).map_err(|_| {
+                CoordinatorError::Service(
+                    "engine spec does not match the declared family".into(),
+                )
+            })?,
+        ))
+    }
 }
 
 /// Cleanup evidence for any engine family: the recorded processes are observed
@@ -655,15 +677,7 @@ impl OwnedCoordinator {
                         binding_id: work.binding_id().to_owned(),
                     });
                 let tools = tools_factory(association);
-                let engine: Arc<dyn EngineAdapter> = Arc::from(
-                    mllm_adapters::resolve::resolve(declared, spec, Some(tools.clone())).map_err(
-                        |_| {
-                            CoordinatorError::Service(
-                                "engine spec does not match the declared family".into(),
-                            )
-                        },
-                    )?,
-                );
+                let engine = bindings.adapter(declared, spec, tools.clone())?;
                 Ok(Arc::new(Driver {
                     engine,
                     cleanup: terminate_then_prove_gone(
@@ -672,65 +686,6 @@ impl OwnedCoordinator {
                         grace,
                     ),
                     tools: Some(tools),
-                }))
-            }),
-        )
-    }
-
-    /// First bounded lane: Fake only. Construction has no engine I/O,
-    /// and uses the immutable validated binding, never a profile lookup.
-    pub fn spawn_fake(
-        owner: SharedCoordinatorState,
-        observations: Arc<dyn ServiceObservation>,
-        clock: ServiceClock,
-        options: CoordinatorOptions,
-    ) -> Result<Self, CoordinatorError> {
-        let observation_clock = clock.clone();
-        Self::spawn(
-            owner,
-            observations,
-            clock,
-            options,
-            Arc::new(move |work| {
-                if work.effective().profile.engine != mllm_config::engine_policy::Engine::Fake
-                    || !matches!(
-                        work.effective().profile.launch_settings,
-                        mllm_domain::launch::ProfileLaunchSettings::Fake(_)
-                    )
-                    || work.endpoint().is_empty()
-                    || work.credential_ref().is_empty()
-                {
-                    return Err(CoordinatorError::Service(
-                        "unsupported frozen Fake binding".into(),
-                    ));
-                }
-                let clock = observation_clock.clone();
-                let engine = Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(
-                    move || {
-                        clock().map_err(|_| {
-                            mllm_adapters::traits::RuntimeError::Uncertain(
-                                "service observation clock failed".into(),
-                            )
-                        })
-                    },
-                )));
-                let cleanup = engine.clone();
-                Ok(Arc::new(Driver {
-                    engine,
-                    cleanup: Arc::new(move |context| {
-                        let engine = cleanup.clone();
-                        Box::pin(async move {
-                            engine
-                                .lifecycle_cleanup_observed(
-                                    &context.binding_id,
-                                    &context.incarnation,
-                                    &context.identities,
-                                )
-                                .map_err(|e| CoordinatorError::Service(e.to_string()))
-                        })
-                    }),
-                    // The Fake launches nothing, so there is nothing to terminate.
-                    tools: None,
                 }))
             }),
         )

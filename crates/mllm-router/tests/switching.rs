@@ -18,8 +18,8 @@ fn controller() -> (Arc<Controller>, Arc<Mutex<Store>>) {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let c = Arc::new(Controller::new(
         store.clone(),
-        Arc::new(mllm_adapters::fake::FakeEngine::new()),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeEngine::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     (c, store)
 }
@@ -167,11 +167,11 @@ async fn a_to_b_to_a_alternates_with_release_evidence() {
 #[tokio::test]
 async fn qualified_sleep_profile_keeps_park_restore_switch_path() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let policy = mllm_adapters::fake::ParkPolicy::Enabled;
+    let policy = mllm_adapters::ParkPolicy::Enabled;
     let c = Arc::new(Controller::new_with_policy(
         store.clone(),
-        Arc::new(mllm_adapters::fake::FakeEngine::new().with_policy(policy)),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeEngine::new().with_policy(policy)),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
         policy,
     ));
     let a = c.submit_deploy(DeployRequest { kind: "vllm-sleep".into(), ..req("sleep-a") }).await.unwrap();
@@ -193,7 +193,7 @@ async fn switch_failure_reopens_a_and_fails_b_fast() {
     let c = Arc::new(Controller::new(
         store.clone(),
         Arc::new(StuckAdapter),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     let a = deploy_and_start(&c, "stuck-a").await;
     let sw = mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_millis(200));

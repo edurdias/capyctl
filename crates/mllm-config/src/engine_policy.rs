@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum Engine {
     Vllm,
     Sglang,
-    Fake,
 }
 
 pub const VLLM_RESERVED_FLAGS: &[&str] = &[

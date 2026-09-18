@@ -71,13 +71,8 @@ fn vllm_work(deep_park: &str) -> InitializeWork {
         .expect("a freshly accepted start plans initialize work")
 }
 
-fn no_op_clock() -> ServiceClock {
-    Arc::new(|| Ok(0))
-}
-
 fn bindings() -> ProfileBindings {
     ProfileBindings::new(
-        no_op_clock(),
         PathBuf::from("/tmp/mllm-test-logs"),
         PathBuf::from("/tmp/mllm-test-runtime"),
     )

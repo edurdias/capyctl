@@ -2,9 +2,10 @@
 //! stop, deadline expiry and ordinary cleanup, all against managed deployments
 //! created by the ordinary writers. These tests were ported out of the deleted
 //! qualification support directory; ADR 0011 removed that concept entirely.
-use mllm_adapters::{fake::FakeEngine, traits::EngineAdapter};
+use mllm_adapters::traits::EngineAdapter;
+use mllm_testkit::FakeEngine;
 use mllm_controller::{RuntimeAction, RuntimeCommand};
-use mllm_controller::coordinator::{CoordinatorOptions, OwnedCoordinator, ServiceObservation};
+use mllm_controller::coordinator::{CoordinatorOptions, ServiceObservation};
 use mllm_controller::ownership::{OwnedCoordinatorState, SharedCoordinatorState};
 use mllm_domain::completion::{CleanupEvidence, CompletionEvidence, OwnedLaunchReceipt};
 use mllm_domain::resources::{MemoryLimit, MemoryObservation, ResourcePhase};
@@ -18,8 +19,7 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[path = "support/fixture.rs"]
-mod fixture;
+use mllm_testkit::fixture;
 
 /// The ordinary cleanup lane's local Fake execution, with the bounds the worker
 /// applies before it sends. This is what the deleted controller qualification
@@ -613,7 +613,7 @@ impl ServiceObservation for Observations {
 #[tokio::test]
 async fn owned_worker_initializes_once_for_joined_and_dropped_observers() {
     let (_dir, owner, fence, observations) = owned_fixture().await;
-    let worker = OwnedCoordinator::spawn_fake(
+    let worker = mllm_testkit::spawn_fake_coordinator(
         owner.clone(),
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
@@ -912,7 +912,7 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
     );
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch + 1);
     let golden: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let mut config = golden["input"]["deployment"].clone();
@@ -1833,7 +1833,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     );
     assert_eq!(counts(&sql), stopped);
     let golden: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let mut config = golden["input"]["deployment"].clone();
@@ -2172,7 +2172,7 @@ async fn expired_unarmed_is_atomic_at_deadline_and_replays_history_after_replace
     );
 
     let golden: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let mut config = golden["input"]["deployment"].clone();
@@ -2804,7 +2804,7 @@ async fn unarmed_stop_rolls_back_receipt_and_events_and_replays_after_replacemen
     );
     assert_eq!(state(&sql), before);
     let golden: Value = serde_json::from_str(include_str!(
-        "../../mllm-config/tests/fixtures/effective-fake-golden.json"
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
     let mut config = golden["input"]["deployment"].clone();

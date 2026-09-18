@@ -11,7 +11,7 @@ use crate::engine_policy::{normalize_option_name, validate_profile_args, validat
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
 use mllm_domain::launch::{
-    FakeLaunchSettings, ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget,
+    ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget,
     VllmLaunchSettings, VllmRequestedBudget,
 };
 use mllm_domain::resources as domain;
@@ -588,7 +588,6 @@ enum RawLaunchSettings {
         recipe: String,
         requested_budget: RawSglangBudget,
     },
-    Fake,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -773,15 +772,6 @@ fn normalize_launch(
                 weight_restore: weight_restore.into(),
                 requested_budget: budget,
             })
-        }
-        RawLaunchSettings::Fake => {
-            if engine != Engine::Fake {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.engine",
-                    "launch settings engine mismatch",
-                ));
-            }
-            ProfileLaunchSettings::Fake(FakeLaunchSettings)
         }
     };
     Ok(settings)
