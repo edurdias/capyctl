@@ -253,6 +253,11 @@ fn collect_members(
             return Err(GroupObservationError::Limit);
         }
         if fact.process_group == group {
+            // A member that began at boot cannot belong to a group launched later;
+            // reporting it would attribute a kernel process to a launch.
+            if fact.start_ticks == 0 {
+                return Err(GroupObservationError::InvalidData);
+            }
             if members.len() >= MAX_MEMBERS {
                 return Err(GroupObservationError::Limit);
             }
@@ -297,7 +302,12 @@ fn parse_stat(pid: u32, raw: &str, boot: &str) -> Result<GroupProcessFact, Group
     let start_ticks = fields[19]
         .parse()
         .map_err(|_| GroupObservationError::InvalidData)?;
-    if pid == 0 || start_ticks == 0 || parent_pid == pid {
+    // A start time of zero is not malformed: on some kernels (host-a, Linux
+    // 6.17 nvidia) init and every kernel thread report exactly that. Such a process
+    // began at boot, so it can never be a member of a group we launched, and it is
+    // refused where membership is claimed (`collect_members`, `validate_api`)
+    // rather than here, where refusing it would fail the whole scan.
+    if pid == 0 || parent_pid == pid {
         return Err(bad);
     }
     Ok(GroupProcessFact {
@@ -382,11 +392,31 @@ mod tests {
             stat(43, 1, 42, 10),
             "42 (x) S 1 42".into(),
             "x".repeat(MAX_STAT_BYTES + 1),
-            stat(42, 1, 42, 0),
         ] {
             assert!(parse_stat(42, &raw, BOOT).is_err());
         }
         assert!(parse_stat(42, &stat(42, 1, 42, 10).replace("S 1 42", "S +1 42"), BOOT).is_err());
+    }
+
+    /// Found live on host-a (Linux 6.17 nvidia): init and every kernel thread
+    /// report a start time of zero. A scan that rejects them as malformed can never
+    /// prove any group gone on such a host. They parse, they are never members of a
+    /// launched group, and one claiming membership is inconsistent data.
+    #[test]
+    fn boot_time_processes_parse_but_never_join_a_launched_group() {
+        let init = parse_stat(1, &stat(1, 0, 1, 0), BOOT).unwrap();
+        assert_eq!(init.start_ticks, 0);
+        let kthread = parse_stat(2, &stat(2, 0, 0, 0), BOOT).unwrap();
+        let ours = parse_stat(42, &stat(42, 1, 42, 10), BOOT).unwrap();
+        let members =
+            collect_members(42, [Ok(init.clone()), Ok(kthread), Ok(ours.clone())]).unwrap();
+        assert_eq!(members, vec![ours]);
+        let impostor = parse_stat(7, &stat(7, 1, 42, 0), BOOT).unwrap();
+        assert_eq!(
+            collect_members(42, [Ok(init), Ok(impostor)]),
+            Err(GroupObservationError::InvalidData)
+        );
+        assert!(validate_api(&api(), &[parse_stat(42, &stat(42, 1, 42, 0), BOOT).unwrap()]).is_err());
     }
 
     #[test]

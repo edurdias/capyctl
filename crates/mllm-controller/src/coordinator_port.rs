@@ -369,10 +369,24 @@ impl LifecyclePort for CoordinatorLifecycle {
                     let row = store.get_operation(&operation)?;
                     let observed =
                         store.get_deployment(&deployment)?.map(|r| r.observed_state);
-                    Ok(row.map(|row| (row.state, row.error_code, observed)))
+                    // SPEC §13.2: an uncertain run is retained, not finished. The
+                    // caller learns that as soon as it is recorded, with the
+                    // coordinator's own reason, instead of waiting out its bound.
+                    let uncertain = if store.operation_is_uncertain(&operation)? {
+                        Some(store.journal_evidence(&operation)?.pop().unwrap_or_default())
+                    } else {
+                        None
+                    };
+                    Ok(row.map(|row| (row.state, row.error_code, observed, uncertain)))
                 })?
                 .ok_or_else(|| LifecycleFault::NotFound(handle.operation_id.0.clone()))?;
-            let (state, error_code, observed) = read;
+            let (state, error_code, observed, uncertain) = read;
+            if let Some(reason) = uncertain {
+                return Err(LifecycleFault::Uncertain(format!(
+                    "operation {} is retained as uncertain: {reason}",
+                    handle.operation_id.0
+                )));
+            }
             if let Some(outcome) = Self::classify(
                 &handle.operation_id.0,
                 state,

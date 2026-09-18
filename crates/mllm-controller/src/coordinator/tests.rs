@@ -2477,6 +2477,25 @@ mod native {
                 .any(|entry| entry.contains("could not be proven gone")),
             "the uncertainty was not journaled: {entries:?}"
         );
+        // SPEC §13.2: the retained uncertainty is reported to whoever waits on the
+        // operation as soon as it is recorded, with the coordinator's reason, not
+        // after their own wait runs out. Found live on host-a: a paused launch
+        // read as "still running" for the full ten-minute bound.
+        use crate::port::LifecyclePort;
+        let port = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+        let handle = crate::operations::OperationHandle {
+            operation_id: mllm_domain::identity::OperationId(start.operation_id().to_owned()),
+            deployment_id: fence.deployment_id.clone(),
+        };
+        let waited = tokio::time::timeout(Duration::from_secs(5), port.wait_terminal(&handle))
+            .await
+            .expect("a retained uncertainty is reported at once");
+        match waited {
+            Err(crate::fault::LifecycleFault::Uncertain(reason)) => {
+                assert!(reason.contains("could not be proven gone"), "{reason}");
+            }
+            other => panic!("expected the retained uncertainty, got {other:?}"),
+        }
         drop(start);
         w.shutdown().await.unwrap();
     }

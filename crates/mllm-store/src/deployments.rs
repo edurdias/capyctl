@@ -379,6 +379,22 @@ impl crate::Store {
         Ok(())
     }
 
+    /// Whether the lifecycle run behind an operation is retained as uncertain.
+    ///
+    /// An uncertain run is not terminal: the operation stays running, its arm is
+    /// kept, and the coordinator resolves it only against a gone-proof. It is still
+    /// a durable, observable condition, and a caller waiting on the operation must
+    /// be told it at once rather than after its own wait runs out (SPEC §13.2).
+    pub fn operation_is_uncertain(&self, operation_id: &str) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM lifecycle_runs WHERE operation_id=?1 AND state='uncertain')",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
     /// All journal evidence recorded for an operation, in insertion order.
     pub fn journal_evidence(&self, operation_id: &str) -> Result<Vec<String>, StoreError> {
         let mut stmt = self.conn.prepare(
