@@ -29,6 +29,9 @@ pub const VLLM_RESERVED_FLAGS: &[&str] = &[
     "--block-size",
     "--enable-sleep-mode",
     "--api-key",
+    // Spec §3: the guard middleware is owned by mllm, not a profile — a
+    // profile cannot pass its own `--middleware` to bypass or replace it.
+    "--middleware",
     "--disable-log-requests",
     "--enable-log-requests",
     "--disable-log-stats",

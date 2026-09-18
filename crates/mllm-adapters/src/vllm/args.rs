@@ -16,14 +16,28 @@ pub struct PlanInputVllm {
     pub engine_bin: String,
     pub model_path: String,
     pub port: u16,
+    /// Spec §3: mllm owns the listener address and the served name, so the
+    /// served id is a launch setting, not a pass-through argument a
+    /// profile could omit or spoof.
+    pub served_model_name: String,
+    pub tensor_parallel_size: u32,
+    pub pipeline_parallel_size: u32,
+    pub kv_cache_dtype: String,
+    pub block_size_tokens: u32,
+    /// CPU-offload budget in bytes; rendered as whole GiB (vLLM's unit).
+    /// Zero means "no offload flag" (Step 3, Spec §3).
+    pub cpu_offload_bytes: i64,
     pub granted: GrantedBudget,
     /// Engine-native arguments approved by the selected profile policy.
     pub engine_args: Vec<String>,
     /// Development/sleep startup flags — rendered only when the profile is
     /// policy-gated in (F1 design §7).
     pub sleep_flags: Vec<String>,
-    /// Per-deployment engine API credential (mllm-controlled, never from
-    /// user args); redacted in fingerprints (SPEC §8.2/§13.3).
+    /// Per-deployment engine API credential. Spec §3: never rendered on
+    /// argv; delivered through the environment by the builder (the adapter
+    /// clears this field before calling `render_command`). Kept so
+    /// `fingerprint_of`'s redaction path keeps compiling and stays in
+    /// place as a defense in depth.
     pub api_key: Option<String>,
     /// Extra PATH entries for the engine's runtime environment (venv bin:
     /// the JIT compile step needs the venv's tools, e.g. ninja).
@@ -31,6 +45,13 @@ pub struct PlanInputVllm {
     /// Where the launcher writes the engine's stdout/stderr (diagnosability
     /// + the runbook's evidence record).
     pub engine_log: Option<String>,
+    /// Directory containing `mllm_vllm_guard.py`, mllm's own middleware
+    /// that requires the engine key on vLLM's development routes (Spec
+    /// §3). Required whenever `sleep_flags` gates development mode in:
+    /// without it there is nowhere to point `PYTHONPATH` and the guard
+    /// cannot be loaded, so dev mode without a runtime dir is refused
+    /// rather than served unguarded.
+    pub runtime_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +75,8 @@ pub enum ArgsError {
     UnexpectedArgument(String),
     #[error("invalid granted budget: {0}")]
     InvalidBudget(String),
+    #[error("development mode (sleep flags) requires a runtime dir for mllm's guard middleware (Spec §3)")]
+    MissingRuntimeDir,
 }
 
 pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsError> {
@@ -84,6 +107,21 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             }
         }
     }
+    // Spec §3: vLLM takes whole GiB; a positive sub-GiB budget would
+    // silently round to zero and offload nothing, so it is refused instead.
+    if input.cpu_offload_bytes > 0 && input.cpu_offload_bytes < 1024 * 1024 * 1024 {
+        return Err(ArgsError::InvalidBudget(format!(
+            "cpu_offload_bytes {}",
+            input.cpu_offload_bytes
+        )));
+    }
+    // Spec §3: development mode always ships with mllm's own guard
+    // middleware, which needs a runtime dir to load from; without one the
+    // dev routes would otherwise be reachable unguarded.
+    let dev_mode = input.sleep_flags.iter().any(|f| f == "--enable-sleep-mode");
+    if dev_mode && input.runtime_dir.is_none() {
+        return Err(ArgsError::MissingRuntimeDir);
+    }
 
     let mut argv: Vec<String> = vec![
         input.engine_bin.clone(),
@@ -93,6 +131,31 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     fn push(argv: &mut Vec<String>, flag: &str, value: String) {
         argv.push(flag.to_string());
         argv.push(value);
+    }
+    // Spec §3: mllm owns the listener address and the served name; a
+    // profile's engine_args cannot set them (they are reserved flags).
+    push(&mut argv, "--host", "127.0.0.1".into());
+    push(&mut argv, "--served-model-name", input.served_model_name.clone());
+    // The five validated launch settings, rendered unconditionally except
+    // the CPU-offload budget, which is omitted rather than sent as zero.
+    push(
+        &mut argv,
+        "--tensor-parallel-size",
+        input.tensor_parallel_size.to_string(),
+    );
+    push(
+        &mut argv,
+        "--pipeline-parallel-size",
+        input.pipeline_parallel_size.to_string(),
+    );
+    push(&mut argv, "--kv-cache-dtype", input.kv_cache_dtype.clone());
+    push(&mut argv, "--block-size", input.block_size_tokens.to_string());
+    if input.cpu_offload_bytes > 0 {
+        push(
+            &mut argv,
+            "--cpu-offload-gb",
+            (input.cpu_offload_bytes / (1024 * 1024 * 1024)).to_string(),
+        );
     }
     push(&mut argv, "--port", input.port.to_string());
     if let Some(pct) = input.granted.gpu_utilization_pct {
@@ -119,24 +182,35 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     for f in &input.sleep_flags {
         argv.push(f.clone());
     }
-    if let Some(key) = &input.api_key {
-        push(&mut argv, "--api-key", key.clone());
+    // Spec §3: the guard middleware is owned by mllm, not a profile — a
+    // profile cannot pass its own `--middleware` (it is reserved). Loading
+    // it requires the guard module to be importable, hence PYTHONPATH.
+    let mut env: std::collections::BTreeMap<String, String> = [(
+        "VLLM_SERVER_DEV_MODE".into(),
+        if dev_mode { "1" } else { "0" }.into(),
+    )]
+    .into_iter()
+    .collect();
+    if dev_mode {
+        // Presence already checked above (MissingRuntimeDir otherwise).
+        let runtime_dir = input.runtime_dir.clone().expect("checked above");
+        push(&mut argv, "--middleware", "mllm_vllm_guard.RequireEngineKey".into());
+        let existing = std::env::var("PYTHONPATH").ok().filter(|p| !p.is_empty());
+        let python_path = match existing {
+            Some(existing) => format!("{runtime_dir}:{existing}"),
+            None => runtime_dir,
+        };
+        env.insert("PYTHONPATH".into(), python_path);
     }
+    // The engine key is never rendered on argv (Spec §3): it is delivered
+    // through the environment by the builder (see `PlanInputVllm::api_key`
+    // doc comment), never as a `--api-key` command-line value.
     // Reviewed engine-native arguments render last.
     argv.extend(input.engine_args.iter().cloned());
     // vLLM gates its HTTP sleep/wake/reload routes separately from the
     // allocator flag. Explicitly disable them for stock profiles too, so
     // an inherited development environment cannot bypass the host opt-in.
-    let dev_mode = input.sleep_flags.iter().any(|f| f == "--enable-sleep-mode");
-    Ok(RenderedCommand {
-        argv,
-        env: [(
-            "VLLM_SERVER_DEV_MODE".into(),
-            if dev_mode { "1" } else { "0" }.into(),
-        )]
-        .into_iter()
-        .collect(),
-    })
+    Ok(RenderedCommand { argv, env })
 }
 
 /// Bytes → whole GiB (vLLM swap-space unit).

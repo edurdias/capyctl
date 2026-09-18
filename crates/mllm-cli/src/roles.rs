@@ -212,6 +212,14 @@ async fn start_standalone_inner(
                 engine_bin: p.engine_bin.to_string_lossy().to_string(),
                 model_path: p.model_path.clone(),
                 port: p.port,
+                // Spec §3: mllm renders --served-model-name itself now
+                // (the qualification args below no longer carry it).
+                served_model_name: p.model_id.clone(),
+                tensor_parallel_size: 1,
+                pipeline_parallel_size: 1,
+                kv_cache_dtype: "auto".into(),
+                block_size_tokens: 16,
+                cpu_offload_bytes: 0,
                 // Conservative KV grant for the unified-memory Spark: the
                 // ledger's deployment budget bounds the engine's KV pool
                 // (activation peak stays well inside the managed limit).
@@ -257,6 +265,7 @@ async fn start_standalone_inner(
                 // experimental session boots with sleep mode enabled.
                 sleep_flags: live_vllm_sleep_flags(policy),
                 api_key: None,
+                runtime_dir: std::env::var("MLLM_RUNTIME_DIR").ok(),
             };
             let adapter = Arc::new(
                 mllm_adapters::vllm::VllmAdapter::new(

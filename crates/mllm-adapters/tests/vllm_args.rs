@@ -2,6 +2,7 @@
 //! mapping, policy-scoped sleep flags, and secret redaction in
 //! fingerprints.
 
+use mllm_adapters::traits::RenderedCommand;
 use mllm_adapters::vllm::args::{
     fingerprint_of, render_command, ArgsError, GrantedBudget, PlanInputVllm, RESERVED_FLAGS,
 };
@@ -11,6 +12,12 @@ fn base_input() -> PlanInputVllm {
         engine_bin: "/opt/vllm/bin/vllm".into(),
         model_path: "/srv/models/toy-model".into(),
         port: 8150,
+        served_model_name: "gate-m".into(),
+        tensor_parallel_size: 1,
+        pipeline_parallel_size: 1,
+        kv_cache_dtype: "auto".into(),
+        block_size_tokens: 16,
+        cpu_offload_bytes: 0,
         granted: GrantedBudget {
             kv_cache_bytes: Some(16 * 1024 * 1024 * 1024),
             gpu_utilization_pct: Some(75),
@@ -21,7 +28,23 @@ fn base_input() -> PlanInputVllm {
         engine_path_extra: None,
         engine_log: None,
         api_key: None,
+        runtime_dir: None,
     }
+}
+
+/// Alias matching the brief's fixture name.
+fn plan() -> PlanInputVllm {
+    base_input()
+}
+
+/// Spec §3: assert a `--flag value` pair is present in argv.
+fn assert_flag(cmd: &RenderedCommand, flag: &str, value: &str) {
+    let pos = cmd
+        .argv
+        .iter()
+        .position(|a| a == flag)
+        .unwrap_or_else(|| panic!("missing flag `{flag}` in {:?}", cmd.argv));
+    assert_eq!(cmd.argv[pos + 1], value, "flag `{flag}`");
 }
 
 #[test]
@@ -190,6 +213,7 @@ fn duplicate_reserved_flag_still_conflicts() {
 fn sleep_flags_render_only_when_profile_gated_in() {
     let mut gated = base_input();
     gated.sleep_flags = vec!["--enable-sleep-mode".into()];
+    gated.runtime_dir = Some("/opt/mllm/runtime".into());
     let cmd = render_command(&gated).unwrap();
     assert!(cmd.argv.contains(&"--enable-sleep-mode".to_string()));
     assert_eq!(
@@ -206,15 +230,112 @@ fn sleep_flags_render_only_when_profile_gated_in() {
     );
 }
 
+/// Spec §3: mllm owns the listener address and the served name; profiles
+/// cannot set them.
 #[test]
-fn fingerprint_redacts_api_key_values() {
-    let mut gated = base_input();
-    gated.sleep_flags = vec!["--enable-sleep-mode".into()];
-    gated.api_key = Some("secret123".into());
-    let cmd = render_command(&gated).unwrap();
-    // The rendered command itself carries the key (the engine needs it);
-    // the fingerprint recorded in provenance must not.
-    assert!(cmd.argv.contains(&"secret123".to_string()));
+fn render_emits_host_and_served_name() {
+    let cmd = render_command(&plan()).unwrap();
+    assert_flag(&cmd, "--host", "127.0.0.1");
+    assert_flag(&cmd, "--served-model-name", "gate-m");
+}
+
+/// Spec §3: every validated launch setting reaches the engine.
+#[test]
+fn render_emits_the_five_launch_settings() {
+    let mut p = plan();
+    p.tensor_parallel_size = 2;
+    p.pipeline_parallel_size = 1;
+    p.kv_cache_dtype = "fp8".into();
+    p.block_size_tokens = 32;
+    p.cpu_offload_bytes = 4 * 1024 * 1024 * 1024;
+    let cmd = render_command(&p).unwrap();
+    assert_flag(&cmd, "--tensor-parallel-size", "2");
+    assert_flag(&cmd, "--pipeline-parallel-size", "1");
+    assert_flag(&cmd, "--kv-cache-dtype", "fp8");
+    assert_flag(&cmd, "--block-size", "32");
+    assert_flag(&cmd, "--cpu-offload-gb", "4");
+
+    let mut none = plan();
+    none.cpu_offload_bytes = 0;
+    assert!(!render_command(&none)
+        .unwrap()
+        .argv
+        .contains(&"--cpu-offload-gb".to_string()));
+}
+
+/// Spec §3: a positive CPU-offload budget below 1 GiB would silently round
+/// to zero, so it is refused instead.
+#[test]
+fn cpu_offload_below_one_gib_is_invalid() {
+    let mut p = plan();
+    p.cpu_offload_bytes = 512 * 1024 * 1024;
+    assert!(matches!(
+        render_command(&p),
+        Err(ArgsError::InvalidBudget(_))
+    ));
+}
+
+/// Spec §3: development mode always comes with mllm's guard, and only
+/// then; without a runtime dir it cannot be rendered at all.
+#[test]
+fn dev_mode_renders_the_guard_middleware() {
+    let mut p = plan();
+    p.sleep_flags = vec!["--enable-sleep-mode".into()];
+    p.runtime_dir = Some("/opt/mllm/runtime".into());
+    let cmd = render_command(&p).unwrap();
+    assert_flag(&cmd, "--middleware", "mllm_vllm_guard.RequireEngineKey");
+    assert_eq!(
+        cmd.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str),
+        Some("1")
+    );
+    assert!(cmd
+        .env
+        .get("PYTHONPATH")
+        .unwrap()
+        .starts_with("/opt/mllm/runtime"));
+
+    let mut off = plan();
+    off.sleep_flags.clear();
+    assert!(!render_command(&off)
+        .unwrap()
+        .argv
+        .contains(&"--middleware".to_string()));
+
+    let mut no_dir = plan();
+    no_dir.sleep_flags = vec!["--enable-sleep-mode".into()];
+    no_dir.runtime_dir = None;
+    assert!(
+        render_command(&no_dir).is_err(),
+        "dev mode without a runtime dir cannot be rendered"
+    );
+}
+
+/// Spec §3: the key never reaches argv even if a caller sets it on the plan.
+#[test]
+fn render_never_emits_api_key() {
+    let mut p = plan();
+    p.api_key = Some("secret".into());
+    assert!(!render_command(&p)
+        .unwrap()
+        .argv
+        .iter()
+        .any(|a| a == "--api-key" || a == "secret"));
+}
+
+/// Spec §3/§8.2: `fingerprint_of`'s redaction path still compiles and still
+/// redacts defensively, even though `render_command` itself never emits
+/// `--api-key` on argv any more.
+#[test]
+fn fingerprint_still_redacts_api_key_if_present() {
+    let cmd = RenderedCommand {
+        argv: vec![
+            "vllm".into(),
+            "serve".into(),
+            "--api-key".into(),
+            "secret123".into(),
+        ],
+        env: Default::default(),
+    };
     let fp = fingerprint_of(&cmd);
     assert!(fp.contains("--api-key <redacted>"), "fp: {fp}");
     assert!(!fp.contains("secret123"));
