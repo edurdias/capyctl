@@ -213,10 +213,23 @@ rendering, the way `VllmAdapter::render_plan` assembles them today. The existing
 `MLLM_ENGINE_API_KEY` name in `render_plan` is retired; L3 proves the engine actually
 requires the key, so a name mismatch cannot launch an unauthenticated engine silently.
 The forwarder sends the key on every request. The loopback bind stays as a second
-control. Whether vLLM 0.29 also requires the key on its non-`/v1` control routes
-(`/sleep`, `/wake_up`, `/collective_rpc`) is verified in the plan and proven in L3; if it
-does not, the design records that the loopback bind and the forwarder allowlist are the
-only controls on those routes and names closing that gap as a precondition of S2.
+control.
+
+**The control routes are guarded by mllm, because vLLM does not.** Verified on
+`host-a` on 2026-09-17: vLLM 0.29's `AuthenticationMiddleware` guards only paths
+under `/v1`, `/v2`, `/inference` and `/cohere`. The development-mode routes `/sleep`,
+`/wake_up`, `/is_sleeping` and `/collective_rpc` are unauthenticated, and development
+mode is required for parking, which the owner ruled is on by default. So the guard is
+a requirement and lands in S1: `runtime/mllm_vllm_guard.py` is a small ASGI middleware
+that requires `Authorization: Bearer <VLLM_API_KEY>` on every path except `/health`.
+Whenever development mode is on, mllm renders `--middleware
+mllm_vllm_guard.RequireEngineKey` and sets `PYTHONPATH` to its runtime directory in the
+child environment; both are owned by mllm, a profile can neither pass nor remove them.
+The runtime directory is the same one the SGLang wrapper lives in; standalone reads
+`MLLM_RUNTIME_DIR`, default the `runtime/` directory beside the binary's source
+checkout. L3 proves the guard live. A Unix-socket listener (`--uds`) is a later option
+that would also exclude other local users; it needs a Unix-socket HTTP client in the
+router and is not S1.
 
 The key is stored with the binding, encrypted, so that S1r can rebuild an engine handle
 from stored facts alone. Construction: XChaCha20-Poly1305 (`chacha20poly1305` crate,
@@ -505,7 +518,7 @@ running on the Fake through the testkit. They are a pre-check and never count as
 |---|---|---|
 | L1 | Deploy qwen3-4b, Start, wait Ready | a real launch through the coordinator; identity durable before the engine runs; API process and worker both recorded; the five launch settings on the command line |
 | L2 | Chat through the router with the API key, plain and streaming | the serving path end to end, through the per-deployment forwarder |
-| L3 | Access control | the router refuses a request without the user key; the socket table shows the engine on `127.0.0.1:<leased port>` and nowhere else; a connection to that port through the host's routable address is refused; a direct local request without the engine key is rejected; a direct request to `127.0.0.1:<leased port>/sleep` and `/collective_rpc` without the engine key is refused; the per-deployment forwarder refuses an upstream path outside its chat and models allowlist, driven directly rather than through the router's route table, which has no such route to begin with |
+| L3 | Access control | the router refuses a request without the user key; the socket table shows the engine on `127.0.0.1:<leased port>` and nowhere else; a connection to that port through the host's routable address is refused; a direct local request without the engine key is rejected; a direct request to `127.0.0.1:<leased port>/sleep` and `/collective_rpc` without the engine key returns 401 and with the key is answered, proving the mllm guard; the per-deployment forwarder refuses an upstream path outside its chat and models allowlist, driven directly rather than through the router's route table, which has no such route to begin with |
 | L4 | Stop | the whole process group empty, workers included; port lease and grant released; `observed_state=stopped` |
 | L5 | Start again | a new incarnation, pid and engine key reach Ready (T10) |
 | L6 | Model source at an empty directory, Start | the engine exits; mllm proves gone, releases, reads `Closed`; the journal carries the reason and a redacted log tail; no `vllm` process remains |
@@ -565,7 +578,10 @@ okay"); no confinement check is to be added.
 
 Decided after the round: deep parking is on by default and a host opts out ("It is opt
 out of deep parking. We will do it by default"). SPEC §9.1, T21 and `AGENTS.md` are
-amended by the S2 ADR; S1 launches with sleep mode enabled.
+amended by the S2 ADR; S1 launches with sleep mode and development mode enabled.
+Development mode is what makes the sleep routes exist, so the owner ruled it "a
+requirement with an opt out"; the unauthenticated control routes found on the box
+the same day are therefore guarded by mllm's own middleware from S1 (§3).
 
 Withdrawn: the feature gate missing four crates, since no feature exists any more.
 

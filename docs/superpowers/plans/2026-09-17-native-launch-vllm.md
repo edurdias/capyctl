@@ -807,13 +807,59 @@ never exceeds what admission accounted for."
 
 ---
 
+### Task 7a: The control-route guard in `runtime/`
+
+vLLM 0.29 authenticates only `/v1`, `/v2`, `/inference` and `/cohere` (verified on the
+box, `vllm/entrypoints/serve/middleware/authenticate.py`, `GUARDED_PREFIX`). The
+development routes mllm parks through are open. Spec §3 makes the guard a requirement.
+
+**Files:**
+- Create: `runtime/mllm_vllm_guard.py`, `runtime/tests/test_mllm_vllm_guard.py`
+
+**Interfaces:**
+- Produces: importable `mllm_vllm_guard.RequireEngineKey`, an ASGI middleware class taking `(app)`; reads the key from `VLLM_API_KEY` at construction; 401 JSON `{"error":"Unauthorized"}` on any HTTP or websocket path except `/health` without a matching bearer; OPTIONS passes.
+
+- [ ] **Step 1: Failing test** (`runtime/tests/test_mllm_vllm_guard.py`, using Starlette's `TestClient` as the other runtime tests do; confirm `starlette` is importable in the test venv, else use a minimal ASGI scope harness)
+
+```python
+def test_dev_routes_require_the_engine_key(monkeypatch):
+    monkeypatch.setenv("VLLM_API_KEY", "k3y")
+    app = RequireEngineKey(echo_app)  # echo_app answers 200 on any path
+    client = TestClient(app)
+    assert client.post("/sleep").status_code == 401
+    assert client.post("/collective_rpc").status_code == 401
+    assert client.post("/sleep", headers={"Authorization": "Bearer k3y"}).status_code == 200
+    assert client.get("/health").status_code == 200
+    assert client.get("/v1/models").status_code == 401  # belt and braces with vLLM's own guard
+def test_missing_key_env_refuses_everything(monkeypatch):
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+    with pytest.raises(RuntimeError): RequireEngineKey(echo_app)
+```
+
+- [ ] **Step 2: Implement** (mirror vLLM's own middleware: hash the token, `secrets.compare_digest`, pure ASGI, no request body read)
+
+- [ ] **Step 3: Run and commit**
+
+Run: `cd runtime && python -m pytest tests/test_mllm_vllm_guard.py -q`
+
+```bash
+git add runtime/mllm_vllm_guard.py runtime/tests/test_mllm_vllm_guard.py
+git commit -m "feat(runtime): guard vLLM's development routes with the engine key
+
+vLLM authenticates only its inference prefixes; the sleep, wake and collective_rpc
+routes mllm parks through are open to any local caller. This middleware, loaded by
+mllm through --middleware, requires the engine key on every path except /health."
+```
+
+---
+
 ### Task 7: vLLM command rendering: owned flags, five settings, no key on argv
 
 **Files:**
 - Modify: `crates/mllm-adapters/src/vllm/args.rs` (`PlanInputVllm`, `render_command`), `crates/mllm-adapters/tests/vllm_args.rs` (or the existing args test file)
 
 **Interfaces:**
-- Produces: `PlanInputVllm { engine_bin, model_path, port, served_model_name: String, tensor_parallel_size: u32, pipeline_parallel_size: u32, kv_cache_dtype: String, block_size_tokens: u32, cpu_offload_bytes: i64, granted, engine_args, sleep_flags, api_key: Option<String>, engine_path_extra, engine_log }` and `render_command` emitting `--host 127.0.0.1`, `--served-model-name`, `--tensor-parallel-size`, `--pipeline-parallel-size`, `--kv-cache-dtype`, `--block-size`, `--cpu-offload-gb` (only when `cpu_offload_bytes > 0`, bytes to whole GiB).
+- Produces: `PlanInputVllm { engine_bin, model_path, port, served_model_name: String, tensor_parallel_size: u32, pipeline_parallel_size: u32, kv_cache_dtype: String, block_size_tokens: u32, cpu_offload_bytes: i64, granted, engine_args, sleep_flags, runtime_dir: Option<String>, api_key: Option<String>, engine_path_extra, engine_log }` and `render_command` emitting `--host 127.0.0.1`, `--served-model-name`, `--tensor-parallel-size`, `--pipeline-parallel-size`, `--kv-cache-dtype`, `--block-size`, `--cpu-offload-gb` (only when `cpu_offload_bytes > 0`, bytes to whole GiB), and, whenever `sleep_flags` contains `--enable-sleep-mode`, `--middleware mllm_vllm_guard.RequireEngineKey` with `PYTHONPATH=<runtime_dir>` in the environment (spec §3: the guard is owned by mllm; `--middleware` joins the reserved list so a profile cannot pass its own).
 
 - [ ] **Step 1: Failing tests**
 
@@ -834,6 +880,19 @@ fn render_emits_the_five_launch_settings() {
     assert_flag(&cmd, "--kv-cache-dtype", "fp8"); assert_flag(&cmd, "--block-size", "32"); assert_flag(&cmd, "--cpu-offload-gb", "4");
     let mut none = plan(); none.cpu_offload_bytes = 0;
     assert!(!render_command(&none).unwrap().argv.contains(&"--cpu-offload-gb".to_string()));
+}
+/// Spec §3: development mode always comes with mllm's guard, and only then.
+#[test]
+fn dev_mode_renders_the_guard_middleware() {
+    let mut p = plan(); p.sleep_flags = vec!["--enable-sleep-mode".into()]; p.runtime_dir = Some("/opt/mllm/runtime".into());
+    let cmd = render_command(&p).unwrap();
+    assert_flag(&cmd, "--middleware", "mllm_vllm_guard.RequireEngineKey");
+    assert_eq!(cmd.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str), Some("1"));
+    assert!(cmd.env.get("PYTHONPATH").unwrap().starts_with("/opt/mllm/runtime"));
+    let mut off = plan(); off.sleep_flags.clear();
+    assert!(!render_command(&off).unwrap().argv.contains(&"--middleware".to_string()));
+    let mut no_dir = plan(); no_dir.sleep_flags = vec!["--enable-sleep-mode".into()]; no_dir.runtime_dir = None;
+    assert!(render_command(&no_dir).is_err(), "dev mode without a runtime dir cannot be rendered");
 }
 /// Spec §3: the key never reaches argv even if a caller sets it on the plan.
 #[test]
@@ -1171,7 +1230,7 @@ The forwarder forwards only the chat and models paths."
 - Test: `crates/mllm-cli/src/standalone_config/tests.rs`, `crates/mllm-cli/tests/standalone_start.rs`
 
 **Interfaces:**
-- Produces: `pub struct EngineInstallation { engine: Engine, executable: PathBuf, build_fingerprint: String, launch_settings: serde_json::Value, deep_park: bool, trust_remote_code: bool, models_root: PathBuf }`; `pub trait EngineProvider: Send + Sync { fn installation(&self) -> Result<EngineInstallation, StartError>; fn bindings(&self, clock, log_dir) -> Arc<dyn EngineBindings>; fn tools_factory(&self) -> ToolsFactory; }`; `roles::start_standalone(state_dir)` builds `EnvEngineProvider` from `MLLM_VLLM_BIN`, `MLLM_MODELS_ROOT`, `MLLM_KV_CACHE_BYTES`, `MLLM_ENGINE_ARGS`, `MLLM_ENGINE_FINGERPRINT`, `MLLM_DEEP_PARK`, `MLLM_TRUST_REMOTE_CODE`, or returns `StartError::NoEngineInstallation`; `roles::start_standalone_with(state_dir, Arc<dyn EngineProvider>)`; `App::deploy(name, source: ModelSource)`.
+- Produces: `pub struct EngineInstallation { engine: Engine, executable: PathBuf, build_fingerprint: String, launch_settings: serde_json::Value, deep_park: bool, trust_remote_code: bool, models_root: PathBuf, runtime_dir: PathBuf }` (standalone: `MLLM_RUNTIME_DIR`, default `<repo>/runtime` resolved from `CARGO_MANIFEST_DIR` at build time for the checkout case, refused if `mllm_vllm_guard.py` is not in it); `pub trait EngineProvider: Send + Sync { fn installation(&self) -> Result<EngineInstallation, StartError>; fn bindings(&self, clock, log_dir) -> Arc<dyn EngineBindings>; fn tools_factory(&self) -> ToolsFactory; }`; `roles::start_standalone(state_dir)` builds `EnvEngineProvider` from `MLLM_VLLM_BIN`, `MLLM_MODELS_ROOT`, `MLLM_KV_CACHE_BYTES`, `MLLM_ENGINE_ARGS`, `MLLM_ENGINE_FINGERPRINT`, `MLLM_DEEP_PARK`, `MLLM_TRUST_REMOTE_CODE`, or returns `StartError::NoEngineInstallation`; `roles::start_standalone_with(state_dir, Arc<dyn EngineProvider>)`; `App::deploy(name, source: ModelSource)`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1351,7 +1410,7 @@ fn state_dir() -> tempfile::TempDir { tempfile::TempDir::new_in(std::env::var("H
     for flag in ["--host", "--served-model-name", "--tensor-parallel-size", "--kv-cache-dtype", "--block-size"] { assert!(argv.contains(flag), "{flag} missing: {argv}"); }
     // L2: router chat, plain and streaming, with the user key (as a1_gate.rs does)
     // L3: no user key → 401/403; `ss -ltnp` shows 127.0.0.1:<port> only; TcpStream::connect(<routable ip>:<port>) is refused;
-    //     direct http://127.0.0.1:<port>/v1/models without bearer → 401; direct /sleep and /collective_rpc without bearer → recorded status (see Step 3);
+    //     direct http://127.0.0.1:<port>/v1/models without bearer → 401; direct POST /sleep and /collective_rpc without bearer → 401 (mllm guard), GET /is_sleeping with bearer → 200;
     //     forwarder refuses "/metrics" upstream (unit-level call on LiveForwarders).
     // L4: Stop → wait; no pid from `ids` alive; `pgrep -f "vllm serve"` empty; endpoint_leases and resource_owners empty; observed_state stopped
     // L5: Start again → Ready; new incarnation, new pid, engine_secrets row differs
@@ -1401,9 +1460,12 @@ echo "evidence under target/live/$STAMP"
 
 Nothing is killed by name. On a refusal the script prints what it found and exits.
 
-- [ ] **Step 3: One fact to establish before the first run**
+- [ ] **Step 3: The fact, already established**
 
-On the box, read-only: `grep -n "startswith\|api_key" $(ls -d ~/mllm-vllm-venv2/lib/python3.*/site-packages/vllm/entrypoints/openai/api_server.py)` and record in the evidence runbook whether the API-key middleware covers only `/v1` paths. If it does (expected from vLLM's source, where the middleware skips paths not under `/v1`), L3 records `/sleep` and `/collective_rpc` as **unkeyed**, the runbook and `f2-current-status.md` record the gap as a precondition of S2 per spec §3, and L3 asserts instead that both are unreachable from the routable address and refused by the forwarder.
+Verified on the box on 2026-09-17: vLLM 0.29's `AuthenticationMiddleware` has
+`GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")`; the development routes are
+unauthenticated. Task 7a's guard closes that. Record the finding and the guard in the
+first evidence entry, and keep L3's direct-route assertions as written above.
 
 - [ ] **Step 4: Run, then record**
 
@@ -1466,6 +1528,7 @@ git commit -m "docs: record S1, vLLM launches through the coordinator on host-a"
 | §3 trait, Presence, DurableProcessLaunch, log file, disposal | 1, 2 |
 | §3 plan table, owned flags, five settings, no key on argv | 7, 9 |
 | §3 park switch, trust-remote-code | 6, 12 |
+| §3 control-route guard | 7a, 7, 15 |
 | §3 engine key, encryption, deletion | 4, 9 |
 | §3 router lookup, forwarder allowlist | 10 |
 | §3 record_launch precondition; §4 worker rule | 3 |
