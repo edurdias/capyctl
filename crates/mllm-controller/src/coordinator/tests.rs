@@ -2246,6 +2246,10 @@ mod native {
             start.wait(Duration::from_secs(60)).await.unwrap(),
             InitializeStatus::Closed
         );
+        // ADR 0011 decision 4: the moment the closure is observable, a start for
+        // another deployment is admitted. No waiting for the worker to come back
+        // round: L7 on host-a arrived in exactly that gap and was refused.
+        let fresh = w.start(&other, 10_000).unwrap();
         // The recorded processes were terminated, and exactly the recorded ones.
         let terminations = tools.terminations();
         assert_eq!(terminations.len(), 1, "the launch was not terminated");
@@ -2289,15 +2293,14 @@ mod native {
             "the failure was not journaled: {entries:?}"
         );
         assert_eq!(status(&owner, start.step_id()), InitializeStatus::Closed);
-        // Only this deployment closed. The worker keeps running and another
+        // Only this deployment closed. The worker keeps running and the other
         // deployment starts as though nothing had happened.
-        assert_eq!(w.status(), WorkerStatus::Running);
-        running(&w).await;
-        let fresh = w.start(&other, 10_000).unwrap();
         assert_eq!(
             fresh.wait(Duration::from_secs(60)).await.unwrap(),
             InitializeStatus::Completed
         );
+        running(&w).await;
+        assert_eq!(w.status(), WorkerStatus::Running);
         drop(start);
         w.shutdown().await.unwrap();
     }

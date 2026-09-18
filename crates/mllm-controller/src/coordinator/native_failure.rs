@@ -112,6 +112,7 @@ pub(super) async fn settle_failed_native_launch(
     let entry = mllm_adapters::vllm::args::redact_text(&format!(
         "deployment {deployment_id}: launch failed: {reason}"
     ));
+    let readmit = shared.clone();
     shared
         .with_owner(move |owner| {
             let now = clock()?;
@@ -137,7 +138,16 @@ pub(super) async fn settle_failed_native_launch(
             owner
                 .store()
                 .set_admission_enabled(&closed_deployment, false)
-                .map_err(|error| CoordinatorError::Service(error.to_string()))
+                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+            // ADR 0011 decision 4: only this deployment closed. Starts for every
+            // other deployment are admitted again here, under the same lock that
+            // made the release observable, so no caller can see this launch closed
+            // and still be refused a start for a healthy one. Admission reads the
+            // flag under this lock; found live on host-a (L7), where the next
+            // start arrived in the gap between the commit and the worker's own
+            // re-admission and was refused as "not admitting Initialize".
+            readmit.initializing.store(true, Ordering::Release);
+            Ok(())
         })
         .await?;
     // The binding was released, so the runtime built for it is no longer this
