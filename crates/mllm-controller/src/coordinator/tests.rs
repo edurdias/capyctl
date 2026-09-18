@@ -2151,6 +2151,17 @@ mod native {
         o.store().journal_evidence(operation).unwrap()
     }
 
+    /// The `state` column of this operation's journal entries, in order: what the
+    /// journal says happened, as distinct from the reason it gives.
+    fn journal_kinds(sql: &rusqlite::Connection, operation: &str) -> Vec<String> {
+        sql.prepare("SELECT state FROM journal_entries WHERE operation_id=?1 ORDER BY rowid")
+            .unwrap()
+            .query_map([operation], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     fn status(owner: &SharedCoordinatorState, step: &str) -> InitializeStatus {
         let o = owner.lock().unwrap();
         o.store()
@@ -2291,6 +2302,20 @@ mod native {
                 .contains(&format!("deployment {}", fence.deployment_id))
                 && entry.contains("engine exited")),
             "the failure was not journaled: {entries:?}"
+        );
+        // One event, one story. The settlement writes the redacted reason and the
+        // worker must not then write it again as an exhausted retry budget: ADR
+        // 0011 decision 5 says a launch that failed after arm is terminal for that
+        // start with no retry.
+        let kinds = journal_kinds(&sql, start.operation_id());
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == "launch_failed").count(),
+            1,
+            "the settlement's entry is the only account of the failure: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|kind| kind == "given_up"),
+            "a settled native launch was also journaled as a give-up: {kinds:?}"
         );
         assert_eq!(status(&owner, start.step_id()), InitializeStatus::Closed);
         // Only this deployment closed. The worker keeps running and the other

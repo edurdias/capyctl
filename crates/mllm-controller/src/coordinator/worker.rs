@@ -2,6 +2,7 @@ use super::permits_send;
 use crate::ownership::SharedCoordinatorState;
 use futures::FutureExt;
 use mllm_adapters::traits::{EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand};
+use mllm_adapters::vllm::args::redact_text;
 use mllm_config::engine_policy::Engine;
 use mllm_launchers::{AssociationError, LaunchAssociation};
 use mllm_domain::{
@@ -1274,15 +1275,18 @@ async fn run(
                         }
                     })
                     .await;
+                let mut settled_native = false;
                 let status = match (status, native) {
                     (Ok(InitializeStatus::Armed), Some(driver)) => {
-                        native_failure::settle_failed_native_launch(
+                        let settled = native_failure::settle_failed_native_launch(
                             &shared,
                             &driver,
                             &work,
                             &recorded_reason,
                         )
-                        .await
+                        .await;
+                        settled_native = matches!(settled, Ok(InitializeStatus::Closed));
+                        settled
                     }
                     (status, _) => status,
                 };
@@ -1294,6 +1298,19 @@ async fn run(
                 let outcome = match status {
                     Ok(InitializeStatus::ExpiredUnarmed) => {
                         shared.set_initializing(true);
+                        shared.changed.notify_waiters();
+                        continue;
+                    }
+                    // Spec §6: the settlement terminated, proved, released, wrote
+                    // the redacted reason, closed this deployment's admission and
+                    // re-admitted every other one, all under a single lock. There
+                    // is nothing left for this loop to decide. Falling through to
+                    // the give-up branch would journal the same event a second
+                    // time, unredacted and labelled as an exhausted retry budget,
+                    // when ADR 0011 decision 5 says a launch that failed after arm
+                    // is terminal for that start with no retry: an operator would
+                    // read two different stories for one failure.
+                    Ok(InitializeStatus::Closed) if settled_native => {
                         shared.changed.notify_waiters();
                         continue;
                     }
@@ -1360,7 +1377,9 @@ async fn run(
                             &deployment_id,
                             &journal_operation,
                             "attempt_not_annotated",
-                            &format!("{recorded_reason}; durable arm retained if recorded: {error}"),
+                            &redact_text(&format!(
+                                "{recorded_reason}; durable arm retained if recorded: {error}"
+                            )),
                         )
                         .await;
                         WorkerStatus::Failed(format!(
@@ -1394,7 +1413,11 @@ async fn run(
                 // configuration, and the deployment is given up on once the budget
                 // is spent. An uncertain outcome never reaches here: it pauses
                 // above and resolves through the gone-proof first.
-                let mut closing = format!("gave up: {recorded_reason}");
+                // SPEC §13.2 and spec §6: a builder's reason quotes the engine's
+                // own output, and this journal is not the owner-only log, so every
+                // reason written from here is redacted at the coordinator rather
+                // than trusting whichever builder produced it to have done so.
+                let mut closing = redact_text(&format!("gave up: {recorded_reason}"));
                 if unlanded {
                     let fence = work.fence().clone();
                     let counting = shared.clone();
@@ -1402,8 +1425,9 @@ async fn run(
                     // SPEC §17: failures are recorded. The attempt and the reason
                     // it failed are written in the same transaction, so a counted
                     // attempt is never left without an explanation.
-                    let attempt_evidence =
-                        format!("deployment {deployment_id}: attempt failed: {recorded_reason}");
+                    let attempt_evidence = redact_text(&format!(
+                        "deployment {deployment_id}: attempt failed: {recorded_reason}"
+                    ));
                     let record = match shared
                         .with_owner(move |owner| {
                             let now = (counting.clock)()?;
@@ -1467,9 +1491,9 @@ async fn run(
                             }
                             continue;
                         }
-                        closing = format!(
+                        closing = redact_text(&format!(
                             "deadline reached before the budget was spent: {recorded_reason}"
-                        );
+                        ));
                     }
                 }
                 // ADR 0011 decision 4: the budget is spent, the deadline arrived

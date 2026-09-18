@@ -34,11 +34,19 @@ pub struct OwnedCoordinatorState {
 }
 
 impl OwnedCoordinatorState {
+    /// For tests only: opens the state directory under an identity key that is
+    /// generated here and dies with the process. Nothing it seals can be opened
+    /// again after a restart, so a store opened this way could hold engine keys
+    /// that S1r can never recover. `open_with_secrets` is the product
+    /// constructor; this one is hidden rather than renamed because the name is
+    /// spelled in a great many tests.
+    ///
     /// The directory must already exist, be canonical, service-owned and 0700.
     /// Existing SQLite files must be service-owned, single-link regular 0600
     /// files. No repair is attempted. Root and the service UID are trusted not
     /// to replace paths concurrently; this is not a sandbox against that UID.
     /// This constructor establishes ownership, not runtime reconciliation.
+    #[doc(hidden)]
     pub fn open(state_dir: &Path) -> Result<Self, OwnedStateError> {
         // Spec §3: a store with no identity key cannot seal an engine key, and a
         // caller that never launches an engine still needs one installed rather

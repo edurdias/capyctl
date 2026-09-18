@@ -319,7 +319,8 @@ impl LifecyclePort for CoordinatorLifecycle {
         let endpoint = crate::port::engine_url(&binding.endpoint)
             .ok_or_else(|| {
                 LifecycleFault::Conflict(format!(
-                    "deployment {deployment} recorded an endpoint that names no                      address: {}",
+                    "deployment {deployment} recorded an endpoint that names no \
+                     address: {}",
                     binding.endpoint
                 ))
             })?

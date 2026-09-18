@@ -35,6 +35,14 @@ pub(super) async fn settle_failed_native_launch(
     let operation_id = work.operation_id().to_owned();
     let deployment_id = work.fence().deployment_id.clone();
 
+    // This read is outside the release transaction, so an association still
+    // running on the launcher's blocking thread may write the api identity after
+    // it. Two store guards make both orderings safe, and this code depends on
+    // them: `release_failed_launch` refuses evidence whose identity set differs
+    // from the recorded one, so a release built on a stale empty read cannot
+    // commit; and `record_api_identity` refuses a released binding, so an
+    // association arriving after the release is refused and the launcher disposes
+    // of the gated child. Neither guard is optional for what follows.
     let recorded = {
         let binding = binding_id.clone();
         shared
