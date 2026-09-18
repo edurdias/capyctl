@@ -364,9 +364,26 @@ fn redaction_blanks_the_credential_shapes_engine_output_carries() {
 }
 
 /// Redaction that ate ordinary words would make an engine log useless, and an
-/// operator who cannot read the log has no reason to keep it.
+/// operator who cannot read the log has no reason to keep it. The two shapes that
+/// used to be eaten are what vLLM prints on every load: the checkpoint directory
+/// and the 40-character revision it resolved.
+// T14
 #[test]
 fn redaction_leaves_ordinary_engine_output_alone() {
+    use mllm_adapters::vllm::args::redact_text;
     let line = "loading weights: 12 shards, block_size=16, model gate-m ready";
-    assert_eq!(mllm_adapters::vllm::args::redact_text(line), line);
+    assert_eq!(redact_text(line), line);
+
+    let path = "/srv/models/Qwen/Qwen3-4B-Instruct-2507/model-00001-of-00003";
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(revision.len(), 40);
+    let load = format!("loading {path} at revision {revision}");
+    assert_eq!(redact_text(&load), load);
+
+    // A key mllm issues is 32 bytes, hex-encoded to 64 characters, and still goes.
+    let key = "a".repeat(64);
+    let logged = format!("engine echoed {key} on startup");
+    let redacted = redact_text(&logged);
+    assert!(!redacted.contains(&key), "{redacted}");
+    assert!(redacted.contains("<redacted>"), "{redacted}");
 }

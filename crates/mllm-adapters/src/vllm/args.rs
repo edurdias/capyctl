@@ -219,9 +219,11 @@ fn swap_gib(b: i64) -> i64 {
 }
 
 /// The shortest run of credential-shaped characters that is redacted on sight.
-/// A hex-encoded 16-byte key is 32 characters, so 40 stays clear of ordinary
-/// words and identifiers while still covering every key mllm issues.
-const SECRET_RUN_MIN: usize = 40;
+/// mllm issues 32-byte keys, hex-encoded to 64 characters, so 48 covers every key
+/// it issues with room to spare while leaving a 40-character git commit id — which
+/// is what vLLM prints for a checkpoint revision — legible in a failure reason
+/// somebody has to read.
+const SECRET_RUN_MIN: usize = 48;
 
 const REDACTED: &str = "<redacted>";
 
@@ -275,7 +277,11 @@ pub fn redact_text(text: &str) -> String {
                 .iter()
                 .position(|c| !credential_shaped(*c))
                 .map_or(chars.len(), |offset| i + offset);
-            if end - i >= SECRET_RUN_MIN {
+            // A run that begins with `/` is a path, never a bare token: the engine
+            // prints checkpoint directories deeper than this threshold, and a
+            // failure reason that blanks the path the weights came from hides the
+            // one fact an operator needs.
+            if chars[i] != '/' && end - i >= SECRET_RUN_MIN {
                 out.push_str(REDACTED);
             } else {
                 out.extend(chars[i..end].iter());

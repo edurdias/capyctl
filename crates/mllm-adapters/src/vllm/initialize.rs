@@ -89,7 +89,14 @@ pub(super) async fn initialize(
         match adapter.check_readiness(&member).await {
             Ok(Readiness::Ready) => break,
             Ok(Readiness::Initializing) => {}
-            Err(e) => return Err(RuntimeError::Uncertain(format!("readiness: {e:?}"))),
+            // Spec §3: both exits from this step are journaled, so both pass
+            // redaction. Display, not Debug, so the reason carries one prefix
+            // rather than nesting this one inside the error's own.
+            Err(e) => {
+                return Err(RuntimeError::Uncertain(redact_text(&format!(
+                    "readiness: {e}"
+                ))))
+            }
         }
         // Spec §4 step 4: a process that left is the answer, and waiting out the
         // deadline would only delay it.
@@ -129,11 +136,22 @@ pub(super) async fn initialize(
         "max_tokens": 8,
         "temperature": 0,
     });
-    let answer = adapter.forward_chat(&body).await.map_err(|e| {
-        RuntimeError::Uncertain(redact_text(&format!(
-            "engine listed the model but did not answer: {e:?}"
-        )))
-    })?;
+    // Spec §4: every wait is bounded by the context deadline, and the builder's own
+    // waits end first so its reason, not a bare coordinator timeout, is what gets
+    // recorded. The chat client carries its own much longer bounds, so a model that
+    // lists itself and then stalls on its first completion would otherwise hand the
+    // outcome to `drive`.
+    let probe_budget = Duration::from_millis(u64::try_from(stop_at - now_ms()?).unwrap_or(0));
+    let answer = tokio::time::timeout(probe_budget, adapter.forward_chat(&body))
+        .await
+        .map_err(|_| {
+            RuntimeError::Uncertain("probe deadline reached with the engine alive".into())
+        })?
+        .map_err(|e| {
+            RuntimeError::Uncertain(redact_text(&format!(
+                "engine listed the model but did not answer: {e:?}"
+            )))
+        })?;
     if answer["choices"][0]["message"]["content"]
         .as_str()
         .is_none_or(str::is_empty)
@@ -158,7 +176,6 @@ pub(super) async fn initialize(
         )));
     }
 
-    adapter.remember_launch(&context.binding_id, &context.incarnation, &api);
     Ok(EffectObservation {
         token: context.token.clone(),
         binding_id: context.binding_id.clone(),

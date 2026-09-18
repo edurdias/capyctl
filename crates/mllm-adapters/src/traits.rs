@@ -156,6 +156,26 @@ pub enum AdapterError {
     UnsupportedCombination,
 }
 
+/// Spec §3: an adapter error is quoted into failure reasons that reach a journal,
+/// and the caller adds its own prefix when it does. Debug would nest the variant
+/// name and its quoting inside that prefix, so `Uncertain` renders as its reason
+/// alone and the other variants as the plain thing they mean.
+impl std::fmt::Display for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdapterError::Uncertain(reason) => f.write_str(reason),
+            AdapterError::PolicyDenied => f.write_str("denied by policy"),
+            AdapterError::UnsupportedCapability => {
+                f.write_str("the engine does not implement this capability")
+            }
+            AdapterError::Crash(phase) => write!(f, "the engine crashed during {phase:?}"),
+            AdapterError::UnsupportedCombination => {
+                f.write_str("unsupported combination of arguments or states")
+            }
+        }
+    }
+}
+
 /// The engine-side contract: inspect state, plan/park/restore, observe work.
 ///
 /// Error semantics are explicit: `Uncertain` means the caller must reconcile;

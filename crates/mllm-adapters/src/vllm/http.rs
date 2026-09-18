@@ -60,11 +60,31 @@ pub struct StreamChunk {
 }
 
 /// HTTP client for one engine member's API surface.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineHttp {
     base: reqwest::Url,
     api_key: Option<String>,
     client: reqwest::Client,
+}
+
+/// SPEC §13.3: this carries the per-launch engine key, so it is never formatted
+/// by the derive. `ChatHttp` and `EngineForward` have no `Debug` at all for the
+/// same reason; this type is public and re-exported, so it keeps one that says
+/// where it points and whether a key is set, and never what the key is.
+impl std::fmt::Debug for EngineHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineHttp")
+            .field("base", &self.base.as_str())
+            .field(
+                "api_key",
+                &if self.api_key.is_some() {
+                    "<set>"
+                } else {
+                    "none"
+                },
+            )
+            .finish()
+    }
 }
 
 impl EngineHttp {

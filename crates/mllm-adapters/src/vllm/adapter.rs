@@ -7,9 +7,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use mllm_domain::completion::ProcessIdentity;
-
-use crate::fake::ParkPolicy;
+use crate::policy::ParkPolicy;
 use crate::traits::{
     AdapterError, CancellationOutcome, EngineAdapter, EngineState, MemberRef, OwnedProcessLaunch,
     ParkLevel, ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome, RenderedCommand,
@@ -30,14 +28,19 @@ pub const fn level2_residue() -> i64 {
 
 /// vLLM adapter for one managed member's API surface.
 ///
+/// One instance is built for one incarnation (Spec §3): the coordinator resolves
+/// an adapter per `InitializeWork`, and `claim_incarnation` refuses a second claim
+/// on the strength of that. Nothing is shared between launches, and a launch's
+/// port, key and plan belong to this instance alone.
+///
 /// Parked-state observability (F1 design §3): the adapter tracks the last
 /// known park state locally per member (`parked` flags keyed by
 /// `member.member_id`) and reports `Phase::Parked` from it; `/v1/models`
 /// alone never establishes Ready after a park. The controller corroborates
-/// via operation provenance. The park state is PER MEMBER (mirroring the
-/// fake's per-member state): the adapter is a per-profile singleton shared
-/// by deployments riding the same profile — member A's park must never
-/// make member B report Parked or Initializing.
+/// via operation provenance. The park state is keyed per member because the
+/// legacy F1 `Controller` drives several members through one adapter; member
+/// A's park must never make member B report Parked or Initializing. That
+/// keying retires with the legacy controller.
 pub struct VllmAdapter {
     forward: crate::forward::ChatHttp,
     http: EngineHttp,
@@ -54,11 +57,11 @@ pub struct VllmAdapter {
     /// identities it produces are recorded.
     tools: Option<Arc<dyn OwnedProcessLaunch>>,
     /// The launch this adapter instance owns: the binding and incarnation it
-    /// claimed, and the API identity once the launcher returned one. The claim
-    /// is taken before a process exists, which is why the identity is optional:
-    /// a step that failed mid-launch still holds the claim, so a repeat cannot
-    /// start a second engine over the first one's memory.
-    launched: Mutex<Option<(String, String, Option<ProcessIdentity>)>>,
+    /// claimed. The claim is taken before a process exists, so a step that failed
+    /// mid-launch still holds it and a repeat cannot start a second engine over
+    /// the first one's memory. Spec §5 has cleanup take identities from the
+    /// execution context, never from adapter memory, so none is kept here.
+    launched: Mutex<Option<(String, String)>>,
     /// The per-launch engine credential. It reaches the engine through the
     /// child's environment and appears in no argv, log or receipt (Spec §3).
     engine_key: Option<String>,
@@ -165,24 +168,8 @@ impl VllmAdapter {
         if launched.is_some() {
             return Err(RuntimeError::Unsupported);
         }
-        *launched = Some((binding_id.to_string(), incarnation.to_string(), None));
+        *launched = Some((binding_id.to_string(), incarnation.to_string()));
         Ok(())
-    }
-
-    /// Record the API identity the launcher returned against the claim.
-    pub(super) fn remember_launch(
-        &self,
-        binding_id: &str,
-        incarnation: &str,
-        api: &ProcessIdentity,
-    ) {
-        if let Ok(mut launched) = self.launched.lock() {
-            *launched = Some((
-                binding_id.to_string(),
-                incarnation.to_string(),
-                Some(api.clone()),
-            ));
-        }
     }
 
     fn require_policy(&self, _what: &str) -> Result<(), AdapterError> {
@@ -277,6 +264,13 @@ impl EngineAdapter for VllmAdapter {
             .map_err(|e| AdapterError::Uncertain(format!("render: {e}")))?;
         // The engine credential is delivered via environment (never argv),
         // redacted from fingerprints and journals (SPEC §8.2/§13.3).
+        //
+        // Spec §3 retires this name. The only caller left is the legacy F1
+        // `Controller`, which the coordinator replaces; a native launch reaches
+        // the engine through `initialize`, which sets `VLLM_API_KEY` instead and
+        // never comes through here. The branch retires with that controller at S5,
+        // and is left alone until then rather than changing behaviour nothing in
+        // this slice exercises.
         if let Some(key) = &plan.engine_api_key {
             cmd.env.insert("MLLM_ENGINE_API_KEY".into(), key.clone());
         }
@@ -313,7 +307,9 @@ impl EngineAdapter for VllmAdapter {
                 // polls); crash detection is the launcher's job.
                 return Ok(Readiness::Initializing);
             }
-            Err(e) => return Err(Self::uncertain_http("readiness", e)),
+            // The stage, not the step: the readiness loop adds "readiness" itself,
+            // and naming the same thing twice in one reason helps nobody.
+            Err(e) => return Err(Self::uncertain_http("model list", e)),
         };
         if ids.contains(&self.model_id) {
             Ok(Readiness::Ready)

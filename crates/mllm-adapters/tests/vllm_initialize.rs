@@ -41,6 +41,22 @@ struct Stub {
     /// appears: a listening HTTP server is not model readiness (SPEC §6.1).
     ready_after: usize,
     polls: Arc<AtomicUsize>,
+    chat: ChatBehaviour,
+}
+
+/// What the chat surface does once the model is listed. The three failures are
+/// separate exits of step 5 and each has its own reason.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatBehaviour {
+    /// Streams a short completion, as a healthy engine does.
+    Answers,
+    /// Accepts the request and never answers: the model lists itself and then
+    /// stalls on its first completion.
+    Stalls,
+    /// Refuses the request outright.
+    Refuses,
+    /// Answers with an empty assistant message.
+    Empty,
 }
 
 /// vLLM guards every `/v1` route with the same key, `/v1/models` included, so an
@@ -76,11 +92,24 @@ async fn chat(
     if presented != format!("Bearer {}", stub.key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    match stub.chat {
+        ChatBehaviour::Answers | ChatBehaviour::Empty => {}
+        ChatBehaviour::Stalls => {
+            // Never answers. The builder's own bound is what has to end this.
+            std::future::pending::<()>().await;
+        }
+        ChatBehaviour::Refuses => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let content = if stub.chat == ChatBehaviour::Empty {
+        ""
+    } else {
+        "ready"
+    };
     let model = body["model"].as_str().unwrap_or_default().to_string();
     let chunks = vec![
         json!({
             "id": "probe-1", "object": "chat.completion.chunk", "created": 1, "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ready"},
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": content},
                          "finish_reason": serde_json::Value::Null}],
         }),
         json!({
@@ -98,22 +127,45 @@ async fn chat(
 }
 
 async fn stub_engine(model: &str, ready_after: usize, key: &str) -> (Stub, u16) {
+    serve_stub(model, ready_after, key, ChatBehaviour::Answers, 0).await
+}
+
+/// `port` of 0 lets the kernel choose; any other value is the port the engine
+/// must come up on, which is what a launch through a leased endpoint looks like.
+async fn serve_stub(
+    model: &str,
+    ready_after: usize,
+    key: &str,
+    chat_behaviour: ChatBehaviour,
+    port: u16,
+) -> (Stub, u16) {
     let stub = Stub {
         model: model.into(),
         key: key.into(),
         ready_after,
         polls: Arc::new(AtomicUsize::new(0)),
+        chat: chat_behaviour,
     };
     let app = axum::Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .with_state(stub.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     (stub, addr.port())
+}
+
+/// A port nobody is listening on: bound to learn a free one, then released.
+async fn free_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
 }
 
 // ---------------------------------------------------------------- process tool
@@ -127,6 +179,8 @@ struct ScriptedTool {
     spawned: Mutex<Vec<RenderedCommand>>,
     /// The engine dies the moment it is spawned (the crash-before-readiness case).
     gone_on_spawn: bool,
+    /// Presence checks the builder has made, one per readiness poll.
+    present_calls: Arc<AtomicUsize>,
 }
 
 impl ScriptedTool {
@@ -138,6 +192,7 @@ impl ScriptedTool {
             group,
             spawned: Mutex::new(Vec::new()),
             gone_on_spawn: false,
+            present_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -145,6 +200,14 @@ impl ScriptedTool {
         Self {
             group: vec![identity.clone()],
             gone_on_spawn: true,
+            ..Self::alive(identity, Vec::new())
+        }
+    }
+
+    /// A process whose presence cannot be established: retention, never absence.
+    fn unknown_presence(identity: ProcessIdentity) -> Self {
+        Self {
+            present: Mutex::new(Presence::Unknown),
             ..Self::alive(identity, Vec::new())
         }
     }
@@ -164,6 +227,7 @@ impl OwnedProcessLaunch for ScriptedTool {
     }
 
     fn present(&self, _identity: &ProcessIdentity) -> Presence {
+        self.present_calls.fetch_add(1, Ordering::SeqCst);
         *self.present.lock().unwrap()
     }
 
@@ -398,6 +462,170 @@ async fn a_deadline_with_the_process_alive_is_reported_as_such() {
     assert!(message.contains("deadline"), "{message}");
     assert!(message.contains("alive"), "{message}");
     assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+/// Spec §4: every wait is bounded by the context deadline, the probe included.
+/// A model that lists itself and then stalls on its first completion used to run
+/// on the chat client's own bounds, which are minutes long, so the coordinator's
+/// bare timeout decided the step and the builder's reason was lost.
+// T10
+#[tokio::test]
+async fn a_probe_that_never_answers_ends_on_the_builders_own_deadline() {
+    let (_stub, port) = serve_stub("gate-m", 0, "k3y", ChatBehaviour::Stalls, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let adapter = adapter(port, Some("k3y"))
+        .with_launch(plan(port))
+        .with_tools(tool)
+        .with_engine_key("k3y".into());
+
+    let started = Instant::now();
+    let error = adapter
+        .execute_persisted(&initialize_command(4_000))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    let RuntimeError::Uncertain(message) = error else {
+        panic!("a stalled probe is uncertain, got {error:?}");
+    };
+    assert!(message.contains("probe deadline"), "{message}");
+    assert!(message.contains("alive"), "{message}");
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+}
+
+/// The shape every live launch has: the process is up and its port is not
+/// listening yet, for the whole weight-staging window. The builder must keep
+/// polling through connection refused, which is what `check_readiness` maps to
+/// Initializing, and finish when the engine finally binds. Without a test at this
+/// shape, a change that turned a refused connection into a readiness error would
+/// pass the suite and fail every launch on the host.
+// T10
+#[tokio::test]
+async fn a_port_that_is_not_listening_yet_is_waited_out_not_failed() {
+    let port = free_port().await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    // The engine binds only after the builder has watched the process a few
+    // times, so every one of those polls met a refused connection.
+    let polls_before_binding = 2;
+    let watched = tool.present_calls.clone();
+    let engine = tokio::spawn(async move {
+        while watched.load(Ordering::SeqCst) < polls_before_binding {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        serve_stub("gate-m", 0, "k3y", ChatBehaviour::Answers, port).await
+    });
+    let adapter = adapter(port, Some("k3y"))
+        .with_launch(plan(port))
+        .with_tools(tool.clone())
+        .with_engine_key("k3y".into());
+
+    let observation = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+
+    let (stub, bound) = engine.await.unwrap();
+    assert_eq!(bound, port, "the engine came up on the leased port");
+    assert!(
+        tool.present_calls.load(Ordering::SeqCst) >= polls_before_binding,
+        "the builder polled the process while the port was closed"
+    );
+    assert!(
+        stub.polls.load(Ordering::SeqCst) >= 1,
+        "the builder asked the engine once it was listening"
+    );
+    assert_eq!(
+        observation
+            .identities
+            .iter()
+            .map(|i| i.role.as_str())
+            .collect::<Vec<_>>(),
+        ["api", "worker-0"]
+    );
+}
+
+/// SPEC §6.1: the served model appearing in the list is not a model that answers.
+/// A refused probe and an empty answer are separate exits, and neither reports the
+/// step as done.
+// T10
+#[tokio::test]
+async fn a_probe_that_is_refused_or_answers_with_nothing_fails_the_step() {
+    for (behaviour, expected) in [
+        (
+            ChatBehaviour::Refuses,
+            "engine listed the model but did not answer",
+        ),
+        (ChatBehaviour::Empty, "engine answered with empty content"),
+    ] {
+        let (_stub, port) = serve_stub("gate-m", 0, "k3y", behaviour, 0).await;
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+        let adapter = adapter(port, Some("k3y"))
+            .with_launch(plan(port))
+            .with_tools(tool)
+            .with_engine_key("k3y".into());
+
+        let error = adapter
+            .execute_persisted(&initialize_command(30_000))
+            .await
+            .unwrap_err();
+
+        let RuntimeError::Uncertain(message) = error else {
+            panic!("an unanswered probe is uncertain, got {error:?}");
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+/// Spec §4 step 6: a group that is only its API process does not cover the
+/// processes holding the device, so reporting it would record an ownership set
+/// that is not the launch.
+// T10
+#[tokio::test]
+async fn a_group_without_a_worker_is_not_reported_as_the_launch() {
+    let (_stub, port) = stub_engine("gate-m", 0, "k3y").await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), Vec::new()));
+    let adapter = adapter(port, Some("k3y"))
+        .with_launch(plan(port))
+        .with_tools(tool)
+        .with_engine_key("k3y".into());
+
+    let error = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap_err();
+
+    let RuntimeError::Uncertain(message) = error else {
+        panic!("an incomplete group is uncertain, got {error:?}");
+    };
+    assert!(message.contains("engine group incomplete"), "{message}");
+    assert!(message.contains("api:4242"), "{message}");
+}
+
+/// Spec §4 step 4: presence that cannot be established is retention, never
+/// absence. The step fails and says which it was, instead of waiting out the
+/// deadline or treating the engine as gone.
+// T10
+#[tokio::test]
+async fn presence_that_cannot_be_established_ends_the_step() {
+    let (_stub, port) = stub_engine("gate-m", usize::MAX, "k3y").await;
+    let tool = Arc::new(ScriptedTool::unknown_presence(api_identity()));
+    let adapter = adapter(port, Some("k3y"))
+        .with_launch(plan(port))
+        .with_tools(tool)
+        .with_engine_key("k3y".into());
+
+    let error = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap_err();
+
+    let RuntimeError::Uncertain(message) = error else {
+        panic!("unknown presence is uncertain, got {error:?}");
+    };
+    assert!(
+        message.contains("presence could not be established"),
+        "{message}"
+    );
 }
 
 /// One launch per incarnation: a repeat would start a second engine holding the
