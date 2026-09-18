@@ -959,7 +959,8 @@ pub(crate) fn complete(
         [&p.receipt.binding_id],
     )?)?;
     // Spec §3: the encrypted engine key does not outlive the binding it was issued
-    // for. A row may not exist yet (Task 9 wires the writer), so this is not `one`.
+    // for. A binding that never had a key stored against it (a legacy or
+    // non-vLLM launch) has no row, so this is not `one`.
     tx.execute(
         "DELETE FROM engine_secrets WHERE binding_id=?1",
         [&p.receipt.binding_id],

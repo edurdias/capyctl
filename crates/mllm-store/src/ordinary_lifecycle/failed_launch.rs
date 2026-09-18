@@ -115,7 +115,13 @@ impl crate::Store {
     /// epoch. The deployment's `desired_state` is not touched: what the owner asked
     /// for did not change because one launch failed.
     ///
-    /// The guards are those of `complete_cleanup`, less the step-deadline bound.
+    /// The guards are those of `complete_cleanup` with two deliberate differences.
+    /// The step-deadline bound is dropped, for the reason `fresh_after_deadline`
+    /// gives. And `complete_cleanup` refuses while the deployment holds a request
+    /// lease under any other fence, where this releases its own fence's leases
+    /// without that check: an Initialize never enables dispatch, so a lease under
+    /// another fence is not evidence about this launch, and refusing on it would
+    /// leave a failed launch retained over a fence it cannot affect.
     pub fn release_failed_launch(
         &self,
         s: &CoordinatorSession,

@@ -2971,3 +2971,88 @@ async fn ordinary_rejects_revision_history_and_route_tampering() {
     );
     assert_eq!(full_counts(&f.sql), before);
 }
+
+/// A store whose identity key is installed, so engine keys can be sealed against
+/// its bindings. `start_fixture` leaves the key out because nothing else in this
+/// file stores one.
+async fn sealed_fixture() -> (
+    Store,
+    mllm_store::dispatch::CoordinatorSession,
+    String,
+    tempfile::TempDir,
+) {
+    let source = fixture::owned_source().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sealed.sqlite3");
+    std::fs::copy(source.dir.path().join("srv.sqlite3"), &path).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    store.set_secrets_key(mllm_store::secrets::SecretsKey::generate_ephemeral());
+    let session = store.begin_coordinator_session().unwrap();
+    (store, session, source.fence.deployment_id.clone(), dir)
+}
+
+/// Seals a key against the deployment's reserved binding and answers what it was
+/// sealed against, so the caller can ask for it again after the release.
+fn seal_key(store: &Store, deployment: &str) -> (String, String) {
+    let binding = store.runtime_binding(deployment).unwrap().unwrap();
+    store
+        .store_engine_key(
+            &binding.id,
+            &binding.incarnation,
+            &mllm_store::secrets::new_engine_key(),
+        )
+        .unwrap();
+    assert!(store
+        .engine_key(&binding.id, &binding.incarnation)
+        .unwrap()
+        .is_some());
+    (binding.id, binding.incarnation)
+}
+
+/// Spec §3: the key row is deleted in the same transaction that releases the
+/// binding, so the stored secret set is exactly the set of engines that exist.
+/// The coordinator seals the key from the driver factory before it arms the step,
+/// so a start that runs out its deadline while still planned has one sealed
+/// against a binding that this release gives up.
+// T37
+#[tokio::test]
+async fn an_expired_unarmed_start_gives_up_its_engine_key() {
+    let (store, session, id, _dir) = sealed_fixture().await;
+    let receipt = store
+        .accept_start_command(&session, "owner", &id, 1, "expiry", 1800, 1901)
+        .unwrap();
+    let (binding, incarnation) = seal_key(&store, &id);
+
+    assert!(store
+        .expire_unarmed_initialize(&session, receipt.step_id(), 1901)
+        .unwrap());
+
+    assert!(store.runtime_binding(&id).unwrap().is_none());
+    assert!(
+        store.engine_key(&binding, &incarnation).unwrap().is_none(),
+        "the released binding must not leave a sealed key behind"
+    );
+}
+
+/// The same invariant on the other pre-arm release: a Stop accepted while the
+/// start is still planned.
+// T37
+#[tokio::test]
+async fn an_unarmed_stop_gives_up_the_starts_engine_key() {
+    let (store, session, id, _dir) = sealed_fixture().await;
+    store
+        .accept_start_command(&session, "owner", &id, 1, "start", 1800, 90_000)
+        .unwrap();
+    let (binding, incarnation) = seal_key(&store, &id);
+    let stop = store
+        .accept_ordinary_stop_command(&session, "owner", &id, 1, "stop", 1900, 10_000)
+        .unwrap();
+
+    assert!(store.complete_unarmed_stop(&session, &stop.step_id).unwrap());
+
+    assert!(store.runtime_binding(&id).unwrap().is_none());
+    assert!(
+        store.engine_key(&binding, &incarnation).unwrap().is_none(),
+        "the released binding must not leave a sealed key behind"
+    );
+}

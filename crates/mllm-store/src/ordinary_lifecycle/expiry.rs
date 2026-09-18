@@ -111,6 +111,15 @@ pub(super) fn expire_in_transaction(
     one(tx.execute("UPDATE operations SET state='failed',error_code=?2 WHERE id=?1 AND state='pending' AND error_code IS NULL",params![p.operation_id,ERROR_CODE])?)?;
     one(tx.execute("UPDATE deployments SET desired_state='stopped',observed_state='stopped',admission_enabled=0,dispatch_enabled=0 WHERE id=?1 AND revision=?2 AND current_generation=?3",params![p.deployment_id,p.revision,p.generation])?)?;
     one(tx.execute("UPDATE runtime_bindings SET state='released' WHERE id=?1 AND incarnation=?2 AND state='reserved'",params![p.binding_id,p.incarnation])?)?;
+    // Spec §3: the key row is deleted in the same transaction that releases the
+    // binding, so the stored secret set is exactly the set of engines that exist.
+    // The coordinator seals the key before it arms the step, so a start that
+    // expires while still planned has one; a launch that never stored a key has
+    // none, which is why this is not `one`.
+    tx.execute(
+        "DELETE FROM engine_secrets WHERE binding_id=?1",
+        [&p.binding_id],
+    )?;
     let binding: BindingDto = decode(&p.binding_json)?;
     let endpoint: std::net::SocketAddr = binding
         .endpoint

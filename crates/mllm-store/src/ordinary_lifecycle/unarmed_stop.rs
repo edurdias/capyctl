@@ -388,6 +388,15 @@ impl crate::Store {
             "DELETE FROM endpoint_leases WHERE binding_id=?1",
             [&r.binding_id],
         )?)?;
+        // Spec §3: the key row is deleted in the same transaction that releases
+        // the binding, so the stored secret set is exactly the set of engines that
+        // exist. The coordinator seals the key before it arms the step, so a start
+        // stopped while still planned has one; a launch that never stored a key
+        // has none, which is why this is not `one`.
+        tx.execute(
+            "DELETE FROM engine_secrets WHERE binding_id=?1",
+            [&r.binding_id],
+        )?;
         one(tx.execute("DELETE FROM lifecycle_claims WHERE deployment_id=?1 AND operation_id=?2 AND revision=?3 AND generation=?4",params![p.source.deployment_id,r.operation_id,r.revision,r.generation])?)?;
         read(&tx, id)?;
         event(&tx, s, &p, UnarmedStopTransition::Completed)?;
