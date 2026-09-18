@@ -34,11 +34,63 @@ Failures and what changed: …
 vLLM control routes keyed by API key: yes/no (see the auth-scope finding below).
 ```
 
-## 2026-09-18 — S1 run 1 — pending
+## 2026-09-18 — S1 runs 1 to 5 — `87b683c` to `000b832`
+vLLM 0.29.0, qwen3-4b-instruct, host-a (GB10, 121 GiB unified, Linux
+6.17.0-1031-nvidia). Command: `scripts/live/run-on-spark.sh`. Evidence for run 5 is
+under `target/live/20260918T131825Z/` on the machine that ran the script.
 
-Not yet run. The suite, the runner and this runbook were committed first so that
-the run has something to report against; the run itself is the next step and will
-replace this heading with the template above.
+Run 5, at `000b832`, is the first green run: six of six scenarios, 138 s wall clock.
+
+| Scenario | Result | Timing / sample |
+| --- | --- | --- |
+| L1 launch | pass | cold start to Ready: 27.2 s |
+| L2 serve | pass | plain 0.1 s, streaming 0.5 s; sample "ready" |
+| L3 access control | pass | engine on 127.0.0.1:8100 only; off-host address refused; unkeyed `/sleep` and `/collective_rpc` refused |
+| L4 stop | pass | 1.2 s, group empty |
+| L5 restart | pass | 27.7 s, new incarnation |
+| L6 bad source | pass | closed in 5.2 s; journal names the launch failure |
+| L7 recovery | pass | Ready in 26.6 s on the same controller; sample "ready" |
+| L8 engine exits at once | pass | closed in 0.6 s, no leftovers |
+| L9 deadline bound | pass | start refused, nothing launched |
+| L10 no engine | pass | NoEngineInstallation; release binary clean |
+| L11 memory returns | pass | before 117.04 GiB, at Ready 89.70 GiB, after stop 117.83 GiB |
+
+Failures and what changed. Runs 1 to 4 each failed, and each failure was a defect
+the CPU suite could not have found, because its fixtures did not have the shape
+the real launch path has.
+
+- Run 1 (`9dfc383`): the pre-flight matched its own command line through the
+  Tailscale SSH wrapper and refused an empty box. Fixed in `87b683c`.
+- Run 2 (`87b683c`): four of six hung until the settle bound and left two vLLM
+  servers running. Two defects. The store's status observer refused the shape a
+  failing launch leaves behind, one API identity recorded and no association, as
+  corrupt data, so the worker recorded the failure as unannotated and nothing
+  terminated the engine. And the adapter probed `/v1/models` without the key it had
+  just given the engine, so a healthy engine answered 401 and a good launch failed
+  as uncertain. Fixed in `3103021`.
+- Run 3 (`3103021`): settlement now ran but could not prove the group gone:
+  "malformed or inconsistent kernel process data". On this kernel, init and every
+  kernel thread report a start time of zero in `/proc/[pid]/stat`, and the group
+  scan rejected any zero as malformed, so no scan of this host's process table
+  could complete. The development machine reports nonzero start times for those
+  processes. The retained uncertainty was also invisible to a waiting caller for
+  the full ten-minute bound. Fixed in `f7a538e`.
+- Run 4 (`f7a538e`): five of six. L7's start, issued the moment L6's closure was
+  observable, was refused with "worker is not admitting Initialize": the worker
+  re-admitted starts only after its own bookkeeping, and the release transaction
+  had already made the closure visible. Re-admission now happens under the lock
+  that commits the release. Fixed in `000b832`.
+
+vLLM control routes keyed by API key: no, not by vLLM's own middleware; yes with
+`runtime/mllm_vllm_guard.py` loaded, which L3 asserts (see the auth-scope finding
+below).
+
+What this run does and does not establish. It establishes that the coordinator
+starts, serves through, stops, restarts and fails over a real vLLM 0.29 engine on
+this host with this model, and that a failed launch is terminated, proven gone and
+released with its key deleted. It does not establish parking (S2), SGLang (S3),
+restart re-attach (S1r) or any other model or engine build. CPU and Fake-engine
+runs remain no evidence of any of it.
 
 ### vLLM auth scope, verified on host-a on 2026-09-17
 
