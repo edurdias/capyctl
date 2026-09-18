@@ -159,6 +159,27 @@ impl DurableSpawn {
         self.spawn_inner(incarnation, cmd, association, Some(descriptors))
     }
 
+    /// A child whose identity was never recorded must not be left blocked on its
+    /// gate. Dropping the write gate makes the child's `dd` read EOF, so the shell
+    /// exits 125 without ever reaching `exec`; the group signal is the backstop for
+    /// a child that somehow got past the gate, and the wait leaves no zombie.
+    /// SPEC §13.2: only the group this launcher just created is signalled.
+    fn dispose(&self, incarnation: &str, pid: u32) {
+        let Some(retained) = self.retained.lock().unwrap().remove(incarnation) else {
+            return;
+        };
+        let RetainedChild {
+            mut child,
+            write_gate,
+        } = retained;
+        drop(write_gate);
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+    }
+
     fn spawn_inner(
         &self,
         incarnation: &str,
@@ -175,6 +196,7 @@ impl DurableSpawn {
             .argv
             .split_first()
             .ok_or_else(|| DurableSpawnError::Spawn("empty argv".into()))?;
+        let log = engine_log(cmd)?;
         let read_fd = read_gate.as_raw_fd();
         let write_fd = write_gate.as_raw_fd();
         const CHILD_GATE_FD: i32 = 9;
@@ -190,9 +212,22 @@ impl DurableSpawn {
             .arg("mllm-init-gate")
             .arg(program)
             .args(args)
-            .envs(&cmd.env)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .envs(&cmd.env);
+        match log {
+            Some(file) => {
+                let second = file
+                    .try_clone()
+                    .map_err(|error| DurableSpawnError::Spawn(error.to_string()))?;
+                command
+                    .stdout(std::process::Stdio::from(file))
+                    .stderr(std::process::Stdio::from(second));
+            }
+            None => {
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
         let inherited = descriptors.map(ProtectedLaunchDescriptors::numbers);
         unsafe {
             command.pre_exec(move || {
@@ -238,11 +273,12 @@ impl DurableSpawn {
             .unwrap()
             .insert(incarnation.into(), RetainedChild { child, write_gate });
         let Some(identity) = identity else {
+            self.dispose(incarnation, pid);
             return Ok(DurableSpawnOutcome::Uncertain {
                 handle,
                 api_identity: None,
                 initialization_acknowledged: false,
-                reason: "API identity unavailable after spawn".into(),
+                reason: "API identity unavailable after spawn; disposed: true".into(),
             });
         };
         match association.persist_api_identity(&identity) {
@@ -263,12 +299,15 @@ impl DurableSpawn {
                     reason: "API identity recorded; qualified worker ownership unavailable".into(),
                 })
             }
-            Err(AssociationError::Uncertain(reason)) => Ok(DurableSpawnOutcome::Uncertain {
-                handle,
-                api_identity: Some(identity),
-                initialization_acknowledged: false,
-                reason,
-            }),
+            Err(AssociationError::Uncertain(reason)) => {
+                self.dispose(incarnation, pid);
+                Ok(DurableSpawnOutcome::Uncertain {
+                    handle,
+                    api_identity: Some(identity),
+                    initialization_acknowledged: false,
+                    reason: format!("{reason}; disposed: true"),
+                })
+            }
         }
     }
 }
@@ -281,6 +320,41 @@ impl Drop for DurableSpawn {
     }
 }
 
+/// The engine's own output is evidence, so it is appended to the file the plan
+/// names rather than discarded. The log may hold prompts and tokens, so the
+/// directories are owner-only and the file is owner read/write.
+///
+/// `ExecLauncher` opens the same variable but without creating parents or fixing
+/// the mode; sharing one helper would change that launcher's behaviour, so the
+/// stricter rule lives here with the gated spawn that needs it.
+fn engine_log(cmd: &RenderedCommand) -> Result<Option<std::fs::File>, DurableSpawnError> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let Some(path) = cmd.env.get("MLLM_ENGINE_LOG") else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(path);
+    let failed = |error: std::io::Error| {
+        DurableSpawnError::Spawn(format!("engine log {}: {error}", path.display()))
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(failed)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map(Some)
+        .map_err(failed)
+}
+
 fn detach_reaper(mut retained: RetainedChild) {
     std::thread::spawn(move || {
         let _gate = retained.write_gate;
@@ -291,6 +365,21 @@ fn detach_reaper(mut retained: RetainedChild) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Accept;
+    impl LaunchAssociation for Accept {
+        fn persist_api_identity(&self, _: &ProcessIdentity) -> Result<(), AssociationError> {
+            Ok(())
+        }
+    }
+
+    struct Refuse;
+    impl LaunchAssociation for Refuse {
+        fn persist_api_identity(&self, _: &ProcessIdentity) -> Result<(), AssociationError> {
+            Err(AssociationError::Uncertain("store refused".into()))
+        }
+    }
 
     struct UnexpectedAssociation;
     impl LaunchAssociation for UnexpectedAssociation {
@@ -299,8 +388,10 @@ mod tests {
         }
     }
 
+    /// An identity that could not be read is never persisted, and the child that
+    /// could not be identified is disposed of rather than left blocked on its gate.
     #[test]
-    fn unknown_api_identity_stays_gated_and_retained() {
+    fn unknown_api_identity_is_gated_and_disposed_of() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("must-not-initialize");
         let command = RenderedCommand {
@@ -325,13 +416,83 @@ mod tests {
             other => panic!("unexpected outcome: {other:?}"),
         };
         drop(launcher);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "gated child still present"
+        );
         assert!(!marker.exists());
-        nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        )
-        .unwrap();
+    }
+
+    /// The engine's output lands in the file the plan names, not in /dev/null, so a
+    /// launch failure can be read afterwards (SPEC §13.2: evidence, not guesswork).
+    #[test]
+    fn child_output_is_written_to_the_engine_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs").join("dep").join("inc.log");
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "MLLM_ENGINE_LOG".to_string(),
+            log.to_str().unwrap().to_string(),
+        );
+        let command = RenderedCommand {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo hello-from-engine; echo oops >&2".into(),
+            ],
+            env,
+        };
+        let launcher = DurableSpawn::new();
+        launcher
+            .spawn_persisted("log-test", &command, &Accept)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            text.contains("hello-from-engine") && text.contains("oops"),
+            "{text}"
+        );
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let parent = std::fs::metadata(log.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parent, 0o700);
+    }
+
+    /// A child whose identity is never recorded is not left blocked on its gate:
+    /// the launcher closes the gate, signals the group and reaps it, so no engine
+    /// command ever runs unattributed.
+    #[test]
+    fn an_unreleased_child_is_disposed_of_before_the_error_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run");
+        let command = RenderedCommand {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch '{}'", marker.display()),
+            ],
+            env: Default::default(),
+        };
+        let launcher = DurableSpawn::new();
+        let outcome = launcher
+            .spawn_persisted("refused", &command, &Refuse)
+            .unwrap();
+        let pid = match outcome {
+            DurableSpawnOutcome::Uncertain {
+                handle,
+                initialization_acknowledged: false,
+                ..
+            } => handle.pid,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "gated child still present"
+        );
+        assert!(!marker.exists(), "the engine command must never have run");
     }
 }

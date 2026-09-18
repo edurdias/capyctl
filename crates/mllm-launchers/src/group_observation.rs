@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 
-use mllm_domain::completion::ProcessIdentity;
+use mllm_domain::completion::{Presence, ProcessIdentity};
 
 const MAX_STAT_BYTES: usize = 4096;
 const MAX_METADATA_BYTES: usize = 65536;
@@ -79,6 +79,67 @@ pub fn observe_process_group(
     finish(expected_api, first, second)
 }
 
+/// Like `observe_process_group`, but a group whose leader is gone is answered
+/// rather than refused, because cleanup needs "nothing is left" as an answer.
+/// Any other failure still fails closed.
+///
+/// A leader that has exited does not mean the group has: a worker can outlive it
+/// and keep holding device memory. So the leaderless case is answered by scanning
+/// for processes still in the group, not by assuming it is empty. A member that
+/// started before the recorded leader cannot be one of its workers and is left
+/// out, which keeps a reused pid's unrelated group from being reported as ours.
+pub fn observe_process_group_or_empty(
+    expected_api: &ProcessIdentity,
+) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
+    match super::process_absence::presence(expected_api) {
+        Presence::Unknown => Err(GroupObservationError::Visibility),
+        Presence::Alive => observe_process_group(expected_api).map(|o| o.members().to_vec()),
+        Presence::Gone => {
+            let boot = read_boot()?;
+            // A different boot is positive evidence: nothing recorded against the
+            // previous boot can still be running under any pid.
+            if boot != expected_api.boot_id {
+                return Ok(Vec::new());
+            }
+            let mut members = scan_group_by_pgid(expected_api.pid, &boot)?;
+            members.retain(|fact| fact.start_ticks >= expected_api.start_ticks);
+            Ok(members)
+        }
+    }
+}
+
+/// Every live process whose process group is `pgid`, whether or not the leader
+/// still exists. The group id is the leader's pid, so this survives the leader.
+///
+/// A pid that disappears between the directory listing and its `stat` read is not
+/// a surviving member; every other read failure still fails closed, because an
+/// unreadable process is indistinguishable from a hidden one.
+pub fn scan_group_by_pgid(
+    pgid: u32,
+    boot: &str,
+) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
+    if pgid == 0 {
+        return Err(GroupObservationError::ApiIdentity);
+    }
+    let mounts = read_bounded("/proc/mounts", MAX_METADATA_BYTES)?;
+    check_mounts(&mounts)?;
+    if read_boot()? != boot {
+        return Err(GroupObservationError::ApiIdentity);
+    }
+    let facts = list_pids()?.into_iter().filter_map(|pid| {
+        match read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES) {
+            Ok(raw) => Some(parse_stat(pid, &raw, boot)),
+            Err(GroupObservationError::Visibility)
+                if !std::path::Path::new(&format!("/proc/{pid}")).exists() =>
+            {
+                None
+            }
+            Err(error) => Some(Err(error)),
+        }
+    });
+    collect_members(pgid, facts)
+}
+
 fn read_bounded(path: &str, limit: usize) -> Result<String, GroupObservationError> {
     let file = std::fs::File::open(path).map_err(|_| GroupObservationError::Visibility)?;
     let mut bytes = Vec::new();
@@ -144,6 +205,15 @@ fn check_mounts(raw: &str) -> Result<(), GroupObservationError> {
 }
 
 fn snapshot(group: u32, boot: &str) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
+    let pids = list_pids()?;
+    let facts = pids.into_iter().map(|pid| {
+        let raw = read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES)?;
+        parse_stat(pid, &raw, boot)
+    });
+    collect_members(group, facts)
+}
+
+fn list_pids() -> Result<BTreeSet<u32>, GroupObservationError> {
     let entries = std::fs::read_dir("/proc").map_err(|_| GroupObservationError::Visibility)?;
     let mut pids = BTreeSet::new();
     for (index, entry) in entries.enumerate() {
@@ -165,11 +235,7 @@ fn snapshot(group: u32, boot: &str) -> Result<Vec<GroupProcessFact>, GroupObserv
             }
         }
     }
-    let facts = pids.into_iter().map(|pid| {
-        let raw = read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES)?;
-        parse_stat(pid, &raw, boot)
-    });
-    collect_members(group, facts)
+    Ok(pids)
 }
 
 fn collect_members(
@@ -441,5 +507,50 @@ mod tests {
         assert_eq!(observed.members()[0].start_ticks, identity.start_ticks);
         assert_eq!(observed.members()[0].parent_pid, std::process::id());
         assert!(observe_process_group(&identity).is_err());
+    }
+
+    /// A leader that has exited is not proof that its group has: the worker it
+    /// started is still in the group and still holding whatever it allocated, so it
+    /// is reported rather than hidden behind an empty answer.
+    // T31: head gone, worker surviving.
+    #[test]
+    fn a_worker_that_outlives_its_leader_is_still_reported() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & read value"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+                    .map_err(std::io::Error::other)
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let leader = crate::exec::process_identity(child.id(), "api").unwrap();
+        // EOF ends the leader while its worker keeps running.
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert_eq!(crate::process_absence::presence(&leader), Presence::Gone);
+        assert!(observe_process_group(&leader).is_err());
+        let members = observe_process_group_or_empty(&leader).unwrap();
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_ne!(members[0].pid, leader.pid);
+        assert_eq!(members[0].process_group, leader.pid);
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(members[0].pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        for _ in 0..50 {
+            if observe_process_group_or_empty(&leader).is_ok_and(|m| m.is_empty()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the group was never observed empty after the worker was killed");
     }
 }

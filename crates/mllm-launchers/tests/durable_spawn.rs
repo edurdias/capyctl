@@ -92,13 +92,13 @@ fn protected_descriptors_reach_only_gated_child_and_association_failure_keeps_ga
         assert_eq!(initialization_acknowledged, !fail);
         drop(descriptors);
         if fail {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The launch was never released, so the launcher has already disposed of
+            // the child: the descriptors reached nothing and no process is left.
             assert!(!marker.exists());
-            nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(handle.pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            )
-            .unwrap();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{}", handle.pid)).exists(),
+                "gated child still present"
+            );
         } else {
             for _ in 0..50 {
                 if std::fs::read(&marker).is_ok_and(|bytes| bytes == b"inference-secret") {
@@ -210,14 +210,13 @@ fn ambiguous_association_is_not_retried_under_same_incarnation() {
     );
     assert_eq!(association.identities.lock().unwrap().len(), 1);
     drop(launcher);
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    // An unreleased child is disposed of before the outcome is returned, so the
+    // ambiguity leaves no process behind to be reconciled later.
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "gated child still present"
+    );
     assert!(!marker.exists(), "gate EOF must not initialize the child");
-    nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    )
-    .unwrap();
 }
 
 #[test]
