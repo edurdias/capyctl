@@ -24,6 +24,12 @@ use crate::{
 };
 
 /// Construction inputs for one immutable runtime binding.
+///
+/// The vLLM variant carries a whole launch plan and is therefore much larger than
+/// the others. It is built once per launch and consumed immediately, so boxing the
+/// plan would only move one short-lived allocation while making every caller spell
+/// the indirection out.
+#[allow(clippy::large_enum_variant)]
 pub enum AdapterSpec {
     Vllm {
         endpoint: reqwest::Url,
@@ -31,6 +37,13 @@ pub enum AdapterSpec {
         fingerprint: String,
         policy: ParkPolicy,
         model_id: String,
+        /// The launch plan for an owned launch (Spec §4). A binding that only
+        /// talks to an engine somebody else started carries none, and the
+        /// resolved adapter then refuses Initialize.
+        launch: Option<crate::vllm::PlanInputVllm>,
+        /// The per-launch engine credential (Spec §3). It reaches the engine
+        /// through the child's environment; nothing renders it on argv.
+        engine_key: Option<String>,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch it
     /// was verified against and the observer that supplies fresh evidence.
@@ -43,9 +56,7 @@ pub enum AdapterSpec {
     /// The Fake family exists for the persisted control path, so it takes the
     /// clock that stamps the milestones it observes. A Fake without one cannot
     /// answer an Initialize, which is the only call the ordinary lifecycle makes.
-    Fake {
-        clock: PersistedClock,
-    },
+    Fake { clock: PersistedClock },
 }
 
 /// A trusted clock for stamping observed effects. The service supplies its own so
@@ -70,9 +81,14 @@ impl AdapterSpec {
 /// is rejected rather than quietly resolved, because the profile's identity — its
 /// build fingerprint, reserved-flag policy and verification evidence — is only
 /// meaningful for the engine it names.
+///
+/// `tools` are the director's process tools (Spec §3). A family that owns the
+/// processes it launches needs them to perform Initialize; one that talks to an
+/// engine somebody else started is resolved without them and refuses the step.
 pub fn resolve(
     declared: Engine,
     spec: AdapterSpec,
+    tools: Option<Arc<dyn crate::traits::OwnedProcessLaunch>>,
 ) -> Result<Box<dyn EngineAdapter>, RuntimeError> {
     if spec.engine() != declared {
         return Err(RuntimeError::Unsupported);
@@ -84,13 +100,21 @@ pub fn resolve(
             fingerprint,
             policy,
             model_id,
-        } => Box::new(VllmAdapter::new(
-            endpoint,
-            api_key,
-            fingerprint,
-            policy,
-            model_id,
-        )),
+            launch,
+            engine_key,
+        } => {
+            let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id);
+            if let Some(launch) = launch {
+                adapter = adapter.with_launch(launch);
+            }
+            if let Some(tools) = tools {
+                adapter = adapter.with_tools(tools);
+            }
+            if let Some(engine_key) = engine_key {
+                adapter = adapter.with_engine_key(engine_key);
+            }
+            Box::new(adapter)
+        }
         AdapterSpec::Sglang {
             frozen,
             inference,

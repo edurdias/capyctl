@@ -15,6 +15,8 @@ fn vllm() -> AdapterSpec {
         fingerprint: "fp".into(),
         policy: ParkPolicy::Disabled,
         model_id: "m".into(),
+        launch: None,
+        engine_key: None,
     }
 }
 
@@ -31,13 +33,16 @@ fn every_family_maps_to_its_own_spec() {
 fn a_spec_for_another_family_is_rejected() {
     for declared in [Engine::Sglang, Engine::Fake] {
         assert!(
-            matches!(resolve(declared, vllm()), Err(RuntimeError::Unsupported)),
+            matches!(
+                resolve(declared, vllm(), None),
+                Err(RuntimeError::Unsupported)
+            ),
             "a vLLM spec must not resolve as {declared:?}"
         );
     }
     for declared in [Engine::Vllm, Engine::Sglang] {
         assert!(matches!(
-            resolve(declared, fake()),
+            resolve(declared, fake(), None),
             Err(RuntimeError::Unsupported)
         ));
     }
@@ -45,15 +50,15 @@ fn a_spec_for_another_family_is_rejected() {
 
 #[test]
 fn a_matching_family_resolves() {
-    assert!(resolve(Engine::Vllm, vllm()).is_ok());
-    assert!(resolve(Engine::Fake, fake()).is_ok());
+    assert!(resolve(Engine::Vllm, vllm(), None).is_ok());
+    assert!(resolve(Engine::Fake, fake(), None).is_ok());
 }
 
 /// vLLM still refuses the persisted control path, which the default trait method
 /// provides. Resolution must not appear to grant a capability the engine lacks.
 #[tokio::test]
 async fn resolution_does_not_invent_a_persisted_control_path() {
-    let adapter = resolve(Engine::Vllm, vllm()).unwrap();
+    let adapter = resolve(Engine::Vllm, vllm(), None).unwrap();
     let command = RuntimeCommand {
         action: RuntimeAction::Park,
         context: StepExecutionContext {
@@ -83,7 +88,7 @@ async fn resolution_does_not_invent_a_persisted_control_path() {
 /// The resolved adapter must be the real engine implementation, not a placeholder.
 #[tokio::test]
 async fn the_resolved_adapter_is_the_engine_implementation() {
-    let adapter = resolve(Engine::Vllm, vllm()).unwrap();
+    let adapter = resolve(Engine::Vllm, vllm(), None).unwrap();
     let member = MemberRef {
         deployment_id: "d".into(),
         member_id: "m".into(),
@@ -98,7 +103,7 @@ async fn the_resolved_adapter_is_the_engine_implementation() {
 /// the lifecycle makes, so every activation on this host stalled after arming.
 #[tokio::test]
 async fn resolving_the_fake_family_grants_the_persisted_control_path() {
-    let adapter = resolve(Engine::Fake, fake()).unwrap();
+    let adapter = resolve(Engine::Fake, fake(), None).unwrap();
     let command = RuntimeCommand {
         action: RuntimeAction::Initialize,
         context: StepExecutionContext {

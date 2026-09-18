@@ -5,13 +5,15 @@
 use async_trait::async_trait;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use mllm_domain::completion::ProcessIdentity;
 
 use crate::fake::ParkPolicy;
 use crate::traits::{
-    AdapterError, CancellationOutcome, EngineAdapter, EngineState, MemberRef, ParkLevel,
-    ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome, RenderedCommand,
-    RequestRef, RestoreOutcome, WorkObservation,
+    AdapterError, CancellationOutcome, EngineAdapter, EngineState, MemberRef, OwnedProcessLaunch,
+    ParkLevel, ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome, RenderedCommand,
+    RequestRef, RestoreOutcome, RuntimeAction, RuntimeCommand, RuntimeError, WorkObservation,
 };
 use crate::vllm::http::{EngineHttp, HttpError};
 
@@ -39,6 +41,7 @@ pub const fn level2_residue() -> i64 {
 pub struct VllmAdapter {
     forward: crate::forward::ChatHttp,
     http: EngineHttp,
+    endpoint: String,
     fingerprint: String,
     policy: ParkPolicy,
     model_id: String,
@@ -46,6 +49,19 @@ pub struct VllmAdapter {
     /// Launch contract (F1 design §4): the concrete vLLM serve command
     /// this adapter renders for managed launches.
     launch: Option<crate::vllm::args::PlanInputVllm>,
+    /// Process tools supplied by the director (Spec §3). The builder spawns,
+    /// watches and enumerates through them and never learns where the
+    /// identities it produces are recorded.
+    tools: Option<Arc<dyn OwnedProcessLaunch>>,
+    /// The launch this adapter instance owns: the binding and incarnation it
+    /// claimed, and the API identity once the launcher returned one. The claim
+    /// is taken before a process exists, which is why the identity is optional:
+    /// a step that failed mid-launch still holds the claim, so a repeat cannot
+    /// start a second engine over the first one's memory.
+    launched: Mutex<Option<(String, String, Option<ProcessIdentity>)>>,
+    /// The per-launch engine credential. It reaches the engine through the
+    /// child's environment and appears in no argv, log or receipt (Spec §3).
+    engine_key: Option<String>,
 }
 
 impl VllmAdapter {
@@ -58,12 +74,16 @@ impl VllmAdapter {
     ) -> Self {
         Self {
             forward: crate::forward::ChatHttp::new(base.clone(), model_id.clone(), api_key.clone()),
+            endpoint: base.to_string(),
             http: EngineHttp::new(base, api_key),
             fingerprint,
             policy,
             model_id,
             parked: Mutex::new(HashMap::new()),
             launch: None,
+            tools: None,
+            launched: Mutex::new(None),
+            engine_key: None,
         }
     }
 
@@ -72,6 +92,86 @@ impl VllmAdapter {
     pub fn with_launch(mut self, launch: crate::vllm::args::PlanInputVllm) -> Self {
         self.launch = Some(launch);
         self
+    }
+
+    /// Attach the process tools the director supplies for an owned launch
+    /// (Spec §3). Without them the adapter answers Initialize with
+    /// `Unsupported`: it has no way to spawn anything it could prove it owns.
+    pub fn with_tools(mut self, tools: Arc<dyn OwnedProcessLaunch>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Attach the per-launch engine credential (Spec §3). It is delivered to
+    /// the child through the environment only.
+    pub fn with_engine_key(mut self, engine_key: String) -> Self {
+        self.engine_key = Some(engine_key);
+        self
+    }
+
+    /// The engine's build fingerprint, for the receipt an Initialize records.
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// The engine endpoint this adapter talks to, for the same receipt.
+    pub(super) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The three things an owned launch needs. Any one missing makes the step
+    /// unsupported rather than partly performed.
+    pub(super) fn launch_parts(
+        &self,
+    ) -> Result<
+        (
+            crate::vllm::args::PlanInputVllm,
+            Arc<dyn OwnedProcessLaunch>,
+            String,
+        ),
+        RuntimeError,
+    > {
+        match (&self.launch, &self.tools, &self.engine_key) {
+            (Some(launch), Some(tools), Some(key)) => {
+                Ok((launch.clone(), tools.clone(), key.clone()))
+            }
+            _ => Err(RuntimeError::Unsupported),
+        }
+    }
+
+    /// Claim this adapter's one launch. A second claim is refused: the adapter
+    /// instance is built for a single incarnation, and a repeat would spawn a
+    /// second engine while the first is still recorded as owned.
+    pub(super) fn claim_incarnation(
+        &self,
+        binding_id: &str,
+        incarnation: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut launched = self
+            .launched
+            .lock()
+            .map_err(|_| RuntimeError::Uncertain("launch record is poisoned".into()))?;
+        if launched.is_some() {
+            return Err(RuntimeError::Unsupported);
+        }
+        *launched = Some((binding_id.to_string(), incarnation.to_string(), None));
+        Ok(())
+    }
+
+    /// Record the API identity the launcher returned against the claim.
+    pub(super) fn remember_launch(
+        &self,
+        binding_id: &str,
+        incarnation: &str,
+        api: &ProcessIdentity,
+    ) {
+        if let Ok(mut launched) = self.launched.lock() {
+            *launched = Some((
+                binding_id.to_string(),
+                incarnation.to_string(),
+                Some(api.clone()),
+            ));
+        }
     }
 
     fn require_policy(&self, _what: &str) -> Result<(), AdapterError> {
@@ -109,6 +209,19 @@ impl VllmAdapter {
 
 #[async_trait]
 impl EngineAdapter for VllmAdapter {
+    /// Spec §4: the builder performs Initialize end to end. Every other action
+    /// stays refused until the slice that implements it lands — an adapter must
+    /// never appear to grant a control path it does not have.
+    async fn execute_persisted(
+        &self,
+        command: &RuntimeCommand,
+    ) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
+        match command.action {
+            RuntimeAction::Initialize => crate::vllm::initialize::initialize(self, command).await,
+            _ => Err(RuntimeError::Unsupported),
+        }
+    }
+
     async fn inspect(&self, member: &MemberRef) -> Result<EngineState, AdapterError> {
         // /v1/models presence tells us the API server is up and serving the
         // model id — but after a park the server stays up (F1 design §3),

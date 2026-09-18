@@ -218,6 +218,77 @@ fn swap_gib(b: i64) -> i64 {
     b / (1024 * 1024 * 1024)
 }
 
+/// The shortest run of credential-shaped characters that is redacted on sight.
+/// A hex-encoded 16-byte key is 32 characters, so 40 stays clear of ordinary
+/// words and identifiers while still covering every key mllm issues.
+const SECRET_RUN_MIN: usize = 40;
+
+const REDACTED: &str = "<redacted>";
+
+/// Characters a hex or base64 credential is made of. `/` is included because a
+/// base64 value contains it; the cost is that a long path may be redacted too,
+/// which is the cheaper mistake.
+fn credential_shaped(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+}
+
+fn starts_with_ignoring_case(text: &[char], marker: &str) -> bool {
+    let marker: Vec<char> = marker.chars().collect();
+    text.len() >= marker.len()
+        && text
+            .iter()
+            .zip(marker.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+/// Blank credential material in free text before it is recorded or reported
+/// (Spec §3, SPEC §13.3). Engine logs and failure reasons are quoted into
+/// journals and errors, and an engine echoes its own key often enough that
+/// quoting one verbatim is a question of when, not whether. Three shapes are
+/// blanked: an `Authorization: Bearer` value, a `VLLM_API_KEY=` value, and any
+/// long run of hex or base64 characters.
+pub fn redact_text(text: &str) -> String {
+    const MARKERS: [&str; 2] = ["bearer ", "vllm_api_key="];
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(marker) = MARKERS
+            .iter()
+            .find(|marker| starts_with_ignoring_case(&chars[i..], marker))
+        {
+            let width = marker.chars().count();
+            out.extend(chars[i..i + width].iter());
+            i += width;
+            let end = chars[i..]
+                .iter()
+                .position(|c| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';'))
+                .map_or(chars.len(), |offset| i + offset);
+            if end > i {
+                out.push_str(REDACTED);
+            }
+            i = end;
+            continue;
+        }
+        if credential_shaped(chars[i]) {
+            let end = chars[i..]
+                .iter()
+                .position(|c| !credential_shaped(*c))
+                .map_or(chars.len(), |offset| i + offset);
+            if end - i >= SECRET_RUN_MIN {
+                out.push_str(REDACTED);
+            } else {
+                out.extend(chars[i..end].iter());
+            }
+            i = end;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Launch fingerprint with secrets redacted (SPEC §8.2/§13.3): the recorded
 /// provenance must never carry credential values.
 pub fn fingerprint_of(cmd: &RenderedCommand) -> String {

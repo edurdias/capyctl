@@ -74,6 +74,11 @@ impl EngineBindings for ProfileBindings {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| effective.name.clone()),
+                    // Task 9 builds the launch plan and the per-launch engine key
+                    // here. Until it does, this binding only talks to an engine
+                    // somebody else started, so the adapter refuses Initialize.
+                    launch: None,
+                    engine_key: None,
                 })
             }
             Engine::Fake => {

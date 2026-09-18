@@ -536,11 +536,15 @@ impl OwnedCoordinator {
                 }
                 let spec = bindings.spec(work)?;
                 let engine: Arc<dyn EngineAdapter> =
-                    Arc::from(mllm_adapters::resolve::resolve(declared, spec).map_err(|_| {
-                        CoordinatorError::Service(
-                            "engine spec does not match the declared family".into(),
-                        )
-                    })?);
+                    Arc::from(
+                        // Task 9 supplies the director's process tools here; until then no
+                        // family resolved on this path owns the processes it talks to.
+                        mllm_adapters::resolve::resolve(declared, spec, None).map_err(|_| {
+                            CoordinatorError::Service(
+                                "engine spec does not match the declared family".into(),
+                            )
+                        })?,
+                    );
                 let clock = cleanup_clock.clone();
                 Ok(Arc::new(Driver {
                     engine,

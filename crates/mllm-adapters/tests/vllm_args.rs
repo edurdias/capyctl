@@ -340,3 +340,33 @@ fn fingerprint_still_redacts_api_key_if_present() {
     assert!(fp.contains("--api-key <redacted>"), "fp: {fp}");
     assert!(!fp.contains("secret123"));
 }
+
+/// Spec §3: engine output is quoted into errors and journals, so the three
+/// shapes a credential takes in it are blanked before it travels.
+#[test]
+fn redaction_blanks_the_credential_shapes_engine_output_carries() {
+    let text = mllm_adapters::vllm::args::redact_text(
+        "INFO header Authorization: Bearer sk-live-4242 accepted\n\
+         env VLLM_API_KEY=deadbeefcafe started\n\
+         token 0123456789abcdef0123456789abcdef0123456789abcdef logged\n",
+    );
+    assert!(text.contains("Bearer <redacted>"), "{text}");
+    assert!(text.contains("VLLM_API_KEY=<redacted>"), "{text}");
+    assert!(!text.contains("sk-live-4242"), "{text}");
+    assert!(!text.contains("deadbeefcafe"), "{text}");
+    assert!(
+        !text.contains("0123456789abcdef0123456789abcdef0123456789abcdef"),
+        "{text}"
+    );
+    // Redaction must leave the operator something to read.
+    assert!(text.contains("INFO header"), "{text}");
+    assert!(text.contains("started"), "{text}");
+}
+
+/// Redaction that ate ordinary words would make an engine log useless, and an
+/// operator who cannot read the log has no reason to keep it.
+#[test]
+fn redaction_leaves_ordinary_engine_output_alone() {
+    let line = "loading weights: 12 shards, block_size=16, model gate-m ready";
+    assert_eq!(mllm_adapters::vllm::args::redact_text(line), line);
+}
