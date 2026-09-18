@@ -1,7 +1,9 @@
 # Native launch through the coordinator, vLLM first
 
 **Date:** 2026-09-17
-**Status:** Approved by the owner in design review; awaiting the implementation plan.
+**Status:** Approved by the owner in design review, then revised after a six-reviewer
+document review on 2026-09-17 (§11 records each decision). Awaiting the owner's read of
+the revision, then the implementation plan.
 **Slice:** S1 of the F2 exit roadmap in §1.
 **Governs:** how the coordinator starts, stops and fails a real engine process, and the
 shape every later slice builds on.
@@ -17,19 +19,42 @@ a signal.
 
 The owner's acceptance bar is the F2 exit gate (SPEC §18): both engines side by side, full
 initialization and offloading, and the residency scenarios active/active, active/parked,
-parked/active and parked/parked, live on `host-a`. That is five slices, each with its
-own design, plan, live run and review:
+parked/active and parked/parked, live on `host-a`. That is seven slices, each with
+its own design, plan, live run and review:
 
 | Slice | Deliverable | Live proof |
 |---|---|---|
 | **S1** | vLLM launches, serves, stops and fails through the coordinator | restart-only cycle and two failure cases |
+| **S1r** | Restart re-attach: on startup mllm takes back, or stops, every engine it recorded | kill mllm under a serving engine, restart, keep serving |
 | **S2** | Ordinary park and wake, vLLM, wired to `mllm-domain/src/park.rs` | active to parked to active, serving after wake |
 | **S3** | SGLang launches through the same mechanism | restart-only cycle on SGLang |
-| **S1b** | Model source materialization (`huggingface`, `http`) into the host model store | deploy from a repo reference |
 | **S4** | Park and wake, SGLang | active to parked to active |
-| **S5** | Eviction in the authority, coexistence, the scenario matrix | the four residency pairs and pressure-driven switching |
+| **S5** | Eviction in the authority, coexistence, the scenario matrix; the legacy F1 `Controller` in `operations.rs` is deleted here, which closes SPEC §18's "no parallel controller implementation" clause | the four residency pairs and pressure-driven switching |
+| **S1b** | Model source materialization (`huggingface`, `http`) into the host model store; nothing in the gate needs it, so it follows the gate | deploy from a repo reference |
 
-Merges to `main` happen after S1 and S3 are both live-green, and again after S5.
+Merges to `main` happen after S1 and S3 are both live-green (S1r and S2 land between
+them in order), and again after S5. S1b follows the second merge.
+
+**Parking is a requirement, and so are its protections.** The owner's ruling: parking is
+required product behavior, not an optional experiment. On `host-a` device and host
+memory are one pool, so ADR 0010 refuses `host_backed` there and `deep` is the only tier
+the box can deliver. For vLLM, deep parking runs through sleep mode, which needs vLLM's
+development mode; vLLM's own security documentation advises against that in production
+because it also enables the collective RPC control (SPEC §9.1). mllm therefore treats
+three protections as requirements rather than mitigations: the engine listens on the
+loopback address only, every launch has its own engine key that only mllm holds (§3),
+and no user-reachable route ever forwards an engine control path. S2 proves all three
+live with a parked engine, and the claim at S5 is stated in those words: parking works
+under these tested conditions. A vLLM control path that does not need development mode
+is later work. SGLang's memory-release path is not tied to a development mode and is
+not affected the same way. The owner also ruled on the switch: **deep parking is on by
+default and a host opts out**, the reverse of what SPEC §9.1, T21 and `AGENTS.md` say
+today. Those three texts are amended by the S2 ADR, which owns parking; until then the
+code carries the new default and the documents carry a pointer to this decision. The
+consequence for S1: vLLM launches with sleep mode enabled from the first slice, so the
+launch shape S1 proves live is the one S2 parks, and the three protections are
+exercised, not deferred. A host that opts out launches without sleep mode and gets
+restart-only parking.
 
 Decisions taken in this review that bind later slices:
 
@@ -38,7 +63,10 @@ Decisions taken in this review that bind later slices:
   SQLite encrypted, and passes them to the process at launch through the private
   descriptor the wrapper already reads. The encryption key lives in
   `<state_dir>/identity/`, owner-only, generated at first boot, never in the database.
-  `credential_ref` on a profile becomes a real reference into that table.
+  `credential_ref` on a profile becomes a real reference into that table. Re-registering
+  an installation generates a fresh pair and invalidates the stored one; rotation takes
+  effect at the next launch. The storage mechanism itself lands in S1, because the
+  per-launch engine key (§3) needs it first.
 - **Post-launch retry (after S3).** Deferred until real failure samples exist; see §6.
 
 ## 2. The pattern: director and builder
@@ -78,11 +106,23 @@ pub trait OwnedProcessLaunch: Send + Sync {
         -> Result<ProcessIdentity, RuntimeError>;
     /// Live now, with the same start identity: boot id and start ticks, not pid alone.
     fn present(&self, identity: &ProcessIdentity) -> Presence;
-    /// SIGTERM the owned group, wait `grace`, SIGKILL, then prove every identity gone.
+    /// Every live member of the process group the recorded API process led: the API
+    /// process first when it is still live, workers named `worker-0`, `worker-1`, ...
+    /// in start order, and an empty list when no member is live. Empty is an answer,
+    /// not an error; cleanup depends on it.
+    fn observe_group(&self, api: &ProcessIdentity)
+        -> Result<Vec<ProcessIdentity>, RuntimeError>;
+    /// SIGTERM the owned group, wait `grace`, SIGKILL, then prove every identity gone
+    /// and the group itself empty.
     fn terminate_owned(&self, identities: &[ProcessIdentity], grace: Duration)
         -> Result<(), RuntimeError>;
 }
 ```
+
+The trait is synchronous on purpose; `mllm-launchers` takes no async runtime. The builder
+calls `terminate_owned` and its blocking waits through `tokio::task::spawn_blocking`, so
+the coordinator's timeout and shutdown signal stay able to interrupt a slow stop and no
+worker thread is held for the length of a grace period.
 
 `Presence` moves from `mllm-launchers/src/process_absence.rs` to
 `mllm-domain/src/completion.rs`, beside `ProcessIdentity`, so both crates can name it.
@@ -93,7 +133,25 @@ new uses them.
 `DurableProcessLaunch { spawn: DurableSpawn, association: Arc<dyn LaunchAssociation> }`.
 `spawn_durable` calls `spawn_persisted`; an outcome with
 `initialization_acknowledged: false` is an error carrying the reason, and the gated child
-is never released. `terminate_owned` is new and is specified in §5.
+is never released. Two changes to `DurableSpawn` come with it:
+
+- **Output goes to a file.** Today it sends the child's stdout and stderr to null, so
+  the log the failure path quotes would never exist. It opens the plan's `engine_log`
+  (created `0600`, parent directories `0700`) and redirects both streams into it before
+  the gate is released, as `ExecLauncher` already does for `MLLM_ENGINE_LOG`. It must be
+  a file and never a pipe held by mllm: a pipe would kill the engine when mllm exits,
+  and S1r depends on engines outliving mllm.
+- **A child that is never released is disposed of.** Today `detach_reaper` moves the
+  write end of the gate into a thread that waits on the child, so the pipe never closes
+  and a blocked `sh` is left behind; the crate's own test has to kill it by hand. When
+  the gate is not released, `spawn_durable` closes the gate, signals the gated child's
+  process group, waits for it, and only then returns the error. A failed launch leaves
+  no process behind.
+
+`terminate_owned` reuses `ExecLauncher`'s existing signal escalation, and `observe_group`
+wraps `observe_process_group` from `crates/mllm-launchers/src/group_observation.rs`,
+which is extended to report an empty group when the leader is gone instead of failing
+closed. Neither operation is written a second time. §5 specifies both.
 
 The association is built in the coordinator's driver factory (`spawn_resolved` in
 `crates/mllm-controller/src/coordinator/worker.rs`) per `InitializeWork`, capturing the
@@ -114,23 +172,111 @@ effective configuration and nothing ambient:
 | `served_model_name` | `effective.routes[0]` |
 | `granted` | `launch_settings.requested_budget` |
 | `engine_args` | `profile.args` |
-| `sleep_flags` | only when `enable_sleep_mode && security.experimental_controls`; empty in S1 |
-| `api_key` | `None`; the engine listener is local and unauthenticated, as in F1 |
+| `sleep_flags` | `--enable-sleep-mode` and its companions when `launch_settings.enable_sleep_mode`, which is on unless the host opts out; `VLLM_SERVER_DEV_MODE=1` follows it |
+| `api_key` | `None` for the renderer, so `--api-key` is never emitted; the key travels in the environment, see below |
+| `tensor_parallel_size`, `pipeline_parallel_size`, `kv_cache_dtype`, `block_size_tokens`, `cpu_offload_bytes` | `launch_settings`, all five |
 | `engine_log` | `<state_dir>/logs/<deployment>/<incarnation>.log` |
 
 `render_command` in `crates/mllm-adapters/src/vllm/args.rs` gains the two flags mllm
 reserves and does not yet emit: `--host 127.0.0.1` always, and `--served-model-name` from
-the new `PlanInputVllm.served_model_name`. Profile arguments render after them and are
-validated by `validate_profile_args` as today.
+the new `PlanInputVllm.served_model_name`. It also renders the five launch settings the
+schema already validates and nothing passes on today: `--tensor-parallel-size`,
+`--pipeline-parallel-size`, `--kv-cache-dtype`, `--block-size`, and `--cpu-offload-gb`
+(converted from bytes with the unit stated, only when above zero). mllm reserves all
+five flags, so a profile could never have supplied them; without this an accepted
+setting would be silently ignored. One unit test pins each flag. Profile arguments
+render after them and are validated by `validate_profile_args` as today.
 
-Unchanged: the `EngineAdapter::execute_persisted` signature, the ordering of the worker's
-`drive`, the store schema up to §6's one new transition.
+**The park switch is an opt-out, and it is one switch.** `security.experimental_controls`
+on a profile becomes `security.deep_park: enabled | disabled`, default `enabled`. It does
+two things together: `ProfileBindings` maps it to the adapter's park policy, and
+`disabled` forces `sleep_flags` empty and `VLLM_SERVER_DEV_MODE=0` regardless of
+`launch_settings.enable_sleep_mode`, so an opted-out host never launches a
+development-mode engine. Effective-config validation refuses `deep_park: disabled` on a
+deployment whose residency parks, with a message naming both settings. The host-level
+`enable_sleep_mode` (`MLLM_DEEP_PARK` for standalone) therefore never overrides a
+profile that says `disabled`. The existing T21 test flips meaning: the default permits
+the park controls, an explicit `disabled` refuses them without an engine call.
+
+**`--trust-remote-code` becomes a host opt-in.** It is on vLLM's approved pass-through
+list today and lets a model directory execute its own Python at load. It stays passable
+only when the engine installation sets `security.trust_remote_code: true`, default
+`false`; a profile argument list that carries it without the switch is refused. Qwen3
+does not need it.
+
+**The engine key.** SPEC §13.3: local-only does not mean unauthenticated. For every
+launch mllm generates a random 32-byte key and delivers it to vLLM through the child's
+environment as `VLLM_API_KEY`, never on the command line: the renderer leaves
+`PlanInputVllm.api_key` as `None`, and the builder inserts `VLLM_API_KEY`, `PATH` with
+the engine's own `bin` first, and the log path into the rendered environment after
+rendering, the way `VllmAdapter::render_plan` assembles them today. The existing
+`MLLM_ENGINE_API_KEY` name in `render_plan` is retired; L3 proves the engine actually
+requires the key, so a name mismatch cannot launch an unauthenticated engine silently.
+The forwarder sends the key on every request. The loopback bind stays as a second
+control. Whether vLLM 0.29 also requires the key on its non-`/v1` control routes
+(`/sleep`, `/wake_up`, `/collective_rpc`) is verified in the plan and proven in L3; if it
+does not, the design records that the loopback bind and the forwarder allowlist are the
+only controls on those routes and names closing that gap as a precondition of S2.
+
+The key is stored with the binding, encrypted, so that S1r can rebuild an engine handle
+from stored facts alone. Construction: XChaCha20-Poly1305 (`chacha20poly1305` crate,
+the workspace's first authenticated-encryption dependency), a fresh 24-byte nonce from
+the OS random source per row, and `binding_id || incarnation` as associated data, so a
+row copied between bindings does not authenticate. A row that fails to authenticate is
+a hard error that leaves the binding `Uncertain`. Schema v14, forward-only, adds the
+table: ciphertext and nonce per binding. The key row is deleted in the same transaction
+that releases the binding, on ordinary cleanup and on `release_failed_launch`, so the
+stored secret set is exactly the set of engines that exist. The encryption key is a
+32-byte file in `<state_dir>/identity/`, owner-only, generated at first boot and never
+written to the database; the database alone cannot recover an engine key, and a
+restored database without its identity directory reaches S1r's unprovable branch. The
+SGLang installation keys in S3 use the same construction in an installation-scoped
+table, keyed by installation and revision rather than by binding; they are not rows of
+this table.
+
+**The router must reach the engine the coordinator launched.** Today `roles.rs` builds
+the forwarding table once at boot from a fixed port, and `LifecyclePort` exposes no
+endpoint or key. With leased ports and per-launch keys that table cannot be right.
+`LifecyclePort` gains a projection, `runtime_endpoint(deployment) -> Option<{endpoint,
+engine_key}>`, answered from the coordinator's retained runtime, and the router builds
+its forwarder per request from it; the boot-time `RouterDeps.forwards` table is
+removed. The forwarder forwards only its chat and models paths and refuses any other
+upstream path, which is the control L3 drives directly.
+
+**Requested budget cannot exceed the admitted footprint.** `PlanInputVllm.granted` is
+rendered from `launch_settings.requested_budget`, which is a request. Deploy-time
+validation refuses a deployment whose profile requests more KV than the Ready-phase
+allocation it declares, so the engine's pool is never sized above what admission
+accounted for.
+
+**One store precondition changes.** The association writes the API identity into
+`runtime_bindings.identities_json` before the engine runs, and `record_launch` in
+`crates/mllm-store/src/ordinary_lifecycle.rs` today requires that column to still be
+`'[]'`; as written, every native start would end `Conflict` with the engine running.
+`record_launch` also accepts a binding that holds exactly the API identity
+`record_api_identity` wrote for the same binding and incarnation.
+
+Unchanged: the `EngineAdapter::execute_persisted` signature and the ordering of the
+worker's `drive`. Store changes in S1 are exactly: the `record_launch` precondition above,
+the worker-identity rule in §4, the encrypted engine-key table (schema v14), and §6's
+new transition.
 
 ## 4. The vLLM Initialize step
 
 `VllmAdapter::execute_persisted` for `RuntimeAction::Initialize`, with context
 `identities: OwnedLaunch`, a Ready completion target and vLLM launch settings. Every wait
-is bounded by `context.deadline_ms`.
+is bounded by `context.deadline_ms` and by the coordinator's Initialize bound.
+
+**That bound is not `protocol_timeout`.** `drive` caps every adapter call at
+`min(deadline - now, protocol_timeout)`, `protocol_timeout` defaults to 30 s, and
+standalone takes `CoordinatorOptions::default()`. This project measured a 4B cold start
+at 27 to 63 s. As written, mllm would give up on a healthy engine mid-load and then kill
+it. `CoordinatorOptions` gains `initialize_timeout`, default 15 minutes, validated
+between 30 s and 2 h, and `drive` uses it in place of `protocol_timeout` for Initialize.
+Standalone constructs its options explicitly. The builder's own waits end 2 s before
+`context.deadline_ms`, so its "deadline reached with the process present" error reaches
+the coordinator before `drive`'s timeout drops the effect future; a coordinator-side
+timeout that fires anyway is handled by §6 the same way.
 
 1. **Guard.** `Unsupported` if no plan or tool is attached, the launch settings are not
    vLLM, or this adapter already launched this binding and incarnation. One launch per
@@ -146,16 +292,27 @@ is bounded by `context.deadline_ms`.
    present ends it with an error saying so.
 5. **Probe.** One `forward_chat`, `max_tokens: 8`, `temperature: 0`. Empty content or an
    HTTP error ends the step with an error.
-6. **Observe.** Return `EffectObservation` with `identities: vec![identity]`, a receipt
-   naming the fingerprint and endpoint, and the facts a cold start proves:
-   `AllocationsRestored`, `WeightsUsable`, `CacheValid`, `ModelUsable`.
+6. **Enumerate.** `tools.observe_group(&identity)`. vLLM is not one process: the API
+   process starts an `EngineCore` worker that holds the model in device memory. Record
+   the API process and every worker.
+7. **Observe.** Return `EffectObservation` with those identities, a receipt naming the
+   fingerprint and endpoint, and the facts a cold start proves: `AllocationsRestored`,
+   `WeightsUsable`, `CacheValid`, `ModelUsable`.
 
 The coordinator then records the owned launch, whose first identity matches the one
 already stored by the association, and completes the step. The retained `Driver` keeps
 the adapter for Cleanup.
 
-Park effects return `Unsupported` from the vLLM builder until S2. vLLM's `EngineCore`
-children are covered by process-group termination and are not recorded individually.
+Recording the workers is not optional. The store's `canonical_members` and `members`
+(`crates/mllm-store/src/lifecycle/completion.rs`) accept exactly two identities, `api`
+and `worker-0`, so a start that reports one identity is refused; the domain's
+`verify_completion` already accepts `api` plus any number of `worker-` roles with a
+shared boot id and distinct pids and needs no change. And the release proof covers only
+recorded identities: with the worker unrecorded, mllm could release a grant while
+`EngineCore` still holds the memory. The store rule is generalized to match the
+domain's, which a tensor-parallel launch needs anyway.
+
+Park effects return `Unsupported` from the vLLM builder until S2.
 
 ## 5. Termination and cleanup
 
@@ -168,18 +325,37 @@ For native builders the closure becomes:
    never signals a process it cannot prove it owns (SPEC §13.2). `SIGTERM` goes to the
    process group of the API process, which `DurableSpawn` made a group leader. Poll
    `verify_gone` every 200 ms until `grace`; then `SIGKILL` and poll for a fixed 5 s.
-2. `observed_gone(&context, &clock)`. `AllGone` yields `CleanupEvidence`. `SomeAlive` or
-   `Indeterminate` is an error; ownership and the reservation are retained.
+2. `observed_gone(&context, &clock)`, which now also requires `observe_group` to find
+   the group empty, so a child that was never recorded cannot hide behind the proof.
+   `AllGone` with an empty group yields `CleanupEvidence`. Anything else is an error;
+   ownership and the reservation are retained.
 
-`CoordinatorOptions.terminate_grace` defaults to 15 s and is validated between 1 s and
-300 s. The whole closure stays inside the cleanup deadline the store already bounds.
+`CoordinatorOptions.terminate_grace` defaults to 15 s. The cleanup closure is bounded by
+the smaller of the store's cleanup deadline and `protocol_timeout`, so validation rejects
+any grace where `terminate_grace + 5 s` is not strictly less than `protocol_timeout`,
+with a floor of 1 s. A grace that cannot fit would turn every Stop into a timeout.
 
-`CleanupMode::TerminateOwned` is the closure above. `InspectOwnedGone` is `observed_gone`
-alone. Both take identities from the context, so they do not depend on adapter memory.
+The closure is chosen by the builder the factory resolved: a builder that launches
+processes terminates and then inspects; one that launches nothing only inspects. The
+store keeps arming `CleanupMode::TerminateOwned` as today, and `InspectOwnedGone` stays
+reserved for S1r. Both take identities from the context, never from adapter memory.
 
-Out of S1: recovering a running engine after a coordinator restart. `drive_cleanup`
-refuses a binding the worker does not retain. That is SPEC §13.2 reconciliation and is
-recorded in the runbook.
+**Until S1r lands,** a coordinator restart strands a running engine: `drive_cleanup`
+refuses a binding the worker does not retain, and nothing ties the engine's life to
+mllm's. A stranded engine is cleared by hand, and the live runner prints the recorded
+process identities to make that exact. S1r removes the gap. On startup, for each engine
+the store says was running: a different boot id means it is gone, so release and start
+again if the deployment wants to be ready; the same boot, the recorded pid with the
+recorded start ticks, that process proven to own the listening socket on the recorded
+endpoint (so the key is never sent to whatever else took the port), and an engine that
+answers there with its key and lists the served model means re-attach, by rebuilding
+the handle from stored facts; a port held by anything else is treated as gone; a stored
+key that fails to decrypt or authenticate is treated as present but unprovable;
+present but not answering means terminate, prove gone, release and start again; gone
+means prove, release and start again; indeterminate keeps the reservation, reads
+`Uncertain`, and is surfaced. S1's obligation to S1r is that every engine handle can be
+rebuilt from what the store holds: identities, endpoint, served name, launch settings
+and the encrypted engine key.
 
 ## 6. Launch failure in v1: terminate, prove, release, fail
 
@@ -189,18 +365,38 @@ path would wait for a human. The coordinator instead classifies by proof, not by
 builder's opinion. After any Initialize error on a native builder:
 
 1. Read the binding's recorded identities from the store. None recorded means the gate
-   never opened; the child is a blocked shell that exits when the tool drops its pipe, and
-   no engine ran.
-2. `terminate_owned`, then `verify_gone`.
+   never opened: `spawn_durable` disposed of the gated child before returning (§3) and
+   no engine ran. That case skips step 2, because `verify_gone` on an empty set returns
+   `Indeterminate` by design ("no recorded processes" could be a lost record). Here it
+   is not a lost record: the never-released spawn outcome is itself the evidence, and
+   the flow goes straight to step 3 with an empty identity set.
+2. Otherwise `terminate_owned`, then `verify_gone` and an empty group.
 3. **Proven gone.** New store transition
    `release_failed_launch(session, step_id, evidence, now)`, one transaction: the step
    becomes `cancelled` and its lifecycle run and operation `failed` (the schema's step
    states have no failed value and its run states do, so no migration is needed), the
    binding becomes `released`, the endpoint lease and resource grant are released, the
    claim is dropped, and the gone evidence is written to `lifecycle_evidence`. This is a
-   release with verified evidence, so the working agreement's invariant holds. The coordinator journals
-   the builder's reason with the engine log tail (SPEC §17), closes that deployment's
-   admission, and the status reads `Closed`. No retry. Other deployments are untouched.
+   release with verified evidence, and it carries the same guards as the existing
+   evidence-gated release in `ordinary_lifecycle::cleanup::complete`, with one deliberate
+   difference: the evidence's identity set must equal the binding's recorded identities
+   (the empty set for the never-released case), the observation must be fresh within the
+   host's `observation_ttl_ms` and not earlier than the step's issued time, so the
+   transition takes the ttl, and a replay with identical evidence is accepted as already
+   done while different evidence is refused. It does **not** apply `fresh`'s rejection of
+   evidence observed after the step deadline: a deadline-triggered failure proves the
+   process gone after that deadline by construction, and applying the bound would send
+   every timeout failure into the `Uncertain` pause this section exists to remove. The
+   coordinator journals the builder's reason with the engine log tail (SPEC §17) after
+   the tail has passed the same credential redaction `fingerprint_of` applies to a
+   recorded command, extended to blank the engine key value and anything shaped like a
+   key or token; the raw log stays in the owner-only log file. It then closes that
+   deployment's admission, and the status reads `Closed`. No retry. Other deployments
+   are untouched.
+
+   **The way back.** A `Closed` deployment accepts a new Start once its configuration
+   is corrected: a new revision starts with a clean slate, and a Stop followed by a
+   Start on the same revision is a new generation. §9 proves it live.
 4. **Not provable.** `Uncertain` pause with the reservation retained, as today. An
    operator Stop retries the termination.
 
@@ -226,7 +422,7 @@ settings the strict schema requires:
 |---|---|---|
 | `executable` | `MLLM_VLLM_BIN` | required |
 | `tensor_parallel_size`, `pipeline_parallel_size` | | 1, 1 |
-| `enable_sleep_mode` | | `false` in S1 |
+| `enable_sleep_mode` | `MLLM_DEEP_PARK=off` to opt out | `true` |
 | `kv_cache_dtype`, `block_size_tokens`, `cpu_offload_bytes` | | `auto`, 16, `0B` |
 | `requested_budget.kv_cache_bytes` | `MLLM_KV_CACHE_BYTES` | `16GiB` |
 | `requested_budget.gpu_utilization_pct` | | 10 |
@@ -246,23 +442,58 @@ refuses to boot if it is not a directory.
 
 **Model source.** A deployment's `model` gains `source`, per ADR 0008: `{type: local,
 path}` with an absolute path or one relative to the store, `{type: huggingface, repo,
-revision}`, or `{type: http, url, sha256}`. The schema and validation land in S1 so the
+revision}`, or `{type: http, url, sha256}`. A `local` path may be any folder the mllm
+user can read; the owner decided against confining it to the model store, which is the
+default root for relative paths and the landing place for downloads, not a fence. For
+`huggingface` the `revision` is optional and may be a branch or a tag: when S1b first
+materializes the source it resolves the reference to the exact commit, records that
+commit as the deployment's locked revision and content fingerprint, and every later
+start, on any host, uses the locked commit until someone deliberately updates the
+deployment. S1 makes room for the locked commit in the stored shape. An `http` source
+must use `https`. The schema and validation land in S1 so the
 shape stops moving. Only `local` is executable in S1; the others are refused at deploy
 with a message saying the source cannot be materialized yet. For `local`, the content
-fingerprint is computed from the directory manifest at first deploy instead of the
-placeholder standalone writes today. The builder receives a resolved absolute path and
+fingerprint is a hash of the directory manifest, every file's relative path, size and
+modification time, computed at first deploy: seconds on any checkpoint size, and it
+detects a swapped or edited file though not a byte-identical rewrite that preserves
+timestamps, which the owner accepted. It replaces the placeholder standalone writes
+today. The builder receives a resolved absolute path and
 never sees the source. Materialization is slice S1b.
 
-## 8. The Fake engine is test-only
+## 8. The Fake engine leaves the product
 
-The owner's rule: the Fake is acceptable for tests and must not be in a release.
-`mllm-adapters` gains a cargo feature `fake-engine`, off by default. `FakeEngine`,
-`AdapterSpec::Fake`, the Fake arm of `resolve` and `Engine::Fake` handling in
-`ProfileBindings` compile only with it. Test targets enable it through dev-dependencies.
-A release build contains no Fake symbol. `roles::start_standalone` without a configured
-engine installation returns `StartError::NoEngineInstallation` naming the variables it
-expects. The coordinator suite and the A1 gate keep running on the Fake under the
-feature. They are a pre-check and never count as done.
+The owner's rule: the final binary is clean of development and testing artifacts, and
+the Fake is a test fixture only. A build switch is not enough; when test targets are
+built, Cargo unifies dev-dependency features into the shared build, so a feature-gated
+Fake would still end up in the binary that was built beside the tests.
+
+The Fake engine, the fake launcher, their lifecycle simulation and the shared test
+fixtures move into a new crate, `crates/mllm-testkit`, which no product crate depends
+on. Only test targets pull it in, through dev-dependencies. Product code loses every
+Fake item: the `fake` engine family and its launch settings in `mllm-config` and
+`mllm-domain`, `AdapterSpec::Fake` and its `resolve` arm, `OwnedCoordinator::spawn_fake`,
+the embedded fake host in `mllm-agent`, the embedded fake in the legacy controller, and
+the Fake branch in `roles.rs`.
+
+Tests reach the Fake through ordinary injection, not a special mode. The coordinator
+exposes its driver factory as a constructor parameter, and standalone takes an engine
+provider as a parameter; product passes the real one, tests pass the testkit one. The
+provider supplies both the builder and the engine installation the host policy is built
+from (executable, build fingerprint, launch settings), so a test boots standalone
+without `MLLM_VLLM_BIN` and without executing any engine binary at boot. Test
+deployments describe a real engine family and the injected builder ignores the launch
+settings. `roles::start_standalone` without a configured engine installation returns
+`StartError::NoEngineInstallation` naming the variables it expects.
+
+`ParkPolicy` is defined in the Fake module today but is the vLLM adapter's park gate,
+carried by `AdapterSpec::Vllm`, built by `ProfileBindings` and stored by the legacy
+controller. It moves to a product module in `mllm-adapters` before the Fake leaves.
+
+Ordering inside S1: the vLLM Initialize and Cleanup path is built first against the
+existing Fake fixtures, so the first native-launch evidence arrives as early as possible;
+the Fake extraction lands after that and before the live run, because L10 depends on
+it. The coordinator suite and the A1 gate keep
+running on the Fake through the testkit. They are a pre-check and never count as done.
 
 ## 9. Live run on host-a
 
@@ -272,19 +503,23 @@ feature. They are a pre-check and never count as done.
 
 | ID | Scenario | Proves |
 |---|---|---|
-| L1 | Deploy qwen3-4b, Start, wait Ready | a real launch through the coordinator; identity durable before the engine runs |
-| L2 | Chat through the router with the API key, plain and streaming | the serving path end to end |
-| L3 | The same request without the key | the router refuses; the engine listener is bound to 127.0.0.1 |
-| L4 | Stop | the whole group gone including `EngineCore` children; port lease and grant released; `observed_state=stopped` |
-| L5 | Start again | a new incarnation and pid reach Ready (T10) |
-| L6 | Model source at an empty directory, Start | the engine exits; mllm proves gone, releases, reads `Closed`; the journal carries the reason and log tail; no `vllm` process remains |
-| L7 | Healthy model, 20 s start deadline | the engine is alive at the deadline; mllm terminates it, proves gone, reads `Closed` |
-| L8 | The release binary | standalone without `MLLM_VLLM_BIN` fails `NoEngineInstallation`; no `FakeEngine` symbol in `target/release/mllm` |
-| L9 | Memory | ledger reservation against `/proc/meminfo` before Start, at Ready and after Stop; recorded; asserted only that Stop returns within tolerance of baseline |
+| L1 | Deploy qwen3-4b, Start, wait Ready | a real launch through the coordinator; identity durable before the engine runs; API process and worker both recorded; the five launch settings on the command line |
+| L2 | Chat through the router with the API key, plain and streaming | the serving path end to end, through the per-deployment forwarder |
+| L3 | Access control | the router refuses a request without the user key; the socket table shows the engine on `127.0.0.1:<leased port>` and nowhere else; a connection to that port through the host's routable address is refused; a direct local request without the engine key is rejected; a direct request to `127.0.0.1:<leased port>/sleep` and `/collective_rpc` without the engine key is refused; the per-deployment forwarder refuses an upstream path outside its chat and models allowlist, driven directly rather than through the router's route table, which has no such route to begin with |
+| L4 | Stop | the whole process group empty, workers included; port lease and grant released; `observed_state=stopped` |
+| L5 | Start again | a new incarnation, pid and engine key reach Ready (T10) |
+| L6 | Model source at an empty directory, Start | the engine exits; mllm proves gone, releases, reads `Closed`; the journal carries the reason and a redacted log tail; no `vllm` process remains |
+| L7 | Recover from L6: correct the model source, Start | the deployment reaches Ready and answers a request |
+| L8 | An engine executable that exits at once (`/bin/false`), Start | reads `Closed`, not `Uncertain`; no blocked helper process is left |
+| L9 | Healthy model, 20 s start deadline | the engine is alive at the deadline; mllm terminates it, proves gone, reads `Closed` |
+| L10 | The release binary, built by `cargo build --release --bin mllm` with no test targets | standalone without `MLLM_VLLM_BIN` fails `NoEngineInstallation`; the binary contains no testkit or Fake symbol |
+| L11 | Memory | ledger reservation against `/proc/meminfo` before Start, at Ready and after Stop; recorded; asserted only that Stop returns within tolerance of baseline |
 
 `scripts/live/run-on-spark.sh` syncs the working tree to `host-a:~/mllm-f2` and never
-touches `~/mllm`, builds with `PROTOC=$HOME/.local/bin/protoc cargo build --release
---tests`, runs the test with `MLLM_VLLM_BIN=~/mllm-vllm-venv2/bin/vllm` and
+touches `~/mllm`, builds the product binary and the test targets as two separate
+invocations (`cargo build --release --bin mllm`, then `cargo build --release --tests`,
+both with `PROTOC=$HOME/.local/bin/protoc`) so L10 inspects a binary built without test
+targets, runs the test with `MLLM_VLLM_BIN=~/mllm-vllm-venv2/bin/vllm` and
 `MLLM_MODELS_ROOT=~/models`, and copies logs back under `target/live/<timestamp>/`. The
 host name is fixed to `host-a`; any other is refused, and `host-b` is never
 contacted. A pre-flight refuses to start when another engine process is already on the
@@ -297,6 +532,78 @@ links to it. Raw logs stay out of git.
 
 ## 10. Done
 
-S1 is done when L1 to L9 pass on `host-a` and are recorded in the evidence runbook,
+S1 is done when L1 to L11 pass on `host-a` and are recorded in the evidence runbook,
 the CPU suite and clippy with warnings denied are green, and one review has been
-answered. CPU and Fake tests are a pre-check. They are never the claim.
+answered. One release path has no live coverage: the no-identity branch of §6, which
+releases on the never-released spawn outcome. The product path always records the
+gate shell's identity first, so no live scenario can reach it; it is proven by the
+failed-association unit test, and that exception is stated here rather than implied.
+CPU and Fake tests are a pre-check. They are never the claim.
+
+## 11. Review record, 2026-09-17
+
+Six reviewers read this design (coherence, feasibility, security, scope, adversarial,
+product); the blocking claims were checked against the code before acting. The owner
+decided each of the 19 findings.
+
+Applied as proposed: the `record_launch` precondition; recording the workers and
+requiring an empty group; the Initialize time limit and the grace that must fit;
+the no-identity case as its own proof; disposing of a never-released child; the engine
+key; the loopback and engine-key checks in L3; the engine log written to a file; the
+release guards; the recovery scenario; blocking waits off the async threads; redaction
+of the log tail.
+
+Applied in the owner's version: the Fake moves to a test-only crate instead of a build
+switch ("the final binary should be clean of development and testing artifacts"); the
+five launch settings are implemented, not documented ("actual implementation"); parking
+is a requirement of mllm, so its protections are requirements too; restart recovery
+re-attaches by recorded pid, start time and boot id, as slice S1r right after S1;
+Hugging Face references are fetched and locked to a commit rather than refused.
+
+Settled against the reviewer: a local model source may be any folder ("any folder is
+okay"); no confinement check is to be added.
+
+Decided after the round: deep parking is on by default and a host opts out ("It is opt
+out of deep parking. We will do it by default"). SPEC §9.1, T21 and `AGENTS.md` are
+amended by the S2 ADR; S1 launches with sleep mode enabled.
+
+Withdrawn: the feature gate missing four crates, since no feature exists any more.
+
+Found while revising, not raised by any reviewer: the router's boot-time forwarding
+table cannot reach an engine on a leased port with a per-launch key (§3); and a wrong
+engine path does not reach the no-identity branch, because the launcher spawns `sh`
+first and the identity recorded is that shell's, so L8 exercises the ordinary
+proven-gone path and the no-identity branch is covered by a unit test of a failed
+association instead.
+
+Left for later designs: what is
+hashed for a large local checkpoint's fingerprint and what it costs (plan); which
+`committed_epoch` a failed-launch release writes (plan); SPEC §20 identifiers for L1 to
+L11 (plan); a loopback-only port range for leases; `--trust-remote-code` on the approved
+argument list, which predates this design.
+
+### Round 2
+
+Six reviewers re-read the revision with the round-1 decisions in hand. No rejected
+finding was re-raised; every round-1 fix was verified as landed. Two counts were fixed
+silently. Twelve findings were routed by the owner to best-judgment resolution; eleven
+were applied: the failed-launch release drops the step-deadline freshness bound; the
+engine key never reaches argv and the builder assembles the environment; the store
+rule, not the domain rule, is what counts identities to two; the cipher is named
+(XChaCha20-Poly1305, associated data, deletion on release); `security.deep_park:
+disabled` also turns sleep mode and development mode off; L3 tests the engine's control
+routes directly; `LifecyclePort` gains the endpoint-and-key projection; the injected
+provider supplies the engine installation; `observe_group` may return empty and the
+group observer is extended; `ParkPolicy` moves to a product module; the builder's waits
+end 2 s before the deadline. The twelfth, the legacy controller, the owner decided:
+retired inside S5, closing SPEC §18's parallel-controller clause.
+
+The owner also decided the items previously left for later: the local fingerprint is a
+manifest hash; S1b moves after S5; `--trust-remote-code` becomes a host opt-in; leased
+ports stay in the general range with `--host 127.0.0.1` as the control and L3 as the
+proof. Of the ten FYI observations, the author adopted: S1r proves socket ownership
+before sending the key; a key that fails to decrypt is unprovable; the SGLang key table
+is installation-scoped and separate; the two "deep park" switches are one; requested
+budget may not exceed the Ready allocation; the Fake extraction follows the first
+native-launch evidence; L3 drives the forwarder allowlist directly; the launcher's
+existing escalation and group observer are reused. Not adopted: none.
