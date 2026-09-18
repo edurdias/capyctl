@@ -258,20 +258,33 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       gone-proof first — an explicit Stop drives that cleanup and the Start
       that follows is a new generation with a fresh budget. CPU and Fake tests
       are not verification of any native recipe.
-- [ ] S1 — native launch (vLLM), in progress; live run pending. Landed: the
-      coordinator directs a native builder to launch a real engine
-      installation; router-facing launch tools; encrypted engine keys; a
-      launch that fails after arm is terminated, proven gone and released
-      with evidence; and configuration for `deep_park`, the model store and
-      the model source. The Fake engine moved out of the product into
-      `mllm-testkit` as a test fixture. The router gained a per-deployment
-      forwarder keyed on what the coordinator recorded, and a guard
-      middleware sits in front of vLLM's development routes. Open items:
-      post-launch retry stays deferred to SPEC §6; state directories written
-      before commit `e4dcd20` must be recreated, because the model-source
-      shape changed the recipe fingerprint; vLLM 0.29 authenticates only
-      `/v1`, `/v2`, `/inference` and `/cohere`, so `runtime/mllm_vllm_guard.py`
-      covers the remaining development routes itself; S1r is next. CPU and
+- [x] S1 — native launch (vLLM), live-green on host-a on 2026-09-18 (run 5
+      at `000b832`, six of six scenarios, evidence entry in
+      `docs/runbooks/spark-live-f2.md`). The coordinator directs a native
+      builder to launch a real vLLM 0.29 engine: cold start to Ready in 27 s,
+      inference through the router, loopback-only listening with the guard
+      middleware refusing unkeyed control routes, a stop that proves the group
+      gone in 1.2 s, a restart under a new incarnation, a bad model source
+      closed in 5 s with the next start on the same controller reaching Ready,
+      an executable that exits at once closed with no leftovers, and memory
+      returning after stop. Landed on the way: encrypted per-launch engine keys;
+      a launch that fails after arm is terminated, proven gone and released with
+      evidence; configuration for `deep_park`, the model store and the model
+      source; the Fake engine moved out of the product into `mllm-testkit` as a
+      test fixture; the router's per-deployment forwarder keyed on what the
+      coordinator recorded. Runs 1 to 4 each found a defect the CPU suite could
+      not see because its fixtures did not have the launch path's real shape
+      (pre-flight self-match, api-only identity refused as corrupt, adapter
+      probing without its key, zero start ticks on this kernel failing every
+      process scan, re-admission gap after a closure); each is recorded with
+      its fix in the live runbook. Open items: post-launch retry stays deferred
+      to SPEC §6; state directories written before commit `e4dcd20` must be
+      recreated, because the model-source shape changed the recipe fingerprint;
+      vLLM 0.29 authenticates only `/v1`, `/v2`, `/inference` and `/cohere`, so
+      `runtime/mllm_vllm_guard.py` covers the remaining development routes
+      itself and L3 holds that true; S1r (restart re-attach) is next. What
+      this establishes is vLLM 0.29 with qwen3-4b-instruct on this host and
+      nothing about parking, SGLang, re-attach or other builds. CPU and
       Fake-engine tests here are a pre-check, never the claim that a native
       engine recipe works live.
 - [ ] Implement ordinary park. The ordinary lifecycle has no park at all; the
@@ -462,6 +475,18 @@ host with several devices or across hosts.
    milestones section above.
 
 ## Owner attention
+
+Two items from S1, 2026-09-18. `crates/mllm-cli/tests/live_interactive.rs`
+(the owner's, excluded from agent edits) uses `ParkPolicy::ExperimentalAllowed`,
+which is now a deprecated alias of `ParkPolicy::Enabled`; workspace-wide clippy
+with warnings denied fails on that one line, and every other crate passes. The
+alias constants and the `start_standalone_with_policy` and
+`LiveVllmProfile::from_env` shims exist only for that file and can go once it is
+updated. Its test `lab_http_auth_status_and_busy_controls` also fails, because
+it boots standalone without declaring an engine installation, which S1 made a
+refusal (`NoEngineInstallation`). Separately, `roles_f1.rs` is flaky under
+parallel test threads; this predates S1 and the live runner uses one thread.
+
 
 Execution capacity item: after Cleanup committed, fresh-worker creation for the
 queued trusted response-capture unit failed with `agent thread limit reached`.
