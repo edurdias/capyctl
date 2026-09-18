@@ -8,16 +8,21 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::Json;
 
+use crate::forwarders::ForwarderError;
 use crate::RouterDeps;
 
 /// Resolve the alias to an explicit deployment (no model-name guessing —
 /// SPEC §10) and ensure READY, joining the single activation operation.
-/// Returns (deployment id, profile kind).
+/// Returns the deployment id.
+///
+/// The profile kind used to be returned with it, to pick a forwarder from a
+/// boot-time table. Dispatch now asks the lifecycle authority where this
+/// deployment's engine is, so the family name is no longer part of the answer.
 pub async fn resolve(
     deps: &RouterDeps,
     model: &str,
-) -> Result<(String, String), (StatusCode, Json<serde_json::Value>)> {
-    let (deployment_id, kind, observed) = {
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let (deployment_id, observed) = {
         let row = deps
             .controller
             .find_deployment_by_route(model)
@@ -28,7 +33,7 @@ pub async fn resolve(
                     &format!("no deployment serves model id {model}"),
                 )
             })?;
-        (row.id.clone(), row.kind.clone(), row.observed_state)
+        (row.id.clone(), row.observed_state)
     };
 
     // Join the deployment's single activation when not READY (T15:
@@ -65,7 +70,7 @@ pub async fn resolve(
             .await?;
     }
 
-    Ok((deployment_id, kind))
+    Ok(deployment_id)
 }
 
 /// Non-streaming dispatch: resolve + forward through the deployment's
@@ -76,13 +81,12 @@ pub async fn dispatch(
     model: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let (deployment_id, kind) = resolve(deps, model).await?;
+    let deployment_id = resolve(deps, model).await?;
 
     let forward = deps
         .forwards
-        .get(&kind)
-        .ok_or_else(|| err("unsupported", &format!("no forwarder for profile {kind}")))?
-        .clone();
+        .forwarder(&deployment_id)
+        .map_err(map_forwarder)?;
     // Admission accounting: per-deployment in-flight bound (T19), enforced
     // atomically (check + increment share the lock — no over-admission).
     let guard = deps
@@ -133,6 +137,26 @@ fn map_controller(e: mllm_controller::LifecycleFault) -> (StatusCode, Json<serde
         F::Uncertain(m) => err("activation_uncertain", &m),
         F::Failed(m) => err("activation_failed", &m),
         F::Unavailable(m) => err("unavailable", &m),
+    }
+}
+
+/// Exhaustive for the same reason as `map_controller`: each outcome tells the client
+/// something different about what is true of the deployment, and a catch-all would
+/// flatten "nothing is running" into "the router is broken".
+pub fn map_forwarder(e: ForwarderError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        // The deployment resolved and was made READY, yet no runtime is recorded.
+        // That is a transient disagreement between the authority's view and its
+        // store, not a client error, so it is retryable rather than a 4xx.
+        ForwarderError::NoRuntime(d) => err(
+            "unavailable",
+            &format!("deployment {d} has no running engine to forward to"),
+        ),
+        ForwarderError::Authority(fault) => map_controller(fault),
+        ForwarderError::Endpoint(d) => err(
+            "internal",
+            &format!("the runtime recorded for deployment {d} has an unusable endpoint"),
+        ),
     }
 }
 

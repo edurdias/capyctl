@@ -509,6 +509,44 @@ impl crate::Store {
             .map_err(StoreError::from)
     }
 
+    /// The routes a deployment's effective revision serves, in the order the frozen
+    /// configuration records them.
+    ///
+    /// SPEC §3: the first of them is the name the engine was launched to answer to,
+    /// so anything addressing that engine must use it rather than the public alias a
+    /// client asked for. The two are the same for a single-route deployment and
+    /// differ as soon as one carries aliases, which is exactly when guessing would
+    /// send an engine a model name it does not serve.
+    ///
+    /// Read from `deployment_routes` rather than by decoding the frozen snapshot.
+    /// The two are the same list: every lifecycle step refuses to proceed unless
+    /// this table matches the effective revision's routes exactly, so the table is
+    /// the cheaper read of the same fact — and decoding a snapshot re-resolves the
+    /// model against the host's store, which is work a request path should not do.
+    ///
+    /// A deployment created before managed configuration keeps its single route in
+    /// the column on its own row, so both forms are read. An unknown deployment
+    /// yields an empty list.
+    pub fn effective_routes(&self, deployment_id: &str) -> Result<Vec<String>, StoreError> {
+        let legacy: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT route_model_id FROM deployments WHERE id=?1",
+                params![deployment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let routes = self
+            .conn
+            .prepare("SELECT route FROM deployment_routes WHERE deployment_id=?1 ORDER BY route")?
+            .query_map(params![deployment_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if routes.is_empty() {
+            return Ok(legacy.flatten().into_iter().collect());
+        }
+        Ok(routes)
+    }
+
     /// All enabled route ids for `/v1/models` (F1 design §5): enabled
     /// routes are listed without waking anything.
     pub fn list_enabled_route_ids(&self) -> Result<Vec<String>, StoreError> {

@@ -21,6 +21,26 @@ fn uncertain() -> AdapterError {
     AdapterError::Uncertain("chat terminal result unverified".into())
 }
 
+/// The only upstream paths a forwarder may reach on an engine.
+///
+/// SPEC §10: the router relays inference and nothing else. An engine also serves
+/// its own administrative surface — park, sleep, weight reload, collective RPC —
+/// and reaching any of it on a client's behalf would put engine control behind the
+/// inference port, where none of the lifecycle authority's accounting applies. The
+/// list is closed rather than filtered so a new path has to be added deliberately.
+const FORWARDED_PATHS: [&str; 2] = ["/v1/models", "/v1/chat/completions"];
+
+/// Resolve one upstream URL, or refuse the path.
+///
+/// Returning `None` rather than joining the path is the refusal: a caller cannot
+/// build a request it has no URL for.
+fn upstream(base: &reqwest::Url, path: &str) -> Option<reqwest::Url> {
+    if !FORWARDED_PATHS.contains(&path) {
+        return None;
+    }
+    base.join(path).ok()
+}
+
 /// Holds only service-selected endpoint, model, and inference authentication.
 /// Intentionally no Debug implementation: credentials must never be formatted.
 pub(crate) struct ChatHttp {
@@ -33,7 +53,7 @@ pub(crate) struct ChatHttp {
 impl ChatHttp {
     pub(crate) fn new(base: reqwest::Url, model: String, key: Option<String>) -> Self {
         Self {
-            endpoint: base.join("/v1/chat/completions").expect("static path"),
+            endpoint: upstream(&base, "/v1/chat/completions").expect("a forwarded path"),
             model,
             key,
             client: reqwest::Client::builder()
@@ -163,6 +183,51 @@ impl ChatHttp {
         // Even a finish_reason without the protocol terminator is uncertain.
         Err(uncertain())
     }
+}
+
+/// A forwarder bound to one engine incarnation.
+///
+/// Intentionally no Debug, for the same reason as `ChatHttp`: the value it holds is
+/// an inference credential.
+struct EngineForward(ChatHttp);
+
+#[async_trait::async_trait]
+impl crate::traits::ChatForward for EngineForward {
+    async fn forward_chat_stream_async(
+        &self,
+        body: &Value,
+        sink: &mut dyn ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        self.0.stream_async(body, sink).await
+    }
+    async fn forward_chat(&self, body: &Value) -> Result<Value, AdapterError> {
+        self.0.collect(body).await
+    }
+    async fn forward_chat_stream(
+        &self,
+        body: &Value,
+        on_chunk: &mut (dyn FnMut(String) + Send),
+    ) -> Result<StreamEnded, AdapterError> {
+        self.0.stream(body, on_chunk).await
+    }
+}
+
+/// A forwarder for one running engine: the endpoint it was leased, the name it was
+/// launched to serve, and the key that launch was given.
+///
+/// SPEC §13.3: the key is held only to authenticate to that engine. It is never
+/// formatted, logged, or returned, and the value this builds has no Debug so it
+/// cannot be printed by accident.
+///
+/// Built per incarnation rather than per engine family. An endpoint and a key both
+/// belong to a single launch, so a forwarder built once at boot would keep
+/// addressing a port and presenting a credential that a later launch replaced.
+pub fn engine_forwarder(
+    base: reqwest::Url,
+    model: String,
+    key: Option<String>,
+) -> std::sync::Arc<dyn crate::traits::ChatForward> {
+    std::sync::Arc::new(EngineForward(ChatHttp::new(base, model, key)))
 }
 
 struct Parser<'a> {
@@ -348,5 +413,45 @@ impl<'de> serde::Deserialize<'de> for StrictValue {
             }
         }
         deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upstream;
+
+    /// SPEC §10: an engine forwarder relays inference and nothing else. The paths
+    /// refused below are real engine surfaces — sleep and wake, weight reload,
+    /// collective RPC, tokenisation — and each one is engine control, which belongs
+    /// to the lifecycle authority rather than to whoever can reach the router. T19
+    #[test]
+    fn a_forwarder_reaches_the_chat_and_model_paths_and_refuses_every_other() {
+        let base: reqwest::Url = "http://127.0.0.1:8000".parse().unwrap();
+        for path in ["/v1/models", "/v1/chat/completions"] {
+            assert_eq!(
+                upstream(&base, path).map(String::from),
+                Some(format!("http://127.0.0.1:8000{path}")),
+                "{path} is forwarded"
+            );
+        }
+        for path in [
+            "/sleep",
+            "/wake_up",
+            "/collective_rpc",
+            "/v1/load_lora_adapter",
+            "/tokenize",
+            "/v1/embeddings",
+            "/v1/completions",
+            "/health",
+            "",
+            "/",
+            "/v1/models/",
+            "/v1/chat/completions?x=1",
+        ] {
+            assert!(
+                upstream(&base, path).is_none(),
+                "{path} must not be reachable through a forwarder"
+            );
+        }
     }
 }

@@ -199,7 +199,9 @@ async fn ready_deps(pending: bool) -> (mllm_router::RouterDeps, String) {
     (
         mllm_router::RouterDeps {
             controller,
-            forwards: std::collections::HashMap::from([("fake".into(), forward)]),
+            forwards: Arc::new(mllm_router::forwarders::StaticForwarders(
+                std::collections::HashMap::from([("fake".into(), forward)]),
+            )),
             limits: mllm_router::QueueLimits {
                 max_requests_per_deployment: 8,
                 max_buffered_bytes_total: 65536,

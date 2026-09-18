@@ -20,7 +20,7 @@ use mllm_store::deployments::{DeploymentRow, OperationRow};
 use crate::coordinator::CoordinatorCommands;
 use crate::fault::LifecycleFault;
 use crate::operations::OperationHandle;
-use crate::port::LifecyclePort;
+use crate::port::{LifecyclePort, RuntimeEndpoint};
 
 /// How long a router-initiated activation may take before its receipt expires. The
 /// store wants an absolute deadline on its own clock, so this window is added to the
@@ -272,6 +272,54 @@ impl LifecyclePort for CoordinatorLifecycle {
     ) -> Result<Vec<String>, LifecycleFault> {
         self.commands
             .read(|store| store.ready_deployments_excluding(deployment))
+    }
+
+    /// Project the retained runtime's endpoint, served name and key.
+    ///
+    /// SPEC §3: all three belong to one launch. The binding names the incarnation,
+    /// the key is sealed under that binding and incarnation together, and the served
+    /// name is the first route of the revision the binding froze. Reading them as one
+    /// answer is what stops a caller pairing this launch's port with the last
+    /// launch's credential.
+    ///
+    /// A retained binding with no key is a runtime started without one, not an
+    /// error: the field is optional in the launch plan too.
+    fn runtime_endpoint(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<RuntimeEndpoint>, LifecycleFault> {
+        let owner = self.commands.owner_for_read()?;
+        let Some(binding) = owner
+            .store()
+            .runtime_binding(deployment)
+            .map_err(LifecycleFault::from)?
+        else {
+            return Ok(None);
+        };
+        // The engine received the key hex-encoded, because it travels through an
+        // environment variable; it is handed back in exactly that form so nothing
+        // downstream has to guess at an encoding. It is never logged.
+        let engine_key = owner
+            .store()
+            .engine_key(&binding.id, &binding.incarnation)?
+            .map(hex::encode);
+        let served_model = owner
+            .store()
+            .effective_routes(deployment)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                LifecycleFault::Conflict(format!(
+                    "deployment {deployment} has a retained runtime but serves no route, \
+                     so there is no name to address its engine by"
+                ))
+            })?;
+        Ok(Some(RuntimeEndpoint {
+            endpoint: binding.endpoint,
+            served_model,
+            engine_key,
+            incarnation: binding.incarnation,
+        }))
     }
 
     async fn observe_adapter(&self, _deployment: &str) -> Result<WorkObservation, LifecycleFault> {

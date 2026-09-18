@@ -23,6 +23,6 @@ pub use ownership::{OwnedCoordinatorState, OwnedStateError};
 pub use fault::LifecycleFault;
 pub use coordinator_port::CoordinatorLifecycle;
 pub use engine_bindings::ProfileBindings;
-pub use port::LifecyclePort;
+pub use port::{LifecyclePort, RuntimeEndpoint};
 pub use runtime::{DurableRuntimeSupervisor, RuntimeBinding, RuntimeBindings, RuntimeOwnership};
 pub use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};

@@ -1,5 +1,5 @@
 pub mod fake;
-mod forward;
+pub mod forward;
 pub mod sglang;
 pub mod resolve;
 pub mod policy;

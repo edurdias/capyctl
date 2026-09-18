@@ -20,6 +20,31 @@ use crate::fault::LifecycleFault;
 use crate::operations::{Controller, OperationHandle};
 use mllm_domain::LifecycleAction;
 
+/// Where a deployment's running engine can be reached, and as what.
+///
+/// Every field belongs to one launch rather than to the deployment. The endpoint is
+/// a leased port, the key is minted fresh per launch, and the served name comes from
+/// the revision that launch froze. `incarnation` names the launch the other three
+/// were read from, so a caller can tell a cached answer apart from a current one
+/// instead of discovering the difference as a connection refused or a 401.
+///
+/// SPEC §13.3: the key authenticates to that engine and nothing else. No Debug is
+/// derived, deliberately — a credential that can be formatted is a credential that
+/// reaches a log.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeEndpoint {
+    /// The base URL the engine was leased, without a path.
+    pub endpoint: String,
+    /// The model name the engine was launched to answer to, which is not
+    /// necessarily the public alias a client asked for.
+    pub served_model: String,
+    /// The key that launch was given, hex-encoded as the engine received it.
+    /// `None` when the runtime was started without one.
+    pub engine_key: Option<String>,
+    /// The launch the three fields above were read from.
+    pub incarnation: String,
+}
+
 #[async_trait]
 pub trait LifecyclePort: Send + Sync {
     // Reads. Named projections rather than a store handle: the coordinator owns
@@ -41,6 +66,19 @@ pub trait LifecyclePort: Send + Sync {
     /// Deployments currently READY other than this one. One exclusive pool means
     /// any other READY deployment holds it and must be released first.
     fn ready_deployments_excluding(&self, deployment: &str) -> Result<Vec<String>, LifecycleFault>;
+
+    /// Where this deployment's engine is running now, or `None` when no runtime is
+    /// retained for it.
+    ///
+    /// SPEC §3: a port is leased per launch and a key is minted per launch, so this
+    /// is a read the caller must repeat rather than a table it may build once. `None`
+    /// is "nothing is running", which is a different answer from a failure to look:
+    /// a caller that cannot distinguish them would report an unstarted deployment as
+    /// a broken one.
+    fn runtime_endpoint(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<RuntimeEndpoint>, LifecycleFault>;
 
     // Writes. These exist only because the router currently drives eviction: it
     // selects a victim, stops it, and clears its suspension itself. That is the
@@ -111,6 +149,16 @@ impl LifecyclePort for Controller {
             .lock()
             .unwrap()
             .ready_deployments_excluding(deployment).map_err(Into::into)
+    }
+    fn runtime_endpoint(
+        &self,
+        _deployment: &str,
+    ) -> Result<Option<RuntimeEndpoint>, LifecycleFault> {
+        // The F1 controller never launches an engine of its own: it drives an adapter
+        // it was handed at construction, so there is no leased endpoint or per-launch
+        // key for it to report. `None` is the truthful answer — nothing is retained —
+        // and it is what keeps this authority from claiming a runtime it does not own.
+        Ok(None)
     }
     fn clear_suspension(&self, deployment: &str) -> Result<(), LifecycleFault> {
         self.store_ref().lock().unwrap().set_suspended(deployment, false).map_err(Into::into)

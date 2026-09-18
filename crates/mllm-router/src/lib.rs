@@ -5,12 +5,12 @@
 
 pub mod admission;
 pub mod chat;
+pub mod forwarders;
 pub mod stream;
 pub mod switch;
 
 pub use switch::WakeJoin;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -19,7 +19,6 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Json;
 
-use mllm_adapters::traits::ChatForward;
 
 /// Queue bounds (F1 design §5 / T19): bounded queues, explicit deadlines.
 #[derive(Debug, Clone)]
@@ -33,8 +32,11 @@ pub struct RouterDeps {
     /// The lifecycle authority, named by port rather than by implementation, so
     /// which authority runs is a wiring decision rather than a compile-time one.
     pub controller: Arc<dyn mllm_controller::LifecyclePort>,
-    /// profile/kind name → inference forwarder.
-    pub forwards: HashMap<String, Arc<dyn ChatForward>>,
+    /// Where a request's forwarder comes from. Resolved per request rather than
+    /// held as a table: a leased port and a per-launch key belong to one launch
+    /// (SPEC §3), so a forwarder built at boot addresses a runtime that may no
+    /// longer exist.
+    pub forwards: Arc<dyn forwarders::ForwarderSource>,
     pub limits: QueueLimits,
     /// Shared inference API key (F1: single-owner lab; per-client keys later).
     pub api_key: Option<String>,
@@ -124,15 +126,12 @@ async fn chat_completions(
     };
     if v["stream"].as_bool() == Some(true) {
         // Streaming path: resolve + activate, then bridge the engine's SSE.
-        let (deployment_id, kind) = chat::resolve(&state.deps, model).await?;
+        let deployment_id = chat::resolve(&state.deps, model).await?;
         let forward = state
             .deps
             .forwards
-            .get(&kind)
-            .cloned()
-            .ok_or_else(|| {
-                err_json("unsupported", &format!("no forwarder for profile {kind}"))
-            })?;
+            .forwarder(&deployment_id)
+            .map_err(chat::map_forwarder)?;
         // In-flight bound enforced atomically BEFORE the response is built
         // (T19): accounting is registered synchronously; the stream guard
         // releases when the backend stream ends.
