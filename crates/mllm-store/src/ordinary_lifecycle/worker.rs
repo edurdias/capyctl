@@ -337,8 +337,24 @@ impl crate::Store {
             [&plan.binding_id],
             |row| row.get(0),
         )?;
-        if associated.is_none() && !decode::<Vec<IdentityDto>>(&identities)?.is_empty() {
-            return Err(LifecycleError::CorruptStoredData);
+        // Spec §3: a durable launcher records the API identity as soon as the
+        // process exists, before the launch is associated. An armed step may
+        // therefore carry exactly that one identity with no association yet; a
+        // planned step has launched nothing and must carry none. Any other
+        // unassociated shape is not one the launch path can write.
+        if associated.is_none() {
+            let recorded = decode::<Vec<IdentityDto>>(&identities)?;
+            let launching = matches!(state.as_str(), "armed" | "uncertain");
+            if !recorded.is_empty()
+                && (!launching
+                    || super::failed_launch::canonical_members_or_empty(
+                        &crate::lifecycle::completion::identities(&recorded),
+                    )
+                    .ok()
+                    .is_none_or(|members| members.len() != 1))
+            {
+                return Err(LifecycleError::CorruptStoredData);
+            }
         }
         if state == "completed" {
             let associated = associated.ok_or(LifecycleError::CorruptStoredData)?;

@@ -103,8 +103,19 @@ impl VllmAdapter {
     }
 
     /// Attach the per-launch engine credential (Spec §3). It is delivered to
-    /// the child through the environment only.
+    /// the child through the environment only, and it is the credential this
+    /// adapter then presents on every request of its own: the engine guards
+    /// `/v1` with exactly this key, so a readiness probe or an inference probe
+    /// sent without it is refused, never merely slow (SPEC §6.1).
     pub fn with_engine_key(mut self, engine_key: String) -> Self {
+        let base = reqwest::Url::parse(&self.endpoint)
+            .expect("the endpoint this adapter was built from is a URL");
+        self.forward = crate::forward::ChatHttp::new(
+            base.clone(),
+            self.model_id.clone(),
+            Some(engine_key.clone()),
+        );
+        self.http = EngineHttp::new(base, Some(engine_key.clone()));
         self.engine_key = Some(engine_key);
         self
     }

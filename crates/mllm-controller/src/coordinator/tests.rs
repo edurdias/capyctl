@@ -47,6 +47,9 @@ struct Gate {
     active: AtomicBool,
     panic: bool,
     association: Mutex<Option<SharedCoordinatorState>>,
+    /// Record only the API identity, as a durable launcher does the moment the
+    /// process exists, instead of the full association a completed launch writes.
+    api_only: AtomicBool,
     lost_reply: AtomicBool,
     /// The builder's own reason for failing, once it has done whatever it does.
     failure: Mutex<Option<String>>,
@@ -61,6 +64,7 @@ impl Gate {
             active: AtomicBool::new(false),
             panic,
             association: Mutex::new(None),
+            api_only: AtomicBool::new(false),
             lost_reply: AtomicBool::new(false),
             failure: Mutex::new(None),
         })
@@ -96,6 +100,22 @@ impl EngineAdapter for Gate {
         let result = self.engine.execute_persisted(command).await;
         if let (Some(owner), Ok(observation)) = (&*self.association.lock().unwrap(), &result) {
             let o = owner.lock().unwrap();
+            if self.api_only.load(Ordering::SeqCst) {
+                // Spec §3: the launcher persists the API identity before the
+                // engine has answered anything; no association exists yet.
+                o.store()
+                    .record_api_identity(
+                        o.session(),
+                        &DeploymentFence {
+                            deployment_id: command.context.token.deployment_id.clone(),
+                            revision: command.context.token.revision,
+                            generation: command.context.token.generation,
+                        },
+                        &observation.binding_id,
+                        &observation.identities[0],
+                    )
+                    .unwrap();
+            } else {
             o.store()
                 .record_owned_launch(
                     o.session(),
@@ -110,6 +130,7 @@ impl EngineAdapter for Gate {
                     1900,
                 )
                 .unwrap();
+            }
         }
         self.entered.add_permits(1);
         assert!(!self.panic, "injected adapter panic after effect");
@@ -2277,6 +2298,75 @@ mod native {
             fresh.wait(Duration::from_secs(60)).await.unwrap(),
             InitializeStatus::Completed
         );
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// Spec §3 and §6: a durable launcher persists the API identity the moment
+    /// the process exists, before anything is associated. An engine that then
+    /// exits, or refuses its readiness probe, fails its launch with exactly that
+    /// one identity recorded and no association. That launch must still settle
+    /// as a proven release, not stall as corrupt stored data with the process
+    /// left running. Found live on host-a: every failed native launch hung.
+    #[tokio::test]
+    async fn a_launch_that_recorded_only_its_api_process_is_released_and_closed() {
+        let (dir, owner, fence, observations) = setup().await;
+        let gate = failing_gate(Some(owner.clone()), "engine exited before readiness");
+        gate.api_only.store(true, Ordering::SeqCst);
+        let tools = ScriptedTool::proving();
+        let options = native_options();
+        let factory_owner = owner.clone();
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |work| {
+                {
+                    let o = factory_owner.lock().unwrap();
+                    o.store()
+                        .store_engine_key(
+                            work.binding_id(),
+                            work.incarnation(),
+                            &mllm_store::secrets::new_engine_key(),
+                        )
+                        .unwrap();
+                }
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Closed
+        );
+        // Exactly the one recorded process was terminated.
+        let terminations = tools.terminations();
+        assert_eq!(terminations.len(), 1, "the launch was not terminated");
+        assert_eq!(terminations[0].len(), 1);
+        assert_eq!(terminations[0][0].role, "api");
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        let (step_state, binding_state): (String, String) = sql
+            .query_row(
+                "SELECT s.state,b.state FROM lifecycle_steps s JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.id=?1",
+                [start.step_id()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((step_state.as_str(), binding_state.as_str()), ("cancelled", "released"));
+        let secrets: i64 = sql
+            .query_row("SELECT COUNT(*) FROM engine_secrets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(secrets, 0, "the engine key outlived its binding");
+        assert_eq!(status(&owner, start.step_id()), InitializeStatus::Closed);
+        assert_eq!(w.status(), WorkerStatus::Running);
         drop(start);
         w.shutdown().await.unwrap();
     }

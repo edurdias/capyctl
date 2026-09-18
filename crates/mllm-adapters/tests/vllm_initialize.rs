@@ -43,14 +43,24 @@ struct Stub {
     polls: Arc<AtomicUsize>,
 }
 
-async fn models(State(stub): State<Stub>) -> Json<Value> {
+/// vLLM guards every `/v1` route with the same key, `/v1/models` included, so an
+/// unkeyed readiness poll is refused there before it ever reaches the chat probe.
+async fn models(State(stub): State<Stub>, headers: HeaderMap) -> axum::response::Response {
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if presented != format!("Bearer {}", stub.key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let seen = stub.polls.fetch_add(1, Ordering::SeqCst);
     let data = if seen >= stub.ready_after {
         json!([{ "id": stub.model, "object": "model" }])
     } else {
         json!([])
     };
-    Json(json!({ "object": "list", "data": data }))
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 async fn chat(
@@ -413,14 +423,15 @@ async fn a_second_initialize_for_the_same_incarnation_is_unsupported() {
     assert_eq!(tool.spawned.lock().unwrap().len(), 1);
 }
 
-/// Spec §3: an unkeyed probe is refused by the engine, so the step fails rather
-/// than reporting a model nobody proved answers.
+/// Spec §3: the engine holds a key this adapter was not given, so its readiness
+/// poll is refused, and the step fails rather than waiting out its deadline on an
+/// engine that is up and will never answer it.
 // T10
 #[tokio::test]
-async fn a_probe_without_the_key_does_not_pass() {
-    let (_stub, port) = stub_engine("gate-m", 0, "k3y").await;
+async fn a_probe_with_the_wrong_key_does_not_pass() {
+    let (_stub, port) = stub_engine("gate-m", 0, "0ther").await;
     let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
-    let adapter = adapter(port, Some("not-the-key"))
+    let adapter = adapter(port, None)
         .with_launch(plan(port))
         .with_tools(tool)
         .with_engine_key("k3y".into());
@@ -431,9 +442,27 @@ async fn a_probe_without_the_key_does_not_pass() {
         .unwrap_err();
 
     let RuntimeError::Uncertain(message) = error else {
-        panic!("an unanswered probe is uncertain, got {error:?}");
+        panic!("a refused probe is uncertain, got {error:?}");
     };
-    assert!(message.contains("did not answer"), "{message}");
+    assert!(message.contains("readiness"), "{message}");
+}
+
+/// Spec §3: the engine key is the credential the adapter presents, whatever the
+/// adapter was built with. The director builds it with none, because the key is
+/// sealed per launch and attached afterwards; a stale one must not win either.
+// T10
+#[tokio::test]
+async fn the_engine_key_is_the_one_presented() {
+    let (_stub, port) = stub_engine("gate-m", 0, "k3y").await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let adapter = adapter(port, Some("not-the-key"))
+        .with_launch(plan(port))
+        .with_tools(tool)
+        .with_engine_key("k3y".into());
+    assert!(adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .is_ok());
 }
 
 /// Actions other than Initialize stay refused until the S2 slice implements them:

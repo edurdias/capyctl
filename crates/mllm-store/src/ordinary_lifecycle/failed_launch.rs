@@ -50,7 +50,7 @@ fn evidence_value(id: &str, e: &CleanupEvidence) -> Result<String, LifecycleErro
 /// `canonical_members` covers only the last of the three, so the two earlier shapes
 /// are accepted here under the same per-identity rules. Field sizes are bounded by
 /// `encode` on the way in and by `decode` on the way out.
-fn canonical_members_or_empty(
+pub(super) fn canonical_members_or_empty(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
     match ids {

@@ -229,3 +229,46 @@ async fn passes_conformance_suite() {
     let failures: Vec<_> = results.iter().filter(|r| !r.passed()).collect();
     assert!(failures.is_empty(), "conformance failures: {failures:?}");
 }
+
+/// Spec §3 and SPEC §6.1: the engine guards `/v1` with the per-launch key, so the
+/// adapter's own readiness probe must present it. Found live on host-a: the
+/// probe went out without the key, the engine answered 401, and a healthy launch
+/// failed as uncertain. The guarded mock answers `/v1/models` only under the exact
+/// bearer token this adapter was given.
+// T10
+#[tokio::test]
+async fn readiness_probe_carries_the_engine_key() {
+    use axum::http::{HeaderMap, StatusCode};
+    const KEY: &str = "0f0e0d0c0b0a09080706050403020100ffeeddccbbaa99887766554433221100";
+    async fn guarded(headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+        match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+            Some(value) if value == format!("Bearer {KEY}") => Ok(Json(serde_json::json!({
+                "object": "list", "data": [{"id": "toy-model"}]
+            }))),
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+    let app = axum::Router::new().route("/v1/models", get(guarded));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, app).await.unwrap();
+    });
+    let build = || {
+        VllmAdapter::new(
+            format!("http://{addr}").parse().unwrap(),
+            None,
+            "vllm-test-1".into(),
+            ParkPolicy::Disabled,
+            "toy-model".into(),
+        )
+    };
+    // Without the key the probe is refused, and a refusal is an error, never a
+    // quiet "still initializing" that a launch would wait out.
+    assert!(build().check_readiness(&member()).await.is_err());
+    let keyed = build().with_engine_key(KEY.into());
+    assert!(matches!(
+        keyed.check_readiness(&member()).await.unwrap(),
+        Readiness::Ready
+    ));
+}
