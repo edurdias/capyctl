@@ -258,6 +258,22 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       gone-proof first — an explicit Stop drives that cleanup and the Start
       that follows is a new generation with a fresh budget. CPU and Fake tests
       are not verification of any native recipe.
+- [ ] S1 — native launch (vLLM), in progress; live run pending. Landed: the
+      coordinator directs a native builder to launch a real engine
+      installation; router-facing launch tools; encrypted engine keys; a
+      launch that fails after arm is terminated, proven gone and released
+      with evidence; and configuration for `deep_park`, the model store and
+      the model source. The Fake engine moved out of the product into
+      `mllm-testkit` as a test fixture. The router gained a per-deployment
+      forwarder keyed on what the coordinator recorded, and a guard
+      middleware sits in front of vLLM's development routes. Open items:
+      post-launch retry stays deferred to SPEC §6; state directories written
+      before commit `e4dcd20` must be recreated, because the model-source
+      shape changed the recipe fingerprint; vLLM 0.29 authenticates only
+      `/v1`, `/v2`, `/inference` and `/cohere`, so `runtime/mllm_vllm_guard.py`
+      covers the remaining development routes itself; S1r is next. CPU and
+      Fake-engine tests here are a pre-check, never the claim that a native
+      engine recipe works live.
 - [ ] Implement ordinary park. The ordinary lifecycle has no park at all; the
       candidate path that formerly had one is deleted. This is the premise of
       the product and the largest remaining piece of A1b.

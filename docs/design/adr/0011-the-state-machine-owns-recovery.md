@@ -124,7 +124,7 @@ continues serving every other deployment.
 |---|---|
 | Succeeded | Terminal. Attempts reset. |
 | Failed — known not to have landed | Count the attempt, wait the cooldown, retry. |
-| Uncertain — prove the recorded processes gone | An explicit Stop drives verified cleanup through the gone-proof; the deployment pauses until then. The Start that follows is a new generation with a fresh budget. |
+| Launch failed after arm | Terminate the recorded processes, prove them gone, release with evidence; terminal for that start. Unprovable: Uncertain. |
 | Uncertain — processes not gone | No retry. Surface it; this is the one case a machine must not guess at. |
 | Attempts exhausted | Terminal `Failed`. Admission closed for **this deployment**. |
 
@@ -174,13 +174,6 @@ reset by a new revision.
 **Ordinary park itself is not designed here.** This ADR removes its gate and defines
 how its failures are handled. The transition — drain, park, parked accounting, wake —
 is the implementation work that follows.
-
-**Automatic retry of an uncertain attempt is not decided here.** Decision 5 pauses an
-uncertain attempt until an operator's Stop proves the recorded processes gone, because
-that is the conservative reading. `SPEC.md` §13.2 permits a coordinator to prove the
-processes gone by itself and then retry, but it does not require it; doing so
-automatically is future work, and it needs its own evidence rules before a machine is
-allowed to decide that an engine is gone.
 
 **Eviction policy is not decided here.** Which deployment to park when another needs
 memory is a scheduling question. This ADR only makes parking reachable.
