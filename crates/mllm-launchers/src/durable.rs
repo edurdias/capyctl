@@ -297,8 +297,15 @@ impl DurableSpawn {
                     // `/proc/<pid>/stat` is still there with matching start ticks:
                     // the failure path would then poll a dead process through
                     // grace and pause the operator over it. Uncertainty must be
-                    // real rather than manufactured.
+                    // real rather than manufactured. The group signal is the same
+                    // backstop `dispose` uses, for a child that somehow got past
+                    // the gate; the identity's start ticks were read from this
+                    // exact child, so the group it leads is ours.
                     drop(retained.write_gate);
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(identity.pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
                     let _ = retained.child.wait();
                     return Err(DurableSpawnError::Spawn(format!(
                         "{error}; the gated child was reaped and never reached exec"

@@ -280,8 +280,22 @@ pub fn redact_text(text: &str) -> String {
             // A run that begins with `/` is a path, never a bare token: the engine
             // prints checkpoint directories deeper than this threshold, and a
             // failure reason that blanks the path the weights came from hides the
-            // one fact an operator needs.
-            if chars[i] != '/' && end - i >= SECRET_RUN_MIN {
+            // one fact an operator needs. A path is kept segment by segment, so a
+            // credential carried inside it (`/v1/models/<key>`) is still blanked.
+            if chars[i] == '/' {
+                let mut first = true;
+                for segment in chars[i..end].split(|c| *c == '/') {
+                    if !first {
+                        out.push('/');
+                    }
+                    first = false;
+                    if segment.len() >= SECRET_RUN_MIN {
+                        out.push_str(REDACTED);
+                    } else {
+                        out.extend(segment.iter());
+                    }
+                }
+            } else if end - i >= SECRET_RUN_MIN {
                 out.push_str(REDACTED);
             } else {
                 out.extend(chars[i..end].iter());

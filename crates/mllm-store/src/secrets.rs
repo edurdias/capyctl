@@ -43,14 +43,22 @@ impl SecretsKey {
                 )));
             }
         }
-        if let Ok(bytes) = std::fs::read(path) {
-            let key: [u8; 32] = bytes.try_into().map_err(|_| {
-                StoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("identity key {} is not 32 bytes", path.display()),
-                ))
-            })?;
-            return Ok(Self(key));
+        // SPEC §13.3: only a file that is absent is created. Any other read
+        // failure on an existing file is reported, never papered over by minting
+        // a new key: a new key would leave every engine secret sealed under the
+        // old one unrecoverable, and a restart could then re-attach to nothing.
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("identity key {} is not 32 bytes", path.display()),
+                    ))
+                })?;
+                return Ok(Self(key));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
         }
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);

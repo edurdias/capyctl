@@ -393,4 +393,10 @@ fn redaction_leaves_ordinary_engine_output_alone() {
     let redacted = redact_text(&logged);
     assert!(!redacted.contains(&key), "{redacted}");
     assert!(redacted.contains("<redacted>"), "{redacted}");
+
+    // A path keeps its segments, and a key carried inside one is still blanked.
+    let in_path = format!("GET /v1/models/{key}/info refused");
+    let redacted = redact_text(&in_path);
+    assert_eq!(redacted, "GET /v1/models/<redacted>/info refused");
+    assert_eq!(redact_text("/a/b/"), "/a/b/");
 }
