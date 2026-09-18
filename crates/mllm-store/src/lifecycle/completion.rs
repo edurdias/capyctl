@@ -73,21 +73,24 @@ pub(crate) fn identity_dtos(ids: &[ProcessIdentity]) -> Vec<IdentityDto> {
         })
         .collect()
 }
+/// The stored form read back as identities, with no shape required of the set.
+/// Callers that need a canonical launch membership use `members`; a caller that
+/// must also accept the sets a launch holds before it is complete checks its own
+/// shape on top of this.
+pub(crate) fn identities(dtos: &[IdentityDto]) -> Vec<ProcessIdentity> {
+    dtos.iter()
+        .map(|i| ProcessIdentity {
+            role: i.role.clone(),
+            pid: i.pid,
+            boot_id: i.boot_id.clone(),
+            start_ticks: i.start_ticks,
+        })
+        .collect()
+}
 /// Spec §4: the stored-association sibling of `canonical_members`, accepting
 /// the same shape (`api` plus workers numbered contiguously from `worker-0`).
 pub(crate) fn members(dtos: &[IdentityDto]) -> Result<Vec<ProcessIdentity>, LifecycleError> {
-    canonical_members(
-        &dtos
-            .iter()
-            .map(|i| ProcessIdentity {
-                role: i.role.clone(),
-                pid: i.pid,
-                boot_id: i.boot_id.clone(),
-                start_ticks: i.start_ticks,
-            })
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|_| LifecycleError::CorruptStoredData)
+    canonical_members(&identities(dtos)).map_err(|_| LifecycleError::CorruptStoredData)
 }
 pub(crate) fn nonempty_receipt(receipt: &str) -> Result<(), LifecycleError> {
     if receipt.trim().is_empty() || receipt.len() > MAX_DTO_BYTES / 2 {

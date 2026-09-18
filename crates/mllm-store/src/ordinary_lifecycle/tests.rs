@@ -76,7 +76,7 @@ fn a_parking_deployment_gets_a_declared_identity() {
     assert_eq!(descriptor["residency"], "deep");
 }
 
-fn identity(role: &str, pid: u32) -> ProcessIdentity {
+pub(super) fn identity(role: &str, pid: u32) -> ProcessIdentity {
     ProcessIdentity {
         role: role.into(),
         pid,
@@ -88,7 +88,7 @@ fn identity(role: &str, pid: u32) -> ProcessIdentity {
 /// An ordinary managed deployment, accepted and armed, ready for its owned
 /// launch to be recorded. Mirrors `a_parking_deployment_gets_a_declared_identity`'s
 /// setup one step further: through `arm_step` and `initialize_execution`.
-fn armed_ordinary() -> (Store, CoordinatorSession, DeploymentFence, StepExecutionContext) {
+pub(super) fn armed_ordinary() -> (Store, CoordinatorSession, DeploymentFence, StepExecutionContext) {
     let (config, host) = fixture();
     let effective = resolve_effective(&config, &host).unwrap();
     let store = Store::open_in_memory().unwrap();

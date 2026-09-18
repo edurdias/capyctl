@@ -123,6 +123,8 @@ pub(crate) enum LifecycleTransition {
     Ready,
     Uncertain,
     ExpiredUnarmed,
+    /// Spec §6: a launch that failed after arm, released against gone evidence.
+    LaunchFailed,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +178,7 @@ impl EventMetadata {
                 LifecycleTransition::Ready => "ready_committed",
                 LifecycleTransition::Uncertain => "initialize_uncertain",
                 LifecycleTransition::ExpiredUnarmed => "initialize_expired_unarmed",
+                LifecycleTransition::LaunchFailed => "initialize_failed_released",
             },
             Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",

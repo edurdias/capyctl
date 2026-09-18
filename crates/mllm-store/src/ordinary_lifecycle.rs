@@ -1,6 +1,7 @@
 //! Ordinary Fake cold initialization from a frozen managed configuration.
 pub mod cleanup;
 mod expiry;
+mod failed_launch;
 mod receipt;
 pub mod unarmed_stop;
 pub mod worker;
