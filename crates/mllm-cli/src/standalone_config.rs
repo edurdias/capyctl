@@ -104,6 +104,13 @@ pub fn host_policy(
     })
 }
 
+/// The request deadline a deployment carries unless its caller names another.
+///
+/// It bounds how far ahead an operation's deadline may be set, so it has to be at
+/// least the window the coordinator gives an activation; a shorter one makes a start
+/// inadmissible rather than merely impatient.
+pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
+
 /// The deployment document, naming the installation it runs on and where its
 /// weights come from.
 ///
@@ -112,11 +119,17 @@ pub fn host_policy(
 ///
 /// Phase footprints are declared because admission compares a transition's peak
 /// against the ceiling, not its steady state.
+///
+/// `request_deadline` is a parameter rather than a constant because the deadline is
+/// a property of the deployment an operator asks for, and the live suite has to be
+/// able to state a short one to see what the bound does. Ordinary callers pass
+/// [`DEFAULT_REQUEST_DEADLINE`].
 pub fn deployment_document(
     name: &str,
     route: &str,
     source: &ModelSource,
     capacity_bytes: i64,
+    request_deadline: &str,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
@@ -138,7 +151,7 @@ pub fn deployment_document(
         "residency": "restart_only",
         "recovery": "reconcile",
         // Ordered: activation window <= deployment deadline <= host ceiling.
-        "request_deadline": "900s",
+        "request_deadline": request_deadline,
         "model": {
             "source": source,
             "content_fingerprint": format!("sha256:{name}"),

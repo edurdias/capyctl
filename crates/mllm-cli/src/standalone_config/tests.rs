@@ -128,7 +128,7 @@ fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
 /// must be declared and the peak must be a transition rather than steady state.
 #[test]
 fn every_phase_is_declared_and_the_peak_is_a_transition() {
-    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY);
+    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
     let resources = d["resources"].as_object().unwrap();
     for phase in ["cold", "ready", "parking", "parked", "wake"] {
         assert!(resources.contains_key(phase), "{phase} must be declared");
@@ -149,7 +149,7 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
 /// A parked deployment holds no device; that is what makes parking reclaim anything.
 #[test]
 fn a_parked_deployment_holds_no_device() {
-    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY);
+    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
     assert_eq!(
         d["resources"]["parked"]["devices"].as_array().unwrap().len(),
         0
@@ -161,7 +161,7 @@ fn a_parked_deployment_holds_no_device() {
 /// it against.
 #[test]
 fn the_deployment_names_its_installation() {
-    let d = deployment_document("m", "route-m", &local("/models/m"), CAPACITY);
+    let d = deployment_document("m", "route-m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
 }
@@ -170,7 +170,7 @@ fn the_deployment_names_its_installation() {
 /// checkpoint that has to be fetched is expressible in the same document.
 #[test]
 fn the_deployment_states_its_model_source() {
-    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY);
+    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
     assert_eq!(d["model"]["source"]["type"], "local");
     assert_eq!(d["model"]["source"]["path"], "/models/m");
 
@@ -183,6 +183,7 @@ fn the_deployment_states_its_model_source() {
             locked_commit: None,
         },
         CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
     );
     assert_eq!(fetched["model"]["source"]["type"], "huggingface");
     assert_eq!(fetched["model"]["source"]["repo"], "org/model");
@@ -205,7 +206,7 @@ fn the_published_host_declares_one_memory_pool() {
 /// a later change to a parking tier is a deliberate edit with a test behind it.
 #[test]
 fn a_standalone_deployment_is_restart_only() {
-    let deployment = deployment_document("m", "m", &local("/models/m"), 1 << 40);
+    let deployment = deployment_document("m", "m", &local("/models/m"), 1 << 40, DEFAULT_REQUEST_DEADLINE);
     assert_eq!(deployment["residency"], "restart_only");
 }
 
@@ -261,6 +262,7 @@ fn host_policy_from_env_is_complete() {
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
         CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
     );
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("the published table resolves");

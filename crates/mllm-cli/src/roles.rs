@@ -118,6 +118,25 @@ impl App {
     /// qualify. Creating a bare record first — which is what the previous path did —
     /// produces a deployment that can be named and never run.
     pub fn deploy(&self, name: &str, source: ModelSource) -> Result<String, StartError> {
+        self.deploy_with_deadline(
+            name,
+            source,
+            crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
+        )
+    }
+
+    /// Deploy while naming the request deadline the deployment carries.
+    ///
+    /// The deadline bounds how far ahead an operation on this deployment may be
+    /// scheduled, so it is the deployment's property rather than the caller's, and
+    /// stating it is how the live suite observes what the bound actually does.
+    /// [`App::deploy`] passes the default.
+    pub fn deploy_with_deadline(
+        &self,
+        name: &str,
+        source: ModelSource,
+        request_deadline: &str,
+    ) -> Result<String, StartError> {
         let host = crate::standalone_config::host_policy(
             &self.installation,
             &self.environment_fingerprint,
@@ -128,6 +147,7 @@ impl App {
             name,
             &source,
             self.capacity_bytes,
+            request_deadline,
         );
         let receipt = self
             .controller
@@ -487,6 +507,7 @@ async fn start_standalone_inner(
                 path: "/dev/null".into(),
             },
             capacity_bytes,
+            crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
         );
         mllm_config::effective::resolve_effective(&probe, &host)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
