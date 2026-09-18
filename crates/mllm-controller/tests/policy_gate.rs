@@ -31,7 +31,7 @@ fn req(name: &str, kind: &str) -> DeployRequest {
 
 #[tokio::test]
 async fn vllm_sleep_profile_launch_denied_by_default() {
-    let (c, store) = controller(ParkPolicy::Denied);
+    let (c, store) = controller(ParkPolicy::Disabled);
     let id = c.submit_deploy(req("sleepy", "vllm-sleep")).await.unwrap();
     let out = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
     assert!(out.is_err(), "development-mode profile denied without opt-in (T21)");
@@ -47,7 +47,7 @@ async fn vllm_sleep_profile_launch_denied_by_default() {
 
 #[tokio::test]
 async fn opt_in_enables_the_experimental_profile() {
-    let (c, _store) = controller(ParkPolicy::ExperimentalAllowed);
+    let (c, _store) = controller(ParkPolicy::Enabled);
     let id = c.submit_deploy(req("sleepy", "vllm-sleep")).await.unwrap();
     let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
     let state = c.wait_terminal(&op).await.unwrap();
@@ -56,7 +56,7 @@ async fn opt_in_enables_the_experimental_profile() {
 
 #[tokio::test]
 async fn stock_profile_launches_without_optin() {
-    let (c, _store) = controller(ParkPolicy::Denied);
+    let (c, _store) = controller(ParkPolicy::Disabled);
     let id = c.submit_deploy(req("stock", "model")).await.unwrap();
     let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
     let state = c.wait_terminal(&op).await.unwrap();

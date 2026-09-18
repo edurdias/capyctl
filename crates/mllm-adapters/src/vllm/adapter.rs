@@ -78,8 +78,8 @@ impl VllmAdapter {
         // Deep-park security gate (SPEC §9.1 / T21): the profile-level
         // opt-in is required for every sleep/collective operation.
         match self.policy {
-            ParkPolicy::Denied => Err(AdapterError::PolicyDenied),
-            ParkPolicy::ExperimentalAllowed => Ok(()),
+            ParkPolicy::Disabled => Err(AdapterError::PolicyDenied),
+            ParkPolicy::Enabled => Ok(()),
         }
     }
 

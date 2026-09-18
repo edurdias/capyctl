@@ -5,6 +5,7 @@
 //! with distinct memory-retention signatures, ambiguous outcomes (effect
 //! applied, ack lost), the deep-park policy gate, and crash injection.
 
+use crate::policy::ParkPolicy;
 use crate::traits::*;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -21,17 +22,6 @@ pub const BUFFER_RESIDUE: i64 = 256;
 /// Stable build fingerprint the fake reports through `EngineState`
 /// (parked-state observability contract, F1 design §3).
 pub const FAKE_BUILD_FINGERPRINT: &str = "fake-engine-1";
-
-/// The deep-park security gate: experimental level-2 operations are denied
-/// unless the host explicitly opts in (design §9.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ParkPolicy {
-    /// Default: level-2 park and weight reload are deterministically denied.
-    #[default]
-    Denied,
-    /// Host explicitly allows the experimental deep-park paths.
-    ExperimentalAllowed,
-}
 
 #[derive(Debug, Clone)]
 struct MemberState {
@@ -207,7 +197,7 @@ impl FakeEngine {
         self.knobs.lock().unwrap().ambiguous_park = true;
     }
 
-    /// Sets the deep-park policy gate (default: [`ParkPolicy::Denied`]).
+    /// Sets the deep-park policy gate (default: [`ParkPolicy::Enabled`]).
     pub fn with_policy(self, p: ParkPolicy) -> Self {
         self.knobs.lock().unwrap().policy = p;
         self
@@ -351,8 +341,8 @@ impl EngineAdapter for FakeEngine {
         if fail_at == Some(Phase::Parking) {
             return Err(AdapterError::Crash(Phase::Parking));
         }
-        // Deep-park security gate: level 2 is experimental and denied by default.
-        if level == ParkLevel::Two && policy == ParkPolicy::Denied {
+        // Deep-park security gate: level 2 is refused when the host has disabled it.
+        if level == ParkLevel::Two && policy == ParkPolicy::Disabled {
             return Err(AdapterError::PolicyDenied);
         }
         let retained = park_retained_bytes(level);
@@ -392,7 +382,7 @@ impl EngineAdapter for FakeEngine {
         }
         // Reloading weights after a deep park is part of the experimental
         // level-2 path: gated by the same policy as the park itself.
-        if knobs.policy == ParkPolicy::Denied {
+        if knobs.policy == ParkPolicy::Disabled {
             return Err(AdapterError::PolicyDenied);
         }
         drop(knobs);

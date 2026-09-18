@@ -264,7 +264,7 @@ impl Controller {
         adapter: Arc<dyn EngineAdapter>,
         launcher: Arc<dyn Launcher>,
     ) -> Self {
-        Self::new_with_policy(store, adapter, launcher, mllm_adapters::fake::ParkPolicy::Denied)
+        Self::new_with_policy(store, adapter, launcher, mllm_adapters::fake::ParkPolicy::Disabled)
     }
 
     pub fn new_with_policy(
@@ -281,7 +281,7 @@ impl Controller {
             host_id: EMBEDDED_HOST_ID.to_string(),
             handles: Arc::new(Mutex::new(HashMap::new())),
             park_policy,
-            park_level: if park_policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+            park_level: if park_policy == mllm_adapters::fake::ParkPolicy::Enabled {
                 mllm_adapters::ParkLevel::Two
             } else {
                 mllm_adapters::ParkLevel::One
@@ -448,7 +448,7 @@ impl Controller {
                     .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?
             };
             let qualified = kind == "vllm-sleep"
-                && self.park_policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed;
+                && self.park_policy == mllm_adapters::fake::ParkPolicy::Enabled;
             if !qualified {
                 return Err(ControllerError::OperationFailed {
                     op: "preinitialize".to_string(),
@@ -480,7 +480,7 @@ impl Controller {
                 .get_deployment(deployment)?
                 .map(|r| r.kind)
                 .unwrap_or_default();
-            if kind == "vllm-sleep" && self.park_policy != mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+            if kind == "vllm-sleep" && self.park_policy != mllm_adapters::fake::ParkPolicy::Enabled {
                 let op = OperationId(format!("op-{}", ulid::Ulid::new()));
                 store.record_operation(NewOperation {
                     id: op.clone(),
@@ -1338,7 +1338,7 @@ mod tests {
             store,
             Arc::new(NeverReadyAdapter),
             Arc::new(FakeLauncher::new()),
-            mllm_adapters::fake::ParkPolicy::Denied,
+            mllm_adapters::fake::ParkPolicy::Disabled,
         )
         .with_operation_timeout(Duration::from_millis(150));
         let dep = c.submit_deploy(req("never-ready-m")).await.unwrap();

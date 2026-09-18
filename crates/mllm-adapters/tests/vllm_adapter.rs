@@ -76,22 +76,22 @@ async fn readiness_requires_served_model_not_liveness() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     // Mock serves "toy-model" → Ready.
     assert!(matches!(a.check_readiness(&member()).await.unwrap(), Readiness::Ready));
 }
 
-// T21: SPEC §9.1 security gate — deep-park stays denied without host-policy opt-in.
+// T21: SPEC §9.1 security gate — deep-park is refused when the host disables it.
 #[tokio::test]
-async fn park_denied_by_default_without_engine_call() {
+async fn park_refused_when_disabled_without_engine_call() {
     let (addr, st) = spawn_mock().await;
     let a = VllmAdapter::new(
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     let out = a.park(&member(), ParkLevel::Two).await;
@@ -102,6 +102,23 @@ async fn park_denied_by_default_without_engine_call() {
     assert!(matches!(out1, Err(mllm_adapters::AdapterError::PolicyDenied)));
 }
 
+// T21: SPEC §9.1 security gate — the default policy permits deep-park.
+#[tokio::test]
+async fn park_permitted_by_default() {
+    assert_eq!(ParkPolicy::default(), ParkPolicy::Enabled);
+    let (addr, st) = spawn_mock().await;
+    let a = VllmAdapter::new(
+        format!("http://{addr}").parse().unwrap(),
+        None,
+        "vllm-test-1".into(),
+        ParkPolicy::default(),
+        "toy-model".into(),
+    );
+    let out = a.park(&member(), ParkLevel::Two).await;
+    assert!(matches!(out, Ok(mllm_adapters::ParkOutcome::Parked { .. })));
+    assert_eq!(st.sleep_hits.load(Ordering::SeqCst), 1, "engine call made under default policy");
+}
+
 #[tokio::test]
 async fn allowed_policy_parks_and_restores_with_collective_once() {
     let (addr, st) = spawn_mock().await;
@@ -109,7 +126,7 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::ExperimentalAllowed,
+        ParkPolicy::Enabled,
         "toy-model".into(),
     );
     let out = a.park(&member(), ParkLevel::Two).await.unwrap();
@@ -133,7 +150,7 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
 async fn rejected_cache_reset_does_not_release_parked_readiness() {
     let (addr, st) = spawn_mock().await;
     let a = VllmAdapter::new(format!("http://{addr}").parse().unwrap(), None,
-        "vllm-test-1".into(), ParkPolicy::ExperimentalAllowed, "toy-model".into());
+        "vllm-test-1".into(), ParkPolicy::Enabled, "toy-model".into());
     a.park(&member(), ParkLevel::Two).await.unwrap();
     st.reset_rejected.store(true, Ordering::SeqCst);
     assert!(a.restore(&member()).await.is_err(), "HTTP 200 with success=false is not restoration");
@@ -151,7 +168,7 @@ async fn park_state_is_per_member_not_per_profile() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::ExperimentalAllowed,
+        ParkPolicy::Enabled,
         "toy-model".into(),
     );
     let ma = MemberRef { deployment_id: "da".into(), member_id: "da-head".into() };
@@ -186,7 +203,7 @@ async fn cancel_without_ack_is_uncertain_no_call() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     let out = a
@@ -203,7 +220,7 @@ async fn passes_conformance_suite() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     let launcher = FakeLauncher::new();

@@ -62,9 +62,9 @@ impl EngineBindings for ProfileBindings {
                     // (SPEC §9.1, T21). The profile carries that decision; it is not
                     // re-derived from anything ambient.
                     policy: if profile.security.experimental_controls {
-                        mllm_adapters::fake::ParkPolicy::ExperimentalAllowed
+                        mllm_adapters::fake::ParkPolicy::Enabled
                     } else {
-                        mllm_adapters::fake::ParkPolicy::Denied
+                        mllm_adapters::fake::ParkPolicy::Disabled
                     },
                     // Readiness is the served id appearing in the engine's model
                     // list, so the adapter must use the route the deployment serves

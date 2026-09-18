@@ -231,6 +231,42 @@ pub trait Launcher: Send + Sync {
     fn verify_handle(&self, h: &OwnedHandle) -> HandleStatus;
 }
 
+/// Process tools a builder uses on Initialize and Cleanup. The director supplies
+/// them; the builder never learns where identities are recorded (spec §3).
+///
+/// Synchronous on purpose: `mllm-launchers` has no async runtime. Builders call the
+/// blocking methods through `tokio::task::spawn_blocking`.
+pub trait OwnedProcessLaunch: Send + Sync {
+    /// Spawn gated: the child runs only after its identity is durable. The engine's
+    /// stdout and stderr go to the file named by `cmd.env["MLLM_ENGINE_LOG"]`.
+    /// A child that is never released is disposed of before this returns an error.
+    fn spawn_durable(
+        &self,
+        incarnation: &str,
+        cmd: &RenderedCommand,
+    ) -> Result<mllm_domain::completion::ProcessIdentity, RuntimeError>;
+    /// Live now, with the same start identity: boot id and start ticks, not pid alone.
+    fn present(&self, identity: &mllm_domain::completion::ProcessIdentity)
+        -> mllm_domain::completion::Presence;
+    /// Every live member of the process group the recorded API process led: the API
+    /// process first when it is still live, workers named `worker-0`, `worker-1`, ...
+    /// in start order, and an empty list when no member is live. Empty is an answer,
+    /// not an error; cleanup depends on it.
+    fn observe_group(
+        &self,
+        api: &mllm_domain::completion::ProcessIdentity,
+    ) -> Result<Vec<mllm_domain::completion::ProcessIdentity>, RuntimeError>;
+    /// SIGTERM the owned group, wait `grace`, SIGKILL, then prove every identity gone
+    /// and the group itself empty. Refuses to signal a pid whose start identity
+    /// differs from the recorded one (SPEC §13.2: never kill a process you cannot
+    /// prove you own).
+    fn terminate_owned(
+        &self,
+        identities: &[mllm_domain::completion::ProcessIdentity],
+        grace: std::time::Duration,
+    ) -> Result<(), RuntimeError>;
+}
+
 /// How a forwarded stream ended (engine-neutral; mirrors SSE semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamEnded {

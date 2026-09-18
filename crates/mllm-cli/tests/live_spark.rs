@@ -119,7 +119,7 @@ async fn live_default_denies_sleep_profile() {
     let Some(_) = live_profile() else { return; };
     let dir = safe_state_dir();
     let app = roles::start_standalone_with_policy(
-        dir.path(), mllm_adapters::fake::ParkPolicy::Denied,
+        dir.path(), mllm_adapters::fake::ParkPolicy::Disabled,
     ).await.unwrap();
     let id = app.controller.submit_deploy("standalone", &DeployRequest {
         kind: "vllm-sleep".into(),
@@ -148,7 +148,7 @@ async fn live_ambiguous_park_reconciles() {
     let Some(p) = live_profile() else { return; };
     let dir = tempfile::Builder::new().prefix("mllm-live").disable_cleanup(true).tempdir().unwrap();
     eprintln!("LIVE-DIR: {}", dir.path().display());
-    let app = roles::start_standalone_with_policy(dir.path(), ParkPolicy::ExperimentalAllowed).await.unwrap();
+    let app = roles::start_standalone_with_policy(dir.path(), ParkPolicy::Enabled).await.unwrap();
     let id = deploy_and_start(&app, &p.model_id).await;
     let pid = live_pid(&app, &id).unwrap();
     let cleanup = LiveProcessCleanup::new(pid);
@@ -182,12 +182,12 @@ async fn live_ambiguous_park_reconciles() {
     });
     let adapter = mllm_adapters::vllm::VllmAdapter::new(
         format!("http://{proxy_addr}").parse().unwrap(), None,
-        p.fingerprint.clone(), ParkPolicy::ExperimentalAllowed, p.model_id.clone(),
+        p.fingerprint.clone(), ParkPolicy::Enabled, p.model_id.clone(),
     );
     let store = app.controller.store_ref().clone();
     let fault_controller = mllm_controller::Controller::new_with_policy(
         store.clone(), Arc::new(adapter), Arc::new(mllm_launchers::ExecLauncher::new()),
-        ParkPolicy::ExperimentalAllowed,
+        ParkPolicy::Enabled,
     );
     let op = fault_controller.request_transition(&id, mllm_domain::LifecycleAction::Park).await.unwrap();
     let result = fault_controller.wait_terminal(&op).await;
@@ -222,7 +222,7 @@ fn live_restart_only_qualification() {
             .tempdir()
             .unwrap();
         eprintln!("LIVE-DIR: {}", dir.path().display());
-        let app = roles::start_standalone_with_policy(dir.path(), mllm_adapters::fake::ParkPolicy::Denied)
+        let app = roles::start_standalone_with_policy(dir.path(), mllm_adapters::fake::ParkPolicy::Disabled)
             .await
             .unwrap();
 
@@ -322,7 +322,7 @@ async fn live_switch_restart_only() {
     eprintln!("LIVE-DIR: {}", dir.path().display());
     let app = roles::start_standalone_with_policy(
         dir.path(),
-        mllm_adapters::fake::ParkPolicy::Denied,
+        mllm_adapters::fake::ParkPolicy::Disabled,
     )
     .await
     .unwrap();
@@ -369,7 +369,7 @@ async fn live_park_reload() {
     let dir = tempfile::Builder::new().prefix("mllm-live").disable_cleanup(true).tempdir().unwrap();
     eprintln!("LIVE-DIR: {}", dir.path().display());
     let app = roles::start_standalone_with_policy(
-        dir.path(), mllm_adapters::fake::ParkPolicy::ExperimentalAllowed,
+        dir.path(), mllm_adapters::fake::ParkPolicy::Enabled,
     ).await.unwrap();
 
     // Park → wake cycles under the opt-in (T20 live, 3 clean cycles) —
@@ -467,7 +467,7 @@ async fn live_concurrent_park_reload() {
     let dir = tempfile::Builder::new().prefix("mllm-concurrent").disable_cleanup(true).tempdir().unwrap();
     eprintln!("LIVE-DIR: {}", dir.path().display());
     let app = roles::start_standalone_with_policy(dir.path(),
-        mllm_adapters::fake::ParkPolicy::ExperimentalAllowed).await.unwrap();
+        mllm_adapters::fake::ParkPolicy::Enabled).await.unwrap();
     let id = app.controller.submit_deploy("standalone", &DeployRequest {
         kind:"vllm-sleep".into(), ..req("concurrent-sleep", &p.model_id)
     }).unwrap();

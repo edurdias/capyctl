@@ -13,7 +13,7 @@ fn vllm() -> AdapterSpec {
         endpoint: "http://127.0.0.1:8000".parse().unwrap(),
         api_key: None,
         fingerprint: "fp".into(),
-        policy: ParkPolicy::Denied,
+        policy: ParkPolicy::Disabled,
         model_id: "m".into(),
     }
 }

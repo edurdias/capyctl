@@ -40,7 +40,7 @@ async fn sleep_level_two_discards_weights_and_kv() {
     // The §9.1 deep-park security gate denies level 2 by default, so the
     // scenario opts in via host policy before exercising the retention
     // semantics. (Brief's verbatim test predates the gate; see task report.)
-    let e = FakeEngine::new().with_policy(ParkPolicy::ExperimentalAllowed);
+    let e = FakeEngine::new().with_policy(ParkPolicy::Enabled);
     e.park(&member(), mllm_adapters::ParkLevel::Two).await.unwrap();
     let obs = e.inspect(&member()).await.unwrap();
     assert_eq!(obs.retained_bytes, BUFFER_RESIDUE); // weights+KV gone, buffers kept
@@ -53,7 +53,7 @@ async fn sleep_level_two_discards_weights_and_kv() {
 async fn ambiguous_park_reports_uncertainty_not_success() {
     // The park effect itself requires the deep-park opt-in (§9.1 gate);
     // ambiguity is injected on top of an otherwise-permitted park.
-    let e = FakeEngine::new().ambiguous_park().with_policy(ParkPolicy::ExperimentalAllowed);
+    let e = FakeEngine::new().ambiguous_park().with_policy(ParkPolicy::Enabled);
     let out = e.park(&member(), mllm_adapters::ParkLevel::Two).await;
     assert!(matches!(out, Err(AdapterError::Uncertain(_))));
 }
@@ -68,11 +68,11 @@ async fn cancellation_without_ack_reports_uncertainty() {
 #[tokio::test]
 async fn deep_park_denied_without_policy_opt_in() {
     // Security gate (design §9): level-2 park is experimental, denied by default.
-    let e = FakeEngine::new().with_policy(ParkPolicy::Denied);
+    let e = FakeEngine::new().with_policy(ParkPolicy::Disabled);
     let out = e.park(&member(), mllm_adapters::ParkLevel::Two).await;
     assert!(matches!(out, Err(AdapterError::PolicyDenied)));
     // Opt-in via explicit host policy enables the path:
-    let e2 = FakeEngine::new().with_policy(ParkPolicy::ExperimentalAllowed);
+    let e2 = FakeEngine::new().with_policy(ParkPolicy::Enabled);
     assert!(e2.park(&member(), mllm_adapters::ParkLevel::Two).await.is_ok());
 }
 
@@ -106,8 +106,8 @@ async fn level_one_park_keeps_cpu_weight_backup() {
 
 #[tokio::test]
 async fn reload_weights_also_denied_without_policy_opt_in() {
-    let e = FakeEngine::new().with_policy(ParkPolicy::Denied);
+    let e = FakeEngine::new().with_policy(ParkPolicy::Disabled);
     assert!(matches!(e.reload_weights(&member()).await, Err(AdapterError::PolicyDenied)));
-    let e2 = FakeEngine::new().with_policy(ParkPolicy::ExperimentalAllowed);
+    let e2 = FakeEngine::new().with_policy(ParkPolicy::Enabled);
     assert!(e2.reload_weights(&member()).await.is_ok());
 }

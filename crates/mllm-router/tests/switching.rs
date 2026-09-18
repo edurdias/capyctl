@@ -167,7 +167,7 @@ async fn a_to_b_to_a_alternates_with_release_evidence() {
 #[tokio::test]
 async fn qualified_sleep_profile_keeps_park_restore_switch_path() {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let policy = mllm_adapters::fake::ParkPolicy::ExperimentalAllowed;
+    let policy = mllm_adapters::fake::ParkPolicy::Enabled;
     let c = Arc::new(Controller::new_with_policy(
         store.clone(),
         Arc::new(mllm_adapters::fake::FakeEngine::new().with_policy(policy)),

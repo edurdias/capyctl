@@ -42,7 +42,7 @@ async fn make_ready(c: &Controller, name: &str, kind: &str) -> String {
 
 #[tokio::test]
 async fn ambiguous_park_reconciles_without_blind_repeat() {
-    let (c, store, fake) = controller(ParkPolicy::ExperimentalAllowed);
+    let (c, store, fake) = controller(ParkPolicy::Enabled);
     let id = make_ready(&c, "amb-m", "vllm-sleep").await;
     // Inject ambiguity: the park's effect applies but the ack is lost.
     fake.set_ambiguous_park();
@@ -59,7 +59,7 @@ async fn ambiguous_park_reconciles_without_blind_repeat() {
 
 #[tokio::test]
 async fn preinitialize_fails_clearly_on_restart_only() {
-    let (c, _store, _f) = controller(ParkPolicy::Denied);
+    let (c, _store, _f) = controller(ParkPolicy::Disabled);
     let id = c.submit_deploy(req("plain", "model")).await.unwrap();
     let out = c.request_transition(&id, mllm_domain::LifecycleAction::Preinitialize).await;
     assert!(out.is_err(), "restart-only deployments cannot preinitialize");
@@ -72,7 +72,7 @@ async fn preinitialize_fails_clearly_on_restart_only() {
 
 #[tokio::test]
 async fn preinitialize_waits_for_qualified_parking() {
-    let (c, store, _f) = controller(ParkPolicy::ExperimentalAllowed);
+    let (c, store, _f) = controller(ParkPolicy::Enabled);
     let id = c.submit_deploy(req("pre-m", "vllm-sleep")).await.unwrap();
     let op = c.request_transition(&id, mllm_domain::LifecycleAction::Preinitialize).await.unwrap();
     let end = c.wait_terminal(&op).await.unwrap();
@@ -87,7 +87,7 @@ async fn quiesce_unknown_proceeds_with_recorded_uncertainty() {
     // per-request surface, so observe_work is always Unknown. The park must
     // proceed with the residual uncertainty recorded — not fail
     // not_quiescent (which landed deployments in Failed live).
-    let (c, store, fake) = controller(ParkPolicy::ExperimentalAllowed);
+    let (c, store, fake) = controller(ParkPolicy::Enabled);
     let id = make_ready(&c, "unknown-q", "vllm-sleep").await;
 
     // The fake's observe_work is Idle by default; drive the Unknown arm via

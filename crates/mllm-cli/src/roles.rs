@@ -131,7 +131,7 @@ impl From<StartError> for StructuredError {
 /// (fake engine + fake launcher, deep-park policy denied by default)
 /// against a controller bound to the same state directory.
 pub async fn start_standalone(state_dir: &Path) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, mllm_adapters::fake::ParkPolicy::Denied).await
+    start_standalone_inner(state_dir, mllm_adapters::fake::ParkPolicy::Disabled).await
 }
 
 /// Boot with an explicit host deep-park policy (the Spark qualification
@@ -317,7 +317,7 @@ async fn start_standalone_inner(
         (
             engine,
             executable,
-            policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed,
+            policy == mllm_adapters::fake::ParkPolicy::Enabled,
             capacity,
         )
     };
@@ -392,7 +392,7 @@ async fn start_standalone_inner(
 }
 
 fn live_vllm_sleep_flags(policy: mllm_adapters::fake::ParkPolicy) -> Vec<String> {
-    if policy == mllm_adapters::fake::ParkPolicy::ExperimentalAllowed {
+    if policy == mllm_adapters::fake::ParkPolicy::Enabled {
         // The deep-park lab profile uses eager checkpoint loading to avoid
         // mmap-backed tensor copies during weight restoration on Spark.
         vec![
@@ -426,13 +426,13 @@ mod tests {
     #[test]
     fn deep_park_lab_profile_enables_eager_weight_loading() {
         assert_eq!(
-            live_vllm_sleep_flags(ParkPolicy::ExperimentalAllowed),
+            live_vllm_sleep_flags(ParkPolicy::Enabled),
             ["--enable-sleep-mode", "--safetensors-load-strategy", "eager"],
         );
     }
 
     #[test]
     fn denied_profile_has_no_sleep_or_loader_override() {
-        assert!(live_vllm_sleep_flags(ParkPolicy::Denied).is_empty());
+        assert!(live_vllm_sleep_flags(ParkPolicy::Disabled).is_empty());
     }
 }

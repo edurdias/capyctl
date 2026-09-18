@@ -14,18 +14,7 @@
 //! rather than a live handle, so it survives the restart that destroys handles.
 
 use mllm_domain::completion::ProcessIdentity;
-
-/// Whether a recorded process still exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Presence {
-    /// The exact recorded process still exists. Never release.
-    Alive,
-    /// Proven absent: the boot differs, the pid is unused, or the pid was reused by
-    /// a different process. Only this authorises release.
-    Gone,
-    /// Could not be established. Treated as retained, never as absent.
-    Unknown,
-}
+pub use mllm_domain::completion::Presence;
 
 /// The whole recorded set, resolved together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

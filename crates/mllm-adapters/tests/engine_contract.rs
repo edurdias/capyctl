@@ -241,7 +241,7 @@ async fn engine(sglang: bool, sse: String) -> (Box<dyn ChatForward>, tokio::task
             url.parse().unwrap(),
             Some("inference-secret".into()),
             "pin".into(),
-            ParkPolicy::Denied,
+            ParkPolicy::Disabled,
             MODEL.into(),
         ))
     };
@@ -438,7 +438,7 @@ async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness()
         url.parse().unwrap(),
         None,
         "pin".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         MODEL.into(),
     );
     let member = MemberRef {
@@ -524,7 +524,7 @@ async fn redirects_never_receive_the_inference_credential() {
             url.parse().unwrap(),
             Some("inference-secret".into()),
             "pin".into(),
-            ParkPolicy::Denied,
+            ParkPolicy::Disabled,
             MODEL.into(),
         )),
     ];
@@ -585,7 +585,7 @@ async fn split_utf8_and_crlf_survive_but_invalid_utf8_never_completes() {
                     url.parse().unwrap(),
                     None,
                     "pin".into(),
-                    ParkPolicy::Denied,
+                    ParkPolicy::Disabled,
                     MODEL.into(),
                 ))
             };

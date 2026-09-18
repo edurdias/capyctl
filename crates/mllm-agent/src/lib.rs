@@ -3,7 +3,7 @@
 //!
 //! No enrollment, no network: the standalone deployment graph is
 //! server + host over one store. The host carries the deep-park security
-//! gate at its default [`ParkPolicy::Denied`] — experimental level-2 park
+//! gate at its default [`ParkPolicy::Disabled`] — experimental level-2 park
 //! and weight reload are deterministically denied unless a later phase
 //! explicitly opts the host in (design §9.1).
 
@@ -42,9 +42,9 @@ impl Host {
         self.launcher.clone()
     }
 
-    /// The host's deep-park policy gate (F0 default: [`ParkPolicy::Denied`]).
+    /// The host's deep-park policy gate (F0 default: [`ParkPolicy::Disabled`]).
     pub fn park_policy(&self) -> ParkPolicy {
-        ParkPolicy::Denied
+        ParkPolicy::Disabled
     }
 }
 
@@ -62,7 +62,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_host_denies_experimental_deep_park_by_default() {
         let host = Host::new();
-        assert_eq!(host.park_policy(), ParkPolicy::Denied);
+        assert_eq!(host.park_policy(), ParkPolicy::Disabled);
         let member = MemberRef { deployment_id: "d-1".into(), member_id: "m-1".into() };
         let err = host
             .adapter()
