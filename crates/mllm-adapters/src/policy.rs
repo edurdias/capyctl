@@ -11,3 +11,13 @@ pub enum ParkPolicy {
     /// Level-2 park and weight reload are deterministically refused.
     Disabled,
 }
+
+#[allow(non_upper_case_globals)]
+impl ParkPolicy {
+    /// Old spelling kept for the owner's untracked live test; remove once it is updated.
+    #[deprecated(note = "use ParkPolicy::Enabled")]
+    pub const ExperimentalAllowed: ParkPolicy = ParkPolicy::Enabled;
+    /// Old spelling kept for the owner's untracked live test; remove once it is updated.
+    #[deprecated(note = "use ParkPolicy::Disabled")]
+    pub const Denied: ParkPolicy = ParkPolicy::Disabled;
+}
