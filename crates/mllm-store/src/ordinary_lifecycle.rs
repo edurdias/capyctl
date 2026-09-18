@@ -825,6 +825,7 @@ pub(crate) fn record_launch(
     if r.binding_id != p.binding_id || r.incarnation != p.incarnation {
         return Err(LifecycleError::Conflict);
     }
+    let canonical = canonical_members(&r.identities)?;
     let supplied = Association {
         version: 1,
         kind: "owned_launch".into(),
@@ -832,7 +833,7 @@ pub(crate) fn record_launch(
         session_id: s.id().into(),
         binding_id: r.binding_id.clone(),
         incarnation: r.incarnation.clone(),
-        identities: identity_dtos(&canonical_members(&r.identities)?),
+        identities: identity_dtos(&canonical),
         observed_at_ms: r.observed_at_ms,
         receipt: r.receipt.clone(),
     };
@@ -853,12 +854,16 @@ pub(crate) fn record_launch(
         now,
         policy(tx, &e)?.controls.observation_ttl_ms,
     )?;
-    let empty: bool = tx.query_row(
-        "SELECT identities_json='[]' FROM runtime_bindings WHERE id=?1",
+    // Spec §3: the association wrote the API identity before the engine ran.
+    // A durable launcher records that identity as soon as the API process
+    // exists, then this call must accept exactly that prior content, or none.
+    let prior_json: String = tx.query_row(
+        "SELECT identities_json FROM runtime_bindings WHERE id=?1",
         [&p.binding_id],
         |r| r.get(0),
     )?;
-    if !empty {
+    let prior: Vec<IdentityDto> = decode(&prior_json)?;
+    if !prior.is_empty() && prior != identity_dtos(std::slice::from_ref(&canonical[0])) {
         return Err(LifecycleError::Conflict);
     }
     tx.execute("INSERT INTO owned_launch_associations(step_id,binding_id,incarnation,association_json) VALUES(?1,?2,?3,?4)",params![id,p.binding_id,p.incarnation,encode(&supplied)?])?;

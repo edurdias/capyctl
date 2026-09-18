@@ -22,10 +22,14 @@ pub(crate) fn check_session(
         _ => LifecycleError::Stale,
     })
 }
+/// Spec §4: a launch's canonical membership is one `api` identity plus one or
+/// more workers named contiguously from `worker-0`, all sharing a boot id with
+/// distinct pids. A tensor-parallel launch needs several workers, and vLLM's
+/// EngineCore already numbers them this way.
 pub(crate) fn canonical_members(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
-    if ids.len() != 2
+    if ids.len() < 2
         || ids.iter().any(|i| {
             i.role.len() > MAX_DTO_BYTES / 4
                 || i.boot_id.len() > MAX_DTO_BYTES / 4
@@ -38,12 +42,24 @@ pub(crate) fn canonical_members(
     }
     let mut ids = ids.to_vec();
     ids.sort();
-    if ids[0].role != "api"
-        || ids[1].role != "worker-0"
-        || ids[0].pid == ids[1].pid
-        || ids[0].boot_id != ids[1].boot_id
-    {
+    let boot_id = ids[0].boot_id.clone();
+    let mut pids = std::collections::BTreeSet::new();
+    let mut roles = std::collections::BTreeSet::new();
+    if ids.iter().any(|i| {
+        i.boot_id != boot_id || !pids.insert(i.pid) || !roles.insert(i.role.clone())
+    }) {
         return Err(LifecycleError::Invalid);
+    }
+    // Every role is distinct (checked above), so removing `api` and then every
+    // expected `worker-i` in turn only succeeds, with nothing left over, when
+    // the role set is exactly {api, worker-0, ..., worker-(len-2)}.
+    if !roles.remove("api") {
+        return Err(LifecycleError::Invalid);
+    }
+    for worker in 0..ids.len() - 1 {
+        if !roles.remove(&format!("worker-{worker}")) {
+            return Err(LifecycleError::Invalid);
+        }
     }
     Ok(ids)
 }
@@ -57,10 +73,9 @@ pub(crate) fn identity_dtos(ids: &[ProcessIdentity]) -> Vec<IdentityDto> {
         })
         .collect()
 }
+/// Spec §4: the stored-association sibling of `canonical_members`, accepting
+/// the same shape (`api` plus workers numbered contiguously from `worker-0`).
 pub(crate) fn members(dtos: &[IdentityDto]) -> Result<Vec<ProcessIdentity>, LifecycleError> {
-    if dtos.len() != 2 {
-        return Err(LifecycleError::CorruptStoredData);
-    }
     canonical_members(
         &dtos
             .iter()
