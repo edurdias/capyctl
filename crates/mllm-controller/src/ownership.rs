@@ -3,6 +3,7 @@
 use mllm_launchers::ControllerLock;
 use mllm_store::{
     dispatch::{CoordinatorSession, DispatchError},
+    secrets::SecretsKey,
     Store, StoreError,
 };
 use std::fs;
@@ -39,6 +40,21 @@ impl OwnedCoordinatorState {
     /// to replace paths concurrently; this is not a sandbox against that UID.
     /// This constructor establishes ownership, not runtime reconciliation.
     pub fn open(state_dir: &Path) -> Result<Self, OwnedStateError> {
+        // Spec §3: a store with no identity key cannot seal an engine key, and a
+        // caller that never launches an engine still needs one installed rather
+        // than a store that fails the first time it is asked. An ephemeral key
+        // lives only for this process, so nothing it seals survives a restart;
+        // a server that must outlive one opens with `open_with_secrets`.
+        Self::open_with_secrets(state_dir, SecretsKey::generate_ephemeral())
+    }
+
+    /// Open the state directory and install the identity key that seals every
+    /// per-launch engine key (Spec §3). The key is read from a file outside the
+    /// database, so the database alone never recovers an engine key.
+    pub fn open_with_secrets(
+        state_dir: &Path,
+        secrets: SecretsKey,
+    ) -> Result<Self, OwnedStateError> {
         let uid = fs::metadata("/proc/self")?.uid();
         validate_directory(state_dir, uid)?;
         let lock = ControllerLock::acquire(&state_dir.join("controller.lock"))?;
@@ -52,7 +68,8 @@ impl OwnedCoordinatorState {
         ] {
             validate_database_file(&state_dir.join(name), uid)?;
         }
-        let store = Store::open(&state_dir.join("srv.sqlite3"))?;
+        let mut store = Store::open(&state_dir.join("srv.sqlite3"))?;
+        store.set_secrets_key(secrets);
         let session = store.begin_coordinator_session()?;
         Ok(Self {
             store,

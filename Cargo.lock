@@ -1122,6 +1122,7 @@ dependencies = [
  "mllm-launchers",
  "mllm-scheduler",
  "mllm-store",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

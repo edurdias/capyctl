@@ -49,6 +49,8 @@ struct Gate {
     panic: bool,
     association: Mutex<Option<SharedCoordinatorState>>,
     lost_reply: AtomicBool,
+    /// The builder's own reason for failing, once it has done whatever it does.
+    failure: Mutex<Option<String>>,
 }
 impl Gate {
     fn new(panic: bool) -> Arc<Self> {
@@ -61,6 +63,7 @@ impl Gate {
             panic,
             association: Mutex::new(None),
             lost_reply: AtomicBool::new(false),
+            failure: Mutex::new(None),
         })
     }
     async fn entered(&self) {
@@ -112,6 +115,9 @@ impl EngineAdapter for Gate {
         self.entered.add_permits(1);
         assert!(!self.panic, "injected adapter panic after effect");
         self.release.acquire().await.unwrap().forget();
+        if let Some(reason) = self.failure.lock().unwrap().clone() {
+            return Err(RuntimeError::Uncertain(reason));
+        }
         if self.lost_reply.load(Ordering::SeqCst) {
             return Err(RuntimeError::Uncertain(
                 "lost Initialize reply after associated launch".into(),
@@ -186,6 +192,9 @@ fn test_driver(gate: Arc<Gate>) -> Arc<Driver> {
                     .map_err(|e| CoordinatorError::Service(e.to_string()))
             })
         }),
+        // This builder launches nothing, so it has nothing to terminate: the
+        // failure path pauses uncertain for it, as it does for the Fake.
+        tools: None,
     })
 }
 async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
@@ -299,16 +308,11 @@ async fn timeout_and_panic_retain_peak_and_never_stop_or_continue() {
     for panic in [false, true] {
         let (_dir, owner, fence, observations) = setup().await;
         let gate = Gate::new(panic);
-        let w = worker(
-            owner.clone(),
-            observations,
-            gate.clone(),
-            CoordinatorOptions {
-                protocol_timeout: Duration::from_millis(30),
-                ..Default::default()
-            },
-        );
-        let a = w.start(&fence, 10000).unwrap();
+        let w = worker(owner.clone(), observations, gate.clone(), CoordinatorOptions::default());
+        // Spec §4: Initialize is bounded by the smaller of its own timeout and what
+        // is left of the accepted deadline. The deadline is the short one here, so
+        // the gate that never replies is abandoned 30 ms after the step arms.
+        let a = w.start(&fence, 1930).unwrap();
         gate.entered().await;
         assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
         assert_eq!(
@@ -743,7 +747,6 @@ async fn current_policy_race_and_observation_timeout_deny_send() {
             source,
             Arc::new(|| Ok(1900)),
             CoordinatorOptions {
-                protocol_timeout: Duration::from_millis(200),
                 // The denial is retried until the budget is spent; the test does
                 // not wait for the policy default between attempts.
                 retry_cooldown: Duration::from_millis(20),
@@ -752,7 +755,9 @@ async fn current_policy_race_and_observation_timeout_deny_send() {
             Arc::new(move |_| Ok(test_driver(driver.clone()))),
         )
         .unwrap();
-        let a = w.start(&fence, 10000).unwrap();
+        // The accepted deadline bounds the observation, so an observation that is
+        // never released is abandoned 200 ms after the step is discovered.
+        let a = w.start(&fence, 2100).unwrap();
         entered.acquire().await.unwrap().forget();
         if !timeout {
             let o = owner.lock().unwrap();
@@ -2015,5 +2020,471 @@ mod cleanup_evidence {
             Arc::new(|| Err(CoordinatorError::Service("clock unavailable".into())));
         let ids = vec![identity(0x7FFF_FFF0, 1, &boot())];
         assert!(observed_gone(&context(ids), &failing).is_err());
+    }
+}
+
+/// The director's side of a native launch: a builder that owns its processes, the
+/// timeout that bounds it, the termination that ends it and the release that
+/// follows a failure. The builder itself is scripted; a real engine is qualified on
+/// the host and never here.
+mod native {
+    use super::*;
+    use mllm_domain::completion::{Presence, ProcessIdentity};
+
+    /// A builder's process tools, scripted. It launches nothing: these tests drive
+    /// the director's decisions, and every one of them is about what mllm does with
+    /// processes it has already recorded.
+    struct ScriptedTool {
+        terminations: Mutex<Vec<Vec<ProcessIdentity>>>,
+        refusal: Option<String>,
+    }
+    impl ScriptedTool {
+        fn proving() -> Arc<Self> {
+            Arc::new(Self {
+                terminations: Mutex::new(Vec::new()),
+                refusal: None,
+            })
+        }
+        /// Tools that signal and then cannot prove the group gone.
+        fn unprovable() -> Arc<Self> {
+            Arc::new(Self {
+                terminations: Mutex::new(Vec::new()),
+                refusal: Some("a recorded process could not be proven gone".into()),
+            })
+        }
+        fn terminations(&self) -> Vec<Vec<ProcessIdentity>> {
+            self.terminations.lock().unwrap().clone()
+        }
+    }
+    impl OwnedProcessLaunch for ScriptedTool {
+        fn spawn_durable(
+            &self,
+            _: &str,
+            _: &RenderedCommand,
+        ) -> Result<ProcessIdentity, RuntimeError> {
+            Err(RuntimeError::Uncertain(
+                "the scripted tool starts no process".into(),
+            ))
+        }
+        fn present(&self, _: &ProcessIdentity) -> Presence {
+            Presence::Gone
+        }
+        fn observe_group(&self, _: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
+            Ok(Vec::new())
+        }
+        fn terminate_owned(
+            &self,
+            identities: &[ProcessIdentity],
+            _: Duration,
+        ) -> Result<(), RuntimeError> {
+            self.terminations.lock().unwrap().push(identities.to_vec());
+            match &self.refusal {
+                Some(reason) => Err(RuntimeError::Uncertain(reason.clone())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// A driver for a builder that owns its processes: the real cleanup closure and
+    /// the tools the failure path terminates with.
+    fn native_driver(
+        gate: Arc<Gate>,
+        tools: Arc<ScriptedTool>,
+        options: &CoordinatorOptions,
+    ) -> Arc<Driver> {
+        let tools: Arc<dyn OwnedProcessLaunch> = tools;
+        Arc::new(Driver {
+            engine: gate,
+            cleanup: terminate_then_prove_gone(
+                tools.clone(),
+                Arc::new(|| Ok(1900)),
+                options.terminate_grace,
+            ),
+            tools: Some(tools),
+        })
+    }
+
+    fn native_options() -> CoordinatorOptions {
+        CoordinatorOptions {
+            // One attempt: a launch that failed after arm is terminal for that
+            // start, so the budget never comes into it.
+            max_attempts: 1,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        }
+    }
+
+    /// A builder that arms, records whatever the test asked it to, and then fails
+    /// with `reason`.
+    fn failing_gate(
+        owner: Option<SharedCoordinatorState>,
+        reason: &str,
+    ) -> Arc<Gate> {
+        let gate = Gate::new(false);
+        *gate.association.lock().unwrap() = owner;
+        *gate.failure.lock().unwrap() = Some(reason.into());
+        gate.release.add_permits(16);
+        gate
+    }
+
+    fn journal(owner: &SharedCoordinatorState, operation: &str) -> Vec<String> {
+        let o = owner.lock().unwrap();
+        o.store().journal_evidence(operation).unwrap()
+    }
+
+    fn status(owner: &SharedCoordinatorState, step: &str) -> InitializeStatus {
+        let o = owner.lock().unwrap();
+        o.store()
+            .initialize_status(o.session(), step, 1900)
+            .unwrap()
+    }
+
+    /// Spec §4: Initialize is bounded by `initialize_timeout`, not by
+    /// `protocol_timeout`. A cold start reads weights off disk; this project
+    /// measured a 4B model taking 27 to 63 seconds, so the protocol bound would
+    /// give up on a healthy engine mid-load and then kill it. T10
+    // T10
+    #[tokio::test]
+    async fn initialize_outlives_protocol_timeout() {
+        let (_dir, owner, fence, observations) = setup().await;
+        let gate = Gate::new(false);
+        // The builder becomes ready after the protocol bound has already passed.
+        let slow = gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(6_200)).await;
+            slow.release.add_permits(1);
+        });
+        let w = worker(
+            owner.clone(),
+            observations,
+            gate.clone(),
+            CoordinatorOptions {
+                // The smallest protocol bound the one-second grace floor fits in.
+                protocol_timeout: Duration::from_millis(6_100),
+                terminate_grace: Duration::from_secs(1),
+                initialize_timeout: Duration::from_secs(30),
+                ..Default::default()
+            },
+        );
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Completed,
+            "the protocol timeout, not the Initialize timeout, bounded the builder"
+        );
+        assert_eq!(w.status(), WorkerStatus::Running);
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// Spec §6: a native launch that fails after arm is terminated, proven gone,
+    /// released with evidence, journaled, and the deployment reads Closed. Before
+    /// this the step paused Uncertain and waited for an operator's Stop. T20
+    // T20
+    #[tokio::test]
+    async fn a_failed_native_launch_is_released_and_closed() {
+        let (dir, owner, fence, observations) = setup().await;
+        let other = fixture::owned_source().await.other.clone();
+        let gate = failing_gate(Some(owner.clone()), "engine exited");
+        let healthy = Gate::new(false);
+        healthy.release.add_permits(16);
+        let tools = ScriptedTool::proving();
+        let options = native_options();
+        let (failing_id, factory_owner) = (fence.deployment_id.clone(), owner.clone());
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |work| {
+                if work.fence().deployment_id != failing_id {
+                    return Ok(test_driver(healthy.clone()));
+                }
+                // Spec §3: the key is sealed under the binding before the builder
+                // is handed it, so the release has one to delete.
+                {
+                    let o = factory_owner.lock().unwrap();
+                    o.store()
+                        .store_engine_key(
+                            work.binding_id(),
+                            work.incarnation(),
+                            &mllm_store::secrets::new_engine_key(),
+                        )
+                        .unwrap();
+                }
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Closed
+        );
+        // The recorded processes were terminated, and exactly the recorded ones.
+        let terminations = tools.terminations();
+        assert_eq!(terminations.len(), 1, "the launch was not terminated");
+        assert_eq!(terminations[0].len(), 2);
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        let step_state: String = sql
+            .query_row(
+                "SELECT state FROM lifecycle_steps WHERE id=?1",
+                [start.step_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_state, "cancelled");
+        let binding_state: String = sql
+            .query_row(
+                "SELECT state FROM runtime_bindings WHERE deployment_id=?1",
+                [&fence.deployment_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_state, "released");
+        {
+            let o = owner.lock().unwrap();
+            assert!(o
+                .store()
+                .resource_snapshot()
+                .unwrap()
+                .owners
+                .is_empty());
+        }
+        let secrets: i64 = sql
+            .query_row("SELECT COUNT(*) FROM engine_secrets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(secrets, 0, "the engine key outlived its binding");
+        // SPEC §17: failures are recorded, naming the deployment and the reason.
+        let entries = journal(&owner, start.operation_id());
+        assert!(
+            entries.iter().any(|entry| entry
+                .contains(&format!("deployment {}", fence.deployment_id))
+                && entry.contains("engine exited")),
+            "the failure was not journaled: {entries:?}"
+        );
+        assert_eq!(status(&owner, start.step_id()), InitializeStatus::Closed);
+        // Only this deployment closed. The worker keeps running and another
+        // deployment starts as though nothing had happened.
+        assert_eq!(w.status(), WorkerStatus::Running);
+        running(&w).await;
+        let fresh = w.start(&other, 10_000).unwrap();
+        assert_eq!(
+            fresh.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Completed
+        );
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// Spec §6 step 1: nothing was recorded, so the gate never opened and the
+    /// launcher disposed of the gated child itself. That outcome is the evidence;
+    /// there is nothing to terminate and no gone-proof to ask for.
+    #[tokio::test]
+    async fn a_launch_with_no_recorded_identity_is_released() {
+        let (dir, owner, fence, observations) = setup().await;
+        let gate = failing_gate(None, "the child was never released");
+        let tools = ScriptedTool::proving();
+        let options = native_options();
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |_| {
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Closed
+        );
+        assert!(
+            tools.terminations().is_empty(),
+            "a launch that recorded nothing was signalled anyway"
+        );
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        let binding_state: String = sql
+            .query_row(
+                "SELECT state FROM runtime_bindings WHERE deployment_id=?1",
+                [&fence.deployment_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_state, "released");
+        {
+            let o = owner.lock().unwrap();
+            assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+        }
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// Spec §6 step 4: what cannot be proven is not released. The reservation is
+    /// retained, the step reads Uncertain and an operator's Stop retries the
+    /// termination.
+    #[tokio::test]
+    async fn an_unprovable_failure_pauses() {
+        let (_dir, owner, fence, observations) = setup().await;
+        let gate = failing_gate(Some(owner.clone()), "engine exited");
+        let tools = ScriptedTool::unprovable();
+        let options = native_options();
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |_| {
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Uncertain
+        );
+        assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
+        assert_eq!(tools.terminations().len(), 1);
+        {
+            let o = owner.lock().unwrap();
+            assert_eq!(
+                o.store().resource_snapshot().unwrap().owners.len(),
+                1,
+                "an unprovable failure released the reservation"
+            );
+            assert_eq!(
+                o.store()
+                    .runtime_binding(&fence.deployment_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "uncertain"
+            );
+        }
+        let entries = journal(&owner, start.operation_id());
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.contains("could not be proven gone")),
+            "the uncertainty was not journaled: {entries:?}"
+        );
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// Spec §5: Stop terminates the recorded group and only then proves it gone.
+    /// An engine's own report that it shut down is not evidence, so the proof still
+    /// runs — after the signal, not instead of it. T12
+    // T12
+    #[tokio::test]
+    async fn stop_terminates_then_proves_gone() {
+        let (_dir, owner, fence, observations) = setup().await;
+        let gate = Gate::new(false);
+        gate.release.add_permits(16);
+        let tools = ScriptedTool::proving();
+        let options = CoordinatorOptions::default();
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |_| {
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Completed
+        );
+        assert!(tools.terminations().is_empty());
+        let stop = w.stop("owner", &fence, "native-stop", 10_000).unwrap();
+        assert_eq!(
+            stop.wait(Duration::from_secs(60)).await.unwrap(),
+            OrdinaryCleanupStatus::Completed
+        );
+        let terminations = tools.terminations();
+        assert_eq!(terminations.len(), 1, "Stop did not terminate the group");
+        assert!(!terminations[0].is_empty());
+        assert!(w.shared.retained.lock().unwrap().is_empty());
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// Spec §5: cleanup terminates and then proves the group gone, all inside the
+    /// protocol bound. A grace that leaves no room for the proof would turn every
+    /// Stop into a timeout, so it is refused at construction rather than discovered
+    /// on the first Stop. Spec §4 bounds the Initialize timeout the same way.
+    #[tokio::test]
+    async fn terminate_grace_must_fit_protocol_timeout() {
+        let (_dir, owner, _fence, observations) = setup().await;
+        let spawn = |options| {
+            OwnedCoordinator::spawn_fake(
+                owner.clone(),
+                Arc::new(Observations(observations.clone())),
+                Arc::new(|| Ok(1900)),
+                options,
+            )
+        };
+        for refused in [
+            CoordinatorOptions {
+                protocol_timeout: Duration::from_secs(10),
+                terminate_grace: Duration::from_secs(8),
+                ..Default::default()
+            },
+            CoordinatorOptions {
+                terminate_grace: Duration::from_millis(999),
+                ..Default::default()
+            },
+            CoordinatorOptions {
+                initialize_timeout: Duration::from_secs(29),
+                ..Default::default()
+            },
+            CoordinatorOptions {
+                initialize_timeout: Duration::from_secs(7_201),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                matches!(spawn(refused.clone()), Err(CoordinatorError::Invalid)),
+                "these options were accepted: {refused:?}"
+            );
+        }
+        // The same grace inside a protocol bound that fits it is accepted.
+        let w = spawn(CoordinatorOptions {
+            protocol_timeout: Duration::from_secs(20),
+            terminate_grace: Duration::from_secs(8),
+            ..Default::default()
+        })
+        .unwrap();
+        w.shutdown().await.unwrap();
     }
 }

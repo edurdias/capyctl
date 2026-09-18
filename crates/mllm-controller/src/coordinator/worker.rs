@@ -3,8 +3,9 @@ use crate::ownership::SharedCoordinatorState;
 use futures::FutureExt;
 use mllm_adapters::{
     fake::FakeEngine,
-    traits::{EngineAdapter, RuntimeAction, RuntimeCommand},
+    traits::{EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand},
 };
+use mllm_launchers::{AssociationError, LaunchAssociation};
 use mllm_domain::{
     completion::{CleanupEvidence, CompletionEvidence, OwnedLaunchReceipt},
     resources::{MemoryLimit, MemoryObservation},
@@ -35,6 +36,9 @@ use tokio::sync::{watch, Notify, OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[path = "native_failure.rs"]
+mod native_failure;
 
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -75,6 +79,14 @@ pub struct CoordinatorOptions {
     /// recipe does not burn a GPU in a tight loop and a transient failure does not
     /// wait minutes.
     pub retry_cooldown: Duration,
+    /// Spec §4: how long one Initialize may take. It is not `protocol_timeout`: a
+    /// cold start reads weights off disk and this project measured a 4B model
+    /// taking 27 to 63 seconds, so the 30-second protocol bound would give up on a
+    /// healthy engine mid-load and then kill it.
+    pub initialize_timeout: Duration,
+    /// Spec §5: how long a terminated process group is given to exit after
+    /// `SIGTERM` before it is killed.
+    pub terminate_grace: Duration,
 }
 impl Default for CoordinatorOptions {
     fn default() -> Self {
@@ -84,6 +96,8 @@ impl Default for CoordinatorOptions {
             max_observers: 256,
             max_attempts: 3,
             retry_cooldown: Duration::from_secs(30),
+            initialize_timeout: Duration::from_secs(900),
+            terminate_grace: Duration::from_secs(15),
         }
     }
 }
@@ -448,11 +462,51 @@ impl CoordinatorCommands {
 
 type CleanupFuture =
     Pin<Box<dyn Future<Output = Result<CleanupEvidence, CoordinatorError>> + Send>>;
-// Private bundle: both callbacks capture the same immutable Fake instance.
-// Public construction remains Fake-only; there is no native launch extension.
+// Private bundle: the callbacks and the process tools belong to one immutable
+// runtime binding, so cleanup and the failure path act on exactly the engine that
+// was built for it.
 struct Driver {
     engine: Arc<dyn EngineAdapter>,
     cleanup: Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>,
+    /// Spec §3: the process tools this builder was given, when it owns the
+    /// processes it launched. A builder that only talks to an engine somebody else
+    /// started has none, and neither terminates anything.
+    tools: Option<Arc<dyn OwnedProcessLaunch>>,
+}
+
+/// Builds the process tools for one launch around the association that records its
+/// API identity. The director owns both: the builder never learns where identities
+/// are written (Spec §3).
+pub type ToolsFactory = Arc<
+    dyn Fn(Arc<dyn LaunchAssociation + Send + Sync>) -> Arc<dyn OwnedProcessLaunch> + Send + Sync,
+>;
+
+/// Records the API identity of a launch under the binding it belongs to, through
+/// the coordinator's own owned state.
+///
+/// Spec §3: the durable launcher holds the child at a gate until this returns, so
+/// a process that exists is a process mllm has on record. Anything that cannot be
+/// written is uncertain, never assumed written.
+struct StoreAssociation {
+    owner: SharedCoordinatorState,
+    fence: DeploymentFence,
+    binding_id: String,
+}
+
+impl LaunchAssociation for StoreAssociation {
+    fn persist_api_identity(
+        &self,
+        identity: &mllm_domain::completion::ProcessIdentity,
+    ) -> Result<(), AssociationError> {
+        let owner = self.owner.lock().map_err(|error| {
+            drop(error);
+            AssociationError::Uncertain("owner poisoned".into())
+        })?;
+        owner
+            .store()
+            .record_api_identity(owner.session(), &self.fence, &self.binding_id, identity)
+            .map_err(|error| AssociationError::Uncertain(error.to_string()))
+    }
 }
 /// Supplies what the lifecycle must not know: resolved credentials and the frozen
 /// launch plan a binding was admitted against. Implemented by the application,
@@ -492,6 +546,32 @@ fn observed_gone(
     }
 }
 
+/// Cleanup for a builder that owns its processes: terminate the recorded group,
+/// then prove it gone the same way every other family is proved.
+///
+/// Spec §5: the order matters. An engine's own report that it shut down is not
+/// evidence, so the proof still runs, and it runs after the signal rather than
+/// instead of it. The blocking signal and wait go to a blocking thread, so a slow
+/// stop never holds an async worker for the length of a grace period.
+fn terminate_then_prove_gone(
+    tools: Arc<dyn OwnedProcessLaunch>,
+    clock: ServiceClock,
+    grace: Duration,
+) -> Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync> {
+    Arc::new(move |context| {
+        let tools = tools.clone();
+        let clock = clock.clone();
+        Box::pin(async move {
+            let identities = context.identities.clone();
+            tokio::task::spawn_blocking(move || tools.terminate_owned(&identities, grace))
+                .await
+                .map_err(|_| CoordinatorError::Service("terminate task failed".into()))?
+                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+            observed_gone(&context, &clock)
+        })
+    })
+}
+
 type DriverFactory =
     Arc<dyn Fn(&InitializeWork) -> Result<Arc<Driver>, CoordinatorError> + Send + Sync>;
 
@@ -520,8 +600,11 @@ impl OwnedCoordinator {
         clock: ServiceClock,
         options: CoordinatorOptions,
         bindings: Arc<dyn EngineBindings>,
+        tools_factory: ToolsFactory,
     ) -> Result<Self, CoordinatorError> {
         let cleanup_clock = clock.clone();
+        let grace = options.terminate_grace;
+        let factory_owner = owner.clone();
         Self::spawn(
             owner,
             observations,
@@ -535,23 +618,60 @@ impl OwnedCoordinator {
                     ));
                 }
                 let spec = bindings.spec(work)?;
-                let engine: Arc<dyn EngineAdapter> =
-                    Arc::from(
-                        // Task 9 supplies the director's process tools here; until then no
-                        // family resolved on this path owns the processes it talks to.
-                        mllm_adapters::resolve::resolve(declared, spec, None).map_err(|_| {
+                // SPEC §13.3: the key the builder is about to use must already be
+                // recoverable from the store, or a restart would leave an engine
+                // running that nothing can authenticate against again.
+                if let mllm_adapters::resolve::AdapterSpec::Vllm {
+                    engine_key: Some(key),
+                    ..
+                } = &spec
+                {
+                    let sealed: [u8; 32] = hex::decode(key)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or_else(|| {
+                            CoordinatorError::Service("engine key is not 32 bytes".into())
+                        })?;
+                    let owner = factory_owner.lock().map_err(|error| {
+                        drop(error);
+                        CoordinatorError::Service("ownership mutex poisoned".into())
+                    })?;
+                    owner
+                        .store()
+                        .store_engine_key(work.binding_id(), work.incarnation(), &sealed)
+                        .map_err(|error| {
+                            CoordinatorError::Service(format!(
+                                "the engine key was not stored: {error}"
+                            ))
+                        })?;
+                }
+                // Spec §3: the association is built per launch and captures this
+                // binding's own fence, so an identity can only ever be recorded
+                // against the launch that produced it.
+                let association: Arc<dyn LaunchAssociation + Send + Sync> =
+                    Arc::new(StoreAssociation {
+                        owner: factory_owner.clone(),
+                        fence: work.fence().clone(),
+                        binding_id: work.binding_id().to_owned(),
+                    });
+                let tools = tools_factory(association);
+                let engine: Arc<dyn EngineAdapter> = Arc::from(
+                    mllm_adapters::resolve::resolve(declared, spec, Some(tools.clone())).map_err(
+                        |_| {
                             CoordinatorError::Service(
                                 "engine spec does not match the declared family".into(),
                             )
-                        })?,
-                    );
-                let clock = cleanup_clock.clone();
+                        },
+                    )?,
+                );
                 Ok(Arc::new(Driver {
                     engine,
-                    cleanup: Arc::new(move |context| {
-                        let clock = clock.clone();
-                        Box::pin(async move { observed_gone(&context, &clock) })
-                    }),
+                    cleanup: terminate_then_prove_gone(
+                        tools.clone(),
+                        cleanup_clock.clone(),
+                        grace,
+                    ),
+                    tools: Some(tools),
                 }))
             }),
         )
@@ -609,6 +729,8 @@ impl OwnedCoordinator {
                                 .map_err(|e| CoordinatorError::Service(e.to_string()))
                         })
                     }),
+                    // The Fake launches nothing, so there is nothing to terminate.
+                    tools: None,
                 }))
             }),
         )
@@ -631,6 +753,16 @@ impl OwnedCoordinator {
             || options.max_attempts > 16
             || options.retry_cooldown.is_zero()
             || options.retry_cooldown > Duration::from_secs(3600)
+            // Spec §4: an Initialize bound below half a minute would fail every
+            // real cold start, and one above two hours is no bound at all.
+            || options.initialize_timeout < Duration::from_secs(30)
+            || options.initialize_timeout > Duration::from_secs(7200)
+            // Spec §5: cleanup terminates and then proves the group gone, all
+            // inside `protocol_timeout`. A grace that leaves no room for the
+            // proof would turn every Stop into a timeout, so it is refused here
+            // rather than discovered on the first Stop.
+            || options.terminate_grace < Duration::from_secs(1)
+            || options.terminate_grace + Duration::from_secs(5) >= options.protocol_timeout
         {
             return Err(CoordinatorError::Invalid);
         }
@@ -1140,6 +1272,16 @@ async fn run(
                 let deployment_id = work.fence().deployment_id.clone();
                 let journal_operation = work.operation_id().to_owned();
                 let status_step = step_id.clone();
+                // Spec §6: a builder that owns its processes can be classified by
+                // proof instead of paused. Only a driver this worker retains for
+                // this exact binding qualifies, and only one with process tools.
+                let native = shared
+                    .retained
+                    .lock()
+                    .ok()
+                    .and_then(|retained| retained.get(work.binding_id()).cloned())
+                    .filter(|driver| driver.tools.is_some());
+                let is_native = native.is_some();
                 let status = shared
                     .read(move |owner, now| {
                         // Keep observation and annotation under the exact owned
@@ -1158,17 +1300,37 @@ async fn run(
                             )?;
                             Ok(InitializeStatus::ExpiredUnarmed)
                         } else if status == InitializeStatus::Armed {
-                            owner.store().mark_initialize_uncertain(
-                                owner.session(),
-                                &status_step,
-                                now,
-                            )?;
-                            Ok(InitializeStatus::Uncertain)
+                            if is_native {
+                                // The annotation belongs to the settlement below,
+                                // which decides between a proven release and the
+                                // uncertain pause. Reporting it armed is what
+                                // carries that decision out of this transaction.
+                                Ok(InitializeStatus::Armed)
+                            } else {
+                                owner.store().mark_initialize_uncertain(
+                                    owner.session(),
+                                    &status_step,
+                                    now,
+                                )?;
+                                Ok(InitializeStatus::Uncertain)
+                            }
                         } else {
                             Ok(status)
                         }
                     })
                     .await;
+                let status = match (status, native) {
+                    (Ok(InitializeStatus::Armed), Some(driver)) => {
+                        native_failure::settle_failed_native_launch(
+                            &shared,
+                            &driver,
+                            &work,
+                            &recorded_reason,
+                        )
+                        .await
+                    }
+                    (status, _) => status,
+                };
                 // SPEC §13.2: only a step the store still reports as planned is a
                 // failure known not to have landed. Nothing was armed, so nothing
                 // can be running, and the same step is still there to be driven
@@ -1548,8 +1710,11 @@ async fn drive(
             "pre-send deadline, observation, or shutdown fence".into(),
         ));
     }
+    // Spec §4: Initialize is bounded by its own timeout. `protocol_timeout` bounds a
+    // control call to a running engine; a cold start is not one, and giving up on a
+    // loading engine after thirty seconds would kill a healthy one.
     let bound = Duration::from_millis((work.deadline_ms() - now) as u64)
-        .min(shared.options.protocol_timeout);
+        .min(shared.options.initialize_timeout);
     let command = RuntimeCommand {
         action: RuntimeAction::Initialize,
         context,

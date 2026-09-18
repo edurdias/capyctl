@@ -244,7 +244,23 @@ impl crate::Store {
                 params![plan.deployment_id,plan.revision,plan.generation], |r| r.get(0),
             )?;
             if !same_terminal_fence {
-                return Ok(InitializeStatus::Superseded);
+                // Spec §6: a launch released after failing leaves its own step
+                // cancelled with the gone evidence recorded, its binding released,
+                // and its deployment's admission closed by the coordinator that
+                // gave up on it. Its fence is unchanged, so this is the
+                // deployment's own closure and not somebody else's work
+                // superseding it, and an operator waiting on the start must be
+                // told which of the two it is.
+                let released_and_closed: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='ready' AND suspended=0 AND admission_enabled=0) AND EXISTS(SELECT 1 FROM lifecycle_evidence WHERE step_id=?4) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?5 AND state='released')",
+                    params![plan.deployment_id,plan.revision,plan.generation,step_id,plan.binding_id],
+                    |r| r.get(0),
+                )?;
+                return Ok(if released_and_closed {
+                    InitializeStatus::Closed
+                } else {
+                    InitializeStatus::Superseded
+                });
             }
             let (plan, effective, _) = load(&tx, step_id)?;
             expiry::terminal(&tx, session, &plan, &effective, now_ms)?;

@@ -73,6 +73,7 @@ impl CleanupGate {
                     Ok(evidence)
                 })
             }),
+            tools: None,
         })
     }
     async fn entered(&self) {
@@ -135,7 +136,12 @@ async fn cleanup_failures_keep_arm_accounting_instance_and_never_resend() {
             observations,
             gate.clone(),
             CoordinatorOptions {
-                protocol_timeout: Duration::from_secs(1),
+                // Spec §5: cleanup terminates and then proves the group gone, so a
+                // grace that leaves no room for the proof is refused. Seven
+                // seconds is the smallest protocol bound the one-second floor fits
+                // in; the short stop deadline below is what bounds this test.
+                protocol_timeout: Duration::from_secs(7),
+                terminate_grace: Duration::from_secs(1),
                 ..Default::default()
             },
         );
@@ -144,7 +150,7 @@ async fn cleanup_failures_keep_arm_accounting_instance_and_never_resend() {
             start.wait(Duration::from_secs(60)).await.unwrap(),
             InitializeStatus::Completed
         );
-        let stop = w.stop("owner", &fence, "failure", 10000).unwrap();
+        let stop = w.stop("owner", &fence, "failure", 2900).unwrap();
         gate.entered().await;
         gate.release.add_permits(1);
         assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
@@ -156,7 +162,7 @@ async fn cleanup_failures_keep_arm_accounting_instance_and_never_resend() {
             let o = owner.lock().unwrap();
             let retry = o
                 .store()
-                .accept_ordinary_cleanup(o.session(), "owner", &fence, "failure", 1900, 10000)
+                .accept_ordinary_cleanup(o.session(), "owner", &fence, "failure", 1900, 2900)
                 .unwrap();
             assert_eq!(&retry, stop.receipt());
             assert!(o
@@ -684,6 +690,7 @@ async fn stop_claim_handoff_waits_for_running_initialize_exit() {
                             .map_err(|e| CoordinatorError::Service(e.to_string()))
                     })
                 }),
+                tools: None,
             }))
         }),
     )
