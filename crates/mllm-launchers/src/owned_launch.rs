@@ -8,10 +8,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mllm_adapters::protected::ProtectedLaunchDescriptors;
 use mllm_adapters::traits::{OwnedProcessLaunch, RenderedCommand, RuntimeError};
 use mllm_domain::completion::{Presence, ProcessIdentity};
 
-use crate::durable::{DurableSpawn, DurableSpawnOutcome, LaunchAssociation};
+use crate::durable::{
+    DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation,
+};
 use crate::group_observation::observe_process_group_or_empty;
 use crate::process_absence::{GoneProof, presence, verify_gone};
 
@@ -44,28 +47,48 @@ fn uncertain(reason: impl Into<String>) -> RuntimeError {
     RuntimeError::Uncertain(reason.into())
 }
 
+/// The launcher's outcome is release evidence, and it maps the same way whether
+/// descriptors were inherited or not.
+fn released(outcome: Result<DurableSpawnOutcome, DurableSpawnError>) -> Result<ProcessIdentity, RuntimeError> {
+    match outcome {
+        Ok(DurableSpawnOutcome::Uncertain {
+            api_identity: Some(identity),
+            initialization_acknowledged: true,
+            ..
+        }) => Ok(identity),
+        // The child was disposed of by the launcher before this returned, so
+        // the failure leaves nothing running and nothing recorded.
+        Ok(DurableSpawnOutcome::Uncertain { reason, .. }) => {
+            Err(uncertain(format!("launch not released: {reason}")))
+        }
+        Err(error) => Err(uncertain(format!("spawn failed: {error}"))),
+    }
+}
+
 impl OwnedProcessLaunch for DurableProcessLaunch {
     fn spawn_durable(
         &self,
         incarnation: &str,
         cmd: &RenderedCommand,
     ) -> Result<ProcessIdentity, RuntimeError> {
-        match self
-            .spawn
-            .spawn_persisted(incarnation, cmd, self.association.as_ref())
-        {
-            Ok(DurableSpawnOutcome::Uncertain {
-                api_identity: Some(identity),
-                initialization_acknowledged: true,
-                ..
-            }) => Ok(identity),
-            // The child was disposed of by the launcher before this returned, so
-            // the failure leaves nothing running and nothing recorded.
-            Ok(DurableSpawnOutcome::Uncertain { reason, .. }) => {
-                Err(uncertain(format!("launch not released: {reason}")))
-            }
-            Err(error) => Err(uncertain(format!("spawn failed: {error}"))),
-        }
+        released(
+            self.spawn
+                .spawn_persisted(incarnation, cmd, self.association.as_ref()),
+        )
+    }
+
+    fn spawn_durable_protected(
+        &self,
+        incarnation: &str,
+        cmd: &RenderedCommand,
+        descriptors: &ProtectedLaunchDescriptors,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        released(self.spawn.spawn_persisted_with_descriptors(
+            incarnation,
+            cmd,
+            Some(descriptors),
+            self.association.as_ref(),
+        ))
     }
 
     fn present(&self, identity: &ProcessIdentity) -> Presence {

@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use mllm_adapters::traits::RenderedCommand;
 use mllm_domain::completion::ProcessIdentity;
@@ -120,6 +120,59 @@ fn protected_descriptors_reach_only_gated_child_and_association_failure_keeps_ga
                 .is_err()
         );
     }
+}
+
+/// A protected spawn through the ordinary owned process tools: the gated child
+/// inherits the three descriptors and can read their contents, exactly as the
+/// direct `DurableSpawn::spawn_protected` path behaves. SPEC §13.3: credentials
+/// ride protected descriptors, never argv.
+// T12
+#[test]
+fn owned_process_launch_spawns_with_protected_descriptors() {
+    use mllm_adapters::traits::OwnedProcessLaunch;
+    use mllm_launchers::{DurableProcessLaunch, ProtectedLaunchDescriptors};
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("descriptor-content");
+    let descriptors = ProtectedLaunchDescriptors::new(
+        b"{\"private\":true}",
+        b"inference-secret",
+        b"admin-secret",
+    )
+    .unwrap();
+    let [launch_fd, inference_fd, admin_fd] = descriptors.numbers();
+    let command = RenderedCommand {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "cat /proc/self/fd/{launch_fd} /proc/self/fd/{inference_fd} /proc/self/fd/{admin_fd} > '{}'",
+                marker.display()
+            ),
+        ],
+        env: Default::default(),
+    };
+    let tools: &dyn OwnedProcessLaunch = &DurableProcessLaunch::new(Arc::new(RecordingAssociation {
+        identities: Mutex::new(vec![]),
+        fail: false,
+    }));
+    let identity = tools
+        .spawn_durable_protected("protected-tools", &command, &descriptors)
+        .unwrap();
+    assert_eq!(identity.role, "api");
+    drop(descriptors);
+    let expected = [
+        b"{\"private\":true}".as_slice(),
+        b"inference-secret",
+        b"admin-secret",
+    ]
+    .concat();
+    for _ in 0..50 {
+        if std::fs::read(&marker).is_ok_and(|bytes| bytes == expected) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read(&marker).unwrap(), expected);
 }
 
 struct RecordingAssociation {

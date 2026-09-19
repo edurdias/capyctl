@@ -1,4 +1,5 @@
 pub mod forward;
+pub mod protected;
 pub mod sglang;
 pub mod resolve;
 pub mod policy;
@@ -6,6 +7,7 @@ pub mod traits;
 pub mod vllm;
 
 pub use policy::ParkPolicy;
+pub use protected::{ProtectedDescriptorError, ProtectedLaunchDescriptors};
 
 /// Where the park policy used to live, kept as a path only.
 ///

@@ -265,6 +265,19 @@ pub trait OwnedProcessLaunch: Send + Sync {
         incarnation: &str,
         cmd: &RenderedCommand,
     ) -> Result<mllm_domain::completion::ProcessIdentity, RuntimeError>;
+    /// Spawn gated like `spawn_durable`, with the three protected descriptors
+    /// inherited by this child only. SPEC §13.3: credentials ride protected
+    /// descriptors, never argv. The default refuses rather than silently
+    /// dropping the descriptors: a launcher without descriptor support must
+    /// never run a launch whose credentials went nowhere.
+    fn spawn_durable_protected(
+        &self,
+        _incarnation: &str,
+        _cmd: &RenderedCommand,
+        _descriptors: &crate::protected::ProtectedLaunchDescriptors,
+    ) -> Result<mllm_domain::completion::ProcessIdentity, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
     /// Live now, with the same start identity: boot id and start ticks, not pid alone.
     fn present(&self, identity: &mllm_domain::completion::ProcessIdentity)
         -> mllm_domain::completion::Presence;

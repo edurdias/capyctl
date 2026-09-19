@@ -14,6 +14,7 @@ serde = { workspace = true }
 mllm-config = { path = "../mllm-config" }
 futures = { workspace = true }
 tokio = { workspace = true }
+nix = { version = "0.29", features = ["fs"] }
 
 [dev-dependencies]
 mllm-testkit = { workspace = true }

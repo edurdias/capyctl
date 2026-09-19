@@ -9,7 +9,9 @@ pub mod process_absence;
 pub use exec::ExecLauncher;
 pub use durable::{
     AssociationError, DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation,
-    ProtectedLaunchDescriptors,
 };
+// The descriptor type lives in `mllm-adapters` next to the process tools that
+// consume it; the launchers' public name for it is kept here.
+pub use mllm_adapters::protected::ProtectedLaunchDescriptors;
 pub use owned_launch::DurableProcessLaunch;
 pub use ownership::ControllerLock;

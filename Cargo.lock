@@ -1054,6 +1054,7 @@ dependencies = [
  "mllm-config",
  "mllm-domain",
  "mllm-testkit",
+ "nix",
  "reqwest",
  "serde",
  "serde_json",
