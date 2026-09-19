@@ -240,26 +240,12 @@ impl<'a> NativeLaunchHandoff<'a> {
             .map_err(|_| native_error("credential resolution failed"))?;
         let admin = resolve(frozen.admin_credential_ref())
             .map_err(|_| native_error("credential resolution failed"))?;
-        let private = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
-            // Wire contract with runtime/sglang_entry.py; renamed with the ordinary native launch design.
-            "kind": "sglang_candidate_private_launch",
-            "checkpoint_root": frozen.checkpoint_root(),
-            "public_settings": launch.public_metadata(),
-            "launch_scope": {
-                "session_id": session.id(),
-                "deployment_id": execution.token.deployment_id,
-                "operation_id": execution.token.operation_id,
-                "step_id": execution.token.step_id,
-                "revision": execution.token.revision,
-                "generation": execution.token.generation,
-                "binding_id": execution.binding_id,
-                "incarnation": execution.incarnation,
-                "issued_at_ms": execution.issued_at_ms,
-                "deadline_ms": execution.deadline_ms,
-            },
-        }))
-        .map_err(|_| native_error("descriptor encoding failed"))?;
+        let private = crate::native_launch::private_descriptor(
+            session.id(),
+            &execution,
+            frozen.checkpoint_root(),
+            launch.public_metadata(),
+        )?;
         let descriptors =
             mllm_launchers::ProtectedLaunchDescriptors::new(&private, &inference, &admin)
                 .map_err(|_| native_error("descriptor creation failed"))?;

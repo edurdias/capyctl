@@ -10,6 +10,7 @@ pub mod coordinator_port;
 pub mod engine_bindings;
 pub mod engine_provider;
 pub mod fault;
+pub mod native_launch;
 pub mod operations;
 pub mod ownership;
 pub mod port;
