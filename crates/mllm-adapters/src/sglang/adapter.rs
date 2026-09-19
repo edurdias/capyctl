@@ -1,8 +1,10 @@
-//! Evidence observations for individual persisted controls. This adapter never
-//! grants permission, verifies a recipe, commits a completion, or opens dispatch.
+//! Evidence observations for individual persisted controls, and the owned
+//! launch this adapter performs on Initialize. This adapter never grants
+//! permission, verifies a recipe, commits a completion, or opens dispatch.
 
 use std::{
     collections::{BTreeSet, HashSet},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,8 +18,8 @@ use mllm_domain::{
 };
 
 use super::{
+    http::{action_timeout, uncertain, ControlHttp},
     SglangLaunch,
-    http::{ControlHttp, action_timeout, uncertain},
 };
 use crate::traits::*;
 
@@ -67,17 +69,53 @@ impl Drop for Attempt<'_> {
     }
 }
 
+/// The frozen launch this adapter instance owns, plus the public settings
+/// rendered from it. Rendering is deterministic and refuses anything the frozen
+/// validation refused, so re-rendering has no effects and no secret surface.
+pub struct SglangLaunchHandle {
+    pub(super) frozen: NativeLaunch,
+    pub(super) rendered: SglangLaunch,
+}
+
 /// One immutable runtime binding. No Debug implementation exposes credentials or
 /// the checkpoint root. The local attempt fence survives cancellation, but is
 /// supplementary: persisted coordinator fencing remains mandatory across restart.
 /// After uncertainty, reconciliation must establish a new adapter binding.
 pub struct SglangAdapter {
     pub(super) forward: crate::forward::ChatHttp,
-    http: ControlHttp,
+    http: Option<ControlHttp>,
+    base: reqwest::Url,
+    checkpoint: String,
     binding_id: String,
     incarnation: String,
-    observer: Arc<dyn SglangRuntimeObserver>,
+    served_name: String,
+    /// The trusted seam for persisted controls. An adapter built for launch has
+    /// none: its control actions are the honest refusal (design §4.4).
+    observer: Option<Arc<dyn SglangRuntimeObserver>>,
     attempts: Mutex<Attempts>,
+    /// The managed-launch contract (Spec §3): the concrete frozen launch this
+    /// adapter renders and spawns for an owned launch.
+    launch: Option<NativeLaunch>,
+    /// Process tools supplied by the director (Spec §3). The builder spawns,
+    /// watches and enumerates through them and never learns where the
+    /// identities it produces are recorded.
+    tools: Option<Arc<dyn OwnedProcessLaunch>>,
+    /// The service-owned protected entrypoint wrapper path. Rendering refuses
+    /// to build a command without one.
+    wrapper: Option<PathBuf>,
+    /// Where the engine's own log is expected; quoted (redacted) when a launch
+    /// dies before readiness.
+    log: Option<String>,
+    /// The per-launch credentials. They reach the engine through protected
+    /// descriptors and appear in no argv, env, log or receipt (SPEC §13.3).
+    inference_key: Option<String>,
+    admin_key: Option<String>,
+    /// The launch this adapter instance owns: the binding and incarnation it
+    /// claimed. The claim is taken before a process exists, so a step that
+    /// failed mid-launch still holds it and a repeat cannot start a second
+    /// engine over the first one's memory. Spec §5 has cleanup take identities
+    /// from the execution context, never from adapter memory, so none is kept.
+    launched: Mutex<Option<(String, String)>>,
 }
 
 impl SglangAdapter {
@@ -86,37 +124,186 @@ impl SglangAdapter {
     /// send the current persisted child command through `execute_persisted`.
     pub fn from_frozen(
         frozen: &NativeLaunch,
-        inference: String,
-        admin: String,
-        observer: Arc<dyn SglangRuntimeObserver>,
+        observer: Option<Arc<dyn SglangRuntimeObserver>>,
     ) -> Result<Self, RuntimeError> {
         SglangLaunch::from_frozen(frozen)?;
         let metadata = frozen.metadata();
-        let http = ControlHttp::new(
-            metadata
-                .endpoint
-                .parse()
-                .map_err(|_| RuntimeError::Unsupported)?,
-            frozen.checkpoint_root().into(),
-            metadata.served_name.clone(),
-            inference.clone(),
-            admin,
-        )?;
+        let base: reqwest::Url = metadata
+            .endpoint
+            .parse()
+            .map_err(|_| RuntimeError::Unsupported)?;
         Ok(Self {
             forward: crate::forward::ChatHttp::new(
-                metadata
-                    .endpoint
-                    .parse()
-                    .map_err(|_| RuntimeError::Unsupported)?,
+                base.clone(),
                 metadata.served_name.clone(),
-                Some(inference),
+                None,
             ),
-            http,
+            http: None,
+            base,
+            checkpoint: frozen.checkpoint_root().into(),
             binding_id: metadata.binding_id.clone(),
             incarnation: metadata.incarnation.clone(),
+            served_name: metadata.served_name.clone(),
             observer,
             attempts: Mutex::new(Attempts::default()),
+            launch: None,
+            tools: None,
+            wrapper: None,
+            log: None,
+            inference_key: None,
+            admin_key: None,
+            launched: Mutex::new(None),
         })
+    }
+
+    /// Attach the per-launch credentials (Spec §3). They are delivered to the
+    /// child through protected descriptors only, and they are the credentials
+    /// this adapter then presents on every request of its own: the engine
+    /// guards `/v1` with exactly the inference key, so a readiness probe or an
+    /// inference probe sent without it is refused, never merely slow (SPEC
+    /// §6.1). An invalid pair leaves the control surface unset, which reports
+    /// uncertainty rather than pretending to hold a credential.
+    pub fn with_credentials(mut self, inference: String, admin: String) -> Self {
+        self.http = ControlHttp::new(
+            self.base.clone(),
+            self.checkpoint.clone(),
+            self.served_name.clone(),
+            inference.clone(),
+            admin.clone(),
+        )
+        .ok();
+        self.forward = crate::forward::ChatHttp::new(
+            self.base.clone(),
+            self.served_name.clone(),
+            Some(inference.clone()),
+        );
+        self.inference_key = Some(inference);
+        self.admin_key = Some(admin);
+        self
+    }
+
+    /// Attach the managed-launch contract (Spec §3): the concrete frozen launch
+    /// this adapter renders in `initialize`.
+    pub fn with_launch(mut self, launch: NativeLaunch) -> Self {
+        self.launch = Some(launch);
+        self
+    }
+
+    /// Attach the process tools the director supplies for an owned launch
+    /// (Spec §3). Without them the adapter answers Initialize with
+    /// `Unsupported`: it has no way to spawn anything it could prove it owns.
+    pub fn with_tools(mut self, tools: Arc<dyn OwnedProcessLaunch>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Attach the service-owned wrapper path the rendered command runs through.
+    /// Service configuration supplies this path, never a candidate or HTTP
+    /// request; rendering revalidates it immediately before use.
+    pub fn with_wrapper(mut self, wrapper: PathBuf) -> Self {
+        self.wrapper = Some(wrapper);
+        self
+    }
+
+    /// Attach the engine log path, delivered as `MLLM_ENGINE_LOG` and quoted
+    /// (redacted) when a launch dies before readiness.
+    pub fn with_log(mut self, log: impl Into<String>) -> Self {
+        self.log = Some(log.into());
+        self
+    }
+
+    /// The engine's recipe pin, for the receipt an Initialize records.
+    pub(super) fn fingerprint(&self) -> &str {
+        &self
+            .launch
+            .as_ref()
+            .expect("a launch fingerprint is only read by the builder")
+            .metadata()
+            .recipe
+    }
+
+    /// The engine endpoint this adapter talks to, for the same receipt.
+    pub(super) fn endpoint(&self) -> &str {
+        &self
+            .launch
+            .as_ref()
+            .expect("an endpoint is only read by the builder")
+            .metadata()
+            .endpoint
+    }
+
+    /// The served name the launch was built to answer on.
+    pub(super) fn served_name(&self) -> &str {
+        &self.served_name
+    }
+
+    /// The engine log path, for the tail quoted when a launch dies.
+    pub(super) fn engine_log(&self) -> Option<&str> {
+        self.log.as_deref()
+    }
+
+    /// The wrapper path the rendered command runs through. A builder without
+    /// one is unsupported: nothing rendered, nothing spawned.
+    pub(super) fn wrapper_path(&self) -> Result<&Path, RuntimeError> {
+        self.wrapper.as_deref().ok_or(RuntimeError::Unsupported)
+    }
+
+    /// The four things an owned launch needs. Any one missing makes the step
+    /// unsupported rather than partly performed.
+    pub(super) fn launch_parts(
+        &self,
+    ) -> Result<
+        (
+            SglangLaunchHandle,
+            Arc<dyn OwnedProcessLaunch>,
+            String,
+            String,
+        ),
+        RuntimeError,
+    > {
+        match (
+            &self.launch,
+            &self.tools,
+            &self.inference_key,
+            &self.admin_key,
+        ) {
+            (Some(launch), Some(tools), Some(inference), Some(admin)) => {
+                let rendered = SglangLaunch::from_frozen(launch)?;
+                Ok((
+                    SglangLaunchHandle {
+                        frozen: launch.clone(),
+                        rendered,
+                    },
+                    tools.clone(),
+                    inference.clone(),
+                    admin.clone(),
+                ))
+            }
+            _ => Err(RuntimeError::Unsupported),
+        }
+    }
+
+    /// Claim this adapter's one launch. A second claim is refused: the adapter
+    /// instance is built for a single incarnation, and a repeat would spawn a
+    /// second engine while the first is still recorded as owned.
+    pub(super) fn claim_incarnation(
+        &self,
+        binding_id: &str,
+        incarnation: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut launched = self
+            .launched
+            .lock()
+            .map_err(|_| RuntimeError::Uncertain("launch record is poisoned".into()))?;
+        if launched.is_some() {
+            return Err(RuntimeError::Unsupported);
+        }
+        *launched = Some((binding_id.to_string(), incarnation.to_string()));
+        Ok(())
+    }
+
+    fn require_observer(&self) -> Result<&Arc<dyn SglangRuntimeObserver>, RuntimeError> {
+        self.observer.as_ref().ok_or(RuntimeError::Unsupported)
     }
 
     fn validate_observation(
@@ -169,7 +356,8 @@ impl SglangAdapter {
         command: &RuntimeCommand,
         timeout: std::time::Duration,
     ) -> Result<EffectObservation, RuntimeError> {
-        let before = self.observer.observe().await.map_err(|_| uncertain())?;
+        let observer = self.require_observer()?;
+        let before = observer.observe().await.map_err(|_| uncertain())?;
         self.validate_observation(command, &before)?;
         let valid = match command.action {
             RuntimeAction::Drain => before.quiesced && !before.unknown_work,
@@ -190,9 +378,13 @@ impl SglangAdapter {
             return Err(uncertain());
         }
         if command.action != RuntimeAction::Drain {
-            self.http.execute(command.action, timeout).await?;
+            self.http
+                .as_ref()
+                .ok_or_else(uncertain)?
+                .execute(command.action, timeout)
+                .await?;
         }
-        let after = self.observer.observe().await.map_err(|_| uncertain())?;
+        let after = observer.observe().await.map_err(|_| uncertain())?;
         self.validate_observation(command, &after)?;
         let (valid, fact) = match command.action {
             RuntimeAction::Drain => (after.quiesced, Milestone::Quiesced),
@@ -242,10 +434,17 @@ fn clock_ms() -> Result<i64, RuntimeError> {
 
 #[async_trait]
 impl EngineAdapter for SglangAdapter {
+    /// Spec §4: the builder performs Initialize end to end. The persisted
+    /// control path below never sees it: its action table has no Initialize
+    /// arm, and an Initialize command carries launch settings the control
+    /// fence refuses.
     async fn execute_persisted(
         &self,
         command: &RuntimeCommand,
     ) -> Result<EffectObservation, RuntimeError> {
+        if command.action == RuntimeAction::Initialize {
+            return crate::sglang::initialize::initialize(self, command).await;
+        }
         let cap = action_timeout(command.action)?;
         let c = &command.context;
         let now = clock_ms()?;
@@ -301,9 +500,28 @@ impl EngineAdapter for SglangAdapter {
         Err(AdapterError::UnsupportedCapability)
     }
     async fn check_readiness(&self, _member: &MemberRef) -> Result<Readiness, AdapterError> {
-        // Even a successful probe only emits ModelUsable; the coordinator must
-        // verify and commit the complete ordered milestone sequence before Ready.
-        Ok(Readiness::Initializing)
+        // SPEC §6.1: liveness of an HTTP server is not model readiness; the
+        // served name appearing in `/v1/models` is the readiness signal.
+        let Some(http) = self.http.as_ref() else {
+            // The adapter holds no launch credential, so its readiness poll
+            // would be refused by the engine: the refusal is named, never
+            // quietly reported as Initializing.
+            return Err(AdapterError::Uncertain(
+                "no launch credential configured; readiness is refused, never assumed".into(),
+            ));
+        };
+        match http.models().await {
+            Ok(ids) if ids.contains(&self.served_name) => Ok(Readiness::Ready),
+            Ok(_) => Ok(Readiness::Initializing),
+            Err(super::http::ModelsError::Unreachable) => {
+                // Not listening yet: Initializing (the readiness loop polls);
+                // crash detection is the launcher's job.
+                Ok(Readiness::Initializing)
+            }
+            Err(e) => Err(AdapterError::Uncertain(crate::vllm::args::redact_text(
+                &format!("model list: {e}"),
+            ))),
+        }
     }
     async fn prepare_park(&self, _member: &MemberRef) -> Result<Quiescence, AdapterError> {
         Ok(Quiescence { quiescent: false })

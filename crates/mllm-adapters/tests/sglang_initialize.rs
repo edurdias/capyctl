@@ -1,0 +1,812 @@
+//! Spec §4 contract for the SGLang builder's Initialize step.
+//!
+//! The builder is exercised against a local axum engine surface (a model list
+//! that only names the served model once startup is far enough along, and a
+//! chat surface that answers only for the right key) and a scripted process
+//! tool that records what it was asked to spawn — including the protected
+//! descriptor contents — without touching a real process. Nothing here
+//! qualifies a native engine recipe: it proves the step's sequence, its
+//! refusals and its evidence, not that SGLang starts.
+
+use std::io::{Read, Seek};
+use std::net::SocketAddr;
+use std::os::fd::{FromRawFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use mllm_adapters::protected::ProtectedLaunchDescriptors;
+use mllm_adapters::sglang::SglangAdapter;
+use mllm_adapters::traits::{
+    AdapterError, EngineAdapter, MemberRef, OwnedProcessLaunch, ParkLevel, RenderedCommand,
+    RuntimeAction, RuntimeCommand, RuntimeError,
+};
+use mllm_domain::completion::{
+    ExecutionIdentities, Milestone, Presence, ProcessIdentity, StepExecutionContext,
+    TransitionToken,
+};
+use mllm_domain::launch::{
+    NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, ProfileLaunchSettings,
+    SglangLaunchSettings, SglangRequestedBudget,
+};
+use serde_json::{json, Value};
+
+const BINDING: &str = "01K00000000000000000000001";
+const INCARNATION: &str = "01K00000000000000000000002";
+const MODEL: &str = "candidate-01K00000000000000000000001";
+const INFERENCE: &str = "inference-secret";
+const ADMIN: &str = "admin-secret";
+const CHECKPOINT: &str = "/private/checkpoints/qwen";
+const SOURCE: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
+const REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
+const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+
+// ---------------------------------------------------------------- stub engine
+
+#[derive(Clone)]
+struct Stub {
+    model: String,
+    key: String,
+    /// Model-list polls that answer with an empty list before the served name
+    /// appears: a listening HTTP server is not model readiness (SPEC §6.1).
+    ready_after: usize,
+    polls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+}
+
+struct RecordedRequest {
+    path: String,
+    authorization: String,
+    body: Value,
+}
+
+/// SGLang guards every `/v1` route with the same key, `/v1/models` included,
+/// so an unkeyed readiness poll is refused there before it ever reaches the
+/// chat probe.
+async fn models(State(stub): State<Stub>, headers: HeaderMap) -> axum::response::Response {
+    stub.requests.lock().unwrap().push(RecordedRequest {
+        path: "/v1/models".into(),
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        body: Value::Null,
+    });
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if presented != format!("Bearer {}", stub.key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let seen = stub.polls.fetch_add(1, Ordering::SeqCst);
+    let data = if seen >= stub.ready_after {
+        json!([{ "id": stub.model, "object": "model" }])
+    } else {
+        json!([])
+    };
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+async fn chat(
+    State(stub): State<Stub>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    stub.requests.lock().unwrap().push(RecordedRequest {
+        path: "/v1/chat/completions".into(),
+        authorization: headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        body: body.clone(),
+    });
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if presented != format!("Bearer {}", stub.key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let model = body["model"].as_str().unwrap_or_default().to_string();
+    let chunks = vec![
+        json!({
+            "id": "probe-1", "object": "chat.completion.chunk", "created": 1, "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ready"},
+                         "finish_reason": serde_json::Value::Null}],
+        }),
+        json!({
+            "id": "probe-1", "object": "chat.completion.chunk", "created": 1, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }),
+    ];
+    let events = chunks
+        .into_iter()
+        .map(|chunk| {
+            Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()))
+        })
+        .chain(std::iter::once(Ok(Event::default().data("[DONE]"))));
+    Sse::new(futures::stream::iter(events.collect::<Vec<_>>())).into_response()
+}
+
+async fn serve_stub(model: &str, ready_after: usize, key: &str, port: u16) -> (Stub, u16) {
+    let stub = Stub {
+        model: model.into(),
+        key: key.into(),
+        ready_after,
+        polls: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .with_state(stub.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (stub, addr.port())
+}
+
+/// A port nobody is listening on: bound to learn a free one, then released.
+async fn free_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+// ---------------------------------------------------------------- process tool
+
+/// A process tool that records what it was asked to spawn and answers from a
+/// script. It never signals or inspects a real process. The protected
+/// descriptor contents are captured through duplicated descriptors so the
+/// rendered command can be checked against what the launcher was handed.
+struct ScriptedTool {
+    identity: ProcessIdentity,
+    present: Mutex<Presence>,
+    group: Vec<ProcessIdentity>,
+    spawned: Mutex<Vec<RenderedCommand>>,
+    descriptors: Mutex<Vec<[Vec<u8>; 3]>>,
+    gone_on_spawn: bool,
+    present_calls: Arc<AtomicUsize>,
+}
+
+/// Read each protected descriptor through a duplicated descriptor, then rewind
+/// so the original stays positioned at zero for a real child to read.
+fn descriptor_contents(descriptors: &ProtectedLaunchDescriptors) -> [Vec<u8>; 3] {
+    descriptors.numbers().map(|fd: RawFd| {
+        let dup = nix::unistd::dup(fd).unwrap();
+        let mut file = unsafe { std::fs::File::from_raw_fd(dup) };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        file.rewind().unwrap();
+        bytes
+    })
+}
+
+impl ScriptedTool {
+    fn alive(identity: ProcessIdentity, workers: Vec<ProcessIdentity>) -> Self {
+        let group = std::iter::once(identity.clone()).chain(workers).collect();
+        Self {
+            identity,
+            present: Mutex::new(Presence::Alive),
+            group,
+            spawned: Mutex::new(Vec::new()),
+            descriptors: Mutex::new(Vec::new()),
+            gone_on_spawn: false,
+            present_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The engine dies the moment it is spawned (the crash-before-readiness case).
+    fn dies_on_spawn(identity: ProcessIdentity) -> Self {
+        Self {
+            gone_on_spawn: true,
+            ..Self::alive(identity, Vec::new())
+        }
+    }
+}
+
+impl OwnedProcessLaunch for ScriptedTool {
+    fn spawn_durable(
+        &self,
+        _incarnation: &str,
+        _cmd: &RenderedCommand,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
+
+    fn spawn_durable_protected(
+        &self,
+        _incarnation: &str,
+        cmd: &RenderedCommand,
+        descriptors: &ProtectedLaunchDescriptors,
+    ) -> Result<ProcessIdentity, RuntimeError> {
+        self.spawned.lock().unwrap().push(cmd.clone());
+        self.descriptors
+            .lock()
+            .unwrap()
+            .push(descriptor_contents(descriptors));
+        if self.gone_on_spawn {
+            *self.present.lock().unwrap() = Presence::Gone;
+        }
+        Ok(self.identity.clone())
+    }
+
+    fn present(&self, _identity: &ProcessIdentity) -> Presence {
+        self.present_calls.fetch_add(1, Ordering::SeqCst);
+        *self.present.lock().unwrap()
+    }
+
+    fn observe_group(&self, _api: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
+        Ok(self.group.clone())
+    }
+
+    fn terminate_owned(
+        &self,
+        _identities: &[ProcessIdentity],
+        _grace: Duration,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------- fixtures
+
+fn api_identity() -> ProcessIdentity {
+    ProcessIdentity {
+        role: "api".into(),
+        pid: 4242,
+        boot_id: "boot".into(),
+        start_ticks: 99,
+    }
+}
+
+fn worker0() -> ProcessIdentity {
+    ProcessIdentity {
+        role: "worker-0".into(),
+        pid: 4243,
+        boot_id: "boot".into(),
+        start_ticks: 100,
+    }
+}
+
+fn wrapper() -> &'static std::path::Path {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::path::Path::new("/usr/bin/true")
+            .canonicalize()
+            .unwrap()
+    })
+}
+
+fn settings() -> SglangLaunchSettings {
+    SglangLaunchSettings {
+        recipe: RECIPE.into(),
+        tensor_parallel_size: 1,
+        data_parallel_size: 1,
+        tokenizer_workers: 1,
+        model_dtype: "bfloat16".into(),
+        context_tokens: 4096,
+        max_running_requests: 8,
+        max_total_tokens: 4096,
+        prefill_cuda_graphs: false,
+        decode_cuda_graphs: false,
+        memory_saver: true,
+        cpu_weight_backup: false,
+        speculative_decoding: false,
+        lora: false,
+        trust_remote_code: false,
+        disaggregation: false,
+        external_cache: false,
+        cpu_kv_offload: false,
+        native_grpc: false,
+        weight_restore: "disk_reload".into(),
+        requested_budget: SglangRequestedBudget {
+            kv_cache_bytes: 4_294_967_296,
+            static_memory_fraction_bps: 7500,
+        },
+    }
+}
+
+fn frozen_launch(port: u16) -> NativeLaunch {
+    NativeLaunch::from_frozen_store(
+        NativeLaunchMetadata {
+            engine: "sglang".into(),
+            recipe: RECIPE.into(),
+            source_revision: SOURCE.into(),
+            checkpoint_revision: REVISION.into(),
+            served_name: MODEL.into(),
+            binding_id: BINDING.into(),
+            incarnation: INCARNATION.into(),
+            endpoint: format!("http://127.0.0.1:{port}"),
+            rendered_settings_digest: "a".repeat(64),
+            device: NativeDeviceSelection {
+                host_id: "host-a".into(),
+                hardware_fingerprint: "hardware-v1".into(),
+                device_id: "gpu0".into(),
+                memory_domain: "uma".into(),
+            },
+        },
+        CHECKPOINT.into(),
+        "/opt/sglang/bin/python3".into(),
+        format!("sglang-inference-{BINDING}"),
+        format!("sglang-admin-{BINDING}"),
+        settings(),
+    )
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn initialize_command(deadline_in_ms: i64) -> RuntimeCommand {
+    RuntimeCommand {
+        action: RuntimeAction::Initialize,
+        context: StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: "d-1".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "o-1".into(),
+                step_id: "s-1".into(),
+            },
+            binding_id: BINDING.into(),
+            incarnation: INCARNATION.into(),
+            issued_at_ms: now_ms() - 10,
+            deadline_ms: now_ms() + deadline_in_ms,
+            identities: ExecutionIdentities::OwnedLaunch,
+            completion_target: None,
+            grant_id: Some("g-1".into()),
+            launch_settings: Some(ProfileLaunchSettings::Sglang(settings())),
+        },
+    }
+}
+
+fn launch_log() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "mllm-sglang-initialize-{}-{}-{}.log",
+        std::process::id(),
+        now_ms(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+/// The fully equipped builder: launch, tools, credentials, wrapper, log.
+fn equipped(launch: NativeLaunch, tool: Arc<ScriptedTool>, log: &std::path::Path) -> SglangAdapter {
+    SglangAdapter::from_frozen(&launch, None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_launch(launch)
+        .with_tools(tool)
+        .with_wrapper(wrapper().to_path_buf())
+        .with_log(log.to_string_lossy().into_owned())
+}
+
+// ----------------------------------------------------------------------- tests
+
+/// A builder without its launch, its tools, its credentials or its wrapper
+/// cannot launch anything: it refuses rather than half-running the step.
+#[tokio::test]
+async fn a_builder_without_its_parts_refuses() {
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let no_launch = SglangAdapter::from_frozen(&frozen_launch(port), None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_tools(tool.clone())
+        .with_wrapper(wrapper().to_path_buf());
+    let no_tools = SglangAdapter::from_frozen(&frozen_launch(port), None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_launch(frozen_launch(port))
+        .with_wrapper(wrapper().to_path_buf());
+    let no_credentials = SglangAdapter::from_frozen(&frozen_launch(port), None)
+        .unwrap()
+        .with_launch(frozen_launch(port))
+        .with_tools(tool.clone())
+        .with_wrapper(wrapper().to_path_buf());
+    let no_wrapper = SglangAdapter::from_frozen(&frozen_launch(port), None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_launch(frozen_launch(port))
+        .with_tools(tool);
+    for adapter in [no_launch, no_tools, no_credentials, no_wrapper] {
+        assert!(
+            matches!(
+                adapter.execute_persisted(&initialize_command(30_000)).await,
+                Err(RuntimeError::Unsupported)
+            ),
+            "a missing part must refuse the step"
+        );
+    }
+}
+
+/// Spec §4: render, protected spawn, readiness, probe, enumerate, observe.
+#[tokio::test]
+async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 2, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool.clone(), &log);
+
+    let command = initialize_command(30_000);
+    let observation = adapter.execute_persisted(&command).await.unwrap();
+
+    assert_eq!(
+        observation
+            .identities
+            .iter()
+            .map(|i| i.role.as_str())
+            .collect::<Vec<_>>(),
+        ["api", "worker-0"]
+    );
+    assert_eq!(
+        observation.facts,
+        vec![
+            Milestone::AllocationsRestored,
+            Milestone::WeightsUsable,
+            Milestone::CacheValid,
+            Milestone::ModelUsable
+        ]
+    );
+    assert_eq!(observation.token, command.context.token);
+    assert_eq!(observation.binding_id, BINDING);
+    assert_eq!(observation.incarnation, INCARNATION);
+    assert_eq!(
+        observation.receipt,
+        format!("sglang {RECIPE} ready on http://127.0.0.1:{port}; probe answered")
+    );
+
+    let spawned = tool.spawned.lock().unwrap();
+    assert_eq!(spawned.len(), 1);
+    let argv = &spawned[0].argv;
+    assert_eq!(
+        &argv[..4],
+        [
+            "/opt/sglang/bin/python3",
+            "-IS",
+            wrapper().to_str().unwrap(),
+            "--public-settings-json"
+        ]
+    );
+    let fds: Vec<i32> = argv[5..].iter().filter_map(|a| a.parse().ok()).collect();
+    assert_eq!(
+        &argv[5..],
+        [
+            "--launch-descriptor-fd",
+            &argv[6],
+            "--inference-credential-fd",
+            &argv[8],
+            "--admin-credential-fd",
+            &argv[10]
+        ]
+    );
+    assert_eq!(fds.len(), 3, "three distinct protected descriptor numbers");
+    assert!(fds.iter().all(|fd| *fd >= 3));
+    assert!(fds[0] != fds[1] && fds[1] != fds[2] && fds[0] != fds[2]);
+
+    // SPEC §13.3: credentials ride protected descriptors, never argv or env.
+    let env = &spawned[0].env;
+    assert_eq!(
+        env.get("MLLM_ENGINE_LOG").map(String::as_str),
+        Some(log.to_string_lossy().as_ref())
+    );
+    let rendered = argv.join(" ");
+    for secret in [INFERENCE, ADMIN] {
+        assert!(!rendered.contains(secret), "a credential reached argv");
+        assert!(
+            !env.values().any(|value| value.contains(secret)),
+            "a credential reached the environment"
+        );
+    }
+
+    // The launcher was handed exactly the private inputs the renderer pinned.
+    let captured = tool.descriptors.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let [private, inference, admin] = &captured[0];
+    let private: Value = serde_json::from_slice(private).unwrap();
+    assert_eq!(private["schema_version"], 1);
+    assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    assert_eq!(private["checkpoint_root"], CHECKPOINT);
+    let public: Value = serde_json::from_str(&argv[4]).unwrap();
+    assert_eq!(private["public_settings"], public);
+    assert_eq!(std::str::from_utf8(inference).unwrap(), INFERENCE);
+    assert_eq!(std::str::from_utf8(admin).unwrap(), ADMIN);
+
+    // The engine was asked about the served name with the launch's own key,
+    // and the probe went through the authenticated inference path.
+    let requests = _stub.requests.lock().unwrap();
+    assert!(requests
+        .iter()
+        .any(|r| r.path == "/v1/models" && r.authorization == format!("Bearer {INFERENCE}")));
+    let probe = requests
+        .iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .unwrap();
+    assert_eq!(probe.authorization, format!("Bearer {INFERENCE}"));
+    assert_eq!(probe.body["model"], MODEL);
+    assert_eq!(probe.body["max_tokens"], 8);
+    assert_eq!(probe.body["temperature"], 0);
+    assert_eq!(probe.body["messages"][0]["content"], "Say ready.");
+    assert!(tool.present_calls.load(Ordering::SeqCst) >= 1);
+    assert!(_stub.polls.load(Ordering::SeqCst) >= 1);
+    std::fs::remove_file(&log).ok();
+}
+
+/// The shape every live launch has: the process is up and its port is not
+/// listening yet. The builder must keep polling through connection refused,
+/// which is what `check_readiness` maps to Initializing, and finish when the
+/// engine finally binds.
+#[tokio::test]
+async fn a_port_that_is_not_listening_yet_is_waited_out_not_failed() {
+    let port = free_port().await;
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let watched = tool.present_calls.clone();
+    let engine = tokio::spawn(async move {
+        while watched.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        serve_stub(MODEL, 0, INFERENCE, port).await
+    });
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool.clone(), &log);
+
+    let observation = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+
+    let (stub, bound) = engine.await.unwrap();
+    assert_eq!(bound, port, "the engine came up on the leased port");
+    assert!(
+        tool.present_calls.load(Ordering::SeqCst) >= 2,
+        "the builder polled the process while the port was closed"
+    );
+    assert!(
+        stub.polls.load(Ordering::SeqCst) >= 1,
+        "the builder asked the engine once it was listening"
+    );
+    assert_eq!(
+        observation
+            .identities
+            .iter()
+            .map(|i| i.role.as_str())
+            .collect::<Vec<_>>(),
+        ["api", "worker-0"]
+    );
+    std::fs::remove_file(&log).ok();
+}
+
+/// Spec §3: the engine holds a key this adapter was not given, so its readiness
+/// poll is refused, and the step fails rather than waiting out its deadline on
+/// an engine that is up and will never answer it.
+// T10
+#[tokio::test]
+async fn a_readiness_poll_with_the_wrong_key_fails_the_step() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, "0ther", 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool, &log);
+
+    let error = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap_err();
+
+    let RuntimeError::Uncertain(message) = error else {
+        panic!("a refused probe is uncertain, got {error:?}");
+    };
+    assert!(message.contains("readiness"), "{message}");
+    std::fs::remove_file(&log).ok();
+}
+
+/// Spec §4 step 4: a process that dies before readiness ends the step with the
+/// log tail, so the operator reads the engine's own reason for leaving, and
+/// every credential the engine echoed is blanked before the error is recorded.
+#[tokio::test]
+async fn an_engine_gone_before_readiness_fails_with_a_redacted_log_tail() {
+    let log = launch_log();
+    let echoed_key = format!("Bearer {}", "0".repeat(64));
+    std::fs::write(
+        &log,
+        format!("loading weights\n{echoed_key}\nCUDA out of memory\nengine core failed to start\n"),
+    )
+    .unwrap();
+    let (_stub, port) = serve_stub(MODEL, usize::MAX, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::dies_on_spawn(api_identity()));
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool, &log);
+
+    let error = adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap_err();
+
+    let RuntimeError::Uncertain(message) = error else {
+        panic!("a dead engine is uncertain ownership, got {error:?}");
+    };
+    for line in [
+        "loading weights",
+        "CUDA out of memory",
+        "engine core failed to start",
+    ] {
+        assert!(message.contains(line), "missing `{line}` in {message}");
+    }
+    assert!(
+        !message.contains(&"0".repeat(64)),
+        "a leaked key in {message}"
+    );
+    assert!(message.contains("<redacted>"), "{message}");
+    std::fs::remove_file(&log).ok();
+}
+
+/// An adapter built without an observer refuses its control actions rather
+/// than appearing to grant park (SPEC §9 posture).
+// T16
+#[tokio::test]
+async fn an_observer_less_adapter_refuses_every_control_action() {
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let launch = frozen_launch(port);
+    let adapter = SglangAdapter::from_frozen(&launch, None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into());
+    let member = MemberRef {
+        deployment_id: "d-1".into(),
+        member_id: "m-1".into(),
+    };
+    assert!(matches!(
+        adapter.park(&member, ParkLevel::One).await,
+        Err(AdapterError::UnsupportedCapability)
+    ));
+    assert!(matches!(
+        adapter.restore(&member).await,
+        Err(AdapterError::UnsupportedCapability)
+    ));
+    assert!(matches!(
+        adapter.reload_weights(&member).await,
+        Err(AdapterError::UnsupportedCapability)
+    ));
+    // A launch adapter holds no launch credential here: readiness is refused,
+    // never quietly Initializing.
+    let unkeyed = SglangAdapter::from_frozen(&frozen_launch(port), None).unwrap();
+    assert!(unkeyed.check_readiness(&member).await.is_err());
+    let command = RuntimeCommand {
+        action: RuntimeAction::Drain,
+        context: StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: "d-1".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "o-1".into(),
+                step_id: "s-drain".into(),
+            },
+            binding_id: BINDING.into(),
+            incarnation: INCARNATION.into(),
+            issued_at_ms: now_ms() - 10,
+            deadline_ms: now_ms() + 5_000,
+            identities: ExecutionIdentities::Retained(vec![api_identity(), worker0()]),
+            completion_target: None,
+            grant_id: Some("g-1".into()),
+            launch_settings: None,
+        },
+    };
+    assert!(matches!(
+        adapter.execute_persisted(&command).await,
+        Err(RuntimeError::Unsupported)
+    ));
+}
+
+/// The descriptor contract pin. The served name is `candidate-{binding_id}`
+/// and the two kinds are the ones `runtime/sglang_entry.py` already accepts,
+/// so this slice provably touches no security-gated Python and no validated
+/// literal. The literals live here and nowhere else in this file.
+#[tokio::test]
+async fn the_descriptor_contract_pin_holds() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool.clone(), &log);
+
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+
+    let spawned = tool.spawned.lock().unwrap();
+    let public: Value = serde_json::from_str(&spawned[0].argv[4]).unwrap();
+    assert_eq!(public["served_name"], format!("candidate-{BINDING}"));
+    assert_eq!(public["kind"], "sglang_candidate_launch");
+    let captured = tool.descriptors.lock().unwrap();
+    let private: Value = serde_json::from_slice(&captured[0][0]).unwrap();
+    assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    std::fs::remove_file(&log).ok();
+}
+
+/// Spec §4: the step is the owned-launch one. A context carrying retained
+/// identities, or another engine's launch settings, is not this step.
+#[tokio::test]
+async fn a_context_that_is_not_an_owned_sglang_launch_is_unsupported() {
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool, &log);
+
+    let mut retained = initialize_command(30_000);
+    retained.context.identities = ExecutionIdentities::Retained(vec![api_identity()]);
+    assert!(matches!(
+        adapter.execute_persisted(&retained).await,
+        Err(RuntimeError::Unsupported)
+    ));
+
+    let mut other_family = initialize_command(30_000);
+    other_family.context.launch_settings = Some(ProfileLaunchSettings::Vllm(
+        mllm_domain::launch::VllmLaunchSettings {
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            enable_sleep_mode: false,
+            kv_cache_dtype: "auto".into(),
+            block_size_tokens: 16,
+            cpu_offload_bytes: 0,
+            requested_budget: mllm_domain::launch::VllmRequestedBudget {
+                kv_cache_bytes: 0,
+                swap_space_bytes: 0,
+                gpu_utilization_pct: 75,
+            },
+        },
+    ));
+    assert!(matches!(
+        adapter.execute_persisted(&other_family).await,
+        Err(RuntimeError::Unsupported)
+    ));
+    std::fs::remove_file(&log).ok();
+}
+
+/// One launch per incarnation: a repeat would start a second engine holding
+/// the same device memory while the first is still recorded as owned.
+#[tokio::test]
+async fn a_second_initialize_for_the_same_incarnation_is_unsupported() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port);
+    let adapter = equipped(launch, tool.clone(), &log);
+
+    assert!(adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .is_ok());
+    assert!(matches!(
+        adapter.execute_persisted(&initialize_command(30_000)).await,
+        Err(RuntimeError::Unsupported)
+    ));
+    assert_eq!(tool.spawned.lock().unwrap().len(), 1);
+    std::fs::remove_file(&log).ok();
+}

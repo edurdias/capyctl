@@ -228,13 +228,9 @@ async fn engine(sglang: bool, sse: String) -> (Box<dyn ChatForward>, tokio::task
     });
     let adapter: Box<dyn ChatForward> = if sglang {
         Box::new(
-            SglangAdapter::from_frozen(
-                &frozen(url),
-                "inference-secret".into(),
-                "admin-secret".into(),
-                std::sync::Arc::new(Observer),
-            )
-            .unwrap(),
+            SglangAdapter::from_frozen(&frozen(url), Some(std::sync::Arc::new(Observer)))
+                .unwrap()
+                .with_credentials("inference-secret".into(), "admin-secret".into()),
         )
     } else {
         Box::new(VllmAdapter::new(
@@ -412,7 +408,7 @@ async fn unsupported_multi_choice_and_tool_requests_do_not_report_success() {
 
 #[tokio::test]
 async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness() {
-    use mllm_adapters::{CancellationOutcome, EngineAdapter, MemberRef, Readiness, RequestRef};
+    use mllm_adapters::{CancellationOutcome, EngineAdapter, MemberRef, RequestRef};
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|| async {
@@ -427,13 +423,10 @@ async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness()
     let task = tokio::spawn(async move {
         axum::serve(socket, app).await.unwrap();
     });
-    let sglang = SglangAdapter::from_frozen(
-        &frozen(url.clone()),
-        "inference-secret".into(),
-        "admin-secret".into(),
-        std::sync::Arc::new(Observer),
-    )
-    .unwrap();
+    let sglang =
+        SglangAdapter::from_frozen(&frozen(url.clone()), Some(std::sync::Arc::new(Observer)))
+            .unwrap()
+            .with_credentials("inference-secret".into(), "admin-secret".into());
     let vllm = VllmAdapter::new(
         url.parse().unwrap(),
         None,
@@ -466,10 +459,9 @@ async fn canceled_stream_does_not_prove_backend_quiescence_or_sglang_readiness()
         vllm.cancel_work(&member, &request, true).await.unwrap(),
         CancellationOutcome::Uncertain
     );
-    assert_eq!(
-        sglang.check_readiness(&member).await.unwrap(),
-        Readiness::Initializing
-    );
+    // Readiness is real now: a surface that answers without the model list
+    // route is an error, never a quiet Initializing-by-default.
+    assert!(sglang.check_readiness(&member).await.is_err());
     task.abort();
 }
 
@@ -512,13 +504,9 @@ async fn redirects_never_receive_the_inference_credential() {
     });
     let adapters: Vec<Box<dyn ChatForward>> = vec![
         Box::new(
-            SglangAdapter::from_frozen(
-                &frozen(url.clone()),
-                "inference-secret".into(),
-                "admin-secret".into(),
-                std::sync::Arc::new(Observer),
-            )
-            .unwrap(),
+            SglangAdapter::from_frozen(&frozen(url.clone()), Some(std::sync::Arc::new(Observer)))
+                .unwrap()
+                .with_credentials("inference-secret".into(), "admin-secret".into()),
         ),
         Box::new(VllmAdapter::new(
             url.parse().unwrap(),
@@ -572,13 +560,9 @@ async fn split_utf8_and_crlf_survive_but_invalid_utf8_never_completes() {
             });
             let adapter: Box<dyn ChatForward> = if sglang {
                 Box::new(
-                    SglangAdapter::from_frozen(
-                        &frozen(url),
-                        "inference-secret".into(),
-                        "admin-secret".into(),
-                        std::sync::Arc::new(Observer),
-                    )
-                    .unwrap(),
+                    SglangAdapter::from_frozen(&frozen(url), Some(std::sync::Arc::new(Observer)))
+                        .unwrap()
+                        .with_credentials("inference-secret".into(), "admin-secret".into()),
                 )
             } else {
                 Box::new(VllmAdapter::new(

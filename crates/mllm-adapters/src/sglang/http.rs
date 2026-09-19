@@ -114,6 +114,24 @@ pub(super) fn action_timeout(action: RuntimeAction) -> Result<Duration, RuntimeE
     Ok(Duration::from_secs(seconds))
 }
 
+/// How a readiness model list failed. Connection refusal is the engine still
+/// staging weights; anything else is an answer worth recording.
+pub(super) enum ModelsError {
+    Unreachable,
+    AuthRejected,
+    Other(String),
+}
+
+impl std::fmt::Display for ModelsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable => write!(f, "engine unreachable"),
+            Self::AuthRejected => write!(f, "engine rejected authentication"),
+            Self::Other(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
 impl ControlHttp {
     pub(super) fn new(
         base: Url,
@@ -151,6 +169,56 @@ impl ControlHttp {
             inference: header(inference)?,
             admin: header(admin)?,
         })
+    }
+
+    /// Served model ids from `/v1/models`, guarded by the inference key the
+    /// engine was launched with. Presence of the served name is the readiness
+    /// signal; a connect refusal is the engine still staging weights.
+    pub(super) async fn models(&self) -> Result<Vec<String>, ModelsError> {
+        const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+        let response = self
+            .client
+            .get(self.base.join("/v1/models").map_err(|_| {
+                ModelsError::Other("model list endpoint could not be resolved".into())
+            })?)
+            .header(AUTHORIZATION, &self.inference)
+            .timeout(MODELS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_connect() {
+                    ModelsError::Unreachable
+                } else {
+                    ModelsError::Other(format!("model list: {e}"))
+                }
+            })?;
+        match response.status().as_u16() {
+            200..=299 => {}
+            401 | 403 => return Err(ModelsError::AuthRejected),
+            status => return Err(ModelsError::Other(format!("model list status {status}"))),
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(ModelsError::Other("model list body too large".into()));
+        }
+        let value: Value = response.json().await.map_err(|e| {
+            if e.is_connect() {
+                ModelsError::Unreachable
+            } else {
+                ModelsError::Other(format!("model list body: {e}"))
+            }
+        })?;
+        Ok(value["data"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub(super) async fn execute(

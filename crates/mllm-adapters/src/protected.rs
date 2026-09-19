@@ -39,8 +39,8 @@ impl ProtectedLaunchDescriptors {
             ));
         }
         fn file(bytes: &[u8]) -> std::io::Result<std::fs::File> {
-            use nix::fcntl::{FcntlArg, SealFlag, fcntl};
-            use nix::sys::memfd::{MemFdCreateFlag, memfd_create};
+            use nix::fcntl::{fcntl, FcntlArg, SealFlag};
+            use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
             let fd = memfd_create(
                 c"mllm-private-launch",
                 MemFdCreateFlag::MFD_CLOEXEC | MemFdCreateFlag::MFD_ALLOW_SEALING,
@@ -68,7 +68,7 @@ impl ProtectedLaunchDescriptors {
         }
         let files = [launch, inference, admin].map(file);
         let [launch, inference, admin] = files;
-        let sanitized = |_| ProtectedDescriptorError::Create(std::io::Error::last_os_error().to_string());
+        let sanitized = |e: std::io::Error| ProtectedDescriptorError::Create(e.to_string());
         Ok(Self {
             files: [
                 launch.map_err(sanitized)?,

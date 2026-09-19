@@ -17,9 +17,7 @@ use mllm_domain::{
     completion::{
         ExecutionIdentities, Milestone, ProcessIdentity, StepExecutionContext, TransitionToken,
     },
-    launch::{
-        NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
-    },
+    launch::{NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget},
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -244,18 +242,25 @@ impl Fixture {
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().fallback(handle).with_state(server.clone());
+        // The control tests exercise persisted controls; readiness is polled
+        // out of band, so the stub answers an always-empty model list without
+        // recording it, matching the adapter's separate readiness surface.
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"object":"list","data":[]})).into_response()
+                }),
+            )
+            .fallback(handle)
+            .with_state(server.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         let adapter = Arc::new(
-            SglangAdapter::from_frozen(
-                &frozen(endpoint),
-                "inference-secret".into(),
-                "admin-secret".into(),
-                observer,
-            )
-            .unwrap(),
+            SglangAdapter::from_frozen(&frozen(endpoint), Some(observer))
+                .unwrap()
+                .with_credentials("inference-secret".into(), "admin-secret".into()),
         );
         Self {
             adapter,

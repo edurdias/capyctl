@@ -45,13 +45,16 @@ pub enum AdapterSpec {
         /// through the child's environment; nothing renders it on argv.
         engine_key: Option<String>,
     },
-    /// SGLang refuses the un-fenced control path, so it takes the frozen launch it
-    /// was verified against and the observer that supplies fresh evidence.
+    /// SGLang refuses the un-fenced control path, so it takes the frozen launch
+    /// it was verified against, the two per-launch credentials, and — when the
+    /// binding is a durable control binding — the observer that supplies fresh
+    /// evidence. An adapter built for launch has no observer and answers its
+    /// control actions with the honest refusal (design §4.4).
     Sglang {
         frozen: Box<NativeLaunch>,
         inference: String,
         admin: String,
-        observer: Arc<dyn SglangRuntimeObserver>,
+        observer: Option<Arc<dyn SglangRuntimeObserver>>,
     },
 }
 
@@ -111,9 +114,14 @@ pub fn resolve(
             inference,
             admin,
             observer,
-        } => Box::new(SglangAdapter::from_frozen(
-            &frozen, inference, admin, observer,
-        )?),
+        } => {
+            let mut adapter =
+                SglangAdapter::from_frozen(&frozen, observer)?.with_credentials(inference, admin);
+            if let Some(tools) = tools {
+                adapter = adapter.with_tools(tools);
+            }
+            Box::new(adapter)
+        }
     })
 }
 
