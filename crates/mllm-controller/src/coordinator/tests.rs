@@ -2241,6 +2241,7 @@ mod native {
                             work.binding_id(),
                             work.incarnation(),
                             &mllm_store::secrets::new_engine_key(),
+                            mllm_store::secrets::SecretRole::Inference,
                         )
                         .unwrap();
                 }
@@ -2359,6 +2360,7 @@ mod native {
                             work.binding_id(),
                             work.incarnation(),
                             &mllm_store::secrets::new_engine_key(),
+                            mllm_store::secrets::SecretRole::Inference,
                         )
                         .unwrap();
                 }

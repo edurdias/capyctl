@@ -278,7 +278,7 @@ fn recorded(tx: &Transaction<'_>, id: &str) -> Result<Option<String>, LifecycleE
 mod tests {
     use super::super::tests::{armed_ordinary, identity};
     use super::*;
-    use crate::secrets::{new_engine_key, SecretsKey};
+    use crate::secrets::{new_engine_key, SecretRole, SecretsKey};
 
     fn text(store: &crate::Store, sql: &str, id: &str) -> String {
         store.conn.query_row(sql, [id], |r| r.get(0)).unwrap()
@@ -322,6 +322,7 @@ mod tests {
                 &execution.binding_id,
                 &execution.incarnation,
                 &new_engine_key(),
+                SecretRole::Inference,
             )
             .unwrap();
         let step = execution.token.step_id.clone();

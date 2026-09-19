@@ -1,8 +1,8 @@
 //! The engine key at rest (spec §3). The database alone cannot recover a key: the
 //! identity key lives in `<state_dir>/identity/secrets.key`, owner-only, and never
 //! enters the database. A per-launch key is sealed with XChaCha20-Poly1305 under
-//! that identity key, with binding id and incarnation as associated data so a row
-//! copied between bindings does not authenticate.
+//! that identity key, with binding id, incarnation and role as associated data so
+//! a row copied between bindings or roles does not authenticate.
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -104,6 +104,39 @@ pub fn new_engine_key() -> [u8; 32] {
     key
 }
 
+/// Which launch credential a sealed engine key is. A binding can carry one key
+/// per role: vLLM seals only `Inference`; SGLang seals `Inference` and `Admin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretRole {
+    Inference,
+    Admin,
+}
+
+impl SecretRole {
+    /// The stored string form of the role, also joined into the sealing AAD.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretRole::Inference => "inference",
+            SecretRole::Admin => "admin",
+        }
+    }
+}
+
+impl std::str::FromStr for SecretRole {
+    type Err = String;
+
+    /// Parses the stored string form. Any other string is an error: the
+    /// table's check constraint already keeps foreign strings out of the
+    /// `role` column, so this only ever rejects what callers invent.
+    fn from_str(role: &str) -> Result<Self, Self::Err> {
+        match role {
+            "inference" => Ok(SecretRole::Inference),
+            "admin" => Ok(SecretRole::Admin),
+            other => Err(format!("unknown secret role {other:?}")),
+        }
+    }
+}
+
 impl crate::Store {
     /// Installs the identity key this store seals and opens engine keys with.
     /// Without it, `store_engine_key` and `engine_key` return `StoreError::Conflict`.
@@ -116,19 +149,21 @@ impl crate::Store {
         Ok(XChaCha20Poly1305::new((&key.0).into()))
     }
 
-    /// Seals `key` for `binding_id`/`incarnation` and stores it, replacing any
-    /// existing row for the binding. Spec §3: the binding id and incarnation are
-    /// associated data, not part of the ciphertext, so a row moved to another
-    /// binding or incarnation fails to authenticate on read.
+    /// Seals `key` for `binding_id`/`incarnation` under `role` and stores it,
+    /// replacing any existing row for the binding and role. Spec §3: the
+    /// binding id, incarnation and role are associated data, not part of the
+    /// ciphertext, so a row moved to another binding, incarnation or role
+    /// fails to authenticate on read.
     pub fn store_engine_key(
         &self,
         binding_id: &str,
         incarnation: &str,
         key: &[u8; 32],
+        role: SecretRole,
     ) -> Result<(), StoreError> {
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
-        let aad = format!("{binding_id}\0{incarnation}");
+        let aad = format!("{binding_id}\0{incarnation}\0{}", role.as_str());
         let ciphertext = self
             .cipher()?
             .encrypt(
@@ -140,33 +175,34 @@ impl crate::Store {
             )
             .map_err(|_| StoreError::Conflict)?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO engine_secrets(binding_id,incarnation,nonce,ciphertext) VALUES(?1,?2,?3,?4)",
-            params![binding_id, incarnation, nonce.to_vec(), ciphertext],
+            "INSERT OR REPLACE INTO engine_secrets(binding_id,role,incarnation,nonce,ciphertext) VALUES(?1,?2,?3,?4,?5)",
+            params![binding_id, role.as_str(), incarnation, nonce.to_vec(), ciphertext],
         )?;
         Ok(())
     }
 
-    /// Opens the engine key stored for `binding_id`/`incarnation`, or `None` if no
-    /// row exists. Fails with `StoreError::Conflict` when the identity key is not
-    /// installed, or when decryption does not authenticate against the requested
-    /// binding id and incarnation.
+    /// Opens the engine key stored for `binding_id`/`incarnation` under `role`,
+    /// or `None` if no row exists. Fails with `StoreError::Conflict` when the
+    /// identity key is not installed, or when decryption does not authenticate
+    /// against the requested binding id, incarnation and role.
     pub fn engine_key(
         &self,
         binding_id: &str,
         incarnation: &str,
+        role: SecretRole,
     ) -> Result<Option<[u8; 32]>, StoreError> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .conn
             .query_row(
-                "SELECT nonce,ciphertext FROM engine_secrets WHERE binding_id=?1 AND incarnation=?2",
-                params![binding_id, incarnation],
+                "SELECT nonce,ciphertext FROM engine_secrets WHERE binding_id=?1 AND incarnation=?2 AND role=?3",
+                params![binding_id, incarnation, role.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         let Some((nonce, ciphertext)) = row else {
             return Ok(None);
         };
-        let aad = format!("{binding_id}\0{incarnation}");
+        let aad = format!("{binding_id}\0{incarnation}\0{}", role.as_str());
         let plain = self
             .cipher()?
             .decrypt(
@@ -180,9 +216,10 @@ impl crate::Store {
         plain.try_into().map(Some).map_err(|_| StoreError::Conflict)
     }
 
-    /// Deletes the engine key row for `binding_id`, if any. Called on ordinary
-    /// cleanup so no encrypted key outlives the binding it was issued for.
-    pub fn delete_engine_key(&self, binding_id: &str) -> Result<(), StoreError> {
+    /// Deletes every engine key row (all roles) for `binding_id`, if any.
+    /// Called on ordinary cleanup so no encrypted key outlives the binding it
+    /// was issued for.
+    pub fn delete_engine_keys(&self, binding_id: &str) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM engine_secrets WHERE binding_id=?1", [binding_id])?;
         Ok(())
@@ -226,8 +263,15 @@ mod tests {
         // engine_secrets -> runtime_bindings foreign key.
         seed_binding(&store, "b2", "inc2");
         let key = [7u8; 32];
-        store.store_engine_key("b1", "inc1", &key).unwrap();
-        assert_eq!(store.engine_key("b1", "inc1").unwrap(), Some(key));
+        store
+            .store_engine_key("b1", "inc1", &key, SecretRole::Inference)
+            .unwrap();
+        assert_eq!(
+            store
+                .engine_key("b1", "inc1", SecretRole::Inference)
+                .unwrap(),
+            Some(key)
+        );
         // Same ciphertext under another binding does not authenticate.
         store
             .conn
@@ -236,7 +280,106 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(store.engine_key("b2", "inc1").is_err());
+        assert!(store.engine_key("b2", "inc1", SecretRole::Inference).is_err());
+    }
+
+    /// SGLang seals two keys per launch, one per role. Each round-trips
+    /// independently under the same binding and incarnation.
+    // T37
+    #[test]
+    fn both_roles_round_trip_independently() {
+        let mut store = crate::Store::open_in_memory().unwrap();
+        store.set_secrets_key(SecretsKey::generate_ephemeral());
+        seed_binding(&store, "b1", "inc1");
+        let inference = [1u8; 32];
+        let admin = [2u8; 32];
+        store
+            .store_engine_key("b1", "inc1", &inference, SecretRole::Inference)
+            .unwrap();
+        store
+            .store_engine_key("b1", "inc1", &admin, SecretRole::Admin)
+            .unwrap();
+        assert_eq!(
+            store
+                .engine_key("b1", "inc1", SecretRole::Inference)
+                .unwrap(),
+            Some(inference)
+        );
+        assert_eq!(
+            store.engine_key("b1", "inc1", SecretRole::Admin).unwrap(),
+            Some(admin)
+        );
+        // Storing one role again does not disturb the other.
+        store
+            .store_engine_key("b1", "inc1", &[3u8; 32], SecretRole::Inference)
+            .unwrap();
+        assert_eq!(
+            store
+                .engine_key("b1", "inc1", SecretRole::Inference)
+                .unwrap(),
+            Some([3u8; 32])
+        );
+        assert_eq!(
+            store.engine_key("b1", "inc1", SecretRole::Admin).unwrap(),
+            Some(admin)
+        );
+    }
+
+    /// The role is associated data: a ciphertext copied from one role's row to
+    /// another does not authenticate when opened as the copied-to role.
+    // T37
+    #[test]
+    fn a_row_copied_between_roles_does_not_authenticate() {
+        let mut store = crate::Store::open_in_memory().unwrap();
+        store.set_secrets_key(SecretsKey::generate_ephemeral());
+        seed_binding(&store, "b1", "inc1");
+        let admin = [2u8; 32];
+        store
+            .store_engine_key("b1", "inc1", &admin, SecretRole::Admin)
+            .unwrap();
+        // Copy the admin ciphertext into the inference role's row.
+        store
+            .conn
+            .execute(
+                "INSERT INTO engine_secrets(binding_id,role,incarnation,nonce,ciphertext)
+                 SELECT binding_id,'inference',incarnation,nonce,ciphertext
+                 FROM engine_secrets WHERE role='admin'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .engine_key("b1", "inc1", SecretRole::Inference)
+                .is_err(),
+            "a row copied across roles must fail to authenticate"
+        );
+    }
+
+    /// Cleanup releases all roles for a binding: no sealed key of any role
+    /// outlives the binding it was issued for.
+    // T37
+    #[test]
+    fn delete_engine_keys_removes_every_role() {
+        let mut store = crate::Store::open_in_memory().unwrap();
+        store.set_secrets_key(SecretsKey::generate_ephemeral());
+        seed_binding(&store, "b1", "inc1");
+        store
+            .store_engine_key("b1", "inc1", &[1u8; 32], SecretRole::Inference)
+            .unwrap();
+        store
+            .store_engine_key("b1", "inc1", &[2u8; 32], SecretRole::Admin)
+            .unwrap();
+        store.delete_engine_keys("b1").unwrap();
+        assert_eq!(
+            store
+                .engine_key("b1", "inc1", SecretRole::Inference)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.engine_key("b1", "inc1", SecretRole::Admin).unwrap(),
+            None
+        );
     }
 
     /// SPEC §13.3 credential handling, and T02: the local identity key is created

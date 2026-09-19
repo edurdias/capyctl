@@ -4,13 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -423,5 +423,60 @@ mod tests {
             )
             .unwrap();
         assert!(present, "engine_secrets must exist");
+    }
+
+    /// Spec §4.2 (ordinary launch design): a v14 store's engine secret was a
+    /// vLLM inference key; the v15 rebuild carries it across under the
+    /// `inference` role with its sealed bytes intact, and the table then
+    /// accepts one row per role for a binding.
+    // T39
+    #[test]
+    fn v15_roles_engine_secrets_and_carries_rows_across() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?1)",
+                [(index + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('kept','kept','model','ready',1,0,1,1);
+            INSERT INTO runtime_bindings VALUES('binding','kept',1,'incarnation','managed','{}','[]','reserved');
+            INSERT INTO engine_secrets VALUES('binding','incarnation',zeroblob(24),x'00');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let row: (String, String, i64) = conn
+            .query_row(
+                "SELECT role,incarnation,length(nonce) FROM engine_secrets WHERE binding_id='binding'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("inference".into(), "incarnation".into(), 24));
+        // One row per role: the second insert for the other role succeeds, and
+        // the check constraint refuses a role outside the pair.
+        conn.execute(
+            "INSERT INTO engine_secrets VALUES('binding','admin','incarnation',zeroblob(24),x'01')",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO engine_secrets VALUES('binding','root','incarnation',zeroblob(24),x'02')",
+                []
+            )
+            .is_err());
+        // The foreign key to runtime_bindings survives the rebuild.
+        assert!(conn
+            .execute(
+                "INSERT INTO engine_secrets VALUES('missing','inference','i',zeroblob(24),x'03')",
+                []
+            )
+            .is_err());
     }
 }

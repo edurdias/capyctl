@@ -336,8 +336,9 @@ DROP TABLE host_qualification_policies;
 "#;
 
 // Spec §3: the per-launch engine key, encrypted at rest with XChaCha20-Poly1305 under
-// the identity key file, with binding id and incarnation as associated data so a row
-// copied between bindings does not authenticate. Deleted when the binding releases.
+// the identity key file, with binding id, incarnation and role as associated data so
+// a row copied between bindings or roles does not authenticate. Deleted when the
+// binding releases.
 pub const SCHEMA_V14: &str = r#"
 CREATE TABLE engine_secrets(
   binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
@@ -345,6 +346,26 @@ CREATE TABLE engine_secrets(
   nonce BLOB NOT NULL CHECK(length(nonce)=24),
   ciphertext BLOB NOT NULL
 );
+"#;
+
+// Spec §4.2 (ordinary launch design): SGLang seals two keys per launch, one
+// inference and one admin, so `engine_secrets` carries a role and a binding may
+// hold one row per role. Existing rows were vLLM inference keys and migrate to
+// that role. The rebuild is foreign-key ordered and preserves nonce/ciphertext
+// bytes, so keys sealed under v14 still open.
+pub const SCHEMA_V15: &str = r#"
+CREATE TABLE engine_secrets_v15(
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  role TEXT NOT NULL CHECK(role IN ('inference','admin')),
+  incarnation TEXT NOT NULL,
+  nonce BLOB NOT NULL CHECK(length(nonce)=24),
+  ciphertext BLOB NOT NULL,
+  PRIMARY KEY(binding_id, role)
+);
+INSERT INTO engine_secrets_v15(binding_id,role,incarnation,nonce,ciphertext)
+  SELECT binding_id,'inference',incarnation,nonce,ciphertext FROM engine_secrets;
+DROP TABLE engine_secrets;
+ALTER TABLE engine_secrets_v15 RENAME TO engine_secrets;
 "#;
 
 pub const SCHEMA_V9: &str = r#"

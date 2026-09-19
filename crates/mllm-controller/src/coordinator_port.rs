@@ -301,7 +301,11 @@ impl LifecyclePort for CoordinatorLifecycle {
         // downstream has to guess at an encoding. It is never logged.
         let engine_key = owner
             .store()
-            .engine_key(&binding.id, &binding.incarnation)?
+            .engine_key(
+                &binding.id,
+                &binding.incarnation,
+                mllm_store::secrets::SecretRole::Inference,
+            )?
             .map(hex::encode);
         let served_model = owner
             .store()

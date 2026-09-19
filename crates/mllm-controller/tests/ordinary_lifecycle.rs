@@ -3000,10 +3000,15 @@ fn seal_key(store: &Store, deployment: &str) -> (String, String) {
             &binding.id,
             &binding.incarnation,
             &mllm_store::secrets::new_engine_key(),
+            mllm_store::secrets::SecretRole::Inference,
         )
         .unwrap();
     assert!(store
-        .engine_key(&binding.id, &binding.incarnation)
+        .engine_key(
+            &binding.id,
+            &binding.incarnation,
+            mllm_store::secrets::SecretRole::Inference
+        )
         .unwrap()
         .is_some());
     (binding.id, binding.incarnation)
@@ -3029,7 +3034,10 @@ async fn an_expired_unarmed_start_gives_up_its_engine_key() {
 
     assert!(store.runtime_binding(&id).unwrap().is_none());
     assert!(
-        store.engine_key(&binding, &incarnation).unwrap().is_none(),
+        store
+            .engine_key(&binding, &incarnation, mllm_store::secrets::SecretRole::Inference)
+            .unwrap()
+            .is_none(),
         "the released binding must not leave a sealed key behind"
     );
 }
@@ -3052,7 +3060,10 @@ async fn an_unarmed_stop_gives_up_the_starts_engine_key() {
 
     assert!(store.runtime_binding(&id).unwrap().is_none());
     assert!(
-        store.engine_key(&binding, &incarnation).unwrap().is_none(),
+        store
+            .engine_key(&binding, &incarnation, mllm_store::secrets::SecretRole::Inference)
+            .unwrap()
+            .is_none(),
         "the released binding must not leave a sealed key behind"
     );
 }

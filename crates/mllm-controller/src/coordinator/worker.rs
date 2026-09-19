@@ -661,7 +661,12 @@ impl OwnedCoordinator {
                     })?;
                     owner
                         .store()
-                        .store_engine_key(work.binding_id(), work.incarnation(), &sealed)
+                        .store_engine_key(
+                            work.binding_id(),
+                            work.incarnation(),
+                            &sealed,
+                            mllm_store::secrets::SecretRole::Inference,
+                        )
                         .map_err(|error| {
                             CoordinatorError::Service(format!(
                                 "the engine key was not stored: {error}"
