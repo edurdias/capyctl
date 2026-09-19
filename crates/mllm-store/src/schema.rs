@@ -352,7 +352,10 @@ CREATE TABLE engine_secrets(
 // inference and one admin, so `engine_secrets` carries a role and a binding may
 // hold one row per role. Existing rows were vLLM inference keys and migrate to
 // that role. The rebuild is foreign-key ordered and preserves nonce/ciphertext
-// bytes, so keys sealed under v14 still open.
+// bytes, but the bytes do not carry over: role joined the sealing AAD in the
+// same change, so pre-v15 ciphertexts no longer authenticate and fail to open.
+// Affected launches re-seal on their next start. As with SCHEMA_V13, there is
+// no compatibility with state written before v15.
 pub const SCHEMA_V15: &str = r#"
 CREATE TABLE engine_secrets_v15(
   binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
