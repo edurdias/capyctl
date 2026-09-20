@@ -394,9 +394,17 @@ def _verified_native_contract(spec, checkpoint):
             return composition.compose(spec, checkpoint,
                                        package_root=_trusted_package_root(),
                                        trusted_mapping=None, placement_digest=None)
+        try:
+            # The mapping is the placement gate's own input, so an assembly
+            # failure (for example a descriptor shape this boundary does not
+            # accept) folds into the gate's closed placement_failed category,
+            # never the blanket startup_error.
+            mapping = _placement_mapping(spec, spec._placement_digest)
+        except Exception:
+            raise composition.NativeCompositionError("placement_failed") from None
         return composition.compose(spec, checkpoint,
                                    package_root=_trusted_package_root(),
-                                   trusted_mapping=_placement_mapping(spec, spec._placement_digest),
+                                   trusted_mapping=mapping,
                                    placement_digest=spec._placement_digest)
     except composition.NativeCompositionError as error:
         raise LaunchError(error.code) from None

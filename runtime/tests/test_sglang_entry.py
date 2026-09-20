@@ -644,6 +644,36 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         self.assertEqual(events, ["verify", "revalidate", "plugins"])
         self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_failed\n")
 
+    def test_mapping_assembly_failure_folds_into_the_placement_category(self):
+        # A mapping the entry cannot honestly assemble is a placement-gate
+        # refusal, never the blanket startup category: the assembly runs
+        # inside composition's closed-category fold. Today's descriptor
+        # boundary makes the malformed shape unreachable, so the assembly is
+        # substituted at its seam (the entry's own function).
+        events = []
+        error = io.StringIO()
+        patches = (*self._green_gate_patches(events, []),
+                   mock.patch.object(entry, "verify_checkpoint",
+                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
+                   mock.patch.object(entry, "revalidate_checkpoint",
+                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
+                   mock.patch.object(entry, "_placement_mapping",
+                                     side_effect=KeyError("device")),
+                   mock.patch.object(entry, "_import_and_launch",
+                                     side_effect=AssertionError("launched")))
+        for patch in patches:
+            patch.start()
+        try:
+            result = entry.main(self.argv(), self.scoped_payloads(digest=PLACEMENT_DIGEST).__getitem__, error)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        self.assertEqual(result, 1)
+        # The assembly is refused before any gate runs; the category is the
+        # placement gate's own, not the blanket startup one.
+        self.assertEqual(events, [])
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_failed\n")
+
     def test_each_gate_failure_surfaces_its_own_closed_category_from_main(self):
         cases = (
             ("plugin_closure_failed",
