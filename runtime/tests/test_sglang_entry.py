@@ -224,10 +224,10 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         self.assertEqual(json.loads(spec._public_json)["device"]["device_id"], "gpu7")
 
     def test_served_name_is_the_route_token_not_the_binding_derivation(self):
-        # The served name is the deployment's route name: ordinary tokens are
-        # accepted unchanged, and the retired `candidate-{binding_id}`
-        # derivation is neither required nor special.
-        for name in ("toy", "a-route", "route.1_v2", "café-route", "x" * 256):
+        # The served name is the deployment's route name: ordinary ASCII
+        # tokens are accepted unchanged, and the retired
+        # `candidate-{binding_id}` derivation is neither required nor special.
+        for name in ("toy", "a-route", "route.1_v2", "x" * 256):
             public = copy.deepcopy(self.public)
             public["served_name"] = name
             spec = self.build(self.argv(public), self.payloads(public))
@@ -244,10 +244,12 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
             ("endpoint", "http://0.0.0.0:20001"),
             ("endpoint", "http://127.0.0.1:020001"),
             ("endpoint", "http://127.0.0.1:65536"),
-            # The served name is the route token: empty, whitespace, and over
-            # the 256-byte bound all refuse; no `candidate-` rule remains.
+            # The served name is the ASCII printable route token: empty,
+            # whitespace, non-ASCII, and over the 256-byte bound all refuse;
+            # no `candidate-` rule remains.
             ("served_name", ""), ("served_name", "has space"),
             ("served_name", "tab\tname"), ("served_name", "x" * 257),
+            ("served_name", "caf\u00e9-route"), ("served_name", "route\u202ename"),
             ("rendered_settings_digest", "z" * 64),
             ("minimum_kv_bytes", 603979775), ("static_memory_fraction", "0.75"),
         ]

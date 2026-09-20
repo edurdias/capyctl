@@ -166,11 +166,14 @@ def _validate_public(value):
                                          for char in selector):
             _reject()
     # The served name is the deployment's route (Spec §3), not a derived
-    # binding artifact: a non-empty printable token, 1..=256 bytes, with no
-    # whitespace. The deleted `candidate-{binding_id}` derivation is gone
-    # rather than deprecated.
+    # binding artifact: an ASCII printable token, a non-empty run of at most
+    # 256 bytes restricted to 0x21..=0x7E. This mirrors the coordinator's
+    # `served_name_token` in crates/mllm-adapters/src/sglang/args.rs, so both
+    # validators refuse exactly the same inputs. The retired
+    # `candidate-{binding_id}` derivation is gone rather than deprecated.
     served = _text(value["served_name"], 256)
-    if not served.isprintable() or any(char.isspace() for char in served):
+    if (not served.isascii() or not served.isprintable()
+            or any(char.isspace() for char in served)):
         _reject()
     endpoint = _text(value["endpoint"], 128)
     prefix = "http://127.0.0.1:"

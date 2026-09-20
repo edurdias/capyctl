@@ -270,14 +270,20 @@ fn ulid(value: &str) -> bool {
 }
 
 /// The served name is the deployment's route (Spec §3), not a derived binding
-/// artifact: the entry and the coordinator's render both accept exactly the
-/// same token here. A non-empty printable token, 1..=256 bytes, carrying no
-/// whitespace and no control characters. No further shape is imposed, so the
-/// deleted `candidate-{binding_id}` derivation is gone rather than deprecated.
+/// artifact. The rule is ASCII printable only: a non-empty token of at most
+/// 256 bytes whose characters are all in 0x21..=0x7E (no space, no control
+/// characters, no non-ASCII code points). This mirrors the entry's check in
+/// `runtime/sglang_entry.py`, which also requires `str.isascii()` and
+/// `str.isprintable()`, so both validators refuse exactly the same inputs.
+/// Shapes produced by the retired `candidate-{binding_id}` derivation are now
+/// ordinary valid tokens: the rule is gone, not deprecated, and no special
+/// case remains for it.
 pub(crate) fn served_name_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
-        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+        && value
+            .chars()
+            .all(|c| matches!(c, '\u{21}'..='\u{7E}'))
 }
 
 fn private_endpoint(value: &str) -> bool {

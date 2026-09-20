@@ -309,14 +309,17 @@ fn ordinary_missing_and_malformed_candidate_metadata_is_rejected() {
         |m| m.binding_id.clear(),
         |m| m.binding_id = "ordinary-binding".into(),
         |m| m.incarnation.clear(),
-        // The served name is the deployment's route token (1..=256 bytes,
-        // printable, no whitespace or control characters); anything else,
-        // including the retired `candidate-{binding_id}` derivation's empty,
-        // whitespace and oversized shapes, is refused.
+        // The served name is the deployment's route token (ASCII printable,
+        // 1..=256 bytes, characters 0x21..=0x7E only, mirroring the entry's
+        // check in runtime/sglang_entry.py); anything else, including the
+        // retired `candidate-{binding_id}` derivation's empty, whitespace,
+        // oversized, and non-ASCII shapes, is refused.
         |m| m.served_name.clear(),
         |m| m.served_name = "has space".into(),
         |m| m.served_name = "tab\tname".into(),
         |m| m.served_name = "x".repeat(257),
+        |m| m.served_name = "café-route".into(),
+        |m| m.served_name = "route\u{202E}name".into(),
         |m| m.rendered_settings_digest = "unverified".into(),
         |m| m.endpoint = "http://0.0.0.0:20001".into(),
         |m| m.endpoint = "http://127.0.0.1:0".into(),
