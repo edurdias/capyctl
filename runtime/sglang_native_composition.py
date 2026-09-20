@@ -17,7 +17,6 @@ residency, or qualification of anything.
 from dataclasses import dataclass, field
 import time
 
-from . import sglang_device as _device
 from . import sglang_observation_server as _server
 from . import sglang_saver_binding as _saver
 from .checkpoint_preflight import revalidate_checkpoint
@@ -63,7 +62,8 @@ class NativeContract:
     observed_at: float
 
     def __repr__(self):
-        return ("NativeContract(sources_ok=True, plugins_closed=True, "
+        return (f"NativeContract(sources_ok={self.sources_ok}, "
+                f"plugins_closed={self.plugins_closed}, "
                 f"placement_asserted={self.placement_asserted}, "
                 f"binding_id={self.binding_id!r}, incarnation={self.incarnation!r})")
 

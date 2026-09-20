@@ -25,9 +25,8 @@ if __name__ in ("__main__", "__mp_main__") and not __package__:
 # alternative spawn/forkserver/main-module paths are not covered by this guard.
 if __name__ == "__mp_main__":
     try:
-        from runtime.sglang_startup_guards import contain_startup_output, enforce_closed_plugins
-        contain_startup_output()
-        enforce_closed_plugins()
+        from runtime.sglang_startup_guards import preimport_guard
+        preimport_guard()
     except BaseException:
         # No native/input exception text, including if containment itself fails.
         raise SystemExit(1) from None

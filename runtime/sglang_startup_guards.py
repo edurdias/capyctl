@@ -104,3 +104,19 @@ def enforce_closed_plugins():
         raise
     except Exception:
         raise StartupGuardError("plugin_inventory_unavailable") from None
+
+
+def preimport_guard():
+    """One-call preimport safety for a freshly spawned interpreter.
+
+    Runs contain_startup_output() then enforce_closed_plugins(), in that order,
+    at the top of a spawned interpreter's main before native Process arguments
+    are unpickled. Raises a closed StartupGuardError category; the caller exits
+    without rendering native details. The selector rejection and installed
+    entry-point inventory observation in enforce_closed_plugins() are the
+    complete in-child posture: trusted immutable package/code/metadata/search
+    paths (including children), the clean isolated interpreter and the closed
+    environment remain launcher prerequisites that no child can self-attest.
+    """
+    contain_startup_output()
+    enforce_closed_plugins()

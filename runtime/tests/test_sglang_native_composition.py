@@ -171,9 +171,12 @@ class CompositionTests(LaunchFixture, unittest.TestCase):
                 raise AssertionError("native import during composition")
             return original(name, *args, **kwargs)
 
+        before = set(sys.modules)
         with mock.patch("builtins.__import__", side_effect=guarded), GatePatch():
             self.compose()
-        self.assertFalse(any(name.split(".")[0] in NATIVE_ROOTS for name in sys.modules))
+        added = set(sys.modules) - before
+        self.assertEqual([name for name in added
+                          if name.split(".")[0] in NATIVE_ROOTS], [])
 
 
 class EnrollmentTests(unittest.TestCase):

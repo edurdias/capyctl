@@ -14,6 +14,7 @@ from unittest import mock
 
 from runtime import sglang_entry as entry
 from runtime import checkpoint_preflight as preflight
+from runtime import sglang_startup_guards as guards
 import test_checkpoint_preflight as checkpoint_fixtures
 
 
@@ -401,6 +402,66 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         result, events, error = self.run_with_contract(prepare)
         self.assertEqual((result, events), (1, []))
         self.assertEqual(error, "sglang_startup_failed: memory_saver_unavailable\n")
+
+
+class PreimportGuardTests(unittest.TestCase):
+    def test_preimport_guard_runs_containment_then_plugin_closure_in_order(self):
+        events = []
+        with mock.patch.object(guards, "contain_startup_output",
+                               side_effect=lambda: events.append("containment")), \
+                mock.patch.object(guards, "enforce_closed_plugins",
+                                  side_effect=lambda: events.append("plugins")):
+            guards.preimport_guard()
+        self.assertEqual(events, ["containment", "plugins"])
+
+    def test_guard_fails_closed_on_nonempty_plugin_selection(self):
+        with mock.patch.object(guards, "contain_startup_output"), \
+                mock.patch.dict(os.environ, {"SGLANG_PLUGINS": "PRIVATE-SELECTION"}):
+            with self.assertRaises(guards.StartupGuardError) as caught:
+                guards.preimport_guard()
+        self.assertEqual(caught.exception.code, "external_plugin_selection")
+        self.assertNotIn("PRIVATE-SELECTION", str(caught.exception))
+        self.assertNotIn("PRIVATE-SELECTION", repr(caught.exception))
+        for platform in ("SGLANG_PLATFORM",):
+            with mock.patch.object(guards, "contain_startup_output"), \
+                    mock.patch.dict(os.environ, {platform: "PRIVATE-SELECTION"}):
+                with self.assertRaises(guards.StartupGuardError) as caught:
+                    guards.preimport_guard()
+            self.assertEqual(caught.exception.code, "external_plugin_selection")
+
+    def spawned_namespace(self):
+        return {"__name__": "__mp_main__", "__package__": None,
+                "__file__": str(Path(entry.__file__).resolve())}
+
+    def test_spawned_interpreter_runs_the_guard_during_spawn_preparation(self):
+        # CPython spawn executes the main script as __mp_main__ before unpickling
+        # the Process and its native argument classes. The exec below runs the
+        # entry's real module body in that role; the source-position assertion
+        # documents that the guard call site precedes the first post-guard
+        # import, so no module-body effect can precede the guard either.
+        wrapper = Path(entry.__file__).resolve()
+        text = wrapper.read_text()
+        self.assertLess(text.index('if __name__ == "__mp_main__":'),
+                        text.index("from runtime.checkpoint_preflight import"))
+        with mock.patch.object(guards, "preimport_guard") as guard:
+            namespace = self.spawned_namespace()
+            with mock.patch.object(sys, "path", []):
+                exec(compile(wrapper.read_bytes(), str(wrapper), "exec"), namespace)
+        guard.assert_called_once_with()
+        self.assertIn("LaunchSpec", namespace)
+
+    def test_spawned_interpreter_fails_closed_before_any_module_body_effect(self):
+        wrapper = Path(entry.__file__).resolve()
+        with mock.patch.object(guards, "preimport_guard",
+                               side_effect=guards.StartupGuardError("external_plugin_selection")):
+            namespace = self.spawned_namespace()
+            with mock.patch.object(sys, "path", []):
+                with self.assertRaises(SystemExit) as caught:
+                    exec(compile(wrapper.read_bytes(), str(wrapper), "exec"), namespace)
+        self.assertEqual(caught.exception.code, 1)
+        # The module body aborted at the guard: nothing after it was defined,
+        # and in real spawn no Process argument would have been unpickled.
+        self.assertNotIn("LaunchSpec", namespace)
 
 
 class HealthTests(unittest.TestCase):
