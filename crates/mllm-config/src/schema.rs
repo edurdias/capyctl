@@ -273,6 +273,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("listeners", LISTENERS),
                 ("hardware_fingerprint", SCALAR),
                 ("environment_fingerprint", SCALAR),
+                ("device_inventory_digest", SCALAR),
                 ("resource_policy", FieldSpec::Struct(F2_RESOURCE_POLICY)),
                 ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
             ],

@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Decode and revalidate a bounded normalized snapshot without profile rereads.
 pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, ConfigError> {
@@ -103,6 +103,10 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     let host = json!({
         "schema_version": 1, "kind":"host", "name":h["name"],
         "hardware_fingerprint":h["hardware_fingerprint"], "environment_fingerprint":h["environment_fingerprint"],
+        // Absent in the snapshot encodes as null and re-normalizes to None;
+        // present, the host's published inventory digest round-trips so the
+        // native launch can assert placement against it.
+        "device_inventory_digest":h["device_inventory_digest"],
         "model_store": {"path": h["model_store"]},
         "runtime_profiles":{"snapshot":profile},
         "resource_policy": {

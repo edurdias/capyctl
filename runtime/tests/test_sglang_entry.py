@@ -15,10 +15,14 @@ from unittest import mock
 from runtime import sglang_entry as entry
 from runtime import checkpoint_preflight as preflight
 from runtime import sglang_native_composition as composition
+from runtime import sglang_device as device
 from runtime import sglang_server_args as server_args
 from runtime import sglang_source_preflight as source
 from runtime import sglang_startup_guards as guards
 import test_checkpoint_preflight as checkpoint_fixtures
+
+PLACEMENT_DIGEST = "0123456789abcdef" * 4
+PLACEMENT_UUID = "GPU-12345678-1234-1234-1234-123456789abc"
 
 
 def finish_without_io(coroutine):
@@ -81,19 +85,7 @@ class LaunchFixture:
                               "public_settings": self.public if public is None else public}).encode(),
                 4: self.inference, 5: self.admin}
 
-    def build(self, argv=None, payloads=None):
-        data = self.payloads() if payloads is None else payloads
-        return entry.build_launch(self.argv() if argv is None else argv, data.__getitem__)
-
-    def rejects(self, argv=None, payloads=None):
-        with self.assertRaises(entry.LaunchError) as caught:
-            self.build(argv, payloads)
-        for private in (self.root, self.inference.decode(), self.admin.decode()):
-            self.assertNotIn(private, str(caught.exception))
-            self.assertNotIn(private, repr(caught.exception))
-
-class LaunchTests(LaunchFixture, unittest.TestCase):
-    def scoped_payloads(self):
+    def scoped_payloads(self, digest=None):
         data = self.payloads()
         private = json.loads(data[3])
         private["schema_version"] = 2
@@ -107,9 +99,23 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
             "revision": 1, "generation": 2,
             "issued_at_ms": 1000, "deadline_ms": 10000,
         }
+        if digest is not None:
+            private["placement_digest"] = digest
         data[3] = json.dumps(private).encode()
         return data
 
+    def build(self, argv=None, payloads=None):
+        data = self.payloads() if payloads is None else payloads
+        return entry.build_launch(self.argv() if argv is None else argv, data.__getitem__)
+
+    def rejects(self, argv=None, payloads=None):
+        with self.assertRaises(entry.LaunchError) as caught:
+            self.build(argv, payloads)
+        for private in (self.root, self.inference.decode(), self.admin.decode()):
+            self.assertNotIn(private, str(caught.exception))
+            self.assertNotIn(private, repr(caught.exception))
+
+class LaunchTests(LaunchFixture, unittest.TestCase):
     def test_scoped_v2_descriptor_is_private_immutable_and_not_launch_authority(self):
         data = self.scoped_payloads()
         spec = self.build(payloads=data)
@@ -134,6 +140,37 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
             with self.assertRaises((AttributeError, TypeError)):
                 entry._import_and_launch(spec, None, None)
         self.assertIsNone(self.build()._launch_scope_json)
+
+    def test_placement_digest_is_an_optional_exact_v2_private_field(self):
+        # Present and well-formed: the digest binds the descriptor to the
+        # service-authorized inventory claim and is carried, never re-derived.
+        spec = self.build(payloads=self.scoped_payloads(digest=PLACEMENT_DIGEST))
+        self.assertEqual(spec._placement_digest, PLACEMENT_DIGEST)
+        self.assertNotIn(PLACEMENT_DIGEST, repr(spec))
+        # Absent: placement stays explicitly unasserted, never guessed.
+        self.assertIsNone(self.build(payloads=self.scoped_payloads())._placement_digest)
+        self.assertIsNone(self.build()._placement_digest)
+        # Malformed digests refuse by name; nothing is repaired or inferred.
+        for digest in ("", "z" * 64, PLACEMENT_DIGEST.upper(), PLACEMENT_DIGEST[:-1],
+                       PLACEMENT_DIGEST + "0", 0, True, None, 64):
+            with self.subTest(digest=digest):
+                data = self.scoped_payloads()
+                private = json.loads(data[3])
+                private["placement_digest"] = digest
+                data[3] = json.dumps(private).encode()
+                self.rejects(payloads=data)
+        # Version 1 never gains the field, and a digest cannot replace the
+        # scope: both refuse as unknown shapes.
+        data = self.payloads()
+        private = json.loads(data[3])
+        private["placement_digest"] = PLACEMENT_DIGEST
+        data[3] = json.dumps(private).encode()
+        self.rejects(payloads=data)
+        data = self.scoped_payloads()
+        private = json.loads(data[3])
+        del private["launch_scope"]
+        data[3] = json.dumps(private).encode()
+        self.rejects(payloads=data)
 
     def test_v2_scope_rejects_wrong_types_bounds_identity_and_unknown_fields(self):
         original = json.loads(self.scoped_payloads()[3])
@@ -484,6 +521,128 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         self.assertEqual(events, ["import"])
         self.assertEqual(error.getvalue(), "sglang_startup_failed: startup_error\n")
         launch.assert_not_called()
+
+    def _asserted_placement_patches(self, events, inventory_digest, uuid=PLACEMENT_UUID):
+        # Green gates plus a synthetic device inventory: the real placement
+        # observation runs, but collect_inventory (its only fresh-evidence
+        # seam) is substituted. This is a CPU fixture, never qualification.
+        def inventory():
+            return device.DeviceInventory(
+                host_id="host-a", architecture="x86_64", boot_id="boot",
+                devices=(device.PhysicalDevice(
+                    PLACEMENT_UUID, "0000:09:00.0", 0, "0x10de", "0x2684"),),
+                digest=inventory_digest, observed_at_ns=1)
+
+        return (*self._green_gate_patches(events, []),
+                mock.patch.object(device, "collect_inventory", side_effect=inventory),
+                mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": uuid}))
+
+    def test_asserted_placement_reaches_the_guarded_boundary_and_launches(self):
+        # The descriptor carries the service-authorized inventory digest; the
+        # entry assembles the mapping from the descriptor's device selectors,
+        # that digest, and the inherited namespace, and compose asserts
+        # placement against freshly collected inventory. The observed
+        # placement — never a guessed one — reaches the audited mapper.
+        events = []
+        error = io.StringIO()
+        arguments = mock.Mock()
+        checked = mock.Mock()
+        native = checked._native
+        launch_calls = []
+        placements = []
+
+        def guarded_import():
+            events.append("import")
+            launch = mock.Mock()
+            launch_calls.append(launch)
+            return arguments, launch
+
+        def recorded_construct(spec, placement, constructor):
+            placements.append(placement)
+            return checked
+
+        patches = (*self._asserted_placement_patches(events, PLACEMENT_DIGEST),
+                   mock.patch.object(entry, "verify_checkpoint",
+                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
+                   mock.patch.object(entry, "revalidate_checkpoint",
+                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
+                   mock.patch.object(entry, "_guarded_engine_import", side_effect=guarded_import),
+                   mock.patch.object(server_args, "construct_server_args",
+                                     side_effect=recorded_construct))
+        for patch in patches:
+            patch.start()
+        try:
+            result = entry.main(self.argv(), self.scoped_payloads(digest=PLACEMENT_DIGEST).__getitem__, error)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        self.assertEqual(result, 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(events, ["verify", "revalidate", "plugins", "checkpoint", "import"])
+        self.assertEqual(len(placements), 1)
+        placement = placements[0]
+        self.assertEqual(placement.physical_gpu_uuid, PLACEMENT_UUID)
+        self.assertEqual(placement.host_id, "host-a")
+        self.assertEqual(placement.device_id, "gpu0")
+        self.assertEqual(placement.memory_domain, "uma")
+        self.assertEqual(placement.cuda_visible_uuids, (PLACEMENT_UUID,))
+        self.assertEqual(placement.cuda_index, 0)
+        launch_calls[0].launch_server.assert_called_once_with(native)
+
+    def test_live_mapping_mismatch_fails_closed_through_the_placement_gate(self):
+        # The host's real inventory digest differs from the descriptor's
+        # authorized claim: observe_placement refuses, and the launch boundary
+        # is never reached.
+        for uuid in (PLACEMENT_UUID, "GPU-99999999-9999-9999-9999-999999999999"):
+            with self.subTest(uuid=uuid):
+                events = []
+                error = io.StringIO()
+                patches = (*self._asserted_placement_patches(events, "f" * 64, uuid=uuid),
+                           mock.patch.object(entry, "verify_checkpoint",
+                                             side_effect=lambda root: preflight._verify(root, self.manifest)),
+                           mock.patch.object(entry, "revalidate_checkpoint",
+                                             side_effect=lambda value: preflight._revalidate(value, self.manifest)),
+                           mock.patch.object(entry, "_import_and_launch",
+                                             side_effect=AssertionError("launched")))
+                for patch in patches:
+                    patch.start()
+                try:
+                    result = entry.main(self.argv(),
+                                        self.scoped_payloads(digest=PLACEMENT_DIGEST).__getitem__, error)
+                finally:
+                    for patch in reversed(patches):
+                        patch.stop()
+                self.assertEqual(result, 1)
+                # The earlier gates ran green; the placement gate is what
+                # refused, before any engine import.
+                self.assertEqual(events, ["verify", "revalidate", "plugins"])
+                self.assertEqual(error.getvalue(),
+                                 "sglang_startup_failed: placement_failed\n")
+
+    def test_digest_without_an_inherited_namespace_fails_closed(self):
+        # The digest alone is not placement: without the guarded inherited
+        # CUDA namespace the mapping cannot be assembled honestly, and the
+        # placement gate refuses rather than guessing a device.
+        events = []
+        error = io.StringIO()
+        patches = (*self._green_gate_patches(events, []),
+                   mock.patch.dict(os.environ, {}, clear=True),
+                   mock.patch.object(entry, "verify_checkpoint",
+                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
+                   mock.patch.object(entry, "revalidate_checkpoint",
+                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
+                   mock.patch.object(entry, "_import_and_launch",
+                                     side_effect=AssertionError("launched")))
+        for patch in patches:
+            patch.start()
+        try:
+            result = entry.main(self.argv(), self.scoped_payloads(digest=PLACEMENT_DIGEST).__getitem__, error)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        self.assertEqual(result, 1)
+        self.assertEqual(events, ["verify", "revalidate", "plugins"])
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_failed\n")
 
     def test_each_gate_failure_surfaces_its_own_closed_category_from_main(self):
         cases = (

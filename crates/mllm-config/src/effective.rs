@@ -1,18 +1,18 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
-pub mod sglang;
 mod core;
 mod current_policy;
+pub mod sglang;
 mod snapshot;
-pub use snapshot::decode_effective_snapshot;
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
+pub use snapshot::decode_effective_snapshot;
 
 use crate::engine_policy::{normalize_option_name, validate_profile_args, validate_profile_env};
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
 use mllm_domain::launch::{
-    ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget,
-    VllmLaunchSettings, VllmRequestedBudget,
+    ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget, VllmLaunchSettings,
+    VllmRequestedBudget,
 };
 use mllm_domain::resources as domain;
 use serde::{Deserialize, Serialize};
@@ -322,6 +322,13 @@ pub struct HostPolicy {
     pub name: String,
     pub hardware_fingerprint: String,
     pub environment_fingerprint: String,
+    /// The host's published NVIDIA device inventory digest
+    /// (`runtime/sglang_device.collect_inventory()` schema
+    /// `mllm-nvidia-inventory-v1`), stated at boot like the fingerprints.
+    /// Optional: a host that has not published one launches with placement
+    /// unasserted and fails closed at the native placement gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_inventory_digest: Option<String>,
     /// Absolute directory this host keeps model weights under. SPEC §7: a relative
     /// local model path is resolved against it, so it is required rather than
     /// defaulted — a guessed directory would resolve paths somewhere unnamed.
@@ -446,6 +453,8 @@ struct HostInput {
     name: String,
     hardware_fingerprint: String,
     environment_fingerprint: String,
+    #[serde(default)]
+    device_inventory_digest: Option<String>,
     model_store: RawModelStore,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,

@@ -11,6 +11,7 @@ fn host() -> HostPolicy {
         name: "host-a".into(),
         hardware_fingerprint: "hw".into(),
         environment_fingerprint: "env".into(),
+        device_inventory_digest: None,
         model_store: "/srv/models".into(),
         domains: BTreeMap::from([(
             "system".into(),

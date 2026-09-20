@@ -58,8 +58,9 @@ fn private_descriptor(
     context: &StepExecutionContext,
     checkpoint_root: &str,
     public_settings: &serde_json::Value,
+    placement_digest: Option<&str>,
 ) -> Result<Vec<u8>, RuntimeError> {
-    serde_json::to_vec(&json!({
+    let mut descriptor = json!({
         "schema_version": 2,
         "kind": "sglang_private_launch",
         "checkpoint_root": checkpoint_root,
@@ -76,8 +77,15 @@ fn private_descriptor(
             "issued_at_ms": context.issued_at_ms,
             "deadline_ms": context.deadline_ms,
         },
-    }))
-    .map_err(|_| RuntimeError::Uncertain("descriptor encoding failed".into()))
+    });
+    if let Some(digest) = placement_digest {
+        descriptor
+            .as_object_mut()
+            .ok_or_else(|| RuntimeError::Uncertain("descriptor encoding failed".into()))?
+            .insert("placement_digest".into(), json!(digest));
+    }
+    serde_json::to_vec(&descriptor)
+        .map_err(|_| RuntimeError::Uncertain("descriptor encoding failed".into()))
 }
 
 pub(super) async fn initialize(
@@ -109,6 +117,7 @@ pub(super) async fn initialize(
         context,
         launch.frozen.checkpoint_root(),
         launch.rendered.public_metadata(),
+        launch.frozen.metadata().placement_digest.as_deref(),
     )?;
     let descriptors =
         ProtectedLaunchDescriptors::new(&private, inference.as_bytes(), admin.as_bytes()).map_err(

@@ -86,6 +86,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
             source_revision: "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1".into(),
             checkpoint_revision: "cdbee75f17c01a7cc42f958dc650907174af0554".into(),
             rendered_settings_digest: "a".repeat(64),
+            placement_digest: None,
             device: mllm_domain::launch::NativeDeviceSelection {
                 host_id: "host-a".into(),
                 hardware_fingerprint: "hardware-v1".into(),

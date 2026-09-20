@@ -51,9 +51,7 @@ pub fn frozen_from_work(
         .host
         .devices
         .get(&device.id)
-        .ok_or_else(|| {
-            CoordinatorError::Service("selected device is not a host device".into())
-        })?
+        .ok_or_else(|| CoordinatorError::Service("selected device is not a host device".into()))?
         .domain;
     // SPEC §13.3: a launch needs a directory on disk; an unresolved source is
     // refused rather than invented.
@@ -61,17 +59,13 @@ pub fn frozen_from_work(
         .model
         .require_resolved_path()
         .map_err(|_| {
-            CoordinatorError::Service(
-                "initialize work resolves to no checkpoint root".into(),
-            )
+            CoordinatorError::Service("initialize work resolves to no checkpoint root".into())
         })?
         .to_owned();
-    let digest = hex::encode(
-        Sha256::digest(
-            serde_json::to_vec(settings)
-                .map_err(|_| CoordinatorError::Service("settings encoding failed".into()))?,
-        ),
-    );
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(settings)
+            .map_err(|_| CoordinatorError::Service("settings encoding failed".into()))?,
+    ));
     let metadata = NativeLaunchMetadata {
         engine: "sglang".into(),
         recipe: NATIVE_SGLANG_RECIPE.into(),
@@ -82,6 +76,11 @@ pub fn frozen_from_work(
         endpoint: format!("http://{}", work.endpoint()),
         served_name,
         rendered_settings_digest: digest,
+        // The host's published inventory digest (SPEC §3: reviewed logical
+        // placement) travels to the entry so its composition can assert
+        // placement against freshly collected inventory. Absent when the host
+        // published none, which leaves the gate unasserted and fail-closed.
+        placement_digest: effective.host.device_inventory_digest.clone(),
         device: NativeDeviceSelection {
             host_id: effective.host.name.clone(),
             hardware_fingerprint: effective.host.hardware_fingerprint.clone(),
@@ -107,8 +106,9 @@ pub fn private_descriptor(
     execution: &StepExecutionContext,
     checkpoint_root: &str,
     public_settings: &serde_json::Value,
+    placement_digest: Option<&str>,
 ) -> Result<Vec<u8>, RuntimeError> {
-    serde_json::to_vec(&serde_json::json!({
+    let mut descriptor = serde_json::json!({
         "schema_version": 2,
         "kind": "sglang_private_launch",
         "checkpoint_root": checkpoint_root,
@@ -125,6 +125,13 @@ pub fn private_descriptor(
             "issued_at_ms": execution.issued_at_ms,
             "deadline_ms": execution.deadline_ms,
         },
-    }))
-    .map_err(|_| RuntimeError::Uncertain("descriptor encoding failed".into()))
+    });
+    if let Some(digest) = placement_digest {
+        descriptor
+            .as_object_mut()
+            .ok_or_else(|| RuntimeError::Uncertain("descriptor encoding failed".into()))?
+            .insert("placement_digest".into(), serde_json::json!(digest));
+    }
+    serde_json::to_vec(&descriptor)
+        .map_err(|_| RuntimeError::Uncertain("descriptor encoding failed".into()))
 }

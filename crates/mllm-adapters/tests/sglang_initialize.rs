@@ -337,6 +337,7 @@ fn frozen_launch(port: u16) -> NativeLaunch {
             incarnation: INCARNATION.into(),
             endpoint: format!("http://127.0.0.1:{port}"),
             rendered_settings_digest: "a".repeat(64),
+            placement_digest: None,
             device: NativeDeviceSelection {
                 host_id: "host-a".into(),
                 hardware_fingerprint: "hardware-v1".into(),

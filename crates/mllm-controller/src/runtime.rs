@@ -245,6 +245,7 @@ impl<'a> NativeLaunchHandoff<'a> {
             &execution,
             frozen.checkpoint_root(),
             launch.public_metadata(),
+            frozen.metadata().placement_digest.as_deref(),
         )?;
         let descriptors =
             mllm_launchers::ProtectedLaunchDescriptors::new(&private, &inference, &admin)

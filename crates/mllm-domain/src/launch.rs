@@ -80,6 +80,10 @@ pub struct NativeLaunchMetadata {
     pub endpoint: String,
     pub served_name: String,
     pub rendered_settings_digest: String,
+    /// The host's service-authorized device inventory digest, or `None` when
+    /// the host published none. Carried in the private descriptor only, so the
+    /// native entry can assert placement against it; never a public field.
+    pub placement_digest: Option<String>,
     pub device: NativeDeviceSelection,
 }
 

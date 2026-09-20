@@ -1125,3 +1125,58 @@ fn legacy_model_path_is_a_local_source() {
         .remove("path");
     assert!(resolve_effective(&deployment, &host).is_err(), "neither");
 }
+
+
+/// The host's published device inventory digest (`runtime/sglang_device`
+/// `mllm-nvidia-inventory-v1`) is optional host policy: present, it must be the
+/// exact lowercase hex digest the collector computes; absent, the native
+/// launch carries placement as unasserted and fails closed.
+#[test]
+fn a_host_may_publish_a_device_inventory_digest() {
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let (deployment, mut host) = fixture();
+    host["device_inventory_digest"] = serde_json::json!(DIGEST);
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(
+        effective.host.device_inventory_digest.as_deref(),
+        Some(DIGEST)
+    );
+    // The digest survives the stored snapshot round-trip, which is the only
+    // path the armed launch's frozen work reads.
+    let snapshot = serde_json::to_value(&effective).unwrap();
+    assert_eq!(snapshot["host"]["device_inventory_digest"], DIGEST);
+    assert_eq!(
+        mllm_config::effective::decode_effective_snapshot(&snapshot.to_string())
+            .unwrap()
+            .host
+            .device_inventory_digest
+            .as_deref(),
+        Some(DIGEST)
+    );
+
+    for bad in [
+        "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+        "z123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+    ] {
+        let (deployment, mut host) = fixture();
+        host["device_inventory_digest"] = serde_json::json!(bad);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(
+            error.to_string().contains("device_inventory_digest"),
+            "{error}"
+        );
+    }
+
+    // The strict document walk (management import path) allowlists the field
+    // for the host kind, so a published digest survives the same gate every
+    // other host field passes.
+    let (deployment, mut host) = fixture();
+    host["device_inventory_digest"] = serde_json::json!(DIGEST);
+    let parsed = parse_strict(ConfigKind::Host, &serde_json::to_string(&host).unwrap()).unwrap();
+    let effective = resolve_effective(&deployment, &parsed).unwrap();
+    assert_eq!(
+        effective.host.device_inventory_digest.as_deref(),
+        Some(DIGEST)
+    );
+}

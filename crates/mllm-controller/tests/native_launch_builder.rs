@@ -154,9 +154,14 @@ fn private_descriptor_output_byte_matches_the_json_the_arm_built() {
         "kind": "sglang_launch",
         "binding_id": execution.binding_id,
     });
-    let bytes =
-        private_descriptor("01J0000000000000000000000SE", &execution, "/srv/models/toy", &public)
-            .unwrap();
+    let bytes = private_descriptor(
+        "01J0000000000000000000000SE",
+        &execution,
+        "/srv/models/toy",
+        &public,
+        None,
+    )
+    .unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 5);
     assert_eq!(value["schema_version"], 2);
@@ -178,6 +183,65 @@ fn private_descriptor_output_byte_matches_the_json_the_arm_built() {
             "deadline_ms": 300000,
         })
     );
+}
+
+// The host's published device inventory digest threads from the host policy
+// through the frozen metadata into the private descriptor, so the entry's
+// composition can assert placement against service-authorized evidence.
+#[test]
+fn builder_threads_the_host_inventory_digest_into_metadata_and_descriptor() {
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let fixture = accepted_work(SGLANG_GOLDEN, |_, host| {
+        host["device_inventory_digest"] = json!(DIGEST);
+    });
+    let work = &fixture.work;
+    let launch = frozen_from_work(
+        work,
+        "ordinary".into(),
+        "secret://engine-key".into(),
+        "secret://admin-key".into(),
+    )
+    .unwrap();
+    assert_eq!(launch.metadata().placement_digest.as_deref(), Some(DIGEST));
+    let execution = StepExecutionContext {
+        token: TransitionToken {
+            deployment_id: "01J0000000000000000000000DE".into(),
+            revision: 3,
+            generation: 2,
+            operation_id: "01J0000000000000000000000OP".into(),
+            step_id: "01J0000000000000000000000ST".into(),
+        },
+        binding_id: "01J0000000000000000000000BI".into(),
+        incarnation: "01J0000000000000000000000IN".into(),
+        issued_at_ms: 1200,
+        deadline_ms: 300000,
+        identities: ExecutionIdentities::OwnedLaunch,
+        completion_target: None,
+        grant_id: None,
+        launch_settings: None,
+    };
+    let bytes = private_descriptor(
+        "01J0000000000000000000000SE",
+        &execution,
+        "/srv/models/toy",
+        &json!({"schema_version": 1}),
+        Some(DIGEST),
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["placement_digest"], DIGEST);
+    // A host that published no digest leaves the field absent: the entry
+    // carries placement as unasserted and fails closed, never guesses.
+    let absent = private_descriptor(
+        "01J0000000000000000000000SE",
+        &execution,
+        "/srv/models/toy",
+        &json!({"schema_version": 1}),
+        None,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_slice(&absent).unwrap();
+    assert!(value.get("placement_digest").is_none());
 }
 
 // T02: a non-SGLang profile is refused closed.

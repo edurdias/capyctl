@@ -152,6 +152,7 @@ impl NativeFixture {
                 endpoint: format!("http://{}", self.endpoint),
                 served_name: "ordinary".into(),
                 rendered_settings_digest: digest.into(),
+                placement_digest: None,
                 device: NativeDeviceSelection {
                     host_id: "lab".into(),
                     hardware_fingerprint: "hw-01".into(),

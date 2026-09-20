@@ -2,10 +2,13 @@
 
 The audited startup gates compose through sglang_native_composition before any
 engine import: pinned source revalidation, plugin closure, and checkpoint
-revalidation must hold as one native contract. Placement stays explicitly
-unasserted until the descriptor carries an authorized inventory digest and the
-service supplies its device mapping; the launch boundary fails closed on that
-carried fact rather than inferring it as satisfaction. The engine import
+revalidation must hold as one native contract. Placement is asserted only when
+the descriptor carries the service-authorized device inventory digest the host
+policy published; the mapping is then assembled from the descriptor's
+service-frozen device selectors, that digest, and the inherited CUDA namespace,
+and corroborated against freshly collected inventory. Without the digest the
+launch boundary fails closed on that carried fact rather than inferring it as
+satisfaction. The engine import
 happens only inside the guarded boundary after the contract is held, through
 the launcher-pinned package root and without site processing. A descriptor
 validates shape and binds private inputs; it does not authorize a launch or
@@ -83,8 +86,11 @@ class LaunchSpec:
     _inference_key: str = field(repr=False)
     _admin_key: str = field(repr=False)
     # Version 1 has no scope and must never be promoted implicitly. Version 2
-    # carries immutable private metadata, not enrollment or execution authority.
+    # carries immutable private metadata, not enrollment or execution authority,
+    # plus the optional service-authorized device inventory digest the host
+    # policy published; the entry never invents either.
     _launch_scope_json: str | None = field(default=None, repr=False)
+    _placement_digest: str | None = field(default=None, repr=False)
 
     def __repr__(self):
         return "LaunchSpec(<private>)"
@@ -289,7 +295,24 @@ def build_launch(argv, descriptor_reader):
         version = private.get("schema_version")
         _integer(version, 1, 2)
         keys = ("schema_version", "kind", "checkpoint_root", "public_settings")
-        _exact_object(private, keys if version == 1 else (*keys, "launch_scope"))
+        if version == 1:
+            _exact_object(private, keys)
+            digest = None
+        else:
+            scope_keys = (*keys, "launch_scope")
+            # The private descriptor carries the service-authorized device
+            # inventory digest (the host policy's published claim, frozen into
+            # the launch) as one optional field. Its presence is the entry's
+            # only instruction to assert placement; its value must be the
+            # exact 64 lowercase hex digits the collector computes.
+            if set(private) == set((*scope_keys, "placement_digest")):
+                digest = private["placement_digest"]
+                _text(digest, 64)
+                if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                    _reject()
+            else:
+                _exact_object(private, scope_keys)
+                digest = None
         _literal(private["kind"], "sglang_private_launch")
         _validate_public(private["public_settings"])
         if private["public_settings"] != public:
@@ -304,7 +327,7 @@ def build_launch(argv, descriptor_reader):
         if hmac.compare_digest(inference, admin):
             raise LaunchError("invalid_credentials")
         return LaunchSpec(json.dumps(public, sort_keys=True, separators=(",", ":")),
-                          root, inference, admin, launch_scope)
+                          root, inference, admin, launch_scope, digest)
     except LaunchError as error:
         raise LaunchError(error.code) from None
     except Exception:
@@ -326,6 +349,27 @@ def _trusted_package_root():
                         "site-packages", "sglang", "srt")
 
 
+def _placement_mapping(spec, digest):
+    """Assemble the service-supplied placement inputs for the digest, or None.
+
+    The descriptor's device selectors (host/hardware/device/memory) are
+    service-frozen values delivered over the protected descriptor fd, and the
+    digest is the host policy's published inventory claim frozen into the same
+    descriptor. The physical UUID is the one complete verified UUID in the
+    inherited CUDA namespace — the guarded-service obligation sglang_device
+    documents — observed here, never invented. observe_placement corroborates
+    the assembled mapping against freshly collected inventory; nothing here is
+    placement evidence by construction.
+    """
+    from runtime.sglang_device import TrustedDeviceMapping
+    device = json.loads(spec._public_json)["device"]
+    return TrustedDeviceMapping(
+        host_id=device["host_id"], hardware_fingerprint=device["hardware_fingerprint"],
+        device_id=device["device_id"], memory_domain=device["memory_domain"],
+        physical_gpu_uuid=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        inventory_digest=digest)
+
+
 def _verified_native_contract(spec, checkpoint):
     """Run the audited startup gates and hold the resulting native contract.
 
@@ -333,16 +377,27 @@ def _verified_native_contract(spec, checkpoint):
     plugin closure, placement, checkpoint revalidation — and any failure
     leaves through the gate's own closed category, never the retired blanket
     denial. The entry supplies the package root composed from the
-    launcher-selected interpreter and no placement inputs: the descriptor
-    carries no authorized inventory digest and the entry process holds no
-    service device mapping, so compose is invoked with placement_digest=None
-    and the contract records placement_asserted=False as an explicit unmet
-    obligation, never as placement evidence.
+    launcher-selected interpreter. When the descriptor carries the
+    service-authorized inventory digest, the entry passes it with a
+    TrustedDeviceMapping assembled from the descriptor's service-frozen device
+    selectors, that digest, and the inherited CUDA namespace, so placement is
+    asserted against freshly collected inventory; otherwise compose is invoked
+    with placement_digest=None and the contract records
+    placement_asserted=False as an explicit unmet obligation, never as
+    placement evidence. A digest the entry cannot honestly pair with a mapping
+    input (for example no inherited namespace) fails closed through the
+    placement gate's own category.
     """
     from runtime import sglang_native_composition as composition
     try:
-        return composition.compose(spec, checkpoint, package_root=_trusted_package_root(),
-                                   trusted_mapping=None, placement_digest=None)
+        if spec._placement_digest is None:
+            return composition.compose(spec, checkpoint,
+                                       package_root=_trusted_package_root(),
+                                       trusted_mapping=None, placement_digest=None)
+        return composition.compose(spec, checkpoint,
+                                   package_root=_trusted_package_root(),
+                                   trusted_mapping=_placement_mapping(spec, spec._placement_digest),
+                                   placement_digest=spec._placement_digest)
     except composition.NativeCompositionError as error:
         raise LaunchError(error.code) from None
 

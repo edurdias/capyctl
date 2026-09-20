@@ -258,6 +258,23 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             return Err(invalid(path, "must not be empty"));
         }
     }
+    // The inventory digest is the host's published claim about its own NVIDIA
+    // device inventory (sglang_device's `mllm-nvidia-inventory-v1` material). It
+    // is versioned evidence the native placement gate asserts against, never a
+    // reinterpretation of the opaque hardware fingerprint, so it must be a
+    // lowercase hex digest exactly as the collector computes it.
+    if let Some(digest) = h.device_inventory_digest.as_ref() {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(invalid(
+                "host.device_inventory_digest",
+                "must be 64 lowercase hexadecimal characters",
+            ));
+        }
+    }
     // Spec §7: the store anchors every relative model path, so it has to be a
     // place, not a fragment that means something different per working directory.
     let model_store = PathBuf::from(h.model_store.path);
@@ -322,6 +339,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
         environment_fingerprint: h.environment_fingerprint,
+        device_inventory_digest: h.device_inventory_digest,
         model_store,
         domains,
         devices: h.resource_policy.devices,
