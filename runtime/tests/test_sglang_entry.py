@@ -14,6 +14,9 @@ from unittest import mock
 
 from runtime import sglang_entry as entry
 from runtime import checkpoint_preflight as preflight
+from runtime import sglang_native_composition as composition
+from runtime import sglang_server_args as server_args
+from runtime import sglang_source_preflight as source
 from runtime import sglang_startup_guards as guards
 import test_checkpoint_preflight as checkpoint_fixtures
 
@@ -116,11 +119,20 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         self.assertNotIn("launch_scope", self.argv()[1])
         with self.assertRaises((AttributeError, TypeError)):
             spec._launch_scope_json = "{}"
-        for guarded in (lambda: entry._verified_native_contract(spec, None),
-                        lambda: entry._import_and_launch(spec, None, None)):
+        # The scope is private immutable metadata, not launch authority: the
+        # boundary still refuses through the gates' own closed categories and
+        # never reaches the audited argument mapper without a held contract.
+        with mock.patch.object(composition, "verify_sglang_sources", side_effect=lambda root: None), \
+                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=lambda previous: None), \
+                mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None):
             with self.assertRaises(entry.LaunchError) as caught:
-                guarded()
-            self.assertEqual(caught.exception.code, "pinned_source_contract_unavailable")
+                entry._verified_native_contract(spec, None)
+        self.assertEqual(caught.exception.code, "checkpoint_revalidation_failed")
+        with mock.patch.object(entry, "_guarded_engine_import", side_effect=lambda: (object(), object())), \
+                mock.patch.object(server_args, "construct_server_args",
+                                  side_effect=AssertionError("constructed")):
+            with self.assertRaises((AttributeError, TypeError)):
+                entry._import_and_launch(spec, None, None)
         self.assertIsNone(self.build()._launch_scope_json)
 
     def test_v2_scope_rejects_wrong_types_bounds_identity_and_unknown_fields(self):
@@ -372,13 +384,167 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         self.root = str(fixture.root)
         self.manifest = fixture.manifest()
 
-    def test_missing_verified_source_contract_cannot_launch(self):
+    def test_failed_source_revalidation_denies_through_the_gates_own_category(self):
+        # A gate failure is the gate's own closed category from main; the
+        # retired blanket denial literal is gone, and the guarded launch
+        # boundary is never reached on any composition failure.
         error = io.StringIO()
         with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
+                mock.patch.object(composition, "verify_sglang_sources",
+                                  side_effect=source.SourcePreflightError("artifact_missing")), \
                 mock.patch.object(entry, "_import_and_launch", side_effect=AssertionError("launched")):
             result = entry.main(self.argv(), self.payloads().__getitem__, error)
         self.assertEqual(result, 1)
-        self.assertEqual(error.getvalue(), "sglang_startup_failed: pinned_source_contract_unavailable\n")
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: source_revalidation_failed\n")
+
+    def _green_gate_patches(self, events, roots):
+        def verify(root):
+            events.append("verify")
+            roots.append(root)
+
+        def revalidate(previous):
+            events.append("revalidate")
+
+        def plugins():
+            events.append("plugins")
+
+        def checkpoint(previous):
+            events.append("checkpoint")
+            return previous
+
+        return (mock.patch.object(composition, "verify_sglang_sources", side_effect=verify),
+                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=revalidate),
+                mock.patch.object(composition, "enforce_closed_plugins", side_effect=plugins),
+                mock.patch.object(composition, "revalidate_checkpoint", side_effect=checkpoint))
+
+    def test_held_contract_reaches_the_guarded_import_boundary_and_launches(self):
+        events = []
+        roots = []
+        error = io.StringIO()
+        arguments = mock.Mock()
+        checked = mock.Mock()
+        native = checked._native
+        launch_calls = []
+
+        def guarded_import():
+            events.append("import")
+            launch = mock.Mock()
+            launch_calls.append(launch)
+            return arguments, launch
+
+        placements = []
+
+        def recorded_construct(spec, placement, constructor):
+            placements.append(placement)
+            return checked
+
+        patches = (*self._green_gate_patches(events, roots),
+                   mock.patch.object(entry, "verify_checkpoint",
+                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
+                   mock.patch.object(entry, "revalidate_checkpoint",
+                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
+                   mock.patch.object(entry, "_guarded_engine_import", side_effect=guarded_import),
+                   mock.patch.object(server_args, "construct_server_args",
+                                     side_effect=recorded_construct))
+        for patch in patches:
+            patch.start()
+        try:
+            result = entry.main(self.argv(), self.payloads().__getitem__, error)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        self.assertEqual(result, 0)
+        self.assertEqual(error.getvalue(), "")
+        # The gates ran in composition's fixed order before the boundary, the
+        # package root is the launcher-selected interpreter's composed tree,
+        # and the unasserted placement is carried as None, never faked.
+        self.assertEqual(events, ["verify", "revalidate", "plugins", "checkpoint", "import"])
+        self.assertEqual(roots, [entry._trusted_package_root()])
+        self.assertEqual(placements, [None])
+        launch_calls[0].launch_server.assert_called_once_with(native)
+
+    def test_unasserted_placement_fails_closed_before_engine_start(self):
+        # The descriptor carries no authorized placement digest, so the
+        # contract records placement_asserted=False and the audited argument
+        # mapper refuses it before any construction; the engine start call is
+        # never reached.
+        events = []
+        error = io.StringIO()
+        launch = mock.Mock()
+        with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
+                mock.patch.object(entry, "revalidate_checkpoint", side_effect=lambda value: preflight._revalidate(value, self.manifest)), \
+                mock.patch.object(composition, "verify_sglang_sources", side_effect=lambda root: None), \
+                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=lambda previous: previous), \
+                mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
+                mock.patch.object(composition, "revalidate_checkpoint", side_effect=lambda previous: previous), \
+                mock.patch.object(entry, "_guarded_engine_import",
+                                  side_effect=lambda: (events.append("import"), (mock.Mock(), launch))[1]):
+            result = entry.main(self.argv(), self.payloads().__getitem__, error)
+        self.assertEqual(result, 1)
+        self.assertEqual(events, ["import"])
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: startup_error\n")
+        launch.assert_not_called()
+
+    def test_each_gate_failure_surfaces_its_own_closed_category_from_main(self):
+        cases = (
+            ("plugin_closure_failed",
+             {"verify_sglang_sources": mock.Mock(),
+              "revalidate_sglang_sources": mock.Mock(),
+              "enforce_closed_plugins": mock.Mock(
+                  side_effect=guards.StartupGuardError("external_plugins_present"))}),
+            ("checkpoint_revalidation_failed",
+             {"verify_sglang_sources": mock.Mock(),
+              "revalidate_sglang_sources": mock.Mock(),
+              "enforce_closed_plugins": mock.Mock(),
+              "revalidate_checkpoint": mock.Mock(
+                  side_effect=preflight.CheckpointPreflightError("artifact_changed"))}),
+        )
+        for expected, overrides in cases:
+            with self.subTest(expected=expected):
+                error = io.StringIO()
+                patches = [mock.patch.object(composition, name, value)
+                           for name, value in overrides.items()]
+                patches.append(mock.patch.object(entry, "verify_checkpoint",
+                                                 side_effect=lambda root: preflight._verify(root, self.manifest)))
+                patches.append(mock.patch.object(entry, "_import_and_launch",
+                                                 side_effect=AssertionError("launched")))
+                for patch in patches:
+                    patch.start()
+                try:
+                    result = entry.main(self.argv(), self.payloads().__getitem__, error)
+                finally:
+                    for patch in reversed(patches):
+                        patch.stop()
+                self.assertEqual((result, error.getvalue()),
+                                 (1, "sglang_startup_failed: " + expected + "\n"))
+
+    def test_composition_denial_category_renders_from_main(self):
+        # compose's own categories pass through the conversion verbatim; the
+        # placement category is unreachable from today's invocation (the
+        # descriptor carries no digest), so it is exercised at the seam.
+        error = io.StringIO()
+        with mock.patch.object(composition, "compose",
+                               side_effect=composition.NativeCompositionError("placement_failed")), \
+                mock.patch.object(entry, "verify_checkpoint",
+                                  side_effect=lambda root: preflight._verify(root, self.manifest)), \
+                mock.patch.object(entry, "_import_and_launch",
+                                  side_effect=AssertionError("launched")):
+            result = entry.main(self.argv(), self.payloads().__getitem__, error)
+        self.assertEqual(result, 1)
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_failed\n")
+
+    def test_failed_engine_import_denies_through_startup_error(self):
+        error = io.StringIO()
+        with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
+                mock.patch.object(entry, "revalidate_checkpoint", side_effect=lambda value: preflight._revalidate(value, self.manifest)), \
+                mock.patch.object(composition, "verify_sglang_sources", side_effect=lambda root: None), \
+                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=lambda previous: previous), \
+                mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
+                mock.patch.object(composition, "revalidate_checkpoint", side_effect=lambda previous: previous), \
+                mock.patch.object(entry, "_guarded_engine_import", side_effect=ImportError("sglang")):
+            result = entry.main(self.argv(), self.payloads().__getitem__, error)
+        self.assertEqual(result, 1)
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: startup_error\n")
 
     def run_with_contract(self, prepare):
         events = []

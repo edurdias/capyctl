@@ -157,7 +157,7 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         for secret in (self.root, self.inference.decode(), self.admin.decode()):
             self.assertNotIn(secret, repr(caught.exception))
 
-    def test_import_is_cpu_only_and_native_gate_remains_closed(self):
+    def test_import_is_cpu_only_and_the_boundary_requires_a_held_contract(self):
         original = __import__
         def guard(name, *args, **kwargs):
             if name.split(".")[0] in ("sglang", "torch", "torch_memory_saver"):
@@ -165,9 +165,16 @@ class MappingTests(LaunchFixture, unittest.TestCase):
             return original(name, *args, **kwargs)
         with mock.patch("builtins.__import__", side_effect=guard):
             importlib.reload(mapping)
+            # The composition runs its gates without any native import and
+            # denies through the gate's own closed category.
             with self.assertRaises(entry.LaunchError):
                 entry._verified_native_contract(self.build(), object())
-            with self.assertRaises(entry.LaunchError):
+        # The guarded import seam is the only native import location, and the
+        # audited argument mapper is never reached without a held contract.
+        with mock.patch.object(entry, "_guarded_engine_import", side_effect=lambda: (object(), object())), \
+                mock.patch.object(mapping, "construct_server_args",
+                                  side_effect=AssertionError("constructed")):
+            with self.assertRaises((AttributeError, TypeError)):
                 entry._import_and_launch(self.build(), object(), object())
 
 

@@ -1,9 +1,15 @@
 """Protected SGLang startup boundary, using only the standard library.
 
-The pinned helpers are not yet composed into a verified native startup contract.
-Real startup therefore fails closed before engine import. A descriptor validates
-shape and binds private inputs; it does not authorize a launch or qualify memory
-release. The controller retains those obligations.
+The audited startup gates compose through sglang_native_composition before any
+engine import: pinned source revalidation, plugin closure, and checkpoint
+revalidation must hold as one native contract. Placement stays explicitly
+unasserted until the descriptor carries an authorized inventory digest and the
+service supplies its device mapping; the launch boundary fails closed on that
+carried fact rather than inferring it as satisfaction. The engine import
+happens only inside the guarded boundary after the contract is held, through
+the launcher-pinned package root and without site processing. A descriptor
+validates shape and binds private inputs; it does not authorize a launch or
+qualify memory release. The controller retains those obligations.
 """
 
 from dataclasses import dataclass, field
@@ -43,7 +49,11 @@ _CHECKPOINT = "cdbee75f17c01a7cc42f958dc650907174af0554"
 _MINIMUM_KV = 603979776
 _CODES = frozenset({"invalid_descriptor", "invalid_credentials", "descriptor_io",
                     "pinned_source_contract_unavailable", "memory_saver_unavailable",
-                    "startup_error"})
+                    "startup_error",
+                    # The composition gates' own closed categories, surfaced
+                    # verbatim through LaunchError when a gate refuses.
+                    "source_revalidation_failed", "plugin_closure_failed",
+                    "placement_failed", "checkpoint_revalidation_failed"})
 _SETTINGS = {
     "recipe": _RECIPE, "tensor_parallel_size": 1, "data_parallel_size": 1,
     "tokenizer_workers": 1, "model_dtype": "bfloat16", "context_tokens": 4096,
@@ -301,20 +311,78 @@ def build_launch(argv, descriptor_reader):
         raise LaunchError("invalid_descriptor") from None
 
 
-def _verified_native_contract(spec, checkpoint):
-    """A pinned source map and real memory-saver observation are mandatory.
+def _trusted_package_root():
+    """Compose the pinned engine package root from the launcher's own selection.
 
-    Source/argument/saver helpers exist, but protected startup, worker enrollment,
-    and service observation are not yet composed. A caller-supplied assertion,
-    settings.memory_saver=true, or installed module is insufficient. Replacing
-    this denial requires the complete audited startup and observation contract.
+    The rendered command (args.rs render_for_launcher) pins the engine
+    interpreter as argv[0]; under -IS no site processing selects a package
+    root, so the path is composed explicitly from that executable's
+    environment prefix. Nothing is discovered from PATH, PYTHONPATH, or .pth
+    hooks. A wrong composition fails closed in source revalidation with that
+    gate's own category.
     """
-    raise LaunchError("pinned_source_contract_unavailable")
+    prefix = os.path.dirname(os.path.dirname(sys.executable))
+    return os.path.join(prefix, "lib", "python%d.%d" % sys.version_info[:2],
+                        "site-packages", "sglang", "srt")
+
+
+def _verified_native_contract(spec, checkpoint):
+    """Run the audited startup gates and hold the resulting native contract.
+
+    The gates run in composition's fixed order — pinned source revalidation,
+    plugin closure, placement, checkpoint revalidation — and any failure
+    leaves through the gate's own closed category, never the retired blanket
+    denial. The entry supplies the package root composed from the
+    launcher-selected interpreter and no placement inputs: the descriptor
+    carries no authorized inventory digest and the entry process holds no
+    service device mapping, so compose is invoked with placement_digest=None
+    and the contract records placement_asserted=False as an explicit unmet
+    obligation, never as placement evidence.
+    """
+    from runtime import sglang_native_composition as composition
+    try:
+        return composition.compose(spec, checkpoint, package_root=_trusted_package_root(),
+                                   trusted_mapping=None, placement_digest=None)
+    except composition.NativeCompositionError as error:
+        raise LaunchError(error.code) from None
+
+
+def _guarded_engine_import():
+    """The single guarded native import seam; only the held contract reaches it.
+
+    Composes the trusted search path explicitly — never site.main(), never
+    .pth hooks — and imports the pinned engine startup modules inside this
+    function only; every engine import in this process happens here. The
+    search path is appended, so the stdlib and this protected package keep
+    precedence over the verified tree. Tests substitute this seam; a failed
+    import leaves through main's closed startup category.
+    """
+    search = os.path.dirname(_trusted_package_root())
+    if search not in sys.path:
+        sys.path.append(search)
+    import sglang.launch_server as launch
+    from sglang.srt import server_args as arguments
+    return arguments, launch
 
 
 def _import_and_launch(spec, checkpoint, contract):
-    """Reserved guarded import boundary; no permissive fallback exists."""
-    raise LaunchError("pinned_source_contract_unavailable")
+    """The guarded launch boundary; the verified contract is the only key.
+
+    The contract's placement is consumed exactly as composed: an unasserted
+    digest is carried as placement=None and the audited argument mapper fails
+    closed on it, never guessing a device. The scheduler observation bridge
+    and protected listener are engine-side wiring — they attach to an
+    initialized Scheduler inside the engine's own spawned interpreter, which
+    this parent process cannot reach — so no observation attachment happens
+    here and that enrollment remains required before any live launch. No
+    permissive fallback exists: an import or startup failure leaves through
+    main's closed categories.
+    """
+    from runtime import sglang_server_args
+    arguments, launch = _guarded_engine_import()
+    checked = sglang_server_args.construct_server_args(
+        spec, contract.placement, arguments.ServerArgs)
+    launch.launch_server(checked._native)
 
 
 def main(argv=None, descriptor_reader=None, stderr=None):
