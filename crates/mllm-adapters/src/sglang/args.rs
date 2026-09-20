@@ -79,7 +79,7 @@ impl SglangLaunch {
             || m.checkpoint_revision != NATIVE_CHECKPOINT_REVISION
             || !ulid(&m.binding_id)
             || !ulid(&m.incarnation)
-            || m.served_name != format!("candidate-{}", m.binding_id)
+            || !served_name_token(&m.served_name)
             || !private_endpoint(&m.endpoint)
             || m.rendered_settings_digest.len() != 64
             || !m
@@ -118,7 +118,7 @@ impl SglangLaunch {
         let fraction = format!("{}.{:04}", bps / 10000, bps % 10000);
         let public = json!({
             "schema_version": 1,
-            "kind": "sglang_candidate_launch",
+            "kind": "sglang_launch",
             "engine": m.engine,
             "recipe": m.recipe,
             "source_revision": m.source_revision,
@@ -212,7 +212,7 @@ impl SglangLaunch {
 
 impl fmt::Display for SglangLaunch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SGLang candidate {}", self.public)
+        write!(f, "SGLang launch {}", self.public)
     }
 }
 
@@ -267,6 +267,17 @@ fn ulid(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
+}
+
+/// The served name is the deployment's route (Spec §3), not a derived binding
+/// artifact: the entry and the coordinator's render both accept exactly the
+/// same token here. A non-empty printable token, 1..=256 bytes, carrying no
+/// whitespace and no control characters. No further shape is imposed, so the
+/// deleted `candidate-{binding_id}` derivation is gone rather than deprecated.
+pub(crate) fn served_name_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn private_endpoint(value: &str) -> bool {

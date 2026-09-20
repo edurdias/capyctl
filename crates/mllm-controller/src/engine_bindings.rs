@@ -190,8 +190,15 @@ impl EngineBindings for ProfileBindings {
                 let binding = work.binding_id();
                 let inference_ref = format!("sglang-inference-{binding}");
                 let admin_ref = format!("sglang-admin-{binding}");
+                // The served name is the deployment's route, the same rule the
+                // vLLM branch follows (Spec §3): clients request the route the
+                // deployment serves, never a derived binding artifact.
+                let served_name = effective.routes.first().cloned().ok_or_else(|| {
+                    CoordinatorError::Service("the deployment serves no route".into())
+                })?;
                 let frozen = Box::new(crate::native_launch::frozen_from_work(
                     work,
+                    served_name,
                     inference_ref.clone(),
                     admin_ref.clone(),
                 )?);

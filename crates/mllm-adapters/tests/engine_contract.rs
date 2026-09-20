@@ -8,7 +8,7 @@ use mllm_domain::launch::{
 use serde_json::{json, Value};
 const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
-const MODEL: &str = "candidate-01K00000000000000000000001";
+const MODEL: &str = "toy";
 
 struct SlowSink {
     chunks: Vec<String>,

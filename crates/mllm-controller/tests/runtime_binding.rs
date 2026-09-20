@@ -150,7 +150,7 @@ impl NativeFixture {
                 binding_id: self.binding.clone(),
                 incarnation: self.incarnation.clone(),
                 endpoint: format!("http://{}", self.endpoint),
-                served_name: format!("candidate-{}", self.binding),
+                served_name: "ordinary".into(),
                 rendered_settings_digest: digest.into(),
                 device: NativeDeviceSelection {
                     host_id: "lab".into(),
@@ -489,7 +489,7 @@ fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_c
     )
     .unwrap();
     assert_eq!(private["schema_version"], 2);
-    assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    assert_eq!(private["kind"], "sglang_private_launch");
     assert_eq!(private["checkpoint_root"], fixture.root.to_str().unwrap());
     assert_eq!(
         private["public_settings"],

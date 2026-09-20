@@ -61,7 +61,7 @@ fn private_descriptor(
 ) -> Result<Vec<u8>, RuntimeError> {
     serde_json::to_vec(&json!({
         "schema_version": 2,
-        "kind": "sglang_candidate_private_launch",
+        "kind": "sglang_private_launch",
         "checkpoint_root": checkpoint_root,
         "public_settings": public_settings,
         "launch_scope": {

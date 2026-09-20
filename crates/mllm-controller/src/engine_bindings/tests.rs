@@ -86,6 +86,12 @@ fn vllm_work(deep_park: Option<&str>) -> InitializeWork {
 /// golden effective fixture drives the actual store lifecycle, so `spec` reads
 /// exactly what production reads.
 fn sglang_work() -> InitializeWork {
+    sglang_work_edit(|_| {})
+}
+
+/// Same fixture builder with a deployment mutation hook, so a test can shape
+/// the frozen effective configuration before admission.
+fn sglang_work_edit(edit: impl FnOnce(&mut Value)) -> InitializeWork {
     let store = Store::open_in_memory().expect("open in-memory store");
     let session = store
         .begin_coordinator_session()
@@ -96,7 +102,8 @@ fn sglang_work() -> InitializeWork {
     ))
     .expect("fixture JSON parses");
     let host = source["input"]["host"].clone();
-    let deployment = source["input"]["deployment"].clone();
+    let mut deployment = source["input"]["deployment"].clone();
+    edit(&mut deployment);
 
     let policy = resolve_effective(&deployment, &host)
         .expect("fixture resolves")
@@ -259,6 +266,9 @@ fn an_sglang_spec_builds_the_native_launch_with_both_credential_references() {
     assert_eq!(frozen.metadata().binding_id, binding);
     assert_eq!(frozen.metadata().incarnation, incarnation);
     assert_eq!(frozen.metadata().endpoint, format!("http://{endpoint}"));
+    // The served name is the deployment's own route name, the same rule the
+    // vLLM branch follows — here the golden fixture's first route.
+    assert_eq!(frozen.metadata().served_name, "toy");
     // The two keys are fresh, distinct, and hex so the factory can decode and
     // seal both roles.
     for key in [&inference, &admin] {
@@ -283,7 +293,27 @@ fn an_sglang_spec_builds_the_native_launch_with_both_credential_references() {
 fn the_native_builder_refuses_another_family() {
     let work = vllm_work(None);
     assert!(
-        crate::native_launch::frozen_from_work(&work, "i-ref".into(), "a-ref".into()).is_err(),
+        crate::native_launch::frozen_from_work(&work, "toy".into(), "i-ref".into(), "a-ref".into())
+            .is_err(),
         "a vLLM profile must not build an SGLang launch"
     );
+}
+
+/// Spec §3: the served name is the deployment's first frozen route, not a
+/// derived binding artifact and not the deployment name. The ordinary writer
+/// freezes routes in its own stored order; `routes.first()` on the frozen
+/// effective is the rule, exactly as the vLLM branch reads it.
+// T16
+#[test]
+fn an_sglang_served_name_is_the_frozen_effective_first_route() {
+    let work = sglang_work_edit(|deployment| {
+        deployment["routes"] = json!(["gamma", "alpha"]);
+    });
+    let first = work.effective().routes.first().cloned().unwrap();
+    let spec = bindings().spec(&work).expect("the sglang spec builds");
+    let AdapterSpec::Sglang { frozen, .. } = spec else {
+        panic!("the fixture profile declares sglang");
+    };
+    assert_ne!(first, "toy", "the route must not fall back to the name");
+    assert_eq!(frozen.metadata().served_name, first);
 }

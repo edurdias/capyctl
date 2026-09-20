@@ -2913,7 +2913,10 @@ mod native {
         let seen = Arc::new(Mutex::new(Vec::new()));
         tokio::spawn(stub_engine(
             port,
-            format!("candidate-{binding}"),
+            // The golden fixture's first route: the served name is the
+            // deployment's route name, which the stub must serve for the
+            // readiness poll to settle.
+            "toy".to_owned(),
             seen.clone(),
         ));
 

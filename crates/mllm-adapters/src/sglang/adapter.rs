@@ -198,12 +198,13 @@ impl SglangAdapter {
 
     /// Attach the managed-launch contract (Spec §3): the concrete frozen launch
     /// this adapter renders in `initialize`. A launch whose served name is not
-    /// the pinned `candidate-{binding_id}` is not attached: rendering it would
-    /// produce a descriptor the entry refuses, so the step must refuse instead,
-    /// which is what a missing launch makes `launch_parts` do.
+    /// the deployment's route token (`args::served_name_token`) is not attached:
+    /// rendering it would produce a descriptor the entry refuses, so the step
+    /// must refuse instead, which is what a missing launch makes `launch_parts`
+    /// do.
     pub fn with_launch(mut self, launch: NativeLaunch) -> Self {
         let metadata = launch.metadata();
-        if metadata.served_name == format!("candidate-{}", metadata.binding_id) {
+        if super::args::served_name_token(&metadata.served_name) {
             self.launch = Some(launch);
         }
         self

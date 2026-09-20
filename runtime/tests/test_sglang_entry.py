@@ -31,14 +31,14 @@ def finish_without_io(coroutine):
 
 def public_settings():
     return {
-        "schema_version": 1, "kind": "sglang_candidate_launch", "engine": "sglang",
+        "schema_version": 1, "kind": "sglang_launch", "engine": "sglang",
         "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
         "source_revision": "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1",
         "checkpoint_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
         "binding_id": "01K00000000000000000000001",
         "incarnation": "01K00000000000000000000099",
         "endpoint": "http://127.0.0.1:20001",
-        "served_name": "candidate-01K00000000000000000000001",
+        "served_name": "toy",
         "rendered_settings_digest": "a" * 64,
         "device": {"host_id": "host-a", "hardware_fingerprint": "hardware-v1",
                    "device_id": "gpu0", "memory_domain": "uma"},
@@ -73,7 +73,7 @@ class LaunchFixture:
 
     def payloads(self, public=None, root=None):
         return {3: json.dumps({"schema_version": 1,
-                              "kind": "sglang_candidate_private_launch",
+                              "kind": "sglang_private_launch",
                               "checkpoint_root": self.root if root is None else root,
                               "public_settings": self.public if public is None else public}).encode(),
                 4: self.inference, 5: self.admin}
@@ -223,16 +223,32 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         spec = self.build(self.argv(public), self.payloads(public))
         self.assertEqual(json.loads(spec._public_json)["device"]["device_id"], "gpu7")
 
+    def test_served_name_is_the_route_token_not_the_binding_derivation(self):
+        # The served name is the deployment's route name: ordinary tokens are
+        # accepted unchanged, and the retired `candidate-{binding_id}`
+        # derivation is neither required nor special.
+        for name in ("toy", "a-route", "route.1_v2", "café-route", "x" * 256):
+            public = copy.deepcopy(self.public)
+            public["served_name"] = name
+            spec = self.build(self.argv(public), self.payloads(public))
+            self.assertEqual(json.loads(spec._public_json)["served_name"], name)
+
     def test_closed_recipe_types_and_bounds(self):
         mutations = [
             ("source_revision", "main"), ("checkpoint_revision", "main"),
             ("schema_version", True), ("schema_version", 1.0),
             ("engine", "vllm"), ("recipe", "restart"),
             ("binding_id", "ordinary"), ("incarnation", ""),
+            # The retired kinds are invalid now, not deprecated aliases.
+            ("kind", "sglang_candidate_launch"), ("kind", "sglang_candidate_private_launch"),
             ("endpoint", "http://0.0.0.0:20001"),
             ("endpoint", "http://127.0.0.1:020001"),
             ("endpoint", "http://127.0.0.1:65536"),
-            ("served_name", "ordinary-model"), ("rendered_settings_digest", "z" * 64),
+            # The served name is the route token: empty, whitespace, and over
+            # the 256-byte bound all refuse; no `candidate-` rule remains.
+            ("served_name", ""), ("served_name", "has space"),
+            ("served_name", "tab\tname"), ("served_name", "x" * 257),
+            ("rendered_settings_digest", "z" * 64),
             ("minimum_kv_bytes", 603979775), ("static_memory_fraction", "0.75"),
         ]
         for key, value in mutations:

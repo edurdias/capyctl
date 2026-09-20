@@ -21,9 +21,12 @@ use sha2::{Digest, Sha256};
 ///
 /// The pinned SGLang recipe constants identify the build and checkpoint the
 /// native contract was written against; the store work must name that engine.
-/// Anything else is refused closed rather than adapted.
+/// The served name is the deployment's own route name, which the caller takes
+/// from `work.effective().routes.first()` and refuses to omit. Anything else
+/// is refused closed rather than adapted.
 pub fn frozen_from_work(
     work: &InitializeWork,
+    served_name: String,
     inference_ref: String,
     admin_ref: String,
 ) -> Result<NativeLaunch, CoordinatorError> {
@@ -77,7 +80,7 @@ pub fn frozen_from_work(
         binding_id: work.binding_id().into(),
         incarnation: work.incarnation().into(),
         endpoint: format!("http://{}", work.endpoint()),
-        served_name: format!("candidate-{}", work.binding_id()),
+        served_name,
         rendered_settings_digest: digest,
         device: NativeDeviceSelection {
             host_id: effective.host.name.clone(),
@@ -107,7 +110,7 @@ pub fn private_descriptor(
 ) -> Result<Vec<u8>, RuntimeError> {
     serde_json::to_vec(&serde_json::json!({
         "schema_version": 2,
-        "kind": "sglang_candidate_private_launch",
+        "kind": "sglang_private_launch",
         "checkpoint_root": checkpoint_root,
         "public_settings": public_settings,
         "launch_scope": {

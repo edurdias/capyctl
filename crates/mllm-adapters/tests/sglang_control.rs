@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 
 const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
-const MODEL: &str = "candidate-01K00000000000000000000001";
+const MODEL: &str = "toy";
 const FLUSH_RESPONSE: &str = "Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n";
 
 fn now() -> i64 {

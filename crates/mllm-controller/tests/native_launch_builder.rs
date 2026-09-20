@@ -93,6 +93,9 @@ fn builder_produces_expected_metadata_for_the_golden_sglang_config() {
         hex::encode(Sha256::digest(serde_json::to_vec(settings).unwrap()));
     let launch = frozen_from_work(
         work,
+        // The route the golden deployment serves; the served name is the route
+        // name, never a derived binding artifact.
+        "ordinary".into(),
         "secret://engine-key".into(),
         "secret://admin-key".into(),
     )
@@ -105,10 +108,7 @@ fn builder_produces_expected_metadata_for_the_golden_sglang_config() {
     assert_eq!(metadata.binding_id, work.binding_id());
     assert_eq!(metadata.incarnation, work.incarnation());
     assert_eq!(metadata.endpoint, format!("http://{}", work.endpoint()));
-    assert_eq!(
-        metadata.served_name,
-        format!("candidate-{}", work.binding_id())
-    );
+    assert_eq!(metadata.served_name, "ordinary");
     assert_eq!(metadata.rendered_settings_digest, expected_digest);
     assert_eq!(metadata.rendered_settings_digest.len(), 64);
     assert!(
@@ -151,7 +151,7 @@ fn private_descriptor_output_byte_matches_the_json_the_arm_built() {
     };
     let public = json!({
         "schema_version": 1,
-        "kind": "sglang_candidate_launch",
+        "kind": "sglang_launch",
         "binding_id": execution.binding_id,
     });
     let bytes =
@@ -160,7 +160,7 @@ fn private_descriptor_output_byte_matches_the_json_the_arm_built() {
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 5);
     assert_eq!(value["schema_version"], 2);
-    assert_eq!(value["kind"], "sglang_candidate_private_launch");
+    assert_eq!(value["kind"], "sglang_private_launch");
     assert_eq!(value["checkpoint_root"], "/srv/models/toy");
     assert_eq!(value["public_settings"], public);
     assert_eq!(
@@ -186,6 +186,7 @@ fn builder_refuses_a_vllm_profile() {
     let fixture = accepted_work(VLLM_GOLDEN, |_, _| {});
     let error = match frozen_from_work(
         &fixture.work,
+        "ordinary".into(),
         "secret://engine-key".into(),
         "secret://admin-key".into(),
     ) {
@@ -206,6 +207,7 @@ fn builder_refuses_work_with_no_selected_device() {
     });
     let error = match frozen_from_work(
         &fixture.work,
+        "ordinary".into(),
         "secret://engine-key".into(),
         "secret://admin-key".into(),
     ) {

@@ -6,8 +6,8 @@ use mllm_domain::launch::{
 use serde_json::{Value, json};
 
 const CHECKPOINT: &str = "/private/checkpoints/qwen";
-const INFERENCE_REF: &str = "private://candidate-inference-reference";
-const ADMIN_REF: &str = "private://candidate-admin-reference";
+const INFERENCE_REF: &str = "private://inference-reference";
+const ADMIN_REF: &str = "private://admin-reference";
 const SOURCE: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
 const REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
 const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
@@ -28,7 +28,7 @@ fn metadata(index: u16) -> NativeLaunchMetadata {
         recipe: RECIPE.into(),
         source_revision: SOURCE.into(),
         checkpoint_revision: REVISION.into(),
-        served_name: format!("candidate-{binding}"),
+        served_name: format!("route-{index}"),
         binding_id: binding,
         incarnation: "01K00000000000000000000099".into(),
         endpoint: format!("http://127.0.0.1:{}", 20000 + index),
@@ -187,10 +187,10 @@ fn two_frozen_bindings_keep_distinct_endpoints_and_served_names() {
     let b = public_args(&second);
     assert_eq!(a["endpoint"], "http://127.0.0.1:20001");
     assert_eq!(b["endpoint"], "http://127.0.0.1:20002");
-    assert_eq!(a["served_name"], "candidate-01K00000000000000000000001");
-    assert_eq!(b["served_name"], "candidate-01K00000000000000000000002");
+    assert_eq!(a["served_name"], "route-1");
+    assert_eq!(b["served_name"], "route-2");
     assert_eq!(a["schema_version"], 1);
-    assert_eq!(a["kind"], "sglang_candidate_launch");
+    assert_eq!(a["kind"], "sglang_launch");
     assert_eq!(a["source_revision"], SOURCE);
     assert_eq!(a["checkpoint_revision"], REVISION);
     assert_eq!(
@@ -309,7 +309,14 @@ fn ordinary_missing_and_malformed_candidate_metadata_is_rejected() {
         |m| m.binding_id.clear(),
         |m| m.binding_id = "ordinary-binding".into(),
         |m| m.incarnation.clear(),
-        |m| m.served_name = "ordinary-model".into(),
+        // The served name is the deployment's route token (1..=256 bytes,
+        // printable, no whitespace or control characters); anything else,
+        // including the retired `candidate-{binding_id}` derivation's empty,
+        // whitespace and oversized shapes, is refused.
+        |m| m.served_name.clear(),
+        |m| m.served_name = "has space".into(),
+        |m| m.served_name = "tab\tname".into(),
+        |m| m.served_name = "x".repeat(257),
         |m| m.rendered_settings_digest = "unverified".into(),
         |m| m.endpoint = "http://0.0.0.0:20001".into(),
         |m| m.endpoint = "http://127.0.0.1:0".into(),

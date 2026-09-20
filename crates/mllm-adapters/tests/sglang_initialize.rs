@@ -43,7 +43,7 @@ const DEPLOYMENT: &str = "01K00000000000000000000003";
 const OPERATION: &str = "01K00000000000000000000004";
 const STEP: &str = "01K00000000000000000000005";
 const SESSION: &str = "01K00000000000000000000006";
-const MODEL: &str = "candidate-01K00000000000000000000001";
+const MODEL: &str = "toy";
 const INFERENCE: &str = "inference-secret";
 const ADMIN: &str = "admin-secret";
 const CHECKPOINT: &str = "/private/checkpoints/qwen";
@@ -556,7 +556,7 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     let [private, inference, admin] = &captured[0];
     let private: Value = serde_json::from_slice(private).unwrap();
     assert_eq!(private["schema_version"], 2);
-    assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    assert_eq!(private["kind"], "sglang_private_launch");
     assert_eq!(private["checkpoint_root"], CHECKPOINT);
     let public: Value = serde_json::from_str(&argv[4]).unwrap();
     assert_eq!(private["public_settings"], public);
@@ -764,11 +764,12 @@ async fn an_observer_less_adapter_refuses_every_control_action() {
     ));
 }
 
-/// The descriptor contract pin. The served name is `candidate-{binding_id}`,
-/// the two kinds are the ones `runtime/sglang_entry.py` accepts, and the
-/// private descriptor is schema version 2 whose launch scope cross-checks
-/// against the public settings exactly as the entry's `_validate_launch_scope`
-/// requires. The literals live here and nowhere else in this file.
+/// The descriptor contract pin. The served name is the deployment's route
+/// name (1..=256 printable bytes, no whitespace), the two kinds are the ones
+/// `runtime/sglang_entry.py` accepts, and the private descriptor is schema
+/// version 2 whose launch scope cross-checks against the public settings
+/// exactly as the entry's `_validate_launch_scope` requires. The literals
+/// live here and nowhere else in this file.
 #[tokio::test]
 async fn the_descriptor_contract_pin_holds() {
     let log = launch_log();
@@ -783,11 +784,11 @@ async fn the_descriptor_contract_pin_holds() {
 
     let spawned = tool.spawned.lock().unwrap();
     let public: Value = serde_json::from_str(&spawned[0].argv[4]).unwrap();
-    assert_eq!(public["served_name"], format!("candidate-{BINDING}"));
-    assert_eq!(public["kind"], "sglang_candidate_launch");
+    assert_eq!(public["served_name"], "toy");
+    assert_eq!(public["kind"], "sglang_launch");
     let captured = tool.descriptors.lock().unwrap();
     let private: Value = serde_json::from_slice(&captured[0][0]).unwrap();
-    assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    assert_eq!(private["kind"], "sglang_private_launch");
     assert_eq!(private["schema_version"], 2);
     // The entry checks the scope's identity against the public settings before
     // anything else about it, so the pin holds the same cross-check.

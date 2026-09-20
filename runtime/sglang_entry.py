@@ -1,4 +1,4 @@
-"""Protected SGLang candidate startup boundary, using only the standard library.
+"""Protected SGLang startup boundary, using only the standard library.
 
 The pinned helpers are not yet composed into a verified native startup contract.
 Real startup therefore fails closed before engine import. A descriptor validates
@@ -151,7 +151,7 @@ def _validate_public(value):
                          "checkpoint_revision", "binding_id", "incarnation", "endpoint",
                          "served_name", "rendered_settings_digest", "settings",
                          "minimum_kv_bytes", "static_memory_fraction", "device"))
-    for key, expected in (("schema_version", 1), ("kind", "sglang_candidate_launch"),
+    for key, expected in (("schema_version", 1), ("kind", "sglang_launch"),
                           ("engine", "sglang"), ("recipe", _RECIPE),
                           ("source_revision", _SOURCE), ("checkpoint_revision", _CHECKPOINT),
                           ("minimum_kv_bytes", _MINIMUM_KV)):
@@ -165,7 +165,13 @@ def _validate_public(value):
         if not selector.isascii() or any(not (char.isalnum() or char in "_-.:")
                                          for char in selector):
             _reject()
-    _literal(value["served_name"], "candidate-" + value["binding_id"])
+    # The served name is the deployment's route (Spec §3), not a derived
+    # binding artifact: a non-empty printable token, 1..=256 bytes, with no
+    # whitespace. The deleted `candidate-{binding_id}` derivation is gone
+    # rather than deprecated.
+    served = _text(value["served_name"], 256)
+    if not served.isprintable() or any(char.isspace() for char in served):
+        _reject()
     endpoint = _text(value["endpoint"], 128)
     prefix = "http://127.0.0.1:"
     port = endpoint[len(prefix):]
@@ -271,7 +277,7 @@ def build_launch(argv, descriptor_reader):
         _integer(version, 1, 2)
         keys = ("schema_version", "kind", "checkpoint_root", "public_settings")
         _exact_object(private, keys if version == 1 else (*keys, "launch_scope"))
-        _literal(private["kind"], "sglang_candidate_private_launch")
+        _literal(private["kind"], "sglang_private_launch")
         _validate_public(private["public_settings"])
         if private["public_settings"] != public:
             _reject()

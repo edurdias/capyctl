@@ -116,7 +116,7 @@ def _validated_public(spec):
             raise ValueError()
         public = json.loads(spec._public_json)
         private = json.dumps({"schema_version": 1,
-                              "kind": "sglang_candidate_private_launch",
+                              "kind": "sglang_private_launch",
                               "checkpoint_root": spec._checkpoint_root,
                               "public_settings": public}).encode()
         payloads = {3: private, 4: spec._inference_key.encode("ascii"),

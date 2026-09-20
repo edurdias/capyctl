@@ -1,4 +1,4 @@
-//! Pure rendering for the pinned candidate recipe, the owned launch this
+//! Pure rendering for the pinned native recipe, the owned launch this
 //! family performs, and evidence observations for persisted controls. Rendering
 //! grants no send authority.
 
