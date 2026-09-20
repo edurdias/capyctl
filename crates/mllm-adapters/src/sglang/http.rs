@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 use crate::traits::{RuntimeAction, RuntimeError};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// How long one readiness model list may take. The readiness loop caps each
+/// poll by this and its own remaining budget, so a stall is a poll failure the
+/// builder reports, never a hang past the coordinator's bound.
+pub(super) const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 const FLUSH_RESPONSE: &[u8] = b"Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n";
 
 #[derive(serde::Deserialize)]
@@ -175,8 +179,7 @@ impl ControlHttp {
     /// engine was launched with. Presence of the served name is the readiness
     /// signal; a connect refusal is the engine still staging weights.
     pub(super) async fn models(&self) -> Result<Vec<String>, ModelsError> {
-        const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
-        let response = self
+        let mut response = self
             .client
             .get(self.base.join("/v1/models").map_err(|_| {
                 ModelsError::Other("model list endpoint could not be resolved".into())
@@ -203,13 +206,23 @@ impl ControlHttp {
         {
             return Err(ModelsError::Other("model list body too large".into()));
         }
-        let value: Value = response.json().await.map_err(|e| {
+        // The same bounded read the controls use: a chunked body without a
+        // declared length must not be read without limit.
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
             if e.is_connect() {
                 ModelsError::Unreachable
             } else {
                 ModelsError::Other(format!("model list body: {e}"))
             }
-        })?;
+        })? {
+            if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
+                return Err(ModelsError::Other("model list body too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ModelsError::Other(format!("model list body: {e}")))?;
         Ok(value["data"]
             .as_array()
             .map(|entries| {

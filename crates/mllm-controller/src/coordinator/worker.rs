@@ -640,38 +640,78 @@ impl OwnedCoordinator {
                         "frozen binding lacks an endpoint or credential reference".into(),
                     ));
                 }
-                let spec = bindings.spec(work)?;
-                // SPEC §13.3: the key the builder is about to use must already be
-                // recoverable from the store, or a restart would leave an engine
-                // running that nothing can authenticate against again.
-                if let mllm_adapters::resolve::AdapterSpec::Vllm {
-                    engine_key: Some(key),
-                    ..
-                } = &spec
+                let mut spec = bindings.spec(work)?;
+                // SPEC §13.3: the keys the builder is about to use must already
+                // be recoverable from the store, or a restart would leave an
+                // engine running that nothing can authenticate against again.
+                // The factory runs under the owner, so the same transaction
+                // point is where the SGLang launch scope learns the session ULID
+                // the private descriptor must name.
                 {
-                    let sealed: [u8; 32] = hex::decode(key)
-                        .ok()
-                        .and_then(|bytes| bytes.try_into().ok())
-                        .ok_or_else(|| {
-                            CoordinatorError::Service("engine key is not 32 bytes".into())
-                        })?;
                     let owner = factory_owner.lock().map_err(|error| {
                         drop(error);
                         CoordinatorError::Service("ownership mutex poisoned".into())
                     })?;
-                    owner
-                        .store()
-                        .store_engine_key(
-                            work.binding_id(),
-                            work.incarnation(),
-                            &sealed,
-                            mllm_store::secrets::SecretRole::Inference,
-                        )
-                        .map_err(|error| {
-                            CoordinatorError::Service(format!(
-                                "the engine key was not stored: {error}"
-                            ))
-                        })?;
+                    let store = owner.store();
+                    match &mut spec {
+                        mllm_adapters::resolve::AdapterSpec::Vllm {
+                            engine_key: Some(key),
+                            ..
+                        } => {
+                            let sealed: [u8; 32] = hex::decode(key)
+                                .ok()
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .ok_or_else(|| {
+                                    CoordinatorError::Service("engine key is not 32 bytes".into())
+                                })?;
+                            store
+                                .store_engine_key(
+                                    work.binding_id(),
+                                    work.incarnation(),
+                                    &sealed,
+                                    mllm_store::secrets::SecretRole::Inference,
+                                )
+                                .map_err(|error| {
+                                    CoordinatorError::Service(format!(
+                                        "the engine key was not stored: {error}"
+                                    ))
+                                })?;
+                        }
+                        mllm_adapters::resolve::AdapterSpec::Sglang {
+                            inference,
+                            admin,
+                            session,
+                            ..
+                        } => {
+                            *session = Some(owner.session().id().to_owned());
+                            for (key, role) in [
+                                (inference.as_str(), mllm_store::secrets::SecretRole::Inference),
+                                (admin.as_str(), mllm_store::secrets::SecretRole::Admin),
+                            ] {
+                                let sealed: [u8; 32] = hex::decode(key)
+                                    .ok()
+                                    .and_then(|bytes| bytes.try_into().ok())
+                                    .ok_or_else(|| {
+                                        CoordinatorError::Service(format!(
+                                            "the {role:?} engine key is not 32 bytes"
+                                        ))
+                                    })?;
+                                store
+                                    .store_engine_key(
+                                        work.binding_id(),
+                                        work.incarnation(),
+                                        &sealed,
+                                        role,
+                                    )
+                                    .map_err(|error| {
+                                        CoordinatorError::Service(format!(
+                                            "the engine key was not stored: {error}"
+                                        ))
+                                    })?;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 // Spec §3: the association is built per launch and captures this
                 // binding's own fence, so an identity can only ever be recorded

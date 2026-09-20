@@ -2625,6 +2625,445 @@ mod native {
         w.shutdown().await.unwrap();
     }
 
+    /// T16: the SGLang start path through the production bindings. The start
+    /// arms through `ProfileBindings`' own SGLang branch; the resolved-spawn
+    /// factory seals both roles before the builder can spawn (the stub tool
+    /// checks the store at the moment of the spawn); the step reaches Ready
+    /// through a stub engine surface presenting the sealed inference key; and
+    /// the release deletes both roles. A stub engine and stub tools prove
+    /// nothing about a native engine recipe — only about mllm's own decisions.
+    // T16
+    #[tokio::test]
+    async fn an_sglang_deployment_seals_both_roles_reaches_ready_and_releases_them() {
+        use crate::engine_bindings::ProfileBindings;
+        use mllm_adapters::traits::RenderedCommand;
+        use mllm_config::effective::resolve_effective;
+        use mllm_domain::completion::ProcessIdentity;
+        use mllm_store::secrets::SecretRole;
+        use serde_json::{json, Value};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct SealCheckTool {
+            owner: SharedCoordinatorState,
+            binding: String,
+            incarnation: String,
+            association: Mutex<Option<Arc<dyn LaunchAssociation + Send + Sync>>>,
+            identity: ProcessIdentity,
+            group: Vec<ProcessIdentity>,
+            spawned: Mutex<Vec<RenderedCommand>>,
+            /// What the store held for this binding the moment the builder
+            /// spawned: the seal-before-spawn claim, recorded where it holds.
+            sealed_at_spawn: Mutex<Option<SealedAtSpawn>>,
+        }
+        type SealedAtSpawn = (Option<[u8; 32]>, Option<[u8; 32]>);
+        impl OwnedProcessLaunch for SealCheckTool {
+            fn spawn_durable(
+                &self,
+                _incarnation: &str,
+                _cmd: &RenderedCommand,
+            ) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
+                Err(mllm_adapters::traits::RuntimeError::Unsupported)
+            }
+            fn spawn_durable_protected(
+                &self,
+                incarnation: &str,
+                cmd: &RenderedCommand,
+                _descriptors: &mllm_adapters::protected::ProtectedLaunchDescriptors,
+            ) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
+                {
+                    let owner = self.owner.lock().unwrap();
+                    *self.sealed_at_spawn.lock().unwrap() = Some((
+                        owner
+                            .store()
+                            .engine_key(&self.binding, &self.incarnation, SecretRole::Inference)
+                            .unwrap(),
+                        owner
+                            .store()
+                            .engine_key(&self.binding, &self.incarnation, SecretRole::Admin)
+                            .unwrap(),
+                    ));
+                }
+                self.spawned.lock().unwrap().push(cmd.clone());
+                if let Some(association) = self.association.lock().unwrap().clone() {
+                    association
+                        .persist_api_identity(&self.identity)
+                        .map_err(|error| {
+                            mllm_adapters::traits::RuntimeError::Uncertain(
+                                error.to_string(),
+                            )
+                        })?;
+                }
+                let _ = incarnation;
+                Ok(self.identity.clone())
+            }
+            fn present(
+                &self,
+                _identity: &ProcessIdentity,
+            ) -> mllm_domain::completion::Presence {
+                mllm_domain::completion::Presence::Alive
+            }
+            fn observe_group(
+                &self,
+                _api: &ProcessIdentity,
+            ) -> Result<Vec<ProcessIdentity>, mllm_adapters::traits::RuntimeError> {
+                Ok(self.group.clone())
+            }
+            fn terminate_owned(
+                &self,
+                _identities: &[ProcessIdentity],
+                _grace: Duration,
+            ) -> Result<(), mllm_adapters::traits::RuntimeError> {
+                Ok(())
+            }
+        }
+
+        /// A stub engine surface on the leased endpoint: a model list that
+        /// names the served model, and a chat stream that answers. It records
+        /// every presented authorization, so the test can prove the builder
+        /// spoke with the sealed inference key.
+        async fn stub_engine(
+            port: u16,
+            model: String,
+            seen: Arc<Mutex<Vec<(String, String)>>>,
+        ) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("the leased endpoint is free");
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) =
+                                buf.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                break pos + 4;
+                            }
+                            if buf.len() > 64 * 1024 {
+                                return;
+                            }
+                        }
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let mut lines = head.split("\r\n");
+                let request_line = lines.next().unwrap_or_default().to_owned();
+                let mut content_length = 0usize;
+                let mut authorization = String::new();
+                for line in lines {
+                    if let Some(rest) = line.strip_prefix("content-length:") {
+                        content_length = rest.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(rest) = line.strip_prefix("authorization:") {
+                        authorization = rest.trim().to_owned();
+                    }
+                }
+                while buf.len() < head_end + content_length {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let mut parts = request_line.split(' ');
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                seen.lock()
+                    .unwrap()
+                    .push((format!("{method} {path}"), authorization));
+                let (body, content_type) = if path.starts_with("/v1/models") {
+                    (
+                        json!({"object":"list","data":[{"id":model,"object":"model"}]})
+                            .to_string(),
+                        "application/json",
+                    )
+                } else {
+                    let first = json!({
+                        "id":"probe","object":"chat.completion.chunk","created":1,"model":model,
+                        "choices":[{"index":0,"delta":{"role":"assistant","content":"ready"},
+                                    "finish_reason":Value::Null}],
+                    });
+                    let second = json!({
+                        "id":"probe","object":"chat.completion.chunk","created":1,"model":model,
+                        "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                    });
+                    (
+                        format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n"),
+                        "text/event-stream",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: \
+                     {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        }
+
+        // The SGLang golden effective configuration, driven through the real
+        // store the worker owns — the same admission production takes. The
+        // service clock is real wall-clock time: the builder bounds its own
+        // waits by the context deadline the store arms with, and the profile's
+        // request deadline caps how far ahead acceptance may set it.
+        fn realtime_ms() -> i64 {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        }
+        let source: Value = serde_json::from_str(include_str!(
+            "../../../mllm-config/tests/fixtures/effective-sglang-golden.json"
+        ))
+        .unwrap();
+        let host = source["input"]["host"].clone();
+        let deployment = source["input"]["deployment"].clone();
+        let (dir, owner) = {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+            std::fs::set_permissions(
+                dir.path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let owner = Arc::new(Mutex::new(
+                crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
+            ));
+            (dir, owner)
+        };
+        let (fence, work, observations) = {
+            let now = realtime_ms();
+            let o = owner.lock().unwrap();
+            let session = o.session().clone();
+            let store = o.store();
+            let policy = resolve_effective(&deployment, &host)
+                .expect("fixture resolves")
+                .host;
+            let observations: Vec<_> = policy
+                .domains
+                .keys()
+                .map(|domain| MemoryObservation {
+                    domain: domain.clone(),
+                    capacity_bytes: 1_i64 << 50,
+                    available_bytes: 1_i64 << 50,
+                    sampled_at_ms: now,
+                })
+                .collect();
+            store
+                .import_resource_policy(&session, &policy, &observations, now)
+                .unwrap();
+            let receipt = store
+                .create_stopped_managed_configuration(
+                    &session,
+                    "owner",
+                    "toy",
+                    &json!({ "config": deployment }).to_string(),
+                    &host,
+                    now,
+                )
+                .unwrap();
+            let fence = DeploymentFence {
+                deployment_id: receipt.deployment_id,
+                revision: receipt.revision,
+                generation: receipt.generation,
+            };
+            store
+                .accept_start(&session, &fence, now, now + 240_000)
+                .unwrap();
+            let work = store
+                .next_initialize(&session)
+                .unwrap()
+                .expect("an accepted start plans initialize work");
+            (fence, work, observations)
+        };
+        let binding = work.binding_id().to_owned();
+        let incarnation = work.incarnation().to_owned();
+        let port: u16 = work
+            .endpoint()
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("the leased endpoint names a port");
+
+        // The wrapper is the protected entrypoint this installation carries:
+        // a regular, owner-only file in an owner-only directory, exactly what
+        // the renderer's revalidation demands.
+        let (runtime_dir, log_dir) = {
+            use std::os::unix::fs::PermissionsExt;
+            let runtime_dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+            std::fs::set_permissions(
+                runtime_dir.path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let wrapper = runtime_dir.path().join("sglang_entry.py");
+            std::fs::write(&wrapper, b"# never executed; the stub tools spawn nothing\n").unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let log_dir = tempfile::tempdir().unwrap();
+            (runtime_dir, log_dir)
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(stub_engine(
+            port,
+            format!("candidate-{binding}"),
+            seen.clone(),
+        ));
+
+        let identity = ProcessIdentity {
+            role: "api".into(),
+            pid: 4242,
+            boot_id: "boot".into(),
+            start_ticks: 99,
+        };
+        let tool = Arc::new(SealCheckTool {
+            owner: owner.clone(),
+            binding: binding.clone(),
+            incarnation: incarnation.clone(),
+            association: Mutex::new(None),
+            identity: identity.clone(),
+            group: vec![
+                identity,
+                ProcessIdentity {
+                    role: "worker-0".into(),
+                    pid: 4243,
+                    boot_id: "boot".into(),
+                    start_ticks: 100,
+                },
+            ],
+            spawned: Mutex::new(Vec::new()),
+            sealed_at_spawn: Mutex::new(None),
+        });
+        let factory_tool = tool.clone();
+        let w = OwnedCoordinator::spawn_resolved(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(realtime_ms())),
+            CoordinatorOptions::default(),
+            Arc::new(ProfileBindings::new(
+                log_dir.path().to_path_buf(),
+                runtime_dir.path().to_path_buf(),
+            )),
+            Arc::new(move |association| {
+                *factory_tool.association.lock().unwrap() = Some(association);
+                factory_tool.clone()
+                    as Arc<dyn mllm_adapters::traits::OwnedProcessLaunch>
+            }),
+        )
+        .unwrap();
+
+        let step = work.step_id().to_owned();
+        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match status(&owner, &step) {
+                    InitializeStatus::Planned
+                    | InitializeStatus::Armed
+                    | InitializeStatus::Expired => tokio::time::sleep(Duration::from_millis(100))
+                        .await,
+                    settled => return settled,
+                }
+            }
+        })
+        .await
+        .expect("the SGLang start settles inside the test's bound");
+        assert_eq!(
+            outcome,
+            InitializeStatus::Completed,
+            "the SGLang start reached Ready through the stub engine"
+        );
+
+        // Both roles were sealed before the builder could spawn, and the
+        // builder presented exactly the sealed inference key.
+        let (sealed_inference, sealed_admin) =
+            (*tool.sealed_at_spawn.lock().unwrap()).expect("spawned");
+        assert!(
+            sealed_inference.is_some() && sealed_admin.is_some(),
+            "both roles must be recoverable from the store at spawn time"
+        );
+        let sealed_inference = sealed_inference.unwrap();
+        let sealed_admin = sealed_admin.unwrap();
+        assert_ne!(
+            sealed_inference, sealed_admin,
+            "the two roles carry distinct keys"
+        );
+        {
+            let o = owner.lock().unwrap();
+            assert_eq!(
+                o.store()
+                    .engine_key(&binding, &incarnation, SecretRole::Inference)
+                    .unwrap(),
+                Some(sealed_inference)
+            );
+            assert_eq!(
+                o.store()
+                    .engine_key(&binding, &incarnation, SecretRole::Admin)
+                    .unwrap(),
+                Some(sealed_admin)
+            );
+        }
+        let presented: Vec<(String, String)> = seen.lock().unwrap().clone();
+        let inference_bearer = format!("Bearer {}", hex::encode(sealed_inference));
+        assert!(
+            presented
+                .iter()
+                .any(|(request, authorization)| request.contains("/v1/models")
+                    && *authorization == inference_bearer),
+            "the readiness poll did not present the sealed inference key: {presented:?}"
+        );
+        assert!(
+            presented
+                .iter()
+                .any(|(request, authorization)| request.contains("/v1/chat/completions")
+                    && *authorization == inference_bearer),
+            "the probe did not present the sealed inference key: {presented:?}"
+        );
+        {
+            let spawned = tool.spawned.lock().unwrap();
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0].argv[0], "/bin/true");
+            assert_eq!(
+                spawned[0].argv[2],
+                runtime_dir.path().join("sglang_entry.py").to_str().unwrap()
+            );
+        }
+
+        // The release deletes both roles: no sealed key of any role outlives
+        // the binding it was issued for.
+        let stop = w
+            .stop("owner", &fence, "sglang-stop", realtime_ms() + 10_000)
+            .unwrap();
+        assert_eq!(
+            stop.wait(Duration::from_secs(60)).await.unwrap(),
+            OrdinaryCleanupStatus::Completed
+        );
+        {
+            let o = owner.lock().unwrap();
+            assert_eq!(
+                o.store()
+                    .engine_key(&binding, &incarnation, SecretRole::Inference)
+                    .unwrap(),
+                None,
+                "the inference key outlived its binding"
+            );
+            assert_eq!(
+                o.store()
+                    .engine_key(&binding, &incarnation, SecretRole::Admin)
+                    .unwrap(),
+                None,
+                "the admin key outlived its binding"
+            );
+        }
+        drop(dir);
+        w.shutdown().await.unwrap();
+    }
+
     /// Spec §3: the router must reach the engine the coordinator launched. The
     /// engine answers to the `--served-model-name` the plan rendered, and the
     /// forwarder rewrites every request's model to whatever `runtime_endpoint`

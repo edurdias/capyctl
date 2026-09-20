@@ -50,11 +50,27 @@ pub enum AdapterSpec {
     /// binding is a durable control binding — the observer that supplies fresh
     /// evidence. An adapter built for launch has no observer and answers its
     /// control actions with the honest refusal (design §4.4).
+    ///
+    /// The launch context is the rest of what an owned SGLang launch needs, and
+    /// each field comes from the only party that honestly holds it: the wrapper
+    /// and log paths are properties of this installation (the bindings), the
+    /// session ULID is the coordinator session (the spawn factory). A missing
+    /// session makes the launch refuse rather than render a descriptor without
+    /// a launch scope.
     Sglang {
         frozen: Box<NativeLaunch>,
         inference: String,
         admin: String,
         observer: Option<Arc<dyn SglangRuntimeObserver>>,
+        /// The protected entrypoint wrapper path under the installation's
+        /// runtime directory; rendering refuses to build a command without it.
+        wrapper: Option<std::path::PathBuf>,
+        /// Where the engine's own log is expected; quoted (redacted) when a
+        /// launch dies before readiness.
+        log: Option<String>,
+        /// The coordinator session ULID the private descriptor's launch scope
+        /// names. Threaded by the resolved-spawn factory, never invented here.
+        session: Option<String>,
     },
 }
 
@@ -114,9 +130,22 @@ pub fn resolve(
             inference,
             admin,
             observer,
+            wrapper,
+            log,
+            session,
         } => {
-            let mut adapter =
-                SglangAdapter::from_frozen(&frozen, observer)?.with_credentials(inference, admin);
+            let mut adapter = SglangAdapter::from_frozen(&frozen, observer)?
+                .with_launch(*frozen)
+                .with_credentials(inference, admin);
+            if let Some(wrapper) = wrapper {
+                adapter = adapter.with_wrapper(wrapper);
+            }
+            if let Some(log) = log {
+                adapter = adapter.with_log(log);
+            }
+            if let Some(session) = session {
+                adapter = adapter.with_session(session);
+            }
             if let Some(tools) = tools {
                 adapter = adapter.with_tools(tools);
             }

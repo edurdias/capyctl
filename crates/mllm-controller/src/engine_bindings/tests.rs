@@ -82,6 +82,63 @@ fn vllm_work(deep_park: Option<&str>) -> InitializeWork {
         .expect("a freshly accepted start plans initialize work")
 }
 
+/// Builds a real `InitializeWork` for an SGLang deployment the same way: the
+/// golden effective fixture drives the actual store lifecycle, so `spec` reads
+/// exactly what production reads.
+fn sglang_work() -> InitializeWork {
+    let store = Store::open_in_memory().expect("open in-memory store");
+    let session = store
+        .begin_coordinator_session()
+        .expect("begin coordinator session");
+
+    let source: Value = serde_json::from_str(include_str!(
+        "../../../mllm-config/tests/fixtures/effective-sglang-golden.json"
+    ))
+    .expect("fixture JSON parses");
+    let host = source["input"]["host"].clone();
+    let deployment = source["input"]["deployment"].clone();
+
+    let policy = resolve_effective(&deployment, &host)
+        .expect("fixture resolves")
+        .host;
+    let observations: Vec<_> = policy
+        .domains
+        .keys()
+        .map(|domain| MemoryObservation {
+            domain: domain.clone(),
+            capacity_bytes: 1_i64 << 50,
+            available_bytes: 1_i64 << 50,
+            sampled_at_ms: 1000,
+        })
+        .collect();
+    store
+        .import_resource_policy(&session, &policy, &observations, 1000)
+        .expect("import resource policy");
+
+    let receipt = store
+        .create_stopped_managed_configuration(
+            &session,
+            "owner",
+            "toy",
+            &json!({ "config": deployment }).to_string(),
+            &host,
+            1700,
+        )
+        .expect("create managed configuration");
+    let fence = mllm_store::lifecycle::DeploymentFence {
+        deployment_id: receipt.deployment_id,
+        revision: receipt.revision,
+        generation: receipt.generation,
+    };
+    store
+        .accept_start(&session, &fence, 1800, 10_000)
+        .expect("accept start");
+    store
+        .next_initialize(&session)
+        .expect("next initialize")
+        .expect("a freshly accepted start plans initialize work")
+}
+
 fn bindings() -> ProfileBindings {
     ProfileBindings::new(
         PathBuf::from("/tmp/mllm-test-logs"),
@@ -161,21 +218,72 @@ fn a_profile_that_does_not_mention_deep_park_launches_with_it_enabled() {
     );
 }
 
-/// A family whose production prerequisites are missing must be refused by name.
-/// Building it with placeholder credentials would produce a runtime that looks
-/// configured and is not, and the failure would surface later as an unauthorised
-/// control rather than here as a missing prerequisite.
+/// The SGLang branch builds the real frozen native launch and names both
+/// credential references it will seal: the launch, its two keys, its wrapper
+/// and its log are all resolved here, so a resolved adapter that cannot launch
+/// is a construction failure, not a discovery at spawn time.
+// T16
 #[test]
-fn sglang_is_refused_by_name_rather_than_stubbed() {
-    let CoordinatorError::Service(message) =
-        ProfileBindings::missing("SGLang", "its controls need a resolved admin credential")
+fn an_sglang_spec_builds_the_native_launch_with_both_credential_references() {
+    let work = sglang_work();
+    let binding = work.binding_id().to_owned();
+    let incarnation = work.incarnation().to_owned();
+    let deployment = work.fence().deployment_id.clone();
+    let endpoint = work.endpoint().to_owned();
+    let spec = bindings().spec(&work).expect("the sglang spec builds");
+    let AdapterSpec::Sglang {
+        frozen,
+        inference,
+        admin,
+        observer,
+        wrapper,
+        log,
+        session,
+    } = spec
     else {
-        panic!("a missing prerequisite is a service failure");
+        panic!("the fixture profile declares sglang");
     };
-    assert!(message.contains("SGLang"), "{message}");
-    assert!(message.contains("credential"), "{message}");
+    assert!(observer.is_none(), "a launch adapter has no observer");
     assert!(
-        message.contains("Refusing"),
-        "the refusal must be explicit: {message}"
+        session.is_none(),
+        "the coordinator, not the bindings, threads the session ULID"
+    );
+    assert_eq!(
+        frozen.inference_credential_ref(),
+        format!("sglang-inference-{binding}")
+    );
+    assert_eq!(
+        frozen.admin_credential_ref(),
+        format!("sglang-admin-{binding}")
+    );
+    assert_eq!(frozen.metadata().binding_id, binding);
+    assert_eq!(frozen.metadata().incarnation, incarnation);
+    assert_eq!(frozen.metadata().endpoint, format!("http://{endpoint}"));
+    // The two keys are fresh, distinct, and hex so the factory can decode and
+    // seal both roles.
+    for key in [&inference, &admin] {
+        assert_eq!(key.len(), 64, "{key}");
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()), "{key}");
+    }
+    assert_ne!(inference, admin, "the two roles carry distinct keys");
+    assert_eq!(
+        wrapper,
+        Some(PathBuf::from("/tmp/mllm-test-runtime").join("sglang_entry.py"))
+    );
+    assert_eq!(
+        log.as_deref(),
+        Some(format!("/tmp/mllm-test-logs/{deployment}/{incarnation}.log").as_str())
+    );
+}
+
+/// The pinned native builder is SGLang's own: a work that names another family
+/// is refused rather than adapted, and the family match in `resolve` is what
+/// keeps a spec from being driven through the wrong adapter.
+#[test]
+fn the_native_builder_refuses_another_family() {
+    let work = vllm_work(None);
+    assert!(
+        crate::native_launch::frozen_from_work(&work, "i-ref".into(), "a-ref".into()).is_err(),
+        "a vLLM profile must not build an SGLang launch"
     );
 }

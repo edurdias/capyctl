@@ -39,6 +39,10 @@ use serde_json::{json, Value};
 
 const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
+const DEPLOYMENT: &str = "01K00000000000000000000003";
+const OPERATION: &str = "01K00000000000000000000004";
+const STEP: &str = "01K00000000000000000000005";
+const SESSION: &str = "01K00000000000000000000006";
 const MODEL: &str = "candidate-01K00000000000000000000001";
 const INFERENCE: &str = "inference-secret";
 const ADMIN: &str = "admin-secret";
@@ -360,11 +364,11 @@ fn initialize_command(deadline_in_ms: i64) -> RuntimeCommand {
         action: RuntimeAction::Initialize,
         context: StepExecutionContext {
             token: TransitionToken {
-                deployment_id: "d-1".into(),
+                deployment_id: DEPLOYMENT.into(),
                 revision: 1,
                 generation: 1,
-                operation_id: "o-1".into(),
-                step_id: "s-1".into(),
+                operation_id: OPERATION.into(),
+                step_id: STEP.into(),
             },
             binding_id: BINDING.into(),
             incarnation: INCARNATION.into(),
@@ -388,7 +392,8 @@ fn launch_log() -> std::path::PathBuf {
     ))
 }
 
-/// The fully equipped builder: launch, tools, credentials, wrapper, log.
+/// The fully equipped builder: launch, tools, credentials, wrapper, log and
+/// the coordinator session ULID the descriptor's launch scope names.
 fn equipped(launch: NativeLaunch, tool: Arc<ScriptedTool>, log: &std::path::Path) -> SglangAdapter {
     SglangAdapter::from_frozen(&launch, None)
         .unwrap()
@@ -397,12 +402,14 @@ fn equipped(launch: NativeLaunch, tool: Arc<ScriptedTool>, log: &std::path::Path
         .with_tools(tool)
         .with_wrapper(wrapper().to_path_buf())
         .with_log(log.to_string_lossy().into_owned())
+        .with_session(SESSION)
 }
 
 // ----------------------------------------------------------------------- tests
 
-/// A builder without its launch, its tools, its credentials or its wrapper
-/// cannot launch anything: it refuses rather than half-running the step.
+/// A builder without its launch, its tools, its credentials, its wrapper or
+/// its coordinator session cannot launch anything: it refuses rather than
+/// half-running the step.
 #[tokio::test]
 async fn a_builder_without_its_parts_refuses() {
     let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
@@ -411,23 +418,47 @@ async fn a_builder_without_its_parts_refuses() {
         .unwrap()
         .with_credentials(INFERENCE.into(), ADMIN.into())
         .with_tools(tool.clone())
-        .with_wrapper(wrapper().to_path_buf());
+        .with_wrapper(wrapper().to_path_buf())
+        .with_session(SESSION);
     let no_tools = SglangAdapter::from_frozen(&frozen_launch(port), None)
         .unwrap()
         .with_credentials(INFERENCE.into(), ADMIN.into())
         .with_launch(frozen_launch(port))
-        .with_wrapper(wrapper().to_path_buf());
+        .with_wrapper(wrapper().to_path_buf())
+        .with_session(SESSION);
     let no_credentials = SglangAdapter::from_frozen(&frozen_launch(port), None)
         .unwrap()
         .with_launch(frozen_launch(port))
         .with_tools(tool.clone())
-        .with_wrapper(wrapper().to_path_buf());
+        .with_wrapper(wrapper().to_path_buf())
+        .with_session(SESSION);
     let no_wrapper = SglangAdapter::from_frozen(&frozen_launch(port), None)
         .unwrap()
         .with_credentials(INFERENCE.into(), ADMIN.into())
         .with_launch(frozen_launch(port))
-        .with_tools(tool);
-    for adapter in [no_launch, no_tools, no_credentials, no_wrapper] {
+        .with_tools(tool.clone())
+        .with_session(SESSION);
+    let no_session = SglangAdapter::from_frozen(&frozen_launch(port), None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_launch(frozen_launch(port))
+        .with_tools(tool.clone())
+        .with_wrapper(wrapper().to_path_buf());
+    let empty_session = SglangAdapter::from_frozen(&frozen_launch(port), None)
+        .unwrap()
+        .with_credentials(INFERENCE.into(), ADMIN.into())
+        .with_launch(frozen_launch(port))
+        .with_tools(tool)
+        .with_wrapper(wrapper().to_path_buf())
+        .with_session("");
+    for adapter in [
+        no_launch,
+        no_tools,
+        no_credentials,
+        no_wrapper,
+        no_session,
+        empty_session,
+    ] {
         assert!(
             matches!(
                 adapter.execute_persisted(&initialize_command(30_000)).await,
@@ -524,11 +555,25 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     assert_eq!(captured.len(), 1);
     let [private, inference, admin] = &captured[0];
     let private: Value = serde_json::from_slice(private).unwrap();
-    assert_eq!(private["schema_version"], 1);
+    assert_eq!(private["schema_version"], 2);
     assert_eq!(private["kind"], "sglang_candidate_private_launch");
     assert_eq!(private["checkpoint_root"], CHECKPOINT);
     let public: Value = serde_json::from_str(&argv[4]).unwrap();
     assert_eq!(private["public_settings"], public);
+    // The launch scope is the descriptor contract's v2 addition: the session
+    // this builder was given, and the armed execution context, byte-compatible
+    // with the controller's shared descriptor builder.
+    let scope = &private["launch_scope"];
+    assert_eq!(scope["session_id"], SESSION);
+    assert_eq!(scope["deployment_id"], DEPLOYMENT);
+    assert_eq!(scope["operation_id"], OPERATION);
+    assert_eq!(scope["step_id"], STEP);
+    assert_eq!(scope["revision"], 1);
+    assert_eq!(scope["generation"], 1);
+    assert_eq!(scope["binding_id"], BINDING);
+    assert_eq!(scope["incarnation"], INCARNATION);
+    assert_eq!(scope["issued_at_ms"], command.context.issued_at_ms);
+    assert_eq!(scope["deadline_ms"], command.context.deadline_ms);
     assert_eq!(std::str::from_utf8(inference).unwrap(), INFERENCE);
     assert_eq!(std::str::from_utf8(admin).unwrap(), ADMIN);
 
@@ -719,10 +764,11 @@ async fn an_observer_less_adapter_refuses_every_control_action() {
     ));
 }
 
-/// The descriptor contract pin. The served name is `candidate-{binding_id}`
-/// and the two kinds are the ones `runtime/sglang_entry.py` already accepts,
-/// so this slice provably touches no security-gated Python and no validated
-/// literal. The literals live here and nowhere else in this file.
+/// The descriptor contract pin. The served name is `candidate-{binding_id}`,
+/// the two kinds are the ones `runtime/sglang_entry.py` accepts, and the
+/// private descriptor is schema version 2 whose launch scope cross-checks
+/// against the public settings exactly as the entry's `_validate_launch_scope`
+/// requires. The literals live here and nowhere else in this file.
 #[tokio::test]
 async fn the_descriptor_contract_pin_holds() {
     let log = launch_log();
@@ -732,10 +778,8 @@ async fn the_descriptor_contract_pin_holds() {
     let launch = frozen_launch(port);
     let adapter = equipped(launch, tool.clone(), &log);
 
-    adapter
-        .execute_persisted(&initialize_command(30_000))
-        .await
-        .unwrap();
+    let command = initialize_command(30_000);
+    adapter.execute_persisted(&command).await.unwrap();
 
     let spawned = tool.spawned.lock().unwrap();
     let public: Value = serde_json::from_str(&spawned[0].argv[4]).unwrap();
@@ -744,6 +788,21 @@ async fn the_descriptor_contract_pin_holds() {
     let captured = tool.descriptors.lock().unwrap();
     let private: Value = serde_json::from_slice(&captured[0][0]).unwrap();
     assert_eq!(private["kind"], "sglang_candidate_private_launch");
+    assert_eq!(private["schema_version"], 2);
+    // The entry checks the scope's identity against the public settings before
+    // anything else about it, so the pin holds the same cross-check.
+    let scope = &private["launch_scope"];
+    assert_eq!(scope["session_id"], SESSION);
+    assert_eq!(scope["binding_id"], public["binding_id"]);
+    assert_eq!(scope["incarnation"], public["incarnation"]);
+    assert_eq!(scope["revision"], command.context.token.revision);
+    assert_eq!(scope["generation"], command.context.token.generation);
+    assert_eq!(scope["issued_at_ms"], command.context.issued_at_ms);
+    assert_eq!(scope["deadline_ms"], command.context.deadline_ms);
+    assert!(
+        scope["deadline_ms"].as_i64().unwrap() > scope["issued_at_ms"].as_i64().unwrap(),
+        "the scope must bound its own issuance"
+    );
     std::fs::remove_file(&log).ok();
 }
 

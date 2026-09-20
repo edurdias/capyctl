@@ -58,13 +58,6 @@ impl ProfileBindings {
         }
     }
 
-    fn missing(family: &str, what: &str) -> CoordinatorError {
-        CoordinatorError::Service(format!(
-            "cannot build a {family} runtime yet: {what}. Refusing rather than \
-             constructing one that looks configured and is not"
-        ))
-    }
-
     fn refuse(what: impl std::fmt::Display) -> CoordinatorError {
         CoordinatorError::Service(format!("cannot build a vLLM launch plan: {what}"))
     }
@@ -188,11 +181,48 @@ impl EngineBindings for ProfileBindings {
                     engine_key: Some(hex::encode(mllm_store::secrets::new_engine_key())),
                 })
             }
-            Engine::Sglang => Err(Self::missing(
-                "SGLang",
-                "its controls need a resolved admin credential and a trusted \
-                 observation socket, and neither is wired in production",
-            )),
+            Engine::Sglang => {
+                // The pinned native builder refuses anything the frozen profile
+                // does not name, and maps its refusals onto this error type.
+                // The credential references name the two fresh keys this spec
+                // carries, so the store rows the factory seals can be traced
+                // back to the launch that used them.
+                let binding = work.binding_id();
+                let inference_ref = format!("sglang-inference-{binding}");
+                let admin_ref = format!("sglang-admin-{binding}");
+                let frozen = Box::new(crate::native_launch::frozen_from_work(
+                    work,
+                    inference_ref.clone(),
+                    admin_ref.clone(),
+                )?);
+                Ok(AdapterSpec::Sglang {
+                    frozen,
+                    // SPEC §13.3: one fresh key per role, hex so it survives the
+                    // factory's decode-and-seal; the resolved-spawn factory
+                    // stores both under the binding before the builder runs.
+                    inference: hex::encode(mllm_store::secrets::new_engine_key()),
+                    admin: hex::encode(mllm_store::secrets::new_engine_key()),
+                    observer: None,
+                    // The wrapper is mllm's own protected entrypoint in this
+                    // installation's runtime directory, the same directory that
+                    // holds the vLLM guard middleware. Rendering revalidates the
+                    // path immediately before use, so a directory that does not
+                    // carry it refuses the launch rather than half-running.
+                    wrapper: Some(self.runtime_dir.join("sglang_entry.py")),
+                    // The engine's own output, one file per incarnation, next
+                    // to every other engine's log.
+                    log: Some(
+                        self.log_dir
+                            .join(&work.fence().deployment_id)
+                            .join(format!("{}.log", work.incarnation()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    // The coordinator session is not the bindings' to know; the
+                    // resolved-spawn factory threads it under the owner lock.
+                    session: None,
+                })
+            }
         }
     }
 }

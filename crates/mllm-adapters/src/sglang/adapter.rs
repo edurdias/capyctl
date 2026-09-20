@@ -106,6 +106,9 @@ pub struct SglangAdapter {
     /// Where the engine's own log is expected; quoted (redacted) when a launch
     /// dies before readiness.
     log: Option<String>,
+    /// The coordinator session ULID the private descriptor names (descriptor
+    /// contract v2). Threaded by the coordinator's resolved-spawn factory.
+    session: Option<String>,
     /// The per-launch credentials. They reach the engine through protected
     /// descriptors and appear in no argv, env, log or receipt (SPEC §13.3).
     inference_key: Option<String>,
@@ -150,6 +153,7 @@ impl SglangAdapter {
             tools: None,
             wrapper: None,
             log: None,
+            session: None,
             inference_key: None,
             admin_key: None,
             launched: Mutex::new(None),
@@ -182,10 +186,26 @@ impl SglangAdapter {
         self
     }
 
+    /// The coordinator session whose ULID the private launch descriptor names.
+    /// The descriptor contract (`runtime/sglang_entry.py::_validate_launch_scope`)
+    /// requires it to be a coordinator session ULID, so it is threaded here by
+    /// the one caller — the coordinator's resolved-spawn factory — that holds
+    /// the session. A launch built without one refuses the step.
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session = Some(session_id.into());
+        self
+    }
+
     /// Attach the managed-launch contract (Spec §3): the concrete frozen launch
-    /// this adapter renders in `initialize`.
+    /// this adapter renders in `initialize`. A launch whose served name is not
+    /// the pinned `candidate-{binding_id}` is not attached: rendering it would
+    /// produce a descriptor the entry refuses, so the step must refuse instead,
+    /// which is what a missing launch makes `launch_parts` do.
     pub fn with_launch(mut self, launch: NativeLaunch) -> Self {
-        self.launch = Some(launch);
+        let metadata = launch.metadata();
+        if metadata.served_name == format!("candidate-{}", metadata.binding_id) {
+            self.launch = Some(launch);
+        }
         self
     }
 
@@ -212,24 +232,36 @@ impl SglangAdapter {
         self
     }
 
-    /// The engine's recipe pin, for the receipt an Initialize records.
-    pub(super) fn fingerprint(&self) -> &str {
-        &self
+    /// The engine's recipe pin, for the receipt an Initialize records. A builder
+    /// with no launch is unsupported rather than assumed to have one.
+    pub(super) fn fingerprint(&self) -> Result<&str, RuntimeError> {
+        Ok(&self
             .launch
             .as_ref()
-            .expect("a launch fingerprint is only read by the builder")
+            .ok_or(RuntimeError::Unsupported)?
             .metadata()
-            .recipe
+            .recipe)
     }
 
     /// The engine endpoint this adapter talks to, for the same receipt.
-    pub(super) fn endpoint(&self) -> &str {
-        &self
+    pub(super) fn endpoint(&self) -> Result<&str, RuntimeError> {
+        Ok(&self
             .launch
             .as_ref()
-            .expect("an endpoint is only read by the builder")
+            .ok_or(RuntimeError::Unsupported)?
             .metadata()
-            .endpoint
+            .endpoint)
+    }
+
+    /// The session ULID the private launch descriptor names. A builder without
+    /// one — or with an empty one, which names no session — is unsupported:
+    /// the descriptor contract requires a coordinator session ULID and there is
+    /// no honest substitute for the one the coordinator holds.
+    pub(super) fn session(&self) -> Result<&str, RuntimeError> {
+        self.session
+            .as_deref()
+            .filter(|session| !session.is_empty())
+            .ok_or(RuntimeError::Unsupported)
     }
 
     /// The served name the launch was built to answer on.

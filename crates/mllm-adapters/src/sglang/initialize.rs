@@ -13,6 +13,7 @@ use serde_json::json;
 
 use mllm_domain::completion::{
     EffectObservation, ExecutionIdentities, Milestone, Presence, ProcessIdentity,
+    StepExecutionContext,
 };
 use mllm_domain::launch::ProfileLaunchSettings;
 
@@ -44,24 +45,37 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 /// The private descriptor the launcher reads on fd 3.
 ///
-/// Wire contract with `runtime/sglang_entry.py`, which accepts exactly two
-/// schema versions: version 1 with the keys below and no `launch_scope`, and
-/// version 2 whose `launch_scope.session_id` must be a coordinator session
-/// ULID (`_validate_launch_scope`). The step execution context carries no
-/// coordinator session id, and inventing or blanking one would render a
-/// descriptor the entry refuses, so this builder emits the entry's accepted
-/// version 1 shape. If the ordinary launch must carry a launch scope, the
-/// coordinator threads the session id to this step and this moves to version 2.
-/// Never log the output: it carries the checkpoint root.
+/// Wire contract with `runtime/sglang_entry.py`: exactly the schema version 2
+/// shape the entry validates, whose `launch_scope` carries the same fields as
+/// the controller's shared builder (`native_launch.rs::private_descriptor`),
+/// cross-checked by the entry's `_validate_launch_scope` against the public
+/// settings' binding id and incarnation. The session ULID is the coordinator
+/// session the spawn factory threaded onto this adapter; the rest comes from
+/// the step execution context the coordinator armed. Never log the output: it
+/// carries the checkpoint root.
 fn private_descriptor(
+    session_id: &str,
+    context: &StepExecutionContext,
     checkpoint_root: &str,
     public_settings: &serde_json::Value,
 ) -> Result<Vec<u8>, RuntimeError> {
     serde_json::to_vec(&json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "sglang_candidate_private_launch",
         "checkpoint_root": checkpoint_root,
         "public_settings": public_settings,
+        "launch_scope": {
+            "session_id": session_id,
+            "deployment_id": context.token.deployment_id,
+            "operation_id": context.token.operation_id,
+            "step_id": context.token.step_id,
+            "revision": context.token.revision,
+            "generation": context.token.generation,
+            "binding_id": context.binding_id,
+            "incarnation": context.incarnation,
+            "issued_at_ms": context.issued_at_ms,
+            "deadline_ms": context.deadline_ms,
+        },
     }))
     .map_err(|_| RuntimeError::Uncertain("descriptor encoding failed".into()))
 }
@@ -86,10 +100,13 @@ pub(super) async fn initialize(
     // the same device memory while the first is still recorded as owned.
     adapter.claim_incarnation(&context.binding_id, &context.incarnation)?;
     let wrapper = adapter.wrapper_path()?.to_path_buf();
+    let session = adapter.session()?;
 
     // SPEC §13.3: the private descriptor and the two credentials ride protected
     // descriptors the launcher hands the child; nothing enters argv or env.
     let private = private_descriptor(
+        session,
+        context,
         launch.frozen.checkpoint_root(),
         launch.rendered.public_metadata(),
     )?;
@@ -125,13 +142,26 @@ pub(super) async fn initialize(
         member_id: context.binding_id.clone(),
     };
     loop {
-        match adapter.check_readiness(&member).await {
-            Ok(Readiness::Ready) => break,
-            Ok(Readiness::Initializing) => {}
+        // Each poll is bounded by the smaller of the model list's own timeout
+        // and the builder's remaining budget: one stalled answer must become a
+        // reported poll failure, never a hang past the coordinator's bound.
+        let remaining_ms = (stop_at - now_ms()?).max(0) as u64;
+        let poll_budget =
+            Duration::from_millis(remaining_ms).min(super::http::MODELS_TIMEOUT);
+        match tokio::time::timeout(poll_budget, adapter.check_readiness(&member)).await {
+            // Spec §4: the builder's own bound ends first, so its reason, not a
+            // bare coordinator timeout, is what gets recorded.
+            Err(_elapsed) => {
+                return Err(RuntimeError::Uncertain(
+                    "readiness poll deadline reached with the engine alive".into(),
+                ))
+            }
+            Ok(Ok(Readiness::Ready)) => break,
+            Ok(Ok(Readiness::Initializing)) => {}
             // Spec §3: both exits from this step are journaled, so both pass
             // redaction. Display, not Debug, so the reason carries one prefix
             // rather than nesting this one inside the error's own.
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Err(RuntimeError::Uncertain(redact_text(&format!(
                     "readiness: {e}"
                 ))))
@@ -224,8 +254,8 @@ pub(super) async fn initialize(
         // The receipt carries provenance, never a credential.
         receipt: format!(
             "sglang {} ready on {}; probe answered",
-            adapter.fingerprint(),
-            adapter.endpoint()
+            adapter.fingerprint()?,
+            adapter.endpoint()?
         ),
         facts: vec![
             Milestone::AllocationsRestored,
