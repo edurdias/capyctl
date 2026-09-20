@@ -95,6 +95,10 @@ impl SglangLaunch {
             || !selector(&m.device.device_id)
             || !selector(&m.device.memory_domain)
             || !selector(&m.device.hardware_fingerprint)
+            || m.device
+                .physical_gpu_uuid
+                .as_deref()
+                .is_some_and(|uuid| !physical_gpu_uuid(uuid))
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -259,6 +263,21 @@ fn selector(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
+/// The physical UUID shape `runtime/sglang_device.py` validates (`GPU-` +
+/// 8-4-4-4 lowercase hex). The launcher sets the child's `CUDA_VISIBLE_DEVICES`
+/// from this value, so a UUID the collector would not have observed is refused
+/// before it can name a namespace.
+fn physical_gpu_uuid(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("GPU-") else {
+        return false;
+    };
+    rest.len() == 36
+        && rest.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
 }
 
 fn ulid(value: &str) -> bool {

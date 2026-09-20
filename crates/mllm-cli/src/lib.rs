@@ -1,3 +1,4 @@
+pub mod device_inventory;
 pub mod grammar;
 pub mod host_observation;
 pub mod output;

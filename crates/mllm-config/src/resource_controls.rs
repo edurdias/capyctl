@@ -129,6 +129,7 @@ mod tests {
             devices: BTreeMap::from([(
                 "gpu0".into(),
                 DevicePolicy {
+                    physical_gpu_uuid: None,
                     domain: "system".into(),
                     sharing: Sharing::Exclusive,
                 },

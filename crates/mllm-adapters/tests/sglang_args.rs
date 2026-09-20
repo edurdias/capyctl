@@ -39,6 +39,7 @@ fn metadata(index: u16) -> NativeLaunchMetadata {
             hardware_fingerprint: "hardware-v1".into(),
             device_id: "gpu0".into(),
             memory_domain: "uma".into(),
+            physical_gpu_uuid: None,
         },
     }
 }

@@ -5,6 +5,7 @@
 //! observed capacity rather than a configured guess, because an invented ceiling is
 //! how a host gets overcommitted.
 
+use crate::device_inventory::InventoryPublication;
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
 use mllm_controller::EngineInstallation;
@@ -40,19 +41,53 @@ fn engine_name(engine: Engine) -> &'static str {
 ///
 /// `environment_fingerprint` names the surrounding environment the installation was
 /// found in; `capacity_bytes` is the host's observed total, not a configured guess.
+///
+/// `inventory` is the host's NVIDIA device publication, observed at boot by the
+/// bounded collector (`crate::device_inventory`). The digest rides the host
+/// document as `device_inventory_digest`; when the inventory holds exactly one
+/// device its physical UUID rides the `gpu0` entry, which is what the guarded
+/// launcher sets the engine child's `CUDA_VISIBLE_DEVICES` from. A host with
+/// no inventory publishes neither — placement then fails closed at the native
+/// gate, honestly, rather than here.
 pub fn host_policy(
     installation: &EngineInstallation,
     environment_fingerprint: &str,
     capacity_bytes: i64,
+    inventory: Option<&InventoryPublication>,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let engine = engine_name(installation.engine);
+    let mut gpu0 = json!({"domain": DOMAIN, "sharing": "shared"});
+    if let Some(uuid) = inventory.and_then(|published| published.physical_gpu_uuid.as_deref()) {
+        gpu0["physical_gpu_uuid"] = json!(uuid);
+    }
+    // SPEC §13.3: an SGLang launch seals two per-launch keys under distinct
+    // roles, so its profile names both references; the coordinator resolves
+    // them per launch, never from the profile itself.
+    let security = if installation.engine == Engine::Sglang {
+        json!({
+            "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
+            "trust_remote_code": installation.trust_remote_code,
+            "credential_ref": "secret://engine-key",
+            "admin_credential_ref": "secret://admin-key"
+        })
+    } else {
+        json!({
+            "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
+            "trust_remote_code": installation.trust_remote_code,
+            "credential_ref": "secret://engine-key"
+        })
+    };
     json!({
         "schema_version": 1,
         "kind": "host",
         "name": "standalone",
         "hardware_fingerprint": format!("standalone-{engine}"),
         "environment_fingerprint": environment_fingerprint,
+        // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
+        // the native launch asserts against. Absent (null) when the host
+        // observed no inventory, which normalizes back to `None`.
+        "device_inventory_digest": inventory.map(|published| published.digest.clone()),
         // Spec §7: a relative model path resolves against this, so the host states
         // it rather than having a directory guessed for it.
         "model_store": {"path": installation.models_root.to_string_lossy()},
@@ -66,13 +101,7 @@ pub fn host_policy(
                 "env": {},
                 "launch_settings": installation.launch_settings,
                 "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
-                "security": {
-                    // SPEC §9.1/T21: the host's decision, not the adapter's.
-                    "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
-                    // Spec §3: executing checkpoint-supplied Python is opt-in.
-                    "trust_remote_code": installation.trust_remote_code,
-                    "credential_ref": "secret://engine-key"
-                }
+                "security": security
             }
         },
         "resource_policy": {
@@ -87,7 +116,7 @@ pub fn host_policy(
                     "memory": "unified"
                 }
             },
-            "devices": {"gpu0": {"domain": DOMAIN, "sharing": "shared"}},
+            "devices": {"gpu0": gpu0},
             "device_sharing": "shared",
             "max_parked": 4,
             "observation_ttl": "2s",
@@ -133,9 +162,7 @@ pub fn deployment_document(
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
-    let allocation = |percent: i64, kv: i64| {
-        json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}])
-    };
+    let allocation = |percent: i64, kv: i64| json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}]);
     json!({
         "schema_version": 1,
         "kind": "deployment",

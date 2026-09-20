@@ -38,8 +38,15 @@ fn local(path: &str) -> ModelSource {
 /// every start refuse.
 #[test]
 fn the_host_declares_exactly_one_engine_installation() {
-    let host = host_policy(&installed(Engine::Vllm, "/bin/true"), "env-1", CAPACITY);
-    let profiles = host["runtime_profiles"].as_object().expect("profiles object");
+    let host = host_policy(
+        &installed(Engine::Vllm, "/bin/true"),
+        "env-1",
+        CAPACITY,
+        None,
+    );
+    let profiles = host["runtime_profiles"]
+        .as_object()
+        .expect("profiles object");
     assert_eq!(profiles.len(), 1, "one installation, named not anonymous");
     let profile = &profiles[STANDALONE_PROFILE];
     assert_eq!(profile["engine"], "vllm");
@@ -54,7 +61,7 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
     for allowed in [false, true] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.deep_park = allowed;
-        let host = host_policy(&installation, "env-1", CAPACITY);
+        let host = host_policy(&installation, "env-1", CAPACITY, None);
         assert_eq!(
             host["runtime_profiles"][STANDALONE_PROFILE]["security"]["deep_park"],
             if allowed { "enabled" } else { "disabled" }
@@ -68,7 +75,7 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
 fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.trust_remote_code = true;
-    let host = host_policy(&installation, "env-1", CAPACITY);
+    let host = host_policy(&installation, "env-1", CAPACITY, None);
     let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
     assert_eq!(security["trust_remote_code"], true);
     assert_eq!(security["deep_park"], "disabled");
@@ -80,7 +87,7 @@ fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
 fn the_published_host_names_the_store_its_weights_live_under() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.models_root = "/data/checkpoints".into();
-    let host = host_policy(&installation, "env-1", CAPACITY);
+    let host = host_policy(&installation, "env-1", CAPACITY, None);
     assert_eq!(host["model_store"]["path"], "/data/checkpoints");
 }
 
@@ -89,8 +96,8 @@ fn the_published_host_names_the_store_its_weights_live_under() {
 #[test]
 fn limits_scale_with_observed_capacity() {
     let installation = installed(Engine::Vllm, "/bin/true");
-    let small = host_policy(&installation, "env-1", 16 << 30);
-    let large = host_policy(&installation, "env-1", 128 << 30);
+    let small = host_policy(&installation, "env-1", 16 << 30, None);
+    let large = host_policy(&installation, "env-1", 128 << 30, None);
     let managed = |h: &Value| {
         h["resource_policy"]["domains"][DOMAIN]["managed_limit"]
             .as_str()
@@ -108,7 +115,12 @@ fn limits_scale_with_observed_capacity() {
 /// twice. Asserted on the produced policy, not on the constants that built it.
 #[test]
 fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
-    let host = host_policy(&installed(Engine::Vllm, "/bin/true"), "env-1", CAPACITY);
+    let host = host_policy(
+        &installed(Engine::Vllm, "/bin/true"),
+        "env-1",
+        CAPACITY,
+        None,
+    );
     let bytes = |field: &str| {
         host["resource_policy"]["domains"][DOMAIN][field]
             .as_str()
@@ -128,7 +140,13 @@ fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
 /// must be declared and the peak must be a transition rather than steady state.
 #[test]
 fn every_phase_is_declared_and_the_peak_is_a_transition() {
-    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
+    let d = deployment_document(
+        "m",
+        "m",
+        &local("/models/m"),
+        CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
+    );
     let resources = d["resources"].as_object().unwrap();
     for phase in ["cold", "ready", "parking", "parked", "wake"] {
         assert!(resources.contains_key(phase), "{phase} must be declared");
@@ -141,27 +159,51 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
             .parse::<i64>()
             .unwrap()
     };
-    assert!(bytes("cold") > bytes("ready"), "loading costs more than serving");
+    assert!(
+        bytes("cold") > bytes("ready"),
+        "loading costs more than serving"
+    );
     assert!(bytes("wake") > bytes("ready"));
-    assert!(bytes("parked") < bytes("ready"), "parked retains only residue");
+    assert!(
+        bytes("parked") < bytes("ready"),
+        "parked retains only residue"
+    );
 }
 
 /// A parked deployment holds no device; that is what makes parking reclaim anything.
 #[test]
 fn a_parked_deployment_holds_no_device() {
-    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
+    let d = deployment_document(
+        "m",
+        "m",
+        &local("/models/m"),
+        CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
+    );
     assert_eq!(
-        d["resources"]["parked"]["devices"].as_array().unwrap().len(),
+        d["resources"]["parked"]["devices"]
+            .as_array()
+            .unwrap()
+            .len(),
         0
     );
-    assert_eq!(d["resources"]["ready"]["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        d["resources"]["ready"]["devices"].as_array().unwrap().len(),
+        1
+    );
 }
 
 /// The deployment must name the profile it runs on, or there is nothing to qualify
 /// it against.
 #[test]
 fn the_deployment_names_its_installation() {
-    let d = deployment_document("m", "route-m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
+    let d = deployment_document(
+        "m",
+        "route-m",
+        &local("/models/m"),
+        CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
+    );
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
 }
@@ -170,7 +212,13 @@ fn the_deployment_names_its_installation() {
 /// checkpoint that has to be fetched is expressible in the same document.
 #[test]
 fn the_deployment_states_its_model_source() {
-    let d = deployment_document("m", "m", &local("/models/m"), CAPACITY, DEFAULT_REQUEST_DEADLINE);
+    let d = deployment_document(
+        "m",
+        "m",
+        &local("/models/m"),
+        CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
+    );
     assert_eq!(d["model"]["source"]["type"], "local");
     assert_eq!(d["model"]["source"]["path"], "/models/m");
 
@@ -194,7 +242,12 @@ fn the_deployment_states_its_model_source() {
 /// a host-backed park refusable rather than silently useless.
 #[test]
 fn the_published_host_declares_one_memory_pool() {
-    let host = host_policy(&installed(Engine::Vllm, "/bin/true"), "env-1", 1 << 40);
+    let host = host_policy(
+        &installed(Engine::Vllm, "/bin/true"),
+        "env-1",
+        1 << 40,
+        None,
+    );
     assert_eq!(
         host["resource_policy"]["domains"]["unified"]["memory"],
         "unified"
@@ -206,7 +259,13 @@ fn the_published_host_declares_one_memory_pool() {
 /// a later change to a parking tier is a deliberate edit with a test behind it.
 #[test]
 fn a_standalone_deployment_is_restart_only() {
-    let deployment = deployment_document("m", "m", &local("/models/m"), 1 << 40, DEFAULT_REQUEST_DEADLINE);
+    let deployment = deployment_document(
+        "m",
+        "m",
+        &local("/models/m"),
+        1 << 40,
+        DEFAULT_REQUEST_DEADLINE,
+    );
     assert_eq!(deployment["residency"], "restart_only");
 }
 
@@ -228,7 +287,9 @@ fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
 /// every start at the point where the refusal is hardest to read.
 #[test]
 fn host_policy_from_env_is_complete() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let models = dir.path().join("models");
@@ -256,7 +317,7 @@ fn host_policy_from_env_is_complete() {
     // claiming the same build after an upgrade.
     assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
 
-    let host = host_policy(&installation, "env-1", CAPACITY);
+    let host = host_policy(&installation, "env-1", CAPACITY, None);
     let deployment = deployment_document(
         "m",
         "m",
@@ -288,7 +349,10 @@ fn host_policy_from_env_is_complete() {
     assert_eq!(resolved.profile.executable, bin.to_string_lossy());
     assert_eq!(resolved.host.model_store, models);
     assert_eq!(
-        resolved.model.require_resolved_path().expect("a local model"),
+        resolved
+            .model
+            .require_resolved_path()
+            .expect("a local model"),
         models.join("m").to_string_lossy()
     );
 
@@ -300,7 +364,9 @@ fn host_policy_from_env_is_complete() {
 /// The switch is the host's, and it is off only when the host says so.
 #[test]
 fn deep_park_is_switched_off_only_by_the_host_saying_so() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);

@@ -370,6 +370,14 @@ pub struct DomainPolicy {
 pub struct DevicePolicy {
     pub domain: String,
     pub sharing: Sharing,
+    /// The device's physical GPU UUID as the `mllm-nvidia-inventory-v1`
+    /// collector observed it. Service-authorized placement evidence: the
+    /// guarded launcher sets the engine child's `CUDA_VISIBLE_DEVICES` from
+    /// it, and the native placement gate corroborates it against a freshly
+    /// collected inventory. Optional: a host that publishes no inventory
+    /// publishes no UUID, and placement then fails closed at the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_gpu_uuid: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -542,6 +550,7 @@ pub fn compose_resource_policy(
                 DevicePolicy {
                     domain: domain.clone(),
                     sharing,
+                    physical_gpu_uuid: None,
                 },
             )
         })

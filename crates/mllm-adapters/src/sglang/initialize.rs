@@ -133,6 +133,18 @@ pub(super) async fn initialize(
     if let Some(log) = adapter.engine_log() {
         cmd.env.insert("MLLM_ENGINE_LOG".into(), log.to_string());
     }
+    // SPEC §3: the profile env allowlist rejects `CUDA_VISIBLE_DEVICES` by name
+    // (`engine_policy.rs::SAFE_ENV`), so the guarded launcher sets it here as a
+    // launch parameter, from the host policy's service-frozen device mapping —
+    // the same physical UUID the native placement gate corroborates against the
+    // published inventory digest. Setting this environment before any CUDA
+    // import is the guarded-service obligation `runtime/sglang_device.py`
+    // names; the entry observes the namespace, it never invents it. Absent
+    // when the host published no inventory UUID, which leaves the namespace
+    // unset and placement fail-closed.
+    if let Some(uuid) = launch.frozen.metadata().device.physical_gpu_uuid.as_deref() {
+        cmd.env.insert("CUDA_VISIBLE_DEVICES".into(), uuid.into());
+    }
 
     // The tool is synchronous on purpose (mllm-launchers has no runtime), so every
     // call into it leaves the async threads free.

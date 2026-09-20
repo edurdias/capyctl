@@ -22,6 +22,7 @@ import platform
 import re
 import socket
 import stat
+import sys
 import time
 
 from .sglang_server_args import ObservedPlacement, _validated_public
@@ -154,6 +155,43 @@ def collect_inventory():
                                   platform.machine())
     except Exception:
         raise DeviceObservationError() from None
+
+
+def publish_inventory(stream):
+    """The one boot publication: the versioned digest and its devices as JSON.
+
+    This is the host-side service obligation, not the guarded engine entry: it
+    imports no native library, opens no engine entrypoint, and changes no
+    environment. The caller is the service boot, which runs this module and
+    publishes what it prints; a refusal prints nothing to the stream and the
+    caller publishes nothing.
+    """
+    inventory = collect_inventory()
+    json.dump(
+        {
+            "schema": "mllm-nvidia-inventory-v1",
+            "digest": inventory.digest,
+            "devices": [
+                {
+                    "physical_gpu_uuid": device.physical_gpu_uuid,
+                    "pci_address": device.pci_address,
+                    "device_minor": device.device_minor,
+                    "vendor_id": device.vendor_id,
+                    "device_id": device.device_id,
+                }
+                for device in inventory.devices
+            ],
+        },
+        stream,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        publish_inventory(sys.stdout)
+    except DeviceObservationError:
+        print("device_observation_denied", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 def observe_placement(spec, trusted_mapping):

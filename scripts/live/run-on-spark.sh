@@ -34,6 +34,17 @@ mkdir -p target/live/current
 # One thread: three scenarios export environment variables to boot standalone
 # against a different installation, and the environment is process-global.
 cargo test --release -p mllm-cli --test live_vllm -- --test-threads=1 --nocapture 2>&1 | tee target/live/current/test-output.log
+# The SGLang live gate. The guarded launcher execs the interpreter named by
+# MLLM_SGLANG_BIN with `-IS` and the protected wrapper, so the bin is the venv's
+# python, not a console script. The fingerprint is the installed SGLang's own
+# report, so the pinned recipe is qualified against what will actually launch.
+# The vLLM bin is unset for this suite: a host publishes exactly one engine.
+(
+  unset MLLM_VLLM_BIN
+  export MLLM_SGLANG_BIN=$HOME/mllm-sglang-f2-venv/bin/python3
+  export MLLM_ENGINE_FINGERPRINT=$("$MLLM_SGLANG_BIN" -c 'import sglang; print(sglang.__version__)')
+  cargo test --release -p mllm-cli --test live_sglang -- --test-threads=1 --nocapture 2>&1 | tee -a target/live/current/test-output.log
+)
 REMOTE
 mkdir -p "target/live/$STAMP"
 rsync -az "$HOST:~/mllm-f2/target/live/current/" "target/live/$STAMP/"

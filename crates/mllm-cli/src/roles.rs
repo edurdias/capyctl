@@ -44,7 +44,10 @@ pub use mllm_controller::engine_provider::{EngineInstallation, EngineProvider, P
 pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 
 /// The engine's executable. Required: a host with no engine cannot serve.
+/// One of these two must name the family this host publishes; a host that
+/// names both is not publishing one installation, and refuses.
 const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
+const SGLANG_BIN: &str = "MLLM_SGLANG_BIN";
 /// The directory model weights live under (Spec §7). Required for the same reason:
 /// a guessed store resolves relative paths somewhere the operator never named.
 const MODELS_ROOT: &str = "MLLM_MODELS_ROOT";
@@ -92,6 +95,9 @@ pub struct App {
     environment_fingerprint: String,
     /// Observed host capacity the published limits were derived from.
     capacity_bytes: i64,
+    /// The NVIDIA device publication this boot observed, carried so every host
+    /// document it builds states the same placement evidence.
+    inventory: Option<crate::device_inventory::InventoryPublication>,
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     deps: mllm_router::RouterDeps,
@@ -141,6 +147,7 @@ impl App {
             &self.installation,
             &self.environment_fingerprint,
             self.capacity_bytes,
+            self.inventory.as_ref(),
         );
         let deployment = crate::standalone_config::deployment_document(
             name,
@@ -239,12 +246,25 @@ fn no_installation(what: impl Into<String>) -> ProviderError {
 
 impl EngineProvider for EnvEngineProvider {
     fn installation(&self) -> Result<EngineInstallation, ProviderError> {
-        let executable = PathBuf::from(env_value(ENGINE_BIN).ok_or_else(|| {
-            no_installation(format!(
-                "this host declares no engine: set {ENGINE_BIN} to the engine's \
-                 executable and {MODELS_ROOT} to the directory its weights live under"
-            ))
-        })?);
+        let vllm = env_value(ENGINE_BIN);
+        let sglang = env_value(SGLANG_BIN);
+        let (executable, engine) = match (vllm, sglang) {
+            (Some(_), Some(_)) => {
+                return Err(no_installation(format!(
+                    "this host declares two engines ({ENGINE_BIN} and {SGLANG_BIN}); \
+                     standalone publishes exactly one"
+                )))
+            }
+            (Some(vllm), None) => (PathBuf::from(vllm), Engine::Vllm),
+            (None, Some(sglang)) => (PathBuf::from(sglang), Engine::Sglang),
+            (None, None) => {
+                return Err(no_installation(format!(
+                    "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
+                     for SGLang) to the engine's executable and {MODELS_ROOT} to the \
+                     directory its weights live under"
+                )))
+            }
+        };
         let models_root = PathBuf::from(env_value(MODELS_ROOT).ok_or_else(|| {
             no_installation(format!(
                 "this host names no model store: set {MODELS_ROOT} to the directory \
@@ -267,34 +287,54 @@ impl EngineProvider for EnvEngineProvider {
         };
         let kv_cache_bytes =
             env_value(KV_CACHE_BYTES).unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
-        let args = env_value(ENGINE_ARGS)
-            .unwrap_or_else(|| DEFAULT_ENGINE_ARGS.to_string())
-            .split(' ')
-            .filter(|argument| !argument.is_empty())
-            .map(str::to_owned)
-            .collect();
+        // Spec §7: the whole family block, not a fragment. The pinned SGLang
+        // recipe takes no profile flags (`engine_policy.rs` refuses any arg on
+        // that family) and sizes its pool through the requested budget.
+        let (args, launch_settings) = match engine {
+            Engine::Vllm => (
+                env_value(ENGINE_ARGS)
+                    .unwrap_or_else(|| DEFAULT_ENGINE_ARGS.to_string())
+                    .split(' ')
+                    .filter(|argument| !argument.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                // The utilization gate is set low because the explicit KV grant
+                // is what sizes the pool, and the gate must still pass when the
+                // previous deployment's memory has not yet been released by the
+                // operating system.
+                serde_json::json!({
+                    "engine": "vllm",
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                    "enable_sleep_mode": deep_park,
+                    "kv_cache_dtype": "auto",
+                    "block_size_tokens": 16,
+                    "cpu_offload_bytes": "0B",
+                    "requested_budget": {
+                        "kv_cache_bytes": kv_cache_bytes,
+                        "swap_space_bytes": "0B",
+                        "gpu_utilization_pct": 10
+                    }
+                }),
+            ),
+            Engine::Sglang => (
+                Vec::new(),
+                serde_json::json!({
+                    "engine": "sglang",
+                    "recipe": mllm_config::effective::sglang::NATIVE_SGLANG_RECIPE,
+                    "requested_budget": {
+                        "kv_cache_bytes": kv_cache_bytes,
+                        "static_memory_fraction_bps": 7500
+                    }
+                }),
+            ),
+        };
         Ok(EngineInstallation {
-            engine: Engine::Vllm,
+            engine,
             executable,
+            // Spec §7: the whole family block, not a fragment.
             build_fingerprint,
-            // Spec §7: the whole family block, not a fragment. The utilization gate
-            // is set low because the explicit KV grant is what sizes the pool, and
-            // the gate must still pass when the previous deployment's memory has
-            // not yet been released by the operating system.
-            launch_settings: serde_json::json!({
-                "engine": "vllm",
-                "tensor_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "enable_sleep_mode": deep_park,
-                "kv_cache_dtype": "auto",
-                "block_size_tokens": 16,
-                "cpu_offload_bytes": "0B",
-                "requested_budget": {
-                    "kv_cache_bytes": kv_cache_bytes,
-                    "swap_space_bytes": "0B",
-                    "gpu_utilization_pct": 10
-                }
-            }),
+            launch_settings,
             deep_park,
             trust_remote_code,
             models_root,
@@ -472,7 +512,10 @@ async fn start_standalone_inner(
     // instead of serving with a guessable key.
     let created_this_boot = matches!(
         resolve_startup(ConfigKind::Standalone, None, state_dir)?,
-        LoadOutcome::Generated { created_identity: true, .. }
+        LoadOutcome::Generated {
+            created_identity: true,
+            ..
+        }
     );
     let db_path = state_dir.join("server").join("srv.sqlite3");
     let store = Rc::new(Store::open(&db_path)?);
@@ -491,6 +534,19 @@ async fn start_standalone_inner(
         .map(|sample| sample.memory.capacity_bytes)
         .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
 
+    // SPEC §3: the NVIDIA device inventory is a host fact published at boot
+    // like the fingerprints. The collector is bounded and closed-error: a
+    // machine with no NVIDIA devices, or one whose collection fails or
+    // overruns its bound, publishes nothing, and an SGLang deployment then
+    // fails placement honestly at the native gate instead of the host
+    // claiming placement it cannot corroborate.
+    let inventory = crate::device_inventory::collect(
+        installation
+            .runtime_dir
+            .parent()
+            .unwrap_or(&installation.runtime_dir),
+    );
+
     // The host's own accounting units, resolved before anything can observe or be
     // admitted against them. The coordinator's observation source is named by these,
     // so it has to exist before the coordinator does.
@@ -499,6 +555,7 @@ async fn start_standalone_inner(
             &installation,
             &environment_fingerprint,
             capacity_bytes,
+            inventory.as_ref(),
         );
         let probe = crate::standalone_config::deployment_document(
             "policy-probe",
@@ -586,6 +643,7 @@ async fn start_standalone_inner(
         installation,
         environment_fingerprint,
         capacity_bytes,
+        inventory,
         router,
         deps,
         api_key,

@@ -326,6 +326,12 @@ fn settings() -> SglangLaunchSettings {
 }
 
 fn frozen_launch(port: u16) -> NativeLaunch {
+    frozen_launch_with_device(port, None)
+}
+
+/// The same launch with the host policy's service-authorized physical UUID,
+/// which is what the guarded launcher sets the child's CUDA namespace from.
+fn frozen_launch_with_device(port: u16, physical_gpu_uuid: Option<&str>) -> NativeLaunch {
     NativeLaunch::from_frozen_store(
         NativeLaunchMetadata {
             engine: "sglang".into(),
@@ -343,6 +349,7 @@ fn frozen_launch(port: u16) -> NativeLaunch {
                 hardware_fingerprint: "hardware-v1".into(),
                 device_id: "gpu0".into(),
                 memory_domain: "uma".into(),
+                physical_gpu_uuid: physical_gpu_uuid.map(str::to_owned),
             },
         },
         CHECKPOINT.into(),
@@ -869,5 +876,84 @@ async fn a_second_initialize_for_the_same_incarnation_is_unsupported() {
         Err(RuntimeError::Unsupported)
     ));
     assert_eq!(tool.spawned.lock().unwrap().len(), 1);
+    std::fs::remove_file(&log).ok();
+}
+
+/// The guarded launcher sets the child's `CUDA_VISIBLE_DEVICES` from the host
+/// policy's service-frozen device mapping — never from profile env, which
+/// rejects that name (`engine_policy.rs::SAFE_ENV`), and never into argv, which
+/// the redaction contract forbids. The UUID is a launch parameter, not
+/// descriptor content: the public settings' device object stays closed at the
+/// four reviewed selectors, and the entry corroborates the inherited namespace
+/// against the published placement digest instead (`runtime/sglang_device.py`).
+#[tokio::test]
+async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
+    let uuid = "GPU-1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch_with_device(port, Some(uuid));
+    let adapter = equipped(launch, tool.clone(), &log);
+
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+
+    let public_device_keys;
+    {
+        let spawned = tool.spawned.lock().unwrap();
+        assert_eq!(
+            spawned[0]
+                .env
+                .get("CUDA_VISIBLE_DEVICES")
+                .map(String::as_str),
+            Some(uuid),
+            "the child inherits exactly the mapped device's physical UUID"
+        );
+        // The namespace is a guarded launch parameter: it must not have
+        // travelled as an argument the engine log or a journal could quote
+        // back.
+        let rendered = spawned[0].argv.join(" ");
+        assert!(!rendered.contains("CUDA_VISIBLE_DEVICES"));
+        assert!(!rendered.contains(uuid));
+
+        // And the descriptor's device object stays closed at the four
+        // reviewed selectors — the UUID never enters public settings.
+        let public: Value = serde_json::from_str(&spawned[0].argv[4]).unwrap();
+        public_device_keys = public["device"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| key.to_owned())
+            .collect::<Vec<String>>();
+    }
+    assert_eq!(
+        public_device_keys,
+        [
+            "device_id".to_owned(),
+            "hardware_fingerprint".to_owned(),
+            "host_id".to_owned(),
+            "memory_domain".to_owned()
+        ]
+    );
+
+    // A host that published no inventory UUID leaves the namespace unset, and
+    // the placement gate then fails closed at the entry — the launcher does
+    // not invent one.
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch_with_device(port, None);
+    let adapter = equipped(launch, tool.clone(), &log);
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert!(
+        !tool.spawned.lock().unwrap()[0]
+            .env
+            .contains_key("CUDA_VISIBLE_DEVICES"),
+        "no mapping, no namespace"
+    );
     std::fs::remove_file(&log).ok();
 }

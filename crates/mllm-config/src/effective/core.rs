@@ -335,6 +335,19 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         .resource_policy
         .planner_max_states
         .unwrap_or(DEFAULT_PLANNER_STATES);
+    // A published physical UUID is placement evidence the launcher sets the
+    // child's CUDA namespace from, so it must be the exact shape the inventory
+    // collector validates (`runtime/sglang_device.py`), not any opaque token.
+    for (name, device) in &h.resource_policy.devices {
+        if let Some(uuid) = device.physical_gpu_uuid.as_ref() {
+            if !is_physical_gpu_uuid(uuid) {
+                return Err(invalid(
+                    format!("resource_policy.devices.{name}.physical_gpu_uuid"),
+                    "must be a GPU- prefixed lowercase physical UUID",
+                ));
+            }
+        }
+    }
     let host = HostPolicy {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
@@ -552,4 +565,19 @@ pub(super) fn recipe_fingerprint(
         serde_json::to_vec(&material).map_err(|e| invalid("fingerprint", e.to_string()))?,
     ));
     Ok(recipe_fingerprint)
+}
+
+/// The physical UUID shape `runtime/sglang_device.py` validates
+/// (`GPU-` + 8-4-4-4 lowercase hex, 32 hex digits in all). Both sides refuse
+/// exactly the same inputs, so a policy UUID the collector would not have
+/// observed never reaches the launcher.
+pub(super) fn is_physical_gpu_uuid(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("GPU-") else {
+        return false;
+    };
+    rest.len() == 36
+        && rest.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
 }

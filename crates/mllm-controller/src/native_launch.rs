@@ -53,6 +53,15 @@ pub fn frozen_from_work(
         .get(&device.id)
         .ok_or_else(|| CoordinatorError::Service("selected device is not a host device".into()))?
         .domain;
+    // The service-authorized physical UUID the guarded launcher sets the
+    // child's CUDA namespace from. Absent when the host published no
+    // inventory, which leaves the namespace unset and the placement gate
+    // fail-closed (runtime/sglang_device.py's guarded-service obligation).
+    let physical_gpu_uuid = effective
+        .host
+        .devices
+        .get(&device.id)
+        .and_then(|policy| policy.physical_gpu_uuid.clone());
     // SPEC §13.3: a launch needs a directory on disk; an unresolved source is
     // refused rather than invented.
     let checkpoint_root = effective
@@ -86,6 +95,7 @@ pub fn frozen_from_work(
             hardware_fingerprint: effective.host.hardware_fingerprint.clone(),
             device_id: device.id.clone(),
             memory_domain: memory_domain.clone(),
+            physical_gpu_uuid,
         },
     };
     Ok(NativeLaunch::from_frozen_store(

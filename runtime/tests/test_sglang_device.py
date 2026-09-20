@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import importlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -169,3 +170,41 @@ class DeviceTests(LaunchFixture, unittest.TestCase):
             with self.assertRaises(device.DeviceObservationError) as caught:
                 device.collect_inventory()
         self.assertEqual(str(caught.exception), "device_observation_denied")
+
+    def test_boot_publication_prints_the_versioned_digest_and_devices(self):
+        import io
+        inventory = self.collect()
+        stream = io.StringIO()
+        with mock.patch.object(device, "collect_inventory", self.collect):
+            device.publish_inventory(stream)
+        published = json.loads(stream.getvalue())
+        self.assertEqual(published["schema"], "mllm-nvidia-inventory-v1")
+        self.assertEqual(published["digest"], inventory.digest)
+        self.assertEqual(
+            published["devices"],
+            [{"physical_gpu_uuid": UUID, "pci_address": BDF, "device_minor": 0,
+              "vendor_id": "0x10de", "device_id": "0x2e12"}])
+
+    def test_boot_publication_refusal_prints_nothing(self):
+        import io
+        stream = io.StringIO()
+        with mock.patch.object(
+                device, "collect_inventory",
+                mock.Mock(side_effect=device.DeviceObservationError())):
+            with self.assertRaises(device.DeviceObservationError):
+                device.publish_inventory(stream)
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_main_module_refusal_exits_closed_with_an_empty_stdout(self):
+        import io
+        import runpy
+        stdout, stderr = io.StringIO(), io.StringIO()
+        # The probe seam is global, so a fresh module execution under runpy
+        # reaches the same sanitized refusal on any host, GPU or not.
+        with mock.patch("socket.gethostname", side_effect=OSError("private-host")):
+            with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    runpy.run_module("runtime.sglang_device", run_name="__main__")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("device_observation_denied", stderr.getvalue())

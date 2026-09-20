@@ -66,6 +66,15 @@ pub struct NativeDeviceSelection {
     pub hardware_fingerprint: String,
     pub device_id: String,
     pub memory_domain: String,
+    /// The host policy's service-authorized physical UUID for this device.
+    /// It is a guarded launch parameter, not descriptor content: the launcher
+    /// sets the engine child's `CUDA_VISIBLE_DEVICES` from it (profile env
+    /// rejects that name, `engine_policy.rs::SAFE_ENV`), and the native entry
+    /// corroborates the inherited namespace against it and the placement
+    /// digest. Deliberately never serialized: the descriptor's device object
+    /// is closed at exactly the four reviewed selectors above.
+    #[serde(skip_serializing)]
+    pub physical_gpu_uuid: Option<String>,
 }
 
 /// Redacted native launch description. Neither metadata nor its digest is send authority.

@@ -174,6 +174,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
                 hardware_fingerprint: "hardware-v1".into(),
                 device_id: "gpu0".into(),
                 memory_domain: "uma".into(),
+                physical_gpu_uuid: None,
             },
         },
         "/private/checkpoint".into(),
