@@ -239,8 +239,11 @@ async fn sgl1_to_sgl3_gate() {
     if !live() {
         return;
     }
-    let dir = state_dir();
-    let app = boot_live(dir.path()).await;
+    // Keep the journal and private logs available when a native gate fails.
+    // The state directory remains owner-only; evidence records only its path.
+    let dir = state_dir().keep();
+    record("SGL state_dir", dir.display());
+    let app = boot_live(&dir).await;
     let id = app
         .deploy(
             "qwen3-4b",
