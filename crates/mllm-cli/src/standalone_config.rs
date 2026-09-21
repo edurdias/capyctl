@@ -157,11 +157,22 @@ pub fn deployment_document(
     name: &str,
     route: &str,
     source: &ModelSource,
+    engine: Engine,
     capacity_bytes: i64,
     request_deadline: &str,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
+    // The pinned SGLang recipe parks by mechanism: `normalize_launch` derives
+    // `memory_saver` from the declared residency, and the frozen launch
+    // contract refuses a recipe shape without it (found live: the restart_only
+    // template made every standalone SGLang launch fail the frozen-shape
+    // check). vLLM keeps the restart-only fallback (SPEC §6.2), which is the
+    // residency its sleep-mode launch does not need.
+    let residency = match engine {
+        Engine::Sglang => "deep",
+        Engine::Vllm => "restart_only",
+    };
     let allocation = |percent: i64, kv: i64| json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}]);
     json!({
         "schema_version": 1,
@@ -173,9 +184,10 @@ pub fn deployment_document(
         "runtime_profile": STANDALONE_PROFILE,
         "runtime_profile_revision": 1,
         "recipe": "standalone",
-        // SPEC §6.2's fallback. Ordinary park is not implemented, so no parking tier
-        // can be declared yet; ADR 0010 makes the choice expressible.
-        "residency": "restart_only",
+        // ADR 0010 makes the residency declarable; SGLang's pinned recipe is a
+        // deep-parking recipe and the template states the tier its profile can
+        // deliver, while vLLM keeps the restart-only fallback (SPEC §6.2).
+        "residency": residency,
         "recovery": "reconcile",
         // Ordered: activation window <= deployment deadline <= host ceiling.
         "request_deadline": request_deadline,

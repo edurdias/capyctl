@@ -356,7 +356,7 @@ Current vLLM documentation distinguishes level 1, which keeps a CPU weight backu
 
 The vLLM adapter wraps this in mllm admission and resource checks. Waking allocations alone is not successful restoration. A functioning plain restart-only deployment is the baseline before enabling this optimization.
 
-**Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It must be disabled unless host policy permits it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production readiness requires a separately reviewed supported control path or appropriate engine changes. Owner decision 2026-09-17: deep parking is on by default and a host opts out; the S2 ADR amends this text in full. See docs/superpowers/specs/2026-09-17-native-launch-vllm-design.md §1.
+**Security gate:** vLLM's security documentation warns against enabling development mode in production and identifies the collective RPC surface as dangerous [S2]. The initial deep-parking path is an explicitly authorized, isolated experimental integration, not a production-safe claim. It must be disabled unless host policy permits it. Private binding and a narrow ingress are necessary controls but do not erase that upstream warning. Production readiness requires a separately reviewed supported control path or appropriate engine changes. The current working agreement requires explicit host-policy opt-in, superseding the 2026-09-17 default-on decision. Omitted policy disables deep parking; standalone requires `MLLM_DEEP_PARK=on`.
 
 ### 9.2 SGLang immediately next
 
@@ -855,7 +855,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T18 | Late ingress request | Stale generation/admission token rejected after closure. |
 | T19 | Fairness and queue bounds | Busy A cannot reset the window forever; byte/count limits and deadlines enforced. |
 | T20 | Park/reload timeout or partial failure | No blind repeated collective; reconcile, quarantine, or verified restart. |
-| T21 | vLLM experimental-controls policy | Default denial, explicit opt-in required; no public admin passthrough. Owner decision 2026-09-17: deep parking is on by default and a host opts out; the S2 ADR amends this text in full. See docs/superpowers/specs/2026-09-17-native-launch-vllm-design.md §1. |
+| T21 | vLLM experimental-controls policy | Default denial, explicit opt-in required; no public admin passthrough. The current working agreement requires explicit host-policy opt-in, superseding the 2026-09-17 default-on decision. Omitted policy disables deep parking; standalone requires `MLLM_DEEP_PARK=on`. |
 | T22 | SGLang conformance | Same domain/controller tests pass; no assumption of vLLM sleep semantics. |
 | T23 | Peak activation versus steady state | Candidate blocked when transient demand exceeds the available budget. |
 | T24 | Retained private host caches: 9 + 8 > 16 GiB | Admission blocked until supported reclamation is verified. |

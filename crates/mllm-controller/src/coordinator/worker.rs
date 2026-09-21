@@ -1,7 +1,7 @@
 use super::permits_send;
 use crate::ownership::SharedCoordinatorState;
 use futures::FutureExt;
-use mllm_adapters::traits::{EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand};
+use mllm_adapters::traits::{EngineAdapter, OwnedProcessLaunch, RuntimeError, RuntimeAction, RuntimeCommand};
 use mllm_adapters::vllm::args::redact_text;
 use mllm_config::engine_policy::Engine;
 use mllm_launchers::{AssociationError, LaunchAssociation};
@@ -532,10 +532,18 @@ pub trait EngineBindings: Send + Sync {
         tools: Arc<dyn OwnedProcessLaunch>,
     ) -> Result<Arc<dyn EngineAdapter>, CoordinatorError> {
         Ok(Arc::from(
-            mllm_adapters::resolve::resolve(declared, spec, Some(tools)).map_err(|_| {
-                CoordinatorError::Service(
-                    "engine spec does not match the declared family".into(),
-                )
+            mllm_adapters::resolve::resolve(declared, spec, Some(tools)).map_err(|error| {
+                // The mapping must keep the real cause: a family mismatch, a
+                // frozen-shape validation refusal and a construction failure
+                // all land here, and "family" alone misdiagnoses a validation
+                // refusal as a wiring bug (found live: an SGLang start failed
+                // three times on a shape the journal could not name).
+                CoordinatorError::Service(match error {
+                    RuntimeError::Unsupported => {
+                        "engine spec does not match the declared family".to_owned()
+                    }
+                    other => other.to_string(),
+                })
             })?,
         ))
     }

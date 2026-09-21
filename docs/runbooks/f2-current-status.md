@@ -4,6 +4,53 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Local SGLang launch validation — 2026-09-21
+
+At HEAD `b9b33af`, the uncommitted launch fixes pass the local diagnostic:
+standalone reaches the wrapper and reports `launch_failed`, with journal evidence
+`sglang_startup_failed: artifact_mismatch`, using `/usr/bin/python3` and the stub
+checkpoint. This replaces the prior never-armed failure in this local reproduction;
+it does not demonstrate native model readiness. The diagnostic state is retained
+at `$HOME/.tmpuCTuz5` (machine-local). Running it inside the sandbox
+first failed controller ownership checks because sandbox ancestor UIDs appeared as
+`nobody`; the successful run used real host filesystem ownership without weakening
+the checks.
+
+The required five-crate core command passes 634 distinct tests (635 reported,
+including the owned-state child-process duplicate). Configuration tests pass;
+the `roles_f1` and `standalone_lifecycle` CLI targets pass 5/5 with one test thread.
+All-target Clippy passes with warnings denied for the five core crates. These are
+CPU/Fake checks, not native qualification. The excluded owner files were not read,
+edited, formatted, tested or staged. No commit or live host run was performed.
+
+The two configuration concerns are fixed in the working tree. The pinned SGLang
+recipe rejects `trust_remote_code: true` during configuration normalization, even
+when the host security switch permits remote code. Omitted host `deep_park`
+policy now means disabled, and standalone requires `MLLM_DEEP_PARK=on` to enable
+it; missing, empty, `off`, and unrecognized values do not grant permission.
+SPEC §9.1 and T21 now reflect the current working agreement rather than the older
+default-on decision. The SGLang standalone template requests deep residency, so
+its next native run requires explicit opt-in. The local diagnostic above predates
+this default change and was not rerun in this session.
+
+Focused configuration tests, 14 standalone configuration unit tests, and the five
+CLI lifecycle tests pass. Regression tests prove default denial, explicit opt-in,
+and early rejection of unsupported remote code. The controller launch regression
+also verifies omitted policy renders no sleep flags and sets
+`VLLM_SERVER_DEV_MODE=0`. Core and affected-library Clippy pass with warnings
+denied. The checkout contains broad pre-existing changes, including formatting,
+beyond these fixes; they remain uncommitted and must not be bundled blindly.
+The final core run passes all 634 distinct tests (635 reported). An earlier run
+hit `AddrInUse` in the SGLang stub-engine test; the full isolated retry passed.
+The sandboxed attempt was blocked by home-directory ownership and write checks,
+so integration verification used the real host filesystem.
+Native rerun and the final S3 review remain pending.
+
+Current host authorization comes from the working agreement: both host-a and
+host-b are authorized; engine-environment changes, driver changes and reboots
+remain prohibited. Older authorization and closed-entrypoint statements below are
+historical and do not override that agreement or the S3 composed startup gate.
+
 ## Recent committed work
 
 - `dc5a3c1`: a success resets the attempt budget.

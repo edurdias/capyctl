@@ -34,7 +34,7 @@ fn vllm_work(deep_park: Option<&str>) -> InitializeWork {
         }
     }
     let mut deployment = source["input"]["deployment"].clone();
-    if deep_park == Some("disabled") {
+    if deep_park != Some("enabled") {
         // SPEC §3: a parking residency on a profile that disables deep park is
         // refused at admission (`core.rs`'s `UnsupportedCombination`), so the
         // disabled fixture asks for the residency deep park does not gate.
@@ -177,7 +177,7 @@ fn a_disabled_profile_launches_without_sleep_flags() {
     );
 }
 
-/// Spec §3: the default profile launches ready to park, in vLLM's development
+/// SPEC §9.1: an explicitly enabled profile launches ready to park, in vLLM's development
 /// mode, with the sleep/eager-load flags that mode needs.
 // T21
 #[test]
@@ -200,28 +200,22 @@ fn an_enabled_profile_launches_with_sleep_mode() {
     );
 }
 
-/// Spec §3 and the owner's 2026-09-17 decision: deep park is on by default and a
-/// host opts out, so a host file that never mentions the switch launches ready to
-/// park. The enabled case above writes the value; only this one proves the
-/// schema's own default.
+/// SPEC §9.1: omitted host policy leaves experimental controls disabled.
 // T21
 #[test]
-fn a_profile_that_does_not_mention_deep_park_launches_with_it_enabled() {
+fn a_profile_that_does_not_mention_deep_park_launches_with_it_disabled() {
     let work = vllm_work(None);
     let spec = bindings().spec(&work).expect("vllm spec builds");
     let AdapterSpec::Vllm { policy, launch, .. } = spec else {
         panic!("the fixture profile declares vllm");
     };
-    assert_eq!(policy, ParkPolicy::Enabled);
+    assert_eq!(policy, ParkPolicy::Disabled);
     let launch = launch.expect("an owned vllm binding carries a launch plan");
-    assert!(
-        !launch.sleep_flags.is_empty(),
-        "an unmentioned deep park is an enabled one"
-    );
+    assert!(launch.sleep_flags.is_empty());
     let rendered = render_command(&launch).expect("plan renders");
     assert_eq!(
         rendered.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str),
-        Some("1")
+        Some("0")
     );
 }
 

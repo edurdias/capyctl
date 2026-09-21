@@ -144,6 +144,7 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         "m",
         "m",
         &local("/models/m"),
+        Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -177,6 +178,7 @@ fn a_parked_deployment_holds_no_device() {
         "m",
         "m",
         &local("/models/m"),
+        Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -201,6 +203,7 @@ fn the_deployment_names_its_installation() {
         "m",
         "route-m",
         &local("/models/m"),
+        Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -216,6 +219,7 @@ fn the_deployment_states_its_model_source() {
         "m",
         "m",
         &local("/models/m"),
+        Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -230,6 +234,7 @@ fn the_deployment_states_its_model_source() {
             revision: None,
             locked_commit: None,
         },
+        Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -263,6 +268,7 @@ fn a_standalone_deployment_is_restart_only() {
         "m",
         "m",
         &local("/models/m"),
+        Engine::Vllm,
         1 << 40,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -281,7 +287,7 @@ fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Spec §7: the host policy built from the environment carries the full vLLM launch
-/// settings, the model store, deep park enabled by default and the flags the
+/// settings, the model store, deep park disabled by default and the flags the
 /// profile passes — and it resolves, which is what a deployment is qualified
 /// against. A table that merely looked complete but did not resolve would refuse
 /// every start at the point where the refusal is hardest to read.
@@ -322,6 +328,7 @@ fn host_policy_from_env_is_complete() {
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
+        Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
     );
@@ -338,12 +345,8 @@ fn host_policy_from_env_is_complete() {
     assert_eq!(settings.requested_budget.kv_cache_bytes, 16 << 30);
     assert_eq!(settings.requested_budget.swap_space_bytes, 0);
     assert_eq!(settings.requested_budget.gpu_utilization_pct, 10);
-    assert!(
-        settings.enable_sleep_mode,
-        "deep park is on unless the host switches it off, and sleep mode is what \
-         makes it possible"
-    );
-    assert_eq!(resolved.profile.security.deep_park, DeepPark::Enabled);
+    assert!(!settings.enable_sleep_mode);
+    assert_eq!(resolved.profile.security.deep_park, DeepPark::Disabled);
     assert!(!resolved.profile.security.trust_remote_code);
     assert_eq!(resolved.profile.args, ["--max-model-len", "4096"]);
     assert_eq!(resolved.profile.executable, bin.to_string_lossy());
@@ -361,9 +364,10 @@ fn host_policy_from_env_is_complete() {
     std::env::remove_var("MLLM_RUNTIME_DIR");
 }
 
-/// The switch is the host's, and it is off only when the host says so.
+/// SPEC §9.1: only an explicit opt-in enables experimental controls.
+// T21
 #[test]
-fn deep_park_is_switched_off_only_by_the_host_saying_so() {
+fn deep_park_requires_explicit_host_opt_in() {
     let _guard = ENVIRONMENT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -378,12 +382,15 @@ fn deep_park_is_switched_off_only_by_the_host_saying_so() {
     std::env::set_var("MLLM_DEEP_PARK", "off");
     std::env::set_var("MLLM_TRUST_REMOTE_CODE", "1");
 
-    let installation = crate::roles::EnvEngineProvider::new()
-        .installation()
-        .expect("the environment declares an installation");
-    assert!(!installation.deep_park);
-    assert!(installation.trust_remote_code);
-    assert_eq!(installation.launch_settings["enable_sleep_mode"], false);
+    for (value, enabled) in [("off", false), ("", false), ("typo", false), ("on", true)] {
+        std::env::set_var("MLLM_DEEP_PARK", value);
+        let installation = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect("the environment declares an installation");
+        assert_eq!(installation.deep_park, enabled, "{value:?}");
+        assert!(installation.trust_remote_code);
+        assert_eq!(installation.launch_settings["enable_sleep_mode"], enabled);
+    }
 
     for name in [
         "MLLM_VLLM_BIN",

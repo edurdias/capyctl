@@ -910,21 +910,44 @@ fn deep_park_disabled_with_parking_residency_is_refused() {
     resolve_effective(&deployment, &host).expect("restart_only does not park");
 }
 
-/// Spec §3: omitting the switch keeps parking available. A host file written
-/// before the rename from `experimental_controls` must not silently lose the
-/// capability it already had.
+/// SPEC §9.1 / T21 and the current working agreement require explicit opt-in.
 // T21
 #[test]
-fn deep_park_defaults_to_enabled() {
-    let (deployment, mut host) = fixture();
+fn deep_park_defaults_to_disabled() {
+    let (mut deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["security"]
         .as_object_mut()
-        .expect("security is an object")
+        .unwrap()
         .remove("deep_park");
-    let effective = resolve_effective(&deployment, &host).expect("the default resolves");
-    assert_eq!(effective.profile.security.deep_park, DeepPark::Enabled);
-    assert!(effective.profile.security.deep_park.is_enabled());
-    assert_eq!(effective.residency, Residency::Deep);
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert_eq!(error.path, "runtime_profiles.security.deep_park");
+    deployment["residency"] = "restart_only".into();
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(effective.profile.security.deep_park, DeepPark::Disabled);
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
+    deployment["residency"] = "deep".into();
+    assert!(resolve_effective(&deployment, &host).is_ok());
+}
+
+// T21: host permission cannot expand the pinned SGLang recipe.
+#[test]
+fn sglang_remote_code_is_rejected_during_configuration_validation() {
+    let (deployment, mut host) = fixture();
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = "sglang".into();
+    profile["args"] = serde_json::json!([]);
+    profile["security"]["admin_credential_ref"] = "secret://admin".into();
+    profile["security"]["trust_remote_code"] = true.into();
+    profile["launch_settings"] = serde_json::json!({
+        "engine": "sglang",
+        "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
+        "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500},
+        "trust_remote_code": true
+    });
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert_eq!(error.path, "runtime_profiles.launch_settings");
+    host["runtime_profiles"]["local"]["launch_settings"]["trust_remote_code"] = false.into();
+    assert!(resolve_effective(&deployment, &host).is_ok());
 }
 
 /// Spec §3: `--trust-remote-code` makes the engine execute Python that arrived with

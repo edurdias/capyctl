@@ -153,6 +153,7 @@ impl App {
             name,
             name,
             &source,
+            self.installation.engine,
             self.capacity_bytes,
             request_deadline,
         );
@@ -277,9 +278,9 @@ impl EngineProvider for EnvEngineProvider {
                 models_root.display()
             )));
         }
-        // Spec §3: deep park is available unless the host switches it off, and
-        // sleep mode is what makes it possible, so the two move together.
-        let deep_park = env_value(DEEP_PARK).is_none_or(|value| value != "off");
+        // SPEC §9.1 / T21: experimental controls require explicit host opt-in.
+        // Sleep mode follows the same permission as deep parking.
+        let deep_park = env_value(DEEP_PARK).is_some_and(|value| value == "on");
         let trust_remote_code = env_value(TRUST_REMOTE_CODE).is_some_and(|value| value == "1");
         let build_fingerprint = match env_value(ENGINE_FINGERPRINT) {
             Some(declared) => declared,
@@ -319,9 +320,34 @@ impl EngineProvider for EnvEngineProvider {
             ),
             Engine::Sglang => (
                 Vec::new(),
+                // The pinned recipe's whole shape, not a fragment: the frozen
+                // contract refuses any field that drifts from the recipe it was
+                // written against, so the template carries every field the
+                // contract validates (found live: an omitted memory_saver made
+                // every SGLang launch fail at the frozen-shape check, and the
+                // old error mapping reported it as a family mismatch).
                 serde_json::json!({
                     "engine": "sglang",
                     "recipe": mllm_config::effective::sglang::NATIVE_SGLANG_RECIPE,
+                    "tensor_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "tokenizer_workers": 1,
+                    "model_dtype": "bfloat16",
+                    "context_tokens": 4096,
+                    "max_running_requests": 8,
+                    "max_total_tokens": 4096,
+                    "prefill_cuda_graphs": false,
+                    "decode_cuda_graphs": false,
+                    "memory_saver": true,
+                    "cpu_weight_backup": false,
+                    "speculative_decoding": false,
+                    "lora": false,
+                    "trust_remote_code": trust_remote_code,
+                    "disaggregation": false,
+                    "external_cache": false,
+                    "cpu_kv_offload": false,
+                    "native_grpc": false,
+                    "weight_restore": "disk_reload",
                     "requested_budget": {
                         "kv_cache_bytes": kv_cache_bytes,
                         "static_memory_fraction_bps": 7500
@@ -379,7 +405,14 @@ fn runtime_dir() -> Result<PathBuf, ProviderError> {
             dir.display()
         )));
     }
-    Ok(dir)
+    // The protected wrapper's validator refuses a path whose canonical form
+    // differs from itself, so a runtime directory named through `..` is
+    // canonicalized here, where the installation is resolved — a launch would
+    // otherwise fail at render with a refusal this boot could have prevented
+    // (found live: the default CARGO_MANIFEST_DIR-relative directory carries
+    // `..` and every SGLang launch was refused before spawning).
+    dir.canonicalize()
+        .map_err(|error| no_installation(format!("runtime directory {}: {error}", dir.display())))
 }
 
 /// What the installed engine says it is.
@@ -563,6 +596,7 @@ async fn start_standalone_inner(
             &ModelSource::Local {
                 path: "/dev/null".into(),
             },
+            installation.engine,
             capacity_bytes,
             crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
         );

@@ -134,7 +134,17 @@ pub fn resolve(
             log,
             session,
         } => {
-            let mut adapter = SglangAdapter::from_frozen(&frozen, observer)?
+            let mut adapter = SglangAdapter::from_frozen(&frozen, observer)
+                .map_err(|error| match error {
+                    // A shape the frozen contract refuses is not a family
+                    // mismatch: the reason names the launch, never a path or
+                    // credential, and the caller's journal must be able to
+                    // tell the two apart.
+                    RuntimeError::Unsupported => RuntimeError::Uncertain(
+                        "the frozen SGLang launch shape was refused by its contract".into(),
+                    ),
+                    other => other,
+                })?
                 .with_launch(*frozen)
                 .with_credentials(inference, admin);
             if let Some(wrapper) = wrapper {

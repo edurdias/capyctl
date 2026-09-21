@@ -213,6 +213,27 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("cpu_offload_bytes", BYTES),
         ("recipe", SCALAR),
         ("requested_budget", REQUESTED_BUDGET),
+        // The SGLang family's own settings. The pinned recipe validates the
+        // whole shape at launch, so the schema's job is to let a profile carry
+        // it at all; anything the recipe refuses is refused there, closed.
+        ("data_parallel_size", SCALAR),
+        ("tokenizer_workers", SCALAR),
+        ("model_dtype", SCALAR),
+        ("context_tokens", SCALAR),
+        ("max_running_requests", SCALAR),
+        ("max_total_tokens", SCALAR),
+        ("prefill_cuda_graphs", SCALAR),
+        ("decode_cuda_graphs", SCALAR),
+        ("memory_saver", SCALAR),
+        ("cpu_weight_backup", SCALAR),
+        ("speculative_decoding", SCALAR),
+        ("lora", SCALAR),
+        ("trust_remote_code", SCALAR),
+        ("disaggregation", SCALAR),
+        ("external_cache", SCALAR),
+        ("cpu_kv_offload", SCALAR),
+        ("native_grpc", SCALAR),
+        ("weight_restore", SCALAR),
     ];
     const PROFILE: FieldSpec = FieldSpec::Struct(&[
         ("engine", SCALAR),
