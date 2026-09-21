@@ -4,6 +4,27 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Native SGLang gate blocked — 2026-09-21
+
+Launch/configuration fixes are committed as `047007a`; the scoped runner and
+failure-evidence retention are committed as `5d07f11`. Unrelated working-tree
+changes remain uncommitted. The subsequent live run used that working tree.
+
+The authorized host-a run reached the protected wrapper, then failed with
+`source_revalidation_failed` in 4.43 seconds. The selected SGLang 0.5.19
+installation has group-writable package files/directories, and seven of ten
+audited source files disagree with the recipe's pinned hashes. The gate remains
+closed. The working agreement prohibits engine-environment changes; a matching,
+protected installation or explicit owner authorization for a reviewed environment
+repair is needed before another native attempt. No installation or driver was
+changed and no host was rebooted.
+
+The deployment settled stopped with admission and dispatch disabled; no engine
+processes remained in the post-run check. Evidence is under
+`target/live/20260921T213446Z/`, with details in `spark-live-f2.md`. Private state
+is retained on host-a at `$HOME/.tmphQyl3M`. This is not native
+qualification. Final S3 review and S2 remain pending behind the live gate.
+
 ## Local SGLang launch validation — 2026-09-21
 
 At HEAD `b9b33af`, the uncommitted launch fixes pass the local diagnostic:

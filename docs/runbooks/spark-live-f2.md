@@ -151,3 +151,36 @@ The scenario as committed asserts the bound that does exist — the refusal is
 definite, nothing was launched, and nothing is owed. Exercising the readiness
 timeout against a live engine needs a lever that does not exist yet, and deciding
 whether to add one is work for after run 1.
+
+## 2026-09-21 — SGLang launch gate blocked — 5d07f11
+
+Command: `bash scripts/live/run-on-spark.sh host-a sglang`.
+The synchronized working tree included pre-existing uncommitted changes; this is
+not a clean-checkout result. Launch/configuration fixes are committed in `047007a`
+and runner/evidence changes in `5d07f11`.
+
+SGLang 0.5.19, qwen3-4b-instruct, host-a. The runner explicitly set
+`MLLM_DEEP_PARK=on`. Wrapper ancestors passed the permission inspection after
+synchronization. Release binary checks passed. The gate failed in 4.43 seconds:
+Initialize armed and reached the protected wrapper, which reported
+`sglang_startup_failed: source_revalidation_failed`. No Ready or inference result
+was established, so SGL1–SGL3 did not pass.
+
+Read-only inspection of `~/mllm-sglang-f2-venv/lib/python3.12/site-packages/sglang/srt`
+found `unsafe_file`: package directories have mode 0775 and selected source files
+have mode 0664. Seven of ten audited files also disagree with the pinned source
+hashes: `server_args.py`, `managers/scheduler.py`,
+`managers/detokenizer_manager.py`, `managers/scheduler_components/weight_updater.py`,
+`entrypoints/engine.py`, `entrypoints/http_server.py`, and `platforms/__init__.py`.
+The version string alone therefore does not establish the pinned recipe.
+
+The failed operation is `launch_failed`; the deployment is stopped with admission
+and dispatch disabled. A subsequent process check found no engine processes.
+No engine installation, driver, or host reboot was changed. The native source
+gate remains closed; an approved matching protected installation is required
+before a rerun.
+
+Evidence: `target/live/20260921T213446Z/` on control-host contains the test output,
+wrapper-path inspection, results, and sanitized engine startup log. The private
+controller state remains on host-a at `$HOME/.tmphQyl3M` for diagnosis.
+This failed native attempt and earlier CPU/Fake passes are not qualification.
