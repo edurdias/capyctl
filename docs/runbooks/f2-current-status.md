@@ -4,6 +4,32 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Version skew policy and capability gating — 2026-09-24 (branch `feat/version-skew`)
+
+Owner decision 2026-09-24: a SemVer skew policy between server and hosts (ADR 0017,
+amending SPEC §13.1). The host sends its release version (`Connect.binary_version`,
+field 7) and every post-baseline protocol feature it implements
+(`Connect.capabilities`, field 8). Same `major.minor` line is supported; N-1 is
+supported with `upgrade_recommended`; older, another major, or no/unparseable version
+is drain-only (`upgrade_required`: only Inspect, Terminate, CloseIngress and Probe are
+sent; not a placement candidate); a newer host is refused with "upgrade the server
+first" and keeps reconnecting. Fourteen post-baseline features are catalogued
+(`mllm_protocol::capabilities`); the send path refuses any command needing one the
+host did not declare, typed and before anything is sent
+(`host_capability_missing:<name>`, `host_upgrade_required`), launch/park/wake preflight
+the same gate, placement requires `checkpoint_digest`, `startup_bytes` and
+`restore_checkpoint_digest`, and a Terminate carries recorded identities only to a
+host that declared them. `model_source_unsupported` became
+`host_capability_missing:model_sources`. Versions and verdicts are recorded (schema
+v34 `host_versions`) and shown in `list hosts` / `inspect host` and per allowed host
+in deployment status. Upgrade order in `docs/operations/install.md`: server first,
+then hosts one at a time. Consequence: hosts on releases before this one report no
+version and are drain-only against an upgraded server until they are upgraded.
+
+Local verification only: core 1070 reported, workspace 1764 passed (1 ignored), Clippy
+clean with warnings denied across the workspace. CPU and mTLS transport tests are not
+qualification; no mixed-version fleet has run on the Sparks. Pending: a live rolling
+upgrade (server first, then host-a, then host-b) once a release carries this change.
 ## Soak M48–M50 — 2026-09-24 (branch `test/soak-m48-m50`, stopped by the owner)
 
 M48 is not passed: the owner stopped the soak after 119 walked steps, short of

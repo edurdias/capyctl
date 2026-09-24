@@ -11,6 +11,7 @@ use mllm_domain::{
     group::{CommandIdentity, MemberKey},
 };
 use mllm_protocol::{
+    capabilities,
     execution::{MemberAction, MemberCommand, SingleLaunchPlan},
     pb,
 };
@@ -209,6 +210,18 @@ impl RemoteEngine {
             return Err(RuntimeError::StaleRevision);
         }
         let park = runtime.action == RuntimeAction::Park;
+        // ADR 0017: a drain-only host is never parked or woken, and a wake
+        // needs the digest fields; refused typed before anything is sent.
+        let mut needs = Vec::new();
+        if !park {
+            needs.extend([capabilities::CHECKPOINT_DIGEST, capabilities::RESTORE_CHECKPOINT_DIGEST]);
+        }
+        if b.instance_index != 0 {
+            needs.push(capabilities::INSTANCE_INDEX);
+        }
+        self.sessions
+            .preflight(&b.host_id, &needs, true)
+            .map_err(RuntimeError::Refused)?;
         // Owner decision 5: a wake carries the recorded digest, measured and
         // recorded first when there is none; nothing is sent otherwise.
         let checkpoint_digest = if park {
@@ -250,7 +263,7 @@ impl RemoteEngine {
             .sessions
             .execute_on_session(command, None)
             .await
-            .map_err(|_| RuntimeError::Uncertain("remote residency change remains unresolved".into()))?;
+            .map_err(|status| unresolved(&status, "remote residency change remains unresolved"))?;
         let (alive, facts) = match residency_evidence(park, recorded, &result) {
             Ok(evidence) => evidence,
             // W4 hand-off (W5): a refused park leaves the host's gate closed;
@@ -355,6 +368,27 @@ impl EngineAdapter for RemoteEngine {
         let mut plan = b.plan.clone();
         plan.issued_at_ms = c.issued_at_ms;
         plan.grant_id = c.grant_id.clone().ok_or(RuntimeError::Missing)?;
+        // ADR 0017: a drain-only host takes no new launch, and a launch needs
+        // every field it will carry; refused typed before anything is sent
+        // (no source download, no digest request, no key).
+        let mut needs = vec![capabilities::CHECKPOINT_DIGEST];
+        if plan.startup_bytes.is_some() {
+            needs.push(capabilities::STARTUP_BYTES);
+        }
+        if b.instance_index != 0 {
+            needs.push(capabilities::INSTANCE_INDEX);
+        }
+        if mllm_protocol::execution::MaterializeSourcePlan::new(
+            &plan.deployment_config,
+            &plan.host_policy_fingerprint,
+        )
+        .is_some()
+        {
+            needs.push(capabilities::MODEL_SOURCES);
+        }
+        self.sessions
+            .preflight(&b.host_id, &needs, true)
+            .map_err(RuntimeError::Refused)?;
         // ADR 0008: a declared remote source must be on this host's disk,
         // verified, before its digest is measured or anything is launched.
         // A failure or a download still running refuses the launch here,
@@ -405,9 +439,7 @@ impl EngineAdapter for RemoteEngine {
             .sessions
             .provision_ingress(&command, b.ingress_gate_key)
             .await
-            .map_err(|_| {
-                RuntimeError::Uncertain("remote ingress provision remains unresolved".into())
-            })?;
+            .map_err(|status| unresolved(&status, "remote ingress provision remains unresolved"))?;
         // SPEC §13 (WE3 limit 1): the host refused on its own policy, for
         // example a checkpoint that no longer matches the recorded digest.
         // Nothing was stored or started and the launch is never sent; the
@@ -424,7 +456,7 @@ impl EngineAdapter for RemoteEngine {
             .sessions
             .execute_on_session(command, Some(observer))
             .await
-            .map_err(|_| RuntimeError::Uncertain("remote initialize remains unresolved".into()))?;
+            .map_err(|status| unresolved(&status, "remote initialize remains unresolved"))?;
         launch_evidence(&result)?;
         // SPEC §13.2 (G2): this readiness belongs to the host session that
         // proved it; a later session must re-prove it before dispatch.
@@ -513,7 +545,8 @@ async fn cleanup(
             owned_handle: binding.launch_command_id.clone(),
             // ADR 0016: what this server recorded, so a host that lost its
             // journal can still report the launch's processes by identity.
-            recorded: context.identities.clone(),
+            // ADR 0017: only to a host that declared the field.
+            recorded: recorded_for(sessions, binding, &context.identities),
         },
     };
     command.identity.payload_digest = command.canonical_digest();
@@ -529,6 +562,33 @@ async fn cleanup(
         observed_at_ms: result.observed_at_unix_ms,
         receipt: receipt.into(),
     })
+}
+
+/// ADR 0016, ADR 0017: the recorded identities a Terminate carries. A host
+/// that did not declare `terminate_recorded_processes` would refuse a command
+/// carrying them (by digest), so it is sent the baseline Terminate and acts on
+/// its own journal record, as before the field existed. The proof required of
+/// its answer is unchanged: every recorded identity must be reported gone.
+fn recorded_for(
+    sessions: &AgentSessions,
+    binding: &RemoteLaunchBinding,
+    identities: &[ProcessIdentity],
+) -> Vec<ProcessIdentity> {
+    if sessions.supports(&binding.host_id, capabilities::TERMINATE_RECORDED_PROCESSES) {
+        identities.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
+/// ADR 0017: a command refused before it was sent (drain-only host, missing
+/// capability) is a typed refusal without effect; anything else unresolved
+/// stays uncertain.
+fn unresolved(status: &tonic::Status, uncertain: &str) -> RuntimeError {
+    match crate::agent_sessions::gate_refusal(status) {
+        Some(reason) => RuntimeError::Refused(reason.to_owned()),
+        None => RuntimeError::Uncertain(uncertain.into()),
+    }
 }
 
 /// What a LaunchSingle result proves (SPEC §§6.1, 6.4, 13, 13.2).
@@ -632,7 +692,8 @@ async fn settle(
             owned_handle: binding.launch_command_id.clone(),
             // ADR 0016: what this server recorded, so a host that lost its
             // journal can still report the launch's processes by identity.
-            recorded: context.identities.clone(),
+            // ADR 0017: only to a host that declared the field.
+            recorded: recorded_for(sessions, binding, &context.identities),
         },
     };
     command.identity.payload_digest = command.canonical_digest();
@@ -964,5 +1025,73 @@ mod tests {
         ready.claim_retained = true;
         ready.model_usable = true;
         assert!(launch_evidence(&ready).is_ok());
+    }
+
+    // T34 T06: ADR 0016, ADR 0017. A Terminate carries the recorded
+    // identities only to a host that declared the field, judged on its live
+    // session or, offline, on the declaration the store recorded; a host
+    // never seen declaring it is sent the baseline Terminate.
+    #[test]
+    fn recorded_identities_go_only_to_a_host_that_declared_them() {
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let owned = Arc::new(Mutex::new(crate::OwnedCoordinatorState::open(dir.path()).unwrap()));
+        let host = {
+            let owner = owned.lock().unwrap();
+            let store = owner.store();
+            store.create_host_invitation(&"b".repeat(64), "spark", 100, 0).unwrap();
+            store
+                .redeem_host_invitation(
+                    &mllm_store::enrollment::Redemption {
+                        invitation_digest: "b".repeat(64),
+                        transaction_id: "tx".into(),
+                        host_name: "spark".into(),
+                        key_digest: "c".repeat(64),
+                        csr_digest: "d".repeat(64),
+                    },
+                    1,
+                    |id| {
+                        Ok(mllm_store::enrollment::CertificateRecord {
+                            host_id: id.into(),
+                            fingerprint: "bf".repeat(32),
+                            certificate_pem: "certificate".into(),
+                            expires_unix: 500,
+                        })
+                    },
+                )
+                .unwrap()
+                .host_id
+        };
+        let authority = Arc::new(crate::enrollment::EnrollmentAuthority::new(
+            owned.clone(),
+            mllm_agent::identity::CertificateAuthority::generate(100).unwrap(),
+        ));
+        let sessions = AgentSessions::new(authority.clone());
+        let mut remote = binding();
+        remote.host_id = host.clone();
+        let identities = vec![ProcessIdentity {
+            role: "api".into(),
+            pid: 10,
+            boot_id: "boot".into(),
+            start_ticks: 3,
+        }];
+        assert!(recorded_for(&sessions, &remote, &identities).is_empty());
+        let declared = |capabilities: Vec<String>| mllm_store::host_versions::HostVersion {
+            binary_version: mllm_protocol::version::BINARY_VERSION.into(),
+            compatibility: "supported".into(),
+            reason: String::new(),
+            capabilities,
+            recorded_at_ms: 1,
+        };
+        authority.record_host_version(&host, &declared(vec!["heartbeats".into()])).unwrap();
+        assert!(recorded_for(&sessions, &remote, &identities).is_empty());
+        authority
+            .record_host_version(&host, &declared(capabilities::agent_capabilities()))
+            .unwrap();
+        assert_eq!(recorded_for(&sessions, &remote, &identities), identities);
     }
 }

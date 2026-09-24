@@ -159,6 +159,18 @@ pub struct HostResolutionSnapshot {
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// ADR 0017: the release version the host declared on its latest control
+    /// session. Absent for a host that has not connected since v34. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<String>,
+    /// ADR 0017: the version skew verdict on that version: `supported`,
+    /// `upgrade_recommended`, `upgrade_required` (drain-only) or `refused`.
+    /// Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    /// ADR 0017: why, when not supported on the server's own line. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_reason: Option<String>,
 }
 
 /// ADR 0013 §6: one instance of a deployment. Recorded placement and identity
@@ -628,8 +640,11 @@ impl Store {
                 instance.startup = Some(reservation);
             }
         }
-        let hosts = budget.read(&tx, "SELECT h.deployment_id,h.host_id,h.outcome,substr(h.diagnostic,1,256) FROM host_effective_revisions h JOIN deployments d ON d.id=h.deployment_id AND d.revision=h.revision WHERE d.kind!='deleted' ORDER BY h.deployment_id,h.host_id", |r| {
-            Ok((r.get::<_, String>(0)?, HostResolutionSnapshot { host_id: r.get(1)?, outcome: r.get(2)?, diagnostic: r.get(3)? }))
+        let hosts = budget.read(&tx, "SELECT h.deployment_id,h.host_id,h.outcome,substr(h.diagnostic,1,256),v.binary_version,v.compatibility,NULLIF(v.reason,'') FROM host_effective_revisions h JOIN deployments d ON d.id=h.deployment_id AND d.revision=h.revision LEFT JOIN host_versions v ON v.host_id=h.host_id WHERE d.kind!='deleted' ORDER BY h.deployment_id,h.host_id", |r| {
+            Ok((r.get::<_, String>(0)?, HostResolutionSnapshot {
+                host_id: r.get(1)?, outcome: r.get(2)?, diagnostic: r.get(3)?,
+                binary_version: r.get(4)?, compatibility: r.get(5)?, compatibility_reason: r.get(6)?,
+            }))
         })?;
         for (deployment, host) in hosts {
             if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {

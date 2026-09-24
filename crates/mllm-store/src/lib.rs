@@ -12,6 +12,7 @@ pub mod events;
 pub mod enrollment;
 pub mod host_drain;
 pub mod host_publication;
+pub mod host_versions;
 // ADR 0013 §5: deployment instances.
 pub mod instances;
 pub mod lifecycle;

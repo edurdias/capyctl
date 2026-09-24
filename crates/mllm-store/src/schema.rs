@@ -824,6 +824,22 @@ CREATE TABLE IF NOT EXISTS model_sources(
 );
 "#;
 
+/// v34 (ADR 0017): the release version and post-baseline capabilities each
+/// enrolled host declared on its latest control session, and the version
+/// skew policy's verdict on it (`supported`, `upgrade_recommended`,
+/// `upgrade_required` or `refused`). Replaced on every connect; evidence for
+/// status, never an authority. Additive; idempotent.
+pub const SCHEMA_V34: &str = r#"
+CREATE TABLE IF NOT EXISTS host_versions(
+  host_id TEXT PRIMARY KEY REFERENCES enrolled_hosts(host_id),
+  binary_version TEXT NOT NULL CHECK(length(binary_version)<=128),
+  compatibility TEXT NOT NULL CHECK(compatibility IN ('supported','upgrade_recommended','upgrade_required','refused')),
+  reason TEXT NOT NULL CHECK(length(reason)<=512),
+  capabilities_json TEXT NOT NULL CHECK(json_valid(capabilities_json) AND json_type(capabilities_json)='array'),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

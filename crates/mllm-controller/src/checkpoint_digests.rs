@@ -342,7 +342,13 @@ impl RemoteDigests {
 
 impl DigestSource for RemoteDigests {
     fn reachable(&self, host: &str) -> bool {
+        // ADR 0017: a drain-only host, or one without the digest action, is
+        // never asked; its digest stays pending until it is upgraded.
         self.sessions.current_session(host).is_some()
+            && self
+                .sessions
+                .preflight(host, &[mllm_protocol::capabilities::CHECKPOINT_DIGEST], true)
+                .is_ok()
     }
     fn measure(&self, pending: PendingDigest) -> MeasureFuture {
         let command = self.command(&pending);

@@ -197,14 +197,37 @@ pub async fn run_session_with_drain(
 }
 /// Why one control session ended, as a fixed phrase safe for operator logs.
 #[derive(Debug)]
-struct SessionEnd(&'static str);
-impl std::fmt::Display for SessionEnd {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+struct SessionEnd(std::borrow::Cow<'static, str>);
+impl SessionEnd {
+    fn fixed(reason: &'static str) -> Self {
+        Self(std::borrow::Cow::Borrowed(reason))
     }
 }
+impl std::fmt::Display for SessionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+/// ADR 0017: a controller older than this host refuses the session and says
+/// so; the operator must upgrade the server first. The reconnect loop keeps
+/// retrying with its backoff, so the host connects once the server is
+/// upgraded. The logged reason is the controller's fixed policy sentence
+/// (two version numbers), bounded and printable, never a payload.
+fn refused_session(status: tonic::Status) -> SessionEnd {
+    let message = status.message();
+    if status.code() == tonic::Code::FailedPrecondition
+        && message.starts_with(mllm_protocol::version::NEWER_HOST_REFUSAL)
+        && message.len() <= 512
+        && message.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+    {
+        return SessionEnd(std::borrow::Cow::Owned(format!(
+            "the controller refused this host's version ({message}); upgrade the server first"
+        )));
+    }
+    SessionEnd::fixed("controller refused the session")
+}
 fn end<E>(reason: &'static str) -> impl FnOnce(E) -> SessionEnd {
-    move |_| SessionEnd(reason)
+    move |_| SessionEnd::fixed(reason)
 }
 struct Fence {
     journal: Arc<HostJournal>,
@@ -226,7 +249,7 @@ async fn connect_once(
 ) -> Result<(), SessionEnd> {
     let host = identity
         .host_id()
-        .ok_or(SessionEnd("host enrollment is incomplete"))?
+        .ok_or(SessionEnd::fixed("host enrollment is incomplete"))?
         .to_owned();
     let endpoint = identity
         .control_endpoint(mllm_protocol::now_unix_ms() / 1000)
@@ -245,6 +268,10 @@ async fn connect_once(
         heartbeats: true,
         // ADR 0008: this agent executes MaterializeSource.
         model_sources: true,
+        // ADR 0017: the server judges this build's version against its own
+        // and sends only the post-baseline features declared here.
+        binary_version: mllm_protocol::version::BINARY_VERSION.into(),
+        capabilities: mllm_protocol::capabilities::agent_capabilities(),
     })))
     .await
     .map_err(end("outbound stream closed"))?;
@@ -253,7 +280,7 @@ async fn connect_once(
         .max_encoding_message_size(65536)
         .session(ReceiverStream::new(receive))
         .await
-        .map_err(end("controller refused the session"))?
+        .map_err(refused_session)?
         .into_inner();
     // SPEC §§4.2, 13: publication refuses a domain observation older than the
     // host policy's observation TTL, so every connect reports a fresh
@@ -422,13 +449,13 @@ async fn connect_once(
             message = stream.message() => {
                 let message = message
                     .map_err(end("controller closed the session with an error"))?
-                    .ok_or(SessionEnd("controller closed the session"))?;
+                    .ok_or(SessionEnd::fixed("controller closed the session"))?;
                 last_heard = tokio::time::Instant::now();
                 message
             },
             _ = beat.tick(), if lost_after.is_some() => {
                 if lost_after.is_some_and(|lost| last_heard.elapsed() >= lost) {
-                    return Err(SessionEnd("controller heartbeats stopped"));
+                    return Err(SessionEnd::fixed("controller heartbeats stopped"));
                 }
                 // A full queue skips a beat; silence is judged by the controller.
                 let _ = reports.try_send(frame(agent_to_server::Msg::Heartbeat(pb::Heartbeat {
@@ -445,7 +472,7 @@ async fn connect_once(
             },
             result = effects.join_next(), if !effects.is_empty() => {
                 let (key, result) = result
-                    .ok_or(SessionEnd("effect set is empty"))?
+                    .ok_or(SessionEnd::fixed("effect set is empty"))?
                     .map_err(end("a local effect task failed"))?;
                 in_flight.remove(&key);
                 let result = result.map_err(end("a local effect failed"))?;
@@ -492,7 +519,7 @@ async fn connect_once(
             // Liveness only; hearing it refreshed `last_heard` above.
             Some(server_to_agent::Msg::Heartbeat(_)) if fence.is_some() && lost_after.is_some() => {}
             Some(server_to_agent::Msg::ExecuteMember(wire)) if fence.is_some() => {
-                let executor = execution.as_ref().ok_or(SessionEnd("host has no native execution"))?.clone();
+                let executor = execution.as_ref().ok_or(SessionEnd::fixed("host has no native execution"))?.clone();
                 let command = mllm_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
                     msg: Some(server_to_agent::Msg::ExecuteMember(wire)),
                 }).map_err(end("controller sent an invalid command"))?;
@@ -501,17 +528,17 @@ async fn connect_once(
                 if in_flight.contains(&key) {
                     continue;
                 }
-                if effects.len() >= 8 { return Err(SessionEnd("local effect bound exceeded")); }
-                let session = fence.as_ref().ok_or(SessionEnd("session is not connected"))?.session;
+                if effects.len() >= 8 { return Err(SessionEnd::fixed("local effect bound exceeded")); }
+                let session = fence.as_ref().ok_or(SessionEnd::fixed("session is not connected"))?.session;
                 in_flight.insert(key.clone());
                 effects.spawn(async move {
                     (key, executor.execute(session, command).await.map(agent_to_server::Msg::MemberResult))
                 });
             }
             Some(server_to_agent::Msg::ProvisionIngress(provision)) if fence.is_some() => {
-                let executor = execution.as_ref().ok_or(SessionEnd("host has no native execution"))?.clone();
+                let executor = execution.as_ref().ok_or(SessionEnd::fixed("host has no native execution"))?.clone();
                 let command = mllm_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
-                    msg: Some(server_to_agent::Msg::ExecuteMember(provision.command.ok_or(SessionEnd("controller sent an invalid provision"))?)),
+                    msg: Some(server_to_agent::Msg::ExecuteMember(provision.command.ok_or(SessionEnd::fixed("controller sent an invalid provision"))?)),
                 }).map_err(end("controller sent an invalid provision"))?;
                 command.verify_digest().map_err(end("controller sent an invalid provision"))?;
                 let gate: [u8; 32] = provision.gate_key.try_into().map_err(end("controller sent an invalid provision"))?;
@@ -519,7 +546,7 @@ async fn connect_once(
                 if in_flight.contains(&key) {
                     continue;
                 }
-                if effects.len() >= 8 { return Err(SessionEnd("local effect bound exceeded")); }
+                if effects.len() >= 8 { return Err(SessionEnd::fixed("local effect bound exceeded")); }
                 let id = command.to_wire().identity;
                 in_flight.insert(key.clone());
                 effects.spawn(async move {
@@ -534,7 +561,36 @@ async fn connect_once(
                 });
             }
             // Legacy raw argv and commands before reconciliation remain denied.
-            _ => return Err(SessionEnd("controller sent an unexpected message")),
+            _ => return Err(SessionEnd::fixed("controller sent an unexpected message")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T06 T34: ADR 0017. A controller older than this host refuses the
+    // session; the host logs "upgrade the server first" with the versions
+    // and keeps reconnecting. Any other refusal stays a fixed phrase.
+    #[test]
+    fn a_newer_host_refusal_says_upgrade_the_server_first() {
+        let refusal = tonic::Status::failed_precondition(format!(
+            "{}: host 0.3.0 is newer than server 0.2.1; upgrade the server first",
+            mllm_protocol::version::NEWER_HOST_REFUSAL
+        ));
+        let logged = refused_session(refusal).to_string();
+        assert!(logged.contains("upgrade the server first"), "{logged}");
+        assert!(logged.contains("0.3.0") && logged.contains("0.2.1"), "{logged}");
+        for other in [
+            tonic::Status::permission_denied("host session authorization failed"),
+            tonic::Status::failed_precondition("something else"),
+            tonic::Status::failed_precondition(format!(
+                "{}: \u{1b}[31mnot printable",
+                mllm_protocol::version::NEWER_HOST_REFUSAL
+            )),
+        ] {
+            assert_eq!(refused_session(other).to_string(), "controller refused the session");
         }
     }
 }

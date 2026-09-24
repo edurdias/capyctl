@@ -1,7 +1,9 @@
 //! SPEC §13: transport sessions never release ownership or grant execution authority.
 use crate::enrollment::EnrollmentAuthority;
-use mllm_protocol::pb::{
-    self, agent_control_server::AgentControl, agent_to_server, server_to_agent,
+use mllm_protocol::{
+    capabilities,
+    pb::{self, agent_control_server::AgentControl, agent_to_server, server_to_agent},
+    version,
 };
 use std::{
     collections::BTreeMap,
@@ -11,6 +13,8 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+/// ADR 0017: the release version hosts are judged against (this build's).
+pub const SERVER_VERSION: &str = version::BINARY_VERSION;
 const CAPACITY: usize = 16;
 /// SPEC §4.3, §13: queue slots commands and heartbeats never take, so the
 /// session's own replies (SessionReady, a drain acknowledgement) always fit.
@@ -52,6 +56,23 @@ pub struct HostSessionView {
     /// Owner decision 2026-09-23: the host's session is up but its heartbeats
     /// have been silent past the suspend bound; dispatch to it is suspended.
     pub unresponsive: bool,
+    /// ADR 0017: the release version the host declared (empty from a host
+    /// that predates the version skew policy).
+    pub binary_version: String,
+    /// ADR 0017: `supported`, `upgrade_recommended` or `upgrade_required`
+    /// (drain-only). A refused (newer) host has no session.
+    pub compatibility: &'static str,
+    /// ADR 0017: why, when not supported on the server's own line.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub compatibility_reason: String,
+    /// ADR 0017: the post-baseline protocol features the host declared.
+    pub capabilities: Vec<String>,
+    /// ADR 0017: the server-to-host features this server uses that the host
+    /// did not declare. Operations needing one are refused for this host
+    /// (`host_capability_missing:<name>`); a placement requirement among them
+    /// keeps the host out of placement.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub capabilities_missing: Vec<String>,
     pub domains: Vec<DomainView>,
     pub profiles: Vec<ProfileView>,
 }
@@ -249,6 +270,15 @@ struct Session {
     /// Silent past the suspend bound. The session's readiness no longer stands
     /// for dispatch until a fresh probe re-proves it (same as a reconnect).
     unresponsive: bool,
+    /// ADR 0017: the version skew verdict. A drain-only host is sent only
+    /// commands that stop, close, probe or inspect what the server owns.
+    drain_only: bool,
+    /// ADR 0017: the post-baseline features the host declared. Nothing it
+    /// did not declare is ever sent to it.
+    capabilities: std::collections::BTreeSet<String>,
+    /// ADR 0017: new work may be placed here: not drain-only, and every
+    /// placement requirement declared.
+    placeable: bool,
 }
 /// Owner decision 2026-09-23: application heartbeats on the control session.
 /// The server sends one every `interval` to a host that declared heartbeats and
@@ -453,6 +483,40 @@ impl AgentSessions {
             .and_then(|s| s.get(host).map(|s| s.model_sources))
             .unwrap_or(false)
     }
+    /// ADR 0017: whether `host` declared the post-baseline feature `name`, on
+    /// its live session or, with none, on the latest session the store
+    /// recorded. A host never seen declaring it is assumed not to have it.
+    pub fn supports(&self, host: &str, name: &str) -> bool {
+        let live = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|s| s.get(host).filter(|s| s.view.online).map(|s| s.capabilities.contains(name)));
+        match live {
+            Some(declared) => declared,
+            None => self
+                .authority
+                .host_version(host)
+                .is_some_and(|recorded| recorded.capabilities.iter().any(|c| c == name)),
+        }
+    }
+    /// ADR 0017: why an operation needing `needs` (and, when `effect`, one a
+    /// drain-only host may not take) is refused for `host`'s live session, as
+    /// a typed reason; `Ok` when it may proceed or no session is live (the
+    /// command path then waits for one and checks again before sending).
+    pub fn preflight(&self, host: &str, needs: &[&str], effect: bool) -> Result<(), String> {
+        let sessions = self.sessions.lock().map_err(|_| capabilities::HOST_UPGRADE_REQUIRED.to_owned())?;
+        let Some(session) = sessions.get(host).filter(|s| s.view.online) else {
+            return Ok(());
+        };
+        if effect && session.drain_only {
+            return Err(capabilities::HOST_UPGRADE_REQUIRED.into());
+        }
+        match needs.iter().find(|need| !session.capabilities.contains(**need)) {
+            Some(need) => Err(capabilities::missing(need)),
+            None => Ok(()),
+        }
+    }
     pub fn snapshot(&self) -> Vec<HostSessionView> {
         // Read before the session lock: the store lock is never taken inside it.
         let pending = self.authority.hosts_with_pending_drain();
@@ -509,6 +573,12 @@ impl AgentSessions {
             })
         {
             return Err(denied().into());
+        }
+        // ADR 0017: never send a drain-only host new work, nor any host a
+        // field or action it did not declare (it would refuse the command by
+        // digest). The refusal is typed and nothing was sent.
+        if let Some(reason) = capabilities::refusal(session.drain_only, &session.capabilities, &command) {
+            return Err(Box::new(Status::failed_precondition(reason)));
         }
         let queued = send_command(
             session.outgoing.as_ref().ok_or_else(denied)?,
@@ -593,13 +663,23 @@ impl AgentSessions {
             };
             if !due { continue; }
             // Queue failure or an offline host does not imply the effect failed.
-            if let Ok(session) = self.dispatch_to(&host, wire.clone()) {
-                if delivered.as_ref().is_some_and(|(previous, _)| *previous == session) {
-                    backoff = (backoff * 2).min(REDELIVER_MAX);
-                } else {
-                    backoff = REDELIVER_FIRST;
+            match self.dispatch_to(&host, wire.clone()) {
+                Ok(session) => {
+                    if delivered.as_ref().is_some_and(|(previous, _)| *previous == session) {
+                        backoff = (backoff * 2).min(REDELIVER_MAX);
+                    } else {
+                        backoff = REDELIVER_FIRST;
+                    }
+                    delivered = Some((session, tokio::time::Instant::now() + backoff));
                 }
-                delivered = Some((session, tokio::time::Instant::now() + backoff));
+                // ADR 0017: refused before it was ever sent, so no effect can
+                // exist: the typed refusal is the answer. Once any session was
+                // sent the command, a later refusal proves nothing about that
+                // effect; it stays unresolved until a result or the deadline.
+                Err(status) if delivered.is_none() && gate_refusal(&status).is_some() => {
+                    return Err(status);
+                }
+                Err(_) => {}
             }
         }
     }
@@ -665,6 +745,7 @@ impl AgentSessions {
         }
         let _guard = ProvisionGuard { pending: self.provisions.clone(), id };
         let mut retry = tokio::time::interval(Duration::from_millis(500));
+        let mut sent = false;
         loop {
             let remaining = identity.deadline_unix_ms - mllm_protocol::now_unix_ms();
             if remaining <= 0 { return Err(Status::deadline_exceeded("private ingress provision unresolved").into()); }
@@ -675,8 +756,14 @@ impl AgentSessions {
                         self.authority.authorize_certificate(&peer, &identity.host_id, now()).map_err(|_| denied())?;
                         let sessions = self.sessions.lock().map_err(|_| denied())?;
                         if let Some(session) = sessions.get(&identity.host_id).filter(|s| s.view.online && s.view.reconciled && s.peer == peer) {
-                            if let Some(outgoing) = &session.outgoing {
-                                let _ = send_command(outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::ProvisionIngress(pb::ProvisionIngress { command: Some(wire.clone()), gate_key: gate_key.to_vec() })) });
+                            // ADR 0017: a launch a host may not take is refused,
+                            // typed, before its key is ever sent.
+                            if let Some(reason) = capabilities::refusal(session.drain_only, &session.capabilities, &wire) {
+                                if !sent {
+                                    return Err(Box::new(Status::failed_precondition(reason)));
+                                }
+                            } else if let Some(outgoing) = &session.outgoing {
+                                sent |= send_command(outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::ProvisionIngress(pb::ProvisionIngress { command: Some(wire.clone()), gate_key: gate_key.to_vec() })) });
                             }
                         }
                     }
@@ -857,7 +944,9 @@ impl AgentSessions {
                                         // SPEC §4.2 (U5-G4): connected, reconciled and
                                         // prepared with a resolvable profile. Revocation
                                         // ends this session, which clears it below.
-                                        s.view.eligible = s.prepared;
+                                        // ADR 0017: nor a drain-only host, nor
+                                        // one missing a placement requirement.
+                                        s.view.eligible = s.prepared && s.placeable;
                                     }
                                     page.complete
                                 }
@@ -1039,6 +1128,13 @@ fn with_drain(
 fn denied() -> Status {
     Status::permission_denied("host session authorization failed")
 }
+/// ADR 0017: the typed reason when `status` is a refusal made before a
+/// command was sent (`host_upgrade_required`, `host_capability_missing:<name>`).
+pub fn gate_refusal(status: &Status) -> Option<&str> {
+    (status.code() == tonic::Code::FailedPrecondition
+        && capabilities::is_gate_refusal(status.message()))
+    .then(|| status.message())
+}
 #[tonic::async_trait]
 impl AgentControl for AgentSessions {
     type SessionStream = ReceiverStream<Result<pb::ServerToAgent, Status>>;
@@ -1068,6 +1164,54 @@ impl AgentControl for AgentSessions {
         {
             return Err(denied());
         }
+        // ADR 0017: the declared capabilities are bounded; the version is
+        // judged by the skew policy. A malformed declaration is refused.
+        let declared = capabilities::declared(&connect).ok_or_else(denied)?;
+        let skew = version::assess(&connect.binary_version, version::BINARY_VERSION);
+        // Only a version that parsed is echoed anywhere; the reason never
+        // quotes an unreadable one.
+        let reported = if version::Version::parse(&connect.binary_version).is_ok() {
+            connect.binary_version.clone()
+        } else {
+            String::new()
+        };
+        let record = mllm_store::host_versions::HostVersion {
+            binary_version: reported.clone(),
+            compatibility: skew.state.as_str().into(),
+            reason: skew.reason.clone(),
+            capabilities: declared.iter().cloned().collect(),
+            recorded_at_ms: mllm_protocol::now_unix_ms(),
+        };
+        // Status evidence only: a store that cannot record it never refuses
+        // or admits a session.
+        if self.authority.record_host_version(&connect.host_id, &record).is_err() {
+            eprintln!("host {} control session: its version could not be recorded", connect.host_id);
+        }
+        if skew.state == version::Compatibility::Refused {
+            // ADR 0017: a newer host is refused with the policy's sentence;
+            // the host logs it and keeps reconnecting with its backoff.
+            eprintln!("host {} control session refused: {}", connect.host_id, skew.reason);
+            return Err(Status::failed_precondition(format!(
+                "{}: {}",
+                version::NEWER_HOST_REFUSAL,
+                skew.reason
+            )));
+        }
+        if !skew.reason.is_empty() {
+            eprintln!("host {} control session: {}", connect.host_id, skew.reason);
+        }
+        let drain_only = skew.state.drain_only();
+        let missing: Vec<String> = capabilities::CATALOGUE
+            .iter()
+            .filter(|(name, direction)| {
+                *direction == capabilities::Direction::ServerToHost && !declared.contains(*name)
+            })
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        let placeable = !drain_only
+            && capabilities::PLACEMENT_REQUIRED
+                .iter()
+                .all(|need| declared.contains(*need));
         let host = connect.host_id;
         let id = ulid::Ulid::new().to_string();
         let (outgoing, receiver) = mpsc::channel(CAPACITY);
@@ -1086,6 +1230,11 @@ impl AgentControl for AgentSessions {
                         eligible: false,
                         drain_pending: false,
                         unresponsive: false,
+                        binary_version: reported,
+                        compatibility: skew.state.as_str(),
+                        compatibility_reason: skew.reason,
+                        capabilities: declared.iter().cloned().collect(),
+                        capabilities_missing: missing,
                         domains: vec![],
                         profiles: vec![],
                     },
@@ -1096,9 +1245,12 @@ impl AgentControl for AgentSessions {
                     history: vec![],
                     prepared: false,
                     draining: false,
-                    heartbeats: connect.heartbeats,
-                    model_sources: connect.model_sources,
+                    heartbeats: declared.contains(capabilities::HEARTBEATS),
+                    model_sources: declared.contains(capabilities::MODEL_SOURCES),
                     unresponsive: false,
+                    drain_only,
+                    capabilities: declared,
+                    placeable,
                 },
             ) {
                 let _ = old.cancel.send(true);
@@ -1146,6 +1298,7 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                                 && s.view.eligible
                                 && !s.draining
                                 && !s.unresponsive
+                                && s.placeable
                                 && !pending.contains(*host)
                         })
                         .map(|(host, _)| host.clone())

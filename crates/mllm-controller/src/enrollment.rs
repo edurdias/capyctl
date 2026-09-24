@@ -68,6 +68,17 @@ impl EnrollmentAuthority {
             .store().record_installation_drift(host, installation, registered, observed)
             .map_err(|_| EnrollmentError)
     }
+    /// ADR 0017: record the version, capabilities and skew verdict a host
+    /// declared on its control session. Status evidence only.
+    pub fn record_host_version(&self, host: &str, version: &mllm_store::host_versions::HostVersion) -> Result<(), EnrollmentError> {
+        self.state.lock().map_err(|_| EnrollmentError)?
+            .store().record_host_version(host, version)
+            .map_err(|_| EnrollmentError)
+    }
+    /// ADR 0017: the latest declaration the store recorded for `host`.
+    pub fn host_version(&self, host: &str) -> Option<mllm_store::host_versions::HostVersion> {
+        self.state.lock().ok()?.store().host_version(host).ok().flatten()
+    }
     /// Owner decision 4 (2026-09-22): the enrolled hosts whose drain still has
     /// an unsettled Stop. `None` when the store cannot be read; callers fail
     /// closed and place nothing on any host then.

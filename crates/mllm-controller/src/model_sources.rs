@@ -192,7 +192,10 @@ impl RemoteSources {
 
 impl SourceHost for RemoteSources {
     fn reachable(&self, host: &str) -> bool {
-        self.sessions.current_session(host).is_some() && self.sessions.supports_model_sources(host)
+        // ADR 0017: never a drain-only host.
+        self.sessions.current_session(host).is_some()
+            && self.sessions.supports_model_sources(host)
+            && self.sessions.preflight(host, &[], true).is_ok()
     }
     fn request(&self, pending: PendingSource) -> ReportFuture {
         let command = self.command(&pending);
@@ -229,7 +232,10 @@ pub async fn ensure_materialized(
         return Ok(());
     };
     if !sessions.supports_model_sources(host) {
-        return Err(RuntimeError::Refused("model_source_unsupported".into()));
+        // ADR 0017: the typed refusal for a host without the feature.
+        return Err(RuntimeError::Refused(mllm_protocol::capabilities::missing(
+            mllm_protocol::capabilities::MODEL_SOURCES,
+        )));
     }
     loop {
         let now = mllm_protocol::now_unix_ms();
