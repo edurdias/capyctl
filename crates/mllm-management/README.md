@@ -19,7 +19,9 @@ a session, driver, database connection, or runtime adapter.
 Actions require one `Idempotency-Key` header and exactly `expected_revision`,
 `action`, and `deadline_ms`. Revisions and absolute deadlines are positive JSON
 integers. `start` and `stop` use existing qualified Fake lifecycle authority;
-`park`, `suspend`, `resume`, and `undeploy` remain unsupported. Other actions,
+`delete` removes a deployment whose cleanup is already verified (SPEC §6.3)
+and answers 409 `delete_requires_cleanup` while anything is still held.
+`park`, `suspend`, and `resume` remain unsupported. Other actions,
 extra fields, duplicate fields, noncanonical ULIDs, and query strings are invalid.
 Stop resolves generation inside its acceptance transaction after exact history
 lookup. No new cleanup authority or support for attached/native targets is added.

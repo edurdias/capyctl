@@ -20,6 +20,7 @@ serde.workspace = true
 http-body-util = "0.1"
 
 [dev-dependencies]
+mllm-agent.workspace = true
 mllm-adapters.workspace = true
 mllm-testkit.workspace = true
 mllm-scheduler.workspace = true

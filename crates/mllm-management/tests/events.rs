@@ -690,6 +690,9 @@ async fn initialize_lifecycle_events_enforce_transition_and_commit_epoch() {
         ("ordinary_cleanup_accepted", "cleanup_accepted"),
         ("ordinary_cleanup_armed", "cleanup_armed"),
         ("ordinary_cleanup_completed", "cleanup_completed"),
+        // SPEC §6 / G1: a launch released against gone evidence, whether proven
+        // locally or by a remote host's settlement, commits a new epoch.
+        ("initialize_failed_released", "launch_failed"),
     ] {
         for corruption in 0..4 {
             let source = fake(move |_, _| {
@@ -697,7 +700,7 @@ async fn initialize_lifecycle_events_enforce_transition_and_commit_epoch() {
                 e.kind = kind.into();
                 e.operation_id = Some(INCARNATION.into());
                 e.deployment_id = Some(INCARNATION.into());
-                let ready = matches!(transition, "ready" | "cleanup_completed");
+                let ready = matches!(transition, "ready" | "cleanup_completed" | "launch_failed");
                 let epoch = if corruption == 3 {
                     serde_json::json!(0)
                 } else if ready ^ (corruption == 2) {
@@ -738,7 +741,7 @@ async fn initialize_lifecycle_events_enforce_transition_and_commit_epoch() {
                 assert_eq!(json["payload"]["transition"], transition);
                 assert_eq!(
                     json["payload"]["committed_epoch"],
-                    if matches!(transition, "ready" | "cleanup_completed") {
+                    if matches!(transition, "ready" | "cleanup_completed" | "launch_failed") {
                         serde_json::json!("18446744073709551615")
                     } else {
                         serde_json::Value::Null
@@ -755,6 +758,11 @@ async fn every_supported_kind_projects_only_known_fields_and_wide_integer_string
         (
             "managed_configuration_accepted",
             "operation_id,deployment_id,revision,generation,session_epoch",
+        ),
+        // SPEC §6.3 (W6).
+        (
+            "deployment_deleted",
+            "operation_id,deployment_id,revision,session_epoch",
         ),
         (
             "host_resource_policy_bootstrapped",
@@ -1013,5 +1021,99 @@ async fn real_store_retention_and_incarnation_require_resnapshot() {
         assert_eq!(json["api_version"], "1");
         assert_eq!(json["error"]["code"], "cursor_expired");
         assert_eq!(json["error"]["details"]["resnapshot_required"], true);
+    }
+}
+
+/// Every kind the store's `EventMetadata::kind` can write, read from its
+/// source so a new kind without a projection fails here rather than as a
+/// `/events` 500 in production.
+fn store_event_kinds() -> Vec<String> {
+    let source = include_str!("../../mllm-store/src/events.rs");
+    let start = source.find("fn kind(&self)").expect("EventMetadata::kind");
+    let end = start + source[start..].find("fn identifiers").expect("identifiers");
+    source[start..end]
+        .split("=> \"")
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_owned())
+        .collect()
+}
+
+/// A payload shaped as the store serializes `kind`, with its columns.
+fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String>) {
+    const DEP: &str = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+    const OP: &str = "01BX5ZZKBKACTAV9WEVGEMMVS0";
+    const STEP: &str = "01BX5ZZKBKACTAV9WEVGEMMVS1";
+    let step = |transition: &str, committed: Option<u64>| {
+        serde_json::json!({"version":"1","transition":transition,"operation_id":OP,
+            "deployment_id":DEP,"step_id":STEP,"session_epoch":3,"committed_epoch":committed})
+    };
+    let ids = (Some(DEP.to_owned()), Some(OP.to_owned()));
+    let (payload, (deployment, operation)) = match kind {
+        "coordinator_session_started" => (serde_json::json!({"version":"1","session_epoch":1}), (None, None)),
+        "managed_configuration_accepted" => (serde_json::json!({"version":"1","operation_id":OP,
+            "deployment_id":DEP,"revision":1,"generation":1,"session_epoch":1}), ids),
+        "deployment_deleted" => (serde_json::json!({"version":"1","operation_id":OP,
+            "deployment_id":DEP,"revision":2,"session_epoch":1}), ids),
+        "host_resource_policy_bootstrapped" => (serde_json::json!({"version":"1","revision":1,
+            "ledger_epoch":1,"session_epoch":1}), (None, None)),
+        "host_resource_policy_updated" => (serde_json::json!({"version":"1","operation_id":OP,
+            "previous_revision":1,"current_revision":2,"ledger_epoch":2,"session_epoch":1}),
+            (None, Some(OP.to_owned()))),
+        "installation_drift_flagged" => (serde_json::json!({"version":"1","host_id":"host-a",
+            "installation":"sglang-main","registered_digest":"sha256:aa","observed_digest":"unmeasured"}),
+            (None, None)),
+        k if k.starts_with("switch_") => (serde_json::json!({"version":"1","phase":&k["switch_".len()..],
+            "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",
+            "victims":[format!("{OP}/0")],"detail":"planned on host-a"}),
+            (Some(DEP.to_owned()), None)),
+        "ready_committed" => (step("ready", Some(4)), ids),
+        "initialize_failed_released" => (step("launch_failed", Some(4)), ids),
+        "ordinary_cleanup_completed" => (step("cleanup_completed", Some(4)), ids),
+        "parked_committed" => (step("parked", Some(4)), ids),
+        "restored_committed" => (step("restored", Some(4)), ids),
+        "park_refused" | "restore_refused" => (step(kind, Some(4)), ids),
+        "residency_cancelled" => (step("cancelled", None), ids),
+        k => {
+            let transition = k
+                .strip_prefix("initialize_")
+                .or_else(|| k.strip_prefix("ordinary_"))
+                .unwrap_or(k);
+            let transition = if k == "owned_launch_associated" { k } else { transition };
+            let transition = if k.starts_with("ordinary_cleanup_") {
+                k.strip_prefix("ordinary_").unwrap()
+            } else {
+                transition
+            };
+            (step(transition, None), ids)
+        }
+    };
+    (payload, deployment, operation)
+}
+
+// T37 (SPEC §14): the management API's required operations include events.
+// Every kind the store can journal projects; an unprojected kind would turn
+// `/management/v1/events` into a 500 for as long as that event is retained.
+#[tokio::test]
+async fn every_store_event_kind_projects_through_the_events_stream() {
+    let kinds = store_event_kinds();
+    assert!(kinds.len() >= 30, "{kinds:?}");
+    for kind in kinds {
+        let (payload, deployment, operation) = store_shaped(&kind);
+        let owned = kind.clone();
+        let source = fake(move |_, _| {
+            let mut e = event(1);
+            e.kind = owned.clone();
+            e.payload_json = payload.to_string();
+            e.deployment_id = deployment.clone();
+            e.operation_id = operation.clone();
+            Ok(page(vec![e], 1))
+        });
+        let response = fake_app(source, options())
+            .oneshot(request("/management/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{kind}");
+        let text = next(&mut response.into_body().into_data_stream()).await;
+        assert!(text.contains(&format!("event: {kind}\n")), "{kind}: {text}");
     }
 }

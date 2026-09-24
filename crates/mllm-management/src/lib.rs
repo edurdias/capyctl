@@ -20,7 +20,14 @@ use tokio::sync::Semaphore;
 pub mod actions;
 pub mod configuration;
 mod credentials;
+pub mod drain;
 pub mod events;
+pub mod enrollment;
+pub mod hosts;
+// ADR 0008: the standalone role's embedded installation.
+pub mod installation;
+// SPEC §17 (M80): router, ingress and engine latency distributions.
+pub mod metrics;
 
 /// Hashes only; intentionally neither Debug nor Serialize. This validates token
 /// syntax/distinctness, not randomness or provenance. Inputs MUST come from the
@@ -102,6 +109,10 @@ struct AppState {
     configuration: Option<Arc<dyn configuration::ConfigurationSource>>,
     actions: Option<Arc<dyn actions::ActionSource>>,
     commands_in_flight: Arc<Semaphore>,
+    /// Owner decision 2026-09-23: evicting starts in flight. Each runs as its
+    /// own task past its command slot (it may drain for the whole switch
+    /// bound), so this bounds those tasks instead.
+    evictions: Arc<Semaphore>,
 }
 
 /// At most two queued/running blocking reads per router. Cancellation retains a
@@ -120,6 +131,7 @@ pub fn snapshot_router(
         configuration: None,
         actions: None,
         commands_in_flight: Arc::new(Semaphore::new(0)),
+        evictions: Arc::new(Semaphore::new(actions::MAX_EVICTING_STARTS)),
     });
     routes(state, false)
 }
@@ -151,6 +163,7 @@ pub fn read_only_router_with_event_options<T: SnapshotSource + events::EventSour
         configuration: None,
         actions: None,
         commands_in_flight: Arc::new(Semaphore::new(0)),
+        evictions: Arc::new(Semaphore::new(actions::MAX_EVICTING_STARTS)),
     });
     Ok(routes(state, true))
 }
@@ -174,6 +187,7 @@ pub fn configuration_router<
         configuration: Some(source),
         actions: None,
         commands_in_flight: Arc::new(Semaphore::new(2)),
+        evictions: Arc::new(Semaphore::new(actions::MAX_EVICTING_STARTS)),
     });
     routes(state, true)
 }
@@ -196,6 +210,7 @@ pub fn lifecycle_router(
             configuration: Some(source.clone()),
             actions: Some(source),
             commands_in_flight: Arc::new(Semaphore::new(2)),
+            evictions: Arc::new(Semaphore::new(actions::MAX_EVICTING_STARTS)),
         }),
         true,
     )
@@ -204,10 +219,16 @@ pub fn lifecycle_router(
 fn routes(state: Arc<AppState>, include_events: bool) -> Router {
     let router = Router::new().route("/management/v1/snapshot", get(snapshot).head(method_denied));
     let router = if state.actions.is_some() {
-        router.route(
-            "/management/v1/deployments/{id}/actions",
-            axum::routing::post(actions::accept),
-        )
+        router
+            .route(
+                "/management/v1/deployments/{id}/actions",
+                axum::routing::post(actions::accept),
+            )
+            // Owner decision Q7: per-instance `start` and `stop`.
+            .route(
+                "/management/v1/deployments/{id}/instances/{index}/actions",
+                axum::routing::post(actions::accept_instance),
+            )
     } else {
         router
     };
@@ -228,6 +249,11 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
             .route(
                 "/management/v1/deployments/{id}",
                 axum::routing::put(configuration::accept),
+            )
+            // SPEC §8.2: `inspect deployment --effective-config`.
+            .route(
+                "/management/v1/deployments/{id}/effective-config",
+                get(configuration::effective_config),
             )
     } else {
         router
@@ -284,6 +310,8 @@ fn error(status: StatusCode, code: &'static str, retryable: bool) -> Response {
     let message = match code {
         "unauthenticated" => "Management authentication required",
         "invalid_request" => "Invalid request",
+        "unsupported_media_type" => "JSON content type required",
+        "identity_conflict" => "Host identity request conflicts with current state",
         "queue_full" => "Read capacity exhausted",
         "not_found" => "Route not found",
         "method_not_allowed" => "Method not allowed",

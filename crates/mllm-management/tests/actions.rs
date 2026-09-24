@@ -226,6 +226,30 @@ async fn operation(owner: &Arc<Mutex<OwnedCoordinatorState>>, id: &str) {
     .await
     .unwrap();
 }
+// T10 T18: found live (Phase B). `mllm stop` then `mllm start` left the
+// operator's stop mark set, so a later ordinary stop (`mllm drain host`)
+// read as an explicit stop and inference never re-activated the deployment.
+// SPEC §6.3: a start enables the deployment; it lifts the earlier stop.
+#[tokio::test]
+async fn a_management_start_lifts_an_earlier_management_stop() {
+    let (_dir, owner, worker, id, app) = setup().await;
+    let start = value(app.clone().oneshot(request(&id, "start-1", "start")).await.unwrap()).await;
+    operation(&owner, start["operation_id"].as_str().unwrap()).await;
+    let stop = value(app.clone().oneshot(request(&id, "stop-1", "stop")).await.unwrap()).await;
+    assert!(owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
+    operation(&owner, stop["operation_id"].as_str().unwrap()).await;
+    let response = app
+        .clone()
+        .oneshot(request(&id, "start-2", "start"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    assert!(!owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
+    let restart = value(response).await;
+    operation(&owner, restart["operation_id"].as_str().unwrap()).await;
+    worker.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn authenticated_actions_start_and_stop_the_owned_fake() {
     let (dir, owner, worker, id, app) = setup().await;
@@ -268,6 +292,9 @@ async fn authenticated_actions_start_and_stop_the_owned_fake() {
         .unwrap();
     assert_eq!(response.status(), 202);
     let stop = value(response).await;
+    // T18 / SPEC §6.3: an explicit management stop suppresses inference autoactivation
+    // in the acceptance transaction, before asynchronous cleanup has finished.
+    assert!(owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
     operation(&owner, stop["operation_id"].as_str().unwrap()).await;
     assert!(owner
         .lock()
@@ -367,8 +394,15 @@ async fn action_rejections_are_typed_before_any_new_receipt() {
         ),
         (
             id.clone(),
-            json!({"expected_revision":1,"action":"park","deadline_ms":10000}),
+            json!({"expected_revision":1,"action":"suspend","deadline_ms":10000}),
             "unsupported_capability",
+        ),
+        // W5: park is supported; a deployment with no READY instance has
+        // nothing to park, and nothing is recorded.
+        (
+            id.clone(),
+            json!({"expected_revision":1,"action":"park","deadline_ms":10000}),
+            "lifecycle_conflict",
         ),
         (
             id.clone(),
@@ -685,5 +719,55 @@ async fn store_failure_is_redacted_and_closes_new_command_admission() {
         .unwrap(),
         0
     );
+    worker.shutdown().await.unwrap();
+}
+
+/// SPEC §6.3 (W5): `park` and `preinitialize` are deployment actions. A park
+/// the engine refuses before any effect (this Fake parks only after a drain it
+/// is never sent) fails with `park_refused` and the deployment keeps serving;
+/// an exact retry replays the receipt.
+// T16 T20
+#[tokio::test]
+async fn park_is_accepted_and_an_engine_refusal_leaves_the_deployment_serving() {
+    let (_dir, owner, worker, id, app) = setup().await;
+    let start = value(app.clone().oneshot(request(&id, "start", "start")).await.unwrap()).await;
+    operation(&owner, start["operation_id"].as_str().unwrap()).await;
+    let response = app.clone().oneshot(request(&id, "park", "park")).await.unwrap();
+    assert_eq!(response.status(), 202);
+    let park = value(response).await;
+    assert_eq!(
+        value(app.clone().oneshot(request(&id, "park", "park")).await.unwrap()).await,
+        park,
+        "an exact retry replays the receipt"
+    );
+    let operation_id = park["operation_id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let failed = {
+                let o = owner.lock().unwrap();
+                o.store()
+                    .get_operation(&operation_id)
+                    .unwrap()
+                    .is_some_and(|op| op.error_code.as_deref() == Some("park_refused"))
+            };
+            if failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refused park settles");
+    let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+    let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    assert_eq!(deployment.observed_state, "ready");
+    assert!(deployment.dispatch_enabled);
+    // Preinitialize is accepted as its own operation.
+    let response = app
+        .clone()
+        .oneshot(request(&id, "pre", "preinitialize"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202, "{}", value(response).await);
     worker.shutdown().await.unwrap();
 }

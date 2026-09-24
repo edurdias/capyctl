@@ -368,6 +368,88 @@ fn unique_object(input: &str) -> Result<Map<String, Value>, Failure> {
     decoder.end().map_err(|_| Failure::Internal)?;
     Ok(object)
 }
+/// How one projected payload field is validated and rendered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// A ULID identifier, rendered as is.
+    Id,
+    /// A non-negative integer, rendered as a decimal string.
+    Number,
+    /// `committed_epoch`: null or a positive integer, per the transition.
+    Epoch,
+    /// The step transition, which must match the event kind.
+    Transition,
+    /// The switch phase, which must match the event kind.
+    Phase,
+    /// A bounded token (host name, profile name, digest, victim).
+    Token,
+    /// A bounded token or null.
+    OptionalToken,
+    /// A bounded list of tokens.
+    Tokens,
+    /// Bounded free text.
+    Text,
+}
+
+const STEP_FIELDS: &[(&str, Field)] = &[
+    ("transition", Field::Transition),
+    ("operation_id", Field::Id),
+    ("deployment_id", Field::Id),
+    ("step_id", Field::Id),
+    ("session_epoch", Field::Number),
+    ("committed_epoch", Field::Epoch),
+];
+
+/// The transition a step kind carries, and whether it commits an epoch.
+fn step_transition(kind: &str) -> Option<(&'static str, bool)> {
+    Some(match kind {
+        "initialize_accepted" => ("accepted", false),
+        "initialize_armed" => ("armed", false),
+        "owned_launch_associated" => ("owned_launch_associated", false),
+        "ready_committed" => ("ready", true),
+        "initialize_uncertain" => ("uncertain", false),
+        "initialize_expired_unarmed" => ("expired_unarmed", false),
+        // SPEC §6: a failed launch released against gone evidence (G1 remote too).
+        "initialize_failed_released" => ("launch_failed", true),
+        "ordinary_cleanup_accepted" => ("cleanup_accepted", false),
+        "ordinary_cleanup_armed" => ("cleanup_armed", false),
+        "ordinary_cleanup_completed" => ("cleanup_completed", true),
+        "ordinary_cleanup_expired_unarmed" => ("cleanup_expired_unarmed", false),
+        "ordinary_unarmed_stop_accepted" => ("unarmed_stop_accepted", false),
+        "ordinary_unarmed_stop_completed" => ("unarmed_stop_completed", false),
+        // SPEC §§6.1, 6.3, 9.1 (W5): park and restore steps. A completion or a
+        // refusal commits the ledger epoch; every other stage commits nothing.
+        "park_accepted" => ("park_accepted", false),
+        "park_armed" => ("park_armed", false),
+        "parked_committed" => ("parked", true),
+        "park_refused" => ("park_refused", true),
+        "park_uncertain" => ("park_uncertain", false),
+        "restore_accepted" => ("restore_accepted", false),
+        "restore_armed" => ("restore_armed", false),
+        "restored_committed" => ("restored", true),
+        "restore_refused" => ("restore_refused", true),
+        "restore_uncertain" => ("restore_uncertain", false),
+        "residency_cancelled" => ("cancelled", false),
+        _ => return None,
+    })
+}
+
+fn token(value: &Value) -> Result<Value, Failure> {
+    let text = value.as_str().ok_or(Failure::Internal)?;
+    if text.is_empty()
+        || text.len() > 256
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
+    {
+        return Err(Failure::Internal);
+    }
+    Ok(value.clone())
+}
+
+// SPEC §14: events are a required management operation. Every kind the store
+// journals (`mllm_store::events::EventMetadata`) has a closed field schema
+// here; a kind without one is corruption, and the stream reports it as such.
 fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if event.payload_json.len() > 16 * 1024 || event.recorded_at_ms < 0 {
         return Err(Failure::Internal);
@@ -376,95 +458,132 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
     if input.get("version").and_then(Value::as_str) != Some("1") {
         return Err(Failure::Internal);
     }
-    let fields: &[&str] = match event.kind.as_str() {
-        "coordinator_session_started" => &["session_epoch"],
+    use Field::{Id, Number, OptionalToken, Phase, Text, Token, Tokens};
+    let step = step_transition(event.kind.as_str());
+    let switch_phase = event.kind.strip_prefix("switch_").filter(|phase| {
+        matches!(
+            *phase,
+            "planned" | "admission_closed" | "released" | "completed" | "failed"
+        )
+    });
+    let fields: &[(&str, Field)] = match event.kind.as_str() {
+        _ if step.is_some() => STEP_FIELDS,
+        _ if switch_phase.is_some() => &[
+            ("phase", Phase),
+            ("switch_id", Token),
+            ("target_deployment", Id),
+            ("host", OptionalToken),
+            ("victims", Tokens),
+            ("detail", Text),
+        ],
+        "coordinator_session_started" => &[("session_epoch", Number)],
         "managed_configuration_accepted" => &[
-            "operation_id",
-            "deployment_id",
-            "revision",
-            "generation",
-            "session_epoch",
+            ("operation_id", Id),
+            ("deployment_id", Id),
+            ("revision", Number),
+            ("generation", Number),
+            ("session_epoch", Number),
         ],
-        "host_resource_policy_bootstrapped" => &["revision", "ledger_epoch", "session_epoch"],
+        // SPEC §6.3 (W6): routes and instances removed after verified cleanup.
+        "deployment_deleted" => &[
+            ("operation_id", Id),
+            ("deployment_id", Id),
+            ("revision", Number),
+            ("session_epoch", Number),
+        ],
+        "host_resource_policy_bootstrapped" => &[
+            ("revision", Number),
+            ("ledger_epoch", Number),
+            ("session_epoch", Number),
+        ],
         "host_resource_policy_updated" => &[
-            "operation_id",
-            "previous_revision",
-            "current_revision",
-            "ledger_epoch",
-            "session_epoch",
+            ("operation_id", Id),
+            ("previous_revision", Number),
+            ("current_revision", Number),
+            ("ledger_epoch", Number),
+            ("session_epoch", Number),
         ],
-        "initialize_accepted"
-        | "initialize_armed"
-        | "owned_launch_associated"
-        | "ready_committed"
-        | "initialize_uncertain"
-        | "initialize_expired_unarmed"
-        | "ordinary_cleanup_accepted"
-        | "ordinary_cleanup_armed"
-        | "ordinary_unarmed_stop_accepted"
-        | "ordinary_unarmed_stop_completed"
-        | "ordinary_cleanup_completed" => &[
-            "transition",
-            "operation_id",
-            "deployment_id",
-            "step_id",
-            "session_epoch",
-            "committed_epoch",
+        // ADR 0008: drift evidence a host reported; bounded tokens only.
+        "installation_drift_flagged" => &[
+            ("host_id", Token),
+            ("installation", Token),
+            ("registered_digest", Token),
+            ("observed_digest", Token),
         ],
         _ => return Err(Failure::Internal),
     };
     if input.len() != fields.len() + 1 {
         return Err(Failure::Internal);
     }
-    let transition_kind = match event.kind.as_str() {
-        "initialize_accepted" => Some("accepted"),
-        "initialize_armed" => Some("armed"),
-        "owned_launch_associated" => Some("owned_launch_associated"),
-        "ready_committed" => Some("ready"),
-        "initialize_uncertain" => Some("uncertain"),
-        "initialize_expired_unarmed" => Some("expired_unarmed"),
-        "ordinary_cleanup_accepted" => Some("cleanup_accepted"),
-        "ordinary_cleanup_armed" => Some("cleanup_armed"),
-        "ordinary_cleanup_completed" => Some("cleanup_completed"),
-        "ordinary_unarmed_stop_accepted" => Some("unarmed_stop_accepted"),
-        "ordinary_unarmed_stop_completed" => Some("unarmed_stop_completed"),
-        _ => None,
-    };
-    if let Some(transition) = transition_kind {
-        let epoch = input.get("committed_epoch").ok_or(Failure::Internal)?;
-        if matches!(transition, "ready" | "cleanup_completed") == epoch.is_null()
-            || epoch.as_u64() == Some(0)
-        {
-            return Err(Failure::Internal);
-        }
-    }
     let mut payload = Map::new();
-    for &field in fields {
+    for &(field, kind) in fields {
         let value = input.get(field).ok_or(Failure::Internal)?;
-        let projected = if field.ends_with("_id") {
-            let id = value.as_str().ok_or(Failure::Internal)?;
-            if id.len() != 26 || id.parse::<ulid::Ulid>().is_err() {
-                return Err(Failure::Internal);
+        let projected = match kind {
+            Field::Id => {
+                let id = value.as_str().ok_or(Failure::Internal)?;
+                if id.len() != 26 || id.parse::<ulid::Ulid>().is_err() {
+                    return Err(Failure::Internal);
+                }
+                value.clone()
             }
-            value.clone()
-        } else if field == "transition" {
-            if value.as_str() != transition_kind {
-                return Err(Failure::Internal);
+            Field::Transition => {
+                if value.as_str() != step.map(|(transition, _)| transition) {
+                    return Err(Failure::Internal);
+                }
+                value.clone()
             }
-            value.clone()
-        } else if value.is_null() && field == "committed_epoch" {
-            Value::Null
-        } else {
-            let number = value.as_u64().ok_or(Failure::Internal)?;
-            if !matches!(field, "committed_epoch" | "ledger_epoch") && number > i64::MAX as u64 {
-                return Err(Failure::Internal);
+            Field::Phase => {
+                if value.as_str() != switch_phase {
+                    return Err(Failure::Internal);
+                }
+                value.clone()
             }
-            Value::String(number.to_string())
+            Field::Epoch => {
+                let committed = step.is_some_and(|(_, committed)| committed);
+                if committed == value.is_null() || value.as_u64() == Some(0) {
+                    return Err(Failure::Internal);
+                }
+                if value.is_null() {
+                    Value::Null
+                } else {
+                    Value::String(value.as_u64().ok_or(Failure::Internal)?.to_string())
+                }
+            }
+            Field::Number => {
+                let number = value.as_u64().ok_or(Failure::Internal)?;
+                if field != "ledger_epoch" && number > i64::MAX as u64 {
+                    return Err(Failure::Internal);
+                }
+                Value::String(number.to_string())
+            }
+            Field::Token => token(value)?,
+            Field::OptionalToken if value.is_null() => Value::Null,
+            Field::OptionalToken => token(value)?,
+            Field::Tokens => {
+                let items = value.as_array().ok_or(Failure::Internal)?;
+                if items.len() > 256 {
+                    return Err(Failure::Internal);
+                }
+                Value::Array(items.iter().map(token).collect::<Result<_, _>>()?)
+            }
+            Field::Text => {
+                let text = value.as_str().ok_or(Failure::Internal)?;
+                if text.chars().count() > 512 {
+                    return Err(Failure::Internal);
+                }
+                value.clone()
+            }
         };
         payload.insert(field.to_owned(), projected);
     }
+    // The indexed columns must agree with the payload they were written from.
+    let deployment_field = if switch_phase.is_some() {
+        "target_deployment"
+    } else {
+        "deployment_id"
+    };
     for (field, column) in [
-        ("deployment_id", &event.deployment_id),
+        (deployment_field, &event.deployment_id),
         ("operation_id", &event.operation_id),
     ] {
         if input.get(field).and_then(Value::as_str) != column.as_deref() {
