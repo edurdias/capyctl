@@ -102,6 +102,8 @@ impl From<AdapterError> for LifecycleFault {
             AdapterError::Crash(_) => Self::Failed(text),
             // Nothing reached the engine; the refusal is retryable, not a failure.
             AdapterError::NotAccepted(_) => Self::Unavailable(text),
+            // The engine answered the request as invalid: deterministic.
+            AdapterError::Rejected { .. } => Self::Blocked(text),
         }
     }
 }

@@ -235,6 +235,12 @@ pub enum AdapterError {
     /// ingress refused it before forwarding because it is shutting down). Unlike
     /// `Uncertain`, nothing can be running on its behalf.
     NotAccepted(String),
+    /// SPEC §10: the engine answered the request as invalid (HTTP 400, 413 or
+    /// 422 with a JSON body read in full), for example a prompt over its context
+    /// or a tool choice it was not launched to serve. The answer is complete, so
+    /// nothing runs on the request's behalf; another instance would reject it
+    /// the same way. `message` is the engine's own, bounded.
+    Rejected { status: u16, message: String },
 }
 
 /// Spec §3: an adapter error is quoted into failure reasons that reach a journal,
@@ -254,6 +260,9 @@ impl std::fmt::Display for AdapterError {
                 f.write_str("unsupported combination of arguments or states")
             }
             AdapterError::NotAccepted(reason) => write!(f, "not accepted: {reason}"),
+            AdapterError::Rejected { status, message } => {
+                write!(f, "the engine rejected the request ({status}): {message}")
+            }
         }
     }
 }

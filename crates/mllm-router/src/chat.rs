@@ -299,6 +299,13 @@ pub async fn dispatch_timed(
                     timing.finish();
                     return Ok((response, timing));
                 }
+                // SPEC §10, T19 (found live 2026-09-24): the engine answered the
+                // request as invalid. That answer is complete, so the lease closed
+                // as completed; another instance would reject it the same way.
+                Err(AdapterError::Rejected { status, message }) => {
+                    guard.release();
+                    return Err(Refused::Before(engine_rejection(status, &message)));
+                }
                 // SPEC §10, T19: refused deterministically before sending;
                 // another instance would refuse it the same way.
                 Err(error) if refused_before_sending(&error) => {
@@ -340,6 +347,13 @@ enum Refused {
     Uncertain,
 }
 
+/// SPEC §10: the client answer for an engine's invalid-request rejection: the
+/// engine's status (400, 413 or 422) and its bounded message, never a 500.
+pub(crate) fn engine_rejection(status: u16, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    let (_, body) = err("engine_rejected", message);
+    (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), body)
+}
+
 /// The router's error answer, for the instance planner.
 pub(crate) fn refusal(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
     err(code, message)
@@ -350,6 +364,8 @@ pub(crate) fn lease_end(error: Option<&AdapterError>) -> LeaseEnd {
     match error {
         None => LeaseEnd::Completed,
         Some(AdapterError::NotAccepted(_)) => LeaseEnd::NotAccepted,
+        // SPEC §10: the engine's complete invalid-request answer ends the work.
+        Some(AdapterError::Rejected { .. }) => LeaseEnd::Completed,
         // SPEC §10: a request the forwarder refused by policy or capability was
         // never sent; that is evidence of non-acceptance, not uncertainty.
         Some(error) if refused_before_sending(error) => LeaseEnd::NotAccepted,

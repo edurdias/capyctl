@@ -363,6 +363,11 @@ impl ChatHttp {
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(refused_before_forwarding(response).await);
         }
+        // SPEC §10 (found live 2026-09-24): an invalid-request answer is the
+        // engine's complete reply, relayed as such rather than as uncertainty.
+        if rejection_status(response.status().as_u16()) {
+            return Err(rejected_by_engine(response).await);
+        }
         if !response.status().is_success()
             || response
                 .headers()
@@ -406,6 +411,72 @@ impl ChatHttp {
         }
         // Even a finish_reason without the protocol terminator is uncertain.
         Err(uncertain())
+    }
+}
+
+/// SPEC §10: the statuses an OpenAI-compatible engine answers when it rejects a
+/// request as invalid before running it (a prompt over its context, an argument
+/// or tool choice it cannot serve, a body too large). With a JSON body read in
+/// full they are the engine's complete answer, so nothing runs on the request's
+/// behalf. Every other error status stays uncertain: a 5xx, a 408 or a 499 can
+/// follow accepted work, and a 401/403 is not the engine judging the request.
+pub fn rejection_status(status: u16) -> bool {
+    matches!(status, 400 | 413 | 422)
+}
+
+/// The largest rejection body read, and the longest message kept from it.
+pub const REJECTION_BODY_LIMIT: usize = 16 * 1024;
+const REJECTION_MESSAGE_LIMIT: usize = 512;
+
+/// The message of an engine's invalid-request answer: vLLM's `error.message`,
+/// SGLang's top-level `message`, or a relayed `engine_rejected` body, cut to
+/// a bounded length on a character boundary. `None` when the body is not a JSON
+/// object, which leaves the answer unproven.
+pub fn rejection_message(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let message = object
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| object.get("message").and_then(Value::as_str))
+        .unwrap_or("the engine rejected the request as invalid");
+    let mut end = message.len().min(REJECTION_MESSAGE_LIMIT);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(message[..end].to_owned())
+}
+
+/// Read an invalid-request answer in full (bounded in size and time). Only a
+/// complete JSON body is evidence; anything else stays uncertain.
+async fn rejected_by_engine(response: reqwest::Response) -> AdapterError {
+    let status = response.status().as_u16();
+    if response
+        .content_length()
+        .is_some_and(|length| length > REJECTION_BODY_LIMIT as u64)
+    {
+        return uncertain();
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| ())?;
+            if body.len() + chunk.len() > REJECTION_BODY_LIMIT {
+                return Err(());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(())
+    })
+    .await;
+    if !matches!(read, Ok(Ok(()))) {
+        return uncertain();
+    }
+    match rejection_message(&body) {
+        Some(message) => AdapterError::Rejected { status, message },
+        None => uncertain(),
     }
 }
 
@@ -803,6 +874,47 @@ mod tests {
             forward.forward_chat(&request).await,
             Err(AdapterError::Uncertain(_))
         ));
+    }
+
+    // T19 T17 (SPEC §10, found live 2026-09-24): an engine that rejects a
+    // request as invalid (400, 413, 422 with a JSON body read in full) has
+    // answered it; nothing runs on its behalf, so the rejection is terminal
+    // evidence and carries the engine's own message, from vLLM's
+    // `error.message`, SGLang's top-level `message`, or the host ingress's
+    // relayed `engine_rejected` body. A rejection that cannot be read as
+    // JSON, and every other status, stays uncertain.
+    #[tokio::test]
+    async fn an_invalid_request_rejection_is_terminal_and_keeps_the_engine_message() {
+        let request = serde_json::json!({"model":"m","messages":[]});
+        for (status, body, needle) in [
+            (400, serde_json::json!({"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}), "maximum context length"),
+            (422, serde_json::json!({"object":"error","message":"tool_choice requires a parser","code":422}), "tool_choice"),
+            (413, serde_json::json!({"error":{"code":"engine_rejected","message":"prompt too large"}}), "prompt too large"),
+        ] {
+            let forward = crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
+            match forward.forward_chat(&request).await {
+                Err(AdapterError::Rejected { status: got, message }) => {
+                    assert_eq!(got, status);
+                    assert!(message.contains(needle), "{message}");
+                }
+                other => panic!("status {status}: {:?}", other.map(|_| ())),
+            }
+        }
+        let long = "x".repeat(4000);
+        let forward = crate::forward::engine_forwarder(
+            answering(400, serde_json::json!({"error":{"message": long}})).await, "m".into(), None);
+        match forward.forward_chat(&request).await {
+            Err(AdapterError::Rejected { message, .. }) => assert!(message.len() <= 512, "{}", message.len()),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        for (status, body) in [
+            (400, serde_json::json!("not an object")),
+            (401, serde_json::json!({"error":{"message":"Unauthorized"}})),
+            (500, serde_json::json!({"error":{"message":"boom"}})),
+        ] {
+            let forward = crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
+            assert!(matches!(forward.forward_chat(&request).await, Err(AdapterError::Uncertain(_))), "status {status}");
+        }
     }
 
     // T38, ADR 0013 §10: a refused connection carried no request, so it is

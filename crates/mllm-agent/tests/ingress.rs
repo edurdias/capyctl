@@ -386,3 +386,70 @@ async fn engine_internal_request_fields_never_reach_the_engine() {
     task.abort();
     native_task.abort();
 }
+
+/// A native endpoint that answers every chat with one fixed status and body.
+async fn answering_native(
+    status: u16,
+    content_type: &'static str,
+    body: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    serve(Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap()
+        }),
+    ))
+    .await
+}
+
+// T19 T17 (SPEC §10, found live 2026-09-24): an engine that rejects a request
+// as invalid (a prompt over its context, a tool choice it was not launched
+// for) has answered it completely; nothing runs on its behalf. The ingress
+// relays that rejection as `engine_rejected` with the engine's own message,
+// instead of flattening it into a 502 the router must treat as uncertain.
+// Any other engine error, or a rejection whose body cannot be read as JSON,
+// stays a 502.
+#[tokio::test]
+async fn an_engine_rejection_is_relayed_and_other_engine_errors_stay_bad_gateway() {
+    let cases: [(u16, &'static str, &'static str, u16); 5] = [
+        (400, "application/json",
+         r#"{"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}"#, 400),
+        (422, "application/json", r#"{"object":"error","message":"tool_choice requires a parser","code":422}"#, 422),
+        (400, "text/plain", "bad", 502),
+        (500, "application/json", r#"{"error":{"message":"boom"}}"#, 502),
+        (401, "application/json", r#"{"error":{"message":"Unauthorized"}}"#, 502),
+    ];
+    for (engine_status, content_type, body, want) in cases {
+        let (native, native_task) = answering_native(engine_status, content_type, body).await;
+        let ingress = Ingress::new().unwrap();
+        let first = scope(1);
+        ingress.register(first.clone(), native, "model".into(), [1; 32], [2; 32]).unwrap();
+        ingress.open(&first).unwrap();
+        let (address, task) = serve(ingress.clone().router()).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&serde_json::json!({"model":"model","messages":[],"stream":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), want, "engine {engine_status} {body}");
+        let answer: serde_json::Value = response.json().await.unwrap();
+        if want == 502 {
+            assert_eq!(answer["error"]["code"], "inference_unavailable");
+        } else {
+            assert_eq!(answer["error"]["code"], "engine_rejected", "{answer}");
+            let message = answer["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("maximum context length") || message.contains("tool_choice"),
+                "{answer}"
+            );
+        }
+        task.abort();
+        native_task.abort();
+    }
+}
