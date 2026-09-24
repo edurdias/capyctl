@@ -153,7 +153,19 @@ async fn revoke(
     })
     .await
     {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        // SPEC §§4.1, 6.4: the revoked identity, and whether this request
+        // revoked it or found it already revoked (an idempotent retry).
+        Ok(Ok(revocation)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "api_version": "1",
+                "host_id": revocation.host_id,
+                "name": revocation.host_name,
+                "revoked": true,
+                "newly_revoked": revocation.newly_revoked,
+            })),
+        )
+            .into_response(),
         Ok(Err(refusal)) => refused(refusal),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", false),
     }

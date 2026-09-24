@@ -7,6 +7,7 @@ pub mod host_observation;
 pub mod output;
 pub mod roles;
 pub mod remote_roles;
+pub mod revoke;
 pub mod shutdown;
 pub mod standalone_config;
 pub mod validate;

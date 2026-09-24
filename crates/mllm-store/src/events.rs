@@ -143,6 +143,11 @@ pub(crate) enum EventMetadata {
         registered_digest: String,
         observed_digest: String,
     },
+    /// SPEC §§4.1, 13.3: an administrator revoked the host's identity. Its
+    /// control session closes and new work stops; nothing it owns is released
+    /// by this record.
+    #[serde(rename = "1")]
+    HostRevoked { host_id: String, host_name: String },
     /// SPEC §10, ADR 0013 §8 (W10): one transition of a request-driven switch.
     /// Victims are `deployment/instance`; each victim's park or stop is its
     /// own operation with its own events.
@@ -283,6 +288,7 @@ impl EventMetadata {
             Self::HostResourcePolicyBootstrapped { .. } => "host_resource_policy_bootstrapped",
             Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
             Self::InstallationDriftFlagged { .. } => "installation_drift_flagged",
+            Self::HostRevoked { .. } => "host_revoked",
             Self::SwitchRecorded { phase, .. } => match phase {
                 SwitchPhase::Planned => "switch_planned",
                 SwitchPhase::AdmissionClosed => "switch_admission_closed",
@@ -330,7 +336,8 @@ impl EventMetadata {
             Self::HostResourcePolicyUpdated { operation_id, .. } => {
                 (None, Some(operation_id.as_str()))
             }
-            Self::InstallationDriftFlagged { .. } => (None, None),
+            Self::InstallationDriftFlagged { .. }
+            | Self::HostRevoked { .. } => (None, None),
             Self::SwitchRecorded {
                 target_deployment, ..
             } => (Some(target_deployment.as_str()), None),

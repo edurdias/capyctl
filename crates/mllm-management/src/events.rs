@@ -510,6 +510,8 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("registered_digest", Token),
             ("observed_digest", Token),
         ],
+        // SPEC §§4.1, 13.3: an administrator revoked a host identity.
+        "host_revoked" => &[("host_id", Token), ("host_name", Token)],
         _ => return Err(Failure::Internal),
     };
     if input.len() != fields.len() + 1 {

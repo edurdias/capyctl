@@ -318,6 +318,126 @@ fn product_enrolls_unprepared_host_and_reconnects_without_identity_change() {
     server.stop();
 }
 
+/// Initialize a server and a host, enroll the host through the product and
+/// start the server. Returns the server and the paths the host role needs.
+fn enrolled_server(temp: &Path, host_name: &str) -> (Service, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let server_root = temp.join("server");
+    let host_root = temp.join("host");
+    let server_config = temp.join("server.yaml");
+    let host_config = temp.join("host.yaml");
+    for (state, role, config) in [
+        (&server_root, "server", &server_config),
+        (&host_root, "host", &host_config),
+    ] {
+        let result = cli(state, &["init", role, "--output", config.to_str().unwrap()]);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&server_config).unwrap()).unwrap();
+    let ports = free_ports(4, false);
+    for (i, name) in ["management", "inference", "bootstrap", "control"].iter().enumerate() {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ports[i]));
+        document["listeners"][name]["bind"] = addr.to_string().into();
+        if matches!(*name, "bootstrap" | "control") {
+            document["enrollment"][format!("{name}_address")] = format!("https://{addr}").into();
+        }
+    }
+    fs::write(&server_config, serde_json::to_vec(&document).unwrap()).unwrap();
+    let server = Service::start(&server_root, "server", &server_config);
+    hosts(&server_root, &server_config, false, 0);
+    let invitation = temp.join(format!("{host_name}.join"));
+    let invited = cli(
+        &server_root,
+        &["invite", "host", "--name", host_name, "--config", server_config.to_str().unwrap(),
+          "--output", invitation.to_str().unwrap()],
+    );
+    assert!(invited.status.success(), "{}", String::from_utf8_lossy(&invited.stderr));
+    let joined = cli(
+        &host_root,
+        &["join", "host", "--join-file", invitation.to_str().unwrap(), "--config", host_config.to_str().unwrap()],
+    );
+    assert!(joined.status.success(), "{}", String::from_utf8_lossy(&joined.stderr));
+    (server, server_root, server_config, host_root, host_config)
+}
+
+fn revoke(root: &Path, config: &Path, host: &str, request_id: Option<&str>) -> std::process::Output {
+    let mut args = vec!["revoke", "host", host, "--config", config.to_str().unwrap(), "--output", "json"];
+    if let Some(id) = request_id {
+        args.extend(["--request-id", id]);
+    }
+    cli(root, &args)
+}
+
+// T06 (SPEC §§4.1, 13.3, 14; F3 revocation gate): `mllm revoke host` through
+// the real binaries and mutual TLS. The live session closes, the host shows
+// `revoked` and offline, its reconnects (including a restarted host role with
+// the same identity) are refused, a replay with the same request identity is an
+// idempotent no-op, one request identity cannot name another host, and an
+// unknown host is `not_found`. CPU-only; the live row (M45) is separate.
+#[test]
+fn revoke_host_closes_the_session_and_keeps_the_host_out() {
+    let temp = root();
+    let (mut server, server_root, server_config, host_root, host_config) =
+        enrolled_server(temp.path(), "revoked-spark");
+    let mut host = Service::start(&host_root, "host", &host_config);
+    let snapshot = hosts(&server_root, &server_config, true, 1);
+    let id = snapshot["hosts"][0]["host_id"].as_str().unwrap().to_owned();
+    assert_eq!(snapshot["hosts"][0]["revoked"], false);
+
+    let request = ulid::Ulid::new().to_string();
+    let out = revoke(&server_root, &server_config, "revoked-spark", Some(&request));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let revoked: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(revoked["host_id"], id.as_str());
+    assert_eq!(revoked["name"], "revoked-spark");
+    assert_eq!(revoked["revoked"], true);
+    assert_eq!(revoked["newly_revoked"], true);
+    assert_eq!(revoked["engines"], "retained");
+    assert_eq!(revoked["request_id"], request.as_str());
+
+    // The live session closes without the host role stopping.
+    let listed = hosts(&server_root, &server_config, false, 1);
+    assert_eq!(listed["hosts"][0]["revoked"], true);
+    assert_eq!(listed["hosts"][0]["eligible"], false);
+    // It keeps retrying with its old certificate and is refused every time,
+    // and a restarted host role with the same identity fares no better.
+    host.stop();
+    host = Service::start(&host_root, "host", &host_config);
+    for _ in 0..30 {
+        let listed = hosts(&server_root, &server_config, false, 1);
+        assert_eq!(listed["hosts"][0]["revoked"], true);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // SPEC §6.4: the same request identity replays; the host was already
+    // revoked, so nothing changes.
+    let out = revoke(&server_root, &server_config, &id, Some(&request));
+    assert!(!out.status.success(), "one request identity named two spellings of the host");
+    let out = revoke(&server_root, &server_config, "revoked-spark", Some(&request));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let replay: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(replay["newly_revoked"], false);
+    let out = revoke(&server_root, &server_config, &id, None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let by_id: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(by_id["host_id"], id.as_str());
+    assert_eq!(by_id["newly_revoked"], false);
+    // SPEC §14: an unknown host is a typed `not_found`.
+    let out = revoke(&server_root, &server_config, "no-such-host", None);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not_found"), "{stderr}");
+    // Still out after a server restart: revocation is durable.
+    server.stop();
+    server = Service::start(&server_root, "server", &server_config);
+    for _ in 0..20 {
+        let listed = hosts(&server_root, &server_config, false, 1);
+        assert_eq!(listed["hosts"][0]["revoked"], true);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    host.stop();
+    server.stop();
+}
+
 // Test hygiene for the role-driving suites (support::process). T33: a role and
 // anything it forked into its process group are gone when the test's guard
 // drops, even though the grandchild was never known to the test.

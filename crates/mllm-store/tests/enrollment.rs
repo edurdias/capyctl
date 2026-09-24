@@ -166,3 +166,34 @@ fn renewal_transaction_replays_and_rejects_changed_content() {
         )
         .is_err());
 }
+
+// T06 (SPEC §§4.1, 6.4, 13.3): a host is revoked by id or by its name; the
+// first revocation is journaled once and a repeat is an idempotent no-op; an
+// unknown or malformed name is refused and changes nothing.
+#[test]
+fn revocation_resolves_id_or_name_and_is_idempotent_and_journaled_once() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_host_invitation(&"b".repeat(64), "host-a", 100, 0)
+        .unwrap();
+    let issued = store
+        .redeem_host_invitation(&request("transaction-one"), 1, |host| Ok(certificate(host)))
+        .unwrap();
+    assert!(store.revoke_host("unknown-host").is_err());
+    assert!(store.revoke_host("bad name").is_err());
+    let first = store.revoke_host("host-a").unwrap();
+    assert_eq!(first.host_id, issued.host_id);
+    assert_eq!(first.host_name, "host-a");
+    assert!(first.newly_revoked);
+    let again = store.revoke_host(&issued.host_id).unwrap();
+    assert_eq!(again.host_id, issued.host_id);
+    assert!(!again.newly_revoked);
+    assert!(store.enrolled_hosts().unwrap()[0].revoked);
+    assert!(store.certificate_host(&issued.fingerprint, 2).is_err());
+    let events = store.events_after(None, 100).unwrap().events;
+    let revoked: Vec<_> = events.iter().filter(|e| e.kind == "host_revoked").collect();
+    assert_eq!(revoked.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&revoked[0].payload_json).unwrap();
+    assert_eq!(payload["host_id"], issued.host_id.as_str());
+    assert_eq!(payload["host_name"], "host-a");
+}
