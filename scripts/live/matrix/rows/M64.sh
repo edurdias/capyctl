@@ -26,19 +26,22 @@ model_dir_digest() { # model_dir_digest <host> <dir>: size+mtime listing digest 
 }
 
 row_main() {
-  local a=${1:-s92-4} b=${2:-v17-4} ha hb rc=0
+  local a=${1:-s92-4} b=${2:-v17-4} ha hb rc=0 aid=
   ha=$(fixture_host "$a"); hb=$(fixture_host "$b")
   step before-a host_idle "$ha" || return 1
   step before-b host_idle "$hb" || return 1
   step files-before model_dir_digest "$ha" qwen3-4b-instruct
   step deploy-a deploy "$a" --activate --wait || return 1
   step owned-a keep_owned "$a" ready
+  # The id, not the name, judges cleanup after the delete removes the name
+  # (found live 2026-09-24: the name lookup failed "no deployment").
+  dry || aid=$(deployment_id "$EVID/accounting-$a-ready.json")
   step infer-a infer "$a" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
   step delete-plain refused delete_dep "$a" || rc=1
   step after-plain wait_state "$a" ready 10 || rc=1
   step delete-stop timed delete-stop cli delete deployment "$a" --stop --output json || rc=1
   sleep 3
-  step cleanup-a cleanup_check_partial "$a" "$ha" "$EVID/owned-$a-ready.json"
+  step cleanup-a cleanup_check_deleted "$aid" "$ha" "$EVID/owned-$a-ready.json" || rc=1
   step host-a host_idle "$ha" || rc=1
   step models-after models_list
   step gone refused infer "$a" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 16 --timeout 30 || rc=1

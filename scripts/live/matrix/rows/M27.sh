@@ -42,23 +42,28 @@ switch_row() {
   local fa=$1 fb=$2 cycles=${3:-1} residency=${4:-deep} host da db c rc=0
   host=$(fixture_host "$fa")
   [ "${POLICY_92:-}" = tight ] || dry || { echo "host-a is not on the tight policy"; return 1; }
+  local va="" mem=()
+  # SWITCH_MEMORY_JSON sizes both sides' engine memory so that two small
+  # models still cannot share the tight host (the 2026-09-24 q4 smoke used
+  # '{"memory": {"request": "47244640256B", "kv_cache": "4294967296B"}}').
+  [ -n "${SWITCH_MEMORY_JSON:-}" ] && mem=(--engine-config-json "$SWITCH_MEMORY_JSON")
   da=$fa; db=$fb
   if [ "$residency" = restart_only ]; then
-    step variant-a variant "$fa" rs --residency restart_only || return 1
-    da=$fa-rs
+    step variant-a variant "$fa" rs --residency restart_only "${mem[@]}" || return 1
+    va=rs
+  elif [ ${#mem[@]} -gt 0 ]; then
+    step variant-a variant "$fa" big "${mem[@]}" || return 1
+    va=big
   fi
+  da=$fa${va:+-$va}
   # The derived wake placeholder (60 s + 5 s/GB) is below a measured SGLang
   # disk reload on GB10 (q30: 61 GB in about 350 s, M27 2026-09-23), so B
   # declares its wake timeout (a deployment setting, ADR 0014 A1).
-  step variant-b variant "$fb" wk --document-json '{"timeouts": {"wake": "900s"}}' || return 1
+  step variant-b variant "$fb" wk "${mem[@]}" --document-json '{"timeouts": {"wake": "900s"}}' || return 1
   db=$fb-wk
   SWITCH_DEPS="$da $db"
   step before host_idle "$host" || return 1
-  if [ "$residency" = restart_only ]; then
-    FIXTURE_VARIANT=rs step deploy-a deploy "$fa" --activate --wait || return 1
-  else
-    step deploy-a deploy "$fa" --activate --wait || return 1
-  fi
+  FIXTURE_VARIANT=$va step deploy-a deploy "$fa" --activate --wait || return 1
   FIXTURE_VARIANT=wk step deploy-b deploy "$fb" || return 1
   step i1-a0 i1 "$da" "$fa" "$da" || rc=1
   step owned-a0 keep_owned "$da" a0

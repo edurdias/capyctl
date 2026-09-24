@@ -55,7 +55,13 @@ STARTED=$(now)
 echo "row $NAME run $RUN started $STARTED dry_run=$DRY_RUN" | tee "$EVID/timeline.txt"
 [ "$E0" = 1 ] && "$MATRIX_DIR/e0.sh" snap before "$EVID"
 RC=0
+# A row that fails, or exits early through die, removes what it deployed
+# (cleanup_failed_row; KEEP_FAILED=1 keeps it).
+ROW_DONE=0
+trap '[ "$ROW_DONE" = 1 ] || cleanup_failed_row' EXIT
 row_main "$@" || RC=$?
+[ "$RC" = 0 ] || cleanup_failed_row
+ROW_DONE=1
 [ "$E0" = 1 ] && "$MATRIX_DIR/e0.sh" snap after "$EVID"
 FINISHED=$(now)
 python3 - "$EVID/result.json" "$NAME" "$RUN" "${SNAPSHOT_DIGEST:-unknown}" "$STARTED" "$FINISHED" "$RC" "$DRY_RUN" <<'PY'

@@ -5,6 +5,13 @@ The protected SGLang and vLLM entries refuse a wrapper that others can write,
 or whose ancestors others can write; Phase B found mllm_vllm_guard.py at 0664.
 This check fails before a launch does. Standard library only; read-only.
 
+It also mirrors the host's runtime integrity check (crates/mllm-agent/src/
+runtime_integrity.rs, SPEC 9.1 / T21): nothing importable other than `.py`
+source may sit anywhere in the tree, so a `__pycache__` directory or a cached
+`.pyc` is refused here too (found live 2026-09-24: the device probe wrote
+bytecode after this check had passed, and every launch was then refused
+`runtime_integrity`).
+
 usage: check_runtime.py <runtime_dir> [required-file ...]
 """
 
@@ -12,6 +19,9 @@ import hashlib
 import os
 import stat
 import sys
+
+# Same list as runtime_integrity.rs FOREIGN_IMPORTABLE.
+FOREIGN_IMPORTABLE = ("pyc", "pyo", "so", "pyd", "pth", "zip", "egg", "whl")
 
 
 def main(argv):
@@ -31,7 +41,13 @@ def main(argv):
         if not stat.S_ISREG(info.st_mode):
             problems.append(f"not a regular file: {name}")
     for dirpath, dirnames, filenames in os.walk(root):
+        for d in dirnames:
+            if d == "__pycache__":
+                problems.append(f"bytecode directory {os.path.join(dirpath, d)}")
         dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for f in filenames:
+            if f.rsplit(".", 1)[-1] in FOREIGN_IMPORTABLE and "." in f:
+                problems.append(f"importable non-source file {os.path.join(dirpath, f)}")
         for entry in [dirpath] + [os.path.join(dirpath, f) for f in filenames]:
             mode = os.lstat(entry).st_mode
             if mode & 0o022:

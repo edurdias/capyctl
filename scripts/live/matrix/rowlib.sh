@@ -31,7 +31,26 @@ fixture_host() { short_host "$(echo "$1" | cut -c2-3)"; }
 deploy() { # deploy <fixture> [--activate] [--wait] [--request-id ULID]
   local f=$1; shift
   [ -f "$(fixture_file "$f")" ] || dry || die "no fixture $f (roles.sh fixtures)"
+  # Recorded before the call: a deploy that fails after the server accepted it
+  # still leaves a deployment behind (cleanup_failed_row).
+  dry || echo "$f${FIXTURE_VARIANT:+-$FIXTURE_VARIANT}" >>"$EVID/deployed.txt"
   cli deploy model --file "$(fixture_file "$f")" "$@" --output json
+}
+
+# cleanup_failed_row: run_row.sh calls this when a row fails or exits early
+# (set KEEP_FAILED=1 to keep its deployments for inspection). Every deployment
+# the row deployed that still exists is removed with `delete deployment --stop`,
+# which stops it with verified cleanup first; a leftover route would otherwise
+# make the next row's deploy fail `route_conflict` (found live 2026-09-24).
+cleanup_failed_row() {
+  local d
+  dry && return 0
+  [ "${KEEP_FAILED:-0}" = 1 ] && { echo "KEEP_FAILED=1: leaving the row's deployments"; return 0; }
+  [ -f "$EVID/deployed.txt" ] || return 0
+  while read -r d; do
+    status_dep "$d" >/dev/null 2>&1 </dev/null || continue
+    step "trap-delete-$d" cli delete deployment "$d" --stop --output json </dev/null || true
+  done < <(sort -u "$EVID/deployed.txt")
 }
 start_dep() { cli start deployment "$1" --output json "${@:2}"; }
 stop_dep() { cli stop deployment "$1" --output json "${@:2}"; }
@@ -51,6 +70,17 @@ variant() {
   [ -f "$RUNSTATE/checkpoints.json" ] && extra+=(--checkpoints "$RUNSTATE/checkpoints.json")
   x python3 "$MATRIX_DIR/gen_deployment.py" --hosts-json "$RUNSTATE/hosts.json" --out-dir "$RUNSTATE/fixtures" \
     "${extra[@]}" --variant "$tag" "$@" "$fix"
+}
+
+# refused_with <code> <command...>: the command is expected to fail, and its
+# output names <code> (a closed error code such as startup_requires_empty_host).
+refused_with() {
+  local code=$1 out rc=0
+  shift
+  out=$("$@" 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  if [ "$rc" = 0 ]; then echo "UNEXPECTED: accepted"; return 1; fi
+  case $out in *"$code"*) echo "refused $code as expected" ;; *) echo "UNEXPECTED: refused without $code"; return 1 ;; esac
 }
 
 # refused <command...>: the command is expected to fail. Succeeds only when it
@@ -412,4 +442,31 @@ ops=[o for o in s.get("operations_recent",[]) if o.get("deployment_id")==dep]
 hits={k:[r for r in v if isinstance(r,dict) and dep in json.dumps(r) and not tomb(k,r)] for k,v in s.items() if isinstance(v,list) and k!="operations_recent"}
 hits={k:v for k,v in hits.items() if v}
 print(json.dumps({"ops":ops,"held":hits})); sys.exit(1 if hits else 0)' "$depid"
+}
+
+# deployment_id <accounting.json>: the deployment id recorded in an accounting
+# snapshot (keep_owned writes one), so a row can still judge cleanup by id after
+# `delete deployment` has removed the name.
+deployment_id() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deployment_id"])' "$1"
+}
+
+# cleanup_check_deleted <deployment id> <host> <owned.json>: verified cleanup
+# after `delete deployment --stop`, when the name no longer resolves: every
+# recorded identity is gone on its host and the ledger holds nothing for the id
+# (its tombstone excepted).
+cleanup_check_deleted() {
+  local depid=$1 host=$2 ownedf=$3 rc=0 pid ticks boot probe hid h
+  dry && return 0
+  while read -r pid ticks boot hid; do
+    h=$host
+    [ "$hid" = "${HOST_ID_92:-}" ] && h=host-a
+    [ "$hid" = "${HOST_ID_17:-}" ] && h=host-b
+    probe=$(rsh "$h" "python3 $REMOTE_TREE/scripts/live/matrix/signal_owned.py --pid $pid --ticks $ticks --boot $boot --signal 0" || true)
+    echo "$h $pid $probe"
+    case $probe in *'"outcome": "absent"'*) ;; *) rc=1 ;; esac
+  done < <(python3 -c 'import json,sys
+for i in json.load(open(sys.argv[1])): print(i["pid"], i["start_ticks"], i["boot_id"], i.get("host_id") or "-")' "$ownedf")
+  residue_check "$depid" || rc=1
+  return "$rc"
 }
