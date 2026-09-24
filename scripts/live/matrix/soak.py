@@ -71,6 +71,11 @@ RUNSTATE = ENV.get("RUNSTATE", "")
 HOSTS = ("host-a", "host-b")
 ENGINE_RE = r"sglang[.]launch_server|sglang_entr[y]|vllm_entr[y]|vllm[ ]serve|Engine[C]ore|sglang::schedule[r]|sglang::detokenize[r]"
 STABLE = {"ready", "parked", "stopped", "failed"}
+# `queued`: a start that waits for room until its own deadline (an instance the
+# on-demand activation could not place without eviction, ADR 0013 section 9).
+# The walk does not wait it out; I-UNCERTAIN tracks its age like any other
+# transitional state.
+SETTLED = STABLE | {"queued"}
 # I1 compares the first I1_PREFIX greedy tokens. The shakedown (2026-09-24) found
 # vLLM q4 flipping a near tie at token 10 (logprob margin 0.05) once the probe
 # prompt sat in the prefix cache: a numerical path change, not another model.
@@ -434,7 +439,7 @@ class Soak:
         if rc != 0:
             return "refused", {"target": name, "rc": rc, "out": data, "err": err}
         parked = self.wait_until(name, lambda s: not self.ready(s) and all(
-            st in STABLE for _, st, _ in self.inst_states(s)), 900)
+            st in SETTLED for _, st, _ in self.inst_states(s)), 900)
         s = self.status(name)
         states = self.inst_states(s)
         if all(st == "parked" for _, st, _ in states if st != "stopped") and any(st == "parked" for _, st, _ in states):
@@ -692,7 +697,7 @@ class Soak:
         end = time.time() + SETTLE_S
         while True:
             sts = self.statuses()
-            moving = {n: [(i, st) for i, st, _ in self.inst_states(s) if st not in STABLE]
+            moving = {n: [(i, st) for i, st, _ in self.inst_states(s) if st not in SETTLED]
                       for n, s in sts.items() if s}
             moving = {n: v for n, v in moving.items() if v}
             if not moving or time.time() > end:

@@ -4,6 +4,57 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Soak M48–M50 — 2026-09-24 (branch `test/soak-m48-m50`, stopped by the owner)
+
+M48 is not passed: the owner stopped the soak after 119 walked steps, short of
+the 200 the matrix asks for, and M50 was not run. Harness: `rows/M48.sh`,
+`soak.py`, `rows/M49.sh` (see `scripts/live/matrix/README.md`). Seed 20260924.
+Deployments: v92-4, s92-14, s17-4, v17-4 and v17-14 (every engine launched with
+its tool parser) and the two-instance replica route `qwen3-4b` (s92-4-rep);
+host-b on the tight policy, so two of its three single-instance deployments
+fit and a request for the third switches.
+
+- Segment 1 (commit `323e80d` binary, runs `M48` and `M48-r69`): 84 steps. Two
+  invariant hits, both harness false positives (a stopped replica instance was
+  credited with the binding of its sibling placed on the same host). It found
+  two product defects, both fixed with regression tests and a failing-first check:
+  1. `081e849`: a first placement whose checkpoint did not measure to the
+     declared `content_fingerprint` failed as "runtime ownership is uncertain";
+     it is now refused `checkpoint_mismatch` before any effect, as a wake is.
+     (Found because `e0.sh checkpoints` fed its payload digest, which is not the
+     product's manifest digest, to fixtures; the harness no longer does.)
+  2. `227feb9`: a request for an operator-stopped deployment made room by
+     switching before the operator-stop refusal, so on the tight host it parked
+     a Ready incumbent and was then refused 429 (steps 77 and 80). The refusal
+     now runs before any switch round.
+- M49 on segment 1: every deployment deleted with verified cleanup and no residue
+  by id, empty ledger, both hosts clean, MemAvailable within 0.5 GiB of the
+  pre-soak baseline, roles exited 0. Before that, a server and both host roles
+  were SIGTERMed and restarted with engines retained: they re-attached, and the
+  invariant check and I1 passed on the re-attached engines.
+- Segment 2 (commit `3585adf` binary, runs `M48-final` and `M48-final-r9`):
+  35 steps, no invariant violation, then stopped by the owner mid-step. M49 on
+  it: same clean outcome (MemAvailable within 0.1 GiB, roles exit 0).
+- Coverage over both segments: routed inference and streams, tool calls, operator
+  start with and without `--evict`, stop, park, wake on request, request-driven
+  switching on the tight host, count-only revisions, instance stop and start,
+  delete `--stop` and redeploy, drain host, host agent SIGTERM and restart,
+  engine SIGKILL and agent SIGSTOP/SIGCONT. Refusals seen and judged expected:
+  requests for operator-stopped deployments (429; its code is
+  `insufficient_resources`, which reads oddly for an operator stop), and an
+  activation that does not fit the tight host without `--evict`.
+- Observations, not changed: a second replica instance that cannot be placed
+  without eviction waits `queued` until its deadline (about 15 minutes), also
+  after `start --evict --wait` returned; vLLM q4 greedy output flips a near tie
+  at token 10 once the probe prompt is prefix-cached, so the soak compares an
+  8-token I1 prefix.
+- Local: core 982 reported, workspace 1983 reported, Clippy clean with warnings
+  denied. CPU and Fake-engine tests are not qualification.
+
+Remaining: M48 needs a full ≥200-step walk on the final binary, then M49 and
+M50 (M73 on both engines and M08). Both Sparks were left with no engine, role
+or GPU compute process and no rendezvous directory.
+
 ## Distribution: one binary, GitHub Releases, install.sh — 2026-09-24 (branch `feat/distribution`)
 
 Owner decision 2026-09-24: one self-contained binary, GitHub Releases and
