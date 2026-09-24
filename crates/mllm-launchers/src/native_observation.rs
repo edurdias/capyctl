@@ -5,6 +5,10 @@
 //! client belongs on a bounded blocking executor, not an async reactor thread.
 //! Kernel filesystem reads cannot be deadline-bounded. Socket waits share one
 //! deadline (at most two seconds); there is no retry or lifecycle side effect.
+//!
+//! Key mode (`with_key`, protocol version 2) proves each request with the
+//! launch's observation key instead of relying on the listener having enrolled
+//! this process's PID, so a restarted host observes the launch it owns (T33).
 
 use mllm_domain::completion::ProcessIdentity;
 use nix::libc;
@@ -29,6 +33,18 @@ use std::{
 pub struct ObservationError;
 type Result<T> = std::result::Result<T, ObservationError>;
 
+/// Which step of an observation failed, on the host's own log: a fixed stage
+/// name only, never a path, key, proof or engine output. Found live
+/// 2026-09-23 (M28): every failure read alike and an SGLang park could only
+/// be refused as unchanged, with no trace of why.
+fn staged(stage: &'static str) -> ObservationError {
+    eprintln!(
+        "{}",
+        serde_json::json!({"event": "native_observation_failed", "stage": stage})
+    );
+    ObservationError
+}
+
 /// Immutable service-provisioned endpoint. Construction does not enroll a worker.
 pub struct NativeObservationClient {
     path: PathBuf,
@@ -37,6 +53,8 @@ pub struct NativeObservationClient {
     incarnation_id: String,
     owner: ProcessIdentity,
     library_sha256: String,
+    /// The per-launch observation key (version 2); `None` is version 1.
+    key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -330,27 +348,43 @@ impl NativeObservationClient {
             incarnation_id,
             owner,
             library_sha256,
+            key: None,
         })
+    }
+    /// Prove every request with the launch's observation key (version 2).
+    pub fn with_key(mut self, key: [u8; 32]) -> Self {
+        self.key = Some(key);
+        self
     }
     /// One fresh correlation ID and one connection. Any incomplete result fails closed.
     pub fn observe(&self, timeout: Duration) -> Result<AllocationFacts> {
         let timeout_ms = timeout.as_millis();
         if !(1..=2000).contains(&timeout_ms) || timeout != Duration::from_millis(timeout_ms as u64)
         {
-            return Err(ObservationError);
+            return Err(staged("timeout_shape"));
         }
         let deadline = Instant::now() + timeout;
         let started = monotonic_ns()?;
-        if protected_socket(&self.path)? != self.socket_identity {
-            return Err(ObservationError);
+        if protected_socket(&self.path).map_err(|_| staged("socket_before"))?
+            != self.socket_identity
+        {
+            return Err(staged("socket_replaced_before"));
         }
-        let mut stream = connect(&self.path, deadline)?;
-        peer(&stream, &self.owner)?;
+        let mut stream = connect(&self.path, deadline).map_err(|_| staged("connect"))?;
+        peer(&stream, &self.owner).map_err(|_| staged("peer_before"))?;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let request = serde_json::to_vec(
-            &serde_json::json!({"version":1,"request_id":request_id,"timeout_ms":timeout_ms}),
-        )
-        .map_err(|_| ObservationError)?;
+        let version = if self.key.is_some() { 2 } else { 1 };
+        let body = match &self.key {
+            Some(key) => serde_json::json!({
+                "version": 2,
+                "request_id": request_id,
+                "timeout_ms": timeout_ms,
+                "proof": mllm_adapters::sglang::observation::request_proof(
+                    key, &self.binding_id, &self.incarnation_id, &request_id),
+            }),
+            None => serde_json::json!({"version":1,"request_id":request_id,"timeout_ms":timeout_ms}),
+        };
+        let request = serde_json::to_vec(&body).map_err(|_| ObservationError)?;
         if request.len() > 1024 {
             return Err(ObservationError);
         }
@@ -371,13 +405,13 @@ impl NativeObservationClient {
             }
         }
         let mut header = [0; 4];
-        receive(&mut stream, &mut header, deadline)?;
+        receive(&mut stream, &mut header, deadline).map_err(|_| staged("receive_header"))?;
         let count = u32::from_be_bytes(header) as usize;
         if !(1..=65536).contains(&count) {
-            return Err(ObservationError);
+            return Err(staged("frame_size"));
         }
         let mut data = vec![0; count];
-        receive(&mut stream, &mut data, deadline)?;
+        receive(&mut stream, &mut data, deadline).map_err(|_| staged("receive_body"))?;
         // A full frame alone is insufficient: exact EOF rules out trailing frames.
         loop {
             wait(&stream, libc::POLLIN, deadline)?;
@@ -392,13 +426,14 @@ impl NativeObservationClient {
                 Err(_) => return Err(ObservationError),
             }
         }
-        peer(&stream, &self.owner)?;
+        peer(&stream, &self.owner).map_err(|_| staged("peer_after"))?;
         if protected_socket(&self.path)? != self.socket_identity {
-            return Err(ObservationError);
+            return Err(staged("socket_replaced_after"));
         }
         let finished = monotonic_ns()?;
-        let response: Response = serde_json::from_slice(&data).map_err(|_| ObservationError)?;
-        if response.version != 1
+        let response: Response =
+            serde_json::from_slice(&data).map_err(|_| staged("response_shape"))?;
+        if response.version != version
             || response.binding_id != self.binding_id
             || response.incarnation_id != self.incarnation_id
             || response.request_id != request_id
@@ -411,11 +446,15 @@ impl NativeObservationClient {
             || response.observation.library_sha256 != self.library_sha256
             || response.observation.hook_mode != "preload"
         {
-            return Err(ObservationError);
+            return Err(staged(if response.status != "observed" {
+                "response_status"
+            } else {
+                "response_binding"
+            }));
         }
         let allocations = response.observation.allocations;
-        validate_allocations(&allocations)?;
-        remaining(deadline)?;
+        validate_allocations(&allocations).map_err(|_| staged("allocations_shape"))?;
+        remaining(deadline).map_err(|_| staged("deadline"))?;
         Ok(AllocationFacts {
             binding_id: response.binding_id,
             incarnation_id: response.incarnation_id,
@@ -527,6 +566,73 @@ mod tests {
         assert_eq!(facts.allocations.virtual_bytes, 8192);
         assert_eq!(facts.allocations.mapped_bytes, 0);
         assert_eq!(facts.allocations.groups[0].tag, AllocationTag::KvCache);
+    }
+    /// T33: key mode against the actual Python listener. A client holding the
+    /// launch's key observes whatever its PID; one with another key is denied
+    /// without the bridge being asked.
+    #[test]
+    fn interoperates_with_actual_python_transport_in_key_mode() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::Builder::new()
+            .prefix("mllm-observer-")
+            .tempdir_in(std::env::var("HOME").unwrap())
+            .unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("observe.sock");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let mut child = Command::new("python3")
+            .args(["-I", "-B"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/native_observation_server.py"),
+            )
+            .arg(root)
+            .arg(&path)
+            .arg("0")
+            .arg("admin-key")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let wire: Identity = serde_json::from_str(&line).unwrap();
+        let owner = ProcessIdentity {
+            role: "scheduler".into(),
+            pid: wire.pid,
+            start_ticks: wire.start_ticks,
+            boot_id: wire.boot_id,
+        };
+        let client = |admin: &str| {
+            NativeObservationClient::new(
+                path.clone(),
+                "binding".into(),
+                "incarnation".into(),
+                owner.clone(),
+                "a".repeat(64),
+            )
+            .unwrap()
+            .with_key(mllm_adapters::sglang::observation::observation_key(
+                admin,
+                "binding",
+                "incarnation",
+            ))
+        };
+        let denied = client("another-key").observe(Duration::from_millis(1000));
+        let result = client("admin-key").observe(Duration::from_millis(1000));
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert!(denied.is_err());
+        let facts = result.unwrap();
+        assert!(status.success());
+        assert_eq!(facts.allocations.virtual_bytes, 8192);
+        assert_eq!(facts.allocations.mapped_bytes, 0);
     }
     fn fixture(
         change: impl FnOnce(&mut serde_json::Value) + Send + 'static,

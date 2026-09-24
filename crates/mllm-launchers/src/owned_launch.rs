@@ -106,6 +106,14 @@ impl OwnedProcessLaunch for DurableProcessLaunch {
             observed = observe_process_group_or_empty(api);
         }
         let facts = observed.map_err(|error| uncertain(error.to_string()))?;
+        // SPEC §13.2: a reused leader is neither ours nor proof of an empty
+        // group. Dropping it from the API/worker split would manufacture cleanup.
+        if facts
+            .iter()
+            .any(|fact| fact.pid == api.pid && fact.start_ticks != api.start_ticks)
+        {
+            return Err(uncertain("process group leader identity changed"));
+        }
         let mut members: Vec<ProcessIdentity> = Vec::new();
         let mut workers: Vec<_> = facts.iter().filter(|fact| fact.pid != api.pid).collect();
         // Start order, not pid order: pids wrap, start ticks within one boot do not.
@@ -357,13 +365,15 @@ mod tests {
         let tool = DurableProcessLaunch::new(Arc::new(Accept));
         let api = tool.spawn_durable("reuse", &sleeper(60)).unwrap();
         let forged = ProcessIdentity {
-            start_ticks: api.start_ticks + 1,
+            start_ticks: api.start_ticks - 1,
             ..api.clone()
         };
         assert_eq!(tool.present(&forged), Presence::Gone);
         // Terminating the forged identity signals nothing: the pid is live, but its
         // start identity is not the recorded one, so the real process survives.
-        let _ = tool.terminate_owned(&[forged], Duration::from_millis(200));
+        assert!(tool
+            .terminate_owned(&[forged], Duration::from_millis(200))
+            .is_err());
         assert_eq!(tool.present(&api), Presence::Alive);
         // Cleanup of the real one so the test leaves nothing behind.
         tool.terminate_owned(&[api], Duration::from_secs(1))

@@ -46,6 +46,8 @@ pub struct DurableSpawn {
 struct RetainedChild {
     child: std::process::Child,
     write_gate: OwnedFd,
+    /// SPEC §13.2 (W13): the identity the reaper records the exit status under.
+    identity: Option<ProcessIdentity>,
 }
 
 impl Default for DurableSpawn {
@@ -117,6 +119,7 @@ impl DurableSpawn {
         let RetainedChild {
             mut child,
             write_gate,
+            ..
         } = retained;
         drop(write_gate);
         let _ = nix::sys::signal::killpg(
@@ -146,9 +149,13 @@ impl DurableSpawn {
         let read_fd = read_gate.as_raw_fd();
         let write_fd = write_gate.as_raw_fd();
         const CHILD_GATE_FD: i32 = 9;
-        let mut command = std::process::Command::new("sh");
+        let mut command = std::process::Command::new("/bin/sh");
+        // SPEC §13.3 / T21: every engine starts from an empty environment and
+        // sees only what its rendered command names (the adapter's closed
+        // allowlist); nothing of the agent's own environment is inherited.
+        command.env_clear();
         if descriptors.is_some() {
-            command.env_clear().stdin(std::process::Stdio::null());
+            command.stdin(std::process::Stdio::null());
         }
         command
             .arg("-c")
@@ -217,7 +224,14 @@ impl DurableSpawn {
         self.retained
             .lock()
             .unwrap()
-            .insert(incarnation.into(), RetainedChild { child, write_gate });
+            .insert(
+                incarnation.into(),
+                RetainedChild {
+                    child,
+                    write_gate,
+                    identity: identity.clone(),
+                },
+            );
         let Some(identity) = identity else {
             self.dispose(incarnation, pid);
             return Ok(DurableSpawnOutcome::Uncertain {
@@ -294,7 +308,7 @@ impl Drop for DurableSpawn {
 /// the mode; sharing one helper would change that launcher's behaviour, so the
 /// stricter rule lives here with the gated spawn that needs it.
 fn engine_log(cmd: &RenderedCommand) -> Result<Option<std::fs::File>, DurableSpawnError> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let Some(path) = cmd.env.get("MLLM_ENGINE_LOG") else {
         return Ok(None);
     };
@@ -312,19 +326,39 @@ fn engine_log(cmd: &RenderedCommand) -> Result<Option<std::fs::File>, DurableSpa
             .create(parent)
             .map_err(failed)?;
     }
-    std::fs::OpenOptions::new()
+    open_private_log(path).map(Some).map_err(failed)
+}
+
+/// SPEC §13.3 / T21: open an engine log for append without following a
+/// symlink, refuse anything but a regular file this user owns, and make it
+/// owner-only through the open descriptor (a pre-existing file keeps no wider
+/// mode than 0600).
+pub fn open_private_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
-        .map(Some)
-        .map_err(failed)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC).bits())
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::other("engine log is not a private regular file"));
+    }
+    if metadata.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn detach_reaper(mut retained: RetainedChild) {
     std::thread::spawn(move || {
         let _gate = retained.write_gate;
-        let _ = retained.child.wait();
+        // SPEC §13.2 (W13): the parent is the only party that learns how the
+        // engine ended; an exit report names it from here.
+        if let (Ok(status), Some(identity)) = (retained.child.wait(), &retained.identity) {
+            crate::reaped::record(identity, status);
+        }
     });
 }
 
@@ -428,6 +462,62 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(parent, 0o700);
+    }
+
+    /// SPEC §13.3 / T21: an engine child inherits nothing from the agent's own
+    /// environment; it sees exactly the variables its rendered command names.
+    // T21
+    #[test]
+    fn a_durable_child_inherits_no_agent_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let command = RenderedCommand {
+            argv: vec![
+                "/usr/bin/env".into(),
+            ],
+            env: std::collections::BTreeMap::from([
+                ("MLLM_ENGINE_LOG".to_string(), out.to_str().unwrap().to_string()),
+                ("NAMED".to_string(), "1".to_string()),
+            ]),
+        };
+        assert!(std::env::var_os("HOME").is_some() || std::env::var_os("PATH").is_some());
+        let launcher = DurableSpawn::new();
+        launcher.spawn_persisted("env-test", &command, &Accept).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let text = std::fs::read_to_string(&out).unwrap();
+        let names: Vec<&str> = text.lines().filter_map(|l| l.split_once('=')).map(|(n, _)| n).collect();
+        assert!(names.contains(&"NAMED"), "{text}");
+        for inherited in ["HOME", "PATH", "USER", "CARGO_PKG_NAME"] {
+            assert!(!names.contains(&inherited), "{inherited} leaked: {text}");
+        }
+    }
+
+    /// SPEC §13.3 / T21: the engine log is never opened through a symlink, and an
+    /// existing log is made owner-only before the engine writes to it.
+    // T21
+    #[test]
+    fn the_engine_log_refuses_a_symlink_and_is_made_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        let log = dir.path().join("inc.log");
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        let command = |log: &std::path::Path| RenderedCommand {
+            argv: vec!["sh".into(), "-c".into(), "echo out".into()],
+            env: std::collections::BTreeMap::from([(
+                "MLLM_ENGINE_LOG".to_string(),
+                log.to_str().unwrap().to_string(),
+            )]),
+        };
+        let launcher = DurableSpawn::new();
+        assert!(launcher.spawn_persisted("symlink-log", &command(&log), &Accept).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+        let plain = dir.path().join("plain.log");
+        std::fs::write(&plain, "").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        launcher.spawn_persisted("plain-log", &command(&plain), &Accept).unwrap();
+        let mode = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     /// A child whose identity is never recorded is not left blocked on its gate:
