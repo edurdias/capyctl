@@ -54,11 +54,18 @@ pub enum Resource {
 pub enum Command {
     Start(Role),
     Init(InitTarget),
+    /// SPEC §4.1: a short-lived, single-use host invitation. ADR 0016: with
+    /// `recover`, the invitation re-enrolls the revoked host `name` (its name
+    /// or id) under its same identity instead of enrolling a new host.
     Invite {
         name: String,
+        recover: bool,
     },
+    /// SPEC §4.1: enroll this host with an invitation. ADR 0016: `recover`
+    /// redeems a recovery invitation, keeping the host's state and journal.
     Join {
         join_file: PathBuf,
+        recover: bool,
     },
     List {
         resource: ListResource,
@@ -129,10 +136,14 @@ impl Command {
         match self {
             Command::Start(role) => format!("start {role:?}").to_lowercase(),
             Command::Init(target) => format!("init {target:?}").to_lowercase(),
-            Command::Invite { name } => format!("invite host {name}"),
-            Command::Join { join_file } => {
-                format!("join host --join-file {}", join_file.display())
+            Command::Invite { name, recover } => {
+                format!("invite host {name}{}", if *recover { " --recover" } else { "" })
             }
+            Command::Join { join_file, recover } => format!(
+                "join host --join-file {}{}",
+                join_file.display(),
+                if *recover { " --recover" } else { "" }
+            ),
             Command::List { resource } => format!("list {resource:?}").to_lowercase(),
             Command::Inspect {
                 resource,
@@ -218,15 +229,30 @@ enum CliCommand {
         #[command(subcommand)]
         target: InitTarget,
     },
+    /// Create a short-lived, single-use host invitation. With `--recover`,
+    /// the invitation lets a revoked host (named by name or id) re-enroll
+    /// under its same identity; its old certificate stays revoked.
     Invite {
         resource: HostWord,
+        /// The host: a new host's name, or with `--recover` a revoked host's
+        /// name or id. The same as `--name`.
+        #[arg(conflicts_with = "name", required_unless_present = "name")]
+        host: Option<String>,
         #[arg(long)]
-        name: String,
+        name: Option<String>,
+        #[arg(long)]
+        recover: bool,
     },
+    /// Enroll this host with an invitation file. With `--recover`, redeem a
+    /// recovery invitation: the host keeps its state and journal (or starts
+    /// with fresh identity files if they were lost) and gets a new
+    /// certificate for its same host id.
     Join {
         resource: HostWord,
         #[arg(long)]
         join_file: PathBuf,
+        #[arg(long)]
+        recover: bool,
     },
     List {
         #[command(subcommand)]
@@ -279,7 +305,9 @@ enum CliCommand {
     /// Revoke an enrolled host's identity. Its control session closes at once,
     /// it can no longer reconnect, take commands or placements, and dispatch
     /// to its engines closes. Engines it runs are not stopped and their
-    /// accounting is kept until an operator settles them with evidence.
+    /// accounting is kept until an operator settles them with evidence. The
+    /// host comes back only through `invite host <name|id> --recover` and
+    /// `join host --recover`, under the same identity with a new certificate.
     Revoke {
         #[command(subcommand)]
         resource: RevokeArgs,
@@ -494,8 +522,19 @@ impl From<CliCommand> for Command {
                 },
             },
             CliCommand::Init { target } => Command::Init(target),
-            CliCommand::Invite { name, .. } => Command::Invite { name },
-            CliCommand::Join { join_file, .. } => Command::Join { join_file },
+            CliCommand::Invite {
+                host,
+                name,
+                recover,
+                ..
+            } => Command::Invite {
+                // clap requires exactly one of the two.
+                name: host.or(name).unwrap_or_default(),
+                recover,
+            },
+            CliCommand::Join {
+                join_file, recover, ..
+            } => Command::Join { join_file, recover },
             CliCommand::List { resource } => match resource {
                 ListArgs::Hosts => Command::List {
                     resource: ListResource::Hosts,

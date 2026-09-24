@@ -356,6 +356,20 @@ message ExecuteMember {
   // waking a launch journaled before WE3, whose plan records none. Empty
   // otherwise, which encodes exactly as before.
   string restore_checkpoint_digest = 12;
+  // ADR 0016 (additive): with terminate_owned_handle only, the process
+  // identities the server recorded for the launch. A host whose journal knows
+  // the handle ignores them and acts on its own record. A host that has no
+  // record of it (its journal was lost) never signals them; it only observes
+  // and reports each one's presence, so gone evidence can still be given by
+  // identity. Empty otherwise, which encodes exactly as before.
+  repeated RecordedProcess terminate_recorded_processes = 13;
+}
+// ADR 0016: one process identity as the server recorded it.
+message RecordedProcess {
+  string role = 1;
+  uint32 pid = 2;
+  string boot_id = 3;
+  uint64 start_ticks = 4;
 }
 
 // Separately mounted on a listener requiring a verified client certificate.

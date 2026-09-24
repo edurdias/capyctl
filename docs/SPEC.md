@@ -145,6 +145,10 @@ A valid invitation can preauthorize enrollment. Optional pending approval is a p
 
 Host-name collisions do not authorize replacing an existing identity. Certificates must be renewable and revocable; a revoked host must not continue accepting new commands through an old connection. Losing identity files requires explicit recovery/re-enrollment, not automatic adoption of a similarly named host.
 
+> **Amended by [ADR 0016](design/adr/0016-revoked-host-recovery.md)** (owner decision 2026-09-24).
+
+A revoked host, or one that lost its identity files, recovers by re-enrolling under its **same** host identity, never under a new one and never by adopting a name. An authenticated administrator issues an explicit recovery invitation for the revoked host (`invite host <name|id> --recover`); it is single-use, short-lived, bound to that host id and journaled, and it is refused for a host that is not revoked. The host redeems it explicitly (`join host --recover`), keeping its state and journal, or starting from fresh identity files if they were lost, and always with a new key. It receives a new certificate bound to the same host id. Revocation is per certificate: the old certificate stays revoked for ever. Name-collision rules for new hosts are unchanged. On reconnect the host is reconciled as after any session loss (§13.2): a Ready engine it still owns is re-proven by a fresh probe against its recorded process identities before dispatch reopens; anything unproven stays closed and charged; pending stops and drains complete through the ordinary path. A host whose journal was lost cannot re-prove its engines: they stay uncertain and charged until an operator stop settles them on gone evidence, which the host reports by observing the server's recorded process identities without signalling anything it does not own. Accounting is never released without evidence.
+
 ### 4.2 Preparation is not deployment
 
 A host may enroll before engines or checkpoints are installed. Track independently: enrolled identity, current connectivity, profile eligibility, and deployment readiness. Online does not mean eligible for every recipe.
@@ -850,7 +854,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T03 | Missing/invalid explicit config or duplicate YAML keys | Clear failure without fallback, file overwrite, or side effects. |
 | T04 | Concurrent initialization | Atomic creation; one state owner; no credential overwrite. |
 | T05 | Invitation enrollment | Server authenticated before secret exchange; one-use/expiry enforced; local key retained. |
-| T06 | Reconnect, name collision, and revocation | Stable identity; no duplicate host; unauthorized replacement/revoked sessions rejected. |
+| T06 | Reconnect, name collision, revocation, and recovery | Stable identity; no duplicate host; unauthorized replacement/revoked sessions rejected; a revoked host recovers only through an explicit, single-use recovery invitation under its same host id, its old certificate stays refused, and its engines reopen only on fresh proof (ADR 0016). |
 | T07 | Online host without prepared runtimes | Inventory visible; deployment preflight fails specifically; no implicit installation. |
 | T08 | Non-wait deployment and CLI crash | ID returned after persistence; operation continues; status works from a new client. |
 | T09 | Lost response and idempotent retry | One deployment and one launch despite repeated submission. |

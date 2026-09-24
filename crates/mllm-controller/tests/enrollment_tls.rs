@@ -85,6 +85,7 @@ async fn trusted_bootstrap_recovery_renewal_and_revocation() {
         invitation_secret: invitation.secret.clone(),
         host_name: invitation.host_name.clone(),
         expires_unix: invitation.expires_unix,
+        recover_host_id: None,
     };
     let mut untrusted = PendingEnrollment::prepare(&bad_storage, &bad_invitation).unwrap();
     assert!(
@@ -138,6 +139,7 @@ async fn trusted_bootstrap_recovery_renewal_and_revocation() {
         invitation_secret: second_invitation.secret,
         host_name: second_invitation.host_name,
         expires_unix: second_invitation.expires_unix,
+        recover_host_id: None,
     };
     let mut pending = PendingEnrollment::prepare(&storage, &join).unwrap();
     let second_host = pending.enroll(&storage, &join, now()).await.unwrap();

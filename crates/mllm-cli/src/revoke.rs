@@ -8,7 +8,10 @@
 //! server closes the host's control session at once, refuses its reconnects
 //! and every new command, closes dispatch to its engines and leaves it out of
 //! placement. Its engines are not stopped, and their reservations and leases
-//! stay accounted until an operator settles them with evidence.
+//! stay accounted until an operator settles them with evidence. ADR 0016: the
+//! host returns only through an explicit recovery (`invite host <name|id>
+//! --recover`, then `join host --recover`), under its same host id with a new
+//! certificate; the revoked certificate stays refused.
 //!
 //! SPEC §6.4: the command carries a request identity like every other
 //! mutation. Revocation is absorbing, so a retry (with the same `--request-id`

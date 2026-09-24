@@ -192,6 +192,7 @@ async fn a_prepared_host_is_eligible_only_while_its_reconciled_session_lives() {
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
     let request = identity.request(&invitation).unwrap();
@@ -277,6 +278,7 @@ async fn a_host_with_a_pending_drain_is_not_a_placement_candidate() {
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
     let request = identity.request(&invitation).unwrap();

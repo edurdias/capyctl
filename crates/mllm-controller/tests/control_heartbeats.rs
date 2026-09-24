@@ -111,6 +111,7 @@ async fn enrolled(policy: HeartbeatPolicy) -> Enrolled {
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
     let request = identity.request(&invitation).unwrap();

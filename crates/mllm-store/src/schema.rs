@@ -785,6 +785,26 @@ CREATE TABLE IF NOT EXISTS host_drain_intent_deadlines(
 );
 "#;
 
+/// v32 (ADR 0016, owner decision 2026-09-24): recovery of a revoked host
+/// under its same identity. A recovery invitation names the one enrolled host
+/// it may re-enroll; a revoked certificate is revoked by its own fingerprint,
+/// so recovery issues a new certificate while every older one stays refused
+/// for ever. Certificates of hosts revoked before v32 are carried in as
+/// revoked. Additive; idempotent so a store rolled back can reapply it.
+pub const SCHEMA_V32: &str = r#"
+CREATE TABLE IF NOT EXISTS host_recovery_invitations(
+  digest TEXT PRIMARY KEY REFERENCES host_invitations(digest),
+  host_id TEXT NOT NULL REFERENCES enrolled_hosts(host_id)
+);
+CREATE TABLE IF NOT EXISTS revoked_host_certificates(
+  fingerprint TEXT PRIMARY KEY REFERENCES host_certificates(fingerprint),
+  revoked_at_unix INTEGER NOT NULL CHECK(revoked_at_unix>=0)
+);
+INSERT OR IGNORE INTO revoked_host_certificates(fingerprint,revoked_at_unix)
+  SELECT c.fingerprint,0 FROM host_certificates c JOIN enrolled_hosts h ON h.host_id=c.host_id
+  WHERE h.revoked=1;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

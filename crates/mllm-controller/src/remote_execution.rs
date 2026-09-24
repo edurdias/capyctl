@@ -502,6 +502,9 @@ async fn cleanup(
         },
         action: MemberAction::Terminate {
             owned_handle: binding.launch_command_id.clone(),
+            // ADR 0016: what this server recorded, so a host that lost its
+            // journal can still report the launch's processes by identity.
+            recorded: context.identities.clone(),
         },
     };
     command.identity.payload_digest = command.canonical_digest();
@@ -618,6 +621,9 @@ async fn settle(
         },
         action: MemberAction::Terminate {
             owned_handle: binding.launch_command_id.clone(),
+            // ADR 0016: what this server recorded, so a host that lost its
+            // journal can still report the launch's processes by identity.
+            recorded: context.identities.clone(),
         },
     };
     command.identity.payload_digest = command.canonical_digest();

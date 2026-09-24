@@ -85,12 +85,23 @@ fn init_targets() {
 #[test]
 fn invite_join_inspect_doctor() {
     let invite = parse(["mllm", "invite", "host", "--name", "host-a"]).unwrap();
-    assert!(matches!(invite, Command::Invite{name} if name == "host-a"));
+    assert!(matches!(invite, Command::Invite{name, recover: false} if name == "host-a"));
 
     let join = parse(["mllm", "join", "host", "--join-file", "host-a.join"]).unwrap();
     assert!(
-        matches!(join, Command::Join{join_file} if join_file == std::path::Path::new("host-a.join"))
+        matches!(join, Command::Join{join_file, recover: false} if join_file == std::path::Path::new("host-a.join"))
     );
+
+    // T05 T06 (ADR 0016): recovery is explicit on both sides; the host is
+    // named positionally or with --name, never both.
+    let recover = parse(["mllm", "invite", "host", "host-a", "--recover"]).unwrap();
+    assert!(matches!(recover, Command::Invite{name, recover: true} if name == "host-a"));
+    let recover = parse(["mllm", "invite", "host", "--name", "host-a", "--recover"]).unwrap();
+    assert!(matches!(recover, Command::Invite{name, recover: true} if name == "host-a"));
+    assert!(parse(["mllm", "invite", "host", "host-a", "--name", "host-a"]).is_err());
+    assert!(parse(["mllm", "invite", "host", "--recover"]).is_err());
+    let join = parse(["mllm", "join", "host", "--join-file", "host-a.join", "--recover"]).unwrap();
+    assert!(matches!(join, Command::Join{recover: true, ..}));
 
     let inspect_host = parse(["mllm", "inspect", "host", "host-a"]).unwrap();
     assert!(

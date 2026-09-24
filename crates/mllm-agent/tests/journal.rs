@@ -201,6 +201,7 @@ fn stop(
     let mut c = command(&format!("stop-{handle}"));
     c.action = MemberAction::Terminate {
         owned_handle: handle.into(),
+        recorded: Vec::new(),
     };
     let c = sign(c);
     let ticket = fresh(j.accept(session, &c, 10, policy).unwrap());
@@ -452,6 +453,7 @@ fn reused_pid_never_becomes_owned_through_inspection() {
     let mut c = command("reject-stop");
     c.action = MemberAction::Terminate {
         owned_handle: "launch".into(),
+        recorded: Vec::new(),
     };
     let c = sign(c);
     let ticket = fresh(j.accept(s, &c, 10, &policy).unwrap());
@@ -656,6 +658,7 @@ fn terminate(id: &str, handle: &str) -> MemberCommand {
     c.identity.expected_state = "retained".into();
     c.action = MemberAction::Terminate {
         owned_handle: handle.into(),
+        recorded: Vec::new(),
     };
     sign(c)
 }
@@ -1007,6 +1010,7 @@ fn terminate_of_a_compacted_launch_checks_its_owner() {
     foreign.identity.expected_state = "retained".into();
     foreign.action = MemberAction::Terminate {
         owned_handle: "launch".into(),
+        recorded: Vec::new(),
     };
     let foreign = sign(foreign);
     let refused = j
@@ -1161,4 +1165,108 @@ fn journal_from_a_newer_version_is_refused_and_left_unmodified() {
         .query_row("SELECT count(*) FROM commands", [], |r| r.get(0))
         .unwrap();
     assert_eq!(commands, 1);
+}
+
+/// This test process's own identity: certainly alive while the test runs.
+fn own_identity() -> mllm_domain::completion::ProcessIdentity {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let close = stat.rfind(')').unwrap();
+    let start_ticks = stat[close + 2..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    mllm_domain::completion::ProcessIdentity {
+        role: "api".into(),
+        pid: std::process::id(),
+        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned(),
+        start_ticks,
+    }
+}
+
+fn terminate_recorded(
+    id: &str,
+    handle: &str,
+    recorded: Vec<mllm_domain::completion::ProcessIdentity>,
+) -> MemberCommand {
+    let mut c = command(id);
+    c.identity.expected_state = "retained".into();
+    c.action = MemberAction::Terminate {
+        owned_handle: handle.into(),
+        recorded,
+    };
+    sign(c)
+}
+
+// T33 T34 (ADR 0016): a host that lost its journal (a recovered host with
+// fresh state) has no record of a launch the server still accounts for. A
+// Terminate carrying the server's recorded identities is then answered by
+// observing exactly those identities: nothing is signalled or adopted, an
+// alive one is reported alive (so the server cannot release the launch), and
+// only when every one is gone is gone evidence reported, by identity. A host
+// whose journal knows the launch ignores the recorded identities and answers
+// from its own record.
+#[test]
+fn terminate_of_an_unrecorded_launch_reports_the_recorded_identities_without_signalling() {
+    let d = directory();
+    let policy = ChildPolicy {
+        marker: d.path().join("never"),
+    };
+    let j = HostJournal::open(d.path(), "controller", "host").unwrap();
+    let s = j.connect().unwrap();
+    let alive = own_identity();
+    let mut gone = alive.clone();
+    gone.role = "worker-0".into();
+    gone.start_ticks += 1;
+
+    let first = terminate_recorded("lost-first", "lost-launch", vec![alive.clone(), gone.clone()]);
+    let ticket = fresh(j.accept(s, &first, 10, &policy).unwrap());
+    j.execute(ticket, 10, &policy).unwrap();
+    let result = j.execution_result("lost-first", 20).unwrap();
+    mllm_protocol::execution::validate_result(&first, &result).unwrap();
+    assert_eq!(result.state, "completed");
+    assert!(!result.claim_retained);
+    let presence = |result: &mllm_protocol::pb::MemberExecutionResult, pid: u32, ticks: u64| {
+        result
+            .processes
+            .iter()
+            .find(|p| p.pid == pid && p.start_ticks == ticks)
+            .map(|p| p.presence.clone())
+    };
+    assert_eq!(presence(&result, alive.pid, alive.start_ticks).as_deref(), Some("alive"));
+    assert_eq!(presence(&result, gone.pid, gone.start_ticks).as_deref(), Some("gone"));
+    // Nothing was signalled: this very process is the "alive" engine.
+    assert_eq!(mllm_launchers::process_absence::presence(&alive), mllm_domain::completion::Presence::Alive);
+    // The handle is fenced: the launch can never start here afterwards.
+    assert!(matches!(
+        j.accept(s, &launch("lost-launch"), 10, &policy),
+        Err(JournalError::Conflict)
+    ));
+
+    // A later Terminate, once the recorded processes are gone, reports them
+    // gone by identity: the evidence the server settles the launch on.
+    let second = terminate_recorded("lost-second", "lost-launch", vec![gone.clone()]);
+    let ticket = fresh(j.accept(s, &second, 10, &policy).unwrap());
+    j.execute(ticket, 10, &policy).unwrap();
+    let result = j.execution_result("lost-second", 20).unwrap();
+    mllm_protocol::execution::validate_result(&second, &result).unwrap();
+    assert_eq!(result.state, "completed");
+    assert!(!result.claim_retained);
+    assert_eq!(result.processes.len(), 1);
+    assert_eq!(result.processes[0].presence, "gone");
+
+    // A launch this journal does know is answered from its own record; the
+    // recorded identities are ignored, never signalled.
+    drop(fresh(j.accept(s, &launch("known"), 10, &policy).unwrap()));
+    let known = terminate_recorded("known-stop", "known", vec![alive.clone()]);
+    let ticket = fresh(j.accept(s, &known, 10, &policy).unwrap());
+    j.execute(ticket, 10, &policy).unwrap();
+    let result = j.execution_result("known-stop", 20).unwrap();
+    assert!(result.processes.is_empty(), "{result:?}");
+    assert_eq!(mllm_launchers::process_absence::presence(&alive), mllm_domain::completion::Presence::Alive);
+    assert!(!policy.marker.exists());
 }

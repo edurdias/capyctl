@@ -249,6 +249,7 @@ async fn an_exited_member_of_a_ready_launch_is_reported_with_its_status() {
     stop.identity.expected_state = "retained".into();
     stop.action = MemberAction::Terminate {
         owned_handle: "exit-launch".into(),
+        recorded: Vec::new(),
     };
     let stop = sign(stop);
     let Acceptance::Fresh(ticket) = journal.accept(session, &stop, 10, policy.as_ref()).unwrap()

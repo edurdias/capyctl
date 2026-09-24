@@ -114,6 +114,7 @@ async fn outbound_reconnect_fences_old_stream_and_revocation_closes_current() {
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
     let request = identity.request(&invitation).unwrap();
@@ -283,6 +284,7 @@ async fn certificate_expiry_closes_existing_stream_and_backpressure_is_bounded()
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
     let request = identity.request(&invitation).unwrap();
@@ -335,6 +337,7 @@ async fn certificate_expiry_closes_existing_stream_and_backpressure_is_bounded()
             }),
             action: Some(pb::execute_member::Action::Inspect(true)),
             restore_checkpoint_digest: String::new(),
+            terminate_recorded_processes: Vec::new(),
         })),
     })
     .unwrap();
@@ -438,6 +441,7 @@ async fn enrolled_host() -> Enrolled {
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
     let request = identity.request(&invitation).unwrap();
