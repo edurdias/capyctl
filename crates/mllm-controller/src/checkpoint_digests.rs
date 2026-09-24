@@ -134,6 +134,37 @@ pub fn record(
         .map_err(|_| MeasureError::Unavailable)
 }
 
+/// ADR 0014 §7 (WE3): the digest a first placement launches with.
+///
+/// The host that holds the checkpoint measures it (`measure`) and the server
+/// records the measurement under the revision's declared expectation before
+/// anything is sent. A measurement that is not the declared canonical
+/// `content_fingerprint` (or the digest already recorded) is a mismatch: the
+/// launch is refused with `checkpoint_mismatch` before any effect, as a wake
+/// is (SPEC §13; found live by the M48 soak on 2026-09-24, where a declared
+/// fingerprint the checkpoint did not measure to was reported as uncertain
+/// runtime ownership). A measurement that cannot be made or recorded stays
+/// uncertain: the launch is not sent and nothing is released on it here.
+pub async fn first_placement_digest<F, Fut>(
+    owner: &SharedCoordinatorState,
+    deployment: &str,
+    revision: i64,
+    host: &str,
+    measure: F,
+) -> Result<String, RuntimeError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Measured, MeasureError>>,
+{
+    let unrecorded = || RuntimeError::Uncertain("the checkpoint digest was not recorded before launch".into());
+    let measured = measure().await.map_err(|_| unrecorded())?;
+    match record(owner, deployment, revision, host, &measured).map_err(|_| unrecorded())? {
+        RecordOutcome::Recorded { digest, .. } if digest == measured.digest => Ok(digest),
+        RecordOutcome::Mismatch => Err(RuntimeError::Refused("checkpoint_mismatch".into())),
+        _ => Err(unrecorded()),
+    }
+}
+
 /// ADR 0014 §7, owner decision 5 (2026-09-22): the digest a wake must carry.
 ///
 /// A revision whose digest is recorded carries it. One with none recorded (a
