@@ -368,6 +368,15 @@ pub enum LifecycleError {
     /// or recorded one, or its weights do not resolve the revision.
     #[error("checkpoint does not match its recorded digest")]
     CheckpointMismatch,
+    /// ADR 0008: the revision's declared remote model source is not yet
+    /// materialized on any host; activation waits for it.
+    #[error("model source pending")]
+    ModelSourcePending,
+    /// ADR 0008: every host's materialization failed with a reason the same
+    /// declaration will meet again (hash mismatch, size over the host's
+    /// limit, policy refusal); a new revision is needed.
+    #[error("model source failed")]
+    ModelSourceFailed,
     /// Owner decision 2026-09-23: an unmeasured model whose startup estimate
     /// exceeds the host's managed limit starts only alone on its host; another
     /// engine holds a charge there. `start --evict` (or a request, through the

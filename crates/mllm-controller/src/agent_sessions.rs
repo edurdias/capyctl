@@ -243,6 +243,9 @@ struct Session {
     /// Owner decision 2026-09-23: the host declared heartbeats in its Connect.
     /// A peer without them is never sent one and never suspended for silence.
     heartbeats: bool,
+    /// ADR 0008: the host declared that it executes MaterializeSource. A peer
+    /// without it is never sent one (it would end the session).
+    model_sources: bool,
     /// Silent past the suspend bound. The session's readiness no longer stands
     /// for dispatch until a fresh probe re-proves it (same as a reconnect).
     unresponsive: bool,
@@ -441,6 +444,14 @@ impl AgentSessions {
             .get(host)
             .filter(|s| s.view.online && s.view.reconciled && !s.draining && !s.unresponsive)
             .map(|s| s.view.session_id.clone())
+    }
+    /// ADR 0008: whether `host`'s current session executes MaterializeSource.
+    pub fn supports_model_sources(&self, host: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|s| s.get(host).map(|s| s.model_sources))
+            .unwrap_or(false)
     }
     pub fn snapshot(&self) -> Vec<HostSessionView> {
         // Read before the session lock: the store lock is never taken inside it.
@@ -1086,6 +1097,7 @@ impl AgentControl for AgentSessions {
                     prepared: false,
                     draining: false,
                     heartbeats: connect.heartbeats,
+                    model_sources: connect.model_sources,
                     unresponsive: false,
                 },
             ) {

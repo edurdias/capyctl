@@ -28,7 +28,7 @@ fn only_a_canonical_digest_is_an_expectation() {
 }
 
 // SPEC §13.3: a checkpoint is located from the model block and the host's own
-// store, without resolving memory; only a local source names a directory.
+// store, without resolving memory.
 #[test]
 fn a_checkpoint_is_located_without_resolving_memory() {
     let (mut deployment, host) = fixture();
@@ -45,14 +45,21 @@ fn a_checkpoint_is_located_without_resolving_memory() {
     assert_eq!(location.model_store.to_str(), Some("/srv/models"));
     assert_eq!(location.checkpoint.to_str(), Some("/srv/models/toy"));
     assert_eq!(location.content_fingerprint, "sha256:model");
+    // ADR 0008: a remote source is located at its fixed directory in the
+    // store, where the host materializes it before the first placement.
+    let sha = "0123456789abcdef0123456789abcdef01234567";
     deployment["model"] = json!({
-        "source": {"type": "huggingface", "repo": "Qwen/Qwen3-4B"},
+        "source": {"type": "huggingface", "repo": "Qwen/Qwen3-4B", "revision": sha},
         "content_fingerprint": "sha256:model", "revision": "r1"
     });
+    let location = checkpoint_location(&deployment, &host).unwrap();
     assert_eq!(
-        checkpoint_location(&deployment, &host).unwrap_err().code,
-        ConfigErrorCode::NotMaterializable
+        location.checkpoint.to_str().unwrap(),
+        format!("/srv/models/sources/huggingface/Qwen--Qwen3-4B@{sha}")
     );
+    // An unpinned revision is refused, not located.
+    deployment["model"]["source"]["revision"] = json!("main");
+    assert!(checkpoint_location(&deployment, &host).is_err());
 }
 
 // T14 (P2): a revision frozen with placeholder weights re-resolves exactly

@@ -173,44 +173,8 @@ pub(super) fn normalize_model(
         (Some(path), None) => ModelSource::Local { path },
         (None, Some(source)) => source,
     };
-    match &source {
-        ModelSource::Local { path } => {
-            if path.is_empty() {
-                return Err(invalid("model.source.path", "must not be empty"));
-            }
-        }
-        ModelSource::HuggingFace {
-            repo,
-            revision,
-            locked_commit,
-        } => {
-            if repo.is_empty() {
-                return Err(invalid("model.source.repo", "must not be empty"));
-            }
-            for (path, value) in [
-                ("model.source.revision", revision),
-                ("model.source.locked_commit", locked_commit),
-            ] {
-                if value.as_ref().is_some_and(String::is_empty) {
-                    return Err(invalid(path, "must not be empty when stated"));
-                }
-            }
-        }
-        ModelSource::Http { url, sha256 } => {
-            // Spec §7: weights fetched over plain HTTP could be replaced in flight,
-            // and a digest is the only thing that makes the fetch reproducible, so
-            // both are required rather than recommended.
-            if !url.starts_with("https://") || url.len() <= "https://".len() {
-                return Err(invalid("model.source.url", "must be an https:// URL"));
-            }
-            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(invalid(
-                    "model.source.sha256",
-                    "must be 64 hexadecimal characters",
-                ));
-            }
-        }
-    }
+    // SPEC §13.3, ADR 0008: pinned revisions and digests, HTTPS, secret refs.
+    source.validate()?;
     let resolved_path = match (&source, store) {
         (ModelSource::Local { path }, Some(store)) => {
             let candidate = Path::new(path);
@@ -226,7 +190,16 @@ pub(super) fn normalize_model(
                     .to_owned(),
             )
         }
-        _ => None,
+        // ADR 0008: a remote source resolves to its fixed directory in the
+        // store; the host materializes it there before the first placement.
+        (remote, Some(store)) => remote.store_key().map(|key| {
+            store
+                .join(key)
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("host.model_store.path", "must be valid UTF-8"))
+        }).transpose()?,
+        (_, None) => None,
     };
     Ok(ModelIdentity {
         source,
@@ -272,6 +245,8 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
     if !model_store.is_absolute() {
         return Err(invalid("host.model_store.path", "must be absolute"));
     }
+    // ADR 0008: remote sources are denied unless this host opts in.
+    let model_sources = crate::model_source::ModelSourcePolicy::from_raw(h.model_sources)?;
     if let Some(labels) = &h.resource_policy.labels {
         crate::instances::validate_labels(labels)?;
     }
@@ -363,6 +338,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         endpoint_port_range: h.resource_policy.endpoint_port_range,
         planner_max_states,
         queue,
+        model_sources,
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)

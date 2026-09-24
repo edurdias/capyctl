@@ -353,12 +353,14 @@ fn certificates_of_hosts_revoked_before_v32_stay_revoked() {
         store.revoke_host("host-a").unwrap();
         old
     };
-    // Roll the store back to v31: forget the per-certificate revocation.
+    // Roll the store back to v31: forget the per-certificate revocation and
+    // every later migration (a v31 store has none of them).
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "DROP TABLE revoked_host_certificates; DROP TABLE host_recovery_invitations;
-             DELETE FROM schema_migrations WHERE version=32;",
+             DROP TABLE IF EXISTS model_sources;
+             DELETE FROM schema_migrations WHERE version>=32;",
         )
         .unwrap();
     }

@@ -380,6 +380,15 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         )
         .spawn_until(supervision.cancel_signal()),
     );
+    // ADR 0008: declared remote model sources are materialized by the host
+    // each resolved on, and their progress recorded here.
+    supervision.supervise(
+        mllm_controller::model_sources::SourceMaterializer::new(
+            owner.clone(),
+            mllm_controller::model_sources::RemoteSources::new(owner.clone(), sessions.clone(), authority.controller_id()),
+        )
+        .spawn_until(supervision.cancel_signal()),
+    );
     let configuration = Arc::new(mllm_management::configuration::SharedConfigurationSource::from_registry(owner.clone(), "owner")
         .map_err(|_| unavailable())?);
     // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching

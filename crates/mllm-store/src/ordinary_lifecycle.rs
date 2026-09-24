@@ -700,6 +700,8 @@ impl crate::Store {
         // ADR 0014 §7 (WE3): a revision whose resources wait for its checkpoint
         // digest, or whose checkpoint is known not to match, never starts.
         crate::checkpoint_digests::admit_start(tx, &f.deployment_id, f.revision)?;
+        // ADR 0008: and while its declared remote source is not yet on disk.
+        crate::model_sources::admit_start(tx, &f.deployment_id, f.revision)?;
         let identity = binding_identity(tx, &f.deployment_id, f.revision, &e).map_err(|error| match error {
             LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
                 LifecycleError::Unsupported

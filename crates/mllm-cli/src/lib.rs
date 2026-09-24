@@ -5,6 +5,8 @@ pub mod drain;
 pub mod grammar;
 pub mod host_observation;
 pub mod output;
+// SPEC §6.3, ADR 0008: `mllm prune sources`.
+pub mod prune;
 pub mod roles;
 pub mod remote_roles;
 pub mod revoke;

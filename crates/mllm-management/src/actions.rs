@@ -733,6 +733,9 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             // ADR 0014 §7 (WE3).
             LifecycleError::CheckpointDigestPending => F::CheckpointDigestPending,
             LifecycleError::CheckpointMismatch => F::CheckpointMismatch,
+            // ADR 0008.
+            LifecycleError::ModelSourcePending => F::ModelSourcePending,
+            LifecycleError::ModelSourceFailed => F::ModelSourceFailed,
         },
     }
 }

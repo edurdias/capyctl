@@ -29,6 +29,10 @@ pub enum ConfigErrorCode {
     /// is answered with this rather than with a guessed cache location.
     #[error("model source is not materializable")]
     NotMaterializable,
+    /// ADR 0008: the host's `model_sources` policy does not allow this
+    /// remote source (remote sources are denied unless the host opts in).
+    #[error("model source denied by host policy")]
+    ModelSourceDenied,
     /// Filesystem/OS-level failures: unreadable files, missing paths
     /// (including an explicit config path that does not exist), failed
     /// atomic writes, unreadable OS entropy. Callers distinguishing

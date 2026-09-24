@@ -11,6 +11,8 @@ mllm-config.workspace = true
 ulid.workspace = true
 mllm-scheduler = { workspace = true }
 sha2 = { workspace = true }
+# ADR 0008: a Hugging Face non-LFS file is pinned by its git blob id (SHA-1).
+sha1 = "0.10"
 hex = { workspace = true }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem", "x509-parser"] }
 time = "0.3"

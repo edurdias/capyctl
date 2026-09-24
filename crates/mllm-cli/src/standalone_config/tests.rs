@@ -285,8 +285,9 @@ fn the_deployment_states_its_model_source() {
         "m",
         &ModelSource::HuggingFace {
             repo: "org/model".into(),
-            revision: None,
-            locked_commit: None,
+            revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            files: vec![],
+            token_ref: None,
         },
         Engine::Vllm,
         CAPACITY,

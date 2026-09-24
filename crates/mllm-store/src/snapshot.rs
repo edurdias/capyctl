@@ -86,6 +86,11 @@ pub struct DeploymentSnapshot {
     /// Additive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_digest: Option<crate::checkpoint_digests::CheckpointDigest>,
+    /// ADR 0008: the current revision's declared remote model source, per
+    /// host: `pending`, `downloading` with its bytes, `verified`, or `failed`
+    /// with a closed reason. Absent for a local source. Additive.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_sources: Vec<crate::model_sources::ModelSourceRecord>,
     /// ADR 0013 §6: the current revision's declared instance count. Additive.
     pub desired_instances: u32,
     /// ADR 0013 §6: instances whose derived state is `ready`. Additive.
@@ -500,6 +505,7 @@ impl Store {
                 ),
                 operator_action: r.get(17)?,
                 checkpoint_digest: None,
+                model_sources: Vec::new(),
                 desired_instances: r.get::<_, Option<u32>>(18)?.unwrap_or(0),
                 ready_instances: 0,
                 conditions: Vec::new(),
@@ -540,6 +546,30 @@ impl Store {
                 &format!("SELECT {LATEST_OPERATION} FROM operations o WHERE o.deployment_id=?1 ORDER BY o.accepted_at DESC,o.rowid DESC LIMIT 1"),
                 rusqlite::params![entry.id],
             )?;
+        }
+        // ADR 0008: the current revision's source records.
+        let sources = budget.read(&tx, "SELECT s.deployment_id,s.host_id,s.source_key,s.state,s.bytes_done,s.bytes_total,s.reason,s.terminal FROM model_sources s JOIN deployments d ON d.id=s.deployment_id AND d.revision=s.revision ORDER BY s.deployment_id,s.host_id", |r| {
+            use crate::model_sources::{ModelSourceRecord, SourceState};
+            let state = match r.get::<_, String>(3)?.as_str() {
+                "pending" => SourceState::Pending,
+                "downloading" => SourceState::Downloading,
+                "verified" => SourceState::Verified,
+                "failed" => SourceState::Failed,
+                _ => return Err(SnapshotError::CorruptData),
+            };
+            let bytes = |index| -> Result<u64, SnapshotError> {
+                u64::try_from(r.get::<_, i64>(index)?).map_err(|_| SnapshotError::CorruptData)
+            };
+            Ok((r.get::<_, String>(0)?, ModelSourceRecord {
+                host_id: r.get(1)?, source_key: r.get(2)?, state,
+                bytes_done: bytes(4)?, bytes_total: bytes(5)?, reason: r.get(6)?,
+                terminal: boolean(r, 7)?,
+            }))
+        })?;
+        for (deployment, record) in sources {
+            if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {
+                entry.model_sources.push(record);
+            }
         }
         for (deployment, digest) in digests {
             if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {

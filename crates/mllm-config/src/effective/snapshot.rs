@@ -142,7 +142,7 @@ pub(super) fn snapshot_inputs(
     if !queue["stream_idle_ms"].is_null() {
         unit(&mut queue, "stream_idle_ms", "stream_idle_timeout", "ms")?;
     }
-    let host = json!({
+    let mut host = json!({
         "schema_version": 1, "kind":"host", "name":h["name"],
         "hardware_fingerprint":h["hardware_fingerprint"], "environment_fingerprint":h["environment_fingerprint"],
         // Absent in the snapshot encodes as null and re-normalizes to None;
@@ -157,6 +157,14 @@ pub(super) fn snapshot_inputs(
             "endpoint_port_range":h["endpoint_port_range"], "planner_max_states":h["planner_max_states"], "queue":queue,
         },
     });
+    // ADR 0008: encoded only when stated; restated in its written form.
+    if !h["model_sources"].is_null() {
+        let mut sources = h["model_sources"].clone();
+        if !sources["max_bytes"].is_null() {
+            unit(&mut sources, "max_bytes", "max_bytes", "B")?;
+        }
+        host["model_sources"] = sources;
+    }
     Ok((deployment, host))
 }
 

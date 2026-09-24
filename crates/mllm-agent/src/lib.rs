@@ -27,6 +27,8 @@ pub mod process_residency;
 pub mod rendezvous;
 // SPEC §9.1, §13.3: mllm's runtime directory is what this account put there.
 pub mod runtime_integrity;
+// ADR 0008: declared model sources materialized into the host's model store.
+pub mod sources;
 
 pub mod journal;
 

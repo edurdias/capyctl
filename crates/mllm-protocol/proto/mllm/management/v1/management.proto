@@ -126,6 +126,9 @@ message Connect {
   // Additive: this agent sends and accepts Heartbeat. A peer without it is
   // never sent one and never suspended for silence.
   bool heartbeats = 5;
+  // ADR 0008 (additive): this agent executes MaterializeSource. A peer without
+  // it is never sent one; its remote sources stay pending.
+  bool model_sources = 6;
 }
 message ReportInventory {
   repeated DomainObservation domains = 1;
@@ -331,6 +334,16 @@ message DigestCheckpointRequest {
   // estimate is known before a first start. The answer is state `sized`.
   bool size_only = 4;
 }
+// ADR 0008 (additive): materialize one deployment's declared remote model
+// source into this host's model store, or report on it. Like DigestCheckpoint
+// it carries the deployment document, never a path or a secret: the host
+// checks its own model-source policy, resolves any token reference from its
+// own secrets, and answers at once with the source's state. A download it
+// starts keeps running after the answer; later requests report its progress.
+message MaterializeSourceRequest {
+  string deployment_config = 1;
+  string host_policy_fingerprint = 2;
+}
 message ExecuteMember {
   CommandIdentity identity = 1;
   oneof action {
@@ -349,6 +362,9 @@ message ExecuteMember {
     string restore_owned_handle = 10;
     // ADR 0014 §7 (WE3, protocol version 2, additive).
     DigestCheckpointRequest digest_checkpoint = 11;
+    // ADR 0008 (additive): sent only to a host whose Connect declared
+    // `model_sources`.
+    MaterializeSourceRequest materialize_source = 14;
   }
   // ADR 0014 §7, owner decision 5 (2026-09-22), additive: with
   // restore_owned_handle only, the checkpoint digest the server recorded for
@@ -428,6 +444,16 @@ message MemberExecutionResult {
   // option names it refused, never an option value or engine output. Empty
   // otherwise.
   string launch_failure = 13;
+  // MaterializeSource results only (ADR 0008).
+  ModelSourceEvidence source = 14;
+}
+message ModelSourceEvidence {
+  string state = 1;                 // pending | downloading | verified | failed
+  uint64 bytes_done = 2;            // downloading; verified (= bytes_total)
+  uint64 bytes_total = 3;           // downloading (0 until sized); verified
+  string reason = 4;                // failed only: a closed category
+  bool reservation_retained = 5;    // failed only: store bytes still charged
+  string source_key = 6;            // the store directory, relative to the store
 }
 message CheckpointDigestEvidence {
   string state = 1;          // computed | mismatch | refused | sized

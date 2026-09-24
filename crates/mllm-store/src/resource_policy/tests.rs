@@ -47,6 +47,7 @@ fn host() -> HostPolicy {
             admission_window_ms: 2_000,
             stream_idle_ms: mllm_config::effective::DEFAULT_STREAM_IDLE_MS,
         },
+        model_sources: Default::default(),
     }
 }
 

@@ -6,6 +6,8 @@ pub mod effective;
 pub mod engine_policy;
 pub mod error;
 pub mod instances;
+// ADR 0008: declared model sources and the host's model-source policy.
+pub mod model_source;
 pub mod resource_controls;
 pub mod remote_roles;
 pub mod remote_resources;

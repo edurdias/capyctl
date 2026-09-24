@@ -104,6 +104,10 @@ pub struct NativeHostExecution {
     /// lock such a command is rechecked cheaply; anything else is admitted in
     /// full there.
     pre_admitted: Arc<Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    /// ADR 0008: declared remote model sources, materialized into this host's
+    /// model store under its own `model_sources` policy. `None` when the host
+    /// document states no usable store, which refuses every request.
+    sources: Option<Arc<crate::sources::SourceStore>>,
 }
 
 /// How long a pre-admission stands for the locked recheck.
@@ -151,7 +155,20 @@ impl NativeHostExecution {
             .and_then(|reporter| reporter.with_interval(config.load_report_interval))
             .ok()
             .map(Arc::new);
+        // ADR 0008: the store and policy come from this host's own approved
+        // document; token references resolve from `<state_dir>/secrets`.
+        let sources = mllm_config::remote_resources::local_host_document(&config.document)
+            .ok()
+            .and_then(|host| mllm_config::effective::normalize_host_policy(&host).ok())
+            .map(|policy| {
+                crate::sources::SourceStore::new(
+                    &policy.model_store,
+                    policy.model_sources.clone(),
+                    Some(config.state_dir.join("secrets")),
+                )
+            });
         Arc::new(Self {
+            sources,
             load,
             journal,
             ingress,
@@ -233,6 +250,12 @@ impl NativeHostExecution {
     /// checkpoint without hashing it in full again.
     pub fn with_checkpoint_cache(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
         Arc::make_mut(&mut self).checkpoints = Arc::new(CheckpointVerifier::with_cache_dir(dir));
+        self
+    }
+    /// ADR 0008: materialize model sources through this store instead of the
+    /// one built from the host document (tests serve a loopback origin).
+    pub fn with_model_sources(mut self: Arc<Self>, store: Arc<crate::sources::SourceStore>) -> Arc<Self> {
+        Arc::make_mut(&mut self).sources = Some(store);
         self
     }
     /// SPEC §8.2 / T21 (found live 2026-09-23): SGLang launches keep their file
@@ -475,6 +498,70 @@ impl NativeHostExecution {
             state: "completed".into(),
             observed_at_unix_ms: mllm_protocol::now_unix_ms(),
             checkpoint: Some(evidence),
+            ..Default::default()
+        })
+    }
+
+    /// ADR 0008: start or report the materialization of a deployment's
+    /// declared remote source, under this host's own model-source policy. Not
+    /// journaled: the store's own files make it idempotent and resumable, and
+    /// a redelivery reports the same download. Refusals are evidence.
+    fn materialize_source(
+        &self,
+        command: &MemberCommand,
+        plan: &mllm_protocol::execution::MaterializeSourcePlan,
+    ) -> Result<pb::MemberExecutionResult, SessionError> {
+        let id = &command.identity;
+        if id.controller_id != self.controller_id
+            || id.member.host_id != self.host_id
+            || id.expected_state != "source"
+            || id.deadline_ms <= mllm_protocol::now_unix_ms()
+        {
+            return Err(SessionError);
+        }
+        use crate::sources::{reason, SourceStatus};
+        let status = match (&self.sources, plan.source()) {
+            (Some(store), Some(source))
+                if plan.host_policy_fingerprint
+                    == mllm_config::remote_resources::policy_fingerprint(&self.config.document) =>
+            {
+                store.request(&source)
+            }
+            _ => SourceStatus::Failed(crate::sources::SourceFailure {
+                reason: reason::DENIED,
+                reservation_retained: false,
+            }),
+        };
+        let mut evidence = pb::ModelSourceEvidence {
+            source_key: plan.source_key.clone(),
+            ..Default::default()
+        };
+        match status {
+            SourceStatus::Pending => evidence.state = "pending".into(),
+            SourceStatus::Downloading {
+                bytes_done,
+                bytes_total,
+            } => {
+                evidence.state = "downloading".into();
+                evidence.bytes_total = bytes_total;
+                evidence.bytes_done = if bytes_total == 0 { 0 } else { bytes_done.min(bytes_total) };
+            }
+            SourceStatus::Verified { bytes } => {
+                evidence.state = "verified".into();
+                evidence.bytes_done = bytes;
+                evidence.bytes_total = bytes;
+            }
+            SourceStatus::Failed(failure) => {
+                evidence.state = "failed".into();
+                evidence.reason = failure.reason.into();
+                evidence.reservation_retained = failure.reservation_retained;
+            }
+        }
+        Ok(pb::MemberExecutionResult {
+            identity: command.to_wire().identity,
+            state: "completed".into(),
+            observed_at_unix_ms: mllm_protocol::now_unix_ms(),
+            source: Some(evidence),
             ..Default::default()
         })
     }
@@ -805,6 +892,9 @@ impl NativeHostExecution {
     ) -> Result<pb::MemberExecutionResult, SessionError> {
         if let MemberAction::DigestCheckpoint(plan) = &command.action {
             return self.digest_checkpoint(&command, plan).await;
+        }
+        if let MemberAction::MaterializeSource(plan) = &command.action {
+            return self.materialize_source(&command, plan);
         }
         // SPEC §13.2: fence and duplicate checks first (cheap), then the slow
         // half of admission outside the journal's locks. A replay or a fenced
@@ -1882,6 +1972,97 @@ mod tests {
         foreign.identity.controller_id = "other".into();
         foreign.identity.payload_digest = foreign.canonical_digest();
         assert!(executor.execute(1, foreign).await.is_err());
+    }
+
+    /// ADR 0008: MaterializeSource answers from this host's own policy and
+    /// store; a remote source is denied unless the host opts in; once
+    /// verified, the WE3 digest measures the materialized directory like any
+    /// local checkpoint. Refusals never end the session.
+    // T14 T34
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn materialize_source_downloads_then_the_digest_measures_the_copy() {
+        use sha2::Digest as _;
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let weights = vec![3_u8; 5000];
+        let sha = hex::encode(sha2::Sha256::digest(&weights));
+        let served = weights.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/model.bin",
+            axum::routing::get(move || {
+                let served = served.clone();
+                async move { served }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let model = deployment["model"].as_object_mut().unwrap();
+        model.remove("path");
+        model.insert(
+            "source".into(),
+            serde_json::json!({"http": {"url": "https://weights.example.test/model.bin", "sha256": sha}}),
+        );
+        let command = |id: &str, policy: &str| {
+            let plan = mllm_protocol::execution::MaterializeSourcePlan::new(&deployment.to_string(), policy)
+                .expect("a remote source");
+            let mut command = MemberCommand {
+                identity: checkpoint_identity(id, "source"),
+                action: MemberAction::MaterializeSource(plan),
+            };
+            command.identity.payload_digest = command.canonical_digest();
+            command
+        };
+        let run = |executor: Arc<NativeHostExecution>, command: MemberCommand| async move {
+            let result = executor.execute(1, command.clone()).await.unwrap();
+            mllm_protocol::execution::validate_result(&command, &result).unwrap();
+            result.source.unwrap()
+        };
+        // The fixture host states no model_sources: denied, nothing fetched.
+        let denied = run(executor.clone(), command("s1", &policy)).await;
+        assert_eq!((denied.state.as_str(), denied.reason.as_str()), ("failed", "denied"));
+        // A command resolved against another host document is denied too.
+        let foreign = run(executor.clone(), command("s2", &"c".repeat(64))).await;
+        assert_eq!(foreign.reason, "denied");
+
+        let models = root.path().join("models");
+        let store = crate::sources::SourceStore::with_loopback_origin(
+            &models,
+            mllm_config::effective::ModelSourcePolicy {
+                http: mllm_config::effective::SourceSwitch::Allowed,
+                max_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+            None,
+            &origin,
+        );
+        let executor = executor.with_model_sources(store);
+        let mut evidence = run(executor.clone(), command("s3", &policy)).await;
+        for attempt in 0.. {
+            if evidence.state == "verified" || attempt > 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            evidence = run(executor.clone(), command(&format!("p{attempt}"), &policy)).await;
+        }
+        assert_eq!(evidence.state, "verified", "{evidence:?}");
+        assert_eq!((evidence.bytes_done, evidence.bytes_total), (5000, 5000));
+        assert_eq!(evidence.source_key, format!("sources/http/{sha}"));
+        // WE3 over the materialized copy (ADR 0014 §7).
+        let mut digest = MemberCommand {
+            identity: checkpoint_identity("d", "checkpoint"),
+            action: MemberAction::DigestCheckpoint(DigestCheckpointPlan {
+                size_only: false,
+                deployment_config: deployment.to_string(),
+                host_policy_fingerprint: policy.clone(),
+                expected_digest: None,
+            }),
+        };
+        digest.identity.payload_digest = digest.canonical_digest();
+        let measured = executor.execute(1, digest).await.unwrap().checkpoint.unwrap();
+        assert_eq!(measured.state, "computed", "{measured:?}");
+        assert_eq!(measured.total_bytes, 5000);
     }
 
     /// SPEC §13 (WE3 limit 1): a launch refused because its checkpoint no

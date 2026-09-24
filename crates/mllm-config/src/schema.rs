@@ -86,6 +86,11 @@ pub const LAUNCH_SETTINGS_MOVED: &str =
      `engine_config` (ADR 0014 §1); the host keeps executable, environment, security \
      and host-fixed `args` only";
 
+/// ADR 0008: a Hugging Face revision is itself the pinned commit.
+pub const LOCKED_COMMIT_MOVED: &str =
+    "`locked_commit` is retired: `revision` must itself be the full commit SHA \
+     (ADR 0008 model sources accept pinned revisions only)";
+
 /// Empty allowlist for nested blocks with no F0 consumer yet: rejects
 /// every unknown key, accepts only empty mappings.
 const NO_FIELDS: &[(&str, FieldSpec)] = &[];
@@ -151,14 +156,43 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     // variant's keys is listed once; which subset is legal is decided by the tagged
     // `ModelSource` in `effective.rs`, so a `repo` on an `http` source is refused
     // there rather than being silently ignored here.
+    //
+    // ADR 0008: the same variants may also be written externally tagged
+    // (`{huggingface: {repo, revision}}`); each variant block is closed.
     const MODEL_SOURCE: FieldSpec = FieldSpec::Struct(&[
         ("type", SCALAR),
         ("path", SCALAR),
         ("repo", SCALAR),
         ("revision", SCALAR),
-        ("locked_commit", SCALAR),
+        ("files", FieldSpec::Seq(&SCALAR)),
+        ("token_ref", SCALAR),
+        ("locked_commit", FieldSpec::Moved(LOCKED_COMMIT_MOVED)),
         ("url", SCALAR),
         ("sha256", SCALAR),
+        ("archive", SCALAR),
+        ("local", FieldSpec::Struct(&[("path", SCALAR)])),
+        (
+            "huggingface",
+            FieldSpec::Struct(&[
+                ("repo", SCALAR),
+                ("revision", SCALAR),
+                ("files", FieldSpec::Seq(&SCALAR)),
+                ("token_ref", SCALAR),
+                ("locked_commit", FieldSpec::Moved(LOCKED_COMMIT_MOVED)),
+            ]),
+        ),
+        (
+            "http",
+            FieldSpec::Struct(&[("url", SCALAR), ("sha256", SCALAR), ("archive", SCALAR)]),
+        ),
+    ]);
+    // ADR 0008: remote model sources are denied unless the host opts in.
+    const MODEL_SOURCES: FieldSpec = FieldSpec::Struct(&[
+        ("huggingface", SCALAR),
+        ("http", SCALAR),
+        ("max_bytes", BYTES),
+        ("allowed_hosts", FieldSpec::Seq(&SCALAR)),
+        ("huggingface_endpoint", SCALAR),
     ]);
     const MODEL: &[(&str, FieldSpec)] = &[
         // Spec §7: `path` predates `source` and still means a local source.
@@ -344,6 +378,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("kind", SCALAR),
                 ("name", SCALAR),
                 ("model_store", MODEL_STORE),
+                ("model_sources", MODEL_SOURCES),
                 ("state_dir", SCALAR),
                 ("identity_dir", SCALAR),
                 ("runtime_dir", SCALAR),

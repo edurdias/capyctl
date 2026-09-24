@@ -1084,45 +1084,68 @@ fn model_store_is_required_and_local_paths_resolve_against_it() {
     }
 }
 
-/// Spec §7: the resolver validates the shape of a remote source and stops. It
-/// performs no fetch, so it can name no local path; a caller that needs one is
-/// told so rather than handed a guessed cache directory.
+/// ADR 0008: a remote source resolves only on a host that opted in to its
+/// kind, only when pinned (a commit SHA, a SHA-256, HTTPS), and it resolves to
+/// its fixed directory in the host's model store. The resolver performs no
+/// fetch; the host materializes the directory before the first placement.
 // T14
 #[test]
-fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
-    let with_source = |source: serde_json::Value| {
-        let (mut deployment, host) = fixture();
+fn remote_sources_need_host_opt_in_and_pins_and_resolve_into_the_store() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let with_source = |source: serde_json::Value, policy: Option<serde_json::Value>| {
+        let (mut deployment, mut host) = fixture();
         let model = deployment["model"].as_object_mut().expect("model object");
         model.remove("path");
         model.insert("source".into(), source);
+        if let Some(policy) = policy {
+            host["model_sources"] = policy;
+        }
         (deployment, host)
     };
+    let allowed = serde_json::json!({
+        "huggingface": "allowed", "http": "allowed", "max_bytes": "100GiB"
+    });
     let digest = "a".repeat(64);
 
-    for source in [
-        serde_json::json!({"type": "huggingface", "repo": "Qwen/Qwen3-4B"}),
-        serde_json::json!({
-            "type": "huggingface", "repo": "Qwen/Qwen3-4B",
-            "revision": "main", "locked_commit": "cafe1234"
-        }),
-        serde_json::json!({"type": "http", "url": "https://example.test/w.tar", "sha256": digest}),
+    for (source, expected) in [
+        (
+            serde_json::json!({"type": "huggingface", "repo": "Qwen/Qwen3-4B", "revision": sha}),
+            format!("/srv/models/sources/huggingface/Qwen--Qwen3-4B@{sha}"),
+        ),
+        (
+            serde_json::json!({"huggingface": {"repo": "Qwen/Qwen3-4B", "revision": sha,
+                "token_ref": "secret://hf"}}),
+            format!("/srv/models/sources/huggingface/Qwen--Qwen3-4B@{sha}"),
+        ),
+        (
+            serde_json::json!({"http": {"url": "https://example.test/w.gguf", "sha256": digest}}),
+            format!("/srv/models/sources/http/{digest}"),
+        ),
     ] {
-        let (deployment, host) = with_source(source.clone());
+        // Denied by default: remote sources need the host's explicit opt-in.
+        let (deployment, host) = with_source(source.clone(), None);
+        let error = resolve_effective(&deployment, &host).expect_err("denied by default");
+        assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied, "{source}");
+
+        let (deployment, host) = with_source(source.clone(), Some(allowed.clone()));
         let effective = resolve_effective(&deployment, &host)
             .unwrap_or_else(|error| panic!("{source} must resolve: {error}"));
-        assert_eq!(effective.model.resolved_path, None, "{source}");
-        let error = effective
-            .model
-            .require_resolved_path()
-            .expect_err("a remote source has no local path");
-        assert_eq!(error.code, ConfigErrorCode::NotMaterializable, "{source}");
+        assert_eq!(effective.model.resolved_path.as_deref(), Some(expected.as_str()));
+        assert!(effective.model.source.is_remote());
+        // The frozen revision round-trips with the host's policy.
+        let text = serde_json::to_string(&effective).unwrap();
+        assert_eq!(mllm_config::effective::decode_effective_snapshot(&text).unwrap(), effective, "{source}");
     }
 
-    // An omitted revision is legal; an empty one is not, and neither is a plain
-    // HTTP URL or a digest that is not 64 hexadecimal characters.
+    // Unpinned or unsafe declarations are refused even where allowed.
     for source in [
-        serde_json::json!({"type": "huggingface", "repo": ""}),
-        serde_json::json!({"type": "huggingface", "repo": "r", "revision": ""}),
+        serde_json::json!({"type": "huggingface", "repo": "Qwen/Qwen3-4B"}),
+        serde_json::json!({"type": "huggingface", "repo": "Qwen/Qwen3-4B", "revision": "main"}),
+        serde_json::json!({"type": "huggingface", "repo": "", "revision": sha}),
+        serde_json::json!({"type": "huggingface", "repo": "r", "revision": sha,
+            "locked_commit": sha}),
+        serde_json::json!({"type": "huggingface", "repo": "r", "revision": sha,
+            "token_ref": "hf_plaintext"}),
         serde_json::json!({"type": "http", "url": "http://example.test/w.tar", "sha256": digest}),
         serde_json::json!({"type": "http", "url": "https://example.test/w.tar", "sha256": "abc"}),
         serde_json::json!({
@@ -1132,7 +1155,7 @@ fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
         serde_json::json!({"type": "local", "path": ""}),
         serde_json::json!({"type": "s3", "path": "/w"}),
     ] {
-        let (deployment, host) = with_source(source.clone());
+        let (deployment, host) = with_source(source.clone(), Some(allowed.clone()));
         assert!(
             resolve_effective(&deployment, &host).is_err(),
             "{source} must be refused"
@@ -1246,5 +1269,41 @@ fn a_host_may_publish_a_device_inventory_digest() {
     assert_eq!(
         effective.host.device_inventory_digest.as_deref(),
         Some(DIGEST)
+    );
+}
+
+/// ADR 0008 / SPEC §15.3: the strict schema accepts both source spellings and
+/// the host's `model_sources` block, and points a retired `locked_commit` at
+/// the pinned `revision` instead of calling it unknown.
+// T14
+#[test]
+fn strict_schema_accepts_model_sources_and_points_locked_commit_at_revision() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let deployment = |source: &str| {
+        format!(
+            "schema_version: 1\nkind: deployment\nname: d\nmodel:\n  source:\n{source}\n  content_fingerprint: sha256:x\n  revision: r1\n"
+        )
+    };
+    for source in [
+        format!("    huggingface:\n      repo: Qwen/Qwen3-4B\n      revision: {sha}\n      files: ['*.json']\n      token_ref: secret://hf"),
+        format!("    type: huggingface\n    repo: Qwen/Qwen3-4B\n    revision: {sha}"),
+        format!("    http:\n      url: https://example.test/w.tar\n      sha256: {}\n      archive: tar", "a".repeat(64)),
+        "    local:\n      path: toy".to_string(),
+    ] {
+        parse_strict(ConfigKind::Deployment, &deployment(&source))
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+    let error = parse_strict(
+        ConfigKind::Deployment,
+        &deployment(&format!("    huggingface:\n      repo: r\n      revision: {sha}\n      locked_commit: {sha}")),
+    )
+    .unwrap_err();
+    assert!(error.detail.contains("revision"), "{error:?}");
+    let host = "schema_version: 1\nkind: host\nname: h\nmodel_store:\n  path: /srv/models\nmodel_sources:\n  huggingface: allowed\n  http: denied\n  max_bytes: 200GiB\n  allowed_hosts: [huggingface.co]\n";
+    parse_strict(ConfigKind::Host, host).unwrap();
+    let unknown = format!("{host}  mirror: x\n");
+    assert_eq!(
+        parse_strict(ConfigKind::Host, &unknown).unwrap_err().code,
+        ConfigErrorCode::UnknownField
     );
 }

@@ -301,6 +301,27 @@ fn revoke_host_parses_with_a_request_identity() {
     assert!(parse(["mllm", "revoke", "deployment", "d"]).is_err());
 }
 
+/// SPEC §6.3, ADR 0008: `prune sources` is explicit: it names the host
+/// document whose store it prunes and only lists unless `--apply` is given.
+// T01
+#[test]
+fn prune_sources_parses_and_lists_by_default() {
+    assert_eq!(
+        parse(["mllm", "prune", "sources", "--host-config", "host.yaml"]).unwrap(),
+        Command::PruneSources {
+            host_config: "host.yaml".into(),
+            apply: false,
+            referenced_file: None,
+        }
+    );
+    let applied = parse(["mllm", "prune", "sources", "--host-config", "h.yaml", "--apply",
+        "--referenced-file", "refs.json"]).unwrap();
+    assert_eq!(applied.label(), "prune sources --apply");
+    assert!(matches!(applied, Command::PruneSources { apply: true, referenced_file: Some(_), .. }));
+    assert!(parse(["mllm", "prune", "sources"]).is_err(), "the store is named explicitly");
+    assert!(parse(["mllm", "prune", "deployment", "d"]).is_err());
+}
+
 /// SPEC §6.4: `--wait` observes the accepted target operation. A deploy
 /// without `--activate` has no operation beyond its durable acceptance, which
 /// it already returns after, so `--wait` alone is refused with the reason

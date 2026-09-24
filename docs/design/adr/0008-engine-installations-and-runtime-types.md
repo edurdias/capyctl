@@ -140,3 +140,76 @@ may change only the drift and capability fields. The SGLang descriptor's
 constrains the installed build. Standalone mode probes capabilities in the
 protected entries but does not yet record an installation fingerprint.
 Passing fingerprints and probes are not qualification evidence.
+
+## Amendment 2026-09-24: materializing declared model sources
+
+**Declaration.** A deployment's `model.source` is `local` (`path`), `huggingface`
+(`repo`, `revision`, optional `files` allow patterns, optional `token_ref`) or
+`http` (`url`, `sha256`, optional `archive: none | tar`). Both the tagged spelling
+(`{type: huggingface, ...}`) and the keyed spelling (`{huggingface: {...}}`) are
+accepted; the frozen revision keeps the tagged form, so existing fingerprints do
+not change. Only pinned sources are accepted: `revision` is a full 40-character
+commit SHA (a branch or tag is refused, and `locked_commit` is retired), `sha256`
+is 64 lowercase hex, URLs are `https://` without credentials, and `token_ref` is a
+`secret://<name>` reference, never a value.
+
+**Host policy.** A host opts in per kind: `model_sources: {huggingface:
+allowed|denied, http: allowed|denied, max_bytes, allowed_hosts,
+huggingface_endpoint}`. Both kinds default to `denied`, and a deployment with a
+denied source does not resolve on that host (`model_source_denied`). A host that
+allows either kind must state `max_bytes`, the model store's ceiling for
+materialized sources. `allowed_hosts`, when stated, lists the origins a source may
+name (the hub's host for Hugging Face).
+
+**Store layout and accounting.** A remote source resolves to a fixed directory in
+the host's model store: `sources/huggingface/<owner>--<name>@<sha>` (with a short
+digest of the allow patterns when they narrow the files) or `sources/http/<sha256>`
+(`-tar` for an archive). The store is the charged filesystem resource owner of
+SPEC §7: before any byte is written, the download's full size (from the hub's
+listing, or the response length; an origin that states none is refused
+`size_unknown`) is reserved against `max_bytes` (verified copies plus reservations
+in flight) and the filesystem's free space, and the reservation is persisted. It
+is released only when the temporary directory is verifiably gone, or converted
+into the verified copy's charge on commit. A transient failure keeps its partial
+files and reservation for a resume; a terminal one (`hash_mismatch`, `too_large`,
+`not_found`, `unauthorized`, `invalid_listing`, `unsafe_archive`, ...) removes
+them first.
+
+**Verification.** Hugging Face LFS files are checked against the SHA-256 in their
+pointer, other repository files against their git blob id, and an `http` payload
+against its declared SHA-256. A tar archive is verified whole, then extracted by a
+reader that accepts regular files and directories under relative paths only. The
+verified tree is renamed into place atomically; the ADR 0014 §7 checkpoint digest
+is then measured over it like any local checkpoint. Engines are unchanged: they
+read the local directory, with the offline environment they always had.
+
+**Protocol and control.** `MaterializeSource` is an additive member action (field
+14 in `ExecuteMember`, result evidence field 14 in `MemberExecutionResult`), sent only to hosts whose `Connect` declares
+`model_sources`. It carries the deployment document, never a path or a secret; the
+host checks its own policy and answers at once with `pending`, `downloading`
+(bytes done and total), `verified` or `failed` with a closed reason. A download it
+starts keeps running; concurrent requests share it, and a request after an agent
+restart resumes it with range requests. The server records each answer per host;
+status shows them under `model_sources`. Activation waits
+(`model_source_pending`) until one host holds a verified copy and is refused
+(`model_source_failed`) once every attempt failed terminally; the checkpoint digest
+is measured only where the copy is verified. A placement on another host
+materializes there first, before anything is launched.
+
+**Secrets.** A `token_ref` resolves from `<state_dir>/secrets/<name>` on the host,
+an owner-only file (no group or other access). The value is sent only as a
+sensitive `Authorization` header (dropped on a cross-host redirect) and never
+written to a file, journal, status, error or log line.
+
+**Reclaim.** Deleting a deployment never deletes its copy (SPEC §6.3).
+`mllm prune sources --host-config <host.yaml> [--apply]` is the explicit,
+host-side reclaim: it removes only verified copies under `sources/` that no
+existing deployment references (the server's `GET /management/v1/model-sources`,
+or `--referenced-file`), lists them unless `--apply` is given, and skips a copy
+whose download lock is held.
+
+**Not yet.** The standalone role's generated host document states no
+`model_sources`, so a standalone deployment with a remote source is refused.
+The server's placement planner does not plan disk; the host enforces the store
+ceiling locally. A live Hugging Face download on a Spark has not been run, and
+the CPU tests (a local fake hub and origin) are not qualification.
