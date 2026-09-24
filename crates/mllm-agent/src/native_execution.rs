@@ -872,7 +872,7 @@ impl NativeHostExecution {
                         launch_failed = error.engine;
                     }
                 }
-                MemberAction::Terminate { owned_handle } => {
+                MemberAction::Terminate { owned_handle, .. } => {
                     // A restarted host has no in-memory gate. Re-register the
                     // exact retained scope closed using its protected credentials.
                     // A handle this host never launched has no scope to close.
@@ -950,7 +950,7 @@ impl NativeHostExecution {
             // the engine refused, never a value or other engine output.
             result.launch_failure = launch_failure(&result, launch_failed.as_deref());
         }
-        if let MemberAction::Terminate { owned_handle } = &command.action {
+        if let MemberAction::Terminate { owned_handle, .. } = &command.action {
             // SPEC §§6, 13.3 (U5 recovery live run): the terminated launch's
             // ingress entry outlived it, so the next launch of the same member
             // (a failed launch keeps its generation) was refused as stale and

@@ -22,6 +22,9 @@ pub struct HostInvitation {
     pub host_name: String,
     pub expires_unix: i64,
     pub ca_pem: String,
+    /// ADR 0016: set only on a recovery invitation, naming the revoked host
+    /// id it re-enrolls. `host_name` is then that host's enrolled name.
+    pub recover_host_id: Option<String>,
 }
 pub struct EnrollmentAuthority {
     state: SharedCoordinatorState,
@@ -41,6 +44,9 @@ pub enum EnrollmentRefusal {
     NotFound,
     #[error("host name already enrolled")]
     Conflict,
+    /// ADR 0016: recovery is for a revoked host only.
+    #[error("host is not revoked")]
+    NotRevoked,
     #[error("enrollment authority failed")]
     Internal,
 }
@@ -124,6 +130,52 @@ impl EnrollmentAuthority {
             host_name: name.into(),
             expires_unix: expiry,
             ca_pem: self.ca.certificate_pem().into(),
+            recover_host_id: None,
+        })
+    }
+    /// ADR 0016 (owner decision 2026-09-24): an explicit, single-use,
+    /// short-lived invitation for the revoked host `host` (id or name) to
+    /// re-enroll under its same host id. Redeeming it issues a new
+    /// certificate; every older one stays revoked. The invitation is
+    /// journaled. A host that is not revoked is refused: it renews instead.
+    pub fn invite_recovery(
+        &self,
+        host: &str,
+        lifetime_seconds: i64,
+        now: i64,
+    ) -> Result<HostInvitation, EnrollmentRefusal> {
+        use mllm_store::enrollment::RecoveryInvitationError as Refused;
+        if !(1..=3600).contains(&lifetime_seconds) || !mllm_store::enrollment::valid_name(host) {
+            return Err(EnrollmentRefusal::Invalid);
+        }
+        let expiry = now
+            .checked_add(lifetime_seconds)
+            .ok_or(EnrollmentRefusal::Invalid)?;
+        let mut secret = [0_u8; 32];
+        OsRng
+            .try_fill_bytes(&mut secret)
+            .map_err(|_| EnrollmentRefusal::Internal)?;
+        let secret = hex::encode(secret);
+        let id = digest(secret.as_bytes());
+        let target = self
+            .state
+            .lock()
+            .map_err(|_| EnrollmentRefusal::Internal)?
+            .store()
+            .create_host_recovery_invitation(&id, host, expiry, now)
+            .map_err(|error| match error {
+                Refused::Invalid => EnrollmentRefusal::Invalid,
+                Refused::NotFound => EnrollmentRefusal::NotFound,
+                Refused::NotRevoked => EnrollmentRefusal::NotRevoked,
+                Refused::Store(_) => EnrollmentRefusal::Internal,
+            })?;
+        Ok(HostInvitation {
+            id,
+            secret,
+            host_name: target.host_name,
+            expires_unix: expiry,
+            ca_pem: self.ca.certificate_pem().into(),
+            recover_host_id: Some(target.host_id),
         })
     }
     /// SPEC §§4.1, 13.3: revoke a host by id or name. The revocation commits

@@ -378,6 +378,7 @@ fn stop(launch: &MemberCommand, id: &str) -> MemberCommand {
         "retained",
         MemberAction::Terminate {
             owned_handle: launch.identity.command_id.clone(),
+            recorded: Vec::new(),
         },
     )
 }

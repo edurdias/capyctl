@@ -115,6 +115,7 @@ struct Harness {
     stop: tokio::sync::watch::Sender<bool>,
     agent: tokio::task::JoinHandle<Result<(), mllm_agent::session::SessionError>>,
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    address: String,
     _dirs: Vec<tempfile::TempDir>,
 }
 
@@ -155,6 +156,7 @@ impl Harness {
             invitation_secret: invite.secret,
             host_name: invite.host_name,
             expires_unix: invite.expires_unix,
+            recover_host_id: None,
         };
         let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
         let request = identity.request(&invitation).unwrap();
@@ -206,6 +208,7 @@ impl Harness {
             stop,
             agent,
             server,
+            address,
             _dirs: vec![state_dir, storage_dir, journal_dir],
         }
     }
@@ -251,7 +254,7 @@ impl Harness {
     }
 
     async fn finish(self) {
-        self.stop.send(true).unwrap();
+        let _ = self.stop.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(15), self.agent).await;
         self.server.abort();
     }
@@ -390,5 +393,167 @@ async fn revocation_closes_the_session_and_refuses_reconnect_and_commands() {
     assert!(revoked[0].payload_json.contains(&h.host));
     let hosts = h.state.lock().unwrap().store().enrolled_hosts().unwrap();
     assert!(hosts.iter().all(|host| host.revoked));
+    h.finish().await;
+}
+
+impl Harness {
+    /// The join file a recovery invitation for `host` becomes.
+    fn recovery_invitation(&self, host: &str) -> JoinInvitation {
+        let invite = self.authority.invite_recovery(host, 300, now()).unwrap();
+        JoinInvitation {
+            version: 1,
+            server_address: self.address.clone(),
+            control_address: self.address.clone(),
+            server_ca: invite.ca_pem,
+            invitation_id: invite.id,
+            invitation_secret: invite.secret,
+            host_name: invite.host_name,
+            expires_unix: invite.expires_unix,
+            recover_host_id: invite.recover_host_id,
+        }
+    }
+
+    /// Redeem `invitation` from the identity directory at `dir`.
+    async fn redeem(
+        &self,
+        dir: &std::path::Path,
+        invitation: &JoinInvitation,
+    ) -> Result<PendingEnrollment, ()> {
+        let storage = IdentityDirectory::open(dir).unwrap();
+        let mut identity = PendingEnrollment::prepare_recovery(&storage, invitation).map_err(|_| ())?;
+        let request = identity.request(invitation).map_err(|_| ())?;
+        let issued = Bootstrap::enroll(self.authority.as_ref(), tonic::Request::new(request))
+            .await
+            .map_err(|_| ())?
+            .into_inner();
+        identity.accept_certificate(&storage, issued, now()).map_err(|_| ())?;
+        Ok(identity)
+    }
+}
+
+// T05 T06 (ADR 0016, SPEC §4.1): a revoked host recovers under its same host
+// id over the real mutual-TLS control stream. Recovery of a host that is not
+// revoked is refused; after revocation, a recovery invitation redeemed from
+// the host's retained identity directory issues a new certificate for the
+// same id; the host reconnects with it and its retained journal and executes
+// commands again; its old certificate stays refused; the invitation is
+// single-use; and the steps are journaled.
+#[tokio::test]
+async fn a_revoked_host_recovers_its_same_identity_and_the_old_certificate_stays_refused() {
+    let mut h = Harness::start().await;
+    let before = h.inspect("inspect-before", 1, Duration::from_secs(10));
+    tokio::time::timeout(Duration::from_secs(12), h.sessions.execute(before))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        h.authority.invite_recovery("spark", 300, now()),
+        Err(mllm_controller::enrollment::EnrollmentRefusal::NotRevoked)
+    ));
+    assert!(matches!(
+        h.authority.invite_recovery("no-such-host", 300, now()),
+        Err(mllm_controller::enrollment::EnrollmentRefusal::NotFound)
+    ));
+    h.authority.revoke("spark").unwrap();
+    let host = h.host.clone();
+    let sessions = h.sessions.clone();
+    eventually(|| !sessions.inspect(&host).is_some_and(|s| s.online)).await;
+    // The operator stops the revoked host role before re-enrolling it.
+    h.stop.send(true).unwrap();
+    let agent = std::mem::replace(&mut h.agent, tokio::spawn(async { Ok(()) }));
+    let _ = tokio::time::timeout(Duration::from_secs(15), agent).await;
+
+    // By id this time; the join file names the host id it re-enrolls.
+    let invitation = h.recovery_invitation(&h.host.clone());
+    assert_eq!(invitation.recover_host_id.as_deref(), Some(h.host.as_str()));
+    assert_eq!(invitation.host_name, "spark");
+    // An ordinary enrollment refuses a recovery invitation.
+    let other = directory();
+    assert!(PendingEnrollment::prepare(&IdentityDirectory::open(other.path()).unwrap(), &invitation).is_err());
+    let storage_dir = h._dirs[1].path().to_path_buf();
+    let identity = h.redeem(&storage_dir, &invitation).await.unwrap();
+    assert_eq!(identity.host_id(), Some(h.host.as_str()), "the same host id");
+    // Single use: another enrollment transaction on the same invitation, even
+    // from fresh identity files, is refused.
+    let fresh = directory();
+    assert!(h.redeem(fresh.path(), &invitation).await.is_err());
+    // An exact retry from the same identity replays the same certificate.
+    let replayed = h.redeem(&storage_dir, &invitation).await.unwrap();
+    assert_eq!(replayed.host_id(), Some(h.host.as_str()));
+
+    // The recovered host reconnects with its new certificate and its retained
+    // journal, and executes commands again.
+    let identity = Arc::new(identity);
+    let executor = Arc::new(JournalExecutor { journal: h.journal.clone(), fresh: h.fresh.clone() });
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let agent_identity = identity.clone();
+    let agent_journal = h.journal.clone();
+    let agent = tokio::spawn(async move {
+        mllm_agent::session::run_session_with_execution(
+            &agent_identity,
+            agent_journal,
+            pb::ReportInventory {
+                domains: vec![pb::DomainObservation {
+                    domain_id: "system-memory".into(),
+                    kind: "system".into(),
+                    observed_bytes: 1024,
+                    observed_at_unix: now(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            shutdown,
+            Some(executor),
+        )
+        .await
+    });
+    let host = h.host.clone();
+    let sessions = h.sessions.clone();
+    eventually(|| sessions.inspect(&host).is_some_and(|s| s.online && s.reconciled)).await;
+    let after = h.inspect("inspect-after-recovery", 2, Duration::from_secs(10));
+    let result = tokio::time::timeout(Duration::from_secs(12), h.sessions.execute(after))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.state, "completed");
+    assert_eq!(h.fresh.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        h.journaled(),
+        vec!["inspect-before".to_owned(), "inspect-after-recovery".to_owned()],
+        "the retained journal carried over"
+    );
+
+    // The old certificate stays refused: a fresh connection with it fails.
+    let channel = h.identity.control_endpoint(now()).unwrap().connect().await.unwrap();
+    let (send, recv) = tokio::sync::mpsc::channel(16);
+    send.send(pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::Connect(pb::Connect {
+            host_id: h.host.clone(),
+            protocol_version: mllm_protocol::PROTOCOL_VERSION.into(),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    assert!(AgentControlClient::new(channel)
+        .session(ReceiverStream::new(recv))
+        .await
+        .is_err());
+    // The recovered session was not displaced by that attempt.
+    assert!(h.online());
+
+    let (hosts, kinds) = {
+        let store = h.state.lock().unwrap();
+        let hosts = store.store().enrolled_hosts().unwrap();
+        let events = store.store().events_after(None, 1000).unwrap();
+        let kinds: Vec<String> = events.events.iter().map(|e| e.kind.clone()).collect();
+        (hosts, kinds)
+    };
+    assert_eq!(hosts.len(), 1, "no second host record");
+    assert!(!hosts[0].revoked);
+    assert_eq!(kinds.iter().filter(|k| *k == "host_recovery_invited").count(), 1);
+    assert_eq!(kinds.iter().filter(|k| *k == "host_recovered").count(), 1);
+    stop.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(15), agent).await;
     h.finish().await;
 }

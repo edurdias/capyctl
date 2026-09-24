@@ -149,7 +149,17 @@ pub enum MemberAction {
     Launch(GroupPlan),
     LaunchSingle(SingleLaunchPlan),
     Inspect,
-    Terminate { owned_handle: String },
+    /// SPEC §§6.1, 13.2: terminate one owned launch and report its processes'
+    /// presence. ADR 0016: `recorded` carries the identities the server
+    /// recorded for the launch. A host whose journal knows the handle acts on
+    /// its own record only; one with no record of it (a lost journal) never
+    /// signals anything and only observes these identities, so the launch can
+    /// still be settled on gone evidence by identity, and never released
+    /// while any of them is alive.
+    Terminate {
+        owned_handle: String,
+        recorded: Vec<mllm_domain::completion::ProcessIdentity>,
+    },
     CloseIngress,
     /// SPEC §§6.1, 13.2: re-prove model readiness of one retained launch with a
     /// fresh native probe, after a session loss cleared its readiness authority.
@@ -174,6 +184,41 @@ pub enum MemberAction {
     /// deployment's checkpoint. Read-only: it never launches, releases or
     /// changes anything, and its result carries only digest evidence.
     DigestCheckpoint(DigestCheckpointPlan),
+}
+
+/// The most recorded process identities one Terminate may carry.
+pub const MAX_RECORDED_PROCESSES: usize = 64;
+
+/// ADR 0016: a Terminate's recorded identities are bounded, well formed and
+/// distinct, like the process observations a result may carry.
+fn recorded_processes(
+    wire: Vec<pb::RecordedProcess>,
+) -> Result<Vec<mllm_domain::completion::ProcessIdentity>, GroupIdentityError> {
+    if wire.len() > MAX_RECORDED_PROCESSES {
+        return Err(GroupIdentityError);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    wire.into_iter()
+        .map(|p| {
+            if p.pid == 0
+                || p.start_ticks == 0
+                || p.start_ticks > i64::MAX as u64
+                || p.role.is_empty()
+                || p.role.len() > 64
+                || p.boot_id.is_empty()
+                || p.boot_id.len() > 64
+                || !seen.insert((p.pid, p.boot_id.clone(), p.start_ticks))
+            {
+                return Err(GroupIdentityError);
+            }
+            Ok(mllm_domain::completion::ProcessIdentity {
+                role: p.role,
+                pid: p.pid,
+                boot_id: p.boot_id,
+                start_ticks: p.start_ticks,
+            })
+        })
+        .collect()
 }
 
 /// Owned handles name a retained launch; they are bounded and never blank.
@@ -250,6 +295,12 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         identity.validate()?;
         use pb::execute_member::Action;
         let restore_digest = command.restore_checkpoint_digest;
+        let recorded = recorded_processes(command.terminate_recorded_processes)?;
+        if !recorded.is_empty()
+            && !matches!(command.action, Some(Action::TerminateOwnedHandle(_)))
+        {
+            return Err(GroupIdentityError);
+        }
         if !(restore_digest.is_empty() || mllm_config::effective::is_checkpoint_digest(&restore_digest))
             || (!restore_digest.is_empty()
                 && !matches!(command.action, Some(Action::RestoreOwnedHandle(_))))
@@ -262,7 +313,10 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
             Action::LaunchSingle(plan) => MemberAction::LaunchSingle(plan.try_into()?),
             Action::Inspect(true) => MemberAction::Inspect,
             Action::TerminateOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
-                MemberAction::Terminate { owned_handle }
+                MemberAction::Terminate {
+                    owned_handle,
+                    recorded,
+                }
             }
             Action::CloseIngress(true) => MemberAction::CloseIngress,
             Action::ProbeOwnedHandle(owned_handle) if owned_handle_ok(&owned_handle) => {
@@ -327,7 +381,7 @@ impl MemberCommand {
                 MemberAction::Launch(plan) => Action::Launch(group_wire(plan)),
                 MemberAction::LaunchSingle(plan) => Action::LaunchSingle(plan.to_wire()),
                 MemberAction::Inspect => Action::Inspect(true),
-                MemberAction::Terminate { owned_handle } => {
+                MemberAction::Terminate { owned_handle, .. } => {
                     Action::TerminateOwnedHandle(owned_handle.clone())
                 }
                 MemberAction::CloseIngress => Action::CloseIngress(true),
@@ -345,6 +399,18 @@ impl MemberCommand {
                     checkpoint_digest, ..
                 } => checkpoint_digest.clone(),
                 _ => String::new(),
+            },
+            terminate_recorded_processes: match &self.action {
+                MemberAction::Terminate { recorded, .. } => recorded
+                    .iter()
+                    .map(|p| pb::RecordedProcess {
+                        role: p.role.clone(),
+                        pid: p.pid,
+                        boot_id: p.boot_id.clone(),
+                        start_ticks: p.start_ticks,
+                    })
+                    .collect(),
+                _ => Vec::new(),
             },
         }
     }

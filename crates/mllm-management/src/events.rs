@@ -512,6 +512,14 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         ],
         // SPEC §§4.1, 13.3: an administrator revoked a host identity.
         "host_revoked" => &[("host_id", Token), ("host_name", Token)],
+        // ADR 0016: a revoked host was invited to, and did, re-enroll under
+        // its same identity.
+        "host_recovery_invited" => &[
+            ("host_id", Token),
+            ("host_name", Token),
+            ("expires_unix", Number),
+        ],
+        "host_recovered" => &[("host_id", Token), ("host_name", Token)],
         // SPEC §4.3: an abandoned drain intent expired after its deadline.
         "host_drain_intent_expired" => &[
             ("host_id", Token),

@@ -346,6 +346,7 @@ impl Fixture {
             identity: identity("stop", "retained", &launch.identity.profile_fingerprint),
             action: MemberAction::Terminate {
                 owned_handle: "launch".into(),
+                recorded: Vec::new(),
             },
         })
     }

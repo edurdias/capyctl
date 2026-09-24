@@ -158,6 +158,24 @@ async fn enrollment_errors_are_structured_and_queries_methods_rejected() {
             StatusCode::BAD_REQUEST,
             "invalid_request",
         ),
+        // ADR 0016: a recovery invitation names an enrolled, revoked host;
+        // an unknown one is 404, a malformed request 400.
+        (
+            "POST",
+            "/management/v1/host-invitations",
+            true,
+            r#"{"host_name":"host-a","lifetime_seconds":300,"recover":true}"#,
+            StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "POST",
+            "/management/v1/host-invitations",
+            true,
+            r#"{"host_name":"host-a","lifetime_seconds":3601,"recover":true}"#,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
     ] {
         let mut request = Request::builder()
             .method(method)

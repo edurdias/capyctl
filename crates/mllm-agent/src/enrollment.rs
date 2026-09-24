@@ -35,6 +35,12 @@ pub struct JoinInvitation {
     pub invitation_secret: String,
     pub host_name: String,
     pub expires_unix: i64,
+    /// ADR 0016: present only on a recovery invitation, naming the revoked
+    /// host id it re-enrolls. An ordinary invitation omits it, so its file is
+    /// exactly as before; an agent that predates recovery refuses a recovery
+    /// invitation instead of enrolling a new host with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recover_host_id: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +96,9 @@ struct HostBundle {
     issued: Option<HostCertificate>,
     #[serde(default)]
     renewal_transaction: Option<String>,
+    /// ADR 0016: the host id a recovery enrollment must be issued for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recover_host_id: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,11 +159,116 @@ fn validate_ca(ca: &str) -> Result<(), EnrollmentError> {
     }
     Ok(())
 }
+fn valid_invitation(invitation: &JoinInvitation) -> Result<(), EnrollmentError> {
+    if invitation.version != 1
+        || !name(&invitation.host_name)
+        || invitation.invitation_secret.len() != 64
+        || !invitation
+            .invitation_secret
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+        || invitation.invitation_id != digest(invitation.invitation_secret.as_bytes())
+        || invitation.recover_host_id.as_deref().is_some_and(|id| !name(id))
+    {
+        return Err(EnrollmentError);
+    }
+    endpoint(&invitation.server_address, &invitation.server_ca)?;
+    endpoint(&invitation.control_address, &invitation.server_ca)?;
+    Ok(())
+}
+fn fresh_bundle(
+    invitation: &JoinInvitation,
+    recover_host_id: Option<String>,
+) -> Result<HostBundle, EnrollmentError> {
+    let key = HostKey::generate()?;
+    // Random key material provides an unguessable, stable transaction ID.
+    let transaction_id = digest(&HostKey::generate()?.public_key_der());
+    Ok(HostBundle {
+        version: 1,
+        server_address: invitation.server_address.clone(),
+        control_address: invitation.control_address.clone(),
+        server_ca: invitation.server_ca.clone(),
+        invitation_id: invitation.invitation_id.clone(),
+        host_name: invitation.host_name.clone(),
+        transaction_id,
+        private_key: key.private_key_pem(),
+        csr_der: key.enrollment_request()?,
+        issued: None,
+        renewal_transaction: None,
+        recover_host_id,
+    })
+}
 impl PendingEnrollment {
+    /// ADR 0016 (owner decision 2026-09-24): prepare the re-enrollment of a
+    /// revoked host under its same host id, from a recovery invitation.
+    ///
+    /// A new key is always generated: the revoked certificate's key is never
+    /// reused. The retained identity is replaced only when it belongs to the
+    /// same controller and names the same host id (or is absent, when the
+    /// identity files were lost); anything else is refused, never adopted.
+    /// The bundle is persisted before any RPC, so a retry with the same
+    /// invitation resumes the same enrollment transaction. The host journal
+    /// lives beside the identity and is not touched here.
+    pub fn prepare_recovery(
+        storage: &IdentityDirectory,
+        invitation: &JoinInvitation,
+    ) -> Result<Self, EnrollmentError> {
+        valid_invitation(invitation)?;
+        let host = invitation.recover_host_id.clone().ok_or(EnrollmentError)?;
+        let existing = storage.read_bundle(HOST_FILE).map_err(|_| EnrollmentError)?;
+        let bytes = match existing {
+            None => {
+                let bytes = serde_json::to_vec(&fresh_bundle(invitation, Some(host))?)
+                    .map_err(|_| EnrollmentError)?;
+                storage
+                    .create_bundle(HOST_FILE, &bytes)
+                    .map_err(|_| EnrollmentError)?;
+                bytes
+            }
+            Some(bytes) => {
+                let retained = Self::decode(&bytes)?;
+                if retained.bundle.invitation_id == invitation.invitation_id {
+                    // A retry of this very recovery: same key, same transaction.
+                    bytes
+                } else {
+                    let same_host = retained
+                        .bundle
+                        .issued
+                        .as_ref()
+                        .map(|c| c.host_id.as_str())
+                        .or(retained.bundle.recover_host_id.as_deref())
+                        == Some(host.as_str());
+                    if !same_host
+                        || retained.bundle.server_ca != invitation.server_ca
+                        || retained.bundle.host_name != invitation.host_name
+                    {
+                        return Err(EnrollmentError);
+                    }
+                    let replacement = serde_json::to_vec(&fresh_bundle(invitation, Some(host))?)
+                        .map_err(|_| EnrollmentError)?;
+                    storage
+                        .replace_bundle(HOST_FILE, &retained.persisted_digest, &replacement)
+                        .map_err(|_| EnrollmentError)?;
+                    replacement
+                }
+            }
+        };
+        let pending = Self::decode(&bytes)?;
+        if pending.bundle.recover_host_id.as_deref() != invitation.recover_host_id.as_deref() {
+            return Err(EnrollmentError);
+        }
+        pending.request(invitation)?;
+        Ok(pending)
+    }
     pub fn prepare(
         storage: &IdentityDirectory,
         invitation: &JoinInvitation,
     ) -> Result<Self, EnrollmentError> {
+        // ADR 0016: a recovery invitation re-enrolls an existing identity and
+        // is prepared only by `prepare_recovery`.
+        if invitation.recover_host_id.is_some() {
+            return Err(EnrollmentError);
+        }
         if invitation.version != 1
             || !name(&invitation.host_name)
             || invitation.invitation_secret.len() != 64
@@ -189,6 +303,7 @@ impl PendingEnrollment {
                     csr_der: key.enrollment_request()?,
                     issued: None,
                     renewal_transaction: None,
+                    recover_host_id: None,
                 };
                 let bytes = serde_json::to_vec(&bundle).map_err(|_| EnrollmentError)?;
                 storage
@@ -236,6 +351,7 @@ impl PendingEnrollment {
             || self.bundle.server_ca != invitation.server_ca
             || invitation.version != 1
             || digest(invitation.invitation_secret.as_bytes()) != invitation.invitation_id
+            || self.bundle.recover_host_id != invitation.recover_host_id
         {
             return Err(EnrollmentError);
         }
@@ -290,6 +406,12 @@ impl PendingEnrollment {
             .issued
             .as_ref()
             .is_some_and(|old| old.host_id != certificate.host_id)
+            // ADR 0016: a recovery is issued for exactly the host it names.
+            || self
+                .bundle
+                .recover_host_id
+                .as_ref()
+                .is_some_and(|host| *host != certificate.host_id)
         {
             return Err(EnrollmentError);
         }

@@ -766,6 +766,8 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         "dispatch_suspension":announced.as_str(),
         "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}))
 }
+/// ADR 0016: how long a recovery invitation stays redeemable.
+const RECOVERY_INVITATION_SECONDS: i64 = 900;
 pub fn supports(command: &Command) -> bool {
     matches!(
         command,
@@ -842,7 +844,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 .await
             }
         }
-        Command::Join { join_file } => {
+        Command::Join { join_file, recover } => {
             let path = invocation
                 .config
                 .clone()
@@ -851,14 +853,42 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 .map_err(|_| error("Invalid host configuration"))?;
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
+            // ADR 0016: recovery is explicit on both sides. A recovery
+            // invitation is never redeemed as an ordinary enrollment, and
+            // `--recover` never enrolls a new host.
+            match (*recover, invitation.recover_host_id.is_some()) {
+                (false, true) => {
+                    return Err(error(
+                        "This is a recovery invitation; run join host --recover to re-enroll the revoked host",
+                    ))
+                }
+                (true, false) => {
+                    return Err(error(
+                        "join host --recover needs a recovery invitation (invite host <name|id> --recover)",
+                    ))
+                }
+                _ => {}
+            }
             let storage = IdentityDirectory::open(&config.identity_dir)
-                .map_err(|_| error("Host identity is unsafe or already in use"))?;
-            let mut pending = PendingEnrollment::prepare(&storage, &invitation)
-                .map_err(|_| error("Invitation conflicts with the retained host identity"))?;
+                .map_err(|_| error("Host identity is unsafe or already in use; stop the host role first"))?;
+            let mut pending = if *recover {
+                PendingEnrollment::prepare_recovery(&storage, &invitation).map_err(|_| {
+                    error("Recovery invitation conflicts with the retained host identity")
+                })?
+            } else {
+                PendingEnrollment::prepare(&storage, &invitation)
+                    .map_err(|_| error("Invitation conflicts with the retained host identity"))?
+            };
             let host_id = pending.enroll(&storage, &invitation, now()).await.map_err(|_| error("Enrollment failed; retain identity and retry the same invitation transaction"))?;
-            Ok(json!({"host_id":host_id,"enrolled":true}))
+            if *recover {
+                // ADR 0016: the same host id, a new certificate; engines the
+                // server recorded reopen only after a fresh probe.
+                Ok(json!({"host_id":host_id,"enrolled":true,"recovered":true}))
+            } else {
+                Ok(json!({"host_id":host_id,"enrolled":true}))
+            }
         }
-        Command::Invite { name } => {
+        Command::Invite { name, recover } => {
             let output = invocation.output.as_ref().ok_or_else(|| {
                 error("invite host requires --output FILE; invitations are never printed")
             })?;
@@ -869,18 +899,31 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 ));
             }
             let config = server_context(invocation.config.as_deref(), root)?;
+            // ADR 0016: a recovery invitation is shorter-lived than an
+            // ordinary one, and only a recovery request carries `recover`, so
+            // an ordinary request keeps its exact earlier shape.
+            let body = if *recover {
+                json!({"host_name":name,"lifetime_seconds":RECOVERY_INVITATION_SECONDS,"recover":true})
+            } else {
+                json!({"host_name":name,"lifetime_seconds":3600})
+            };
             let result = management_request(
                 &config,
                 reqwest::Method::POST,
                 "/host-invitations",
-                Some(json!({"host_name":name,"lifetime_seconds":3600})),
+                Some(body),
             )
             .await?;
             write_new(
                 path,
                 &serde_json::to_vec(&result).map_err(|_| unavailable())?,
             )?;
-            Ok(json!({"invitation_file":path,"host_name":name}))
+            if *recover {
+                Ok(json!({"invitation_file":path,"host_name":result["host_name"],
+                    "recover_host_id":result["recover_host_id"],"expires_unix":result["expires_unix"]}))
+            } else {
+                Ok(json!({"invitation_file":path,"host_name":name}))
+            }
         }
         Command::List {
             resource: ListResource::Hosts,
@@ -951,7 +994,13 @@ pub async fn management_request(
         bytes.extend_from_slice(&chunk);
     }
     if !status.is_success() {
-        return Err(error("Management command rejected"));
+        // SPEC §14: keep the server's error class when it sent one.
+        return Err(match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) if value["error"]["code"].is_string() => {
+                crate::client::refusal(status, &value)
+            }
+            _ => error("Management command rejected"),
+        });
     }
     serde_json::from_slice(&bytes).map_err(|_| unavailable())
 }

@@ -148,6 +148,21 @@ pub(crate) enum EventMetadata {
     /// by this record.
     #[serde(rename = "1")]
     HostRevoked { host_id: String, host_name: String },
+    /// ADR 0016: an administrator issued a single-use, short-lived invitation
+    /// for a revoked host to re-enroll under its same identity. Nothing is
+    /// restored by this record; the host stays revoked until it redeems it.
+    #[serde(rename = "1")]
+    HostRecoveryInvited {
+        host_id: String,
+        host_name: String,
+        expires_unix: i64,
+    },
+    /// ADR 0016: a revoked host redeemed its recovery invitation. It holds a
+    /// new certificate bound to the same host id; every older certificate
+    /// stays revoked. Nothing it owns is released or re-proven by this record:
+    /// its engines reopen only on a fresh probe (SPEC §13.2).
+    #[serde(rename = "1")]
+    HostRecovered { host_id: String, host_name: String },
     /// SPEC §4.3: a host drain intent whose request never completed (the
     /// server stopped between opening it and recording its Stops) expired
     /// after its deadline with no Stop of the host still open.
@@ -298,6 +313,8 @@ impl EventMetadata {
             Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
             Self::InstallationDriftFlagged { .. } => "installation_drift_flagged",
             Self::HostRevoked { .. } => "host_revoked",
+            Self::HostRecoveryInvited { .. } => "host_recovery_invited",
+            Self::HostRecovered { .. } => "host_recovered",
             Self::HostDrainIntentExpired { .. } => "host_drain_intent_expired",
             Self::SwitchRecorded { phase, .. } => match phase {
                 SwitchPhase::Planned => "switch_planned",
@@ -348,6 +365,8 @@ impl EventMetadata {
             }
             Self::InstallationDriftFlagged { .. }
             | Self::HostRevoked { .. }
+            | Self::HostRecoveryInvited { .. }
+            | Self::HostRecovered { .. }
             | Self::HostDrainIntentExpired { .. } => (None, None),
             Self::SwitchRecorded {
                 target_deployment, ..

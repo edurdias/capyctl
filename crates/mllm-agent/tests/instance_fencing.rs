@@ -110,6 +110,7 @@ fn terminate(owner: &MemberCommand, id: &str, generation: i64, instance: u32) ->
         instance,
         MemberAction::Terminate {
             owned_handle: owner.identity.command_id.clone(),
+            recorded: Vec::new(),
         },
     )
 }

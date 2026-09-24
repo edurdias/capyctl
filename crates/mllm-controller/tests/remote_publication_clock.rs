@@ -66,6 +66,7 @@ async fn enrolled(
         invitation_secret: invite.secret,
         host_name: invite.host_name,
         expires_unix: invite.expires_unix,
+        recover_host_id: None,
     };
     let storage_dir = directory();
     let storage = IdentityDirectory::open(storage_dir.path()).unwrap();

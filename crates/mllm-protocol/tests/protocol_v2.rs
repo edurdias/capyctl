@@ -30,6 +30,7 @@ fn base() -> MemberCommand {
             }),
             action: Some(pb::execute_member::Action::Inspect(true)),
             restore_checkpoint_digest: String::new(),
+            terminate_recorded_processes: Vec::new(),
         })),
     })
     .unwrap()
@@ -105,6 +106,7 @@ fn park_and_restore_roundtrip_and_are_digest_bound() {
         .canonical_digest(),
         with_action(MemberAction::Terminate {
             owned_handle: "launch".into(),
+            recorded: Vec::new(),
         })
         .canonical_digest(),
     ];
@@ -330,6 +332,7 @@ fn residency_evidence_is_refused_on_other_actions() {
         },
         MemberAction::Terminate {
             owned_handle: "launch".into(),
+            recorded: Vec::new(),
         },
         MemberAction::Inspect,
     ] {
@@ -597,5 +600,84 @@ fn restore_carries_a_recorded_checkpoint_digest() {
     assert!(MemberCommand::try_from(pb::ServerToAgent {
         msg: Some(pb::server_to_agent::Msg::ExecuteMember(parked)),
     })
+    .is_err());
+}
+
+fn recorded(pid: u32) -> mllm_domain::completion::ProcessIdentity {
+    mllm_domain::completion::ProcessIdentity {
+        role: "api".into(),
+        pid,
+        boot_id: "boot".into(),
+        start_ticks: 7,
+    }
+}
+
+// T34 (ADR 0016, additive): a Terminate carries the identities the server
+// recorded. Empty, it encodes and digests exactly as before; carried, they
+// round-trip and are bound by the digest; they are bounded, well formed and
+// distinct, and belong to a Terminate only.
+#[test]
+fn terminate_recorded_identities_are_additive_and_bound() {
+    let plain = with_action(MemberAction::Terminate {
+        owned_handle: "launch".into(),
+        recorded: Vec::new(),
+    });
+    let Some(pb::server_to_agent::Msg::ExecuteMember(encoded)) = wire(&plain).msg else {
+        panic!()
+    };
+    assert!(encoded.terminate_recorded_processes.is_empty());
+    let mut legacy = encoded.clone();
+    legacy.terminate_recorded_processes.clear();
+    assert_eq!(encoded.encode_to_vec(), legacy.encode_to_vec());
+
+    let carried = with_action(MemberAction::Terminate {
+        owned_handle: "launch".into(),
+        recorded: vec![recorded(10), recorded(11)],
+    });
+    assert_ne!(carried.canonical_digest(), plain.canonical_digest());
+    carried.verify_digest().unwrap();
+    let decoded = MemberCommand::try_from(wire(&carried)).unwrap();
+    assert_eq!(decoded, carried);
+    // Changing a recorded identity breaks the bound digest.
+    let mut forged = carried.clone();
+    if let MemberAction::Terminate { recorded, .. } = &mut forged.action {
+        recorded[0].pid = 12;
+    }
+    assert!(forged.verify_digest().is_err());
+
+    let decode = |processes: Vec<pb::RecordedProcess>, action: pb::execute_member::Action| {
+        let Some(pb::server_to_agent::Msg::ExecuteMember(mut message)) = wire(&plain).msg else {
+            panic!()
+        };
+        message.terminate_recorded_processes = processes;
+        message.action = Some(action);
+        MemberCommand::try_from(pb::ServerToAgent {
+            msg: Some(pb::server_to_agent::Msg::ExecuteMember(message)),
+        })
+    };
+    let one = |pid: u32, ticks: u64, role: &str, boot: &str| pb::RecordedProcess {
+        role: role.into(),
+        pid,
+        boot_id: boot.into(),
+        start_ticks: ticks,
+    };
+    let terminate = || pb::execute_member::Action::TerminateOwnedHandle("launch".into());
+    assert!(decode(vec![one(1, 7, "api", "boot")], terminate()).is_ok());
+    for bad in [
+        vec![one(0, 7, "api", "boot")],
+        vec![one(1, 0, "api", "boot")],
+        vec![one(1, 7, "", "boot")],
+        vec![one(1, 7, "api", "")],
+        vec![one(1, 7, &"r".repeat(65), "boot")],
+        vec![one(1, 7, "api", "boot"), one(1, 7, "worker-0", "boot")],
+        (1..=65).map(|pid| one(pid, 7, "api", "boot")).collect(),
+    ] {
+        assert!(decode(bad, terminate()).is_err());
+    }
+    // Only a Terminate carries recorded identities.
+    assert!(decode(
+        vec![one(1, 7, "api", "boot")],
+        pb::execute_member::Action::ProbeOwnedHandle("launch".into())
+    )
     .is_err());
 }

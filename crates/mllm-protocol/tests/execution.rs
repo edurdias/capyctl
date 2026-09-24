@@ -22,6 +22,7 @@ fn command() -> pb::ServerToAgent {
             }),
             action: Some(pb::execute_member::Action::Inspect(true)),
             restore_checkpoint_digest: String::new(),
+            terminate_recorded_processes: Vec::new(),
         })),
     }
 }
@@ -90,6 +91,7 @@ fn canonical_digest_binds_identity_deadline_and_action() {
         MemberAction::CloseIngress,
         MemberAction::Terminate {
             owned_handle: "owned".into(),
+            recorded: Vec::new(),
         },
     ] {
         let mut changed = original.clone();

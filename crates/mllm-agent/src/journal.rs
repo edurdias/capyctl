@@ -827,7 +827,7 @@ impl HostJournal {
                 self.refresh_owned(&tools)?;
                 self.complete(&ticket.command_id)?;
             }
-            MemberAction::Terminate { owned_handle } => {
+            MemberAction::Terminate { owned_handle, .. } => {
                 // Every branch below runs under the transition lock taken above,
                 // which is also held across any spawn of this owner's launch
                 // tools. A spawn therefore either finished (and journaled its
@@ -1477,7 +1477,7 @@ impl HostJournal {
             (load_command(&db, command_id)?, record(&db, command_id)?)
         };
         let handle = match &command.action {
-            MemberAction::Terminate { owned_handle }
+            MemberAction::Terminate { owned_handle, .. }
             | MemberAction::Probe { owned_handle }
             | MemberAction::Park { owned_handle }
             | MemberAction::Restore { owned_handle, .. } => owned_handle.clone(),
@@ -1488,11 +1488,34 @@ impl HostJournal {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             !db.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE command_id=?1)", [&handle], |r| r.get::<_, bool>(0))?
         };
+        // ADR 0016: a Terminate of a handle this host has no launch record of
+        // (it was fenced when first named, typically because the journal was
+        // lost and the host re-enrolled) observes the identities the server
+        // recorded. Nothing is signalled, adopted or journaled as owned; each
+        // identity's presence is reported as observed now, so the server can
+        // settle the launch on gone evidence by identity and never while any
+        // of them is alive.
+        let recorded_only = match &command.action {
+            MemberAction::Terminate { recorded, .. } if !recorded.is_empty() => {
+                let db = self.db.lock().map_err(|_| JournalError::Storage)?;
+                fenced_handle(&db, &handle)?.then(|| recorded.clone())
+            }
+            _ => None,
+        };
         let (processes, claim_retained) = if handle.is_empty() {
             (Vec::new(), record.claim_retained)
         } else if unknown_probe_target {
             // A probe of a launch this host never accepted observes nothing.
             (Vec::new(), false)
+        } else if let Some(recorded) = recorded_only {
+            let observed = recorded
+                .into_iter()
+                .map(|identity| {
+                    let presence = mllm_launchers::process_absence::presence(&identity);
+                    (identity, presence)
+                })
+                .collect();
+            (observed, false)
         } else {
             let observations = self.inspect_owned(&handle)?;
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
@@ -1688,6 +1711,20 @@ fn alive_identities(result: &pb::MemberExecutionResult) -> Vec<ProcessIdentity> 
         })
         .collect()
 }
+/// ADR 0016: whether `handle` names only the fence a Terminate wrote for a
+/// launch this host never accepted (no body, operation `fenced:<command>`),
+/// as opposed to a launch it accepted, compacted or not.
+fn fenced_handle(db: &Connection, handle: &str) -> Result<bool, JournalError> {
+    Ok(db
+        .query_row(
+            "SELECT body IS NULL AND operation LIKE 'fenced:%' FROM commands WHERE command_id=?1",
+            [handle],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
     identities.sort_by(|a, b| {
         (&a.role, a.pid, &a.boot_id, a.start_ticks).cmp(&(&b.role, b.pid, &b.boot_id, b.start_ticks))
@@ -1718,7 +1755,7 @@ fn same_owner(owner: &MemberCommand, command: &MemberCommand) -> bool {
 fn fence_instance(db: &Connection, command: &MemberCommand) -> Result<u32, JournalError> {
     let declared = command.identity.instance_index;
     let named = match &command.action {
-        MemberAction::Terminate { owned_handle }
+        MemberAction::Terminate { owned_handle, .. }
         | MemberAction::Probe { owned_handle }
         | MemberAction::Park { owned_handle }
         | MemberAction::Restore { owned_handle, .. } => owned_handle,

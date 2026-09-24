@@ -4,6 +4,55 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Revoked host recovery — 2026-09-24 (branch `feat/host-recovery`)
+
+Owner decision 2026-09-24: a revoked host recovers by re-enrolling under the
+**same** identity (ADR 0016, amending SPEC §4.1). Implemented on
+`feat/host-recovery`, rebased on `origin/main` `4decb9e` (after PR #3 host
+revocation, PR #4 packaging and PR #5 schema downgrade guard; store v32 lands
+after the guard).
+
+- `mllm invite host <name|id> --recover --output FILE`: an explicit, single-use
+  recovery invitation, 15 minutes by default (at most one hour), bound to the
+  revoked host's id and journaled (`host_recovery_invited`). A host that is not
+  revoked is refused `host_not_revoked` (409); an unknown host is `not_found`.
+  An ordinary invitation for a revoked name is still refused.
+- `mllm join host --join-file FILE --recover`: the host keeps its state and
+  journal (or starts from fresh identity files if they were lost), always
+  generates a new key, and gets a new certificate for the same host id
+  (`host_recovered`). An ordinary join refuses a recovery invitation and
+  `--recover` refuses an ordinary one. A retained identity for another host or
+  controller is refused, never adopted.
+- Revocation is now per certificate as well as per host (store v32): the old
+  certificate stays refused after recovery; certificates of hosts revoked before
+  v32 are carried in as revoked.
+- On reconnect the existing reconciliation runs: a still-owned Ready engine is
+  re-proven by a fresh probe against its recorded identities before dispatch
+  reopens (not relaunched). A host that lost its journal re-proves nothing; its
+  engines stay closed and charged until an operator stop settles them on gone
+  evidence. For that, a Terminate now carries the server's recorded process
+  identities (additive protocol field); a host with no record of the launch only
+  observes and reports them, never signals them, so the launch is never released
+  while one is alive.
+
+Tests (CPU and Fake-engine only; not qualification): `mllm-cli`
+`host_recovery` drives the real server and host binaries over mutual TLS (deploy
+a fake engine, revoke, dispatch closed and reconnect refused, recovery of an
+active host refused, recover by name, join `--recover`, same host id, engine
+re-proven and served without relaunch, old certificate refused, invitation
+single-use; and a lost-journal variant with an expired invitation refused,
+dispatch closed and accounting retained while the engine runs, and an operator
+stop issued while the host was away completing only on gone evidence by
+identity). Also store, controller (real mTLS session), agent journal and
+enrollment, protocol, management and grammar tests (T05 T06 T33 T34).
+Local verification after the rebase on `4decb9e`: core 985 reported (984
+distinct), workspace all-targets 1710, all passing; Clippy clean with warnings
+denied. The
+lost-journal test was shown to fail (stop never settles) with the recorded
+identities removed from the Terminate. One early run hit a transient
+`revoke host` request-journal refusal that did not recur in five later runs.
+Pending: live rows M45 (revocation) and a live recovery row on the Sparks.
+
 ## Schema downgrade guard and standalone `--config` — 2026-09-24 (branch `fix/schema-guard-standalone-config`)
 
 Closes the two gaps the packaging guide found, verified locally only (CPU
