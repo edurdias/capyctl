@@ -88,7 +88,12 @@ pub(super) fn identity(role: &str, pid: u32) -> ProcessIdentity {
 /// An ordinary managed deployment, accepted and armed, ready for its owned
 /// launch to be recorded. Mirrors `a_parking_deployment_gets_a_declared_identity`'s
 /// setup one step further: through `arm_step` and `initialize_execution`.
-pub(super) fn armed_ordinary() -> (Store, CoordinatorSession, DeploymentFence, StepExecutionContext) {
+pub(super) fn armed_ordinary() -> (
+    Store,
+    CoordinatorSession,
+    DeploymentFence,
+    StepExecutionContext,
+) {
     let (config, host) = fixture();
     let effective = resolve_effective(&config, &host).unwrap();
     let store = Store::open_in_memory().unwrap();
@@ -135,7 +140,9 @@ pub(super) fn armed_ordinary() -> (Store, CoordinatorSession, DeploymentFence, S
         policy.controls.observation_ttl_ms,
         policy.controls.max_parked as usize,
     );
-    store.arm_step(&session, &accepted.step_id, context).unwrap();
+    store
+        .arm_step(&session, &accepted.step_id, context)
+        .unwrap();
     let execution = store
         .initialize_execution(&session, &accepted.step_id)
         .unwrap();
@@ -161,7 +168,12 @@ fn record_launch_accepts_the_api_identity_the_association_wrote() {
         receipt: "vllm ready".into(),
     };
     store
-        .record_owned_launch(&session, &execution.token.step_id, &receipt, execution.issued_at_ms)
+        .record_owned_launch(
+            &session,
+            &execution.token.step_id,
+            &receipt,
+            execution.issued_at_ms,
+        )
         .unwrap();
 }
 
@@ -171,7 +183,12 @@ fn record_launch_accepts_the_api_identity_the_association_wrote() {
 fn record_launch_refuses_a_mismatched_prior_identity() {
     let (store, session, fence, execution) = armed_ordinary();
     store
-        .record_api_identity(&session, &fence, &execution.binding_id, &identity("api", 999))
+        .record_api_identity(
+            &session,
+            &fence,
+            &execution.binding_id,
+            &identity("api", 999),
+        )
         .unwrap();
     let receipt = OwnedLaunchReceipt {
         binding_id: execution.binding_id.clone(),
@@ -181,7 +198,12 @@ fn record_launch_refuses_a_mismatched_prior_identity() {
         receipt: "vllm ready".into(),
     };
     assert!(matches!(
-        store.record_owned_launch(&session, &execution.token.step_id, &receipt, execution.issued_at_ms),
+        store.record_owned_launch(
+            &session,
+            &execution.token.step_id,
+            &receipt,
+            execution.issued_at_ms
+        ),
         Err(LifecycleError::Conflict)
     ));
 }

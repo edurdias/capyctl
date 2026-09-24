@@ -4,15 +4,19 @@ use super::*;
 pub(super) const ERROR_CODE: &str = "deadline_expired_unarmed";
 
 fn no_effects(tx: &Transaction<'_>, p: &Plan) -> Result<(), LifecycleError> {
-    no_effects_with_successor(tx, p, None, true)
+    no_effects_with_successor(tx, p, None, None, true)
 }
 
 // Only the closed unarmed Stop validator may admit its separately validated
 // successor. Historical reads ignore a replacement's current ownership.
+/// `successor_generation` is the generation the successor's fence moved the
+/// instance to (ADR 0013 §5: drawn from the deployment's counter, so not
+/// necessarily the next integer); without one it is taken as the next.
 pub(super) fn no_effects_with_successor(
     tx: &Transaction<'_>,
     p: &Plan,
     successor: Option<(&str, &str)>,
+    successor_generation: Option<i64>,
     current: bool,
 ) -> Result<(), LifecycleError> {
     if p.execution.is_some() {
@@ -24,10 +28,10 @@ pub(super) fn no_effects_with_successor(
          AND NOT EXISTS(SELECT 1 FROM lifecycle_evidence WHERE step_id IN (SELECT id FROM lifecycle_steps WHERE id=?2 OR binding_id=?1))
          AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE (id=?2 OR binding_id=?1) AND (state IN ('armed','uncertain') OR (state='completed' AND id IS NOT ?6) OR grant_id IS NOT NULL))
          AND NOT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?4 OR operation_id=?7)
-         AND ((?8=0 AND EXISTS(SELECT 1 FROM deployments WHERE id=?5 AND (revision>?9 OR current_generation>?10+1))) OR NOT EXISTS(SELECT 1 FROM resource_owners WHERE owner_id=?5))
-         AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?5 AND (?8 OR (revision<=?9 AND generation<=?10+1)))
+         AND ((?8=0 AND EXISTS(SELECT 1 FROM deployment_instances i WHERE i.deployment_id=?5 AND i.instance_index=?11 AND (i.revision>?9 OR i.generation>COALESCE(?12,?10+1)))) OR NOT EXISTS(SELECT 1 FROM resource_owners WHERE deployment_id=?5 AND instance_index=?11))
+         AND NOT EXISTS(SELECT 1 FROM request_leases WHERE deployment_id=?5 AND instance_index=?11 AND (?8 OR (revision<=?9 AND generation<=COALESCE(?12,?10+1))))
          AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE binding_id=?1 AND id!=?2 AND id IS NOT ?6)",
-        params![p.binding_id,p.step_id,p.incarnation,p.operation_id,p.deployment_id,successor.map(|s|s.0),successor.map(|s|s.1),current,p.revision,p.generation],
+        params![p.binding_id,p.step_id,p.incarnation,p.operation_id,p.deployment_id,successor.map(|s|s.0),successor.map(|s|s.1),current,p.revision,p.generation,p.instance_index,successor_generation],
         |r| r.get(0),
     )?;
     if !clean {
@@ -49,9 +53,9 @@ pub(super) fn terminal(
     validate_local(tx, p, effective, "cancelled")?;
     no_effects(tx, p)?;
     let exact: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='stopped' AND observed_state='stopped' AND suspended=0 AND admission_enabled=0 AND dispatch_enabled=0)
-         AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1 OR operation_id=?4)",
-        params![p.deployment_id,p.revision,p.generation,p.operation_id],|r|r.get(0),
+        "SELECT EXISTS(SELECT 1 FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='stopped' AND observed_state='stopped' AND suspended=0 AND admission_enabled=0 AND dispatch_enabled=0)
+         AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE (deployment_id=?1 AND instance_index=?5) OR operation_id=?4)",
+        params![p.deployment_id,p.revision,p.generation,p.operation_id,p.instance_index],|r|r.get(0),
     )?;
     if !exact {
         return Err(LifecycleError::Stale);
@@ -102,14 +106,14 @@ pub(super) fn expire_in_transaction(
         return Err(LifecycleError::Conflict);
     }
     no_effects(tx, p)?;
-    let stopped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND observed_state='stopped' AND dispatch_enabled=0)",[&p.deployment_id],|r|r.get(0))?;
+    let stopped: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2 AND observed_state='stopped' AND dispatch_enabled=0)",params![p.deployment_id,p.instance_index],|r|r.get(0))?;
     if !stopped {
         return Err(LifecycleError::Conflict);
     }
     one(tx.execute("UPDATE lifecycle_steps SET state='cancelled' WHERE id=?1 AND state='planned' AND session_id=?2 AND grant_id IS NULL",params![p.step_id,session.id()])?)?;
     one(tx.execute("UPDATE lifecycle_runs SET state='failed' WHERE operation_id=?1 AND session_id=?2 AND state='queued'",params![p.operation_id,session.id()])?)?;
     one(tx.execute("UPDATE operations SET state='failed',error_code=?2 WHERE id=?1 AND state='pending' AND error_code IS NULL",params![p.operation_id,ERROR_CODE])?)?;
-    one(tx.execute("UPDATE deployments SET desired_state='stopped',observed_state='stopped',admission_enabled=0,dispatch_enabled=0 WHERE id=?1 AND revision=?2 AND current_generation=?3",params![p.deployment_id,p.revision,p.generation])?)?;
+    one(tx.execute("UPDATE deployment_instances SET desired_state='stopped',observed_state='stopped',admission_enabled=0,dispatch_enabled=0 WHERE deployment_id=?1 AND revision=?2 AND generation=?3",params![p.deployment_id,p.revision,p.generation])?)?;
     one(tx.execute("UPDATE runtime_bindings SET state='released' WHERE id=?1 AND incarnation=?2 AND state='reserved'",params![p.binding_id,p.incarnation])?)?;
     // Spec §3: the key row is deleted in the same transaction that releases the
     // binding, so the stored secret set is exactly the set of engines that exist.

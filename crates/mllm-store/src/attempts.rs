@@ -28,8 +28,13 @@ impl crate::Store {
             return Err(StoreError::Conflict);
         }
         self.conn.execute(
-            "INSERT INTO deployment_attempts(deployment_id,revision,generation,attempts,last_attempt_ms)
-             VALUES(?1,?2,?3,1,?4)
+            // ADR 0013 §6: the budget is per instance. A generation is drawn by
+            // exactly one instance activation, so the fence already names one
+            // instance incarnation; the index is recorded for status.
+            "INSERT INTO deployment_attempts(deployment_id,revision,generation,attempts,last_attempt_ms,instance_index)
+             VALUES(?1,?2,?3,1,?4,COALESCE((SELECT instance_index FROM lifecycle_runs
+               WHERE deployment_id=?1 AND revision=?2 AND generation=?3 AND action='activate'
+               ORDER BY rowid DESC LIMIT 1),0))
              ON CONFLICT(deployment_id,revision,generation)
              DO UPDATE SET attempts = attempts + 1, last_attempt_ms = ?4",
             params![fence.deployment_id, fence.revision, fence.generation, now_ms],

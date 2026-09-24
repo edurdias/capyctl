@@ -12,6 +12,13 @@ const ERROR_CODE: &str = "stopped_before_initialize_armed";
 enum StopKind {
     OrdinaryCleanup,
     OrdinaryUnarmedStop,
+    /// SPEC §6.3: an operator's Stop of a deployment that held nothing. The
+    /// intent was recorded and there was nothing to clean up.
+    AdministrativeStopRecorded,
+    /// SPEC §6.3 (live M47): an operator's Stop accepted while a launch was
+    /// still in flight with no association yet. It is carried out by an
+    /// ordinary Stop once the launch has settled.
+    AdministrativeStopDeferred,
 }
 
 /// Observation-only common command receipt. Legacy cleanup APIs retain their
@@ -35,6 +42,46 @@ impl OrdinaryStopReceipt {
     }
     pub fn revision(&self) -> i64 {
         self.revision
+    }
+
+    /// SPEC §6.3: the receipt of an operator's Stop that found nothing held.
+    /// No step, binding or incarnation exists, so those fields are empty; the
+    /// operation completed in the acceptance transaction.
+    ///
+    /// `deferred`: the Stop waits for an in-flight launch to settle and is then
+    /// carried out by an ordinary Stop (live M47).
+    pub(super) fn recorded(
+        deferred: bool,
+        operation_id: String,
+        revision: i64,
+        generation: i64,
+        accepted_at_ms: i64,
+        deadline_ms: i64,
+    ) -> Self {
+        Self {
+            kind: if deferred {
+                StopKind::AdministrativeStopDeferred
+            } else {
+                StopKind::AdministrativeStopRecorded
+            },
+            operation_id,
+            step_id: String::new(),
+            binding_id: String::new(),
+            incarnation: String::new(),
+            revision,
+            generation,
+            accepted_at_ms,
+            deadline_ms,
+        }
+    }
+
+    /// Whether this receipt is one `recorded` made, and whether it was deferred.
+    pub(super) fn recorded_kind(&self) -> Option<bool> {
+        match self.kind {
+            StopKind::AdministrativeStopRecorded => Some(false),
+            StopKind::AdministrativeStopDeferred => Some(true),
+            _ => None,
+        }
     }
 }
 impl From<OrdinaryCleanupReceipt> for OrdinaryStopReceipt {
@@ -61,6 +108,24 @@ struct StopPlan {
     key: String,
     receipt: OrdinaryStopReceipt,
     source: Plan,
+    /// Owner decision Q7: the instance scope the receipt was stored under;
+    /// absent means the deployment's scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    /// ADR 0013 §7: the revision the command named when it differs from the
+    /// source's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_revision: Option<i64>,
+}
+impl StopPlan {
+    fn command_scope(&self) -> String {
+        self.scope
+            .clone()
+            .unwrap_or_else(|| cleanup::scope(&self.source.deployment_id))
+    }
+    fn command_revision(&self) -> i64 {
+        self.command_revision.unwrap_or(self.source.revision)
+    }
 }
 fn target(p: &StopPlan) -> DeploymentFence {
     DeploymentFence {
@@ -120,7 +185,8 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<(StopPlan, String), LifecycleE
         || r.binding_id != original.binding_id
         || r.incarnation != original.incarnation
         || r.revision != original.revision
-        || Some(r.generation) != original.generation.checked_add(1)
+        // ADR 0013 §5: drawn from the deployment's counter, after the source's.
+        || r.generation <= original.generation
         || r.accepted_at_ms < original.accepted_at_ms
         || r.deadline_ms <= r.accepted_at_ms
         || r.deadline_ms
@@ -133,7 +199,7 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<(StopPlan, String), LifecycleE
     super::receipt::check_request(
         &p.principal,
         &original.deployment_id,
-        r.revision,
+        p.command_revision(),
         &p.key,
         r.deadline_ms,
     )
@@ -178,7 +244,7 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<(StopPlan, String), LifecycleE
     {
         return Err(LifecycleError::CorruptStoredData);
     }
-    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.grant_id IS NULL AND o.deployment_id=?3 AND o.kind='ordinary_unarmed_stop' AND o.state=?6 AND o.error_code IS NULL) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?7 AND s.step_json=?8 AND s.state=?9 AND s.grant_id IS NULL AND o.state=?10 AND o.error_code IS ?11) AND EXISTS(SELECT 1 FROM command_receipts WHERE principal_id=?12 AND command_scope=?13 AND idempotency_key=?14 AND request_hash=?15 AND operation_id=?2 AND response_json=?16) AND (SELECT COUNT(*) FROM command_receipts WHERE operation_id=?2)=1 AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE operation_id=?17)",params![id,r.operation_id,original.deployment_id,r.binding_id,original.session_id,if terminal {"succeeded"}else{"pending"},original.step_id,encode(original)?,if terminal {"cancelled"}else{"planned"},if terminal {"failed"}else{"pending"},terminal.then_some(ERROR_CODE),p.principal,cleanup::scope(&original.deployment_id),p.key,cleanup::hash(&p.principal,&original.fence(),r.deadline_ms)?,encode(r)?,original.operation_id],|r|r.get(0))?;
+    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.operation_id=?2 AND s.deployment_id=?3 AND s.binding_id=?4 AND s.session_id=?5 AND s.ordinal=0 AND s.grant_id IS NULL AND o.deployment_id=?3 AND o.kind='ordinary_unarmed_stop' AND o.state=?6 AND o.error_code IS NULL) AND (SELECT COUNT(*) FROM lifecycle_steps WHERE operation_id=?2)=1 AND EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE s.id=?7 AND s.step_json=?8 AND s.state=?9 AND s.grant_id IS NULL AND o.state=?10 AND o.error_code IS ?11) AND EXISTS(SELECT 1 FROM command_receipts WHERE principal_id=?12 AND command_scope=?13 AND idempotency_key=?14 AND request_hash=?15 AND operation_id=?2 AND response_json=?16) AND (SELECT COUNT(*) FROM command_receipts WHERE operation_id=?2)=1 AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE operation_id=?17)",params![id,r.operation_id,original.deployment_id,r.binding_id,original.session_id,if terminal {"succeeded"}else{"pending"},original.step_id,encode(original)?,if terminal {"cancelled"}else{"planned"},if terminal {"failed"}else{"pending"},terminal.then_some(ERROR_CODE),p.principal,p.command_scope(),p.key,cleanup::hash_in(&p.principal,&p.command_scope(),p.command_revision(),r.deadline_ms)?,encode(r)?,original.operation_id],|r|r.get(0))?;
     if !exact {
         return Err(LifecycleError::CorruptStoredData);
     }
@@ -186,6 +252,7 @@ fn read(tx: &Transaction<'_>, id: &str) -> Result<(StopPlan, String), LifecycleE
         tx,
         original,
         Some((&r.step_id, &r.operation_id)),
+        Some(r.generation),
         !terminal,
     )?;
     let b: BindingDto = decode(&original.binding_json)?;
@@ -213,17 +280,21 @@ fn current(
 ) -> Result<(), LifecycleError> {
     check_session(tx, session)?;
     let r = &p.receipt;
-    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='stopped' AND observed_state='stopped' AND suspended=0 AND admission_enabled=0 AND dispatch_enabled=0) AND EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1 AND operation_id=?4 AND revision=?2 AND generation=?3) AND (SELECT COUNT(*) FROM lifecycle_claims WHERE operation_id=?4)=1 AND (SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?1 AND state!='released')=1 AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE deployment_id=?1 AND id NOT IN (?5,?6) AND state IN ('planned','armed','uncertain'))",params![p.source.deployment_id,r.revision,r.generation,r.operation_id,p.source.step_id,r.step_id],|r|r.get(0))?;
+    // ADR 0013 §5: the instance's own fence, binding and work; its siblings
+    // may be running.
+    let exact:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='stopped' AND observed_state='stopped' AND suspended=0 AND admission_enabled=0 AND dispatch_enabled=0) AND EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1 AND operation_id=?4 AND revision=?2 AND generation=?3) AND (SELECT COUNT(*) FROM lifecycle_claims WHERE operation_id=?4)=1 AND (SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?1 AND instance_index=?7 AND state!='released')=1 AND NOT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND b.instance_index=?7 AND s.id NOT IN (?5,?6) AND s.state IN ('planned','armed','uncertain'))",params![p.source.deployment_id,r.revision,r.generation,r.operation_id,p.source.step_id,r.step_id,p.source.instance_index],|r|r.get(0))?;
     if !exact || p.source.session_id != session.id() {
         return Err(LifecycleError::Stale);
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lookup(
     tx: &Transaction<'_>,
     principal: &str,
-    f: &DeploymentFence,
+    deployment: &str,
+    revision: i64,
     key: &str,
     deadline: i64,
     operation: &str,
@@ -234,8 +305,8 @@ pub(super) fn lookup(
     if p.receipt != receipt
         || receipt.operation_id != operation
         || receipt.deadline_ms != deadline
-        || p.source.deployment_id != f.deployment_id
-        || receipt.revision != f.revision
+        || p.source.deployment_id != deployment
+        || p.command_revision() != revision
         || p.principal != principal
         || p.key != key
     {
@@ -253,8 +324,13 @@ pub(super) fn accept(
     key: &str,
     now: i64,
     deadline: i64,
+    command: &cleanup::StopCommand,
 ) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
-    let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND o.kind='initialize' AND b.state!='released' AND s.state='planned'",[&f.deployment_id],|r|r.get(0)).optional()?;
+    // ADR 0013 §5: the planned start of the instance the fence names.
+    let Some(instance) = crate::instances::generation_instance(tx, &f.deployment_id, f.generation)? else {
+        return Ok(None);
+    };
+    let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released' AND s.state='planned'",params![f.deployment_id,instance],|r|r.get(0)).optional()?;
     let Some(id) = id else { return Ok(None) };
     let (original, e, state) = load(tx, &id)?;
     // ADR 0011 decision 4: a deployment that gave up closes its own admission.
@@ -273,8 +349,8 @@ pub(super) fn accept(
     {
         return Err(LifecycleError::Conflict);
     }
-    expiry::no_effects_with_successor(tx, &original, None, true)?;
-    let stopped:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND observed_state='stopped' AND dispatch_enabled=0) AND NOT EXISTS(SELECT 1 FROM lifecycle_steps WHERE deployment_id=?1 AND id!=?2 AND state IN ('planned','armed','uncertain'))",params![f.deployment_id,id],|r|r.get(0))?;
+    expiry::no_effects_with_successor(tx, &original, None, None, true)?;
+    let stopped:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?3 AND observed_state='stopped' AND dispatch_enabled=0) AND NOT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND b.instance_index=?3 AND s.id!=?2 AND s.state IN ('planned','armed','uncertain'))",params![f.deployment_id,id,instance],|r|r.get(0))?;
     if !stopped {
         return Err(LifecycleError::Conflict);
     }
@@ -311,12 +387,15 @@ pub(super) fn accept(
         key: key.into(),
         receipt: receipt.clone(),
         source: original,
+        scope: command.scope.clone(),
+        command_revision: command.revision,
     };
     tx.execute("INSERT INTO lifecycle_steps(id,operation_id,ordinal,deployment_id,binding_id,session_id,state,step_json) VALUES(?1,?2,0,?3,?4,?5,'planned',?6)",params![receipt.step_id,receipt.operation_id,f.deployment_id,receipt.binding_id,s.id(),encode(&p)?])?;
-    tx.execute("INSERT INTO command_receipts(principal_id,command_scope,idempotency_key,request_hash,operation_id,response_json) VALUES(?1,?2,?3,?4,?5,?6)",params![principal,cleanup::scope(&f.deployment_id),key,cleanup::hash(principal,f,deadline)?,receipt.operation_id,encode(&receipt)?])?;
+    tx.execute("INSERT INTO command_receipts(principal_id,command_scope,idempotency_key,request_hash,operation_id,response_json) VALUES(?1,?2,?3,?4,?5,?6)",params![principal,p.command_scope(),key,cleanup::hash_in(principal,&p.command_scope(),p.command_revision(),deadline)?,receipt.operation_id,encode(&receipt)?])?;
+    // ADR 0013 §6: the stopping instance closes its own admission.
     one(tx.execute(
-        "UPDATE deployments SET admission_enabled=0 WHERE id=?1",
-        [&f.deployment_id],
+        "UPDATE deployment_instances SET admission_enabled=0 WHERE deployment_id=?1 AND instance_index=?2",
+        params![f.deployment_id, instance],
     )?)?;
     read(tx, &receipt.step_id)?;
     current(tx, s, &p)?;
@@ -409,9 +488,21 @@ impl crate::Store {
         &self,
         s: &CoordinatorSession,
     ) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
+        self.next_unarmed_stop_among(s, &Default::default())
+    }
+
+    /// As `next_unarmed_stop`, skipping every stop whose instance is in
+    /// `busy.instances`: its predecessor's task may still be running and must
+    /// exit, and report, before the stop completes.
+    // ADR 0015: completion still follows the predecessor's exit, per instance.
+    pub fn next_unarmed_stop_among(
+        &self,
+        s: &CoordinatorSession,
+        busy: &super::lanes::BusyLanes,
+    ) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, s)?;
-        let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE o.kind='ordinary_unarmed_stop' AND s.state='planned' AND s.session_id=?1 ORDER BY o.accepted_at,o.id LIMIT 1",[s.id()],|r|r.get(0)).optional()?;
+        let id:Option<String>=tx.query_row(&format!("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE o.kind='ordinary_unarmed_stop' AND s.state='planned' AND s.session_id=?1 AND {} ORDER BY o.accepted_at,o.id LIMIT 1", super::lanes::lane_free(2)),params![s.id(), busy.instances_json()?],|r|r.get(0)).optional()?;
         let Some(id) = id else { return Ok(None) };
         let (p, _) = read(&tx, &id)?;
         current(&tx, s, &p)?;

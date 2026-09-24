@@ -3,19 +3,38 @@
 //! idempotency, and owner-only file permissions.
 
 pub mod attempts;
+// ADR 0014 §7 (WE3): recorded checkpoint digests.
+pub mod checkpoint_digests;
 pub mod deployments;
+pub mod development_controls;
 pub mod dispatch;
 pub mod events;
+pub mod enrollment;
+pub mod host_drain;
+pub mod host_publication;
+// ADR 0013 §5: deployment instances.
+pub mod instances;
 pub mod lifecycle;
+// ADR 0014 amendment A1: default Initialize and Stop windows.
+pub mod lifecycle_windows;
 pub mod managed_configuration;
 pub mod migrations;
 pub mod ordinary_lifecycle;
-pub mod resource_ledger;
 pub mod residency;
+pub mod resource_ledger;
+// ADR 0007: resident floors attributed by process identity.
+mod resident_floors;
 pub mod resource_policy;
+mod resource_namespace;
 pub mod schema;
 pub mod secrets;
+// ADR 0013 §10 (I3): the router's read of serving instances.
+pub mod serving;
 pub mod snapshot;
+// W10 gaps: dispatch closure reasons, switch in progress, warm residency.
+pub mod switch_state;
+// SPEC §6.3 (W6): `delete deployment` after verified cleanup, leaving a tombstone.
+pub mod delete;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -24,10 +43,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 pub use deployments::{
-    AcceptDeployment, Accepted, DeploymentRow, GenerationRow, NewOperation, OpState,
-    OperationRow, ReservationRow,
+    AcceptDeployment, Accepted, DeploymentRow, GenerationRow, NewOperation, OpState, OperationRow,
+    ReservationRow,
 };
- 
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("conflict: the request clashes with existing store state")]
@@ -66,7 +85,10 @@ impl Store {
         set_pragmas(&conn)?;
         migrations::apply(&conn)?;
         set_owner_only(path)?;
-        Ok(Store { conn, secrets: None })
+        Ok(Store {
+            conn,
+            secrets: None,
+        })
     }
 
     /// In-memory store with the same schema and pragmas.
@@ -74,7 +96,10 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         set_pragmas(&conn)?;
         migrations::apply(&conn)?;
-        Ok(Store { conn, secrets: None })
+        Ok(Store {
+            conn,
+            secrets: None,
+        })
     }
 }
 

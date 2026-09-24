@@ -67,7 +67,10 @@ fn only_completed_steps_contribute_milestones() {
         step(&store, "s-1", 0, state);
         evidence(&store, "s-1", 1, r#""memory_released""#);
         assert!(
-            store.committed_milestones("bind-1", "inc-1").unwrap().is_empty(),
+            store
+                .committed_milestones("bind-1", "inc-1")
+                .unwrap()
+                .is_empty(),
             "a {state} step has decided nothing"
         );
     }

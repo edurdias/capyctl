@@ -41,17 +41,60 @@ impl crate::Store {
         &self,
         session: &CoordinatorSession,
     ) -> Result<Option<OrdinaryCleanupReceipt>, LifecycleError> {
+        self.next_ordinary_cleanup_reachable(session, None, 0)
+    }
+
+    /// As `next_ordinary_cleanup`, deferring every cleanup of a remote binding
+    /// whose host is not in `online` (owner decision 4, 2026-09-22). A deferred
+    /// cleanup is never armed, so nothing is sent and nothing is uncertain; it
+    /// stays planned, owned and charged until its host reconnects, and cleanups
+    /// on other hosts are not held behind it. `None` defers nothing.
+    ///
+    /// A remote cleanup whose accepted deadline passed while it was deferred can
+    /// no longer be armed (the arm refuses an elapsed deadline). It is not
+    /// selected, so it cannot halt the worker; it stays planned, owned and
+    /// charged, with its engine running. When it is a drain's Stop, its host's
+    /// reconnection closes it as expired and issues a fresh one
+    /// (`reissue_expired_drain_stops`); any other is left for the operator.
+    pub fn next_ordinary_cleanup_reachable(
+        &self,
+        session: &CoordinatorSession,
+        online: Option<&std::collections::BTreeSet<String>>,
+        now_ms: i64,
+    ) -> Result<Option<OrdinaryCleanupReceipt>, LifecycleError> {
+        Ok(self
+            .next_ordinary_cleanup_among(session, online, now_ms, &Default::default())?
+            .map(|(receipt, _)| receipt))
+    }
+
+    /// As `next_ordinary_cleanup_reachable`, skipping every cleanup whose
+    /// instance is in `busy.instances`, and answering with the instance the
+    /// cleanup belongs to (`None` for a binding without one), which is the lane
+    /// the coordinator drives it on.
+    // ADR 0015: a Stop never waits behind another deployment's effect.
+    pub fn next_ordinary_cleanup_among(
+        &self,
+        session: &CoordinatorSession,
+        online: Option<&std::collections::BTreeSet<String>>,
+        now_ms: i64,
+        busy: &super::lanes::BusyLanes,
+    ) -> Result<Option<(OrdinaryCleanupReceipt, Option<super::lanes::InstanceLane>)>, LifecycleError> {
+        let online = online
+            .map(|hosts| serde_json::to_string(hosts).map_err(|_| LifecycleError::Invalid))
+            .transpose()?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
         let id: Option<String> = tx.query_row(
-            "SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN lifecycle_runs r ON r.operation_id=s.operation_id WHERE o.kind='ordinary_cleanup' AND s.state='planned' AND s.session_id=?1 AND r.session_id=?1 ORDER BY o.accepted_at,o.id LIMIT 1",
-            [session.id()], |r| r.get(0),
+            &format!("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN lifecycle_runs r ON r.operation_id=s.operation_id WHERE o.kind='ordinary_cleanup' AND s.state='planned' AND s.session_id=?1 AND r.session_id=?1 AND (?2 IS NULL OR NOT EXISTS(SELECT 1 FROM remote_binding_ingress ri WHERE ri.binding_id=s.binding_id AND (ri.host_id NOT IN (SELECT value FROM json_each(?2)) OR r.deadline_ms<=?3))) AND {} ORDER BY o.accepted_at,o.id LIMIT 1", super::lanes::lane_free(4)),
+            params![session.id(), online, now_ms, busy.instances_json()?], |r| r.get(0),
         ).optional()?;
         let Some(id) = id else { return Ok(None) };
         let (p, e, state) = read(&tx, &id)?;
         current_cleanup(&tx, session, &p)?;
         retained(&tx, &p, &e, &state)?;
-        Ok(Some(p.receipt))
+        tx.commit()?;
+        let lane = self.binding_lane(&p.receipt.binding_id)?;
+        Ok(Some((p.receipt, lane)))
     }
 
     /// Strict observation, including canonical evidence, committed epoch and
@@ -74,6 +117,11 @@ impl crate::Store {
         }
         if state == "uncertain" {
             return Ok(OrdinaryCleanupStatus::Uncertain);
+        }
+        // Owner decision 2026-09-22: closed at its deadline, never armed; a
+        // drain issued a fresh Stop in its place.
+        if state == "cancelled" {
+            return Ok(OrdinaryCleanupStatus::Expired);
         }
         match current_cleanup(&tx, session, &p) {
             Err(LifecycleError::Stale) => return Ok(OrdinaryCleanupStatus::Superseded),
@@ -103,7 +151,7 @@ impl crate::Store {
         current_cleanup(&tx, session, &p)?;
         retained(&tx, &p, &e, &state)?;
         if state != "armed"
-            || context(&p)? != *expected
+            || context(&tx, &p)? != *expected
             || now < expected.issued_at_ms
             || now >= expected.deadline_ms
         {

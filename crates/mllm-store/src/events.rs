@@ -1,4 +1,4 @@
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{params, Transaction, TransactionBehavior};
 use serde::Serialize;
 
 const MAX_EVENTS: i64 = 100_000;
@@ -96,6 +96,26 @@ pub(crate) enum EventMetadata {
         generation: i64,
         session_epoch: i64,
     },
+    /// SPEC §6.3 (W6): the deployment's routes and instances were removed
+    /// after verified cleanup; its row remains as a tombstone.
+    #[serde(rename = "1")]
+    DeploymentDeleted {
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        revision: i64,
+        session_epoch: i64,
+    },
+    /// SPEC §§6.1, 6.3, 9.1 (W5): one park or restore of an instance's
+    /// retained launch, per persisted transition.
+    #[serde(rename = "1")]
+    ResidencyRecorded {
+        transition: ResidencyTransition,
+        operation_id: EventOperationId,
+        deployment_id: EventOperationId,
+        step_id: EventOperationId,
+        session_epoch: i64,
+        committed_epoch: Option<u64>,
+    },
     #[serde(rename = "1")]
     CoordinatorSessionStarted { session_epoch: i64 },
     #[serde(rename = "1")]
@@ -112,6 +132,45 @@ pub(crate) enum EventMetadata {
         ledger_epoch: u64,
         session_epoch: i64,
     },
+    /// ADR 0008 (owner decision 2026-09-23): a host reported that a launch
+    /// measured one of its engine installations to a different fingerprint
+    /// than the one registered at agent start. Evidence only; whether the
+    /// launch was refused is the host policy's (`installation_drift`).
+    #[serde(rename = "1")]
+    InstallationDriftFlagged {
+        host_id: String,
+        installation: String,
+        registered_digest: String,
+        observed_digest: String,
+    },
+    /// SPEC §10, ADR 0013 §8 (W10): one transition of a request-driven switch.
+    /// Victims are `deployment/instance`; each victim's park or stop is its
+    /// own operation with its own events.
+    #[serde(rename = "1")]
+    SwitchRecorded {
+        phase: SwitchPhase,
+        switch_id: String,
+        target_deployment: String,
+        host: Option<String>,
+        victims: Vec<String>,
+        detail: String,
+    },
+}
+
+/// SPEC §10 (W10): what a request-driven switch recorded.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchPhase {
+    /// A plan was chosen: the host and the victims to release there.
+    Planned,
+    /// The fairness window ended and the victims' admission closed.
+    AdmissionClosed,
+    /// Every victim drained and its park or stop completed on evidence.
+    Released,
+    /// The waiting deployment's instance is READY and dispatch is open.
+    Completed,
+    /// The switch failed; victims whose release was not accepted serve again.
+    Failed,
 }
 
 #[derive(Serialize)]
@@ -135,6 +194,10 @@ pub(crate) enum OrdinaryCleanupTransition {
     Armed,
     #[serde(rename = "cleanup_completed")]
     Completed,
+    /// Owner decision 2026-09-22: a drain Stop closed at its deadline before it
+    /// was ever armed, so no effect was sent.
+    #[serde(rename = "cleanup_expired_unarmed")]
+    ExpiredUnarmed,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +206,26 @@ pub(crate) enum UnarmedStopTransition {
     Accepted,
     #[serde(rename = "unarmed_stop_completed")]
     Completed,
+}
+/// SPEC §§6.1, 9.1 (W5): what a residency step recorded.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResidencyTransition {
+    ParkAccepted,
+    ParkArmed,
+    Parked,
+    /// Refused before any effect; the launch stays Ready.
+    ParkRefused,
+    /// The effect's outcome is unknown; accounting is retained.
+    ParkUncertain,
+    RestoreAccepted,
+    RestoreArmed,
+    Restored,
+    /// Refused before any effect; the launch stays parked.
+    RestoreRefused,
+    RestoreUncertain,
+    /// Closed without any effect (deadline, or superseded by a stop).
+    Cancelled,
 }
 #[derive(Clone)]
 pub(crate) struct EventOperationId(String);
@@ -170,6 +253,7 @@ impl EventMetadata {
                 OrdinaryCleanupTransition::Accepted => "ordinary_cleanup_accepted",
                 OrdinaryCleanupTransition::Armed => "ordinary_cleanup_armed",
                 OrdinaryCleanupTransition::Completed => "ordinary_cleanup_completed",
+                OrdinaryCleanupTransition::ExpiredUnarmed => "ordinary_cleanup_expired_unarmed",
             },
             Self::LifecycleRecorded { transition, .. } => match transition {
                 LifecycleTransition::Accepted => "initialize_accepted",
@@ -180,25 +264,117 @@ impl EventMetadata {
                 LifecycleTransition::ExpiredUnarmed => "initialize_expired_unarmed",
                 LifecycleTransition::LaunchFailed => "initialize_failed_released",
             },
+            Self::ResidencyRecorded { transition, .. } => match transition {
+                ResidencyTransition::ParkAccepted => "park_accepted",
+                ResidencyTransition::ParkArmed => "park_armed",
+                ResidencyTransition::Parked => "parked_committed",
+                ResidencyTransition::ParkRefused => "park_refused",
+                ResidencyTransition::ParkUncertain => "park_uncertain",
+                ResidencyTransition::RestoreAccepted => "restore_accepted",
+                ResidencyTransition::RestoreArmed => "restore_armed",
+                ResidencyTransition::Restored => "restored_committed",
+                ResidencyTransition::RestoreRefused => "restore_refused",
+                ResidencyTransition::RestoreUncertain => "restore_uncertain",
+                ResidencyTransition::Cancelled => "residency_cancelled",
+            },
             Self::ManagedConfigurationAccepted { .. } => "managed_configuration_accepted",
+            Self::DeploymentDeleted { .. } => "deployment_deleted",
             Self::CoordinatorSessionStarted { .. } => "coordinator_session_started",
             Self::HostResourcePolicyBootstrapped { .. } => "host_resource_policy_bootstrapped",
             Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
+            Self::InstallationDriftFlagged { .. } => "installation_drift_flagged",
+            Self::SwitchRecorded { phase, .. } => match phase {
+                SwitchPhase::Planned => "switch_planned",
+                SwitchPhase::AdmissionClosed => "switch_admission_closed",
+                SwitchPhase::Released => "switch_released",
+                SwitchPhase::Completed => "switch_completed",
+                SwitchPhase::Failed => "switch_failed",
+            },
         }
     }
 
     fn identifiers(&self) -> (Option<&str>, Option<&str>) {
         match self {
-            Self::UnarmedStopRecorded { operation_id, deployment_id, .. }
-            | Self::OrdinaryCleanupRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::LifecycleRecorded { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
-            Self::ManagedConfigurationAccepted { operation_id, deployment_id, .. } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
+            Self::UnarmedStopRecorded {
+                operation_id,
+                deployment_id,
+                ..
+            }
+            | Self::OrdinaryCleanupRecorded {
+                operation_id,
+                deployment_id,
+                ..
+            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
+            Self::LifecycleRecorded {
+                operation_id,
+                deployment_id,
+                ..
+            }
+            | Self::ResidencyRecorded {
+                operation_id,
+                deployment_id,
+                ..
+            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
+            Self::ManagedConfigurationAccepted {
+                operation_id,
+                deployment_id,
+                ..
+            }
+            | Self::DeploymentDeleted {
+                operation_id,
+                deployment_id,
+                ..
+            } => (Some(deployment_id.as_str()), Some(operation_id.as_str())),
             Self::CoordinatorSessionStarted { .. } => (None, None),
             Self::HostResourcePolicyBootstrapped { .. } => (None, None),
             Self::HostResourcePolicyUpdated { operation_id, .. } => {
                 (None, Some(operation_id.as_str()))
             }
+            Self::InstallationDriftFlagged { .. } => (None, None),
+            Self::SwitchRecorded {
+                target_deployment, ..
+            } => (Some(target_deployment.as_str()), None),
         }
+    }
+}
+
+impl crate::Store {
+    /// ADR 0008 (owner decision 2026-09-23): journal one installation drift a
+    /// host reported. Fields are bounded tokens (profile name, `sha256:`
+    /// digests or `unmeasured`); anything else is refused.
+    pub fn record_installation_drift(
+        &self,
+        host_id: &str,
+        installation: &str,
+        registered_digest: &str,
+        observed_digest: &str,
+    ) -> Result<(), crate::StoreError> {
+        let token = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
+        };
+        if ![host_id, installation, registered_digest, observed_digest]
+            .into_iter()
+            .all(token)
+        {
+            return Err(crate::StoreError::Conflict);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        append_event(
+            &tx,
+            &EventMetadata::InstallationDriftFlagged {
+                host_id: host_id.into(),
+                installation: installation.into(),
+                registered_digest: registered_digest.into(),
+                observed_digest: observed_digest.into(),
+            },
+        )
+        .map_err(|_| crate::StoreError::Conflict)?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
@@ -213,16 +389,31 @@ fn append_event_at(
     event: &EventMetadata,
     at: i64,
 ) -> Result<i64, EventWriteError> {
-    if let EventMetadata::UnarmedStopRecorded { session_epoch, committed_epoch, .. } = event {
+    if let EventMetadata::UnarmedStopRecorded {
+        session_epoch,
+        committed_epoch,
+        ..
+    } = event
+    {
         if *session_epoch <= 0 || committed_epoch.is_some() {
             return Err(EventWriteError::InvalidMetadata);
         }
     }
-    if let EventMetadata::OrdinaryCleanupRecorded { transition, committed_epoch, session_epoch, .. } = event {
-        if *session_epoch <= 0 || match transition {
-            OrdinaryCleanupTransition::Completed => committed_epoch.is_none_or(|epoch| epoch == 0),
-            _ => committed_epoch.is_some(),
-        } {
+    if let EventMetadata::OrdinaryCleanupRecorded {
+        transition,
+        committed_epoch,
+        session_epoch,
+        ..
+    } = event
+    {
+        if *session_epoch <= 0
+            || match transition {
+                OrdinaryCleanupTransition::Completed => {
+                    committed_epoch.is_none_or(|epoch| epoch == 0)
+                }
+                _ => committed_epoch.is_some(),
+            }
+        {
             return Err(EventWriteError::InvalidMetadata);
         }
     }
@@ -364,20 +555,36 @@ mod tests {
     fn ordinary_cleanup_writer_rejects_epoch_without_completion_and_missing_commit() {
         use super::*;
         for (transition, epoch, valid) in [
-            (OrdinaryCleanupTransition::Accepted,None,true),
-            (OrdinaryCleanupTransition::Armed,None,true),
-            (OrdinaryCleanupTransition::Completed,Some(7),true),
-            (OrdinaryCleanupTransition::Accepted,Some(7),false),
-            (OrdinaryCleanupTransition::Armed,Some(7),false),
-            (OrdinaryCleanupTransition::Completed,None,false),
-            (OrdinaryCleanupTransition::Completed,Some(0),false),
+            (OrdinaryCleanupTransition::Accepted, None, true),
+            (OrdinaryCleanupTransition::Armed, None, true),
+            (OrdinaryCleanupTransition::Completed, Some(7), true),
+            (OrdinaryCleanupTransition::Accepted, Some(7), false),
+            (OrdinaryCleanupTransition::Armed, Some(7), false),
+            (OrdinaryCleanupTransition::Completed, None, false),
+            (OrdinaryCleanupTransition::Completed, Some(0), false),
         ] {
-            let store=crate::Store::open_in_memory().unwrap();
-            let tx=Transaction::new_unchecked(&store.conn,TransactionBehavior::Immediate).unwrap();
-            let id=ulid::Ulid::new();
-            let result=append_event(&tx,&EventMetadata::OrdinaryCleanupRecorded{transition,operation_id:EventOperationId::generated(id),deployment_id:EventOperationId::generated(id),step_id:EventOperationId::generated(id),session_epoch:1,committed_epoch:epoch});
-            assert_eq!(result.is_ok(),valid);
-            assert_eq!(tx.query_row("SELECT COUNT(*) FROM management_events",[],|r|r.get::<_,i64>(0)).unwrap(),i64::from(valid));
+            let store = crate::Store::open_in_memory().unwrap();
+            let tx =
+                Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+            let id = ulid::Ulid::new();
+            let result = append_event(
+                &tx,
+                &EventMetadata::OrdinaryCleanupRecorded {
+                    transition,
+                    operation_id: EventOperationId::generated(id),
+                    deployment_id: EventOperationId::generated(id),
+                    step_id: EventOperationId::generated(id),
+                    session_epoch: 1,
+                    committed_epoch: epoch,
+                },
+            );
+            assert_eq!(result.is_ok(), valid);
+            assert_eq!(
+                tx.query_row("SELECT COUNT(*) FROM management_events", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                i64::from(valid)
+            );
         }
     }
     use super::*;
@@ -574,6 +781,24 @@ mod tests {
             s.events_after(Some(&format!("{i}:9223372036854775808")), 1),
             Err(EventReadError::MalformedCursor)
         ))
+    }
+    #[test]
+    // T21 T22: ADR 0008. A reported installation drift is journaled as a
+    // typed event; malformed fields are refused.
+    fn installation_drift_is_journaled_as_a_typed_event() {
+        let s = Store::open_in_memory().unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        s.record_installation_drift("host-1", "local", &digest, "unmeasured")
+            .unwrap();
+        let page = s.events_after(None, 10).unwrap();
+        let event = page.events.last().unwrap();
+        assert_eq!(event.kind, "installation_drift_flagged");
+        let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(payload["installation"], "local");
+        assert_eq!(payload["observed_digest"], "unmeasured");
+        assert!(s
+            .record_installation_drift("host-1", "local", &digest, "bad value")
+            .is_err());
     }
     #[test]
     fn payload_limit_accepts_exact_bytes_and_rejects_one_more() {

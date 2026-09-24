@@ -351,9 +351,11 @@ fn strict_input_rejects_activation_duplicates_unknown_fields_and_bounds() {
         ),
         " ".repeat((1 << 20) + 1),
     ] {
+        // A malformed envelope is `Invalid`; a refused configuration names
+        // its reason (`Rejected`, SPEC §15.3).
         assert!(matches!(
             store.create_stopped_managed_configuration(&session, "p", "k", &body, &host, 1),
-            Err(ManagedConfigurationError::Invalid)
+            Err(ManagedConfigurationError::Invalid | ManagedConfigurationError::Rejected(_))
         ));
     }
     for principal in ["".to_string(), "p\n".into(), "p".repeat(257)] {
@@ -426,7 +428,7 @@ fn current_policy_and_session_required_without_resetting_policy() {
 #[test]
 fn retained_accounting_or_runtime_denies_replacement_without_revision_change() {
     for insert in [
-        "INSERT INTO resource_owners(owner_id,footprint_json) VALUES(?1,'{}')",
+        "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES(?1,'{}',?1)",
         "INSERT INTO owners(id,kind,deployment_id) VALUES('owner','managed',?1)",
         "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition) VALUES('lease',?1,1,1,'old','uncertain')",
         "INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES('binding',?1,1,'incarnation','managed','{}','[]','uncertain')",
@@ -589,7 +591,7 @@ fn released_binding_with_retained_endpoint_still_blocks_update() {
     store
         .conn
         .execute(
-            "INSERT INTO endpoint_leases(host,port,binding_id) VALUES('lab',8100,'binding')",
+            "INSERT INTO endpoint_leases(host_id,host,port,binding_id) VALUES('','lab',8100,'binding')",
             [],
         )
         .unwrap();

@@ -7,6 +7,7 @@
 //! coordinator integration. Recorded identities are historical facts, not fresh
 //! proof of process ownership. Callers must never turn these DTOs into authority.
 
+use crate::development_controls::{from_stored, DevelopmentControls};
 use crate::{events::EventCursor, Store};
 use mllm_domain::resources::{ResourcePhase, Sharing};
 use rusqlite::{types::ValueRef, Row, Transaction, TransactionBehavior};
@@ -70,6 +71,135 @@ pub struct DeploymentSnapshot {
     pub suspended: bool,
     /// Current revision fingerprint only; never the raw effective configuration.
     pub effective_fingerprint: Option<String>,
+    /// SPEC §9.1 / T21 / P4: whether this revision's launch enables vLLM
+    /// development mode, derived from its effective configuration. Additive.
+    pub development_controls: DevelopmentControls,
+    /// Owner decision 2026-09-22 (schema v19): set when the upgrade could not
+    /// carry this revision's pre-E1 engine settings forward. Everything the
+    /// deployment owns is retained; the text says what the operator must do.
+    /// Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_action: Option<String>,
+    /// ADR 0014 §7 (WE3): the current revision's checkpoint digest record;
+    /// `state: pending` is the `checkpoint_digest_pending` condition. Absent
+    /// for a revision accepted before WE3 whose digest is not yet recorded.
+    /// Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_digest: Option<crate::checkpoint_digests::CheckpointDigest>,
+    /// ADR 0013 §6: the current revision's declared instance count. Additive.
+    pub desired_instances: u32,
+    /// ADR 0013 §6: instances whose derived state is `ready`. Additive.
+    pub ready_instances: u32,
+    /// ADR 0013 §6: `degraded` when at least one instance is READY but fewer
+    /// than the desired count (declared, less operator-stopped instances) are.
+    /// Additive.
+    pub conditions: Vec<&'static str>,
+    /// ADR 0013 §6: every instance: index, placement, generation, derived state,
+    /// reservation owner and its own development-control mark. Additive.
+    pub instances: Vec<InstanceSnapshot>,
+    /// ADR 0013 §3: every allowed host the current revision was resolved
+    /// against, and the reason each refusing host refused. A refusing host is
+    /// never a placement candidate. Additive.
+    pub hosts: Vec<HostResolutionSnapshot>,
+    /// ADR 0014 amendment A1: the current revision's timeouts and the windows
+    /// a start or stop that names no deadline is given. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<crate::lifecycle_windows::LifecycleWindows>,
+    /// Owner decision 2026-09-23: the current revision's startup reservation
+    /// with its provenance (`declared`, `default`, `resources` or `request`)
+    /// and every startup peak measured for it. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<crate::ordinary_lifecycle::startup::StartupStatus>,
+    /// W10 (owner decision 2026-09-23): the switch in progress that names this
+    /// deployment as its target or a victim: target, host, victims and phase.
+    /// Additive; absent when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch: Option<crate::switch_state::SwitchStatus>,
+    /// SPEC §6.5 (ADR 0013 amendment 2026-09-23): the current revision
+    /// declares a warm-residency commitment. Additive; absent when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub warm: bool,
+    /// SPEC §6.4: the deployment's most recently accepted operation, with its
+    /// closed error code, the recorded reason and a fixed operator hint.
+    /// Additive; absent when the deployment has no operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_operation: Option<LatestOperation>,
+}
+
+/// SPEC §6.4: an operation and its error as status shows them. The reason is
+/// the latest journal evidence of an operation that did not succeed, bounded
+/// and redacted (`mllm_domain::diagnostics::public_reason`): one line, never an
+/// engine log tail, an option value or a credential. The hint is fixed text
+/// for the closed category the error belongs to. Recorded history, not proof
+/// of what runs now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LatestOperation {
+    pub id: String,
+    pub kind: String,
+    pub state: String,
+    /// Only a closed code (`[a-z0-9_:.]`); anything else is not shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<&'static str>,
+}
+
+/// ADR 0013 §3: one allowed host's resolution of the current revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostResolutionSnapshot {
+    pub host_id: String,
+    /// `resolved` or `refused`.
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+/// ADR 0013 §6: one instance of a deployment. Recorded placement and identity
+/// are historical facts, not proof that a process runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstanceSnapshot {
+    pub index: u32,
+    /// The placed host; absent until an activation places the instance.
+    pub host_id: Option<String>,
+    /// The devices chosen at placement; absent until placed.
+    pub devices: Option<serde_json::Value>,
+    /// The generation its last activation drew; absent until activated.
+    pub generation: Option<String>,
+    /// Derived per instance (SPEC §6.1, ADR 0013 §6): `uncertain`, `starting`,
+    /// `queued` (accepted, or waiting for a host to fit), `stopping`,
+    /// `reconciling`, `ready`, `parking`, `parked`, `waking` (W5), `failed`
+    /// (it gave up and closed its own admission) or `stopped`. A runtime
+    /// nothing can interpret reads `uncertain`, never `stopped`.
+    pub observed_state: String,
+    /// The revision its current incarnation was admitted against; absent
+    /// until it first starts. A count-only revision leaves it unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// The closed placement or start diagnostic, when it has one (for
+    /// example no allowed host fits without eviction). Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// `active`, or `retiring` while a count decrease drains it.
+    pub lifecycle: String,
+    /// Owner decision Q7: stopped by `stop instance`.
+    pub operator_stopped: bool,
+    /// The resource owner charged for this instance, when it holds a reservation.
+    pub reservation_owner: Option<String>,
+    /// SPEC §9.1 / T21 / P4 (W14): the mark of the revision as resolved on
+    /// this instance's host, or the deployment's revision while unplaced.
+    pub development_controls: DevelopmentControls,
+    /// Owner decision 2026-09-23: the startup reservation its start in
+    /// flight holds (armed) or will hold (queued) until Ready, with its
+    /// provenance (`measured` when a first run's peak replaced the default).
+    /// Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<crate::ordinary_lifecycle::startup::StartupReservation>,
+    /// SPEC §6.4: this instance's most recently accepted operation and its
+    /// error (see [`LatestOperation`]). Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_operation: Option<LatestOperation>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouteSnapshot {
@@ -84,6 +214,10 @@ pub struct OperationSnapshot {
     pub action: String,
     pub state: String,
     pub has_error: bool,
+    /// SPEC §6.4: the error's closed code; a code of any other shape is not
+    /// shown. Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     /// Existing persisted ISO timestamp, not a fabricated millisecond value.
     pub accepted_at: String,
 }
@@ -248,6 +382,76 @@ fn boolean(row: &Row<'_>, column: usize) -> Result<bool, SnapshotError> {
     }
 }
 
+/// A text scalar of the current effective revision, or NULL when the stored
+/// configuration is not valid JSON or the value is absent or not text. It is
+/// cut to 64 bytes, so an oversized value decodes as unrecognized instead of
+/// failing the bounded read. SQLite
+/// evaluates only the taken `CASE` branch, so malformed JSON never raises.
+fn effective_text(path: &str) -> String {
+    json_text("e.effective_json", path)
+}
+fn json_text(column: &str, path: &str) -> String {
+    format!("CASE WHEN json_valid({column}) THEN CASE WHEN json_type({column},'{path}')='text' THEN substr(json_extract({column},'{path}'),1,64) END END")
+}
+/// A boolean scalar as 1/0, or 2 when present but not a boolean, else NULL.
+fn effective_bool(path: &str) -> String {
+    json_bool("e.effective_json", path)
+}
+fn json_bool(column: &str, path: &str) -> String {
+    format!("CASE WHEN json_valid({column}) THEN CASE WHEN json_type({column},'{path}') IS NULL THEN NULL WHEN json_type({column},'{path}')='true' THEN 1 WHEN json_type({column},'{path}')='false' THEN 0 ELSE 2 END END")
+}
+
+/// The reported observed state (SPEC §§6.1, 6.4; Phase B follow-up). The stored
+/// `observed_state` changes only on evidence, so on its own it reads `stopped`
+/// while a start is queued or running and `ready` while dispatch is closed for a
+/// readiness re-proof. Status derives what is actually happening, in order:
+/// - `uncertain`: a launch or cleanup outcome is unresolved (G3);
+/// - `parking` / `waking`: a park or restore of the instance is accepted and
+///   not yet settled (W5; its stored state changes only on evidence);
+/// - `queued` / `starting`: an activation is accepted and not yet sent, or sent
+///   and not yet Ready;
+/// - `stopping`: a stop is accepted and its cleanup not yet verified;
+/// - `reconciling`: Ready by evidence, but dispatch is closed while readiness is
+///   re-proven (host session loss or restart, engine exit, or leases a crashed
+///   session left behind) for a coordinator-managed deployment;
+/// - `failed`: stopped, and the latest operation was the verified cleanup that
+///   followed an engine exit (W13, principal `system:engine_exit`); the next
+///   start or on-demand activation replaces it, and an operator's Stop (SPEC
+///   §6.3, `admin_stopped`) acknowledges it as `stopped`;
+/// - otherwise the stored state.
+///
+/// ADR 0013 §6: the same derivation for one instance `i`, over its own runs,
+/// steps, bindings and reservation. ADR 0013 §7: compaction moves an instance
+/// into an index earlier incarnations used, so the closed-history rules (the
+/// two `failed` cases) read only runs of the instance's current generation
+/// (generations are drawn once per deployment, so each names one
+/// incarnation). The open-run rules need no filter: an instance with a run in
+/// flight is never moved.
+const INSTANCE_OBSERVED_STATE: &str = "CASE \
+ WHEN EXISTS(SELECT 1 FROM lifecycle_steps u JOIN runtime_bindings ub ON ub.id=u.binding_id WHERE u.deployment_id=i.deployment_id AND ub.instance_index=i.instance_index AND u.state='uncertain') THEN 'uncertain' \
+ WHEN EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND o.kind='park' AND r.state IN ('queued','running')) THEN 'parking' \
+ WHEN EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND o.kind='restore' AND r.state IN ('queued','running')) THEN 'waking' \
+ WHEN i.observed_state!='ready' AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='activate' AND r.state IN ('queued','running')) THEN \
+   CASE WHEN EXISTS(SELECT 1 FROM lifecycle_runs r JOIN lifecycle_steps t ON t.operation_id=r.operation_id WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='activate' AND r.state IN ('queued','running') AND t.state='armed') THEN 'starting' ELSE 'queued' END \
+ WHEN i.observed_state!='stopped' AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.action='stop' AND r.state IN ('queued','running')) THEN 'stopping' \
+ WHEN i.observed_state='ready' AND i.dispatch_enabled=0 AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index) THEN 'reconciling' \
+ WHEN i.observed_state='stopped' AND (EXISTS(SELECT 1 FROM runtime_bindings b WHERE b.deployment_id=i.deployment_id AND b.instance_index=i.instance_index AND b.state!='released') OR EXISTS(SELECT 1 FROM resource_owners o WHERE o.deployment_id=i.deployment_id AND o.instance_index=i.instance_index)) THEN 'uncertain' \
+ WHEN i.observed_state='stopped' AND i.pending_start_until_ms IS NOT NULL THEN 'queued' \
+ WHEN i.observed_state='stopped' AND NOT EXISTS(SELECT 1 FROM deployments sd WHERE sd.id=i.deployment_id AND sd.admin_stopped=1) AND (SELECT c.principal_id FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id JOIN command_receipts c ON c.operation_id=o.id WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.generation=i.generation ORDER BY o.accepted_at DESC,o.id DESC LIMIT 1)='system:engine_exit' THEN 'failed' \
+ WHEN i.observed_state='stopped' AND i.desired_state='ready' AND i.admission_enabled=0 AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=i.deployment_id AND r.instance_index=i.instance_index AND r.generation=i.generation AND r.action='activate') THEN 'failed' \
+ ELSE i.observed_state END";
+
+const OBSERVED_STATE: &str = "CASE \
+ WHEN EXISTS(SELECT 1 FROM lifecycle_steps u WHERE u.deployment_id=d.id AND u.state='uncertain') THEN 'uncertain' \
+ WHEN d.observed_state!='ready' AND EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=d.id AND o.kind='restore' AND r.state IN ('queued','running')) THEN 'waking' \
+ WHEN d.observed_state='ready' AND d.dispatch_enabled=0 AND EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE r.deployment_id=d.id AND o.kind='park' AND r.state IN ('queued','running')) THEN 'parking' \
+ WHEN d.observed_state!='ready' AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=d.id AND r.action='activate' AND r.state IN ('queued','running')) THEN \
+   CASE WHEN EXISTS(SELECT 1 FROM lifecycle_runs r JOIN lifecycle_steps t ON t.operation_id=r.operation_id WHERE r.deployment_id=d.id AND r.action='activate' AND r.state IN ('queued','running') AND t.state='armed') THEN 'starting' ELSE 'queued' END \
+ WHEN d.observed_state!='stopped' AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=d.id AND r.action='stop' AND r.state IN ('queued','running')) THEN 'stopping' \
+ WHEN d.observed_state='ready' AND d.dispatch_enabled=0 AND EXISTS(SELECT 1 FROM lifecycle_runs r WHERE r.deployment_id=d.id) THEN 'reconciling' \
+ WHEN d.observed_state='stopped' AND d.admin_stopped=0 AND (SELECT c.principal_id FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id JOIN command_receipts c ON c.operation_id=o.id WHERE r.deployment_id=d.id ORDER BY o.accepted_at DESC,o.id DESC LIMIT 1)='system:engine_exit' THEN 'failed' \
+ ELSE d.observed_state END";
+
 impl Store {
     /// Bounded coherent read. Overflow is an error, never a partial snapshot.
     /// Numeric counters/bytes/revisions are decimal strings for future JSON clients.
@@ -261,9 +465,161 @@ impl Store {
             Ok((EventCursor { incarnation, sequence }, number(r,2)?, number(r,3)?))
         })?;
         let (cursor, ledger_epoch, session_epoch) = meta.pop().ok_or(SnapshotError::CorruptData)?;
-        let deployments = budget.read(&tx, "SELECT d.id,d.name,d.kind,d.route_model_id,d.revision,d.current_generation,d.desired_state,d.observed_state,d.admission_enabled,d.dispatch_enabled,d.suspended,e.fingerprint FROM deployments d LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision ORDER BY d.id", |r| Ok(DeploymentSnapshot {
-            id:r.get(0)?, name:r.get(1)?, kind:r.get(2)?, legacy_route:r.get(3)?, revision:number(r,4)?, generation:number(r,5)?, desired_state:r.get(6)?, observed_state:r.get(7)?, admission_enabled:boolean(r,8)?, dispatch_enabled:boolean(r,9)?, suspended:boolean(r,10)?, effective_fingerprint:r.get(11)?,
-        }))?;
+        // SPEC §6.3 (W6): a deleted deployment is a tombstone kept for its
+        // history; it is not listed. Its operations stay listed below.
+        // SPEC §§6.1, 6.4 (G3): a deployment whose launch or cleanup outcome is
+        // unresolved still holds its reservation and may still run an engine. It
+        // is reported uncertain, never the stored `stopped` it had before starting.
+        // SPEC §9.1 / T21 / P4: only the scalars the development-control mark
+        // needs are extracted, type-checked in SQL, so the raw effective
+        // configuration is never read into the snapshot or reflected. Sleep
+        // mode is read from `engine_config` (ADR 0014) and, for a revision frozen
+        // before it, from the profile's launch settings.
+        let deployments_sql = format!("SELECT d.id,d.name,d.kind,d.route_model_id,d.revision,d.current_generation,d.desired_state,{},d.admission_enabled,d.dispatch_enabled,d.suspended,e.fingerprint,{},{},{},COALESCE({},{}),{},(SELECT 'engine configuration not carried forward by the upgrade: '||substr(m.diagnostic,1,1024)||'; stop the deployment and replace its configuration with an engine_config' FROM engine_config_migrations m WHERE m.deployment_id=d.id AND m.revision=d.revision AND m.outcome='refused'),(SELECT n.instances FROM deployment_revision_instances n WHERE n.deployment_id=d.id AND n.revision=d.revision) FROM deployments d LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.kind!='deleted' ORDER BY d.id",
+            OBSERVED_STATE, effective_text("$.profile.engine"), effective_text("$.profile.security.deep_park"), effective_text("$.profile.security.deep_park_source"), effective_bool("$.engine_config.enable_sleep_mode"), effective_bool("$.profile.launch_settings.enable_sleep_mode"), effective_text("$.residency"));
+        let deployments = budget.read(&tx, &deployments_sql, |r| {
+            Ok(DeploymentSnapshot {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                legacy_route: r.get(3)?,
+                revision: number(r, 4)?,
+                generation: number(r, 5)?,
+                desired_state: r.get(6)?,
+                observed_state: r.get(7)?,
+                admission_enabled: boolean(r, 8)?,
+                dispatch_enabled: boolean(r, 9)?,
+                suspended: boolean(r, 10)?,
+                effective_fingerprint: r.get(11)?,
+                development_controls: from_stored(
+                    r.get(12)?,
+                    r.get(13)?,
+                    r.get(14)?,
+                    r.get(15)?,
+                    r.get(16)?,
+                ),
+                operator_action: r.get(17)?,
+                checkpoint_digest: None,
+                desired_instances: r.get::<_, Option<u32>>(18)?.unwrap_or(0),
+                ready_instances: 0,
+                conditions: Vec::new(),
+                instances: Vec::new(),
+                hosts: Vec::new(),
+                timeouts: None,
+                startup: None,
+                switch: None,
+                warm: false,
+                latest_operation: None,
+            })
+        })?;
+        let mut deployments = deployments;
+        let digests = budget.read(&tx, "SELECT c.deployment_id,c.state,c.host_id,c.expected,c.digest,c.weights_bytes,c.provisional,c.diagnostic FROM checkpoint_digests c JOIN deployments d ON d.id=c.deployment_id AND d.revision=c.revision ORDER BY c.deployment_id", |r| {
+            use crate::checkpoint_digests::{CheckpointDigest, DigestState};
+            let state = match r.get::<_, String>(1)?.as_str() {
+                "pending" => DigestState::Pending,
+                "recorded" => DigestState::Recorded,
+                "mismatch" => DigestState::Mismatch,
+                "unusable" => DigestState::Unusable,
+                _ => return Err(SnapshotError::CorruptData),
+            };
+            let weights: Option<i64> = r.get(5)?;
+            if weights.is_some_and(|w| w < 0) { return Err(SnapshotError::CorruptData); }
+            Ok((r.get::<_, String>(0)?, CheckpointDigest {
+                state, host_id: r.get(2)?, expected: r.get(3)?, digest: r.get(4)?, weights_bytes: weights,
+                provisional: boolean(r, 6)?, diagnostic: r.get(7)?,
+            }))
+        })?;
+        // ADR 0014 amendment A1: read per deployment in this transaction.
+        for entry in &mut deployments {
+            entry.timeouts = crate::lifecycle_windows::read(&tx, &entry.id)?;
+            entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
+            entry.switch = crate::switch_state::status(&tx, &entry.id)?;
+            entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
+            entry.latest_operation = latest_operation(
+                &tx,
+                &format!("SELECT {LATEST_OPERATION} FROM operations o WHERE o.deployment_id=?1 ORDER BY o.accepted_at DESC,o.rowid DESC LIMIT 1"),
+                rusqlite::params![entry.id],
+            )?;
+        }
+        for (deployment, digest) in digests {
+            if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {
+                entry.checkpoint_digest = Some(digest);
+            }
+        }
+        // ADR 0013 §6: per-instance status. The chosen JSON is the revision as
+        // resolved on the instance's host, else the deployment's revision.
+        let chosen = "COALESCE(h.effective_json,e.effective_json)";
+        // The instance's own revision when it has one (a count-only revision
+        // leaves a running instance on its predecessor), else the deployment's.
+        let instances_sql = format!("SELECT i.deployment_id,i.instance_index,i.host_id,i.device_json,i.generation,i.state,i.operator_stopped,{},(SELECT o.owner_id FROM resource_owners o WHERE o.deployment_id=i.deployment_id AND o.instance_index=i.instance_index),{},{},{},COALESCE({},{}),{},i.revision,substr(i.last_error,1,1024) FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id LEFT JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=COALESCE(i.revision,d.revision) LEFT JOIN host_effective_revisions h ON h.deployment_id=d.id AND h.revision=COALESCE(i.revision,d.revision) AND h.host_id=i.host_id AND h.outcome='resolved' ORDER BY i.deployment_id,i.instance_index",
+            INSTANCE_OBSERVED_STATE, json_text(chosen, "$.profile.engine"), json_text(chosen, "$.profile.security.deep_park"), json_text(chosen, "$.profile.security.deep_park_source"), json_bool(chosen, "$.engine_config.enable_sleep_mode"), json_bool(chosen, "$.profile.launch_settings.enable_sleep_mode"), json_text(chosen, "$.residency"));
+        let instances = budget.read(&tx, &instances_sql, |r| {
+            let devices: Option<String> = r.get(3)?;
+            let devices = devices
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|_| SnapshotError::CorruptData)?;
+            Ok((r.get::<_, String>(0)?, InstanceSnapshot {
+                index: r.get(1)?,
+                host_id: r.get(2)?,
+                devices,
+                generation: optional_number(r, 4)?,
+                lifecycle: r.get(5)?,
+                operator_stopped: boolean(r, 6)?,
+                observed_state: r.get(7)?,
+                reservation_owner: r.get(8)?,
+                development_controls: from_stored(r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?),
+                revision: optional_number(r, 14)?,
+                last_error: r.get(15)?,
+                startup: None,
+                latest_operation: None,
+            }))
+        })?;
+        for (deployment, mut instance) in instances {
+            if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {
+                instance.latest_operation = latest_operation(
+                    &tx,
+                    // ADR 0013 §7: only the current incarnation's runs; the
+                    // index may have been used by an earlier, retired one.
+                    &format!("SELECT {LATEST_OPERATION} FROM operations o JOIN lifecycle_runs r ON r.operation_id=o.id WHERE r.deployment_id=?1 AND r.instance_index=?2 AND r.generation=(SELECT i.generation FROM deployment_instances i WHERE i.deployment_id=?1 AND i.instance_index=?2) ORDER BY o.accepted_at DESC,o.rowid DESC LIMIT 1"),
+                    rusqlite::params![deployment, instance.index],
+                )?;
+                entry.instances.push(instance);
+            }
+        }
+        let starting = crate::ordinary_lifecycle::startup::instance_reservations(&tx)
+            .map_err(|_| SnapshotError::CorruptData)?;
+        for (deployment, index, reservation) in starting {
+            if let Some(instance) = deployments
+                .iter_mut()
+                .find(|d| d.id == deployment)
+                .and_then(|d| d.instances.iter_mut().find(|i| i.index == index))
+            {
+                instance.startup = Some(reservation);
+            }
+        }
+        let hosts = budget.read(&tx, "SELECT h.deployment_id,h.host_id,h.outcome,substr(h.diagnostic,1,256) FROM host_effective_revisions h JOIN deployments d ON d.id=h.deployment_id AND d.revision=h.revision WHERE d.kind!='deleted' ORDER BY h.deployment_id,h.host_id", |r| {
+            Ok((r.get::<_, String>(0)?, HostResolutionSnapshot { host_id: r.get(1)?, outcome: r.get(2)?, diagnostic: r.get(3)? }))
+        })?;
+        for (deployment, host) in hosts {
+            if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {
+                entry.hosts.push(host);
+            }
+        }
+        for entry in &mut deployments {
+            if entry.desired_instances == 0 {
+                entry.desired_instances = u32::try_from(entry.instances.len()).map_err(|_| SnapshotError::CorruptData)?;
+            }
+            entry.ready_instances = u32::try_from(entry.instances.iter().filter(|i| i.observed_state == "ready").count()).map_err(|_| SnapshotError::CorruptData)?;
+            let stopped = u32::try_from(entry.instances.iter().filter(|i| i.operator_stopped && i.lifecycle == "active").count()).map_err(|_| SnapshotError::CorruptData)?;
+            let wanted = entry.desired_instances.saturating_sub(stopped);
+            if entry.ready_instances >= 1 && entry.ready_instances < wanted {
+                entry.conditions.push("degraded");
+            }
+            if let Some(state) = aggregate_state(&entry.instances) {
+                entry.observed_state = state.into();
+            }
+        }
         let routes = budget.read(
             &tx,
             "SELECT deployment_id,route FROM deployment_routes ORDER BY deployment_id,route",
@@ -276,7 +632,7 @@ impl Store {
         )?;
         let operations = budget.read(
             &tx,
-            "SELECT id,deployment_id,kind,state,error_code IS NOT NULL,accepted_at
+            "SELECT id,deployment_id,kind,state,error_code IS NOT NULL,accepted_at,substr(error_code,1,65)
              FROM operations ORDER BY id",
             |r| {
                 Ok(OperationSnapshot {
@@ -286,6 +642,9 @@ impl Store {
                     state: r.get(3)?,
                     has_error: boolean(r, 4)?,
                     accepted_at: r.get(5)?,
+                    error_code: r
+                        .get::<_, Option<String>>(6)?
+                        .filter(|code| mllm_domain::diagnostics::is_closed_code(code)),
                 })
             },
         )?;
@@ -427,6 +786,91 @@ impl Store {
         tx.commit()?;
         Ok(snapshot)
     }
+}
+
+/// SPEC §6.4: the columns [`latest_operation`] reads, the operation aliased
+/// `o`: its latest journal evidence is cut in SQL before it is read.
+const LATEST_OPERATION: &str = "o.id,o.kind,o.state,o.error_code,(SELECT substr(j.evidence,1,4096) FROM journal_entries j WHERE j.operation_id=o.id ORDER BY j.rowid DESC LIMIT 1)";
+
+/// SPEC §6.4: one latest operation, with its closed error code and, when it did
+/// not succeed, its bounded reason and hint.
+fn latest_operation(
+    tx: &Transaction<'_>,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Option<LatestOperation>, SnapshotError> {
+    use mllm_domain::diagnostics::{classify, is_closed_code, operator_hint, public_reason};
+    let mut statement = tx.prepare_cached(sql)?;
+    let mut rows = statement.query(params)?;
+    let Some(r) = rows.next()? else {
+        return Ok(None);
+    };
+    for column in 0..5 {
+        if let ValueRef::Text(value) | ValueRef::Blob(value) = r.get_ref(column)? {
+            if value.len() > MAX_FIELD_BYTES {
+                return Err(SnapshotError::TooLarge);
+            }
+        }
+    }
+    let state: String = r.get(2)?;
+    let error_code = r
+        .get::<_, Option<String>>(3)?
+        .filter(|code| is_closed_code(code));
+    let failed = state != "succeeded";
+    let reason = failed
+        .then(|| r.get::<_, Option<String>>(4))
+        .transpose()?
+        .flatten()
+        .and_then(|evidence| public_reason(&evidence));
+    let hint = failed
+        .then(|| classify(error_code.as_deref(), reason.as_deref().unwrap_or("")))
+        .flatten()
+        .and_then(operator_hint);
+    Ok(Some(LatestOperation {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        state,
+        error_code,
+        reason,
+        hint,
+    }))
+}
+
+/// ADR 0013 §6: a deployment's observed state from its instances. `ready`
+/// while any instance is Ready (`degraded` says the rest); `failed` only when
+/// every active instance failed; otherwise the most pressing state any active
+/// instance is in. `None` leaves the deployment's own derivation (no instance
+/// has anything more to say than `stopped` or `parked`).
+fn aggregate_state(instances: &[InstanceSnapshot]) -> Option<&'static str> {
+    let states: Vec<&str> = instances
+        .iter()
+        .filter(|i| i.lifecycle == "active" || i.observed_state != "stopped")
+        .map(|i| i.observed_state.as_str())
+        .collect();
+    if states.is_empty() {
+        return None;
+    }
+    if states.contains(&"ready") {
+        return Some("ready");
+    }
+    // W5: a wake or a park in flight is reported like a start or a stop.
+    for state in [
+        "uncertain",
+        "waking",
+        "starting",
+        "queued",
+        "parking",
+        "stopping",
+        "reconciling",
+    ] {
+        if states.contains(&state) {
+            return Some(state);
+        }
+    }
+    if states.iter().all(|state| *state == "failed") {
+        return Some("failed");
+    }
+    None
 }
 
 struct SizeLimit(usize);

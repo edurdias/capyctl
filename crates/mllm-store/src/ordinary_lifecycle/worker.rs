@@ -34,6 +34,7 @@ fn next_plan(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,
     admitted: bool,
+    busy: &super::lanes::BusyLanes,
 ) -> Result<Option<(Plan, EffectiveDeployment)>, LifecycleError> {
     let id: Option<String> = tx
         .query_row(
@@ -42,17 +43,21 @@ fn next_plan(
             // that would follow refuses it and one deployment's failure would
             // again stop every other deployment on the host.
             // SPEC §6.1 FAILED: admission closed.
-            "SELECT s.id FROM lifecycle_steps s
+            // ADR 0015: a step on a busy instance, or a held start, is skipped
+            // so that it cannot hide every step queued behind it.
+            &format!("SELECT s.id FROM lifecycle_steps s
          JOIN operations o ON o.id=s.operation_id
          JOIN lifecycle_runs r ON r.operation_id=o.id
-         JOIN deployments d ON d.id=s.deployment_id
+         JOIN instance_runtime d ON d.id=s.deployment_id AND d.instance_index=r.instance_index
          WHERE o.kind='initialize' AND s.state='planned'
            AND s.session_id=?1 AND r.session_id=?1
            AND d.revision=r.revision AND d.current_generation=r.generation
            AND d.desired_state='ready' AND d.suspended=0
            AND (?2=0 OR d.admission_enabled=1)
-         ORDER BY o.accepted_at,o.id LIMIT 1",
-            params![session.id(), admitted],
+           AND {lane_free}
+           AND s.binding_id NOT IN (SELECT value FROM json_each(?4))
+         ORDER BY o.accepted_at,o.id LIMIT 1", lane_free = super::lanes::lane_free(3)),
+            params![session.id(), admitted, busy.instances_json()?, busy.held_json()?],
             |row| row.get(0),
         )
         .optional()?;
@@ -84,20 +89,24 @@ fn next_expired_plan(
     tx: &Transaction<'_>,
     session: &CoordinatorSession,
     now_ms: i64,
+    busy: &super::lanes::BusyLanes,
 ) -> Result<Option<(Plan, EffectiveDeployment)>, LifecycleError> {
     let id: Option<String> = tx
         .query_row(
-            "SELECT s.id FROM lifecycle_steps s
+            // ADR 0015: a step whose instance has an effect in flight is that
+            // effect's to settle, deadline included; it is not expired here.
+            &format!("SELECT s.id FROM lifecycle_steps s
          JOIN operations o ON o.id=s.operation_id
          JOIN lifecycle_runs r ON r.operation_id=o.id
-         JOIN deployments d ON d.id=s.deployment_id
+         JOIN instance_runtime d ON d.id=s.deployment_id AND d.instance_index=r.instance_index
          WHERE o.kind='initialize' AND s.state='planned'
            AND s.session_id=?1 AND r.session_id=?1
            AND d.revision=r.revision AND d.current_generation=r.generation
            AND d.desired_state='ready' AND d.suspended=0
            AND r.deadline_ms<=?2
-         ORDER BY r.deadline_ms,o.accepted_at,o.id LIMIT 1",
-            params![session.id(), now_ms],
+           AND {lane_free}
+         ORDER BY r.deadline_ms,o.accepted_at,o.id LIMIT 1", lane_free = super::lanes::lane_free(3)),
+            params![session.id(), now_ms, busy.instances_json()?],
             |row| row.get(0),
         )
         .optional()?;
@@ -118,16 +127,88 @@ fn next_expired_plan(
     Ok(Some((plan, effective)))
 }
 
-/// Whether this plan's deployment is still admitting work.
+/// The most retired planned steps one discovery pass transfers.
+const MAX_RETIRED_PLANNED: i64 = 64;
+
+/// SPEC §13.2: reconcile before dispatch. A planned Initialize has had no
+/// effect: nothing is armed, granted or sent, so no process can exist for it.
+/// Found live (Phase B): a step left planned by a retired coordinator session
+/// was neither armed nor expired by any later session, and its claim made every
+/// later Start and Stop of that deployment fail as `reconciliation_required`
+/// for ever. Such a step is moved to this session unchanged, keeping its
+/// original deadline, so it is armed within that deadline or expired at it like
+/// any other. A step that does not validate as effect-free stays where it is.
+fn adopt_retired_planned(
+    tx: &Transaction<'_>,
+    session: &CoordinatorSession,
+) -> Result<(), LifecycleError> {
+    let ids = tx
+        .prepare(
+            "SELECT s.id FROM lifecycle_steps s
+             JOIN operations o ON o.id=s.operation_id
+             JOIN lifecycle_runs r ON r.operation_id=o.id
+             WHERE o.kind='initialize' AND s.state='planned' AND r.state='queued'
+               AND o.state='pending' AND s.grant_id IS NULL
+               AND s.session_id!=?1 AND r.session_id=s.session_id
+             ORDER BY o.accepted_at,o.id LIMIT ?2",
+        )?
+        .query_map(params![session.id(), MAX_RETIRED_PLANNED], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for id in ids {
+        let (mut plan, _, state) = load(tx, &id)?;
+        let granted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resource_grants WHERE operation_id=?1)
+             OR EXISTS(SELECT 1 FROM lifecycle_evidence WHERE step_id=?2)
+             OR EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?3 AND state!='reserved')",
+            params![plan.operation_id, plan.step_id, plan.binding_id],
+            |r| r.get(0),
+        )?;
+        if state != "planned"
+            || plan.execution.is_some()
+            || plan.session_id == session.id()
+            || granted
+            || association(tx, &plan)?.is_some()
+        {
+            continue;
+        }
+        let retired = std::mem::replace(&mut plan.session_id, session.id().into());
+        one(tx.execute(
+            "UPDATE lifecycle_steps SET session_id=?2,step_json=?3 WHERE id=?1 AND session_id=?4 AND state='planned'",
+            params![id, session.id(), encode(&plan)?, retired],
+        )?)?;
+        one(tx.execute(
+            "UPDATE lifecycle_runs SET session_id=?2 WHERE operation_id=?1 AND session_id=?3 AND state='queued'",
+            params![plan.operation_id, session.id(), retired],
+        )?)?;
+        tx.execute(
+            "INSERT INTO journal_entries(id,host_id,operation_id,state,evidence) VALUES(?1,NULL,?2,'planned_initialize_adopted',?3)",
+            params![
+                ulid::Ulid::new().to_string(),
+                plan.operation_id,
+                format!(
+                    "deployment {}: a restarted controller adopted a start that never armed; \
+                     it keeps its original deadline",
+                    plan.deployment_id
+                ),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether this plan's instance is still admitting work (ADR 0013 §6: one
+/// instance that gave up closes its own admission, not its siblings').
 fn admitting(tx: &Transaction<'_>, plan: &Plan) -> Result<bool, LifecycleError> {
     Ok(tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND admission_enabled=1)",
-        [&plan.deployment_id],
+        "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2 AND admission_enabled=1)",
+        params![plan.deployment_id, plan.instance_index],
         |row| row.get(0),
     )?)
 }
 
-fn prepare_work(
+pub(super) fn prepare_work(
     tx: &Transaction<'_>,
     plan: Plan,
     effective: EffectiveDeployment,
@@ -155,6 +236,9 @@ pub struct InitializeWork {
 }
 
 impl InitializeWork {
+    pub(super) fn plan(&self) -> &Plan {
+        &self.plan
+    }
     pub fn operation_id(&self) -> &str {
         &self.plan.operation_id
     }
@@ -169,6 +253,10 @@ impl InitializeWork {
     }
     pub fn fence(&self) -> &DeploymentFence {
         &self.fence
+    }
+    /// ADR 0013 §5: the instance this incarnation realizes.
+    pub fn instance_index(&self) -> u32 {
+        self.plan.instance_index
     }
     pub fn deadline_ms(&self) -> i64 {
         self.plan.deadline_ms
@@ -196,9 +284,22 @@ impl crate::Store {
         step_id: &str,
         context: AdmissionContext<'_>,
     ) -> Result<(ArmResult, Option<StepExecutionContext>), LifecycleError> {
+        self.arm_initialize_with_residents(session, step_id, context, &[])
+    }
+
+    /// As [`Self::arm_initialize_with_context`], crediting Ready engines on
+    /// the host with the memory `residents` (sampled beside the observations)
+    /// attributes to their own processes (ADR 0007).
+    pub fn arm_initialize_with_residents(
+        &self,
+        session: &CoordinatorSession,
+        step_id: &str,
+        context: AdmissionContext<'_>,
+        residents: &[mllm_domain::resources::ProcessResident],
+    ) -> Result<(ArmResult, Option<StepExecutionContext>), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
-        let result = arm_with_context(&tx, session, step_id, context)?;
+        let result = arm_with_context(&tx, session, step_id, context, residents)?;
         tx.commit()?;
         Ok(result)
     }
@@ -240,8 +341,8 @@ impl crate::Store {
             // An observer of old work must not inspect a successor's owners or
             // reservation as though they belonged to the cancelled operation.
             let same_terminal_fence: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND desired_state='stopped') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1)",
-                params![plan.deployment_id,plan.revision,plan.generation], |r| r.get(0),
+                "SELECT EXISTS(SELECT 1 FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3 AND desired_state='stopped') AND NOT EXISTS(SELECT 1 FROM lifecycle_claims WHERE deployment_id=?1 AND instance_index=?4)",
+                params![plan.deployment_id,plan.revision,plan.generation,plan.instance_index], |r| r.get(0),
             )?;
             if !same_terminal_fence {
                 // Spec §6: a launch released after failing leaves its own step
@@ -252,7 +353,7 @@ impl crate::Store {
                 // superseding it, and an operator waiting on the start must be
                 // told which of the two it is.
                 let released_and_closed: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='ready' AND suspended=0 AND admission_enabled=0) AND EXISTS(SELECT 1 FROM lifecycle_evidence WHERE step_id=?4) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?5 AND state='released')",
+                    "SELECT EXISTS(SELECT 1 FROM instance_runtime WHERE id=?1 AND revision=?2 AND current_generation=?3 AND kind='model' AND desired_state='ready' AND suspended=0 AND admission_enabled=0) AND EXISTS(SELECT 1 FROM lifecycle_evidence WHERE step_id=?4) AND EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?5 AND state='released')",
                     params![plan.deployment_id,plan.revision,plan.generation,step_id,plan.binding_id],
                     |r| r.get(0),
                 )?;
@@ -436,8 +537,8 @@ impl crate::Store {
         validate_local(&tx, &plan, &effective, &state)?;
         current(&tx, session, &plan, false)?;
         let no_prior_effect: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?1 AND identities_json='[]') AND NOT EXISTS(SELECT 1 FROM owned_launch_associations WHERE step_id=?2) AND EXISTS(SELECT 1 FROM deployments WHERE id=?3 AND dispatch_enabled=0)",
-            params![plan.binding_id,plan.step_id,plan.deployment_id], |row| row.get(0),
+            "SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE id=?1 AND identities_json='[]') AND NOT EXISTS(SELECT 1 FROM owned_launch_associations WHERE step_id=?2) AND EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?3 AND instance_index=?4 AND dispatch_enabled=0)",
+            params![plan.binding_id,plan.step_id,plan.deployment_id,plan.instance_index], |row| row.get(0),
         )?;
         if !no_prior_effect {
             return Err(LifecycleError::Conflict);
@@ -464,7 +565,7 @@ impl crate::Store {
     ) -> Result<Option<InitializeWork>, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, session)?;
-        let work = next_plan(&tx, session, true)?
+        let work = next_plan(&tx, session, true, &Default::default())?
             .map(|(plan, effective)| prepare_work(&tx, plan, effective))
             .transpose()?;
         tx.commit()?;
@@ -487,13 +588,28 @@ impl crate::Store {
         session: &CoordinatorSession,
         now_ms: i64,
     ) -> Result<InitializePoll, LifecycleError> {
+        self.next_initialize_or_expire_among(session, now_ms, &Default::default())
+    }
+
+    /// As `next_initialize_or_expire`, skipping every step on an instance in
+    /// `busy.instances` (for work and for expiry: the effect in flight settles
+    /// its own step) and every start whose binding is in `busy.held` (for work
+    /// only: a held start still reaches its deadline).
+    // ADR 0015: one deployment's in-flight load never hides another's start.
+    pub fn next_initialize_or_expire_among(
+        &self,
+        session: &CoordinatorSession,
+        now_ms: i64,
+        busy: &super::lanes::BusyLanes,
+    ) -> Result<InitializePoll, LifecycleError> {
         if now_ms < 0 {
             return Err(LifecycleError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session)?;
+        adopt_retired_planned(&tx, session)?;
         let mut expired = false;
-        while let Some((plan, effective)) = next_expired_plan(&tx, session, now_ms)? {
+        while let Some((plan, effective)) = next_expired_plan(&tx, session, now_ms, busy)? {
             expiry::expire_in_transaction(&tx, session, &plan, &effective, "planned", now_ms)?;
             expired = true;
         }
@@ -502,7 +618,7 @@ impl crate::Store {
         } else {
             // SPEC §6.1 FAILED: admission closed. A closed deployment's step is
             // neither work nor expired, and it must not starve any other one.
-            match next_plan(&tx, session, true)? {
+            match next_plan(&tx, session, true, busy)? {
                 None => InitializePoll::Idle,
                 Some((plan, effective)) => {
                     InitializePoll::Work(Box::new(prepare_work(&tx, plan, effective)?))
@@ -542,9 +658,121 @@ impl crate::Store {
         }
         one(tx.execute("UPDATE lifecycle_steps SET state='uncertain' WHERE id=?1 AND session_id=?2 AND state='armed'", params![step_id,session.id()])?)?;
         one(tx.execute("UPDATE lifecycle_runs SET state='uncertain' WHERE operation_id=?1 AND session_id=?2 AND state='running'", params![plan.operation_id,session.id()])?)?;
-        one(tx.execute("UPDATE deployments SET dispatch_enabled=0 WHERE id=?1 AND revision=?2 AND current_generation=?3", params![plan.deployment_id,plan.revision,plan.generation])?)?;
+        one(tx.execute("UPDATE deployment_instances SET dispatch_enabled=0 WHERE deployment_id=?1 AND revision=?2 AND generation=?3", params![plan.deployment_id,plan.revision,plan.generation])?)?;
         event(&tx, session, &plan, Transition::Uncertain, None)?;
         tx.commit()?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod retired_planned_tests {
+    use super::*;
+    use crate::Store;
+    use mllm_config::effective::resolve_effective;
+    use mllm_domain::resources::MemoryObservation;
+    use serde_json::{json, Value};
+
+    /// A deployment whose Start was accepted by `old` and never armed.
+    fn planned_by_retired_session() -> (Store, CoordinatorSession, DeploymentFence, String) {
+        let value: Value = serde_json::from_str(include_str!(
+            "../../../mllm-config/tests/fixtures/f2-deployment.json"
+        ))
+        .unwrap();
+        let (config, host) = (value["deployment"].clone(), value["host"].clone());
+        let effective = resolve_effective(&config, &host).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let old = store.begin_coordinator_session().unwrap();
+        let observations = vec![MemoryObservation {
+            domain: "unified".into(),
+            capacity_bytes: 64 << 30,
+            available_bytes: 60 << 30,
+            sampled_at_ms: 1,
+        }];
+        store
+            .import_resource_policy(&old, &effective.host, &observations, 1)
+            .unwrap();
+        let body = json!({"config": config}).to_string();
+        let receipt = store
+            .create_stopped_managed_configuration(&old, "principal", "key", &body, &host, 10)
+            .unwrap();
+        let fence = DeploymentFence {
+            deployment_id: receipt.deployment_id.clone(),
+            revision: receipt.revision,
+            generation: receipt.generation,
+        };
+        let accepted = store.accept_start(&old, &fence, 100, 100_100).unwrap();
+        (store, old, fence, accepted.step_id)
+    }
+
+    fn step_session(store: &Store, step: &str) -> String {
+        store
+            .conn
+            .query_row("SELECT session_id FROM lifecycle_steps WHERE id=?1", [step], |r| r.get(0))
+            .unwrap()
+    }
+
+    // T33 T34 T09: found live (Phase B). A Start the retired controller accepted
+    // but never armed is adopted by the restarted one and driven within its
+    // original deadline, instead of blocking the deployment for ever.
+    #[test]
+    fn a_restarted_controller_adopts_a_start_that_never_armed() {
+        let (store, old, fence, step) = planned_by_retired_session();
+        let session = store.begin_coordinator_session().unwrap();
+        // Before discovery the retired session's claim refuses a new Start.
+        assert!(matches!(
+            store.accept_start(&session, &fence, 200, 100_100),
+            Err(LifecycleError::Stale)
+        ));
+        match store.next_initialize_or_expire(&session, 200).unwrap() {
+            InitializePoll::Work(work) => assert_eq!(work.step_id(), step),
+            _ => panic!("the adopted start must be discovered as work"),
+        }
+        assert_eq!(step_session(&store, &step), session.id());
+        assert_ne!(old.id(), session.id());
+        // Adoption granted nothing: the ledger holds no owner for it.
+        assert!(!store
+            .resource_snapshot()
+            .unwrap()
+            .owners
+            .contains_key(&fence.deployment_id));
+        // The same Start is joined now, not refused.
+        assert_eq!(
+            store.accept_start(&session, &fence, 300, 100_100).unwrap().step_id,
+            step
+        );
+    }
+
+    // T30 T33: a retired start past its deadline (a deployment that gave up
+    // before the restart) is expired by the restarted controller, not orphaned.
+    #[test]
+    fn a_retired_start_past_its_deadline_is_expired_after_adoption() {
+        let (store, _old, fence, step) = planned_by_retired_session();
+        store
+            .conn
+            .execute(
+                "UPDATE deployments SET admission_enabled=0 WHERE id=?1",
+                [&fence.deployment_id],
+            )
+            .unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        assert!(matches!(
+            store.next_initialize_or_expire(&session, 100_200).unwrap(),
+            InitializePoll::ExpiredUnarmed
+        ));
+        let state: String = store
+            .conn
+            .query_row("SELECT state FROM lifecycle_steps WHERE id=?1", [&step], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "cancelled");
+        let claims: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM lifecycle_claims WHERE deployment_id=?1",
+                [&fence.deployment_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0);
     }
 }

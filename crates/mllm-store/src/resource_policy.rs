@@ -2,7 +2,9 @@ use crate::dispatch::{check_session, CoordinatorSession, DispatchError};
 use crate::events::{append_event, EventMetadata, EventOperationId, EventWriteError};
 use crate::resource_ledger::{read_snapshot, ResourceStoreError};
 use crate::OpState;
-use mllm_config::effective::{DomainMemory, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing};
+use mllm_config::effective::{
+    DomainMemory, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing,
+};
 use mllm_config::resource_controls::{ResourceContext, ResourceControls};
 use mllm_domain::resources::{LedgerSnapshot, MemoryObservation, ResourcePhase};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -133,6 +135,16 @@ struct StoredQueue {
     max_buffered_bytes_total: i64,
     request_deadline_ms: i64,
     admission_window_ms: i64,
+    /// SPEC §10: absent in policies stored before it existed, and omitted at
+    /// its default so their stored identity is unchanged.
+    #[serde(default = "default_stream_idle", skip_serializing_if = "is_default_stream_idle")]
+    stream_idle_ms: i64,
+}
+fn default_stream_idle() -> i64 {
+    mllm_config::effective::DEFAULT_STREAM_IDLE_MS
+}
+fn is_default_stream_idle(value: &i64) -> bool {
+    *value == mllm_config::effective::DEFAULT_STREAM_IDLE_MS
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +254,7 @@ impl StoredControls {
                 max_buffered_bytes_total: value.queue.max_buffered_bytes_total,
                 request_deadline_ms: value.queue.request_deadline_ms,
                 admission_window_ms: value.queue.admission_window_ms,
+                stream_idle_ms: value.queue.stream_idle_ms,
             },
             device_sharing: sharing(value.device_sharing),
             device_sharing_overrides: value
@@ -278,6 +291,7 @@ impl StoredControls {
                 max_buffered_bytes_total: self.queue.max_buffered_bytes_total,
                 request_deadline_ms: self.queue.request_deadline_ms,
                 admission_window_ms: self.queue.admission_window_ms,
+                stream_idle_ms: self.queue.stream_idle_ms,
             },
             device_sharing: parse_sharing(&self.device_sharing)?,
             device_sharing_overrides: self
@@ -387,7 +401,7 @@ fn decode_policy(
         revision: value.revision,
     })
 }
-fn read_policy(
+pub(crate) fn read_policy(
     tx: &Transaction<'_>,
     host: &str,
 ) -> Result<Option<ResourcePolicySnapshot>, ResourcePolicyError> {
@@ -402,20 +416,16 @@ fn read_policy(
         .transpose()
 }
 
-pub(crate) fn read_singleton_policy(
+pub(crate) fn read_selected_policy(
     tx: &Transaction<'_>,
     host: &str,
 ) -> Result<Option<ResourcePolicySnapshot>, ResourcePolicyError> {
-    let stored_hosts: Vec<String> = tx
-        .prepare("SELECT host_id FROM host_resource_policies ORDER BY host_id LIMIT 2")?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    if stored_hosts.len() > 1 { return Err(ResourcePolicyError::CorruptStoredPolicy); }
-    if stored_hosts.first().is_some_and(|stored| stored != host) {
-        return Err(ResourcePolicyError::RevisionConflict);
+    match crate::resource_namespace::selected_policy_key(tx, host)? {
+        Some(key) => read_policy(tx, &key),
+        None => Ok(None),
     }
-    read_policy(tx, host)
 }
+
 fn next_epoch(tx: &Transaction<'_>) -> Result<u64, ResourcePolicyError> {
     let epoch: i64 = tx.query_row(
         "SELECT epoch FROM resource_ledger_meta WHERE singleton=1",
@@ -502,16 +512,126 @@ impl crate::Store {
             return Err(ResourcePolicyError::Invalid);
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        let result = read_policy(&tx, host_id)?;
+        let result = read_selected_policy(&tx, host_id)?;
         tx.commit()?;
         Ok(result)
     }
+    /// W10 gap (b): the tightest queue policy over every host with a selected
+    /// resource policy (SPEC §16.2 `resource_policy.queue`), each bound the
+    /// smallest any host sets. One router queue serves every host, so no host
+    /// sees more waiting requests than its own policy allows. `None` while no
+    /// host has published a policy.
+    pub fn tightest_queue_policy(
+        &self,
+    ) -> Result<Option<mllm_config::effective::QueuePolicy>, ResourcePolicyError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let hosts: Vec<String> = tx
+            .prepare("SELECT host_id FROM host_resource_namespaces ORDER BY host_id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut tightest: Option<mllm_config::effective::QueuePolicy> = None;
+        for host in hosts {
+            let Some(policy) = read_selected_policy(&tx, &host)? else {
+                continue;
+            };
+            let queue = policy.controls.queue;
+            tightest = Some(match tightest {
+                None => queue,
+                Some(t) => mllm_config::effective::QueuePolicy {
+                    max_pending_per_deployment: t
+                        .max_pending_per_deployment
+                        .min(queue.max_pending_per_deployment),
+                    max_pending_total: t.max_pending_total.min(queue.max_pending_total),
+                    max_buffered_bytes_total: t
+                        .max_buffered_bytes_total
+                        .min(queue.max_buffered_bytes_total),
+                    request_deadline_ms: t.request_deadline_ms.min(queue.request_deadline_ms),
+                    admission_window_ms: t.admission_window_ms.min(queue.admission_window_ms),
+                    stream_idle_ms: t.stream_idle_ms.min(queue.stream_idle_ms),
+                },
+            });
+        }
+        tx.commit()?;
+        Ok(tightest)
+    }
+
     pub fn import_resource_policy(
         &self,
         session: &CoordinatorSession,
         host: &HostPolicy,
         observations: &[MemoryObservation],
         now_ms: i64,
+    ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
+        self.import_policy(session, host, observations, now_ms, None)
+    }
+
+    /// Import an enrolled host's local policy using collision-free durable keys.
+    /// SPEC §7: inventory names are local; accounting keys belong to the host.
+    pub fn import_remote_resource_policy(
+        &self, session: &CoordinatorSession, host_id: &str, host: &HostPolicy,
+        observations: &[MemoryObservation], now_ms: i64,
+    ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
+        if !valid_id(host_id) { return Err(ResourcePolicyError::Invalid); }
+        let local = ResourceContext::from_host(host);
+        let mut scoped = host.clone();
+        scoped.name = host_id.into();
+        scoped.domains = host.domains.iter().map(|(id,p)|
+            (crate::resource_namespace::ledger_key(host_id,"domain",id),p.clone())).collect();
+        scoped.devices = host.devices.iter().map(|(id,p)| {
+            let mut policy = p.clone();
+            policy.domain = crate::resource_namespace::ledger_key(host_id,"domain",&p.domain);
+            (crate::resource_namespace::ledger_key(host_id,"device",id),policy)
+        }).collect();
+        let observations: Vec<_> = observations.iter().map(|o| {
+            let mut observation = o.clone();
+            observation.domain = crate::resource_namespace::ledger_key(host_id,"domain",&o.domain);
+            observation
+        }).collect();
+        let imported =
+            self.import_policy(session, &scoped, &observations, now_ms, Some((host_id, &local)))?;
+        // Found live 2026-09-23 (matrix M32): a host restarted with changed
+        // limits (normal to tight) kept its first imported limits here,
+        // silently. The host's document governs its limits, so a changed
+        // publication is applied as a revision through the ordinary update,
+        // which refuses a limit the current charges already exceed (the
+        // publication then fails closed rather than keeping stale limits).
+        let published = ResourceControls::from_host(&scoped);
+        if imported.changed || imported.controls == published {
+            return Ok(imported);
+        }
+        // One key per (revision, limits): a later flip back and forth is a new
+        // revision each time, never a replay of an older receipt.
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&StoredControls::from_public(&published))
+                    .map_err(|_| ResourcePolicyError::Invalid)?
+            )
+        );
+        let key = format!("host-publication-{}-{}", imported.revision, &digest[..32]);
+        let update = self.update_resource_policy(
+            session,
+            "host-publication",
+            host_id,
+            imported.revision,
+            &key,
+            &published,
+            &observations,
+            now_ms,
+        )?;
+        Ok(ResourcePolicyImport {
+            context: imported.context,
+            controls: published,
+            revision: update.revision,
+            epoch: update.epoch,
+            changed: true,
+        })
+    }
+
+    fn import_policy(
+        &self, session: &CoordinatorSession, host: &HostPolicy,
+        observations: &[MemoryObservation], now_ms: i64,
+        remote: Option<(&str, &ResourceContext)>,
     ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
         let context = ResourceContext::from_host(host);
         let controls = ResourceControls::from_host(host);
@@ -523,7 +643,20 @@ impl crate::Store {
             .map_err(|_| ResourcePolicyError::Invalid)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(map_session)?;
-        if let Some(current) = read_singleton_policy(&tx, &context.host_id)? {
+        crate::resource_namespace::ensure_resolved(&tx)?;
+        if let Some((host_id, local)) = remote {
+            let existing: Option<(String,String)> = tx.query_row(
+                "SELECT policy_key,kind FROM host_resource_namespaces WHERE host_id=?1 OR policy_key=?1",
+                [host_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            match existing {
+                Some((key,kind)) if key == host_id && kind == "remote" => {},
+                Some(_) => return Err(ResourcePolicyError::RevisionConflict),
+                None => crate::resource_namespace::insert(&tx,host_id,host_id,"remote",local,&context)?,
+            }
+        } else {
+            crate::resource_namespace::ensure_embedded(&tx, &context)?;
+        }
+        if let Some(current) = read_selected_policy(&tx, &context.host_id)? {
             if current.context != context {
                 return Err(ResourcePolicyError::RevisionConflict);
             }
@@ -629,6 +762,7 @@ impl crate::Store {
             tx.commit()?;
             return Ok(stored.into());
         }
+        crate::resource_namespace::ensure_resolved(&tx)?;
         let current = read_policy(&tx, host_id)?.ok_or(ResourcePolicyError::RevisionConflict)?;
         if current.revision != expected_revision {
             return Err(ResourcePolicyError::RevisionConflict);
@@ -669,7 +803,15 @@ impl crate::Store {
             .checked_add(1)
             .filter(|v| *v > 0)
             .ok_or(ResourcePolicyError::Invalid)?;
-        let snapshot = read_snapshot(&tx).map_err(map_ledger)?;
+        // SPEC §7 (T26 T27, Phase B): this host's limits are judged against this
+        // host's owners. Another host's charges are neither overcommit here nor
+        // corrupt, and `max_parked` counts this host's parked owners only.
+        let snapshot = crate::resource_ledger::scoped_to_domain_hosts(
+            &tx,
+            &read_snapshot(&tx).map_err(map_ledger)?,
+            controls.domains.keys().map(String::as_str),
+        )
+        .map_err(map_ledger)?;
         let report = overcommit(&snapshot, controls)?;
         let epoch = next_epoch(&tx)?;
         let generated_operation_id = EventOperationId::generated(ulid::Ulid::new());

@@ -1,8 +1,6 @@
 //! Physical completion retains conservative accounting and closed admission.
 use super::*;
-use mllm_domain::completion::{
-    CompletionEvidence, Milestone, OwnedLaunchReceipt, TransitionToken,
-};
+use mllm_domain::completion::{CompletionEvidence, Milestone, OwnedLaunchReceipt, TransitionToken};
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, LifecycleError> {
     if text.len() > MAX_DTO_BYTES {
@@ -29,7 +27,8 @@ pub(crate) fn check_session(
 pub(crate) fn canonical_members(
     ids: &[ProcessIdentity],
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
-    if ids.len() < 2
+    if mllm_domain::group::validate_local_processes(ids).is_err()
+        || ids.len() < 2
         || ids.iter().any(|i| {
             i.role.len() > MAX_DTO_BYTES / 4
                 || i.boot_id.len() > MAX_DTO_BYTES / 4
@@ -45,9 +44,10 @@ pub(crate) fn canonical_members(
     let boot_id = ids[0].boot_id.clone();
     let mut pids = std::collections::BTreeSet::new();
     let mut roles = std::collections::BTreeSet::new();
-    if ids.iter().any(|i| {
-        i.boot_id != boot_id || !pids.insert(i.pid) || !roles.insert(i.role.clone())
-    }) {
+    if ids
+        .iter()
+        .any(|i| i.boot_id != boot_id || !pids.insert(i.pid) || !roles.insert(i.role.clone()))
+    {
         return Err(LifecycleError::Invalid);
     }
     // Every role is distinct (checked above), so removing `api` and then every
@@ -175,7 +175,9 @@ pub(crate) struct CompletionEvidenceV1 {
     control_receipt: Option<String>,
     milestones: Vec<MilestoneDto>,
 }
-pub(crate) fn completion_value(e: &CompletionEvidence) -> Result<CompletionEvidenceV1, LifecycleError> {
+pub(crate) fn completion_value(
+    e: &CompletionEvidence,
+) -> Result<CompletionEvidenceV1, LifecycleError> {
     nonempty_receipt(
         e.control_receipt
             .as_deref()

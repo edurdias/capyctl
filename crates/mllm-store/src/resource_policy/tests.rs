@@ -45,6 +45,7 @@ fn host() -> HostPolicy {
             max_buffered_bytes_total: 64 << 20,
             request_deadline_ms: 600_000,
             admission_window_ms: 2_000,
+            stream_idle_ms: mllm_config::effective::DEFAULT_STREAM_IDLE_MS,
         },
     }
 }
@@ -252,7 +253,7 @@ fn lowering_limits_retains_all_owners_and_reports_each_overcommit_category() {
     store
         .conn
         .execute(
-            "INSERT INTO resource_owners(owner_id,footprint_json) VALUES('owner',?1)",
+            "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('owner',?1,'owner')",
             [footprint],
         )
         .unwrap();
@@ -261,7 +262,7 @@ fn lowering_limits_retains_all_owners_and_reports_each_overcommit_category() {
     store
         .conn
         .execute(
-            "INSERT INTO resource_owners(owner_id,footprint_json) VALUES('owner-2',?1)",
+            "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('owner-2',?1,'owner-2')",
             [second],
         )
         .unwrap();
@@ -980,4 +981,191 @@ fn revision_epoch_legacy_and_event_failures_roll_back() {
             .unwrap(),
         before_events
     );
+}
+
+// T24: two hosts may publish the same local domain/device labels without overlap.
+#[test]
+fn remote_policies_namespace_local_resources_and_do_not_break_embedded_lookup() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let embedded = store.import_resource_policy(&session,&host(),&observations(),11_000).unwrap();
+    let embedded_id = store.embedded_host_id().unwrap().unwrap();
+    assert_ne!(embedded_id, host().name);
+    assert_eq!(store.host_resource_key(&embedded_id,"domain","system").unwrap(),Some("system".into()));
+    let first = store.import_remote_resource_policy(&session,"enrolled-one",&host(),&observations(),11_000).unwrap();
+    let second = store.import_remote_resource_policy(&session,"enrolled-two",&host(),&observations(),11_000).unwrap();
+    assert_ne!(first.context.domain_ids,second.context.domain_ids);
+    assert_ne!(first.context.device_domains,second.context.device_domains);
+    assert_eq!(store.resource_policy(&embedded_id).unwrap().unwrap().context,embedded.context);
+    assert_eq!(store.resource_policy("enrolled-one").unwrap().unwrap().context,first.context);
+    assert_eq!(store.import_resource_policy(&session,&host(),&observations(),11_000).unwrap().context,embedded.context);
+}
+
+// T24: migration adds ownership metadata without changing accounting or replay bytes.
+#[test]
+fn namespace_upgrade_preserves_owned_reservations_grants_and_epoch() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store.import_resource_policy(&session,&host(),&observations(),11_000).unwrap();
+    // Recreate the populated pre-namespace schema shape. Ownership bytes are
+    // deliberately opaque here: the migration must not reinterpret their digest.
+    store.conn.execute_batch("DROP TABLE host_publication_migrations; DROP TABLE engine_config_migrations; DROP TABLE remote_binding_ingress; DROP TABLE managed_configuration_sources; DROP TABLE approved_host_publications; DROP TABLE host_certificate_renewals; DROP TABLE host_enrollment_transactions; DROP TABLE host_certificates; DROP TABLE enrolled_hosts; DROP TABLE host_invitations; DROP TABLE host_resource_keys; DROP TABLE host_resource_namespaces; DELETE FROM schema_migrations WHERE version>=16;
+        INSERT INTO deployments(id,name,kind,desired_state,admission_enabled,suspended,current_generation,schema_version,revision) VALUES('kept','kept','model','ready',0,0,8,1,3);
+        INSERT INTO operations(id,deployment_id,kind,state) VALUES('op-kept','kept','initialize','running');
+        INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES('binding-kept','kept',3,'incarnation-kept','managed','original binding','original identities','live');
+        INSERT INTO endpoint_leases(host_id,host,port,binding_id) VALUES('','127.0.0.1',30000,'binding-kept');
+        INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('kept','{\"immutable\":true}','kept');
+        INSERT INTO resource_grants VALUES('grant-kept','kept','op-kept','original request digest',23);
+        UPDATE resource_ledger_meta SET epoch=23;").unwrap();
+    crate::migrations::apply(&store.conn).unwrap();
+    let host_id = store.embedded_host_id().unwrap().unwrap();
+    crate::migrations::apply(&store.conn).unwrap();
+    assert_eq!(store.embedded_host_id().unwrap(),Some(host_id.clone()));
+    assert_eq!(store.host_resource_key(&host_id,"device","gpu0").unwrap(),Some("gpu0".into()));
+    let state:(String,String,i64,i64) = store.conn.query_row("SELECT footprint_json,(SELECT request_json FROM resource_grants WHERE id='grant-kept'),(SELECT epoch FROM resource_ledger_meta),(SELECT current_generation FROM deployments WHERE id='kept') FROM resource_owners WHERE owner_id='kept'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(state,("{\"immutable\":true}".into(),"original request digest".into(),23,8));
+    let binding:(String,String,String,i64) = store.conn.query_row("SELECT state,binding_json,identities_json,(SELECT count(*) FROM endpoint_leases WHERE binding_id='binding-kept') FROM runtime_bindings WHERE id='binding-kept'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(binding,("live".into(),"original binding".into(),"original identities".into(),1));
+}
+
+// T24: multiple legacy policies have no reliable ownership provenance.
+#[test]
+fn ambiguous_legacy_namespace_requires_reconciliation() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store.import_resource_policy(&session,&host(),&observations(),11_000).unwrap();
+    store.conn.execute_batch("DROP TABLE host_publication_migrations; DROP TABLE engine_config_migrations; DROP TABLE remote_binding_ingress; DROP TABLE managed_configuration_sources; DROP TABLE approved_host_publications; DROP TABLE host_certificate_renewals; DROP TABLE host_enrollment_transactions; DROP TABLE host_certificates; DROP TABLE enrolled_hosts; DROP TABLE host_invitations; DROP TABLE host_resource_keys; DROP TABLE host_resource_namespaces; DELETE FROM schema_migrations WHERE version>=16;
+        INSERT INTO host_resource_policies SELECT 'other-host',revision,policy_json FROM host_resource_policies;").unwrap();
+    crate::migrations::apply(&store.conn).unwrap();
+    assert!(matches!(store.resource_policy("host-a"),Err(ResourcePolicyError::NeedsReconciliation)));
+    assert!(matches!(store.import_resource_policy(&session,&host(),&observations(),11_000),Err(ResourcePolicyError::NeedsReconciliation)));
+    assert!(store.embedded_host_id().unwrap().is_none());
+    assert!(matches!(store.import_remote_resource_policy(&session,"new-host",&host(),&observations(),11_000),Err(ResourcePolicyError::NeedsReconciliation)));
+}
+
+// T24: legacy local labels cannot alias a new host's generated accounting key.
+#[test]
+fn scoped_key_collision_rolls_back_namespace_and_policy() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let collision = crate::resource_namespace::ledger_key("remote","domain","system");
+    let mut legacy = host();
+    let domain = legacy.domains.remove("system").unwrap();
+    legacy.domains.insert(collision.clone(),domain);
+    legacy.devices.get_mut("gpu0").unwrap().domain = collision.clone();
+    let mut sampled = observations(); sampled[0].domain = collision;
+    let before = store.import_resource_policy(&session,&legacy,&sampled,11_000).unwrap();
+    assert!(store.import_remote_resource_policy(&session,"remote",&host(),&observations(),11_000).is_err());
+    assert!(store.resource_policy("remote").unwrap().is_none());
+    assert!(store.host_resource_key("remote","domain","system").unwrap().is_none());
+    assert_eq!(store.resource_snapshot().unwrap().epoch,before.epoch);
+}
+
+// T26 T27 (Phase B follow-up): a host's policy update is judged against that
+// host's owners. Another host's parked charge on its own domain is neither
+// corrupt stored policy nor overcommit here, and does not count against this
+// host's `max_parked`; the host-scoped snapshot sets it aside the same way.
+#[test]
+fn a_policy_update_on_one_host_ignores_another_hosts_owners() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let one = store
+        .import_remote_resource_policy(&session, "enrolled-one", &host(), &observations(), 11_000)
+        .unwrap();
+    store
+        .import_remote_resource_policy(&session, "enrolled-two", &host(), &observations(), 11_000)
+        .unwrap();
+    let theirs = store
+        .host_resource_key("enrolled-two", "domain", "system")
+        .unwrap()
+        .unwrap();
+    let ours = store
+        .host_resource_key("enrolled-one", "domain", "system")
+        .unwrap()
+        .unwrap();
+    store.conn.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('elsewhere','elsewhere','model',NULL,'stopped',1,0,1,1)", []).unwrap();
+    let parked = serde_json::json!({"version":1,"phase":"parked","allocations":[[theirs,60,30]],"devices":[]}).to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('elsewhere',?1,'elsewhere')",
+            [parked],
+        )
+        .unwrap();
+    let mut controls = one.controls.clone();
+    controls.max_parked = 0;
+    controls.domains.get_mut(&ours).unwrap().managed_limit = 40;
+    let scoped_observations: Vec<_> = observations()
+        .into_iter()
+        .map(|mut o| {
+            o.domain = ours.clone();
+            o
+        })
+        .collect();
+    let result = store
+        .update_resource_policy(
+            &session,
+            "alice",
+            "enrolled-one",
+            one.revision,
+            "scoped",
+            &controls,
+            &scoped_observations,
+            11_000,
+        )
+        .unwrap();
+    assert_eq!(result.overcommit.parked_owners, 0);
+    assert_eq!(
+        result.overcommit.domains[&ours],
+        DomainOvercommit { managed_bytes: 0, host_kv_bytes: 0, parked_bytes: 0 }
+    );
+    // Set aside, never released.
+    assert!(store.resource_snapshot().unwrap().owners.contains_key("elsewhere"));
+    let scoped = store.host_scoped_resource_snapshot(&[ours.as_str()]).unwrap();
+    assert!(scoped.owners.is_empty());
+    let theirs_view = store.host_scoped_resource_snapshot(&[theirs.as_str()]).unwrap();
+    assert!(theirs_view.owners.contains_key("elsewhere"));
+    // An unregistered domain keeps the whole ledger (fails closed).
+    let unknown = store.host_scoped_resource_snapshot(&["unregistered"]).unwrap();
+    assert!(unknown.owners.contains_key("elsewhere"));
+}
+
+// T24 T26: found live 2026-09-23 (matrix M32). A host restarted with a changed
+// resource policy in its document (normal to tight: max_parked 2 to 1) kept its
+// first imported limits at the controller, silently, so `max_parked` was never
+// enforced. A changed remote policy is now applied as a revision on the next
+// publication.
+#[test]
+fn a_republished_remote_policy_with_changed_limits_is_applied() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let first = store
+        .import_remote_resource_policy(&session, "enrolled-one", &host(), &observations(), 11_000)
+        .unwrap();
+    assert_eq!(first.controls.max_parked, 2);
+    let mut tight = host();
+    tight.max_parked = 1;
+    let again = store
+        .import_remote_resource_policy(&session, "enrolled-one", &tight, &observations(), 11_000)
+        .unwrap();
+    assert_eq!(again.controls.max_parked, 1);
+    assert_eq!(again.revision, first.revision + 1);
+    assert!(again.changed);
+    let stored = store.resource_policy("enrolled-one").unwrap().unwrap();
+    assert_eq!(stored.controls.max_parked, 1);
+    // Publishing the same document again changes nothing.
+    let same = store
+        .import_remote_resource_policy(&session, "enrolled-one", &tight, &observations(), 11_000)
+        .unwrap();
+    assert_eq!(same.revision, again.revision);
+    assert!(!same.changed);
+    // Back to the first limits and to tight again: each change is a revision.
+    let back = store
+        .import_remote_resource_policy(&session, "enrolled-one", &host(), &observations(), 11_000)
+        .unwrap();
+    assert_eq!((back.controls.max_parked, back.revision), (2, again.revision + 1));
+    let tight_again = store
+        .import_remote_resource_policy(&session, "enrolled-one", &tight, &observations(), 11_000)
+        .unwrap();
+    assert_eq!((tight_again.controls.max_parked, tight_again.revision), (1, back.revision + 1));
 }

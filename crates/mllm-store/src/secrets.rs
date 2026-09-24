@@ -220,8 +220,10 @@ impl crate::Store {
     /// Called on ordinary cleanup so no encrypted key outlives the binding it
     /// was issued for.
     pub fn delete_engine_keys(&self, binding_id: &str) -> Result<(), StoreError> {
-        self.conn
-            .execute("DELETE FROM engine_secrets WHERE binding_id=?1", [binding_id])?;
+        self.conn.execute(
+            "DELETE FROM engine_secrets WHERE binding_id=?1",
+            [binding_id],
+        )?;
         Ok(())
     }
 }
@@ -238,7 +240,7 @@ pub(crate) fn seed_binding(store: &crate::Store, binding_id: &str, incarnation: 
     store
         .conn
         .execute(
-            "INSERT INTO runtime_bindings VALUES(?1,?1,1,?2,'managed','{}','[]','reserved')",
+            "INSERT INTO runtime_bindings(id,deployment_id,revision,incarnation,ownership,binding_json,identities_json,state) VALUES(?1,?1,1,?2,'managed','{}','[]','reserved')",
             params![binding_id, incarnation],
         )
         .unwrap();
@@ -280,7 +282,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(store.engine_key("b2", "inc1", SecretRole::Inference).is_err());
+        assert!(store
+            .engine_key("b2", "inc1", SecretRole::Inference)
+            .is_err());
     }
 
     /// SGLang seals two keys per launch, one per role. Each round-trips

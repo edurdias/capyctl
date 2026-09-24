@@ -71,7 +71,7 @@ pub(super) fn canonical_members_or_empty(
 
 /// What the binding records as having been started, in the same normal form the
 /// evidence is put into, so the two are compared as sets and not as orderings.
-fn recorded_identities(
+pub(super) fn recorded_identities(
     tx: &Transaction<'_>,
     binding_id: &str,
 ) -> Result<Vec<ProcessIdentity>, LifecycleError> {
@@ -213,7 +213,7 @@ fn release(
     )?)?;
     one(tx.execute(
         "DELETE FROM resource_owners WHERE owner_id=?1",
-        [&p.deployment_id],
+        [&p.owner()],
     )?)?;
     one(tx.execute(
         "DELETE FROM endpoint_leases WHERE binding_id=?1",
@@ -300,7 +300,32 @@ mod tests {
         text(store, "SELECT state FROM runtime_bindings WHERE id=?1", id)
     }
     fn desired_state(store: &crate::Store, id: &str) -> String {
-        text(store, "SELECT desired_state FROM deployments WHERE id=?1", id)
+        text(
+            store,
+            "SELECT desired_state FROM deployments WHERE id=?1",
+            id,
+        )
+    }
+
+    // T30/T34: an explicit retry is legal only after verified failed-launch cleanup.
+    #[test]
+    fn start_after_verified_failure_creates_a_fresh_operation() {
+        let (store, session, fence, execution) = armed_ordinary();
+        let now = execution.issued_at_ms + 10;
+        let evidence = CleanupEvidence {
+            binding_id: execution.binding_id.clone(),
+            incarnation: execution.incarnation.clone(),
+            identities: vec![],
+            observed_at_ms: now,
+            receipt: "no process was associated".into(),
+        };
+        let ttl = store.observation_ttl_for_step(&execution.token.step_id).unwrap();
+        store.release_failed_launch(&session, &execution.token.step_id, &evidence, now, ttl).unwrap();
+        store.set_admission_enabled(&fence.deployment_id, false).unwrap();
+        let retry = store.accept_start(&session, &fence, now + 1, now + 1000).unwrap();
+        assert!(!retry.joined);
+        assert_ne!(retry.operation_id, execution.token.operation_id);
+        assert_ne!(retry.binding_id, execution.binding_id);
     }
 
     /// Spec §6: a launch that failed after arm is released with gone evidence. The
@@ -351,7 +376,11 @@ mod tests {
         assert_eq!(step_state(&store, &step), "cancelled");
         assert_eq!(run_state(&store, &operation), "failed");
         assert_eq!(
-            text(&store, "SELECT state FROM operations WHERE id=?1", &operation),
+            text(
+                &store,
+                "SELECT state FROM operations WHERE id=?1",
+                &operation
+            ),
             "failed"
         );
         assert_eq!(
