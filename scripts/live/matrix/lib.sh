@@ -20,7 +20,9 @@ DRY_RUN=${DRY_RUN:-0}
 # Machines. Addresses are the Tailscale 100.64/10 addresses recorded in the
 # Phase B host documents (target/live/phase-b/host-b-*.yaml).
 REMOTE_HOME=${MLLM_REMOTE_HOME:-$HOME}
-REMOTE_TREE=$REMOTE_HOME/mllm-f2
+# MLLM_REMOTE_TREE lets a second worktree keep its own tree and binary on the
+# Sparks (the 2026-09-24 soak ran from ~/mllm-soak beside another agent's tree).
+REMOTE_TREE=${MLLM_REMOTE_TREE:-$REMOTE_HOME/mllm-f2}
 SERVER_IP=${MLLM_SERVER_IP:-100.64.0.20}
 MATRIX_HOSTS=(host-a host-b)
 MODELS_ROOT=$REMOTE_HOME/models
