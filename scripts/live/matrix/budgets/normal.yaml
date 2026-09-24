@@ -1,0 +1,9 @@
+{
+ "policy": "normal",
+ "capacity_bytes": 130663170048,
+ "managed_limit": "104530536038B",
+ "free_reserve": "13066317005B",
+ "parked_limit": "32665792500B",
+ "host_kv_limit": "13066317000B",
+ "max_parked": 2
+}

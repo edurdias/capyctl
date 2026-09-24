@@ -11,11 +11,16 @@
 # identifiers it prints. The matches are collected rather than piped into
 # `grep -q`, because a quiet grep closes the pipe early and `pipefail` would then
 # read the writer's broken pipe as "nothing found".
+#
+# Run from the workspace root. It honours CARGO_TARGET_DIR, so the matrix
+# harness (`scripts/live/matrix/sync.sh build`) checks the very binary it built
+# on control-host as well as on each Spark. It replaces the check the removed live
+# runner made for live_vllm.rs L10 (matrix row M75 is the other half).
 set -euo pipefail
 
 cargo build --release --bin mllm --offline
 
-artifacts=$(strings target/release/mllm |
+artifacts=$(strings "${CARGO_TARGET_DIR:-target}/release/mllm" |
   grep -E "FakeEngine|FakeLauncher|mllm_testkit|mllm-testkit|src/fake/|fake-engine|fake-lifecycle" || true)
 if [ -n "$artifacts" ]; then
   echo "release binary contains test artifacts:" >&2

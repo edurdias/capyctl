@@ -1,0 +1,89 @@
+{
+ "schema_version": 1,
+ "kind": "host",
+ "name": "@HOST_NAME@",
+ "state_dir": "@RUN_ROOT@/host",
+ "identity_dir": "@RUN_ROOT@/host/identity",
+ "runtime_dir": "@REMOTE_TREE@/runtime",
+ "ingress": {
+  "bind": "@INGRESS@",
+  "address": "http://@INGRESS@",
+  "transport": "trusted_private_link"
+ },
+ "hardware_fingerprint": "gb10-aarch64-@HOST_NAME@",
+ "environment_fingerprint": "matrix-sglang-@SGLANG_VERSION@-vllm-@VLLM_VERSION@",
+ "device_inventory_digest": "@DEVICE_DIGEST@",
+ "model_store": {
+  "path": "@MODELS_ROOT@"
+ },
+ "runtime_profiles": {
+  "sglang": {
+   "engine": "sglang",
+   "revision": 1,
+   "executable": "@SGLANG_VENV@/bin/python3",
+   "build_fingerprint": "@SGLANG_VERSION@",
+   "args": [],
+   "env": {},
+   "log_policy": {
+    "max_file_bytes": "16MiB",
+    "retained_files": 3
+   },
+   "security": {
+    "deep_park": "enabled",
+    "trust_remote_code": false,
+    "credential_ref": "secret://engine-key",
+    "admin_credential_ref": "secret://admin-key"
+   }
+  },
+  "vllm": {
+   "engine": "vllm",
+   "revision": 1,
+   "executable": "@VLLM_VENV@/bin/vllm",
+   "build_fingerprint": "@VLLM_VERSION@",
+   "args": [],
+   "env": {},
+   "log_policy": {
+    "max_file_bytes": "16MiB",
+    "retained_files": 3
+   },
+   "security": {
+    "deep_park": "enabled",
+    "trust_remote_code": false,
+    "credential_ref": "secret://engine-key"
+   }
+  }
+ },
+ "resource_policy": {
+  "domains": {
+   "unified": {
+    "managed_limit": "@MANAGED_LIMIT@",
+    "free_reserve": "@FREE_RESERVE@",
+    "parked_limit": "@PARKED_LIMIT@",
+    "host_kv_limit": "@HOST_KV_LIMIT@",
+    "memory": "unified"
+   }
+  },
+  "devices": {
+   "gpu0": {
+    "domain": "unified",
+    "sharing": "shared",
+    "physical_gpu_uuid": "@GPU_UUID@"
+   }
+  },
+  "device_sharing": "shared",
+  "max_parked": "@MAX_PARKED@",
+  "observation_ttl": "2s",
+  "endpoint_port_range": {
+   "start": 8100,
+   "end": 8199
+  },
+  "planner_max_states": 4096,
+  "queue": {
+   "admission_window": "2s",
+   "max_pending_per_deployment": 64,
+   "max_pending_total": 256,
+   "max_buffered_bytes_total": "64MiB",
+   "request_deadline": "1800s"
+  }
+ }
+}
