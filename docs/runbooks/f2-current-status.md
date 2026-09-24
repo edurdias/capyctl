@@ -36,15 +36,15 @@ file:// installer fixture; not qualification of any engine recipe).
    the built tarball.
 
 Draft release `v0.1.0-rc.1` (pre-release, unpublished; owner reviews before
-publishing) targets ee8ca2f: `mllm-0.1.0-rc.1-linux-x86_64.tar.gz` (built on
-control-host, sha256 `ee80c7c3…8114`), `mllm-0.1.0-rc.1-linux-aarch64.tar.gz` (built
-natively on host-a in `~/mllm-release-build`, nice 19, sha256
-`1cee96c3…38fd`), `install.sh` and `SHA256SUMS`. Both passed
+publishing) was rebuilt after PR #8 merged and targets `main` at 6d7bf36:
+`mllm-0.1.0-rc.1-linux-x86_64.tar.gz` (built on control-host, sha256
+`606f7702…dbc2`), `mllm-0.1.0-rc.1-linux-aarch64.tar.gz` (built natively on
+host-a in `~/mllm-release-build`, nice 19, sha256 `26dda1d9…5783`),
+`install.sh` (`e09a327f…e43b`) and `SHA256SUMS`. Both passed
 `scripts/verify-packaging.sh` on their own architecture; both binaries carry
-runtime manifest `80044870…ddee0`. The API and `gh` download paths of
-`install.sh` resolve published releases only, so they work once the draft is
-published; the target is a branch commit, so re-target or rebuild after merge
-if the release should point at `main`.
+runtime manifest `80044870…ddee0` and `BUILDINFO` commit 6d7bf36, not dirty.
+The API and `gh` download paths of `install.sh` resolve published releases
+only, so they work once the draft is published.
 
 Not established: no release binary has run a role on a Spark, and the matrix
 harness still declares `runtime_dir` (synced tree), so the managed runtime has
