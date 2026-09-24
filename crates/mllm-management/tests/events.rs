@@ -1064,6 +1064,8 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
             (None, None)),
         "host_revoked" => (serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
             "host_name":"host-a"}), (None, None)),
+        "host_drain_intent_expired" => (serde_json::json!({"version":"1","host_id":"host-a",
+            "drain_key":"01BX5ZZKBKACTAV9WEVGEMMVS3","deadline_ms":900000}), (None, None)),
         k if k.starts_with("switch_") => (serde_json::json!({"version":"1","phase":&k["switch_".len()..],
             "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",
             "victims":[format!("{OP}/0")],"detail":"planned on host-a"}),

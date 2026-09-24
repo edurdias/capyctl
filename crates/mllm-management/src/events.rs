@@ -512,6 +512,12 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
         ],
         // SPEC §§4.1, 13.3: an administrator revoked a host identity.
         "host_revoked" => &[("host_id", Token), ("host_name", Token)],
+        // SPEC §4.3: an abandoned drain intent expired after its deadline.
+        "host_drain_intent_expired" => &[
+            ("host_id", Token),
+            ("drain_key", Token),
+            ("deadline_ms", Number),
+        ],
         _ => return Err(Failure::Internal),
     };
     if input.len() != fields.len() + 1 {

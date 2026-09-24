@@ -65,13 +65,17 @@ impl EnrollmentAuthority {
     /// Owner decision 4 (2026-09-22): the enrolled hosts whose drain still has
     /// an unsettled Stop. `None` when the store cannot be read; callers fail
     /// closed and place nothing on any host then.
+    ///
+    /// SPEC §4.3: an abandoned drain intent (past its deadline, with no Stop
+    /// of its host still open) is completed and journaled first, so a server
+    /// that stopped mid-drain does not hold the host out forever. An expiry
+    /// that cannot be written leaves the intent open: fail closed.
     pub fn hosts_with_pending_drain(&self) -> Option<std::collections::BTreeSet<String>> {
-        self.state
-            .lock()
-            .ok()?
+        let owner = self.state.lock().ok()?;
+        let _ = owner
             .store()
-            .hosts_with_pending_drain()
-            .ok()
+            .expire_host_drain_intents(mllm_protocol::now_unix_ms());
+        owner.store().hosts_with_pending_drain().ok()
     }
     pub fn new(state: SharedCoordinatorState, ca: CertificateAuthority) -> Self {
         let (revocations, _) = watch::channel(0);

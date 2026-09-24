@@ -356,6 +356,16 @@ async fn a_drain_of_an_idle_host_leaves_no_hold() {
         )
         .unwrap();
     assert_eq!(intents, 1, "the intent was written and completed");
+    // SPEC §4.3: the intent carries the drain's own deadline, so one whose
+    // request is abandoned expires instead of holding the host forever.
+    let deadline: i64 = sql
+        .query_row(
+            "SELECT deadline_ms FROM host_drain_intent_deadlines WHERE host_id='lab' AND drain_key='drain-idle'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(deadline, 10000);
     assert!(!setup
         .owner
         .lock()

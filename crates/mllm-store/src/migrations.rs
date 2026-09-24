@@ -3,7 +3,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{
-    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V30,
+    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V30, SCHEMA_V31,
     SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
@@ -33,6 +33,8 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V29,
     // SPEC §4.3 (router review item 14): drain intents written before any Stop.
     SCHEMA_V30,
+    // SPEC §4.3: drain intent deadlines, so an abandoned intent expires.
+    SCHEMA_V31,
 ];
 
 /// Applies every migration newer than the recorded schema version.
@@ -492,7 +494,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, MIGRATIONS.len() as i64);
         let marker: (String, String, i64) = conn
             .query_row("SELECT host_id,operation_id,recorded_at_ms FROM host_drains", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))

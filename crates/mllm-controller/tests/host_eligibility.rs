@@ -310,7 +310,7 @@ async fn a_host_with_a_pending_drain_is_not_a_placement_candidate() {
         .lock()
         .unwrap()
         .store()
-        .begin_host_drain(&host, "drain", 1)
+        .begin_host_drain(&host, "drain", mllm_protocol::now_unix_ms())
         .unwrap();
     assert!(
         !sessions.eligible_hosts().unwrap().contains(&host),

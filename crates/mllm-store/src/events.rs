@@ -148,6 +148,15 @@ pub(crate) enum EventMetadata {
     /// by this record.
     #[serde(rename = "1")]
     HostRevoked { host_id: String, host_name: String },
+    /// SPEC §4.3: a host drain intent whose request never completed (the
+    /// server stopped between opening it and recording its Stops) expired
+    /// after its deadline with no Stop of the host still open.
+    #[serde(rename = "1")]
+    HostDrainIntentExpired {
+        host_id: String,
+        drain_key: String,
+        deadline_ms: i64,
+    },
     /// SPEC §10, ADR 0013 §8 (W10): one transition of a request-driven switch.
     /// Victims are `deployment/instance`; each victim's park or stop is its
     /// own operation with its own events.
@@ -289,6 +298,7 @@ impl EventMetadata {
             Self::HostResourcePolicyUpdated { .. } => "host_resource_policy_updated",
             Self::InstallationDriftFlagged { .. } => "installation_drift_flagged",
             Self::HostRevoked { .. } => "host_revoked",
+            Self::HostDrainIntentExpired { .. } => "host_drain_intent_expired",
             Self::SwitchRecorded { phase, .. } => match phase {
                 SwitchPhase::Planned => "switch_planned",
                 SwitchPhase::AdmissionClosed => "switch_admission_closed",
@@ -337,7 +347,8 @@ impl EventMetadata {
                 (None, Some(operation_id.as_str()))
             }
             Self::InstallationDriftFlagged { .. }
-            | Self::HostRevoked { .. } => (None, None),
+            | Self::HostRevoked { .. }
+            | Self::HostDrainIntentExpired { .. } => (None, None),
             Self::SwitchRecorded {
                 target_deployment, ..
             } => (Some(target_deployment.as_str()), None),

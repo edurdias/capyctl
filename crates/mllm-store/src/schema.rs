@@ -769,6 +769,22 @@ CREATE TABLE IF NOT EXISTS host_drain_intents(
 );
 "#;
 
+/// v31 (SPEC §4.3): the deadline a host drain intent was opened with. A drain
+/// whose request never completed (the server stopped between opening the
+/// intent and recording its Stops) otherwise held its host out of placement
+/// forever; with its deadline, an intent past it with no Stop of the host
+/// still open is completed and journaled (`Store::expire_host_drain_intents`).
+/// A v30 intent has no row here and is given the drain window from its
+/// recording. Additive; idempotent so a store rolled back can reapply it.
+pub const SCHEMA_V31: &str = r#"
+CREATE TABLE IF NOT EXISTS host_drain_intent_deadlines(
+  host_id TEXT NOT NULL CHECK(length(host_id)>0),
+  drain_key TEXT NOT NULL CHECK(length(drain_key)>0),
+  deadline_ms INTEGER NOT NULL CHECK(deadline_ms>=0),
+  PRIMARY KEY(host_id,drain_key)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
