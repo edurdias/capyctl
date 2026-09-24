@@ -11,7 +11,7 @@
 # Python environments, model weights and GPU drivers are never installed.
 #
 # Options:
-#   --version V     release to install, e.g. 0.1.0-rc.1 (a leading "v" is
+#   --version V     release to install, e.g. 0.1.0-rc.2 (a leading "v" is
 #                   accepted). Default: the latest published release.
 #   --system        install for every user: /usr/local/bin/mllm, units under
 #                   /etc/systemd/system (needs root). Default: this user only,

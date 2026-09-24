@@ -20,8 +20,8 @@ ARM64); mllm's Python runtime helpers are compiled into it. The repository is
 private, so use a logged-in `gh` (or set `GITHUB_TOKEN`):
 
 ```bash
-gh release download v0.1.0-rc.1 -R edurdias/mllm -p install.sh
-sh install.sh --version 0.1.0-rc.1          # ~/.local/bin/mllm
+gh release download v0.1.0-rc.2 -R edurdias/mllm -p install.sh
+sh install.sh --version 0.1.0-rc.2          # ~/.local/bin/mllm
 # sudo sh install.sh --system ...           # /usr/local/bin/mllm
 # add --systemd <server|host|standalone> to install that role's unit
 ```
