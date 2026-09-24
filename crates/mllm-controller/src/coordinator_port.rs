@@ -478,6 +478,23 @@ impl CoordinatorLifecycle {
     /// operator's stop, wake a parked instance in place, else start one
     /// instance cold. Capacity refusal is reported apart, for W10.
     fn activate_once(&self, deployment: &str) -> Result<Activation, LifecycleFault> {
+        let row = self.refuse_operator_stop(deployment)?;
+        // Commands fence on the effective revision, which is not the row's schema
+        // version; confusing them yields a revision conflict rather than a clear
+        // failure.
+        let revision = self
+            .commands
+            .read(|store| store.current_revision(deployment))?
+            .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))?;
+        self.activate_revision(deployment, &row, revision)
+    }
+
+    /// SPEC §6.3, owner decisions Q5 and Q7: an operator's stop survives the
+    /// next inference request. Refused before anything else a request would
+    /// do, including making room by switching: the M48 soak (2026-09-24) found
+    /// a request for an explicitly stopped deployment parking a Ready
+    /// incumbent on the tight host and only then being refused.
+    fn refuse_operator_stop(&self, deployment: &str) -> Result<DeploymentRow, LifecycleFault> {
         let row = self.current(deployment)?;
         // An explicit stop must survive the next inference request (SPEC §6.3). The
         // coordinator's start would otherwise clear nothing and start it anyway.
@@ -504,13 +521,10 @@ impl CoordinatorLifecycle {
                 "every instance of deployment {deployment} was explicitly stopped"
             )));
         }
-        // Commands fence on the effective revision, which is not the row's schema
-        // version; confusing them yields a revision conflict rather than a clear
-        // failure.
-        let revision = self
-            .commands
-            .read(|store| store.current_revision(deployment))?
-            .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))?;
+        Ok(row)
+    }
+
+    fn activate_revision(&self, deployment: &str, row: &DeploymentRow, revision: i64) -> Result<Activation, LifecycleFault> {
         let key = Self::activation_key(deployment, revision, row.current_generation);
         // Owner decision Q5, ADR 0013 §4 (W5): a parked instance is restored in
         // place, on the host it parked on, before anything starts cold; a
@@ -857,6 +871,9 @@ impl LifecyclePort for CoordinatorLifecycle {
                     "no room could be made for deployment {deployment} after {rounds} switch round(s)"
                 )));
             }
+            // SPEC §6.3: an operator's stop is refused before any victim is
+            // chosen; no incumbent is evicted for a request that cannot run.
+            self.refuse_operator_stop(deployment)?;
             let room = match self.switching.make_room(deployment).await {
                 Ok(room) => room,
                 Err(crate::switching::NoRoom::Moved) => continue,
