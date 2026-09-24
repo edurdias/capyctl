@@ -4,6 +4,61 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Post-merge live smoke — 2026-09-24 (branch `fix/live-smoke-2026-09-24`)
+
+PR #1 (`edurdias/mllm`) merged into `main` as `eb33deb` after local
+verification (no CI minutes available). A live smoke on both Sparks then passed
+M75, M73 on both engines, M08, vLLM and SGLang park and wake (M29, M28), a
+cross-engine switch with warm processes (M31), M47, M53, M65, M66, M54, a sustained
+frozen-agent run (M58: 2400 of 2400 requests, 5.4 s suspension, no replay), M64 and
+M36, plus vLLM tool calls with a tool parser. It found two defects, both fixed on
+`fix/live-smoke-2026-09-24` (from `origin/main`):
+
+1. An engine's invalid-request rejection became a 500 and held an uncertain lease.
+   The owner decided on 2026-09-24 that a complete engine response with status 400,
+   413 or 422 and a JSON body is completion evidence, so the client receives the
+   engine's status and message (`engine_rejected`) and the lease closes, while every
+   other status stays uncertain (SPEC §10 note).
+2. SGLang tool calls failed at the router with a 500, streaming or not (the adapter
+   always streams from the engine). The cause was not the tool-call index: SGLang
+   0.5.20 serializes each tool-call delta through pydantic without dropping unset
+   fields, so the delta carries `"role": null`, which the strict delta check read
+   as a role other than `assistant`. Read-only inspection of the 0.5.20 source on
+   host-a (`serving_chat._process_tool_call_stream`, `ToolCallItem.tool_index:
+   int`) shows the index is always an integer, so index validation stays strict. A
+   null role is now an absent role; a non-null role other than `assistant` is still
+   uncertain, and a chunk's `"usage": null` no longer overwrites collected usage. The
+   regression test replays SGLang's exact bytes (T19).
+
+Tool calls need the engine's own tool parser, passed through
+`engine_config.extra_args` with `accept_extra_args: true` (vLLM
+`--enable-auto-tool-choice --tool-call-parser hermes`, SGLang
+`--tool-call-parser qwen25`); mllm relays, never parses (SPEC §10 note).
+
+Harness: a row that fails or exits early now deletes what it deployed
+(`cleanup_failed_row`, `KEEP_FAILED=1` keeps it), so a failed deploy no longer
+leaves a route that makes the next row fail `route_conflict`. M64 judges cleanup
+after `delete --stop` by deployment id. M53 now expects the failed target's
+restart to be refused `startup_requires_empty_host` and checks ledger residue by
+id. New rows: `TC` (tool calls, named and auto, streamed and not), `REJ` (engine
+rejections), `M58` (sustained frozen agent); `M31` takes `SWITCH_MEMORY_JSON` for
+the q4 pair; `M08` records tool-call behaviour without a parser (not gating).
+
+Live after the fixes (2026-09-24, run `matrix-20260924T185326Z`): TC on SGLang
+s92-4 with `qwen25` returned `get_weather` tool calls for named and auto, streamed
+and not (4 of 4, finish `tool_calls`, well-formed SSE); TC on vLLM v17-4 with
+`hermes` 4 of 4; REJ 40 of 40 rejections relayed 400 `engine_rejected`, the
+streamed rejection an `engine_rejected` error event, no lease held, and the route
+then served; M08 passed. The failure-cleanup trap was exercised with a scratch row.
+Both hosts were left with no engine or role process and no GPU compute process.
+Local: core 974 reported (973 distinct), workspace 1678 (one run had a load-timed
+failure in `a_success_resets_the_attempt_budget`, 0 of 30 in isolation), Clippy
+clean, runtime Python 276. CPU and Fake-engine tests are not qualification.
+
+Open: the keyed vLLM admin-key probe was not run because the permission classifier
+refused an agent reading engine keys from process environments, even with the
+owner's relayed approval.
+
 ## Consolidated review round — 2026-09-24 (uncommitted)
 
 The owner's single end-of-work review ran as four read-only reviewers (store;
