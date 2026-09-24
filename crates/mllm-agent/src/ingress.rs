@@ -396,6 +396,41 @@ impl Drop for InFlight {
 fn failure(status: StatusCode) -> Response {
     (status,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"error":{"code":"inference_unavailable","message":"Inference request is not authorized or could not complete"}}))).into_response()
 }
+/// Relay an engine's invalid-request answer, read in full within bounds; any
+/// body that cannot be read or is not JSON stays a 502.
+async fn engine_rejection(response: reqwest::Response) -> Response {
+    let status = response.status();
+    let limit = mllm_adapters::forward::REJECTION_BODY_LIMIT;
+    if response.content_length().is_some_and(|length| length > limit as u64) {
+        return failure(StatusCode::BAD_GATEWAY);
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| ())?;
+            if body.len() + chunk.len() > limit {
+                return Err(());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(())
+    })
+    .await;
+    let message = match read {
+        Ok(Ok(())) => mllm_adapters::forward::rejection_message(&body),
+        _ => None,
+    };
+    let (Some(message), Ok(status)) = (message, StatusCode::from_u16(status.as_u16())) else {
+        return failure(StatusCode::BAD_GATEWAY);
+    };
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"error":{"code":"engine_rejected","message":message}})),
+    )
+        .into_response()
+}
 async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Response {
     // SPEC §17 (M80): the ingress clock starts when the request reaches it.
     let received = Instant::now();
@@ -465,6 +500,13 @@ async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Respo
     .await
     {
         Ok(Ok(response)) if response.status().is_success() => response,
+        // SPEC §10 (found live 2026-09-24): the engine rejected the request as
+        // invalid. Its answer is complete and nothing runs for it, so it is
+        // relayed as `engine_rejected` with the engine's bounded message; a 502
+        // would leave the router unable to tell it from an unverified failure.
+        Ok(Ok(response)) if mllm_adapters::forward::rejection_status(response.status().as_u16()) => {
+            return engine_rejection(response).await;
+        }
         _ => return failure(StatusCode::BAD_GATEWAY),
     };
     let content = response

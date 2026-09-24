@@ -78,7 +78,11 @@ build() {
 runtime() {
   local host
   for host in $(hosts_or_all "$@"); do
-    x rsync -rlpDz --checksum --delete --chmod=Dgo-w,Fgo-w --exclude __pycache__ "$SNAPSHOT/tree/runtime/" "$host:$REMOTE_TREE/runtime/"
+    # --delete-excluded: an excluded path is otherwise kept on the receiver, and
+    # stale bytecode there makes the host refuse every launch `runtime_integrity`
+    # (found live 2026-09-24). Only __pycache__ is excluded here, so nothing else
+    # is affected.
+    x rsync -rlpDz --checksum --delete --delete-excluded --chmod=Dgo-w,Fgo-w --exclude __pycache__ "$SNAPSHOT/tree/runtime/" "$host:$REMOTE_TREE/runtime/"
     x rsync -az --chmod=Dgo-w,Fgo-w "$SNAPSHOT/tree/scripts/live/matrix/check_runtime.py" "$host:$REMOTE_TREE/scripts/live/matrix/"
     rsh "$host" "python3 $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime ${RUNTIME_REQUIRED[*]}"
   done

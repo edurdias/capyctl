@@ -22,8 +22,14 @@ $M/run_row.sh M73 --tag v92-4 -- v92-4    # engine lifecycle gate; also s92-4
 $M/run_row.sh M38 --tag v92-4 -- v92-4    # launch failures close, then recovery
 $M/run_row.sh M74 --tag v92-14 -- v92-14  # timeouts.initialize expires, override wins
 $M/run_row.sh M75 --no-e0                 # no engine installation, no boot
+$M/run_row.sh TC --tag s92-4 -- s92-4 '["--tool-call-parser","qwen25"]'   # tool calls need the engine's parser
+$M/run_row.sh REJ --tag v17-4 -- v17-4    # engine 400/413/422 relayed as engine_rejected, leases closed
 $M/roles.sh down
 ```
+
+A row that fails, or exits early, deletes every deployment it deployed with
+`delete deployment --stop` (`cleanup_failed_row`); set `KEEP_FAILED=1` to keep them
+for inspection.
 
 Put `DRY_RUN=1` in front of any command to print its plan without running it. A dry run
 still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writes to

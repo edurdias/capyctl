@@ -225,6 +225,12 @@ pub fn stream_planned_timed(
             durable = attempt.settle(end).await;
             // SPEC §10, T19: a deterministic refusal decided before sending is
             // answered in-band; another instance would refuse it the same way.
+            if let Ok(Err(AdapterError::Rejected { message, .. })) = &result {
+                // SPEC §10 (found live 2026-09-24): the engine's complete
+                // invalid-request answer, relayed in-band; not retryable.
+                let message = message.clone();
+                break (result, Some(("engine_rejected".to_owned(), message)));
+            }
             if let Ok(Err(error)) = &result {
                 if crate::chat::refused_before_sending(error) {
                     let (_, Json(answer)) = crate::chat::adapter_refusal(error);
@@ -257,7 +263,8 @@ pub fn stream_planned_timed(
         if let Some((code, reason)) = refusal {
             // Nothing reached any engine; say so in-band, retryably.
             guard.release();
-            let retryable = !matches!(code.as_str(), "invalid_request" | "unsupported");
+            let retryable =
+                !matches!(code.as_str(), "invalid_request" | "unsupported" | "engine_rejected");
             let refusal = serde_json::json!({"error": {
                 "code": code, "message": reason, "retryable": retryable}});
             let _ = tokio::time::timeout(

@@ -85,10 +85,14 @@ host_init() {
   local host=$1 policy=${2:-normal} device sgv vv
   load_run
   rsh "$host" "[ -d $RRD ] || mkdir -p -m 700 $RRD; MLLM_STATE_DIR=$RRD/host $RBIN init host --output $RRD/host.yaml"
+  # -B: the probe imports runtime modules, and a written __pycache__ makes the
+  # host refuse every launch `runtime_integrity` (found live 2026-09-24).
   device=$(rsh_out "$host" '{"schema":"mllm-nvidia-inventory-v1","host_id":"'"$host"'","digest":"0000000000000000000000000000000000000000000000000000000000000000","devices":[{"physical_gpu_uuid":"GPU-00000000-0000-0000-0000-000000000000"}]}' \
-    "cd $REMOTE_TREE && python3 -m runtime.sglang_device")
+    "cd $REMOTE_TREE && PYTHONDONTWRITEBYTECODE=1 python3 -B -m runtime.sglang_device")
   sgv=$(rsh_out "$host" 0.5.20 "$SGLANG_VENV/bin/python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null | tail -1")
   vv=$(rsh_out "$host" 0.29.0 "$(vllm_venv "$host")/bin/python3 -c 'import importlib.metadata as m; print(m.version(\"vllm\"))'")
+  # The runtime tree must still pass the host's integrity rule after the probes.
+  rsh "$host" "python3 -B $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime >/dev/null || { python3 -B $REMOTE_TREE/scripts/live/matrix/check_runtime.py $REMOTE_TREE/runtime | grep FAIL >&2; exit 3; }"
   if ! dry; then
     mkdir -p "$RUNSTATE"
     printf '%s\n' "$device" >"$RUNSTATE/device-$host.json"

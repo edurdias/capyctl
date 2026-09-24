@@ -159,6 +159,12 @@ row_main() {
     step engine-v engine_surface "$host" v92-4 vllm || rc=1
     step engine-s engine_surface "$host" s92-4 sglang || rc=1
     step engine-sockets engine_sockets "$host" || rc=1
+    # SPEC §10 tool calls on engines launched without a tool parser (evidence,
+    # not gating; rows/TC.sh gates tool calls with a parser). Observed
+    # 2026-09-24: vLLM answered a named tool_choice 400; SGLang answered it as
+    # plain JSON text, not tool_calls.
+    step toolcall-v python3 "$MATRIX_DIR/toolcall.py" --route v92-4 --out "$EVID/toolcall.jsonl"
+    step toolcall-s python3 "$MATRIX_DIR/toolcall.py" --route s92-4 --out "$EVID/toolcall.jsonl"
   fi
   for dep in v92-4 s92-4; do
     step "stop-$dep" stop_dep "$dep" || rc=1

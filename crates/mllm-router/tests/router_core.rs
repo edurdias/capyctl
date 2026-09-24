@@ -685,6 +685,35 @@ async fn a_shutting_down_refusal_is_a_retryable_503_that_closes_the_lease() {
     assert_eq!(ends(&authority)[1], Some(mllm_controller::LeaseEnd::NotAccepted));
 }
 
+// T17 T19 (SPEC §10, found live 2026-09-24): an engine rejection of an
+// invalid request is its complete answer. The router relays it with the
+// engine's status and message as `engine_rejected`, not retryable, never a
+// 500, and closes the lease as completed: rejected requests must not pile up
+// uncertain leases until the deployment's outstanding bound refuses everyone.
+#[tokio::test]
+async fn an_engine_rejection_is_relayed_and_closes_the_lease() {
+    let rejection = serde_json::json!({"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}});
+    let (endpoint, _) = scripted_engine(400, "application/json", rejection.to_string()).await;
+    let (authority, deps) = stub_router(&endpoint);
+    let router = mllm_router::serve_router(deps.clone());
+    let bound = deps.limits.max_requests_per_deployment;
+    for _ in 0..bound + 2 {
+        let (status, body) = chat_once(&router, "public-alias").await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], "engine_rejected");
+        assert!(body["message"].as_str().unwrap().contains("maximum context length"), "{body}");
+    }
+    let (status, text) = chat_stream(&router, "public-alias").await;
+    assert_eq!(status, 200);
+    assert!(text.contains("engine_rejected") && text.contains("maximum context length"), "{text}");
+    assert!(text.contains("\"retryable\":false") && !text.contains("[DONE]"), "{text}");
+    assert_eq!(
+        ends(&authority),
+        vec![Some(mllm_controller::LeaseEnd::Completed); bound + 3]
+    );
+    assert_eq!(deps.inflight.current("dep-1"), 0);
+}
+
 // T17 T19 (SPEC §10): an engine failure after the request may have been
 // accepted keeps the durable lease charged as uncertain. The per-process slot is
 // released, so uncertain ends never shrink the deployment's in-flight bound for
