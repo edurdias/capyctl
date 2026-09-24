@@ -1154,3 +1154,55 @@ fn effective_view_redacts_secret_argument_values() {
     mllm_management::configuration::redact_effective(&mut ordinary);
     assert_eq!(ordinary, before);
 }
+
+/// ADR 0008: a deployment declaring a remote source is refused on a host that
+/// did not opt in (`model_source_denied` names why), accepted on one that did,
+/// and its store key is listed as referenced for `mllm prune sources`.
+// T14
+#[tokio::test]
+async fn remote_sources_need_host_opt_in_and_are_listed_as_referenced() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let (_directory, state, mut config, mut host) = fixture();
+    let model = config["model"].as_object_mut().unwrap();
+    model.remove("path");
+    model.insert(
+        "source".into(),
+        json!({"huggingface": {"repo": "Qwen/Qwen3-4B", "revision": sha}}),
+    );
+    let refused = app(state.clone(), host.clone())
+        .oneshot(request("POST", "/management/v1/deployments", "denied", json!({"config":config,"activate":false})))
+        .await
+        .unwrap();
+    assert!(refused.status().is_client_error(), "{}", refused.status());
+    let body = json_response(refused).await;
+    assert_eq!(body["error"]["details"]["path"], "model.source", "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("model source denied by host policy"), "{message}");
+
+    host["model_sources"] = json!({"huggingface": "allowed", "max_bytes": "100GiB"});
+    let router = app(state, host);
+    let created = router
+        .clone()
+        .oneshot(request("POST", "/management/v1/deployments", "allowed", json!({"config":config,"activate":false})))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 202);
+    let listed = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/management/v1/model-sources")
+                .header("authorization", format!("Bearer {MANAGEMENT}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    let body = json_response(listed).await;
+    assert_eq!(
+        body["referenced"],
+        json!([format!("sources/huggingface/Qwen--Qwen3-4B@{sha}")]),
+        "{body}"
+    );
+}

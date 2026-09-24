@@ -255,6 +255,12 @@ fn routes(state: Arc<AppState>, include_events: bool) -> Router {
                 "/management/v1/deployments/{id}/effective-config",
                 get(configuration::effective_config),
             )
+            // SPEC §6.3, ADR 0008: the store keys deployments still reference,
+            // for the host-side `mllm prune sources`.
+            .route(
+                "/management/v1/model-sources",
+                get(configuration::model_sources).head(method_denied),
+            )
     } else {
         router
     };

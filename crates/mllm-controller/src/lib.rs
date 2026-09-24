@@ -19,6 +19,8 @@ pub mod installation_gate;
 pub mod engine_provider;
 pub mod fault;
 pub mod local_readiness;
+// ADR 0008: declared remote model sources materialized on their hosts.
+pub mod model_sources;
 pub mod native_launch;
 pub mod operations;
 pub mod ownership;

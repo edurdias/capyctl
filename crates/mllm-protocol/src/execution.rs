@@ -143,6 +143,63 @@ impl DigestCheckpointPlan {
     }
 }
 
+/// ADR 0008 (additive): materialize one deployment's declared remote model
+/// source on its host, or report on it. Like a digest request it carries the
+/// deployment document, never a path or a secret; the host checks its own
+/// model-source policy. `source_key` is derived from the document, never
+/// taken from the wire, and binds the result to the source it answers for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializeSourcePlan {
+    pub deployment_config: String,
+    pub host_policy_fingerprint: String,
+    pub source_key: String,
+}
+impl MaterializeSourcePlan {
+    /// A plan for `deployment_config`, whose `model` must name a valid remote
+    /// source. `None` otherwise.
+    pub fn new(deployment_config: &str, host_policy_fingerprint: &str) -> Option<Self> {
+        Self::try_from(pb::MaterializeSourceRequest {
+            deployment_config: deployment_config.into(),
+            host_policy_fingerprint: host_policy_fingerprint.into(),
+        })
+        .ok()
+    }
+    /// The declared source this plan names.
+    pub fn source(&self) -> Option<mllm_config::model_source::ModelSource> {
+        let value: serde_json::Value = serde_json::from_str(&self.deployment_config).ok()?;
+        remote_source(&value)
+    }
+    fn to_wire(&self) -> pb::MaterializeSourceRequest {
+        pb::MaterializeSourceRequest {
+            deployment_config: self.deployment_config.clone(),
+            host_policy_fingerprint: self.host_policy_fingerprint.clone(),
+        }
+    }
+}
+/// The deployment's remote `model.source`, validated; `None` for a local one.
+fn remote_source(deployment: &serde_json::Value) -> Option<mllm_config::model_source::ModelSource> {
+    let source: mllm_config::model_source::ModelSource =
+        serde_json::from_value(deployment.get("model")?.get("source")?.clone()).ok()?;
+    (source.is_remote() && source.validate().is_ok()).then_some(source)
+}
+impl TryFrom<pb::MaterializeSourceRequest> for MaterializeSourcePlan {
+    type Error = GroupIdentityError;
+    fn try_from(plan: pb::MaterializeSourceRequest) -> Result<Self, Self::Error> {
+        if plan.deployment_config.len() > 24 * 1024
+            || plan.host_policy_fingerprint.len() != 64
+            || !plan.host_policy_fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        { return Err(GroupIdentityError); }
+        let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
+            .map_err(|_| GroupIdentityError)?;
+        let source = remote_source(&config).ok_or(GroupIdentityError)?;
+        Ok(Self {
+            deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,
+            host_policy_fingerprint: plan.host_policy_fingerprint,
+            source_key: source.store_key().ok_or(GroupIdentityError)?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberAction {
     Prepare(GroupPlan),
@@ -184,6 +241,11 @@ pub enum MemberAction {
     /// deployment's checkpoint. Read-only: it never launches, releases or
     /// changes anything, and its result carries only digest evidence.
     DigestCheckpoint(DigestCheckpointPlan),
+    /// ADR 0008 (additive): materialize (or report on) one deployment's
+    /// declared remote model source. It never launches, releases or reserves
+    /// engine resources; the store bytes a download reserves are the host's
+    /// own filesystem accounting. Its result carries only source evidence.
+    MaterializeSource(MaterializeSourcePlan),
 }
 
 /// The most recorded process identities one Terminate may carry.
@@ -332,6 +394,7 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
                 }
             }
             Action::DigestCheckpoint(plan) => MemberAction::DigestCheckpoint(plan.try_into()?),
+            Action::MaterializeSource(plan) => MemberAction::MaterializeSource(plan.try_into()?),
             // SPEC §13.1, T34: an action this build does not know (including a
             // newer peer's field, which decodes as no action) is never guessed.
             _ => return Err(GroupIdentityError),
@@ -393,6 +456,7 @@ impl MemberCommand {
                     Action::RestoreOwnedHandle(owned_handle.clone())
                 }
                 MemberAction::DigestCheckpoint(plan) => Action::DigestCheckpoint(plan.to_wire()),
+                MemberAction::MaterializeSource(plan) => Action::MaterializeSource(plan.to_wire()),
             }),
             restore_checkpoint_digest: match &self.action {
                 MemberAction::Restore {
@@ -509,6 +573,21 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
             { return Err(GroupIdentityError); }
         }
         (MemberAction::DigestCheckpoint(_), None) => return Err(GroupIdentityError),
+        (_, Some(_)) => return Err(GroupIdentityError),
+        (_, None) => {}
+    }
+    // ADR 0008: source evidence belongs to MaterializeSource results only, and
+    // such a result is nothing but that evidence.
+    match (&command.action, &result.source) {
+        (MemberAction::MaterializeSource(plan), Some(evidence)) => {
+            validate_source(plan, evidence)?;
+            if result.state != "completed" || result.claim_retained || result.model_usable
+                || !result.processes.is_empty() || !result.owned_handle.is_empty()
+                || !result.binding_id.is_empty() || !result.incarnation.is_empty()
+                || result.checkpoint.is_some() || result.residency.is_some()
+            { return Err(GroupIdentityError); }
+        }
+        (MemberAction::MaterializeSource(_), None) => return Err(GroupIdentityError),
         (_, Some(_)) => return Err(GroupIdentityError),
         (_, None) => {}
     }
@@ -665,6 +744,27 @@ fn validate_checkpoint(
         "refused" => evidence.digest.is_empty() && evidence.weights_bytes == 0
             && evidence.file_count == 0 && evidence.total_bytes == 0 && !evidence.full_rehash
             && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str()),
+        _ => false,
+    };
+    if !ok { return Err(GroupIdentityError); }
+    Ok(())
+}
+
+/// ADR 0008: `verified` carries its bytes; `downloading` its progress (a
+/// total of zero until sized); `failed` only a closed reason; `pending`
+/// nothing. The key must be the one the plan's source names.
+fn validate_source(
+    plan: &MaterializeSourcePlan, evidence: &pb::ModelSourceEvidence,
+) -> Result<(), GroupIdentityError> {
+    let quiet = evidence.reason.is_empty() && !evidence.reservation_retained;
+    let ok = evidence.source_key == plan.source_key && match evidence.state.as_str() {
+        "pending" => quiet && evidence.bytes_done == 0 && evidence.bytes_total == 0,
+        "downloading" => quiet
+            && (evidence.bytes_total == 0 && evidence.bytes_done == 0
+                || evidence.bytes_done <= evidence.bytes_total),
+        "verified" => quiet && evidence.bytes_done == evidence.bytes_total,
+        "failed" => evidence.bytes_done == 0 && evidence.bytes_total == 0
+            && mllm_config::model_source::reason::ALL.contains(&evidence.reason.as_str()),
         _ => false,
     };
     if !ok { return Err(GroupIdentityError); }

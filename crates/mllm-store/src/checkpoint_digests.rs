@@ -251,6 +251,26 @@ fn resolved_host(
     )?)
 }
 
+/// ADR 0008: the frozen revision, for the model-source records.
+pub(crate) fn frozen_revision(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    revision: i64,
+) -> Result<(String, EffectiveDeployment)> {
+    frozen(tx, deployment, revision)
+}
+
+/// ADR 0008: whether `host_id` is a host `revision` resolved on.
+pub(crate) fn is_resolved_host(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    revision: i64,
+    effective: &EffectiveDeployment,
+    host_id: &str,
+) -> Result<bool> {
+    resolved_host(tx, deployment, revision, effective, host_id)
+}
+
 impl crate::Store {
     /// The digest record of one revision, if it has one.
     pub fn checkpoint_digest(
@@ -271,7 +291,9 @@ impl crate::Store {
             // the instance placed on the measuring host, so it never moves that
             // host past the launch it runs; with none placed there, the
             // deployment's counter.
-            .prepare("SELECT c.deployment_id,c.revision,COALESCE((SELECT i.generation FROM deployment_instances i WHERE i.deployment_id=c.deployment_id AND i.host_id=c.host_id AND i.generation IS NOT NULL ORDER BY i.generation DESC LIMIT 1),d.current_generation),c.host_id,c.expected,COALESCE(c.weights_bytes,(SELECT z.weights_bytes FROM checkpoint_sizes z WHERE z.deployment_id=c.deployment_id AND z.revision=c.revision)) FROM checkpoint_digests c JOIN deployments d ON d.id=c.deployment_id AND d.revision=c.revision WHERE c.state='pending' ORDER BY c.updated_at_ms,c.deployment_id LIMIT 256")?
+            // ADR 0008: a remote source is measured only once its copy on the
+            // measuring host is verified; before that there is nothing to hash.
+            .prepare(&format!("SELECT c.deployment_id,c.revision,COALESCE((SELECT i.generation FROM deployment_instances i WHERE i.deployment_id=c.deployment_id AND i.host_id=c.host_id AND i.generation IS NOT NULL ORDER BY i.generation DESC LIMIT 1),d.current_generation),c.host_id,c.expected,COALESCE(c.weights_bytes,(SELECT z.weights_bytes FROM checkpoint_sizes z WHERE z.deployment_id=c.deployment_id AND z.revision=c.revision)) FROM checkpoint_digests c JOIN deployments d ON d.id=c.deployment_id AND d.revision=c.revision WHERE c.state='pending' AND {} ORDER BY c.updated_at_ms,c.deployment_id LIMIT 256", crate::model_sources::DIGEST_READY_CLAUSE))?
             .query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?))
             })?

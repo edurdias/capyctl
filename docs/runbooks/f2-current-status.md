@@ -4,6 +4,20 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Model sources — 2026-09-24 (branch `feat/model-sources`)
+
+Declared `huggingface` and `http` model sources are materialized by the host into
+`<store>/sources/...` through the additive `MaterializeSource` action (ADR 0008
+amendment 2026-09-24): pinned revisions and digests only, host opt-in
+(`model_sources`, denied by default), a store reservation against `max_bytes`
+before any byte is written, per-file verification, atomic commit, then the WE3
+digest. Activation waits (`model_source_pending`) and status shows per-host state
+and bytes. `mllm prune sources` reclaims unreferenced copies explicitly. Local
+verification only, against a fake hub and origin: core 992 reported, workspace
+1741, Clippy clean (schema v33, `ExecuteMember` field 14). Pending: a live Hugging Face download on a Spark; standalone
+support; disk in the server's placement plan. CPU and fake-origin tests are not
+qualification.
+
 ## Revoked host recovery — 2026-09-24 (branch `feat/host-recovery`)
 
 Owner decision 2026-09-24: a revoked host recovers by re-enrolling under the

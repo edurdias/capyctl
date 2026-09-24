@@ -512,6 +512,9 @@ mllm delete deployment dep_example --stop
 # Configuration operations.
 mllm validate config --file host.yaml
 mllm inspect config --role host --effective
+
+# Reclaim materialized model sources no deployment references (ADR 0008).
+mllm prune sources --host-config host.yaml --apply
 ```
 
 `start host` starts the local agent, not a remote machine or power-on action. A client-only installation selects a server context and credential reference. Do not mix action-first commands with the previous `mllm server run` grammar in user documentation.

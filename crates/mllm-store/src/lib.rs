@@ -19,6 +19,8 @@ pub mod lifecycle;
 pub mod lifecycle_windows;
 pub mod managed_configuration;
 pub mod migrations;
+// ADR 0008: declared remote model sources, materialized per host.
+pub mod model_sources;
 pub mod ordinary_lifecycle;
 pub mod residency;
 pub mod resource_ledger;

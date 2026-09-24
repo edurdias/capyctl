@@ -243,6 +243,8 @@ async fn connect_once(
         envelope: None,
         // Owner decision 2026-09-23: this agent sends and accepts heartbeats.
         heartbeats: true,
+        // ADR 0008: this agent executes MaterializeSource.
+        model_sources: true,
     })))
     .await
     .map_err(end("outbound stream closed"))?;

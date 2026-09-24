@@ -364,6 +364,24 @@ impl EngineAdapter for RemoteEngine {
         let mut plan = b.plan.clone();
         plan.issued_at_ms = c.issued_at_ms;
         plan.grant_id = c.grant_id.clone().ok_or(RuntimeError::Missing)?;
+        // ADR 0008: a declared remote source must be on this host's disk,
+        // verified, before its digest is measured or anything is launched.
+        // A failure or a download still running refuses the launch here,
+        // before anything was sent.
+        crate::model_sources::ensure_materialized(
+            &self.owner,
+            &self.sessions,
+            &b.controller_id,
+            &b.host_id,
+            &c.token.deployment_id,
+            c.token.revision,
+            c.token.generation,
+            &b.profile_fingerprint,
+            &plan.deployment_config,
+            &plan.host_policy_fingerprint,
+            c.deadline_ms,
+        )
+        .await?;
         if plan.checkpoint_digest.is_empty() {
             // ADR 0014 §7 (WE3): first placement of a revision whose digest is
             // not recorded yet. The host measures it and the server records it

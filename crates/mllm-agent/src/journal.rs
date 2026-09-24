@@ -1562,6 +1562,8 @@ impl HostJournal {
             refused: String::new(),
             // SPEC §§6.4, 13.2: the session adds a launch failure's summary.
             launch_failure: String::new(),
+            // ADR 0008: MaterializeSource is never journaled either.
+            source: None,
         };
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         // A launch that is not resident (parking, parked, restoring or

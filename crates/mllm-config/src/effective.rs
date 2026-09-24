@@ -184,31 +184,8 @@ pub struct EffectiveDeployment {
     pub recipe_fingerprint: String,
 }
 
-/// Where a deployment's weights come from, per SPEC §7.
-///
-/// Only `Local` names a file the host already holds. `HuggingFace` and `Http`
-/// describe a fetch that a later slice performs; the resolver validates their
-/// shape and stops there, because a resolver that reached the network would make
-/// validating a configuration depend on a remote service being up.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelSource {
-    /// A path on the host. Relative paths resolve against the host's model store;
-    /// an absolute path is taken as written.
-    Local { path: String },
-    /// A Hugging Face repository. `revision` is a branch or tag; `locked_commit`
-    /// is the immutable commit a fetch must end up at.
-    #[serde(rename = "huggingface")]
-    HuggingFace {
-        repo: String,
-        #[serde(default)]
-        revision: Option<String>,
-        #[serde(default)]
-        locked_commit: Option<String>,
-    },
-    /// An archive over HTTPS, pinned by content digest.
-    Http { url: String, sha256: String },
-}
+/// Where a deployment's weights come from, per SPEC §7 and ADR 0008.
+pub use crate::model_source::{Archive, ModelSource, ModelSourcePolicy, SourceSwitch};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,8 +209,8 @@ impl ModelIdentity {
             ConfigError::new(
                 ConfigErrorCode::NotMaterializable,
                 "model.source",
-                "this model source names no local path; only a local source \
-                 resolves to one before the fetcher lands",
+                "this model source names no local path here; a remote source \
+                 resolves to its directory in a host's model store",
             )
         })
     }
@@ -481,6 +458,10 @@ pub struct HostPolicy {
     pub endpoint_port_range: PortRange,
     pub planner_max_states: u32,
     pub queue: QueuePolicy,
+    /// ADR 0008: which remote model sources this host materializes, and the
+    /// model store's ceiling for them. Encoded only when stated.
+    #[serde(skip_serializing_if = "ModelSourcePolicy::is_default")]
+    pub model_sources: ModelSourcePolicy,
 }
 
 /// Whether a domain's device memory and host memory are one physical pool.
@@ -635,6 +616,9 @@ struct HostInput {
     #[serde(default)]
     device_inventory_digest: Option<String>,
     model_store: RawModelStore,
+    /// ADR 0008: remote model sources are denied unless stated here.
+    #[serde(default)]
+    model_sources: Option<crate::model_source::RawModelSources>,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
 }
@@ -896,6 +880,8 @@ pub fn resolve_effective_with_checkpoint(
     let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
     let host = core::normalize_host(h)?;
     let model = core::normalize_model(d.model, Some(&host.model_store))?;
+    // ADR 0008: a remote source resolves only on a host that opted in to it.
+    host.model_sources.permits(&model.source)?;
     let declared_resources = d.resources.map(raw_recipe).transpose()?;
     let declared_ready_total = declared_resources.as_ref().map(|resources| {
         resources

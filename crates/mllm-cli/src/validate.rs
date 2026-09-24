@@ -226,6 +226,7 @@ fn error_name(code: ConfigErrorCode) -> &'static str {
         ConfigErrorCode::ContradictoryConnection => "contradictory_connection",
         ConfigErrorCode::SchemaVersion => "schema_version",
         ConfigErrorCode::NotMaterializable => "not_materializable",
+        ConfigErrorCode::ModelSourceDenied => "model_source_denied",
         ConfigErrorCode::Io => "io",
     }
 }

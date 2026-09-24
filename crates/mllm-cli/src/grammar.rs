@@ -129,6 +129,14 @@ pub enum Command {
     Revoke {
         host: String,
     },
+    /// SPEC §6.3, ADR 0008: remove materialized model sources in a host's
+    /// model store that no deployment references. Host-side and explicit:
+    /// without `apply` it only reports.
+    PruneSources {
+        host_config: PathBuf,
+        apply: bool,
+        referenced_file: Option<PathBuf>,
+    },
 }
 
 impl Command {
@@ -197,6 +205,9 @@ impl Command {
             } => format!("drain host {host}"),
             Command::Drain { host: None, .. } => "drain standalone".to_string(),
             Command::Revoke { host } => format!("revoke host {host}"),
+            Command::PruneSources { apply, .. } => {
+                format!("prune sources{}", if *apply { " --apply" } else { "" })
+            }
         }
     }
 }
@@ -311,6 +322,32 @@ enum CliCommand {
     Revoke {
         #[command(subcommand)]
         resource: RevokeArgs,
+    },
+    /// Remove materialized model sources that no deployment references, from
+    /// this machine's model store. Deleting a deployment never does this.
+    Prune {
+        #[command(subcommand)]
+        resource: PruneArgs,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum PruneArgs {
+    /// Copies under `<model store>/sources` that no existing deployment
+    /// declares. The referenced set comes from the server's management API
+    /// (or `--referenced-file`); without it nothing is removed. Lists only,
+    /// unless `--apply` is given. A download in progress is never touched.
+    Sources {
+        /// The host document naming the model store to prune.
+        #[arg(long, value_name = "FILE")]
+        host_config: PathBuf,
+        /// Remove the unreferenced copies instead of listing them.
+        #[arg(long)]
+        apply: bool,
+        /// The server's `GET /management/v1/model-sources` answer, saved to a
+        /// file, for a host that cannot reach the management API itself.
+        #[arg(long, value_name = "FILE")]
+        referenced_file: Option<PathBuf>,
     },
 }
 
@@ -625,6 +662,18 @@ impl From<CliCommand> for Command {
             CliCommand::Revoke {
                 resource: RevokeArgs::Host { host },
             } => Command::Revoke { host },
+            CliCommand::Prune {
+                resource:
+                    PruneArgs::Sources {
+                        host_config,
+                        apply,
+                        referenced_file,
+                    },
+            } => Command::PruneSources {
+                host_config,
+                apply,
+                referenced_file,
+            },
         }
     }
 }

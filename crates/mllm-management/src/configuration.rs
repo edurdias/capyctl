@@ -67,6 +67,10 @@ pub enum ConfigurationFailure {
     CheckpointDigestPending,
     /// ADR 0014 §7: the checkpoint is not the declared or recorded one.
     CheckpointMismatch,
+    /// ADR 0008: activation waits for the declared remote model source.
+    ModelSourcePending,
+    /// ADR 0008: the declared remote model source failed terminally.
+    ModelSourceFailed,
     Internal,
 }
 impl ConfigurationFailure {
@@ -186,6 +190,18 @@ impl ConfigurationFailure {
                 "The checkpoint does not match its declared or recorded digest",
                 false,
             ),
+            ModelSourcePending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_source_pending",
+                "The declared model source is still being downloaded and verified on its host; status shows its progress; retry shortly",
+                true,
+            ),
+            ModelSourceFailed => (
+                StatusCode::CONFLICT,
+                "model_source_failed",
+                "The declared model source failed on its host (status shows the reason); fix the source or the host's model_sources policy and deploy a new revision",
+                false,
+            ),
             HostPolicyDenied => (
                 StatusCode::FORBIDDEN,
                 "host_policy_denied",
@@ -275,6 +291,13 @@ pub trait ConfigurationSource: Send + Sync + 'static {
     ) -> Result<Option<Value>, ConfigurationFailure> {
         Err(ConfigurationFailure::Unsupported)
     }
+
+    /// SPEC §6.3, ADR 0008: every model-store key (`sources/...`) a deployment
+    /// that still exists references. A deleted deployment's copies are not in
+    /// it; that is what `mllm prune sources` may reclaim.
+    fn referenced_model_sources(&self) -> Result<Vec<String>, ConfigurationFailure> {
+        Err(ConfigurationFailure::Unsupported)
+    }
 }
 
 /// Uses the worker's exact owned Store/session and lifetime process lock. It does
@@ -360,6 +383,13 @@ impl ConfigurationSource for SharedConfigurationSource {
                 "diagnostic": host.diagnostic,
             })).collect::<Vec<_>>(),
         })))
+    }
+    fn referenced_model_sources(&self) -> Result<Vec<String>, ConfigurationFailure> {
+        let state = self.state.lock().map_err(|_| ConfigurationFailure::Internal)?;
+        state
+            .store()
+            .referenced_model_sources()
+            .map_err(|_| ConfigurationFailure::Internal)
     }
     fn checkpoint_digest_state(&self, deployment_id: &str, revision: i64) -> Option<String> {
         let state = self.state.lock().ok()?;
@@ -679,6 +709,26 @@ pub fn redact_effective(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// SPEC §6.3, ADR 0008: `GET /management/v1/model-sources`, the store keys
+/// of every declared remote source a deployment that still exists references.
+pub(crate) async fn model_sources(State(state): State<Arc<AppState>>) -> Response {
+    use ConfigurationFailure::*;
+    let Some(source) = state.configuration.clone() else {
+        return Unsupported.response();
+    };
+    let Ok(permit) = state.reads.clone().try_acquire_owned() else {
+        return QueueFull.response();
+    };
+    match accept_blocking(permit, move || source.referenced_model_sources()).await {
+        Ok(keys) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"api_version": "1", "referenced": keys})),
+        )
+            .into_response(),
+        Err(error) => error.response(),
     }
 }
 

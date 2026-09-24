@@ -104,6 +104,35 @@ fn main() -> ExitCode {
             }
         };
     }
+    // SPEC §6.3, ADR 0008: explicit, host-side reclaim of unreferenced
+    // materialized model sources.
+    if let Command::PruneSources {
+        host_config,
+        apply,
+        referenced_file,
+    } = &invocation.command
+    {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
+        };
+        return match runtime.block_on(mllm_cli::prune::execute(
+            host_config,
+            *apply,
+            referenced_file.as_deref(),
+            &default_state_dir(),
+            invocation.config.as_deref(),
+        )) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
     // SPEC §14 / §15.3: offline validation; no runtime, state, or network.
     if let Command::Validate { file, host } = &invocation.command {
         return match mllm_cli::validate::validate_config(file, host.as_deref()) {

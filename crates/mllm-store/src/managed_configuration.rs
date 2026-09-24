@@ -476,6 +476,9 @@ impl crate::Store {
         // ADR 0014 §7 (WE3): every accepted revision starts with its checkpoint
         // digest pending (`checkpoint_digest_pending`) until a host measures it.
         crate::checkpoint_digests::insert_accepted(&tx, &receipt.deployment_id, revision, &effective, provisional, now_ms)?;
+        // ADR 0008: a declared remote source starts pending on its host until
+        // that host materializes it (`model_source_pending`).
+        crate::model_sources::insert_accepted(&tx, &receipt.deployment_id, revision, &effective, now_ms)?;
         persist_receipt(
             &tx,
             principal,

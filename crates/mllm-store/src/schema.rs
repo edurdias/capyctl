@@ -805,6 +805,25 @@ INSERT OR IGNORE INTO revoked_host_certificates(fingerprint,revoked_at_unix)
   WHERE h.revoked=1;
 "#;
 
+/// v33 (ADR 0008): the materialization state of each revision's declared
+/// remote model source on each host. Rows of a deleted deployment stay (a
+/// delete never removes a copy); they stop counting as references.
+pub const SCHEMA_V33: &str = r#"
+CREATE TABLE IF NOT EXISTS model_sources(
+  deployment_id TEXT NOT NULL CHECK(length(deployment_id)>0),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  host_id TEXT NOT NULL CHECK(length(host_id)>0),
+  source_key TEXT NOT NULL CHECK(source_key LIKE 'sources/%'),
+  state TEXT NOT NULL CHECK(state IN ('pending','downloading','verified','failed')),
+  bytes_done INTEGER NOT NULL CHECK(bytes_done>=0),
+  bytes_total INTEGER NOT NULL CHECK(bytes_total>=0),
+  reason TEXT CHECK((state='failed')=(reason IS NOT NULL)),
+  terminal INTEGER NOT NULL CHECK(terminal IN (0,1)),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

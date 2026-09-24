@@ -133,6 +133,10 @@ impl From<LifecycleError> for LifecycleFault {
             // own; a checkpoint known not to match needs the operator.
             LifecycleError::CheckpointDigestPending => Self::Unavailable(text),
             LifecycleError::CheckpointMismatch => Self::Blocked(text),
+            // ADR 0008: a source still materializing clears on its own; one
+            // that failed terminally needs a new revision.
+            LifecycleError::ModelSourcePending => Self::Unavailable(text),
+            LifecycleError::ModelSourceFailed => Self::Blocked(text),
             // The store cannot say what the current state is, so nothing about the
             // request was decided.
             LifecycleError::ReconciliationRequired

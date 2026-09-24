@@ -93,6 +93,7 @@ async fn agent_control_roundtrip_over_real_channel() {
                     protocol_version: PROTOCOL_VERSION.into(),
                     ..Default::default()
                 }),
+                model_sources: true,
             })),
         })
         .await

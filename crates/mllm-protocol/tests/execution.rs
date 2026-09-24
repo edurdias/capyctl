@@ -223,6 +223,7 @@ fn ready_result(command: &MemberCommand) -> pb::MemberExecutionResult {
         checkpoint: None,
         refused: String::new(),
         launch_failure: String::new(),
+        source: None,
     }
 }
 
