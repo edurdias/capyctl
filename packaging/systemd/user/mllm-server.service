@@ -1,0 +1,68 @@
+# mllm server (controller, scheduler, router), as a user service
+# (SPEC §4.3: foreground role, OS service definition, no custom
+# daemonization).
+#
+# Install: docs/operations/install.md. Customize with a drop-in
+# (`systemctl --user edit mllm-server`), never by editing this file in place.
+# Keep the user manager running while logged out: `loginctl enable-linger`;
+# otherwise logging out stops the role.
+#
+# Stopping or restarting this unit is a SERVICE RESTART, not a drain.
+# SIGTERM closes admission, lets admitted requests finish within the server
+# document's `shutdown.drain_timeout`, and exits. Deployments are not deleted
+# and engines on the hosts keep running; the next start reconciles them
+# (crates/mllm-cli/src/shutdown.rs, owner decision P3). Stopping a host's
+# engines is the explicit `mllm drain host <name>`, run while this server is up.
+#
+# There is deliberately no ExecStop= that drains: a package upgrade or a
+# `systemctl restart` must never stop deployments as a side effect.
+
+[Unit]
+Description=mllm server
+Documentation=file://%h/.local/opt/mllm/current/docs/operations/install.md
+
+[Service]
+Type=simple
+# Optional overrides (MLLM_CONFIG, RUST_LOG, ...). The leading '-' makes the
+# file optional.
+Environment=MLLM_CONFIG=%E/mllm/server.yaml
+EnvironmentFile=-%E/mllm/server.env
+ExecStart=%h/.local/opt/mllm/current/bin/mllm start server --config ${MLLM_CONFIG}
+
+# The server launches no engines, so nothing but mllm runs in this cgroup.
+# `mixed` sends SIGTERM to mllm alone (the drain) and SIGKILL to any stray
+# process once it exits. Host and standalone units use `process` instead,
+# because their engines must outlive a restart.
+KillMode=mixed
+KillSignal=SIGTERM
+# Must cover the drain: `shutdown.drain_timeout` (default 30s, at most 600s)
+# plus the 2s cancellation grace and teardown. Keep it at least
+# drain_timeout + 60s; raise it in a drop-in when the server document raises
+# drain_timeout.
+TimeoutStopSec=90s
+TimeoutStartSec=90s
+
+Restart=on-failure
+RestartSec=5s
+# Invalid configuration (2), unauthorized (3) and unsupported (5) do not heal
+# by restarting.
+RestartPreventExitStatus=2 3 5
+
+# The user manager cannot raise the hard limit; keep within it.
+LimitNOFILE=65536:524288
+
+# mllm's private state is owner-only (SPEC §13.3).
+UMask=0077
+# The state root, ~/.local/state/mllm (%S/mllm). Role state_dir values live
+# beneath it; it must be a real directory, not a symlink.
+StateDirectory=mllm
+StateDirectoryMode=0700
+
+# User units get no file-system sandboxing: ProtectSystem= and friends need
+# privileges the per-user manager does not have (systemd.exec(5)). The service
+# runs with the invoking user's own rights; the system unit is the hardened
+# form.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

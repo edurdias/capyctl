@@ -4,6 +4,29 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Service packaging — 2026-09-24 (branch `feat/service-packaging`)
+
+SPEC §4.3 service definitions and an F5-direction release tarball, verified
+locally only. `packaging/systemd/{system,user}/` hold server, host and
+standalone units: `Type=simple` foreground, `KillMode=process` on host and
+standalone so engines survive a restart and are re-attached (server:
+`mixed`), no draining `ExecStop=`, `TimeoutStopSec=90s` (drain_timeout + 60s),
+`Restart=on-failure` except exit codes 2, 3 and 5, `OOMPolicy=continue`, and
+engine-compatible hardening (no `PrivateTmp`, `PrivateDevices` or syscall
+filter on host and standalone). `packaging/release.sh` builds a stripped,
+reproducible tarball of git-tracked files with an owner-only `runtime/`;
+`scripts/verify-packaging.sh` checks the unit invariants, runs
+`systemd-analyze verify`, builds the tarball twice and checks its entries,
+modes and digests. Operator guide: `docs/operations/install.md`.
+
+Not established: no unit has run on a Spark. Whether the host unit's
+hardening lets vLLM and SGLang start, park and wake, and whether engines
+survive `systemctl restart mllm-host` and are re-attached, needs a live run.
+Found while writing the guide: an older binary does not refuse a state store
+migrated by a newer one (`crates/mllm-store/src/migrations.rs` skips versions
+it does not know), so rollback across a schema change needs a state backup;
+`mllm start standalone --config` is still refused as not implemented.
+
 ## Post-merge live smoke — 2026-09-24 (branch `fix/live-smoke-2026-09-24`)
 
 PR #1 (`edurdias/mllm`) merged into `main` as `eb33deb` after local
