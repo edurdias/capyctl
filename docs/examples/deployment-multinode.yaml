@@ -1,37 +1,44 @@
-# mllm schema sketch; not an implemented configuration or tested engine recipe.
+# mllm deployment with two instances spread over two hosts. Each instance is a
+# whole engine on one host; mllm does not split one engine across hosts.
+# Parsed by the product: `mllm validate config --file docs/examples/deployment-multinode.yaml
+# --host docs/examples/host.yaml` also resolves it against that host.
+# An illustration of the schema, not a tested engine recipe.
 schema_version: 1
 kind: deployment
 name: coding-large
-ownership: managed
-model:
-  path: /srv/models/coding-large-r1
-runtime_profile: sglang-patched
+instances: 2
 placement:
   hosts: ["host-a", "host-b"]
-  head: host-a
-topology:
-  tensor_parallel: 2
-  pipeline_parallel: 1
-resources:
-  per_host:
-    devices: ["gpu:0"]
-    memory:
-      system:
-        activation_peak: "80GiB"
-        ready_budget: "72GiB"
-        parked_budget: "8GiB"
-route:
-  model_id: coding-large
-lifecycle:
-  activation: on_demand
-  parking: auto
-kv_cache:
-  integration: hicache
-  ownership: private
-  availability: required
-  per_host:
-    host_memory_budget: "6GiB"
-    storage:
-      pool: kv-local
-      max_bytes: "80GiB"
-      reclaimable: true
+  # Only hosts whose labels match are candidates.
+  selector:
+    accelerator: gb10
+  strategy: spread
+  max_per_host: 1
+routes: ["coding-large"]
+runtime_profile: sglang
+runtime_profile_revision: 1
+recipe: standard
+residency: deep
+recovery: reconcile
+model:
+  source:
+    type: local
+    path: /srv/models/coding-large-r1
+  content_fingerprint: "sha256:coding-large-r1"
+  revision: r1
+# Devices are not named (`id`): a named device requires exactly one allowed
+# host. Each instance takes a shared device from its own host.
+devices:
+  - sharing: shared
+engine_config:
+  dtype: bfloat16
+  context_length: 32768
+  memory:
+    request: "72GiB"
+    kv_cache: "16GiB"
+  sglang:
+    chunked_prefill_size: 8192
+request_deadline: "1800s"
+timeouts:
+  initialize: "1200s"
+  wake: "600s"

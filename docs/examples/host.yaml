@@ -1,65 +1,93 @@
-# mllm schema sketch; not an implemented configuration or tested engine recipe.
+# mllm host role document (`mllm start host --config host.yaml`) for a
+# unified-memory host (one memory pool shared by device and system).
+# Parsed by the product: `mllm validate config --file docs/examples/host.yaml`.
+# An illustration of the schema, not a tested engine recipe: executables,
+# fingerprints and limits are placeholders for the host's own values.
 schema_version: 1
 kind: host
 name: host-a
 state_dir: /var/lib/mllm/host
-server:
-  url: "https://mllm.lab:7444"
-  identity_dir: /var/lib/mllm/host/identity
+# Must be `<state_dir>/identity`.
+identity_dir: /var/lib/mllm/host/identity
+# mllm's runtime helper scripts (owner-only files).
+runtime_dir: /opt/mllm/runtime
+hardware_fingerprint: gb10-spark
+environment_fingerprint: spark-env-2026-09
+# Relative model paths in deployments resolve under this directory.
+model_store:
+  path: /srv/models
+# The private ingress the server forwards inference to (loopback or a
+# Tailscale 100.64.0.0/10 address).
+ingress:
+  transport: trusted_private_link
+  address: "http://100.64.0.21:8444"
+  bind: "100.64.0.21:8444"
+load_report_interval: "1s"
+shutdown:
+  drain_timeout: "30s"
 resource_policy:
-  allowed_devices: ["gpu:0"]
-  memory:
-    accounting: auto
-    system:
+  domains:
+    unified:
+      memory: unified
       managed_limit: "96GiB"
       free_reserve: "12GiB"
-      host_kv_limit: "16GiB"
       parked_limit: "16GiB"
-  max_parked_groups: 3
-storage_pools:
-  checkpoints:
-    path: /srv/models
-    access: read_only
-  kv-local:
-    path: /srv/mllm/kv-cache
-    aggregate_limit: "200GiB"
-    filesystem_free_reserve: "50GiB"
-network:
-  ingress:
-    mode: when_api_facing
-    bind: "10.10.0.21:8444"
-    advertise_url: "https://host-a.lab:8444"
-    authentication: router_mtls
-    tls: managed
-  engine_api:
-    bind: "127.0.0.1"
-    port_range: [8100, 8199]
+      host_kv_limit: "8GiB"
+  devices:
+    gpu0:
+      domain: unified
+      sharing: shared
+  device_sharing: shared
+  max_parked: 3
+  observation_ttl: "2s"
+  endpoint_port_range:
+    start: 8100
+    end: 8199
+  planner_max_states: 4096
+  queue:
+    admission_window: "2s"
+    max_pending_per_deployment: 64
+    max_pending_total: 256
+    max_buffered_bytes_total: "64MiB"
+    request_deadline: "1800s"
+  # Deployments select hosts by these labels (`placement.selector`).
+  labels:
+    site: lab
+    accelerator: gb10
+# Engine installations. Engine tuning belongs to each deployment's
+# `engine_config`; a profile keeps host-fixed settings only.
 runtime_profiles:
-  vllm-stock:
-    adapter: vllm
-    launch:
-      type: exec
-      command: ["/opt/vllm/bin/vllm", "serve"]
-      argument_contract: native
-  vllm-patched:
-    adapter: vllm
-    launch:
-      type: exec
-      command: ["/opt/inference/start-vllm-patched"]
-      argument_contract: native
-      working_directory: /opt/inference
-      environment_file: /etc/mllm/runtime/vllm-patched.env
-  sglang-patched:
-    adapter: sglang
-    launch:
-      type: exec
-      command: ["/opt/sglang/bin/python", "-m", "sglang.launch_server"]
-      argument_contract: native
-security:
-  allow_development_engine_controls: false
-supervision:
-  process_mode: foreground
-  stop_grace_period: "30s"
-logging:
-  level: info
-  log_prompts: false
+  vllm:
+    engine: vllm
+    revision: 1
+    executable: /opt/vllm/bin/vllm
+    build_fingerprint: "vllm 0.29.0"
+    args: []
+    env: {}
+    log_policy:
+      max_file_bytes: "16MiB"
+      retained_files: 3
+    security:
+      # Deep parking is on unless a host opts out with `disabled`.
+      deep_park: enabled
+      trust_remote_code: false
+      credential_ref: "secret://engine-key"
+      # `warn` (default) or `refuse` when the installation's files change
+      # after the agent registered them.
+      installation_drift: warn
+  sglang:
+    engine: sglang
+    revision: 1
+    executable: /opt/sglang/bin/python3
+    build_fingerprint: "sglang 0.5.20"
+    args: []
+    env: {}
+    log_policy:
+      max_file_bytes: "16MiB"
+      retained_files: 3
+    security:
+      deep_park: enabled
+      trust_remote_code: false
+      credential_ref: "secret://engine-key"
+      admin_credential_ref: "secret://admin-key"
+      installation_drift: refuse

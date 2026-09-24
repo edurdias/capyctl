@@ -1,9 +1,16 @@
-# mllm schema sketch; not an implemented configuration or tested engine recipe.
+# mllm standalone role document: an embedded server and host on one machine,
+# with local-only authenticated listeners. `mllm start standalone` generates
+# this shape under its state directory when none exists; the engine
+# installation comes from the environment (MLLM_VLLM_BIN or MLLM_SGLANG_BIN,
+# MLLM_MODELS_ROOT, ...), not from this file. The listeners serve plain HTTP
+# on loopback, so there is no `tls` block (SPEC §16.5).
+# Parsed by the product: `mllm validate config --file docs/examples/standalone.yaml`.
 schema_version: 1
 kind: standalone
+name: local
 server:
   name: local
-  state_dir: ./state/server
+  state_dir: /home/operator/.local/state/mllm/server
   listeners:
     management:
       bind: "127.0.0.1:7443"
@@ -11,12 +18,9 @@ server:
     inference:
       bind: "127.0.0.1:8443"
       authentication: api_key
-  tls:
-    mode: managed
-    identity_dir: ./state/server/identity
 host:
   name: local
-  state_dir: ./state/host
+  state_dir: /home/operator/.local/state/mllm/host
   connection: embedded
   resource_policy:
     allowed_devices: auto
@@ -26,3 +30,5 @@ host:
         managed_limit: auto
         free_reserve: auto
   runtime_profiles: {}
+shutdown:
+  drain_timeout: "30s"

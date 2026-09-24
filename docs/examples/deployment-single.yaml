@@ -1,28 +1,40 @@
-# mllm schema sketch; not an implemented configuration or tested engine recipe.
+# mllm deployment on one host (`mllm deploy model --file deployment-single.yaml`).
+# Parsed by the product: `mllm validate config --file docs/examples/deployment-single.yaml
+# --host docs/examples/host.yaml` also resolves it against that host.
+# An illustration of the schema, not a tested engine recipe.
 schema_version: 1
 kind: deployment
 name: coding-small
-ownership: managed
+# Shorthand for `placement: {hosts: [host-a]}`.
+host: host-a
+routes: ["coding-small"]
+runtime_profile: vllm
+runtime_profile_revision: 1
+recipe: standard
+# `deep` releases weights and KV cache when parked; `restart_only` never parks.
+residency: deep
+recovery: reconcile
 model:
-  path: /srv/models/coding-small-r1
-runtime_profile: vllm-patched
-placement:
-  hosts: ["host-a"]
-resources:
-  per_host:
-    devices: ["gpu:0"]
-    memory:
-      system:
-        activation_peak: "48GiB"
-        ready_budget: "40GiB"
-        parked_budget: "2GiB"
-route:
-  model_id: coding-small
-lifecycle:
-  activation: on_demand
-  parking: auto
-kv_cache:
-  integration: none
-engine_args:
-  - --max-model-len
-  - "65536"
+  # Relative to the host's model store.
+  path: coding-small-r1
+  content_fingerprint: "sha256:coding-small-r1"
+  revision: r1
+devices:
+  - id: gpu0
+    sharing: shared
+# Typed engine settings. Memory phases are derived from `memory` and the
+# checkpoint's weights when `resources` is omitted.
+engine_config:
+  dtype: bfloat16
+  context_length: 65536
+  max_concurrent_requests: 16
+  memory:
+    request: "40GiB"
+    kv_cache: "12GiB"
+  vllm:
+    block_size_tokens: 16
+request_deadline: "900s"
+# Derived from the checkpoint's size when omitted; never beyond the request deadline.
+timeouts:
+  initialize: "600s"
+  wake: "300s"

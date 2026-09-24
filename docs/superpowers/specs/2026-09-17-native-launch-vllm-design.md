@@ -513,6 +513,14 @@ running on the Fake through the testkit. They are a pre-check and never count as
 
 ## 9. Live run on host-a
 
+> Retired 2026-09-23 (owner decision 2026-09-22): the suite and runner below drove
+> standalone in process, not the shipped binary. They are deleted, and their scenarios
+> are matrix rows driven through the shipped CLI and roles: L1–L5 and L11 are M73, L6–L8
+> are M38, L9 is M74 (the readiness bound is now the deployment's `timeouts.initialize`),
+> L10 is M75 plus `scripts/check-release-clean.sh` in `scripts/live/matrix/sync.sh build`
+> (`docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8). The text
+> below is kept as the design record.
+
 `crates/mllm-cli/tests/live_vllm.rs`, gated on `MLLM_LIVE=1`, release build,
 `--test-threads=1`, driving only the product path: `roles::start_standalone`,
 `app.deploy`, `request_transition`, the real router listener. `live_spark.rs` is deleted.

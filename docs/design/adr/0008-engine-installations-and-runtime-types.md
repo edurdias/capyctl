@@ -77,3 +77,66 @@ permitted. Implicit or silent download, and any quantization, remain out of scop
 - CLI gains engine installation management alongside discovery.
 - `SPEC.md` §2 gains engine family, engine installation, runtime type and model source;
   "model recipe" narrows to the internal frozen artifact.
+
+## Amendment 2026-09-23: installation identity without pinned hashes
+
+**Owner decision** (after reviewing which files the permission checks guard):
+mllm's private state stays strict; mllm's own runtime helper scripts use the
+owner-only rule everywhere, including the SGLang entry path check; engine
+installation files get no hard-coded hashes and no permission rule. This
+replaces the pinned SGLang 0.5.20 source audit (`runtime/sglang_source_preflight.py`,
+with the pinned saver source inventory `runtime/saver_source_preflight.py`),
+which refused any custom or patched SGLang build and any group-writable
+installation. It also reconciles ADR 0014 §9, which had kept that audit with a
+per-installation source manifest generated at registration.
+
+**Fingerprint at registration.** When a host registers its installations
+(agent start), it measures each one: the engine package's version from its
+`*.dist-info` metadata and a `sha256:` digest over a canonical manifest of the
+package's files (relative path, size and SHA-256, sorted; bytecode caches left
+out), bounded, reading bytes and metadata only and never running the
+installation (carve-out 2). The host publishes version, digest and state
+(`measured` or `unmeasured`) with each installation, and the host view shows
+them. An installation that cannot be measured is `unmeasured`, never refused.
+
+**Drift.** Every launch measures again. A different digest is drift: the host's
+status marks the installation `drifted` with the observed digest, and the
+controller journals an `installation_drift_flagged` event. Drift refuses the
+launch (closed reason `installation_drift`) only when the installation's host
+policy says `security.installation_drift: refuse`; the default is `warn`.
+
+**Capability probes.** Each internal API mllm hooks is probed at launch by
+shape (`runtime/engine_capabilities.py`): the module imports, the attribute or
+method exists and is callable, the record declares the field, the router serves
+the route, the metrics module names the gauge. Capabilities are closed per
+family: `core` (what every launch needs), `deep_park` (SGLang's memory saver
+adapter and saver package, release, resume, reload-from-disk and flush routes;
+vLLM's sleep and middleware destinations and sleep, wake, collective RPC and
+prefix-cache routes), `metrics` (the scraped load gauges) and, for SGLang,
+`observation` (the scheduler and saver shapes the allocation observer binds).
+A missing capability refuses only the dependent feature with a typed closed
+reason: `capability_missing:deep_park` refuses a `deep` launch (declare
+`restart_only`) and any Park, which leaves the launch `unchanged`;
+`capability_missing:core` refuses every launch. Core serving on a build without
+the saver hooks stays available. The host probes before admitting a launch
+whose tier depends on a gated feature, under the installation's own interpreter
+with a bounded time; the protected entries probe again at startup. A probe that
+cannot run is unknown and refuses nothing by itself.
+
+**Permissions.** The owner-only rule (owned by root or the service user, never
+other-writable, group-writable only through the owning user's private group)
+has one Rust statement, `mllm_adapters::owner_only`, mirrored for Python by
+`runtime/owner_only.py`. It covers the runtime directory and its modules, the
+protected SGLang entry and its ancestors, the reviewed saver library binding and
+the observation listener's ancestor directories. Private state that mllm
+creates 0600/0700 (identity storage, management credentials, remote role
+files, launcher lock files, observation sockets and their directory) keeps the
+strict rule with no group write.
+
+**Consequences.** `RuntimeProfileStatus` gains installation version, digest,
+state, observed digest and missing capabilities (additive). A reconciled host
+may change only the drift and capability fields. The SGLang descriptor's
+`source_revision` literal remains as a wire token and no longer identifies or
+constrains the installed build. Standalone mode probes capabilities in the
+protected entries but does not yet record an installation fingerprint.
+Passing fingerprints and probes are not qualification evidence.

@@ -6,6 +6,12 @@
 
 **Tech Stack:** Rust workspace; `rusqlite` with forward-only migrations; `tokio`; `nix` for process groups and signals; `chacha20poly1305` (new) for the engine key at rest; `axum` for test HTTP stubs; vLLM 0.29.0 on `host-a` in `~/mllm-vllm-venv2`.
 
+> Retired 2026-09-23: `crates/mllm-cli/tests/live_vllm.rs` and `scripts/live/run-on-spark.sh`,
+> which Task 15 creates, are deleted by owner decision (2026-09-22). Their scenarios are
+> matrix rows M38 and M73–M75 driven through the shipped CLI and roles; see
+> `docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8. This plan is a
+> historical record.
+
 **Spec:** `docs/superpowers/specs/2026-09-17-native-launch-vllm-design.md`. Read it first. Its §11 records the owner's decisions; where this plan and the spec disagree, the spec wins.
 
 ## Global Constraints

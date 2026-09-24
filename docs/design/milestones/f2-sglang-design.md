@@ -209,8 +209,9 @@ through a status read.
 Parking leaves a deployment eligible for on-demand wake. Warm-residency policy does
 not allow an idle timer to silently cold-stop a retained runtime. Administrative stop
 explicitly terminates owned processes and disables automatic activation; subsequent
-requests cannot undo it. Undeploy removes the route and deployment only after
-authorized cleanup, without implicitly deleting checkpoints or user-owned caches.
+requests cannot undo it. `delete deployment` removes the route and deployment only
+after authorized cleanup, without implicitly deleting checkpoints or user-owned caches
+(owner decision 2026-09-23 renamed `undeploy model`).
 
 ## 6. Failure, recovery, and engine verification
 
