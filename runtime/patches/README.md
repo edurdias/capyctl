@@ -71,9 +71,18 @@ the observer export.
 
 `observe_saver(cdll, require_no_backup=True)` in `runtime/memory_saver_observer.py`
 uses only the supplied library and makes one bounded export call, without retries.
-Pass the actual saver instance's existing `_binary_wrapper.cdll`. Obtaining that
-instance must not initialize a saver or a CUDA pool during observation. Missing
+Pass the initialized saver implementation's existing `_binary_wrapper.cdll`.
+At this pin, the package singleton contains it at
+`_memory_saver._impl._binary_wrapper.cdll`; `_impl is None` must fail, never call
+the lazy initializer. `TorchMemorySaver.enabled` alone is not initialization proof.
+Obtaining that instance must not initialize a saver or a CUDA pool during observation. Missing
 symbols fail; the reader never constructs a replacement `ctypes.CDLL`.
+
+`runtime/sglang_saver_binding.py` now binds an existing pinned scheduler to this
+reader. It checks the exact loaded singleton/hook/pool chain, enrolled process,
+protected library hash, and export mappings before and after one snapshot. The
+CPU fixtures do not establish CUDA allocator interposition. An authenticated
+in-scheduler observation hook and reviewed native build remain required.
 
 Returned frozen aggregates group by device and UTF-8 tag. They include allocation
 and state counts, virtual bytes, mapped bytes, backup bytes and the count of

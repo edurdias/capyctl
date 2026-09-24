@@ -1,0 +1,938 @@
+//! SPEC §§3–4, §14–15: foreground remote roles and enrollment through the product.
+use crate::{
+    grammar::{Command, InitTarget, Invocation, ListResource, Resource, Role},
+    output::StructuredError,
+};
+use mllm_agent::{
+    enrollment::{self, JoinInvitation, PendingEnrollment},
+    identity::HostKey,
+    identity_storage::IdentityDirectory,
+    journal::HostJournal,
+};
+use mllm_config::remote_roles::{HostConfig, ServerConfig};
+use mllm_controller::{
+    agent_sessions::AgentSessions, enrollment::EnrollmentAuthority,
+    OwnedCoordinatorState,
+};
+use mllm_management::ManagementCredentials;
+use mllm_protocol::pb::{
+    self, agent_control_server::AgentControlServer, bootstrap_server::BootstrapServer,
+    host_identity_server::HostIdentityServer,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+fn error(message: &str) -> StructuredError {
+    StructuredError {
+        code: "invalid_config",
+        message: message.into(),
+    }
+}
+fn unavailable() -> StructuredError {
+    StructuredError {
+        code: "management_unavailable",
+        message: "Remote role operation failed; inspect the saved configuration and identity"
+            .into(),
+    }
+}
+fn now() -> i64 {
+    mllm_protocol::now_unix_ms() / 1000
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Credentials {
+    version: u32,
+    admin_token: String,
+    api_key: String,
+}
+fn token() -> String {
+    mllm_store::secrets::new_engine_key()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn private_dir(path: &Path) -> Result<(), StructuredError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta)
+            if meta.is_dir()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o7777 == 0o700 => {}
+        Ok(_) => {
+            return Err(error(
+                "Existing role state directory is unsafe; no permissions were changed",
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| error("Role state requires an absolute path"))?;
+            if !parent.exists() {
+                private_dir(parent)?;
+            }
+            let mut builder = fs::DirBuilder::new();
+            match builder.mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return private_dir(path)
+                }
+                Err(_) => return Err(unavailable()),
+            }
+        }
+        Err(_) => return Err(unavailable()),
+    }
+    if path.canonicalize().map_err(|_| unavailable())? != path {
+        return Err(error("Role state path must be canonical"));
+    }
+    Ok(())
+}
+/// Owner-protected bounded reads without taking the running service's exclusive lock.
+fn private_read(path: &Path) -> Result<Vec<u8>, StructuredError> {
+    // A bare relative name (`--join-file host.join`) has an empty parent, which
+    // names the working directory, not an unreadable path.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .map_err(|_| unavailable())?;
+    for ancestor in parent.ancestors() {
+        let m = fs::symlink_metadata(ancestor).map_err(|_| unavailable())?;
+        if !m.is_dir()
+            || ![0, unsafe { libc::geteuid() }].contains(&m.uid())
+            || m.mode() & 0o022 != 0
+        {
+            return Err(error("Unsafe private file directory"));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| unavailable())?;
+    let m = file.metadata().map_err(|_| unavailable())?;
+    if !m.is_file()
+        || m.uid() != unsafe { libc::geteuid() }
+        || m.mode() & 0o7777 != 0o600
+        || m.nlink() != 1
+        || m.len() == 0
+        || m.len() > 131072
+    {
+        return Err(error("Unsafe or incomplete private file"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(131073)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unavailable())?;
+    if bytes.len() > 131072 {
+        return Err(error("Private file exceeds its bound"));
+    }
+    Ok(bytes)
+}
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), StructuredError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|_| unavailable())?;
+    file.write_all(bytes).map_err(|_| unavailable())?;
+    file.as_file().sync_all().map_err(|_| unavailable())?;
+    file.persist_noclobber(path).map_err(|_| {
+        error("Output already exists or cannot be created; nothing was overwritten")
+    })?;
+    fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|_| unavailable())?;
+    Ok(())
+}
+fn read_config(path: &Path) -> Result<String, StructuredError> {
+    let metadata =
+        fs::metadata(path).map_err(|_| error("Explicit or saved role configuration is missing"))?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(error("Invalid role configuration file"));
+    }
+    fs::read_to_string(path).map_err(|_| error("Cannot read role configuration"))
+}
+fn implicit(root: &Path, role: &str) -> PathBuf {
+    root.join("config").join(format!("{role}.yaml"))
+}
+fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, StructuredError> {
+    if fs::symlink_metadata(output).is_ok() {
+        return Err(error("Output already exists; nothing was overwritten"));
+    }
+    let text = match role {
+        InitTarget::Server => ServerConfig::template(root),
+        InitTarget::Host => HostConfig::template(root),
+    };
+    match role {
+        InitTarget::Server => {
+            ServerConfig::parse(&text).map_err(|_| error("Invalid server initialization path"))?;
+        }
+        InitTarget::Host => {
+            HostConfig::parse(&text).map_err(|_| error("Invalid host initialization path"))?;
+        }
+    }
+    // SPEC §15.3: complete semantic validation before creating any state.
+    private_dir(root)?;
+    private_dir(&root.join("identity"))?;
+    let storage = IdentityDirectory::open(&root.join("identity"))
+        .map_err(|_| error("Role identity is unsafe or already in use"))?;
+    if role == InitTarget::Server {
+        if storage
+            .read_bundle("server-credentials.json")
+            .map_err(|_| unavailable())?
+            .is_some()
+        {
+            return Err(error(
+                "Server identity already exists; use its saved configuration",
+            ));
+        }
+        enrollment::initialize_controller_ca(&storage, now())
+            .map_err(|_| error("Server CA already exists or cannot be initialized"))?;
+        let credentials = Credentials {
+            version: 1,
+            admin_token: token(),
+            api_key: token(),
+        };
+        storage
+            .create_bundle(
+                "server-credentials.json",
+                &serde_json::to_vec(&credentials).map_err(|_| unavailable())?,
+            )
+            .map_err(|_| unavailable())?;
+        storage
+            .create_bundle("secrets.key", &mllm_store::secrets::new_engine_key())
+            .map_err(|_| unavailable())?;
+    }
+    if output
+        == implicit(
+            root,
+            if role == InitTarget::Server {
+                "server"
+            } else {
+                "host"
+            },
+        )
+    {
+        private_dir(&root.join("config"))?;
+    }
+    write_new(output, text.as_bytes())?;
+    Ok(json!({"config":output,"state_dir":root,"initialized":true}))
+}
+fn load_credentials(config: &ServerConfig) -> Result<Credentials, StructuredError> {
+    let c: Credentials = serde_json::from_slice(&private_read(
+        &config.identity_dir.join("server-credentials.json"),
+    )?)
+    .map_err(|_| unavailable())?;
+    if c.version != 1
+        || ManagementCredentials::from_trusted_resolver(&c.admin_token, &c.api_key).is_err()
+    {
+        return Err(error("Invalid saved server credentials"));
+    }
+    Ok(c)
+}
+pub(crate) fn management_context(config: &ServerConfig) -> Result<(String, String), StructuredError> {
+    Ok((format!("http://{}/management/v1", config.management), load_credentials(config)?.admin_token))
+}
+fn management_credentials(c: &Credentials) -> Result<ManagementCredentials, StructuredError> {
+    ManagementCredentials::from_trusted_resolver(&c.admin_token, &c.api_key)
+        .map_err(|_| unavailable())
+}
+/// How often the server re-reads the hosts' queue policies (W10 gap b).
+const QUEUE_POLICY_REFRESH: Duration = Duration::from_secs(5);
+
+/// Aborts a supervision task when dropped, so it ends with the role.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// SPEC §10 step 1, §16.2 (W10 gap b): the router's waiting-request bounds
+/// from a host queue policy. The deadline a waiting request is given is the
+/// policy's request deadline.
+pub(crate) fn wait_limits(queue: &mllm_config::effective::QueuePolicy) -> mllm_router::queue::WaitLimits {
+    mllm_router::queue::WaitLimits {
+        max_pending_per_deployment: queue.max_pending_per_deployment as usize,
+        max_pending_total: queue.max_pending_total as usize,
+        max_buffered_bytes_total: usize::try_from(queue.max_buffered_bytes_total).unwrap_or(0),
+        deadline: Duration::from_millis(u64::try_from(queue.request_deadline_ms).unwrap_or(0)),
+        stream_idle: Duration::from_millis(u64::try_from(queue.stream_idle_ms).unwrap_or(0)),
+    }
+}
+
+async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
+    let storage = IdentityDirectory::open(&config.identity_dir)
+        .map_err(|_| error("Server identity is missing, unsafe or already in use"))?;
+    let credentials = load_credentials(&config)?;
+    let ca = enrollment::load_controller_ca(&storage)
+        .map_err(|_| error("Server CA is missing or invalid; explicit recovery is required"))?;
+    let key = HostKey::generate().map_err(|_| unavailable())?;
+    let certificate = ca
+        .issue_server(&config.certificate_name, &key, now())
+        .map_err(|_| unavailable())?;
+    // Reopening never regenerates the sealing key of an existing controller.
+    private_read(&config.identity_dir.join("secrets.key"))?;
+    let secrets =
+        mllm_store::secrets::SecretsKey::load_or_create(&config.identity_dir.join("secrets.key"))
+            .map_err(|_| unavailable())?;
+    let owner = Arc::new(Mutex::new(
+        OwnedCoordinatorState::open_with_secrets(&config.state_dir, secrets)
+            .map_err(|_| error("Controller state is unsafe or already owned"))?,
+    ));
+    let ca_pem = ca.certificate_pem().to_owned();
+    let authority = Arc::new(EnrollmentAuthority::new(owner.clone(), ca));
+    // Owner decision 2026-09-23: heartbeats every second on each control
+    // session; silence suspends a host's dispatch, then loses its session.
+    let sessions = AgentSessions::with_heartbeats(
+        authority.clone(),
+        mllm_controller::agent_sessions::HeartbeatPolicy {
+            interval: mllm_config::remote_roles::HEARTBEAT_INTERVAL,
+            suspend_after: config.heartbeat.suspend_after,
+            lost_after: config.heartbeat.lost_after,
+        },
+    );
+    let bindings = mllm_controller::remote_execution::RemoteProfileBindings::new(
+        owner.clone(), sessions.clone(), authority.controller_id(),
+    );
+    let readiness = bindings.readiness();
+    let coordinator = mllm_controller::coordinator::OwnedCoordinator::spawn_with_execution_bindings(
+        owner.clone(), sessions.clone(),
+        Arc::new(|| Ok(mllm_protocol::now_unix_ms())),
+        mllm_controller::coordinator::CoordinatorOptions {
+            // ADR 0014 amendment A1: a ceiling only; each Initialize is bounded
+            // by its step deadline, the deployment's `timeouts.initialize` or
+            // the operator's override, within the host's request deadline.
+            initialize_timeout: Duration::from_secs(3600),
+            // SPEC §6.5 (W5): the server document's idle policy, off unless named.
+            idle: mllm_store::ordinary_lifecycle::park::IdlePolicy {
+                ready_idle_ms: config.idle.ready_idle.map(|d| d.as_millis() as i64),
+                parked_idle_ms: config.idle.parked_idle.map(|d| d.as_millis() as i64),
+            },
+            // SPEC §6.3: a Stop drains accepted requests for the same bound a
+            // switch does (`switching.drain_timeout`) before it terminates.
+            stop_drain_timeout: config.switch_drain_timeout,
+            ..Default::default()
+        },
+        bindings,
+    ).map_err(|_| unavailable())?;
+    // SPEC §§6.1, 13.2 (G2, D8): a Ready remote engine dispatches only while the
+    // host session that proved it is current; a new session must re-prove it.
+    let supervisor = mllm_controller::remote_readiness::RemoteReadiness::new(
+        owner.clone(), sessions.clone(), authority.controller_id(), readiness,
+    );
+    // SPEC §4.3: a host's drain notice closes dispatch to its engines before
+    // the host is acknowledged and closes its ingress.
+    {
+        let supervisor = supervisor.clone();
+        sessions.on_host_draining(Arc::new(move |host: &str| supervisor.suspend_host(host)));
+    }
+    // Owner decision 2026-09-23: a host silent past the suspend bound has its
+    // dispatch suspended and its readiness re-proven when it is heard again.
+    {
+        let supervisor = supervisor.clone();
+        sessions.on_host_unresponsive(Arc::new(move |host: &str| {
+            supervisor.suspend_unresponsive_host(host)
+        }));
+    }
+    // SPEC §13.2 (W13): a host's report that an owned engine exited closes that
+    // instance's dispatch and settles it with verified cleanup.
+    {
+        let exits = mllm_controller::engine_exit::EngineExits::new(coordinator.commands());
+        sessions.on_member_exit(Arc::new(move |host: &str, exit| {
+            exits.remote(host, exit);
+        }));
+    }
+    // ADR 0015 invariant 6: the server's supervisors share one cancel signal
+    // and are joined at shutdown (`crate::shutdown::Supervision`).
+    let mut supervision = crate::shutdown::Supervision::new();
+    supervision.supervise(supervisor.spawn_until(supervision.cancel_signal()));
+    // ADR 0014 §7 (WE3): pending checkpoint digests are measured by the host
+    // that holds each checkpoint and recorded here, one measurement per host.
+    supervision.supervise(
+        mllm_controller::checkpoint_digests::CheckpointDigests::new(
+            owner.clone(),
+            mllm_controller::checkpoint_digests::RemoteDigests::new(owner.clone(), sessions.clone(), authority.controller_id()),
+        )
+        .spawn_until(supervision.cancel_signal()),
+    );
+    let configuration = Arc::new(mllm_management::configuration::SharedConfigurationSource::from_registry(owner.clone(), "owner")
+        .map_err(|_| unavailable())?);
+    // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching
+    // and the operator's `start --evict`, bounded by `switching.drain_timeout`.
+    let switcher = Arc::new(mllm_controller::switching::Switcher::new(
+        coordinator.commands(),
+        mllm_controller::switching::SwitchOptions {
+            drain_timeout: config.switch_drain_timeout,
+            ..Default::default()
+        },
+    ));
+    let actions = Arc::new(mllm_management::actions::OwnedActionSource::new(configuration, coordinator.commands())
+        .map_err(|_| unavailable())?
+        .with_switcher(switcher.clone()));
+    // ADR 0013 §10 (I3, D9): the router balances across instances on host
+    // liveness and the engine load each host agent reports.
+    let controller = Arc::new(
+        mllm_controller::CoordinatorLifecycle::new(coordinator.commands())
+            .with_routing(mllm_controller::RoutingSignals::from_sessions(&sessions))
+            .with_switcher(switcher.clone()),
+    );
+    let inflight = Arc::new(mllm_router::admission::InFlight::default());
+    // SPEC §17 (M80): `observability.timing_header`, off unless set.
+    inflight.latency.set_timing_header(config.timing_header);
+    // SPEC §17 (M80): the timing header names the engine family the host reports.
+    inflight.latency.set_host_latency(sessions.latency_table());
+    // SPEC §17 (M80): router, host ingress and engine latency, read together.
+    let latency_view = {
+        let (recorder, hosts) = (inflight.latency.clone(), sessions.latency_table());
+        mllm_management::metrics::latency_router(
+            management_credentials(&credentials)?,
+            Arc::new(move |deployment: Option<&str>| {
+                mllm_router::timing::latency_report(&recorder, &hosts.snapshot(deployment), deployment)
+            }),
+        )
+    };
+    // SPEC §10 step 1, §16.2 (W10 gap b): waiting requests are bounded by the
+    // hosts' published `resource_policy.queue` (the tightest of them), read
+    // again as hosts enroll and publish.
+    let _queue_limits = {
+        let (controller, inflight) = (controller.clone(), inflight.clone());
+        AbortOnDrop(tokio::spawn(async move {
+            loop {
+                if let Ok(Some(queue)) = controller.queue_policy() {
+                    inflight.waiting.set_limits(wait_limits(&queue));
+                }
+                tokio::time::sleep(QUEUE_POLICY_REFRESH).await;
+            }
+        }))
+    };
+    let inference = mllm_router::serve_router(mllm_router::RouterDeps {
+        controller: controller.clone(),
+        forwards: Arc::new(mllm_router::forwarders::LiveForwarders::new(controller)),
+        limits: mllm_router::QueueLimits { max_requests_per_deployment:32, max_buffered_bytes_total:64 * 1024 * 1024 },
+        api_key: Some(credentials.api_key.clone()),
+        inflight,
+        activation_join: Arc::new(mllm_router::WakeJoin::new()),
+    });
+    // SPEC §4.3: the explicit drain of an enrolled host. Owner decision 4: an
+    // offline host's drain is accepted at once with its Stops pending.
+    let presence = {
+        let sessions = sessions.clone();
+        Arc::new(move |host: &str| sessions.current_session(host).is_some())
+    };
+    let drain = mllm_management::drain::drain_router_with_presence(
+        management_credentials(&credentials)?, actions.clone(), Vec::new(), presence,
+    );
+    let management = mllm_management::lifecycle_router(
+        management_credentials(&credentials)?, actions,
+    )
+    .merge(drain)
+    .merge(
+        mllm_management::enrollment::enrollment_router(
+            management_credentials(&credentials)?,
+            authority.clone(),
+            config.bootstrap_address.clone(),
+            config.control_address.clone(),
+        )
+        .map_err(|_| unavailable())?
+        .reset_fallback(),
+    )
+    .merge(mllm_management::hosts::hosts_router(
+        management_credentials(&credentials)?,
+        owner,
+        sessions.clone(),
+    ))
+    .merge(latency_view);
+    let management_listener = tokio::net::TcpListener::bind(config.management)
+        .await
+        .map_err(|_| unavailable())?;
+    let inference_listener = tokio::net::TcpListener::bind(config.inference)
+        .await
+        .map_err(|_| unavailable())?;
+    let bootstrap_listener = tokio::net::TcpListener::bind(config.bootstrap)
+        .await
+        .map_err(|_| unavailable())?;
+    let control_listener = tokio::net::TcpListener::bind(config.control)
+        .await
+        .map_err(|_| unavailable())?;
+    let identity = Identity::from_pem(certificate.pem, key.private_key_pem());
+    // SPEC §4.3 (owner decision P3): a signal is a service restart. Inference
+    // admission closes first, admitted streams finish within the bound, then
+    // every listener stops and the coordinator is joined; remote engines keep
+    // running on their hosts and the next start adopts and re-proves them.
+    let bound = config.drain_timeout;
+    let mut signals = crate::shutdown::Signals::install().map_err(|_| unavailable())?;
+    let admission = crate::shutdown::Admission::new();
+    let inference = admission.gate(inference);
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let stopping = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stopped.wait_for(|stopped| *stopped).await;
+    };
+    let bootstrap = Server::builder()
+        .tls_config(ServerTlsConfig::new().identity(identity.clone()))
+        .map_err(|_| unavailable())?
+        .add_service(
+            BootstrapServer::from_arc(authority.clone())
+                .max_decoding_message_size(32768)
+                .max_encoding_message_size(131072),
+        )
+        .serve_with_incoming_shutdown(
+            TcpListenerStream::new(bootstrap_listener),
+            stopping(stopped.clone()),
+        );
+    let control = Server::builder()
+        .tls_config(
+            ServerTlsConfig::new()
+                .identity(identity)
+                .client_ca_root(Certificate::from_pem(ca_pem)),
+        )
+        .map_err(|_| unavailable())?
+        .add_service(
+            HostIdentityServer::from_arc(authority)
+                .max_decoding_message_size(32768)
+                .max_encoding_message_size(131072),
+        )
+        .add_service(
+            AgentControlServer::from_arc(sessions.clone())
+                .max_decoding_message_size(65536)
+                .max_encoding_message_size(65536),
+        )
+        .serve_with_incoming_shutdown(
+            TcpListenerStream::new(control_listener),
+            stopping(stopped.clone()),
+        );
+    println!(
+        "{}",
+        json!({"role":"server","management":config.management.to_string(),"state_dir":config.state_dir})
+    );
+    // SPEC §3: remote and embedded modes share the ordinary lifecycle/router.
+    let management_stopped = stopped.clone();
+    let mut listeners = tokio::spawn(async move {
+        tokio::try_join!(
+            async { bootstrap.await.map_err(|_| unavailable()) },
+            async { control.await.map_err(|_| unavailable()) },
+            async {
+                crate::shutdown::serve(management_listener, management, management_stopped)
+                    .await
+                    .map_err(|_| unavailable())
+            },
+            async {
+                crate::shutdown::serve(inference_listener, inference, stopped)
+                    .await
+                    .map_err(|_| unavailable())
+            }
+        )
+        .map(|_| ())
+    });
+    let failed = tokio::select! {
+        result = &mut listeners => Some(result),
+        _ = signals.recv() => None,
+    };
+    if let Some(result) = failed {
+        listeners.abort();
+        supervision.join(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+        sessions.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+        switcher.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+        let _ = coordinator.shutdown().await;
+        result.map_err(|_| unavailable())??;
+        return Err(unavailable());
+    }
+    let started = std::time::Instant::now();
+    let drain = admission.drain(bound).await;
+    stop.send_replace(true);
+    let _ = crate::shutdown::join_listeners(&mut listeners).await;
+    listeners.abort();
+    // ADR 0015 invariant 6: nothing the role started outlives it. The
+    // supervisors finish their pass and are joined, then every host session
+    // ends through its teardown (claims retained, SPEC §13), then the
+    // switcher's follow-ups, then the coordinator's worker.
+    supervision.join(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+    sessions.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+    switcher.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+    coordinator.shutdown().await.map_err(|_| unavailable())?;
+    drop(storage);
+    Ok(json!({"role":"server","stopped":true,"engines":"retained","drain":drain.to_json(),
+        "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}))
+}
+/// How long a draining host waits for the controller to acknowledge that its
+/// dispatch is suspended before it closes ingress anyway.
+const DRAIN_NOTICE_BOUND: Duration = Duration::from_secs(5);
+
+async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
+    let storage = IdentityDirectory::open(&config.identity_dir)
+        .map_err(|_| error("Host identity is unsafe or in use; run join host before startup"))?;
+    let identity = PendingEnrollment::load(&storage).map_err(|_| {
+        error(
+            "Host is not enrolled or its identity needs recovery; run join host with an invitation",
+        )
+    })?;
+    let host = identity
+        .host_id()
+        .ok_or_else(|| {
+            error("Enrollment is incomplete; repeat join host with the same invitation")
+        })?
+        .to_owned();
+    identity.control_endpoint(now()).map_err(|_| {
+        error("Host certificate is invalid or expired; explicit identity recovery is required")
+    })?;
+    private_dir(&config.state_dir.join("journal"))?;
+    let journal = HostJournal::open(
+        &config.state_dir.join("journal"),
+        &identity.controller_id(),
+        &host,
+    )
+    .map_err(|_| error("Host journal is unsafe or owned by another process"))?;
+    let memory = mllm_agent::memory::read_host_memory().map_err(|_| error("Host memory inventory unavailable"))?.memory;
+    let declared=config.document["resource_policy"]["domains"].as_object();
+    let domains=if let Some(declared)=declared {
+        declared.iter().map(|(name,policy)| {
+            // The supported GB10 preparation has one unified physical pool.
+            // Multiple/distinct pools require their own observers, never copied capacity.
+            let supported=declared.len()==1 && policy["memory"]=="unified";
+            pb::DomainObservation {residents:vec![],domain_id:name.clone(),kind:"system".into(),
+                observed_bytes:if supported {memory.available_bytes} else {-1}, observed_at_unix:memory.sampled_at_ms/1000,
+                capacity_bytes:if supported {memory.capacity_bytes} else {-1}, available_bytes:if supported {memory.available_bytes} else {-1},observed_at_unix_ms:memory.sampled_at_ms}
+        }).collect()
+    } else {vec![pb::DomainObservation {residents:vec![],domain_id:"system".into(),kind:"system".into(),observed_bytes:memory.available_bytes,observed_at_unix:memory.sampled_at_ms/1000,
+        capacity_bytes:memory.capacity_bytes,available_bytes:memory.available_bytes,observed_at_unix_ms:memory.sampled_at_ms}]};
+    // ADR 0008 (owner decision 2026-09-23): registration measures each
+    // installation (engine package version and a digest over its files);
+    // later drift is flagged against this. Unmeasurable is never a refusal.
+    let declared = config.profiles.clone();
+    let profiles = tokio::task::spawn_blocking(move || {
+        let measurer = mllm_agent::installation::InstallationMeasurer::new();
+        declared
+            .iter()
+            .map(|(name, v)| {
+                let mut status = pb::RuntimeProfileStatus {
+                    name: name.clone(),
+                    build_fingerprint: v["build_fingerprint"].as_str().unwrap_or("unknown").into(),
+                    eligibility: "unknown".into(),
+                    reason: String::new(),
+                    ..Default::default()
+                };
+                mllm_agent::installation::register_profile(&measurer, v, &mut status);
+                status
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| unavailable())?;
+    let inventory = pb::ReportInventory {
+        domains,
+        profiles,
+        envelope: Some(pb::Envelope {
+            host_id: host.clone(),
+            protocol_version: mllm_protocol::PROTOCOL_VERSION.into(),
+            ..Default::default()
+        }),
+        approved_host_config_json:config.document.to_string(),
+        host_boot_id:fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_|error("Host boot identity unavailable"))?.trim().to_owned(),
+        policy_fingerprint:mllm_config::remote_resources::policy_fingerprint(&config.document),
+        // SPEC §§3.1, 7.3: the native executor below advertises per-launch
+        // claims in the inventory it publishes; this startup snapshot does not.
+        launch_claims: String::new(),
+    };
+    let ingress = mllm_agent::ingress::Ingress::new().map_err(|_| unavailable())?;
+    let (execution, ingress_listener) = if let Some(settings) = &config.ingress {
+        private_dir(&config.state_dir.join("ingress-identity"))?;
+        private_dir(&config.state_dir.join("logs"))?;
+        // SPEC §9.2: memory-saver SGLang launches enroll their saver
+        // observation here (0700, this service user).
+        private_dir(&config.state_dir.join("observation"))?;
+        // SPEC §8.2 / T21: per-launch SGLang file rendezvous directories,
+        // removed on gone evidence (0700, this service user).
+        private_dir(&config.state_dir.join("rendezvous"))?;
+        let private = IdentityDirectory::open(&config.state_dir.join("ingress-identity")).map_err(|_| unavailable())?;
+        let identities = mllm_agent::ingress_identity::IngressIdentities::new(private);
+        let execution = mllm_agent::native_execution::NativeHostExecution::new(
+            journal.clone(), ingress.clone(), identities, config.clone(), host.clone(), identity.controller_id(),
+            config.runtime_dir.clone(), config.state_dir.join("logs"), inventory.clone(),
+        )
+        // ADR 0014 §7, Q9: the per-host checkpoint stat cache is private state.
+        .with_checkpoint_cache(config.state_dir.join("checkpoints"))
+        // SPEC §8.2 / T21 (found live 2026-09-23): a signalled SGLang stop
+        // left its rendezvous directory in /tmp; the host now owns and removes it.
+        .with_rendezvous_root(config.state_dir.join("rendezvous"))
+        // SPEC §9.2 (W4): the production saver observation source; without it
+        // SGLang Park is refused unchanged.
+        .with_saver_residency(Arc::new(mllm_agent::native_execution::EnrolledSaver::new(
+            config.state_dir.join("observation"),
+        )))
+        // ADR 0007 (found live 2026-09-23, matrix M33): each GPU process's
+        // memory rides the availability reports, so the server credits
+        // resident engines instead of charging them twice.
+        .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia());
+        let listener = tokio::net::TcpListener::bind(settings.bind).await.map_err(|_| unavailable())?;
+        (Some(execution as Arc<dyn mllm_agent::session::SessionExecution>), Some(listener))
+    } else { (None, None) };
+    // SPEC §4.3 (owner decision P3): a signal is a service restart. Ingress
+    // admission and every ingress gate close, admitted streams finish within the
+    // bound, and the control session closes (its fence journals the disconnect).
+    // No engine is signalled: each stays running and owned, and the next session
+    // re-proves it with a fresh probe before its gate reopens.
+    let bound = config.drain_timeout;
+    let mut signals = crate::shutdown::Signals::install().map_err(|_| unavailable())?;
+    let admission = crate::shutdown::Admission::new();
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let drain_signal = mllm_agent::session::DrainSignal::new();
+    let session = mllm_agent::session::run_session_with_drain(&identity, journal, inventory, receiver, execution, Some(drain_signal.clone()));
+    let gates = ingress.clone();
+    let router = admission.gate(ingress.router());
+    let mut ingress_server = tokio::spawn(async move {
+        match ingress_listener {
+            Some(listener) => crate::shutdown::serve(listener, router, stopped).await.map_err(|_| unavailable()),
+            None => std::future::pending::<Result<(), StructuredError>>().await,
+        }
+    });
+    tokio::pin!(session);
+    tokio::select! {
+        result = &mut ingress_server => {
+            result.map_err(|_| unavailable())??;
+            return Err(unavailable());
+        }
+        result = &mut session => {
+            result.map_err(|_| unavailable())?;
+            return Err(unavailable());
+        }
+        _ = signals.recv() => {}
+    }
+    let started = std::time::Instant::now();
+    // SPEC §4.3 (Phase B follow-up): the controller suspends dispatch to this
+    // host first, so the router answers a retryable 503 instead of forwarding
+    // into an ingress that is closing. Bounded: an unreachable controller does
+    // not hold the drain.
+    // The session is polled only here, while the notice goes out and its
+    // acknowledgement comes back; as before, it runs no further effects while
+    // the ingress drains.
+    let mut session_ended = None;
+    let announced = {
+        let announce = drain_signal.announce(DRAIN_NOTICE_BOUND);
+        tokio::pin!(announce);
+        tokio::select! {
+            announced = &mut announce => announced,
+            ended = &mut session => {
+                session_ended = Some(ended);
+                mllm_agent::session::DrainAnnouncement::NotConnected
+            }
+        }
+    };
+    admission.close();
+    // SPEC §13: closing forwarding claims no native quiescence and releases
+    // nothing; it only stops new work reaching the engines.
+    let _ = gates.close_all();
+    let drain = admission.drain(bound).await;
+    stop.send_replace(true);
+    let _ = crate::shutdown::join_listeners(&mut ingress_server).await;
+    ingress_server.abort();
+    let _ = shutdown.send(true);
+    match session_ended {
+        Some(ended) => ended,
+        None => session.await,
+    }
+    .map_err(|_| unavailable())?;
+    Ok(json!({"role":"host","host_id":host,"stopped":true,"engines":"retained","drain":drain.to_json(),
+        "dispatch_suspension":announced.as_str(),
+        "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}))
+}
+pub fn supports(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Start(Role::Server | Role::Host)
+            | Command::Init(_)
+            | Command::Invite { .. }
+            | Command::Join { .. }
+            | Command::List {
+                resource: ListResource::Hosts
+            }
+            | Command::Inspect {
+                resource: Resource::Host,
+                ..
+            }
+    )
+}
+pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, StructuredError> {
+    match &invocation.command {
+        Command::Init(role) => {
+            let output = invocation
+                .output
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    implicit(
+                        root,
+                        if *role == InitTarget::Server {
+                            "server"
+                        } else {
+                            "host"
+                        },
+                    )
+                });
+            initialize(root, *role, &output)
+        }
+        Command::Start(role @ (Role::Server | Role::Host)) => {
+            let label = if *role == Role::Server {
+                "server"
+            } else {
+                "host"
+            };
+            let path = invocation
+                .config
+                .clone()
+                .unwrap_or_else(|| implicit(root, label));
+            if invocation.config.is_none()
+                && fs::symlink_metadata(&path)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                initialize(
+                    root,
+                    if *role == Role::Server {
+                        InitTarget::Server
+                    } else {
+                        InitTarget::Host
+                    },
+                    &path,
+                )?;
+                if *role == Role::Host {
+                    return Err(error("Created an offline host template; run join host with an invitation before starting"));
+                }
+            }
+            let source = read_config(&path)?;
+            if *role == Role::Server {
+                serve_server(
+                    ServerConfig::parse(&source)
+                        .map_err(|_| error("Invalid server configuration"))?,
+                )
+                .await
+            } else {
+                serve_host(
+                    HostConfig::parse(&source).map_err(|_| error("Invalid host configuration"))?,
+                )
+                .await
+            }
+        }
+        Command::Join { join_file } => {
+            let path = invocation
+                .config
+                .clone()
+                .unwrap_or_else(|| implicit(root, "host"));
+            let config = HostConfig::parse(&read_config(&path)?)
+                .map_err(|_| error("Invalid host configuration"))?;
+            let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
+                .map_err(|_| error("Invalid join invitation"))?;
+            let storage = IdentityDirectory::open(&config.identity_dir)
+                .map_err(|_| error("Host identity is unsafe or already in use"))?;
+            let mut pending = PendingEnrollment::prepare(&storage, &invitation)
+                .map_err(|_| error("Invitation conflicts with the retained host identity"))?;
+            let host_id = pending.enroll(&storage, &invitation, now()).await.map_err(|_| error("Enrollment failed; retain identity and retry the same invitation transaction"))?;
+            Ok(json!({"host_id":host_id,"enrolled":true}))
+        }
+        Command::Invite { name } => {
+            let output = invocation.output.as_ref().ok_or_else(|| {
+                error("invite host requires --output FILE; invitations are never printed")
+            })?;
+            let path = Path::new(output);
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(error(
+                    "Invitation output already exists; nothing was overwritten",
+                ));
+            }
+            let config = server_context(invocation.config.as_deref(), root)?;
+            let result = management_request(
+                &config,
+                reqwest::Method::POST,
+                "/host-invitations",
+                Some(json!({"host_name":name,"lifetime_seconds":3600})),
+            )
+            .await?;
+            write_new(
+                path,
+                &serde_json::to_vec(&result).map_err(|_| unavailable())?,
+            )?;
+            Ok(json!({"invitation_file":path,"host_name":name}))
+        }
+        Command::List {
+            resource: ListResource::Hosts,
+        }
+        | Command::Inspect {
+            resource: Resource::Host,
+            ..
+        } => {
+            let config = server_context(invocation.config.as_deref(), root)?;
+            let result = management_request(&config, reqwest::Method::GET, "/hosts", None).await?;
+            if let Command::Inspect { id: Some(id), .. } = &invocation.command {
+                result["hosts"]
+                    .as_array()
+                    .and_then(|hosts| {
+                        hosts
+                            .iter()
+                            .find(|h| h["host_id"] == *id || h["name"] == *id)
+                    })
+                    .cloned()
+                    .ok_or_else(|| error("Host not found"))
+            } else {
+                Ok(result)
+            }
+        }
+        _ => Err(error("Unsupported remote role command")),
+    }
+}
+pub fn server_context(
+    explicit: Option<&Path>,
+    root: &Path,
+) -> Result<ServerConfig, StructuredError> {
+    ServerConfig::parse(&read_config(
+        &explicit
+            .map(PathBuf::from)
+            .unwrap_or_else(|| implicit(root, "server")),
+    )?)
+    .map_err(|_| error("Invalid server context"))
+}
+pub async fn management_request(
+    config: &ServerConfig,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, StructuredError> {
+    let credentials = load_credentials(config)?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| unavailable())?;
+    let mut request = client
+        .request(
+            method,
+            format!("http://{}/management/v1{path}", config.management),
+        )
+        .bearer_auth(credentials.admin_token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let mut response = request.send().await.map_err(|_| unavailable())?;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+        if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
+            return Err(unavailable());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(error("Management command rejected"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| unavailable())
+}

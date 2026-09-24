@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mllm_controller::Controller;
+use mllm_controller::LifecyclePort;
 use mllm_domain::LifecycleState;
 
 /// Bounded, non-resetting admission window (T19): busy traffic cannot
@@ -119,8 +119,107 @@ impl<E: Clone> WakeJoin<E> {
     }
 }
 
+impl<E: Clone + Send + Sync + 'static> WakeJoin<E> {
+    /// Join (or start) the wake for `key` as a detached task (SPEC §10 step
+    /// 2, W10). Unlike [`WakeJoin::join`], the wake does not run inside the
+    /// first caller's future: a client that disconnects, or a caller that
+    /// stops waiting at its deadline, never cancels the activation the other
+    /// waiting requests joined, and a later caller still joins it.
+    ///
+    /// `aborted` is the outcome published if the wake task ends without one (it
+    /// panicked, or the runtime dropped it): the slot is then removed, so the
+    /// waiting callers are answered and the next caller starts a fresh wake
+    /// instead of joining a claim nobody will ever complete.
+    pub async fn join_detached<F, Fut>(
+        self: &Arc<Self>,
+        key: &str,
+        wake: F,
+        aborted: E,
+    ) -> Result<u64, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<u64, E>> + Send + 'static,
+    {
+        let (slot, mut rx) = {
+            let mut wakes = self.wakes.lock().unwrap_or_else(|p| p.into_inner());
+            let slot = wakes
+                .entry(key.to_string())
+                .or_insert_with(|| {
+                    Arc::new(JoinSlot {
+                        tx: tokio::sync::watch::channel(None).0,
+                        claimed: std::sync::atomic::AtomicBool::new(false),
+                    })
+                })
+                .clone();
+            let rx = slot.tx.subscribe();
+            (slot, rx)
+        };
+        if !slot
+            .claimed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let task = wake();
+            let join = self.clone();
+            let owned = slot.clone();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                let mut publish = Publish {
+                    join,
+                    slot: owned,
+                    key,
+                    aborted: Some(aborted),
+                };
+                let outcome = task.await;
+                publish.aborted = None;
+                publish.send(outcome);
+            });
+        }
+        loop {
+            if let Some(r) = rx.borrow().clone() {
+                return r;
+            }
+            // The slot (and its sender) is held here, so `changed` returns
+            // only when the outcome lands.
+            let _ = rx.changed().await;
+        }
+    }
+}
+
+/// Publishes a detached wake's outcome and frees its slot — on completion, or
+/// with the `aborted` outcome when the wake task unwinds or is dropped first.
+struct Publish<E> {
+    join: Arc<WakeJoin<E>>,
+    slot: Arc<JoinSlot<E>>,
+    key: String,
+    aborted: Option<E>,
+}
+
+impl<E> Publish<E> {
+    fn send(&self, outcome: Result<u64, E>) {
+        // Publish before removing: a caller arriving in between reads the
+        // outcome instead of starting a second wake.
+        let _ = self.slot.tx.send(Some(outcome));
+        let mut wakes = self.join.wakes.lock().unwrap_or_else(|p| p.into_inner());
+        if wakes.get(&self.key).is_some_and(|s| Arc::ptr_eq(s, &self.slot)) {
+            wakes.remove(&self.key);
+        }
+    }
+}
+
+impl<E> Drop for Publish<E> {
+    fn drop(&mut self) {
+        if let Some(aborted) = self.aborted.take() {
+            self.send(Err(aborted));
+        }
+    }
+}
+
+/// F1 router-owned switching over the F1 controller. Not constructed by any
+/// role: under the coordinator, victims are chosen and released by the
+/// lifecycle authority (`mllm_controller::switching`, W10), and the router
+/// only queues and joins (`LifecyclePort::activate_for_request`).
 pub struct SwitchEngine {
-    controller: Arc<Controller>,
+    controller: Arc<dyn LifecyclePort>,
     /// Bounded drain grace before the best-effort abort (design §5).
     drain_grace: Duration,
     /// In-flight wake joins (T15): concurrent activations for one target
@@ -129,7 +228,7 @@ pub struct SwitchEngine {
 }
 
 impl SwitchEngine {
-    pub fn new(controller: Arc<Controller>, drain_grace: Duration) -> Self {
+    pub fn new(controller: Arc<dyn LifecyclePort>, drain_grace: Duration) -> Self {
         Self {
             controller,
             drain_grace,
@@ -145,10 +244,8 @@ impl SwitchEngine {
     }
 
     async fn current_generation(&self, target: &str) -> Result<u64, SwitchError> {
-        let store = self.controller.store_ref();
-        let gen = store
-            .lock()
-            .unwrap()
+        let gen = self
+            .controller
             .get_deployment(target)
             .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?
             .ok_or_else(|| SwitchError::Activation(target.into(), "vanished".into()))?
@@ -157,10 +254,9 @@ impl SwitchEngine {
     }
 
     async fn activate(&self, target: &str) -> Result<u64, SwitchError> {
-        let store = self.controller.store_ref();
         let (target_state, target_observed) = {
-            let s = store.lock().unwrap();
-            let row = s
+            let row = self
+                .controller
                 .get_deployment(target)
                 .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?
                 .ok_or_else(|| SwitchError::Activation(target.into(), "vanished".into()))?;
@@ -174,11 +270,10 @@ impl SwitchEngine {
 
         // Step 1: any other READY deployment holds the pool — drain and
         // release it before B can start (one pool, exclusive residency).
-        let ready_others: Vec<String> = {
-            let s = store.lock().unwrap();
-            s.ready_deployments_excluding(target)
-                .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?
-        };
+        let ready_others: Vec<String> = self
+            .controller
+            .ready_deployments_excluding(target)
+            .map_err(|e| SwitchError::Activation(target.into(), e.to_string()))?;
         for a in ready_others {
             self.drain_and_release(&a).await?;
         }
@@ -202,7 +297,6 @@ impl SwitchEngine {
     /// failure: A reopens (not suspended, window preserved) and the failed
     /// switch is journaled (T16/T19 failure branch).
     async fn drain_and_release(&self, a: &str) -> Result<(), SwitchError> {
-        let store = self.controller.store_ref();
         let deadline = Instant::now() + self.drain_grace;
         // Drain: the fake's observe_work is the quiescence oracle; real
         // engines' in-flight telemetry arrives via the adapter (F1 design
@@ -241,9 +335,8 @@ impl SwitchEngine {
             }
         }
         // Release A: park if qualified, else stop (restart-only fallback).
-        let deployment = store
-            .lock()
-            .unwrap()
+        let deployment = self
+            .controller
             .get_deployment(a)
             .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
         let observed = deployment.as_ref().map(|r| r.observed_state);
@@ -299,8 +392,7 @@ impl SwitchEngine {
         // A reopens with its window state preserved: not suspended, the
         // failed switch does not punish A. The event feeds SPEC §17's
         // failed-switches metric.
-        let store = self.controller.store_ref();
-        let _ = store.lock().unwrap().set_suspended(a, false);
+        let _ = self.controller.clear_suspension(a);
         self.journal_switch_failed(a);
         SwitchError::DrainTimeout(a.to_string())
     }
@@ -311,15 +403,11 @@ impl SwitchEngine {
 
     fn journal_switch(&self, a: &str, evidence: &str) {
         // Journal on the deployment's latest operation (evidence-only).
-        let store = self.controller.store_ref();
-        let op = store
-            .lock()
-            .unwrap()
-            .latest_operation(a)
-            .ok()
-            .flatten();
+        let op = self.controller.latest_operation(a).ok().flatten();
         if let Some(op) = op {
-            let _ = store.lock().unwrap().record_journal(Some("switch"), Some(&op.id), None, evidence);
+            let _ = self
+                .controller
+                .journal(Some("switch"), Some(&op.id), None, evidence);
         }
     }
 }

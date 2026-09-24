@@ -5,16 +5,21 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2.workspace = true
+hex.workspace = true
 mllm-domain = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde_json = "1"
+serde = { workspace = true }
 mllm-config = { path = "../mllm-config" }
 futures = { workspace = true }
+tokio = { workspace = true }
+nix = { version = "0.29", features = ["fs", "user"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+mllm-testkit = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 [dev-dependencies.harness]

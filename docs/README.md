@@ -14,23 +14,25 @@ Request ownership is specified in the [F2A2c dispatch plan](superpowers/plans/20
 The [F2A2d coordinator integration plan](superpowers/plans/2026-09-12-f2a2d-coordinator-integration.md) connects lifecycle, runtime ownership, and routing.
 The [F2 planning index](superpowers/plans/2026-09-12-f2-planning-index.md) tracks written slices and remaining integration work.
 All eight F2 plans are written; integrated document review fixes have landed.
-CPU-only implementation has started. Live mixed-engine qualification remains pending.
-The design-package revision is not a software release or a hardware qualification claim.
+CPU-only implementation has started. Live mixed-engine verification remains pending.
+The design-package revision is not a software release or a hardware verification claim.
 
-Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning.
+Start with `AGENTS.md`, then `SPEC.md`.
 
 ## Contents
 
 | File | Purpose |
 |---|---|
 | `SPEC.md` | Consolidated architecture, requirements, interfaces, resource rules, configuration, milestones, and 40 acceptance scenarios. |
-| `AGENT_HANDOFF.md` | Coding-agent brief and implementation/verification boundaries. |
-| `examples/server.yaml` | Explicitly networked server configuration sketch. |
-| `examples/host.yaml` | Host aggregate boundaries and approved runtime profiles. |
-| `examples/deployment-single.yaml` | Single-host resource and lifecycle contract. |
-| `examples/deployment-multinode.yaml` | Two-host resource contract with a private host-cache tier. |
-| `examples/standalone.yaml` | Embedded local server/host shape with safe unresolved defaults. |
-| `DOCUMENT_CHECKS.txt` | Results of document and example consistency checks, not software or hardware tests. |
+| `examples/server.yaml` | Server role document: loopback management and inference, networked enrollment and control. |
+| `examples/host.yaml` | Host role document: unified-memory resource policy, labels, and vLLM and SGLang installations. |
+| `examples/deployment-single.yaml` | vLLM deployment on one host with `engine_config` and `timeouts`. |
+| `examples/deployment-multinode.yaml` | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
+| `examples/standalone.yaml` | Embedded local server/host shape, as `mllm start standalone` generates it. |
+
+Every example passes `mllm validate config` (deployments also against `examples/host.yaml`);
+`crates/mllm-cli/tests/validate_config.rs` checks this. They illustrate the schema and are
+not calibrated engine recipes.
 
 Revision 0.2 supersedes `mllm-initial-design.md` revision 0.1 and incorporates the subsequent design decisions. The old file is not repeated in the bundle to avoid conflicting instructions.
 

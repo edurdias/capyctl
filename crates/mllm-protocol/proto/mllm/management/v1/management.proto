@@ -8,7 +8,7 @@ message Envelope {
   int64  generation = 3;
   string operation_id = 4;
   int64  deadline_unix_ms = 5;
-  string protocol_version = 6;  // "1"
+  string protocol_version = 6;  // session protocol version, "2"
   string expected_state = 7;    // expected observed-state precondition
   string profile_fingerprint = 8; // expected runtime build fingerprint
 }
@@ -21,12 +21,17 @@ message EnrollRequest {
   string invitation_id = 1;
   string invitation_secret = 2;   // single-use; server verifies + burns
   string host_name = 3;
-  bytes  client_public_key = 4;   // host-generated key retained locally
+  bytes  client_public_key = 4;   // legacy; MUST be empty for v1 enrollment
+  string transaction_id = 5;
+  bytes csr_der = 6;
+  string protocol_version = 7;
 }
 message EnrollResponse {
   string host_id = 1;
   string server_certificate = 2;  // CA/trust material for pinning
   int64  lease_expires_unix = 3;
+  string client_certificate = 4;
+  string certificate_fingerprint = 5;
 }
 
 // --- Agent control (agent-initiated bidirectional stream) ---
@@ -39,30 +44,141 @@ message AgentToServer {
     Connect connect = 1;
     ReportInventory report_inventory = 2;
     ReportOperationResult report_operation_result = 3;
+    ReconcileHistory reconcile_history = 4;
+    MemberExecutionResult member_result = 5;
+    IngressProvisioned ingress_provisioned = 6;
+    // Protocol version 2 (SPEC §13.1). Ephemeral engine load; never journaled.
+    ReportLoad report_load = 7;
+    // Protocol version 2 (SPEC §13.2). An owned process exited on its own.
+    MemberExit member_exit = 8;
+    // SPEC §4.3: the host is beginning a graceful shutdown. The controller
+    // suspends dispatch to its engines before the host closes ingress.
+    HostDraining host_draining = 9;
+    // Owner decision 2026-09-23: application liveness on a reconciled session,
+    // sent only when the controller's SessionReady asked for it.
+    Heartbeat heartbeat = 10;
   }
+}
+// Owner decision 2026-09-23 (additive): application-level liveness on the
+// control session, in both directions, about once a second. A frozen peer keeps
+// its TCP connection but stops sending these. Carries no authority.
+message Heartbeat { int64 sent_at_unix_ms = 1; }
+// SPEC §4.3 (Phase B follow-up): sent once per session when the host role
+// begins a graceful shutdown. Carries no authority: it only closes dispatch.
+message HostDraining { string host_id = 1; }
+// The controller has suspended dispatch to every engine on the host.
+message HostDrainAcknowledged { string host_id = 1; }
+// SPEC §§10, 17: a bounded batch of loopback engine load samples, one per
+// Ready scope. Samples are routing hints, never readiness or release evidence.
+message ReportLoad {
+  string host_id = 1;
+  repeated LoadSample samples = 2;
+}
+message LoadSample {
+  string deployment_id = 1;
+  int64 generation = 2;
+  string owned_handle = 3;
+  int64 sampled_at_unix_ms = 4;
+  uint32 ingress_in_flight = 5;    // measured by host ingress, always present
+  uint32 running = 6;              // engine gauges; zero unless scrape_ok
+  uint32 waiting = 7;
+  uint32 kv_usage_ppm = 8;         // parts per million, 0..=1_000_000
+  bool scrape_ok = 9;              // false: the engine scrape failed or timed out
+  // SPEC §17 (M80): latency observed since the previous report for this scope.
+  // Absent when nothing was observed. Additive: an older receiver ignores it.
+  SampleLatency latency = 10;
+}
+// SPEC §17: host-side latency distributions for one load sample's scope. Series
+// names come from a fixed set (reports::HOST_LATENCY_SERIES), so cardinality is
+// bounded by the protocol, never by request input. No request content.
+message SampleLatency {
+  string engine = 1;                     // "vllm", "sglang", or "" when unknown
+  repeated LatencyHistogram histograms = 2;
+}
+// One bounded histogram delta: upper bucket bounds in seconds (ascending, +Inf
+// implicit) and the observations in each bucket alone (bounds + 1 entries).
+message LatencyHistogram {
+  string series = 1;
+  repeated double bounds = 2;
+  repeated uint64 counts = 3;
+  double sum_seconds = 4;
+  uint64 count = 5;
+}
+// SPEC §13.2: the exit of one owned process, identified by PID plus start
+// identity. It closes admission; it never releases the reservation by itself.
+message MemberExit {
+  string host_id = 1;
+  string deployment_id = 2;
+  int64 generation = 3;
+  string owned_handle = 4;
+  OwnedProcessObservation process = 5; // presence must be "gone"
+  // At most one of these is set; neither set means the status was not observed
+  // (for example, a retained process this agent did not spawn).
+  optional int32 exit_code = 6;
+  optional int32 exit_signal = 7;
+  int64 observed_at_unix_ms = 8;
 }
 message Connect {
   string host_id = 1;
   string protocol_version = 2;
   bytes  journal_resume_token = 3;   // bounded operation history
   Envelope envelope = 4;
+  // Additive: this agent sends and accepts Heartbeat. A peer without it is
+  // never sent one and never suspended for silence.
+  bool heartbeats = 5;
 }
 message ReportInventory {
   repeated DomainObservation domains = 1;
   repeated RuntimeProfileStatus profiles = 2;
   Envelope envelope = 3;
+  string approved_host_config_json = 4;
+  string host_boot_id = 5;
+  string policy_fingerprint = 6;
+  // SPEC §§3.1, 7.3 (per-launch claims, additive): "per_launch" when the
+  // host's journal keeps one claim per launch and admits a launch beside the
+  // others it claims; empty for a host that holds one launch claim at a time.
+  // "per_instance" (journal v5) is "per_launch" whose journal also fences
+  // each instance of a deployment by its own generation, so two instances of
+  // one deployment may share the host (ADR 0013 §4, owner decision P1).
+  string launch_claims = 7;
 }
 message DomainObservation {
   string domain_id = 1;        // stable local identity
   string kind = 2;             // system | device_memory | filesystem | remote_storage
   int64  observed_bytes = 3;   // -1 = unknown (closes admission upstream)
   int64  observed_at_unix = 4;
+  int64 capacity_bytes = 5;
+  int64 available_bytes = 6;
+  int64 observed_at_unix_ms = 7;
+  // ADR 0007 (additive): the memory each GPU process on the host holds,
+  // sampled beside `available_bytes`, bound to the process identity. The
+  // server credits it to an owner only by matching the identity of a runtime
+  // it recorded, and only as a lower bound. Empty from an older host.
+  repeated ProcessResidency residents = 8;
+}
+message ProcessResidency {
+  uint32 pid = 1;
+  string boot_id = 2;
+  uint64 start_ticks = 3;
+  int64 resident_bytes = 4;
 }
 message RuntimeProfileStatus {
   string name = 1;
   string build_fingerprint = 2;
   string eligibility = 3;      // unknown | qualified | unsupported | disabled
   string reason = 4;
+  // ADR 0008 (owner decision 2026-09-23, additive): the installation's
+  // fingerprint measured by the host at registration: the engine package's
+  // version and a `sha256:` digest over its files. Empty from an older host.
+  string installation_version = 5;
+  string installation_digest = 6;
+  // "" (older host) | measured | unmeasured | drifted. `drifted`: a launch
+  // measured `installation_observed_digest` instead of the registered digest.
+  string installation_state = 7;
+  string installation_observed_digest = 8;
+  // Capabilities a launch-time probe found missing (engine_capabilities.py):
+  // core | deep_park | metrics | observation. Empty until probed.
+  repeated string capabilities_missing = 9;
 }
 message ReportOperationResult {
   string operation_id = 1;
@@ -80,6 +196,12 @@ message ServerToAgent {
     GroupControl group_control = 4;
     TerminateMember terminate_member = 5;
     CancelWork cancel_work = 6;
+    ExecuteMember execute_member = 7;
+    SessionReady session_ready = 8;
+    ProvisionIngress provision_ingress = 9;
+    HostDrainAcknowledged host_drain_acknowledged = 10;
+    // Sent only to a host whose Connect declared `heartbeats`.
+    Heartbeat heartbeat = 11;
   }
 }
 message LaunchMember {
@@ -129,3 +251,188 @@ message DomainAllocation {
   int64  bytes = 2;
   string phase = 3;                  // activation | ready | parked
 }
+
+// SPEC §13: the validated execution boundary rejects the older untyped commands.
+message CommandIdentity {
+  string controller_id = 1;
+  string host_id = 2;
+  string member_id = 3;
+  string deployment_id = 4;
+  string operation_id = 5;
+  string command_id = 6;
+  string step_id = 7;
+  int64 generation = 8;
+  int64 revision = 9;
+  int64 deadline_unix_ms = 10;
+  bytes payload_digest = 11;
+  string expected_state = 12;
+  string profile_fingerprint = 13;
+  // The command encoding version, "1". It stays distinct from the session
+  // protocol version so journaled command digests survive agent upgrades.
+  string protocol_version = 14;
+  // ADR 0013 §5 (per-instance host fencing, additive): the deployment
+  // instance this command belongs to. Zero is instance 0 and is never
+  // encoded, so every command written before instances existed keeps its
+  // exact bytes and payload digest. A host fences each instance of a
+  // deployment by that instance's own last assignment.
+  uint32 instance_index = 15;
+}
+message GroupMemberPlan {
+  string host_id = 1;
+  string member_id = 2;
+  uint32 rank = 3;
+  string profile_name = 4;
+  string profile_fingerprint = 5;
+  string checkpoint_fingerprint = 6;
+  repeated string devices = 7;
+  string peer_address = 8;
+  uint32 service_port = 9;
+}
+message GroupLaunchPlan {
+  repeated GroupMemberPlan members = 1;
+  uint32 rendezvous_port = 2;
+}
+// Standalone native lifecycle uses a separate shape from the pinned TP2 group.
+// The host resolves this strict deployment manifest against its own approved
+// profile. No executable, argv, environment or credentials are carried here.
+message SingleLaunchPlan {
+  string deployment_config = 1;
+  string profile_name = 2;
+  string checkpoint_fingerprint = 3;
+  string host_policy_fingerprint = 4;
+  string binding_id = 5;
+  string incarnation = 6;
+  string grant_id = 7;
+  uint32 service_port = 8;
+  int64 issued_at_unix_ms = 9;
+  string coordinator_session_id = 10;
+  // ADR 0014 §7 (WE3): the checkpoint digest the server recorded for this
+  // revision, which the host must measure before launching or waking. Empty
+  // only in commands journaled before WE3.
+  string checkpoint_digest = 11;
+  // ADR 0014 §5: the weights bytes the server resolved this revision with, so
+  // the host resolves the same memory request. Absent when it resolved without.
+  optional int64 checkpoint_weights_bytes = 12;
+  // Owner decision 2026-09-23: the startup peak the server reserved for this
+  // launch until Ready (its cold phase), so the host re-checks the same peak.
+  // Absent in commands from a server that predates the startup budget.
+  optional int64 startup_bytes = 13;
+}
+// ADR 0014 §7 (WE3): measure one deployment's checkpoint on this host. The host
+// locates it from its own approved document and the deployment's model block;
+// nothing is launched, released or changed.
+message DigestCheckpointRequest {
+  string deployment_config = 1;
+  string host_policy_fingerprint = 2;
+  // The recorded or declared digest, if any; empty = measure only.
+  string expected_digest = 3;
+  // Owner decision 2026-09-23 (solo first start, additive): only size the
+  // checkpoint's weight files by a stat walk, without hashing, so the startup
+  // estimate is known before a first start. The answer is state `sized`.
+  bool size_only = 4;
+}
+message ExecuteMember {
+  CommandIdentity identity = 1;
+  oneof action {
+    GroupLaunchPlan prepare = 2;
+    GroupLaunchPlan launch = 3;
+    bool inspect = 4;
+    string terminate_owned_handle = 5;
+    bool close_ingress = 6;
+    SingleLaunchPlan launch_single = 7;
+    // SPEC §§6.1, 13.2: a fresh native model probe of one retained launch,
+    // named by its owned handle. Never a launch, never a release.
+    string probe_owned_handle = 8;
+    // SPEC §§9.1, 10: park or restore one retained launch in place, named by
+    // its owned handle. Neither launches, releases or replaces a process.
+    string park_owned_handle = 9;
+    string restore_owned_handle = 10;
+    // ADR 0014 §7 (WE3, protocol version 2, additive).
+    DigestCheckpointRequest digest_checkpoint = 11;
+  }
+  // ADR 0014 §7, owner decision 5 (2026-09-22), additive: with
+  // restore_owned_handle only, the checkpoint digest the server recorded for
+  // the launch's revision. The host measures the checkpoint against it before
+  // waking a launch journaled before WE3, whose plan records none. Empty
+  // otherwise, which encodes exactly as before.
+  string restore_checkpoint_digest = 12;
+}
+
+// Separately mounted on a listener requiring a verified client certificate.
+service HostIdentity {
+  rpc Renew(RenewHostRequest) returns (EnrollResponse);
+  rpc Verify(VerifyHostRequest) returns (VerifyHostResponse);
+}
+message RenewHostRequest { bytes csr_der = 1; string protocol_version = 2; string transaction_id = 3; }
+message VerifyHostRequest { string host_id = 1; }
+message VerifyHostResponse { string host_id = 1; }
+
+// Bounded pages preserve unresolved claims; the last page completes transport reconciliation.
+message JournalSummary { int64 sequence = 1; string command_id = 2; string state = 3; bool claim_retained = 4; }
+message ReconcileHistory { repeated JournalSummary records = 1; bool complete = 2; }
+message SessionReady {
+  string controller_id = 1;
+  string session_id = 2;
+  // Additive, nonzero only for an agent that declared `heartbeats`: send a
+  // Heartbeat this often, and treat the session as lost after this long
+  // without any message from the controller.
+  int64 heartbeat_interval_ms = 3;
+  int64 heartbeat_lost_after_ms = 4;
+}
+
+// Physical process observations are made on the authenticated assigned host.
+message OwnedProcessObservation {
+  string role = 1;
+  uint32 pid = 2;
+  string boot_id = 3;
+  uint64 start_ticks = 4;
+  string presence = 5; // alive | gone | unknown
+}
+message MemberExecutionResult {
+  CommandIdentity identity = 1;
+  string state = 2; // accepted | attempted | launched | completed | tombstone
+  string owned_handle = 3;
+  repeated OwnedProcessObservation processes = 4;
+  int64 observed_at_unix_ms = 5;
+  bool claim_retained = 6;
+  // Only a persisted native adapter readiness/probe result can set this.
+  bool model_usable = 7;
+  string binding_id = 8;
+  string incarnation = 9;
+  // Park and Restore results only (SPEC §§9.1, 10).
+  ResidencyEvidence residency = 10;
+  // DigestCheckpoint results only (ADR 0014 §7).
+  CheckpointDigestEvidence checkpoint = 11;
+  // SPEC §13: a closed category when host policy refused a LaunchSingle, Park
+  // or Restore before any effect; nothing was journaled or started. Empty
+  // otherwise. A refused launch is `completed` with no claim; a refused Park or
+  // Restore reports residency `unchanged`.
+  string refused = 12;
+  // SPEC §§6.4, 13.2: a LaunchSingle whose engine exited before readiness
+  // (`launched`, not usable, every recorded process gone) says why in at most
+  // 256 bytes of one printable line: the engine's exit code or signal and the
+  // option names it refused, never an option value or engine output. Empty
+  // otherwise.
+  string launch_failure = 13;
+}
+message CheckpointDigestEvidence {
+  string state = 1;          // computed | mismatch | refused | sized
+  string digest = 2;         // sha256:<64 hex>; computed and mismatch only
+  int64 weights_bytes = 3;   // computed, mismatch and sized only
+  uint64 file_count = 4;
+  uint64 total_bytes = 5;
+  string reason = 6;         // refused only: a closed category
+  bool full_rehash = 7;      // every file was hashed, not only the small ones
+}
+message ResidencyEvidence {
+  string state = 1;                      // parked | restored | unchanged | unknown
+  int64 mem_available_before_bytes = 2;  // -1 = not observed
+  int64 mem_available_after_bytes = 3;   // -1 = not observed
+  repeated string milestones = 4;        // bounded engine-generic step names
+}
+
+// Private mTLS delivery only. Never write this message to command/result journals.
+message ProvisionIngress { ExecuteMember command = 1; bytes gate_key = 2; }
+// `refused` is a closed category when host policy refused the launch before
+// any effect (no key stored); empty when the key was stored.
+message IngressProvisioned { CommandIdentity identity = 1; string refused = 2; }

@@ -1,11 +1,16 @@
 use mllm_cli::grammar::parse;
-use mllm_cli::output::{exit_code_for_cli_error, ExitCode, OperationError, OutputFormat, StructuredError};
+use mllm_cli::output::{
+    exit_code_for_cli_error, ExitCode, OperationError, OutputFormat, StructuredError,
+};
 
 #[test]
 fn exit_code_table_matches_design_section_7() {
     assert_eq!(OperationError::InvalidConfig.exit_code(), ExitCode(2));
     assert_eq!(OperationError::Unauthorized.exit_code(), ExitCode(3));
-    assert_eq!(OperationError::InsufficientResources.exit_code(), ExitCode(4));
+    assert_eq!(
+        OperationError::InsufficientResources.exit_code(),
+        ExitCode(4)
+    );
     assert_eq!(OperationError::Unsupported.exit_code(), ExitCode(5));
     assert_eq!(OperationError::Unreconciled.exit_code(), ExitCode(6));
     assert_eq!(OperationError::DeviceConflict.exit_code(), ExitCode(7));
@@ -56,9 +61,15 @@ fn internal_failures_exit_13_not_invalid_config() {
     // F1 design §4: store/I-O/runtime-boot failures get a distinct internal
     // code so scripts never mistake a broken state dir for bad config.
     assert_eq!(ExitCode::INTERNAL.0, 13);
-    let internal = StructuredError { code: "internal", message: "store: sqlite".into() };
+    let internal = StructuredError {
+        code: "internal",
+        message: "store: sqlite".into(),
+    };
     assert_eq!(internal.exit_code(), ExitCode(13));
-    let config = StructuredError { code: "invalid_config", message: "bad yaml".into() };
+    let config = StructuredError {
+        code: "invalid_config",
+        message: "bad yaml".into(),
+    };
     assert_eq!(config.exit_code(), ExitCode(2));
     assert_ne!(internal.exit_code(), config.exit_code());
 }

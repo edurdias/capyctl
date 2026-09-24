@@ -1,10 +1,10 @@
 use mllm_config::effective::{
     binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, Engine,
+    resolve_effective, DeepPark, DeepParkSource, DomainMemory, Engine, ModelSource, Residency,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
-use mllm_domain::launch::ProfileLaunchSettings;
+use mllm_domain::launch::{LaunchSettings, SettingSource};
 
 fn fixture() -> (serde_json::Value, serde_json::Value) {
     let all: serde_json::Value =
@@ -12,26 +12,197 @@ fn fixture() -> (serde_json::Value, serde_json::Value) {
     (all["deployment"].clone(), all["host"].clone())
 }
 
+/// Point the lab host's only profile at an SGLang installation. ADR 0014 §1: the
+/// installation carries no tuning, so this is all an engine switch takes.
+fn sglang_profile(host: &mut serde_json::Value) {
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = "sglang".into();
+    profile["args"] = serde_json::json!([]);
+    profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+}
+
+/// ADR 0011: a runtime profile carries no qualification reference. A host file
+/// that still has the key is refused by the strict schema with the key named.
+#[test]
+fn a_runtime_profile_has_no_declared_identity_key() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["qualification_id"] = serde_json::json!("x");
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert!(error.to_string().contains("qualification_id"), "{error}");
+    host["runtime_profiles"]["local"]
+        .as_object_mut()
+        .unwrap()
+        .remove("qualification_id");
+    resolve_effective(&deployment, &host).unwrap();
+}
+
+/// Set the topology of the lab host's only domain. Used here and by the host-check
+/// tests below (ADR 0010 decision 5).
+fn host_with_domain_memory(memory: &str) -> serde_json::Value {
+    let (_, mut host) = fixture();
+    host["resource_policy"]["domains"]["unified"]["memory"] = memory.into();
+    host
+}
+
+/// A host-backed park retains weights in host RAM, which frees nothing where that
+/// is the same pool the device allocates from. The host is the only party that
+/// knows which it is, so it states it rather than having it guessed from a domain's
+/// name or from which limits happen to be set.
+#[test]
+fn a_domain_declares_whether_its_memory_is_one_pool() {
+    let (deployment, _) = fixture();
+    for (declared, expected) in [
+        ("unified", DomainMemory::Unified),
+        ("distinct", DomainMemory::Distinct),
+    ] {
+        let host = host_with_domain_memory(declared);
+        let resolved = resolve_effective(&deployment, &host).expect("valid host");
+        assert_eq!(
+            resolved.host.domains["unified"].memory, expected,
+            "{declared}"
+        );
+    }
+}
+
+/// Omitting it is a configuration error, not a default. Either default is wrong on
+/// one class of hardware, and the failure it causes is silent: a park that frees
+/// nothing and an eviction that does not relieve pressure.
+#[test]
+fn a_domain_without_declared_memory_is_rejected() {
+    let (deployment, mut host) = fixture();
+    host["resource_policy"]["domains"]["unified"]
+        .as_object_mut()
+        .expect("the domain is an object")
+        .remove("memory");
+    let error = resolve_effective(&deployment, &host).expect_err("must be rejected");
+    assert!(format!("{error}").contains("memory"), "{error}");
+}
+
+/// SPEC §6.2 distinguishes a host-backed park, which retains a weight backup in host
+/// RAM, from deep parking, which releases the weights. A single `warm` cannot say
+/// which, and the two differ in wake cost by several times and in host RAM by orders
+/// of magnitude, so the deployment names the one it wants.
+#[test]
+fn residency_names_which_park_the_deployment_asks_for() {
+    for (declared, expected) in [
+        ("restart_only", Residency::RestartOnly),
+        ("host_backed", Residency::HostBacked),
+        ("deep", Residency::Deep),
+    ] {
+        let (mut deployment, host) = fixture();
+        deployment["residency"] = declared.into();
+        // ADR 0010 decision 5 refuses host_backed on a unified domain, which is what
+        // the lab host declares, so this asserts the vocabulary on a host that
+        // allows every tier.
+        let mut host = host;
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        let resolved = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
+        assert_eq!(resolved.residency, expected, "for {declared}");
+    }
+}
+
+/// A host-backed park retains weights in host RAM. Where that is the same pool the
+/// device allocates from, it frees nothing: the park reports success, the memory is
+/// still held, and the eviction it was meant to enable does not relieve pressure.
+/// Refusing at configuration time is the only point where that is visible.
+#[test]
+fn a_host_backed_park_is_refused_on_a_unified_domain() {
+    let (mut deployment, _) = fixture();
+    deployment["residency"] = "host_backed".into();
+    let host = host_with_domain_memory("unified");
+
+    let error = resolve_effective(&deployment, &host).expect_err("must be refused");
+    let text = format!("{error}");
+    assert!(text.contains("unified"), "names the domain: {text}");
+}
+
+/// The same deployment is valid where the pools are distinct - that is the hardware
+/// the tier exists for.
+#[test]
+fn a_host_backed_park_resolves_on_a_distinct_domain() {
+    let (mut deployment, _) = fixture();
+    deployment["residency"] = "host_backed".into();
+    let host = host_with_domain_memory("distinct");
+    resolve_effective(&deployment, &host).expect("host-backed is valid where pools differ");
+}
+
+/// Deep parking releases the weights, so it is valid on either topology.
+#[test]
+fn deep_parking_resolves_on_a_unified_domain() {
+    let (mut deployment, _) = fixture();
+    deployment["residency"] = "deep".into();
+    let host = host_with_domain_memory("unified");
+    resolve_effective(&deployment, &host).expect("deep parking releases, so it is valid");
+}
+
+/// `auto` is deliberately not adopted: choosing a tier at runtime is the fallback
+/// ladder ADR 0010 rejects, and SGLang cannot implement one because its memory-saver
+/// and weights-CPU-backup are startup flags.
+#[test]
+fn residency_auto_is_refused() {
+    let (mut deployment, host) = fixture();
+    deployment["residency"] = "auto".into();
+    let error = resolve_effective(&deployment, &host).expect_err("auto must not resolve");
+    assert_eq!(
+        error.code,
+        ConfigErrorCode::UnsupportedCombination,
+        "{error:?}"
+    );
+    assert_eq!(error.path, "deployment.residency", "{error:?}");
+}
+
+/// Spec §3: sleep mode stopped being a precondition of a parking residency. The
+/// rendered launch derives its sleep behaviour from `enable_sleep_mode &&
+/// deep_park == Enabled`, so a profile with sleep mode off describes a deployment
+/// that restarts instead of parking, which is a supported configuration rather
+/// than a rejected one. The switch that does refuse a parking deployment is
+/// `deep_park`, asserted separately below.
+// T14 T21
+#[test]
+fn a_parking_vllm_deployment_derives_sleep_mode() {
+    for residency in ["host_backed", "deep"] {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = residency.into();
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{residency} must resolve: {error}"));
+        let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+            panic!("vLLM settings");
+        };
+        assert!(settings.enable_sleep_mode, "{residency}");
+        assert_eq!(
+            settings.provenance["enable_sleep_mode"],
+            SettingSource::Derived
+        );
+    }
+}
+
+/// `restart_only` never parks, so mllm never renders development mode for it
+/// (SPEC §6.2): the switch is derived, not declared (ADR 0014 §3).
+// T14 T21
+#[test]
+fn restart_only_vllm_deployment_never_gets_sleep_mode() {
+    let (mut deployment, host) = fixture();
+    deployment["residency"] = "restart_only".into();
+    let effective = resolve_effective(&deployment, &host).expect("restart_only resolves");
+    let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+        panic!("vLLM settings");
+    };
+    assert!(!settings.enable_sleep_mode);
+}
+
 #[test]
 fn ordinary_engine_compatibility_goldens() {
-    for engine in ["vllm", "sglang", "fake"] {
+    for engine in ["vllm", "sglang"] {
         let (deployment, mut host) = fixture();
-        let profile = &mut host["runtime_profiles"]["local"];
         if engine != "vllm" {
-            profile["engine"] = engine.into();
-            profile["args"] = serde_json::json!([]);
-            profile["launch_settings"] = if engine == "sglang" {
-                profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
-                serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}})
-            } else {
-                serde_json::json!({"engine":"fake"})
-            };
+            sglang_profile(&mut host);
         }
         let effective = resolve_effective(&deployment, &host).unwrap();
         let golden: serde_json::Value = serde_json::from_str(match engine {
             "vllm" => include_str!("fixtures/effective-vllm-golden.json"),
-            "sglang" => include_str!("fixtures/effective-sglang-golden.json"),
-            _ => include_str!("fixtures/effective-fake-golden.json"),
+            _ => include_str!("fixtures/effective-sglang-golden.json"),
         })
         .unwrap();
         assert_eq!(
@@ -40,269 +211,6 @@ fn ordinary_engine_compatibility_goldens() {
             "{engine}"
         );
     }
-}
-
-fn qualification_policy() -> serde_json::Value {
-    serde_json::json!({
-        "revision": 1,
-        "allow_qualification_runs": true,
-        "allow_experimental_controls": false,
-        "allowed_manifest_digests": [
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            "0000000000000000000000000000000000000000000000000000000000000000"
-        ],
-        "max_run_duration": "24h",
-        "max_cleanup_duration": "1h",
-        "max_cases": 128,
-        "max_requests": 4096,
-        "max_request_body_bytes": "1MiB",
-        "max_input_tokens_per_request": 131072,
-        "max_output_tokens_per_request": 16384
-    })
-}
-
-#[test]
-fn qualification_policy_is_optional_and_normalized_without_authorizing_runs() {
-    let (deployment, host) = fixture();
-    let absent = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(absent.host.qualification_policy, None);
-
-    let mut host = host;
-    host["qualification_policy"] = qualification_policy();
-    let effective = resolve_effective(&deployment, &host).unwrap();
-    let policy = effective.host.qualification_policy.unwrap();
-    assert_eq!(policy.revision, 1);
-    assert!(policy.allow_qualification_runs);
-    assert!(!policy.allow_experimental_controls);
-    assert_eq!(policy.max_run_duration_ms, 86_400_000);
-    assert_eq!(policy.max_cleanup_duration_ms, 3_600_000);
-    assert_eq!(policy.max_request_body_bytes, 1 << 20);
-    assert!(policy
-        .allowed_manifest_digests
-        .windows(2)
-        .all(|w| w[0] < w[1]));
-}
-
-#[test]
-fn qualification_permissions_are_independent_and_empty_allowlist_is_deny_all() {
-    for permissions in [(false, false), (false, true), (true, false), (true, true)] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy["allow_qualification_runs"] = permissions.0.into();
-        policy["allow_experimental_controls"] = permissions.1.into();
-        policy["allowed_manifest_digests"] = serde_json::json!([]);
-        host["qualification_policy"] = policy;
-        let normalized = resolve_effective(&deployment, &host)
-            .unwrap()
-            .host
-            .qualification_policy
-            .unwrap();
-        assert_eq!(normalized.allow_qualification_runs, permissions.0);
-        assert_eq!(normalized.allow_experimental_controls, permissions.1);
-        assert!(normalized.allowed_manifest_digests.is_empty());
-    }
-}
-
-#[test]
-fn qualification_policy_bounds_and_digest_rules_fail_closed() {
-    let digest = "0".repeat(64);
-    let (deployment, mut host) = fixture();
-    let mut exact_digest_limit = qualification_policy();
-    exact_digest_limit["allowed_manifest_digests"] = serde_json::json!((0..1024)
-        .map(|value| format!("{value:064x}"))
-        .collect::<Vec<_>>());
-    host["qualification_policy"] = exact_digest_limit;
-    assert_eq!(
-        resolve_effective(&deployment, &host)
-            .unwrap()
-            .host
-            .qualification_policy
-            .unwrap()
-            .allowed_manifest_digests
-            .len(),
-        1024
-    );
-    for (field, value) in [
-        ("revision", serde_json::json!(0)),
-        ("max_run_duration", serde_json::json!("86400001ms")),
-        ("max_cleanup_duration", serde_json::json!("3600001ms")),
-        ("max_cases", serde_json::json!(129)),
-        ("max_requests", serde_json::json!(4097)),
-        ("max_request_body_bytes", serde_json::json!("1048577B")),
-        ("max_input_tokens_per_request", serde_json::json!(131073)),
-        ("max_output_tokens_per_request", serde_json::json!(16385)),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = value;
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
-    }
-    for bad in [
-        "A".repeat(64),
-        "0".repeat(63),
-        format!("{}g", "0".repeat(63)),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy["allowed_manifest_digests"] = serde_json::json!([bad]);
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err());
-    }
-    for digests in [vec![digest.clone(), digest], vec!["0".repeat(64); 1025]] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy["allowed_manifest_digests"] = serde_json::json!(digests);
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err());
-    }
-}
-
-#[test]
-fn qualification_policy_requires_complete_typed_bounded_input() {
-    for field in [
-        "revision",
-        "allow_qualification_runs",
-        "allow_experimental_controls",
-        "allowed_manifest_digests",
-        "max_run_duration",
-        "max_cleanup_duration",
-        "max_cases",
-        "max_requests",
-        "max_request_body_bytes",
-        "max_input_tokens_per_request",
-        "max_output_tokens_per_request",
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy.as_object_mut().unwrap().remove(field);
-        host["qualification_policy"] = policy;
-        let error = resolve_effective(&deployment, &host).unwrap_err();
-        assert_eq!(
-            error.code,
-            ConfigErrorCode::MissingRequired,
-            "{field}: {error:?}"
-        );
-        assert!(error.path.ends_with(field), "{field}: {error:?}");
-    }
-    for (field, value) in [
-        ("revision", serde_json::json!("secret-value")),
-        ("max_cases", serde_json::json!(-1)),
-        ("max_requests", serde_json::json!(18446744073709551615u64)),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = value;
-        host["qualification_policy"] = policy;
-        let error = resolve_effective(&deployment, &host).unwrap_err();
-        assert!(error.path.ends_with(field), "{error:?}");
-        assert!(!error.to_string().contains("secret-value"));
-    }
-    let (deployment, mut host) = fixture();
-    let mut policy = qualification_policy();
-    policy["unknown"] = serde_json::json!("secret-value");
-    host["qualification_policy"] = policy;
-    let error = resolve_effective(&deployment, &host).unwrap_err();
-    assert_eq!(error.code, ConfigErrorCode::UnknownField);
-    assert!(
-        error.path.ends_with("qualification_policy.unknown"),
-        "{error:?}"
-    );
-    assert!(!error.to_string().contains("secret-value"));
-}
-
-#[test]
-fn qualification_policy_rejects_zero_overflow_and_oversized_encoding() {
-    for field in [
-        "revision",
-        "max_cases",
-        "max_requests",
-        "max_input_tokens_per_request",
-        "max_output_tokens_per_request",
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = 0.into();
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
-    }
-    for (field, value) in [
-        ("max_run_duration", "0ms"),
-        ("max_cleanup_duration", "0ms"),
-        ("max_request_body_bytes", "0B"),
-        ("max_run_duration", "9223372036854775808ms"),
-        ("max_cleanup_duration", "9223372036854775808ms"),
-        ("max_request_body_bytes", "9223372036854775808B"),
-    ] {
-        let (deployment, mut host) = fixture();
-        let mut policy = qualification_policy();
-        policy[field] = value.into();
-        host["qualification_policy"] = policy;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{field}");
-    }
-    let (deployment, mut host) = fixture();
-    let mut policy = qualification_policy();
-    policy["max_run_duration"] = format!("{}ms", "1".repeat(1 << 20)).into();
-    host["qualification_policy"] = policy;
-    let error = resolve_effective(&deployment, &host).unwrap_err();
-    assert!(error.to_string().contains("encoding exceeds 1MiB"));
-}
-
-#[test]
-fn qualification_policy_is_not_part_of_recipe_qualification_identity() {
-    let (deployment, host) = fixture();
-    let original = resolve_effective(&deployment, &host).unwrap();
-    let mut changed = host;
-    changed["qualification_policy"] = qualification_policy();
-    let changed = resolve_effective(&deployment, &changed).unwrap();
-    assert_eq!(
-        original.qualification_fingerprint,
-        changed.qualification_fingerprint
-    );
-    assert_ne!(
-        original.host.qualification_policy,
-        changed.host.qualification_policy
-    );
-}
-
-#[test]
-fn normalized_policy_exposes_shared_fail_closed_validation() {
-    let (deployment, mut host) = fixture();
-    host["qualification_policy"] = qualification_policy();
-    let policy = resolve_effective(&deployment, &host)
-        .unwrap()
-        .host
-        .qualification_policy
-        .unwrap();
-    assert!(policy.validate().is_ok());
-
-    let mut stale_or_forged = policy.clone();
-    stale_or_forged.max_requests = 4097;
-    assert!(stale_or_forged.validate().is_err());
-    let mut noncanonical = policy;
-    noncanonical.allowed_manifest_digests.reverse();
-    assert!(noncanonical.validate().is_err());
-}
-
-#[test]
-fn strict_yaml_accepts_only_complete_qualification_policy_shape() {
-    let yaml = "schema_version: 1\nkind: host\nname: h\nqualification_policy:\n  revision: 1\n  allow_qualification_runs: false\n  allow_experimental_controls: true\n  allowed_manifest_digests: []\n  max_run_duration: 24h\n  max_cleanup_duration: 60m\n  max_cases: 128\n  max_requests: 4096\n  max_request_body_bytes: 1024KiB\n  max_input_tokens_per_request: 131072\n  max_output_tokens_per_request: 16384\n";
-    assert!(parse_strict(ConfigKind::Host, yaml).is_ok());
-    assert_eq!(
-        parse_strict(ConfigKind::Host, &yaml.replace("  max_cases: 128\n", ""))
-            .unwrap_err()
-            .code,
-        ConfigErrorCode::MissingRequired
-    );
-    assert_eq!(
-        parse_strict(
-            ConfigKind::Host,
-            &yaml.replace("  max_cases: 128", "  surprise: 128")
-        )
-        .unwrap_err()
-        .code,
-        ConfigErrorCode::UnknownField
-    );
 }
 
 #[test]
@@ -327,20 +235,13 @@ fn resolves_complete_typed_configuration_without_claiming_qualification() {
     let effective = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(effective.profile.engine, Engine::Vllm);
     assert_eq!(
-        effective.profile.qualification_id,
-        "qualification-evidence-17"
-    );
-    assert_eq!(
         effective.resources.ready.allocations[0].bytes,
         8 * 1024 * 1024 * 1024
     );
     assert_eq!(effective.host.observation_ttl_ms, 2_000);
     assert_eq!(effective.host.queue.max_pending_per_deployment, 64);
-    assert!(matches!(
-        effective.profile.launch_settings,
-        ProfileLaunchSettings::Vllm(_)
-    ));
-    assert_eq!(effective.qualification_fingerprint.len(), 64);
+    assert!(matches!(effective.engine_config, LaunchSettings::Vllm(_)));
+    assert_eq!(effective.recipe_fingerprint.len(), 64);
     assert!(!serde_json::to_string(&effective)
         .unwrap()
         .contains("secret-value"));
@@ -360,6 +261,8 @@ fn missing_host_bounds_use_named_product_defaults() {
     assert_eq!(effective.host.queue.max_buffered_bytes_total, 64 << 20);
     assert_eq!(effective.host.queue.request_deadline_ms, 600_000);
     assert_eq!(effective.host.queue.admission_window_ms, 2_000);
+    // SPEC §10: the idle bound between a relayed stream's events.
+    assert_eq!(effective.host.queue.stream_idle_ms, 120_000);
     assert_eq!(effective.host.observation_ttl_ms, 2_000);
     assert_eq!(effective.host.planner_max_states, 4096);
     assert_eq!(effective.host.max_parked, 16);
@@ -372,7 +275,7 @@ fn host_bounds_accept_limits_and_reject_zero_or_just_over() {
     policy["queue"] = serde_json::json!({
         "max_pending_per_deployment": 4096, "max_pending_total": 16384,
         "max_buffered_bytes_total": "1GiB", "request_deadline": "1h",
-        "admission_window": "30s"
+        "admission_window": "30s", "stream_idle_timeout": "1h"
     });
     policy["observation_ttl"] = "10s".into();
     policy["planner_max_states"] = 65536.into();
@@ -410,6 +313,12 @@ fn host_bounds_accept_limits_and_reject_zero_or_just_over() {
         let (deployment, mut host) = fixture();
         *host.pointer_mut(pointer).unwrap() = value;
         assert!(resolve_effective(&deployment, &host).is_err(), "{pointer}");
+    }
+    // SPEC §10: the stream idle bound is at least 1 s and at most 1 h.
+    for value in ["3601s", "999ms"] {
+        let (deployment, mut host) = fixture();
+        host["resource_policy"]["queue"]["stream_idle_timeout"] = value.into();
+        assert!(resolve_effective(&deployment, &host).is_err(), "{value}");
     }
     for pointer in [
         "/resource_policy/queue/max_pending_per_deployment",
@@ -457,71 +366,31 @@ fn profile_revision_and_fingerprint_are_exact() {
     let changed = resolve_effective(&deployment, &host).unwrap();
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
-    assert_ne!(
-        changed.qualification_fingerprint,
-        original.qualification_fingerprint
-    );
+    assert_ne!(changed.recipe_fingerprint, original.recipe_fingerprint);
 }
 
+// T14
 #[test]
-fn owned_launch_setting_mutations_change_qualification_identity() {
+fn engine_config_mutations_change_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host)
         .unwrap()
-        .qualification_fingerprint;
-    for (pointer, value) in [
-        (
-            "/runtime_profiles/local/launch_settings/tensor_parallel_size",
-            serde_json::json!(2),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/pipeline_parallel_size",
-            serde_json::json!(2),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/kv_cache_dtype",
-            serde_json::json!("fp8"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/block_size_tokens",
-            serde_json::json!(32),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/cpu_offload_bytes",
-            serde_json::json!("1GiB"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/kv_cache_bytes",
-            serde_json::json!("5GiB"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/swap_space_bytes",
-            serde_json::json!("1GiB"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/gpu_utilization_pct",
-            serde_json::json!(76),
-        ),
+        .recipe_fingerprint;
+    for block in [
+        serde_json::json!({"memory": {"kv_cache": "5GiB"}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "kv_cache_dtype": "fp8"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "dtype": "bfloat16"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "quantization": "modelopt_fp4"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "max_concurrent_requests": 16}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "vllm": {"block_size_tokens": 32}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "accept_extra_args": true,
+            "extra_args": ["--reasoning-parser", "qwen3"]}),
     ] {
-        let mut changed_host = host.clone();
-        *changed_host.pointer_mut(pointer).unwrap() = value;
-        let changed = resolve_effective(&deployment, &changed_host).unwrap();
-        assert_ne!(original, changed.qualification_fingerprint, "{pointer}");
+        let mut changed = deployment.clone();
+        changed["engine_config"] = block.clone();
+        let changed = resolve_effective(&changed, &host).unwrap();
+        assert_ne!(original, changed.recipe_fingerprint, "{block}");
     }
-    let mut restart = deployment.clone();
-    restart["residency"] = "restart_only".into();
-    let baseline = resolve_effective(&restart, &host)
-        .unwrap()
-        .qualification_fingerprint;
-    let mut changed_host = host;
-    changed_host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] =
-        false.into();
-    assert_ne!(
-        baseline,
-        resolve_effective(&restart, &changed_host)
-            .unwrap()
-            .qualification_fingerprint
-    );
 }
 
 #[test]
@@ -529,7 +398,7 @@ fn qualification_dimensions_fail_to_alias() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     for (side, pointer, value) in [
         (
             "deployment",
@@ -595,7 +464,7 @@ fn qualification_dimensions_fail_to_alias() {
         };
         *target.pointer_mut(pointer).unwrap() = value;
         let changed = resolve_effective(&changed_deployment, &changed_host).unwrap();
-        assert_ne!(original, changed.qualification_fingerprint, "{pointer}");
+        assert_ne!(original, changed.recipe_fingerprint, "{pointer}");
     }
 
     let mut changed_deployment = deployment.clone();
@@ -606,7 +475,7 @@ fn qualification_dimensions_fail_to_alias() {
         original,
         resolve_effective(&changed_deployment, &changed_host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 
     let mut changed_deployment = deployment.clone();
@@ -618,7 +487,7 @@ fn qualification_dimensions_fail_to_alias() {
         original,
         resolve_effective(&changed_deployment, &host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 
     let mut auth_structure = host.clone();
@@ -628,74 +497,54 @@ fn qualification_dimensions_fail_to_alias() {
         original,
         resolve_effective(&deployment, &auth_structure)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 
     let mut restart = deployment.clone();
     restart["residency"] = "restart_only".into();
     let mut controls = host.clone();
-    controls["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
     let enabled = resolve_effective(&restart, &controls)
         .unwrap()
-        .qualification_fingerprint;
-    controls["runtime_profiles"]["local"]["security"]["experimental_controls"] = false.into();
+        .recipe_fingerprint;
+    controls["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
     assert_ne!(
         enabled,
         resolve_effective(&restart, &controls)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 }
 
+// T03 T14
 #[test]
-fn unsupported_launch_mutations_fail_closed() {
-    for (pointer, value) in [
-        (
-            "/runtime_profiles/local/launch_settings/tensor_parallel_size",
-            serde_json::json!(0),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/pipeline_parallel_size",
-            serde_json::json!(0),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/kv_cache_dtype",
-            serde_json::json!(""),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/block_size_tokens",
-            serde_json::json!(0),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/kv_cache_bytes",
-            serde_json::json!("0B"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/gpu_utilization_pct",
-            serde_json::json!(101),
-        ),
+fn unsupported_engine_config_fails_closed() {
+    for block in [
+        serde_json::json!({"memory": {"kv_cache": "0B"}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "kv_cache_dtype": ""}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "kv_cache_dtype": "fp8 --port 1"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "dtype": "fp9"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "context_length": 0}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "max_concurrent_requests": 0}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "vllm": {"block_size_tokens": 0}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "surprise": true}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB", "surprise": "1GiB"}}),
+        // Closed per family (Spec §7): an SGLang block on a vLLM installation.
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "sglang": {"max_total_tokens": 4096}}),
     ] {
-        let (deployment, mut host) = fixture();
-        *host.pointer_mut(pointer).unwrap() = value;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{pointer}");
+        let (mut deployment, host) = fixture();
+        deployment["engine_config"] = block.clone();
+        assert!(resolve_effective(&deployment, &host).is_err(), "{block}");
     }
-    let (deployment, mut host) = fixture();
-    host["runtime_profiles"]["local"]["launch_settings"]["engine"] = "fake".into();
-    assert!(resolve_effective(&deployment, &host).is_err());
 }
 
 #[test]
-fn equivalent_byte_units_have_identical_qualification_identity() {
+fn equivalent_byte_units_have_identical_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
-    let mut equivalent = host;
-    equivalent["runtime_profiles"]["local"]["launch_settings"]["requested_budget"]
-        ["kv_cache_bytes"] = "4096MiB".into();
-    let normalized = resolve_effective(&deployment, &equivalent).unwrap();
-    assert_eq!(
-        original.qualification_fingerprint,
-        normalized.qualification_fingerprint
-    );
+    let mut equivalent = deployment;
+    equivalent["engine_config"]["memory"]["kv_cache"] = "4096MiB".into();
+    let normalized = resolve_effective(&equivalent, &host).unwrap();
+    assert_eq!(original.recipe_fingerprint, normalized.recipe_fingerprint);
 }
 
 #[test]
@@ -709,10 +558,7 @@ fn equivalent_resource_units_have_identical_normalized_controls() {
         ResourceControls::from_host(&original.host),
         ResourceControls::from_host(&normalized.host)
     );
-    assert_eq!(
-        original.qualification_fingerprint,
-        normalized.qualification_fingerprint
-    );
+    assert_eq!(original.recipe_fingerprint, normalized.recipe_fingerprint);
 }
 
 #[test]
@@ -737,11 +583,11 @@ fn parsed_host_uses_shared_resource_validation_during_resolution() {
 }
 
 #[test]
-fn binding_dimensions_change_binding_not_qualification_identity() {
+fn binding_dimensions_change_binding_not_recipe_identity() {
     let (deployment, host) = fixture();
     let qualification = resolve_effective(&deployment, &host)
         .unwrap()
-        .qualification_fingerprint;
+        .recipe_fingerprint;
     let base = binding_fingerprint("127.0.0.1:8100", "toy", "secret://a", "inc-1");
     for changed in [
         binding_fingerprint("127.0.0.1:8101", "toy", "secret://a", "inc-1"),
@@ -755,7 +601,7 @@ fn binding_dimensions_change_binding_not_qualification_identity() {
         qualification,
         resolve_effective(&deployment, &host)
             .unwrap()
-            .qualification_fingerprint
+            .recipe_fingerprint
     );
 }
 
@@ -767,69 +613,95 @@ fn resolved_snapshot_isolated_from_later_profile_edits() {
     host["runtime_profiles"]["local"]["build_fingerprint"] = "edited".into();
     let later = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(bytes, serde_json::to_vec(&snapshot).unwrap());
-    assert_ne!(
-        snapshot.qualification_fingerprint,
-        later.qualification_fingerprint
-    );
+    assert_ne!(snapshot.recipe_fingerprint, later.recipe_fingerprint);
 }
 
+/// ADR 0014 §4, owner decision E1: SGLang no longer pins a recipe. Omitted
+/// fields stay omitted (the engine's default applies), mllm's safe defaults are
+/// shown with their provenance, and residency-derived switches say so.
+// T14
 #[test]
-fn sglang_recipe_expands_to_exact_normalized_settings() {
+fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     let (deployment, mut host) = fixture();
-    host["runtime_profiles"]["local"]["engine"] = "sglang".into();
-    host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
-    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
-    host["runtime_profiles"]["local"]["launch_settings"] = serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}});
+    sglang_profile(&mut host);
     let effective = resolve_effective(&deployment, &host).unwrap();
-    let ProfileLaunchSettings::Sglang(settings) = effective.profile.launch_settings else {
+    let LaunchSettings::Sglang(settings) = &effective.engine_config else {
         panic!("sglang settings")
     };
-    assert_eq!(
-        (
-            settings.tensor_parallel_size,
-            settings.data_parallel_size,
-            settings.tokenizer_workers
-        ),
-        (1, 1, 1)
-    );
-    assert_eq!(
-        (
-            settings.model_dtype.as_str(),
-            settings.context_tokens,
-            settings.max_running_requests,
-            settings.max_total_tokens
-        ),
-        ("bfloat16", 4096, 8, 4096)
-    );
+    assert_eq!(settings.common.dtype, None);
+    assert_eq!(settings.common.context_length, None);
+    assert_eq!(settings.max_total_tokens, None);
+    assert_eq!(settings.tokenizer_workers, 1);
+    assert_eq!(settings.common.cuda_graphs, Some(false));
     assert!(settings.memory_saver);
+    assert!(!settings.cpu_weight_backup);
     assert_eq!(settings.weight_restore, "disk_reload");
-    assert!([
-        settings.prefill_cuda_graphs,
-        settings.decode_cuda_graphs,
-        settings.cpu_weight_backup,
-        settings.speculative_decoding,
-        settings.lora,
-        settings.trust_remote_code,
-        settings.disaggregation,
-        settings.external_cache,
-        settings.cpu_kv_offload,
-        settings.native_grpc,
-    ]
-    .into_iter()
-    .all(|value| !value));
+    let provenance = &settings.provenance;
+    assert_eq!(provenance["cuda_graphs"], SettingSource::MllmDefault);
+    assert_eq!(provenance["sglang.tokenizer_workers"], SettingSource::MllmDefault);
+    assert_eq!(provenance["memory_saver"], SettingSource::Derived);
+    assert_eq!(provenance["memory.request"], SettingSource::Derived);
+    assert!(!provenance.contains_key("memory.kv_cache"));
+    let shown = serde_json::to_value(&effective).unwrap();
+    assert_eq!(shown["engine_config"]["provenance"]["cuda_graphs"], "mllm default");
+    assert_eq!(shown["engine_config"]["engine"], "sglang");
+
+    // A deployment may override a safe default; the provenance entry goes away.
+    let (mut deployment, _) = fixture();
+    deployment["engine_config"]["cuda_graphs"] = true.into();
+    deployment["engine_config"]["sglang"] = serde_json::json!({"tokenizer_workers": 2});
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let LaunchSettings::Sglang(settings) = &effective.engine_config else {
+        panic!("sglang settings")
+    };
+    assert_eq!(settings.common.cuda_graphs, Some(true));
+    assert_eq!(settings.tokenizer_workers, 2);
+    assert!(!settings.provenance.contains_key("cuda_graphs"));
+    assert!(!settings.provenance.contains_key("sglang.tokenizer_workers"));
+}
+
+/// Owner decision E1: every engine serves any model. The configuration layer
+/// accepts any checkpoint shape the typed schema can express, for both engines,
+/// with no recipe name and no pinned context or concurrency.
+// T14 T22
+#[test]
+fn any_model_shape_resolves_on_either_engine() {
+    for engine in ["vllm", "sglang"] {
+        let (mut deployment, mut host) = fixture();
+        if engine == "sglang" {
+            sglang_profile(&mut host);
+        } else {
+            // The lab profile fixes `--max-model-len`; the typed field replaces it.
+            host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
+        }
+        deployment["model"]["path"] = "/srv/models/qwen3.8-27b-nvfp4".into();
+        deployment["recipe"] = "anything".into();
+        let mut block = serde_json::json!({
+            "dtype": "bfloat16", "quantization": "modelopt_fp4", "kv_cache_dtype": "fp8_e4m3",
+            "context_length": 32768, "max_concurrent_requests": 16, "language_model_only": true,
+            "memory": {"kv_cache": "4GiB"},
+        });
+        block[engine] = if engine == "vllm" {
+            serde_json::json!({"block_size_tokens": 16, "max_num_batched_tokens": 8192})
+        } else {
+            serde_json::json!({"max_total_tokens": 65536, "chunked_prefill_size": -1})
+        };
+        deployment["engine_config"] = block;
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{engine}: {error}"));
+        assert_eq!(effective.engine_config.common().context_length, Some(32768));
+        assert!(effective.engine_config.common().language_model_only);
+    }
 }
 
 #[test]
-fn credential_reference_values_do_not_change_qualification_identity() {
+fn credential_reference_values_do_not_change_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
     let mut edited = host;
     edited["runtime_profiles"]["local"]["security"]["credential_ref"] = "secret://rotated".into();
     let rotated = resolve_effective(&deployment, &edited).unwrap();
-    assert_eq!(
-        original.qualification_fingerprint,
-        rotated.qualification_fingerprint
-    );
+    assert_eq!(original.recipe_fingerprint, rotated.recipe_fingerprint);
     assert_eq!(
         original.profile.security.credential_ref.as_deref(),
         Some("secret://engine-key")
@@ -852,22 +724,36 @@ fn sglang_requires_separate_admin_authority_reference() {
     let (deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["engine"] = "sglang".into();
     host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
-    host["runtime_profiles"]["local"]["launch_settings"] = serde_json::json!({
-        "engine": "sglang", "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-        "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500}
-    });
     assert!(resolve_effective(&deployment, &host).is_err());
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
     assert!(resolve_effective(&deployment, &host).is_ok());
 }
 
+/// ADR 0014 §1, §3: host-fixed arguments are the installation's own. The
+/// approved-flag list is gone, so an ordinary engine option passes; a reserved
+/// one never does, however it is spelled.
+// T03 T14
 #[test]
-fn resolver_rejects_owned_or_unapproved_profile_arguments() {
-    for argument in ["--api-key=secret-value", "--future-unsafe-flag"] {
+fn resolver_rejects_reserved_profile_arguments_and_accepts_ordinary_ones() {
+    for argument in [
+        "--api-key=secret-value",
+        "--api-k=secret-value",
+        "--port",
+        "--host=0.0.0.0",
+        "--no-enable-sleep-mode",
+        "--config=/etc/vllm.yaml",
+        "-q",
+    ] {
         let (deployment, mut host) = fixture();
         host["runtime_profiles"]["local"]["args"] = serde_json::json!([argument]);
-        assert!(resolve_effective(&deployment, &host).is_err(), "{argument}");
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(!error.to_string().contains("secret-value"), "{error}");
+        assert!(!error.to_string().contains("0.0.0.0"), "{error}");
     }
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["args"] =
+        serde_json::json!(["--max-model-len", "4096", "--future-ordinary-flag"]);
+    resolve_effective(&deployment, &host).expect("ordinary host-fixed arguments pass");
 }
 
 #[test]
@@ -882,29 +768,17 @@ fn resolver_rejects_secret_device_and_unrecognized_environment_names() {
     let changed = resolve_effective(&deployment, &host).unwrap();
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
-    assert_ne!(
-        changed.qualification_fingerprint,
-        original.qualification_fingerprint
-    );
+    assert_ne!(changed.recipe_fingerprint, original.recipe_fingerprint);
 }
 
 #[test]
 fn engines_without_reviewed_argument_allowlists_accept_only_empty_args() {
-    for engine in ["sglang", "fake"] {
-        let (deployment, mut host) = fixture();
-        host["runtime_profiles"]["local"]["engine"] = engine.into();
-        host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--max-model-len", "4096"]);
-        host["runtime_profiles"]["local"]["launch_settings"] = if engine == "sglang" {
-            serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}})
-        } else {
-            serde_json::json!({"engine":"fake"})
-        };
-        if engine == "sglang" {
-            host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
-                "secret://admin".into();
-        }
-        assert!(resolve_effective(&deployment, &host).is_err(), "{engine}");
-    }
+    let engine = "sglang";
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["engine"] = engine.into();
+    host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--max-model-len", "4096"]);
+    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
+    assert!(resolve_effective(&deployment, &host).is_err(), "{engine}");
 }
 
 #[test]
@@ -934,7 +808,7 @@ fn strict_yaml_rejects_unknown_nested_and_wrong_scalar_type() {
     let without_unknown = complete_unknown.replace("    surprise: true\n", "");
     assert!(parse_strict(ConfigKind::Deployment, &without_unknown).is_ok());
 
-    let wrong = "schema_version: 1\nkind: deployment\nname: d\nmodel:\n  path: /m\n  content_fingerprint: fp\n  revision: r\nroutes: route-a\nruntime_profile: p\nruntime_profile_revision: 1\nrecipe: r\nresidency: warm\nrecovery: reconcile\ndevices: []\nresources: {}\n";
+    let wrong = "schema_version: 1\nkind: deployment\nname: d\nmodel:\n  path: /m\n  content_fingerprint: fp\n  revision: r\nroutes: route-a\nruntime_profile: p\nruntime_profile_revision: 1\nrecipe: r\nresidency: deep\nrecovery: reconcile\ndevices: []\nresources: {}\n";
     assert!(parse_strict(ConfigKind::Deployment, wrong).is_err());
 }
 
@@ -955,9 +829,422 @@ fn typed_decode_errors_do_not_echo_supplied_secret_scalars() {
     assert_eq!(error.code, ConfigErrorCode::MissingRequired);
 }
 
+/// SGLang takes its park strategy as startup flags, so the declared tier has to
+/// reach them. They were constants, which meant a deployment asking for a
+/// host-backed park launched an engine that could only deep-park.
+#[test]
+fn sglang_launch_flags_follow_the_declared_tier() {
+    let expected = [
+        // (residency, memory_saver, cpu_weight_backup, weight_restore)
+        ("restart_only", false, false, "disk_reload"),
+        ("host_backed", true, true, "cpu_backup"),
+        ("deep", true, false, "disk_reload"),
+    ];
+    for (declared, memory_saver, cpu_weight_backup, weight_restore) in expected {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = declared.into();
+        // Same profile rewrite `ordinary_engine_compatibility_goldens` uses to point
+        // the lab host at SGLang.
+        sglang_profile(&mut host);
+        // host_backed needs a host whose pools are distinct; ADR 0010 decision 5
+        // refuses it otherwise, and this test is about the flags, not the host check.
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        let resolved = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
+        let LaunchSettings::Sglang(settings) = &resolved.engine_config else {
+            panic!("expected SGLang launch settings for {declared}");
+        };
+        assert_eq!(
+            settings.memory_saver, memory_saver,
+            "memory_saver for {declared}"
+        );
+        assert_eq!(
+            settings.cpu_weight_backup, cpu_weight_backup,
+            "cpu_weight_backup for {declared}"
+        );
+        assert_eq!(
+            settings.weight_restore, weight_restore,
+            "weight_restore for {declared}"
+        );
+    }
+}
+
 #[test]
 fn strict_yaml_rejects_duplicate_nested_keys() {
     let yaml = include_str!("fixtures/f2-deployment.yaml");
     let error = parse_strict(ConfigKind::Deployment, yaml).unwrap_err();
     assert_eq!(error.code, ConfigErrorCode::DuplicateKey);
+}
+
+/// Spec §3: a host that switches deep park off must not accept a deployment that
+/// asks to park. Refusing at resolution is the only place the contradiction is
+/// visible; accepted, it would surface as a park that never happens under memory
+/// pressure, long after the deployment was admitted.
+// T21
+#[test]
+fn deep_park_disabled_with_parking_residency_is_refused() {
+    for residency in ["host_backed", "deep"] {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = residency.into();
+        host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+        let error = resolve_effective(&deployment, &host)
+            .expect_err("a parking residency on a disabled profile is refused");
+        assert_eq!(
+            error.path, "runtime_profiles.security.deep_park",
+            "{residency}: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("deep_park"), "{residency}: {text}");
+        assert!(text.contains("restart_only"), "{residency}: {text}");
+    }
+    // The same host accepts the deployment that never parks.
+    let (mut deployment, mut host) = fixture();
+    deployment["residency"] = "restart_only".into();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+    resolve_effective(&deployment, &host).expect("restart_only does not park");
+}
+
+/// SPEC §9.1 / ADR 0012: deep parking is enabled unless host policy forbids it,
+/// so a profile that omits the switch resolves a parking residency.
+// T21
+#[test]
+fn deep_park_defaults_to_enabled() {
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]
+        .as_object_mut()
+        .unwrap()
+        .remove("deep_park");
+    deployment["residency"] = "deep".into();
+    let effective = resolve_effective(&deployment, &host).expect("omitted policy enables");
+    assert_eq!(effective.profile.security.deep_park, DeepPark::Enabled);
+    assert_eq!(effective.residency, Residency::Deep);
+}
+
+/// SPEC §9.1 / ADR 0012: `deep_park: disabled` is the host opt-out, and it is
+/// honored whatever residency the deployment asks for: a parking tier is refused
+/// at resolution and the restart-only tier resolves without deep parking.
+// T21
+#[test]
+fn an_explicit_opt_out_is_honored() {
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+    deployment["residency"] = "deep".into();
+    let error = resolve_effective(&deployment, &host).expect_err("the opt-out refuses deep");
+    assert_eq!(error.path, "runtime_profiles.security.deep_park");
+    assert!(error.to_string().contains("opts out"), "{error}");
+    deployment["residency"] = "restart_only".into();
+    let effective = resolve_effective(&deployment, &host).expect("restart_only resolves");
+    assert_eq!(effective.profile.security.deep_park, DeepPark::Disabled);
+}
+
+/// SPEC §7: the effective configuration says where the deep-park value came
+/// from. A defaulted value is marked `default`; a value the host declared
+/// carries no marker, so every explicit profile serializes exactly as before.
+// T14 T21
+#[test]
+fn effective_configuration_shows_deep_park_provenance() {
+    let (mut deployment, mut host) = fixture();
+    deployment["residency"] = "restart_only".into();
+    for (declared, value) in [
+        ("enabled", DeepPark::Enabled),
+        ("disabled", DeepPark::Disabled),
+    ] {
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = declared.into();
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        assert_eq!(effective.profile.security.deep_park, value);
+        assert_eq!(
+            effective.profile.security.deep_park_source,
+            DeepParkSource::HostPolicy
+        );
+        let shown = serde_json::to_value(&effective).unwrap();
+        assert_eq!(shown["profile"]["security"]["deep_park"], declared);
+        assert!(shown["profile"]["security"]
+            .get("deep_park_source")
+            .is_none());
+    }
+    host["runtime_profiles"]["local"]["security"]
+        .as_object_mut()
+        .unwrap()
+        .remove("deep_park");
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(
+        effective.profile.security.deep_park_source,
+        DeepParkSource::Default
+    );
+    let shown = serde_json::to_value(&effective).unwrap();
+    assert_eq!(shown["profile"]["security"]["deep_park"], "enabled");
+    assert_eq!(shown["profile"]["security"]["deep_park_source"], "default");
+}
+
+/// T14: provenance is derived, never declared. A host document cannot claim a
+/// source for its own switch.
+// T14
+#[test]
+fn a_host_cannot_declare_deep_park_provenance() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["deep_park_source"] = "host_policy".into();
+    let error = resolve_effective(&deployment, &host).unwrap_err();
+    assert_eq!(error.code, ConfigErrorCode::UnknownField, "{error:?}");
+}
+
+/// ADR 0014 §8: remote code is a typed field behind the host's own switch, the
+/// same for both engines; host permission is necessary, not sufficient.
+// T21
+#[test]
+fn typed_remote_code_needs_the_host_switch() {
+    for engine in ["vllm", "sglang"] {
+        let (mut deployment, mut host) = fixture();
+        if engine == "sglang" {
+            sglang_profile(&mut host);
+        }
+        deployment["engine_config"]["trust_remote_code"] = true.into();
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "engine_config.trust_remote_code", "{engine}");
+        host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        assert!(effective.engine_config.common().trust_remote_code, "{engine}");
+    }
+}
+
+/// Spec §3: `--trust-remote-code` makes the engine execute Python that arrived with
+/// the checkpoint. A host-fixed argument may carry it, and the only thing that
+/// stops it being passed by habit is the host's own switch.
+// T21
+#[test]
+fn trust_remote_code_arg_needs_the_host_switch() {
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--trust-remote-code"]);
+    let error =
+        resolve_effective(&deployment, &host).expect_err("the flag without the switch is refused");
+    assert_eq!(
+        error.path, "runtime_profiles.security.trust_remote_code",
+        "{error:?}"
+    );
+
+    host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
+    let effective = resolve_effective(&deployment, &host).expect("the switch permits the flag");
+    assert!(effective.profile.security.trust_remote_code);
+
+    // The switch on its own changes nothing about a profile that does not pass it.
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
+    resolve_effective(&deployment, &host).expect("an unused switch is harmless");
+}
+
+/// Spec §7: a host declares the directory its weights live under, and a relative
+/// local model path means "inside it". An absolute path is taken as written, even
+/// outside the store: which directories may hold weights is the operator's
+/// decision, and confining them would stop a host serving a checkpoint it has.
+// T14
+#[test]
+fn model_store_is_required_and_local_paths_resolve_against_it() {
+    let (deployment, mut host) = fixture();
+    host.as_object_mut()
+        .expect("host is an object")
+        .remove("model_store");
+    let error = resolve_effective(&deployment, &host).expect_err("the store is required");
+    assert_eq!(error.code, ConfigErrorCode::MissingRequired, "{error:?}");
+
+    let (deployment, mut host) = fixture();
+    host["model_store"]["path"] = "relative/store".into();
+    let error = resolve_effective(&deployment, &host).expect_err("the store must be absolute");
+    assert_eq!(error.path, "host.model_store.path", "{error:?}");
+
+    for (declared, expected) in [
+        ("qwen3-4b", "/srv/models/qwen3-4b"),
+        ("/anywhere/x", "/anywhere/x"),
+    ] {
+        let (mut deployment, host) = fixture();
+        let model = deployment["model"].as_object_mut().expect("model object");
+        model.remove("path");
+        model.insert(
+            "source".into(),
+            serde_json::json!({"type": "local", "path": declared}),
+        );
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
+        assert_eq!(
+            effective.model.source,
+            ModelSource::Local {
+                path: declared.into()
+            },
+            "{declared}"
+        );
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(expected),
+            "{declared}"
+        );
+        assert_eq!(
+            effective.model.require_resolved_path().unwrap(),
+            expected,
+            "{declared}"
+        );
+    }
+}
+
+/// Spec §7: the resolver validates the shape of a remote source and stops. It
+/// performs no fetch, so it can name no local path; a caller that needs one is
+/// told so rather than handed a guessed cache directory.
+// T14
+#[test]
+fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
+    let with_source = |source: serde_json::Value| {
+        let (mut deployment, host) = fixture();
+        let model = deployment["model"].as_object_mut().expect("model object");
+        model.remove("path");
+        model.insert("source".into(), source);
+        (deployment, host)
+    };
+    let digest = "a".repeat(64);
+
+    for source in [
+        serde_json::json!({"type": "huggingface", "repo": "Qwen/Qwen3-4B"}),
+        serde_json::json!({
+            "type": "huggingface", "repo": "Qwen/Qwen3-4B",
+            "revision": "main", "locked_commit": "cafe1234"
+        }),
+        serde_json::json!({"type": "http", "url": "https://example.test/w.tar", "sha256": digest}),
+    ] {
+        let (deployment, host) = with_source(source.clone());
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{source} must resolve: {error}"));
+        assert_eq!(effective.model.resolved_path, None, "{source}");
+        let error = effective
+            .model
+            .require_resolved_path()
+            .expect_err("a remote source has no local path");
+        assert_eq!(error.code, ConfigErrorCode::NotMaterializable, "{source}");
+    }
+
+    // An omitted revision is legal; an empty one is not, and neither is a plain
+    // HTTP URL or a digest that is not 64 hexadecimal characters.
+    for source in [
+        serde_json::json!({"type": "huggingface", "repo": ""}),
+        serde_json::json!({"type": "huggingface", "repo": "r", "revision": ""}),
+        serde_json::json!({"type": "http", "url": "http://example.test/w.tar", "sha256": digest}),
+        serde_json::json!({"type": "http", "url": "https://example.test/w.tar", "sha256": "abc"}),
+        serde_json::json!({
+            "type": "http", "url": "https://example.test/w.tar",
+            "sha256": "z".repeat(64)
+        }),
+        serde_json::json!({"type": "local", "path": ""}),
+        serde_json::json!({"type": "s3", "path": "/w"}),
+    ] {
+        let (deployment, host) = with_source(source.clone());
+        assert!(
+            resolve_effective(&deployment, &host).is_err(),
+            "{source} must be refused"
+        );
+    }
+}
+
+/// Spec §3: admission reserves the Ready footprint before the engine starts, so a
+/// requested KV cache larger than that reservation would hand the engine a grant
+/// nothing accounted for. The overrun would otherwise appear much later, as an
+/// out-of-memory kill on a deployment that had already been accepted.
+// T14
+#[test]
+fn requested_kv_above_ready_allocation_is_refused() {
+    // The lab fixture's Ready phase allocates 8GiB, which is the memory request.
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["memory"]["kv_cache"] = "8GiB".into();
+    resolve_effective(&deployment, &host).expect("a request equal to the allocation is accepted");
+
+    deployment["engine_config"]["memory"]["kv_cache"] = "9GiB".into();
+    let error = resolve_effective(&deployment, &host).expect_err("9GiB exceeds the 8GiB Ready");
+    assert_eq!(error.path, "engine_config.memory.kv_cache", "{error:?}");
+
+    // The same bound applies to SGLang.
+    let (mut deployment, mut host) = fixture();
+    sglang_profile(&mut host);
+    deployment["engine_config"]["memory"]["kv_cache"] = "9GiB".into();
+    assert!(resolve_effective(&deployment, &host).is_err(), "sglang");
+}
+
+/// Spec §7: `model: { path }` predates `source` and keeps working, meaning exactly
+/// a local source. Stating both is refused rather than resolved by precedence,
+/// because a file that says two different things about its weights is a mistake.
+// T14
+#[test]
+fn legacy_model_path_is_a_local_source() {
+    let (deployment, host) = fixture();
+    let effective = resolve_effective(&deployment, &host).expect("the legacy spelling resolves");
+    assert_eq!(
+        effective.model.source,
+        ModelSource::Local {
+            path: "/srv/models/toy".into()
+        }
+    );
+    assert_eq!(
+        effective.model.resolved_path.as_deref(),
+        Some("/srv/models/toy")
+    );
+
+    let (mut deployment, host) = fixture();
+    deployment["model"]["source"] = serde_json::json!({"type": "local", "path": "/other"});
+    let error = resolve_effective(&deployment, &host).expect_err("both spellings is a mistake");
+    assert_eq!(error.path, "model", "{error:?}");
+
+    let (mut deployment, host) = fixture();
+    deployment["model"]
+        .as_object_mut()
+        .expect("model object")
+        .remove("path");
+    assert!(resolve_effective(&deployment, &host).is_err(), "neither");
+}
+
+/// The host's published device inventory digest (`runtime/sglang_device`
+/// `mllm-nvidia-inventory-v1`) is optional host policy: present, it must be the
+/// exact lowercase hex digest the collector computes; absent, the native
+/// launch carries placement as unasserted and fails closed.
+#[test]
+fn a_host_may_publish_a_device_inventory_digest() {
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let (deployment, mut host) = fixture();
+    host["device_inventory_digest"] = serde_json::json!(DIGEST);
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(
+        effective.host.device_inventory_digest.as_deref(),
+        Some(DIGEST)
+    );
+    // The digest survives the stored snapshot round-trip, which is the only
+    // path the armed launch's frozen work reads.
+    let snapshot = serde_json::to_value(&effective).unwrap();
+    assert_eq!(snapshot["host"]["device_inventory_digest"], DIGEST);
+    assert_eq!(
+        mllm_config::effective::decode_effective_snapshot(&snapshot.to_string())
+            .unwrap()
+            .host
+            .device_inventory_digest
+            .as_deref(),
+        Some(DIGEST)
+    );
+
+    for bad in [
+        "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+        "z123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+    ] {
+        let (deployment, mut host) = fixture();
+        host["device_inventory_digest"] = serde_json::json!(bad);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(
+            error.to_string().contains("device_inventory_digest"),
+            "{error}"
+        );
+    }
+
+    // The strict document walk (management import path) allowlists the field
+    // for the host kind, so a published digest survives the same gate every
+    // other host field passes.
+    let (deployment, mut host) = fixture();
+    host["device_inventory_digest"] = serde_json::json!(DIGEST);
+    let parsed = parse_strict(ConfigKind::Host, &serde_json::to_string(&host).unwrap()).unwrap();
+    let effective = resolve_effective(&deployment, &parsed).unwrap();
+    assert_eq!(
+        effective.host.device_inventory_digest.as_deref(),
+        Some(DIGEST)
+    );
 }

@@ -117,7 +117,9 @@ mod tests {
         assert!(Draining.can_transition_to(Stopping));
         assert!(Stopping.can_transition_to(Stopped));
         assert!(Parked.can_transition_to(Stopping));
-        for s in [Stopped, Starting, Ready, Draining, Parking, Parked, Waking, Stopping, Failed] {
+        for s in [
+            Stopped, Starting, Ready, Draining, Parking, Parked, Waking, Stopping, Failed,
+        ] {
             assert!(s.can_transition_to(Reconciling), "{s:?} -> RECONCILING");
         }
         assert!(Reconciling.can_transition_to(Failed));
@@ -133,7 +135,9 @@ mod tests {
 
     #[test]
     fn reconciling_is_the_only_uncertain_state() {
-        for s in [Stopped, Starting, Ready, Draining, Parking, Parked, Waking, Stopping, Failed] {
+        for s in [
+            Stopped, Starting, Ready, Draining, Parking, Parked, Waking, Stopping, Failed,
+        ] {
             assert!(!s.is_uncertain());
         }
         assert!(Reconciling.is_uncertain());

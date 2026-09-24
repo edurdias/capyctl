@@ -1,35 +1,64 @@
-use mllm_domain::{DeploymentId, LifecycleState, OperationId};
 use mllm_domain::resources::*;
+use mllm_domain::{DeploymentId, LifecycleState, OperationId};
 use mllm_scheduler::residency::{AdmissionContext, ResourceError};
-use mllm_store::AcceptDeployment;
 use mllm_store::resource_ledger::{GrantReceipt, GrantRequest, ResourceStoreError};
+use mllm_store::AcceptDeployment;
 use mllm_store::Store;
 
 fn deployment(store: &Store, name: &str) -> String {
     let id = DeploymentId::new();
-    store.accept_deployment(AcceptDeployment {
-        id, name: name.into(), kind: "model".into(), route_model_id: None,
-        desired_state: LifecycleState::Stopped, schema_version: 1,
-        idempotency_key: name.into(), initial_operation_id: OperationId(format!("op-{name}")),
-    }).unwrap();
+    store
+        .accept_deployment(AcceptDeployment {
+            id,
+            name: name.into(),
+            kind: "model".into(),
+            route_model_id: None,
+            desired_state: LifecycleState::Stopped,
+            schema_version: 1,
+            idempotency_key: name.into(),
+            initial_operation_id: OperationId(format!("op-{name}")),
+        })
+        .unwrap();
     id.to_string()
 }
 
 fn request(deployment: &str, name: &str, bytes: i64) -> GrantRequest {
-    GrantRequest { id: format!("grant-{name}"), deployment_id: deployment.into(),
-        operation_id: format!("op-{name}"), revision: 1, generation: 1, expected_epoch: 0,
-        next: PhaseFootprint { phase: ResourcePhase::Cold,
-            allocations: vec![Allocation { domain: "system".into(), bytes, host_kv_bytes: 0 }],
-            devices: vec![] } }
+    GrantRequest {
+        id: format!("grant-{name}"),
+        owner_id: deployment.into(),
+        deployment_id: deployment.into(),
+        operation_id: format!("op-{name}"),
+        revision: 1,
+        generation: 1,
+        expected_epoch: 0,
+        next: PhaseFootprint {
+            phase: ResourcePhase::Cold,
+            allocations: vec![Allocation {
+                domain: "system".into(),
+                bytes,
+                host_kv_bytes: 0,
+            }],
+            devices: vec![],
+        },
+    }
 }
 
 fn observations() -> [MemoryObservation; 1] {
-    [MemoryObservation { domain: "system".into(), capacity_bytes: 128,
-        available_bytes: 128, sampled_at_ms: 100 }]
+    [MemoryObservation {
+        domain: "system".into(),
+        capacity_bytes: 128,
+        available_bytes: 128,
+        sampled_at_ms: 100,
+    }]
 }
 fn limits() -> [MemoryLimit; 1] {
-    [MemoryLimit { domain: "system".into(), managed_bytes: 96,
-        free_reserve_bytes: 12, host_kv_bytes: None, parked_bytes: None }]
+    [MemoryLimit {
+        domain: "system".into(),
+        managed_bytes: 96,
+        free_reserve_bytes: 12,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    }]
 }
 
 #[test]
@@ -49,16 +78,30 @@ fn grants_are_atomic_and_retries_are_not_dispatch_authority() {
     let bounds = limits();
     let context = AdmissionContext::new(&obs, &bounds, 101, 60, 4);
     let first = request(&a, "a", 60);
-    assert_eq!(store.reserve_increase(&first, context).unwrap(), GrantReceipt::New { epoch: 1 });
-    assert_eq!(store.reserve_increase(&first, context).unwrap(), GrantReceipt::Recorded { epoch: 1 });
+    assert_eq!(
+        store.reserve_increase(&first, context).unwrap(),
+        GrantReceipt::New { epoch: 1 }
+    );
+    assert_eq!(
+        store.reserve_increase(&first, context).unwrap(),
+        GrantReceipt::Recorded { epoch: 1 }
+    );
     let mut changed = first.clone();
     changed.next.allocations[0].bytes = 61;
-    assert!(matches!(store.reserve_increase(&changed, context), Err(ResourceStoreError::Conflict)));
+    assert!(matches!(
+        store.reserve_increase(&changed, context),
+        Err(ResourceStoreError::Conflict)
+    ));
     let mut second = request(&b, "b", 60);
-    assert!(matches!(store.reserve_increase(&second, context), Err(ResourceStoreError::Conflict)));
+    assert!(matches!(
+        store.reserve_increase(&second, context),
+        Err(ResourceStoreError::Conflict)
+    ));
     second.expected_epoch = 1;
-    assert!(matches!(store.reserve_increase(&second, context),
-        Err(ResourceStoreError::Admission(ResourceError::Insufficient))));
+    assert!(matches!(
+        store.reserve_increase(&second, context),
+        Err(ResourceStoreError::Admission(ResourceError::Insufficient))
+    ));
     let snapshot = store.resource_snapshot().unwrap();
     assert_eq!(snapshot.epoch, 1);
     assert_eq!(snapshot.owners.len(), 1);
@@ -75,16 +118,28 @@ fn stale_revision_generation_and_observation_leave_no_grant() {
     let valid = request(&a, "a", 60);
     let mut stale = valid.clone();
     stale.revision = 2;
-    assert!(matches!(store.reserve_increase(&stale, context), Err(ResourceStoreError::Conflict)));
+    assert!(matches!(
+        store.reserve_increase(&stale, context),
+        Err(ResourceStoreError::Conflict)
+    ));
     store.bump_generation(&a).unwrap();
-    assert!(matches!(store.reserve_increase(&valid, context), Err(ResourceStoreError::Conflict)));
+    assert!(matches!(
+        store.reserve_increase(&valid, context),
+        Err(ResourceStoreError::Conflict)
+    ));
     stale = valid;
     stale.generation = 2;
-    assert!(matches!(store.reserve_increase(&stale,
-        AdmissionContext::new(&obs, &bounds, 161, 60, 4)),
-        Err(ResourceStoreError::Admission(ResourceError::StaleObservation))));
+    assert!(matches!(
+        store.reserve_increase(&stale, AdmissionContext::new(&obs, &bounds, 161, 60, 4)),
+        Err(ResourceStoreError::Admission(
+            ResourceError::StaleObservation
+        ))
+    ));
     assert_eq!(store.resource_snapshot().unwrap().epoch, 0);
-    assert_eq!(store.reserve_increase(&stale, context).unwrap(), GrantReceipt::New { epoch: 1 });
+    assert_eq!(
+        store.reserve_increase(&stale, context).unwrap(),
+        GrantReceipt::New { epoch: 1 }
+    );
 }
 
 #[test]
@@ -96,13 +151,18 @@ fn committed_reservation_survives_reopen_without_authorizing_replay() {
     let grant = request(&a, "a", 60);
     let obs = observations();
     let bounds = limits();
-    store.reserve_increase(&grant, AdmissionContext::new(&obs, &bounds, 101, 60, 4)).unwrap();
+    store
+        .reserve_increase(&grant, AdmissionContext::new(&obs, &bounds, 101, 60, 4))
+        .unwrap();
     drop(store);
     let reopened = Store::open(&path).unwrap();
     assert_eq!(reopened.resource_snapshot().unwrap().owners[&a], grant.next);
-    assert_eq!(reopened.reserve_increase(&grant,
-        AdmissionContext::new(&obs, &bounds, 10_000, 60, 4)).unwrap(),
-        GrantReceipt::Recorded { epoch: 1 });
+    assert_eq!(
+        reopened
+            .reserve_increase(&grant, AdmissionContext::new(&obs, &bounds, 10_000, 60, 4))
+            .unwrap(),
+        GrantReceipt::Recorded { epoch: 1 }
+    );
 }
 
 #[test]
@@ -114,18 +174,25 @@ fn independent_connections_cannot_spend_one_epoch_twice() {
     let a = deployment(&first, "a");
     let b = deployment(&first, "b");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let launch = |store: Store, grant: GrantRequest, barrier: std::sync::Arc<std::sync::Barrier>| {
-        std::thread::spawn(move || {
-            let obs = observations();
-            let bounds = limits();
-            barrier.wait();
-            store.reserve_increase(&grant, AdmissionContext::new(&obs, &bounds, 101, 60, 4))
-        })
-    };
+    let launch =
+        |store: Store, grant: GrantRequest, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let obs = observations();
+                let bounds = limits();
+                barrier.wait();
+                store.reserve_increase(&grant, AdmissionContext::new(&obs, &bounds, 101, 60, 4))
+            })
+        };
     let left = launch(first, request(&a, "a", 60), barrier.clone());
     let right = launch(second, request(&b, "b", 60), barrier);
     let outcomes = [left.join().unwrap(), right.join().unwrap()];
-    assert_eq!(outcomes.iter().filter(|r| matches!(r, Ok(GrantReceipt::New { epoch: 1 }))).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|r| matches!(r, Ok(GrantReceipt::New { epoch: 1 })))
+            .count(),
+        1
+    );
     for outcome in &outcomes {
         match outcome {
             Ok(GrantReceipt::New { epoch: 1 }) | Err(ResourceStoreError::Conflict) => {}

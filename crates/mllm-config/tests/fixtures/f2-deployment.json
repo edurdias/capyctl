@@ -3,7 +3,7 @@
     "schema_version": 1, "kind": "deployment", "name": "toy",
     "model": {"path": "/srv/models/toy", "content_fingerprint": "sha256:model", "revision": "r1"},
     "routes": ["toy"], "runtime_profile": "local", "runtime_profile_revision": 7,
-    "recipe": "standard", "residency": "warm", "recovery": "reconcile",
+    "recipe": "standard", "residency": "deep", "recovery": "reconcile",
     "devices": [{"id": "gpu0", "sharing": "shared"}],
     "resources": {
       "cold": {"allocations": [{"domain": "unified", "bytes": "10GiB", "host_kv_bytes": "1GiB"}], "devices": [{"id": "gpu0", "sharing": "shared"}]},
@@ -12,12 +12,14 @@
       "parked": {"allocations": [{"domain": "unified", "bytes": "2GiB", "host_kv_bytes": "0B"}], "devices": []},
       "wake": {"allocations": [{"domain": "unified", "bytes": "10GiB", "host_kv_bytes": "1GiB"}], "devices": [{"id": "gpu0", "sharing": "shared"}]}
     },
-    "request_deadline": "300s"
+    "request_deadline": "300s",
+    "engine_config": {"memory": {"kv_cache": "4GiB"}}
   },
   "host": {
     "schema_version": 1, "kind": "host", "name": "lab", "hardware_fingerprint": "hw-01", "environment_fingerprint": "env-01",
+    "model_store": {"path": "/srv/models"},
     "resource_policy": {
-      "domains": {"unified": {"managed_limit": "32GiB", "free_reserve": "16GiB", "host_kv_limit": "4GiB", "parked_limit": "8GiB"}},
+      "domains": {"unified": {"managed_limit": "32GiB", "free_reserve": "16GiB", "host_kv_limit": "4GiB", "parked_limit": "8GiB", "memory": "unified"}},
       "devices": {"gpu0": {"domain": "unified", "sharing": "shared"}},
       "max_parked": 16, "observation_ttl": "2s", "device_sharing": "shared",
       "endpoint_port_range": {"start": 8100, "end": 8199}, "planner_max_states": 4096,
@@ -25,10 +27,9 @@
     },
     "runtime_profiles": {"local": {
       "engine": "vllm", "revision": 7, "executable": "/bin/true", "build_fingerprint": "vllm-build-1",
-      "qualification_id": "qualification-evidence-17", "args": ["--max-model-len", "4096"],
-      "launch_settings": {"engine": "vllm", "tensor_parallel_size": 1, "pipeline_parallel_size": 1, "enable_sleep_mode": true, "kv_cache_dtype": "auto", "block_size_tokens": 16, "cpu_offload_bytes": "0B", "requested_budget": {"kv_cache_bytes": "4GiB", "swap_space_bytes": "0B", "gpu_utilization_pct": 75}},
+      "args": ["--max-model-len", "4096"],
       "env": {"RUST_LOG": "info"},
-      "security": {"experimental_controls": true, "credential_ref": "secret://engine-key"},
+      "security": {"deep_park": "enabled", "credential_ref": "secret://engine-key"},
       "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3}
     }}
   }

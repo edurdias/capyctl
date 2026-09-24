@@ -251,3 +251,77 @@ fn independent_connections_serialize_close_against_dispatch() {
         .unwrap();
     assert_eq!(pending.len(), usize::from(dispatched.is_ok()));
 }
+
+// T17 T18 T19: a group commit applies each write on its own terms. A refused
+// grant leaves nothing behind and does not undo its neighbours; a finished
+// lease is deleted and an uncertain one stays charged.
+#[test]
+fn a_lease_batch_commits_grants_and_settlements_together() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    let open = ready_deployment(&store, "a");
+    let closed = ready_deployment(&store, "b");
+    store.close_dispatch(&session, &closed, 1, 1).unwrap();
+    let grant = |deployment: &str| LeaseWrite::Grant {
+        deployment_id: deployment.into(),
+        max_per_deployment: 2,
+        max_total: 8,
+    };
+    let outcomes = store
+        .apply_request_lease_batch(
+            &session,
+            &[grant(&open), grant(&closed), grant(&open), grant(&open)],
+        )
+        .unwrap();
+    assert!(matches!(outcomes[0], Ok(LeaseWriteOutcome::Granted(_))));
+    assert!(matches!(outcomes[1], Err(DispatchError::Closed)));
+    assert!(matches!(outcomes[2], Ok(LeaseWriteOutcome::Granted(_))));
+    // The per-deployment bound sees the grants earlier in the same batch.
+    assert!(matches!(outcomes[3], Err(DispatchError::Full)));
+    assert_eq!(store.pending_dispatches(&open).unwrap().len(), 2);
+    assert!(store.pending_dispatches(&closed).unwrap().is_empty());
+    let tickets: Vec<DispatchTicket> = outcomes
+        .into_iter()
+        .filter_map(|o| match o {
+            Ok(LeaseWriteOutcome::Granted(t)) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let settled = store
+        .apply_request_lease_batch(
+            &session,
+            &[
+                LeaseWrite::Finish(tickets[0].clone()),
+                LeaseWrite::Uncertain(tickets[1].clone()),
+                LeaseWrite::Finish(tickets[0].clone()),
+            ],
+        )
+        .unwrap();
+    assert!(matches!(settled[0], Ok(LeaseWriteOutcome::Settled(true))));
+    assert!(matches!(settled[1], Ok(LeaseWriteOutcome::Settled(true))));
+    assert!(matches!(settled[2], Ok(LeaseWriteOutcome::Settled(false))));
+    let pending = store.pending_dispatches(&open).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].uncertain);
+}
+
+// T18: a batch from a retired session writes nothing.
+#[test]
+fn a_lease_batch_from_a_stale_session_is_refused_whole() {
+    let store = Store::open_in_memory().unwrap();
+    let old = store.begin_coordinator_session().unwrap();
+    let deployment = ready_deployment(&store, "a");
+    let _current = store.begin_coordinator_session().unwrap();
+    assert!(matches!(
+        store.apply_request_lease_batch(
+            &old,
+            &[LeaseWrite::Grant {
+                deployment_id: deployment.clone(),
+                max_per_deployment: 2,
+                max_total: 8,
+            }],
+        ),
+        Err(DispatchError::StaleSession)
+    ));
+    assert!(store.pending_dispatches(&deployment).unwrap().is_empty());
+}

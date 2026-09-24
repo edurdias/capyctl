@@ -291,6 +291,86 @@ CREATE TABLE qualification_parked_status(
 );
 "#;
 
+/// SPEC §6.3 requires an administrative stop to suspend automatic activation, and
+/// requires an automatic idle stop not to. `suspended` cannot carry that intent: its
+/// nine readers all use it to mean "eligible to proceed", so writing it on a stop
+/// breaks completion, replay and expiry for the very operation that wrote it. This
+/// column carries the intent alone, and nothing else reads it.
+pub const SCHEMA_V11: &str =
+    "ALTER TABLE deployments ADD COLUMN admin_stopped INTEGER NOT NULL DEFAULT 0;";
+
+/// ADR 0011 decision 5: a deployment's failed attempts are counted against the exact
+/// configuration that failed. A new revision is a new configuration and starts fresh,
+/// so the key is the fence rather than the deployment alone.
+pub const SCHEMA_V12: &str = r#"
+CREATE TABLE deployment_attempts(
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  generation INTEGER NOT NULL CHECK(generation > 0),
+  attempts INTEGER NOT NULL CHECK(attempts >= 0),
+  last_attempt_ms INTEGER NOT NULL CHECK(last_attempt_ms >= 0),
+  PRIMARY KEY(deployment_id, revision, generation)
+);
+"#;
+
+/// ADR 0011: qualification is not an mllm concept. The tables that held candidate
+/// runs, their catalog, evidence, probes, budgets and parked-status records are
+/// dropped in foreign-key order. Nothing wrote them outside tests; a v12 store from
+/// this branch has no rows in them. State directories older than 2026-09-16 must
+/// already be deleted for the resource-policy shape, so no data path is preserved.
+///
+/// Stored kind strings of the ordinary path were renamed in the same change without
+/// a data migration; a v12 state directory that holds lifecycle history is recreated,
+/// as the design keeps no compatibility.
+pub const SCHEMA_V13: &str = r#"
+DROP TABLE qualification_evidence_refs;
+DROP TABLE qualification_ready_probes;
+DROP TABLE qualification_request_results;
+DROP TABLE qualification_request_attempts;
+DROP TABLE qualification_case_actions;
+DROP TABLE qualification_parked_status;
+DROP TABLE candidate_cleanup_actions;
+DROP TABLE qualifications;
+DROP TABLE qualification_runs;
+DROP TABLE host_qualification_policies;
+"#;
+
+// Spec §3: the per-launch engine key, encrypted at rest with XChaCha20-Poly1305 under
+// the identity key file, with binding id, incarnation and role as associated data so
+// a row copied between bindings or roles does not authenticate. Deleted when the
+// binding releases.
+pub const SCHEMA_V14: &str = r#"
+CREATE TABLE engine_secrets(
+  binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
+  incarnation TEXT NOT NULL,
+  nonce BLOB NOT NULL CHECK(length(nonce)=24),
+  ciphertext BLOB NOT NULL
+);
+"#;
+
+// Spec §4.2 (ordinary launch design): SGLang seals two keys per launch, one
+// inference and one admin, so `engine_secrets` carries a role and a binding may
+// hold one row per role. Existing rows were vLLM inference keys and migrate to
+// that role. The rebuild is foreign-key ordered and preserves nonce/ciphertext
+// bytes, but the bytes do not carry over: role joined the sealing AAD in the
+// same change, so pre-v15 ciphertexts no longer authenticate and fail to open.
+// Affected launches re-seal on their next start. As with SCHEMA_V13, there is
+// no compatibility with state written before v15.
+pub const SCHEMA_V15: &str = r#"
+CREATE TABLE engine_secrets_v15(
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  role TEXT NOT NULL CHECK(role IN ('inference','admin')),
+  incarnation TEXT NOT NULL,
+  nonce BLOB NOT NULL CHECK(length(nonce)=24),
+  ciphertext BLOB NOT NULL,
+  PRIMARY KEY(binding_id, role)
+);
+INSERT INTO engine_secrets_v15(binding_id,role,incarnation,nonce,ciphertext)
+  SELECT binding_id,'inference',incarnation,nonce,ciphertext FROM engine_secrets;
+DROP TABLE engine_secrets;
+ALTER TABLE engine_secrets_v15 RENAME TO engine_secrets;
+"#;
+
 pub const SCHEMA_V9: &str = r#"
 CREATE TABLE owned_launch_associations(
   step_id TEXT PRIMARY KEY REFERENCES lifecycle_steps(id),
@@ -332,6 +412,360 @@ CREATE TABLE management_events(
   deployment_id TEXT,
   operation_id TEXT,
   payload_json TEXT NOT NULL
+);
+"#;
+
+/// v16: additive resource namespaces preserve immutable legacy receipts and keys.
+pub const SCHEMA_V16: &str = r#"
+CREATE TABLE host_resource_namespaces(
+  host_id TEXT PRIMARY KEY,
+  policy_key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL CHECK(kind IN ('embedded','remote'))
+);
+CREATE UNIQUE INDEX one_embedded_resource_namespace ON host_resource_namespaces(kind) WHERE kind='embedded';
+CREATE TABLE host_resource_keys(
+  host_id TEXT NOT NULL REFERENCES host_resource_namespaces(host_id),
+  kind TEXT NOT NULL CHECK(kind IN ('domain','device')),
+  local_id TEXT NOT NULL,
+  ledger_key TEXT NOT NULL,
+  PRIMARY KEY(host_id,kind,local_id),
+  UNIQUE(kind,ledger_key)
+);
+"#;
+
+/// SPEC §4.1: immutable redemption binding and renewable, revocable host identity.
+pub const SCHEMA_V18: &str = r#"
+CREATE TABLE remote_binding_ingress (
+ binding_id TEXT PRIMARY KEY REFERENCES runtime_bindings(id),
+ host_id TEXT NOT NULL REFERENCES enrolled_hosts(host_id), endpoint TEXT NOT NULL
+);
+CREATE TABLE approved_host_publications (
+ host_id TEXT PRIMARY KEY REFERENCES enrolled_hosts(host_id),
+ config_json TEXT NOT NULL, boot_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+ received_at_ms INTEGER NOT NULL CHECK(received_at_ms>=0)
+);
+CREATE TABLE managed_configuration_sources (
+ deployment_id TEXT NOT NULL, revision INTEGER NOT NULL, config_json TEXT NOT NULL,
+ PRIMARY KEY(deployment_id,revision),
+ FOREIGN KEY(deployment_id,revision) REFERENCES effective_revisions(deployment_id,revision)
+);
+"#;
+
+pub const SCHEMA_V17: &str = r#"
+CREATE TABLE host_invitations (
+ digest TEXT PRIMARY KEY, host_name TEXT NOT NULL, expires_unix INTEGER NOT NULL
+);
+CREATE TABLE enrolled_hosts (
+ host_id TEXT PRIMARY KEY, host_name TEXT NOT NULL UNIQUE, key_digest TEXT NOT NULL,
+ revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1))
+);
+CREATE TABLE host_certificates (
+ fingerprint TEXT PRIMARY KEY, host_id TEXT NOT NULL REFERENCES enrolled_hosts(host_id),
+ certificate_pem TEXT NOT NULL, expires_unix INTEGER NOT NULL
+);
+CREATE TABLE host_enrollment_transactions (
+ invitation_digest TEXT PRIMARY KEY REFERENCES host_invitations(digest),
+ transaction_id TEXT NOT NULL UNIQUE, host_name TEXT NOT NULL, key_digest TEXT NOT NULL,
+ csr_digest TEXT NOT NULL, fingerprint TEXT NOT NULL REFERENCES host_certificates(fingerprint)
+);
+CREATE TABLE host_certificate_renewals (
+ host_id TEXT NOT NULL REFERENCES enrolled_hosts(host_id), transaction_id TEXT NOT NULL,
+ csr_digest TEXT NOT NULL, fingerprint TEXT NOT NULL REFERENCES host_certificates(fingerprint),
+ PRIMARY KEY(host_id,transaction_id)
+);
+"#;
+
+/// v19: pre-E1 state carried into the ADR 0014 shape (owner decision
+/// 2026-09-22). One row per effective revision the upgrade found in the old
+/// shape: migrated with the fingerprint it carried before, so ownership and
+/// adoption keep the identity the running engine was launched under, or refused
+/// with the operator diagnostic while everything it owns stays retained. The
+/// legacy bytes are kept verbatim; nothing is deleted. The data step is
+/// `ordinary_lifecycle::legacy_engine_config::migrate`, in the same transaction.
+pub const SCHEMA_V19: &str = r#"
+CREATE TABLE engine_config_migrations (
+ deployment_id TEXT NOT NULL, revision INTEGER NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('migrated','refused')),
+ legacy_fingerprint TEXT NOT NULL,
+ fingerprint TEXT,
+ legacy_command_fingerprint TEXT,
+ legacy_effective_json TEXT NOT NULL,
+ legacy_source_json TEXT,
+ diagnostic TEXT NOT NULL,
+ PRIMARY KEY(deployment_id,revision),
+ FOREIGN KEY(deployment_id,revision) REFERENCES effective_revisions(deployment_id,revision),
+ CHECK((outcome='migrated') = (fingerprint IS NOT NULL))
+);
+CREATE TABLE host_publication_migrations (
+ host_id TEXT PRIMARY KEY REFERENCES enrolled_hosts(host_id),
+ legacy_fingerprint TEXT NOT NULL, fingerprint TEXT NOT NULL,
+ legacy_config_json TEXT NOT NULL
+);
+"#;
+
+/// v20 (ADR 0014 §7, WE3): the checkpoint digest of each deployment revision.
+/// `pending` until a host holding the checkpoint measures it; `recorded` with
+/// the digest and the weights bytes the manifest supplies; `mismatch` when the
+/// measured digest is not the declared expectation; `unusable` when a derived
+/// memory request cannot be resolved with the measured weights. `provisional`
+/// marks a revision frozen before its weights were known, whose activation
+/// waits for the digest. Revisions accepted before v20 have no row: their
+/// digest is measured and recorded on first placement. Additive; idempotent so
+/// a store rolled back to an earlier version can reapply it.
+pub const SCHEMA_V20: &str = r#"
+CREATE TABLE IF NOT EXISTS checkpoint_digests (
+ deployment_id TEXT NOT NULL, revision INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','recorded','mismatch','unusable')),
+ host_id TEXT NOT NULL,
+ expected TEXT,
+ digest TEXT,
+ weights_bytes INTEGER CHECK(weights_bytes IS NULL OR weights_bytes>=0),
+ provisional INTEGER NOT NULL CHECK(provisional IN (0,1)),
+ diagnostic TEXT,
+ updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0),
+ PRIMARY KEY(deployment_id,revision),
+ FOREIGN KEY(deployment_id,revision) REFERENCES effective_revisions(deployment_id,revision),
+ CHECK((state='pending') = (digest IS NULL)),
+ CHECK((state IN ('recorded','mismatch')) = (weights_bytes IS NOT NULL))
+);
+"#;
+
+/// v21 (SPEC §3, Phase B follow-up): endpoint port leases are per host. A lease
+/// was keyed `(127.0.0.1, port)` for the whole installation, so two hosts could
+/// not both lease the same port of their own ranges although every engine binds
+/// its own host's loopback. The key now names the host the deployment revision
+/// is placed on (`$.host.name` of its effective revision: the enrolled host id,
+/// or the embedded host's name). Existing leases keep their binding, address
+/// and port and take their binding's host; a binding whose revision cannot be
+/// read keeps the lease under the empty host key rather than losing it.
+/// Rebuilt in place; idempotent so a store rolled back can reapply it.
+pub const SCHEMA_V21: &str = r#"
+DROP TABLE IF EXISTS endpoint_leases_by_host;
+CREATE TABLE endpoint_leases_by_host(
+  host_id TEXT NOT NULL,
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+  binding_id TEXT NOT NULL REFERENCES runtime_bindings(id),
+  PRIMARY KEY(host_id,host,port)
+);
+INSERT INTO endpoint_leases_by_host(host_id,host,port,binding_id)
+  SELECT COALESCE((SELECT json_extract(e.effective_json,'$.host.name')
+                     FROM runtime_bindings b JOIN effective_revisions e
+                       ON e.deployment_id=b.deployment_id AND e.revision=b.revision
+                    WHERE b.id=l.binding_id),''),
+         l.host, l.port, l.binding_id
+    FROM endpoint_leases l;
+DROP TABLE endpoint_leases;
+ALTER TABLE endpoint_leases_by_host RENAME TO endpoint_leases;
+CREATE INDEX IF NOT EXISTS endpoint_leases_binding ON endpoint_leases(binding_id);
+"#;
+
+/// v22 (ADR 0013 §5, owner decision P1): deployment instances. A deployment
+/// declares `instances: N`; each instance is one engine group with its own
+/// placement, generation, binding, lifecycle claim, activation, request leases
+/// and resource owner.
+///
+/// - `deployment_revision_instances`: the declared count and normalized
+///   placement constraints of each accepted revision.
+/// - `host_effective_revisions`: the revision resolved against each host that
+///   was checked (ADR 0013 §3; SPEC §8: one installation name does not prove one
+///   build). The canonical `effective_revisions` row stays the first resolving
+///   host's.
+/// - `deployment_instances`: dense indices `0..N-1`, stable across restarts;
+///   the placed host and devices (NULL until placed), the generation its last
+///   activation drew from the deployment's one counter, and the operator's
+///   per-instance stop (owner decision Q7). `retiring` marks a surplus row a
+///   count decrease drains before it is removed.
+///
+/// The tables are created here; `crate::instances::migrate` then adds
+/// `instance_index` to bindings, runs, claims, request leases, attempts and
+/// resource owners, re-keys their one-per-deployment rules per instance and
+/// backfills every existing deployment as instance 0, in the same transaction.
+/// Additive and idempotent, so a store rolled back to an earlier version can
+/// reapply it.
+pub const SCHEMA_V22: &str = r#"
+CREATE TABLE IF NOT EXISTS deployment_revision_instances(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  instances INTEGER NOT NULL CHECK(instances BETWEEN 1 AND 64),
+  placement_json TEXT NOT NULL CHECK(json_valid(placement_json)),
+  PRIMARY KEY(deployment_id,revision),
+  FOREIGN KEY(deployment_id,revision) REFERENCES effective_revisions(deployment_id,revision)
+);
+CREATE TABLE IF NOT EXISTS host_effective_revisions(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  host_id TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK(outcome IN ('resolved','refused')),
+  effective_json TEXT,
+  fingerprint TEXT,
+  diagnostic TEXT,
+  PRIMARY KEY(deployment_id,revision,host_id),
+  FOREIGN KEY(deployment_id,revision) REFERENCES effective_revisions(deployment_id,revision),
+  CHECK((outcome='resolved') = (effective_json IS NOT NULL AND fingerprint IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS deployment_instances(
+  deployment_id TEXT NOT NULL REFERENCES deployments(id),
+  instance_index INTEGER NOT NULL CHECK(instance_index BETWEEN 0 AND 63),
+  host_id TEXT,
+  device_json TEXT CHECK(device_json IS NULL OR json_valid(device_json)),
+  generation INTEGER CHECK(generation IS NULL OR generation>=1),
+  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','retiring')),
+  operator_stopped INTEGER NOT NULL DEFAULT 0 CHECK(operator_stopped IN (0,1)),
+  placed_at TEXT,
+  PRIMARY KEY(deployment_id,instance_index)
+);
+"#;
+
+/// v23 (ADR 0013 §4, §6, §7; unit I2): the instance is the unit of runtime.
+///
+/// Every runtime fact a single-instance deployment kept on its `deployments`
+/// row moves onto its instance row: the revision its current incarnation was
+/// admitted against, its generation (drawn from the deployment's one counter,
+/// so a deployment and a generation still identify exactly one incarnation),
+/// and its desired, observed, admission and dispatch state. The `deployments`
+/// row keeps the declaration (revision, counter, suspension, operator stop)
+/// and carries the aggregate of its instances, which triggers maintain for
+/// managed deployments so every existing reader keeps working.
+///
+/// - `pending_start_until_ms`: a start the scheduler must still place (an
+///   explicit start whose instance did not fit, or a restart after a
+///   non-count revision, owner decision Q8), retried until this deadline.
+/// - `last_error`: the closed placement or start diagnostic status shows.
+/// - `host_effective_revisions.source_json`: the deployment document scoped
+///   to that host, which a remote launch on it is rendered from.
+/// - `instance_runtime`: one row per instance with the columns the lifecycle
+///   fences read, named as the `deployments` columns they replace.
+///
+/// The columns are added, the view and triggers created and instance 0's
+/// state copied from its deployment by the data step
+/// (`crate::instances::migrate_v23`), which checks what already exists so it
+/// is idempotent; this batch only removes the v22 trigger that inferred an
+/// instance's host from the canonical revision, because placement now records
+/// the host explicitly.
+pub const SCHEMA_V23: &str = r#"
+DROP TRIGGER IF EXISTS instance_activation_generation;
+"#;
+
+/// v24 (SPEC §4.3, owner decision 4 of 2026-09-22): the durable marker of a host
+/// drain. One row per Stop the drain issued; the drain is pending while any of
+/// those operations is not terminal, and the host takes no new placements while
+/// it is. Additive; idempotent so a store rolled back can reapply it.
+pub const SCHEMA_V24: &str = r#"
+CREATE TABLE IF NOT EXISTS host_drains(
+  host_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL REFERENCES operations(id),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  PRIMARY KEY(host_id,operation_id)
+);
+"#;
+
+/// v25 (SPEC §§3.1, 7.3; per-launch host claims): the hosts whose latest
+/// authenticated publication says their agent journal keeps one claim per
+/// launch. A row is replaced or removed with each publication; a host without
+/// one holds one launch claim at a time, so placement keeps refusing a second
+/// launch there. Additive; idempotent so a store rolled back can reapply it.
+pub const SCHEMA_V25: &str = r#"
+CREATE TABLE IF NOT EXISTS host_launch_claims(
+  host_id TEXT PRIMARY KEY REFERENCES enrolled_hosts(host_id),
+  mode TEXT NOT NULL CHECK(mode IN ('per_launch')),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+"#;
+
+/// v26 (ADR 0013 §4, owner decision P1; per-instance host fencing): a host may
+/// also advertise `per_instance`, a per-launch journal (v5) that fences each
+/// instance of a deployment by its own generation, so two instances of one
+/// deployment may share it. SQLite cannot widen a CHECK in place, so the table
+/// is rebuilt with every row carried across unchanged. Rerunnable.
+pub const SCHEMA_V26: &str = r#"
+CREATE TABLE IF NOT EXISTS host_launch_claims(
+  host_id TEXT PRIMARY KEY REFERENCES enrolled_hosts(host_id),
+  mode TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+DROP TABLE IF EXISTS host_launch_claims_v26;
+CREATE TABLE host_launch_claims_v26(
+  host_id TEXT PRIMARY KEY REFERENCES enrolled_hosts(host_id),
+  mode TEXT NOT NULL CHECK(mode IN ('per_launch','per_instance')),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+INSERT INTO host_launch_claims_v26(host_id,mode,recorded_at_ms)
+  SELECT host_id,mode,recorded_at_ms FROM host_launch_claims
+   WHERE mode IN ('per_launch','per_instance');
+DROP TABLE host_launch_claims;
+ALTER TABLE host_launch_claims_v26 RENAME TO host_launch_claims;
+"#;
+
+/// Owner decision 2026-09-23: startup peaks measured on a first run, per
+/// revision, host and engine installation. Later starts of the revision on
+/// that host reserve the largest one recorded instead of the placeholder.
+pub const SCHEMA_V27: &str = r#"
+CREATE TABLE IF NOT EXISTS startup_measurements(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  installation TEXT NOT NULL,
+  peak_bytes INTEGER NOT NULL CHECK(peak_bytes>0),
+  step_id TEXT NOT NULL,
+  measured_at_ms INTEGER NOT NULL CHECK(measured_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision,host_id,installation)
+);
+"#;
+
+/// W10 gaps (owner decisions 2026-09-23). `dispatch_closures` records why an
+/// instance incarnation's dispatch gate is closed, one row per reason, so a
+/// failed switch reopens only a gate it alone closed (SPEC §§10, 13.2).
+/// `active_switches` is the switch in progress, for status. The warm-residency
+/// flag (SPEC §6.5, ADR 0013 amendment) is added by `switch_state::migrate`,
+/// which checks for the column so a reapplied migration changes nothing.
+pub const SCHEMA_V28: &str = r#"
+CREATE TABLE IF NOT EXISTS dispatch_closures(
+  deployment_id TEXT NOT NULL,
+  instance_index INTEGER NOT NULL CHECK(instance_index>=0),
+  generation INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK(reason IN ('switch','host_session','engine_exit')),
+  PRIMARY KEY(deployment_id,instance_index,generation,reason)
+);
+CREATE TABLE IF NOT EXISTS active_switches(
+  switch_id TEXT PRIMARY KEY,
+  target_deployment TEXT NOT NULL,
+  host_id TEXT,
+  victims_json TEXT NOT NULL CHECK(json_valid(victims_json)),
+  phase TEXT NOT NULL CHECK(phase IN ('planned','admission_closed','released')),
+  evicting INTEGER NOT NULL DEFAULT 0 CHECK(evicting IN (0,1))
+);
+"#;
+
+/// Owner decision 2026-09-23 (solo first start): the weights a host sized by
+/// a stat walk while a revision's checkpoint digest is still pending, so a
+/// first start's startup estimate is known before the full digest.
+pub const SCHEMA_V29: &str = r#"
+CREATE TABLE IF NOT EXISTS checkpoint_sizes(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>=1),
+  host_id TEXT NOT NULL,
+  weights_bytes INTEGER NOT NULL CHECK(weights_bytes>=0),
+  sized_at_ms INTEGER NOT NULL CHECK(sized_at_ms>=0),
+  PRIMARY KEY(deployment_id,revision)
+);
+"#;
+
+/// v30 (SPEC §4.3, owner decision 4; router review item 14): the drain intent.
+/// A v24 marker names the Stops a drain issued, so it cannot exist before the
+/// first of them, and an instance placed on the host in between survived the
+/// drain. An intent row needs no operation: it is written in the same
+/// transaction that enumerates the host's instances, before any Stop, and the
+/// host takes no new placements while an intent is open (`completed_at_ms`
+/// null) or any marked Stop is unsettled. Additive; idempotent so a store
+/// rolled back can reapply it.
+pub const SCHEMA_V30: &str = r#"
+CREATE TABLE IF NOT EXISTS host_drain_intents(
+  host_id TEXT NOT NULL CHECK(length(host_id)>0),
+  drain_key TEXT NOT NULL CHECK(length(drain_key)>0),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  completed_at_ms INTEGER CHECK(completed_at_ms IS NULL OR completed_at_ms>=0),
+  PRIMARY KEY(host_id,drain_key)
 );
 "#;
 

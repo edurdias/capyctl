@@ -4,7 +4,8 @@ members = [
   "crates/mllm-domain", "crates/mllm-store", "crates/mllm-scheduler",
   "crates/mllm-protocol", "crates/mllm-controller", "crates/mllm-router",
   "crates/mllm-agent", "crates/mllm-adapters", "crates/mllm-launchers",
-  "crates/mllm-config", "crates/mllm-cli", "tests/harness",
+  "crates/mllm-config", "crates/mllm-cli", "crates/mllm-management",
+  "crates/mllm-testkit", "tests/harness",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ mllm-config = { path = "crates/mllm-config" }
 mllm-adapters = { path = "crates/mllm-adapters" }
 mllm-agent = { path = "crates/mllm-agent" }
 mllm-controller = { path = "crates/mllm-controller" }
+mllm-testkit = { path = "crates/mllm-testkit" }
 
 [profile.dev]
 debug = 1

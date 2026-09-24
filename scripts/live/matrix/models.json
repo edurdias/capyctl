@@ -1,0 +1,120 @@
+{
+  "_comment": [
+    "D5 model set (matrix section 3). q27 is the bf16 qwen3.8-27b checkpoint and q27f the NVFP4 anchor (qwen3.8-27b-nvfp4, M16 run 2026-09-22). request_bytes are the M16 steady measurements (run matrix-20260923T034935Z): q4 24 GiB, q14 46 GiB, q27 78 GiB, q27f 40 GiB, q30 82 GiB.",
+    "P2: the first live run of each model measures its peak; record it in measured.json (gen_budgets.py suggest) and regenerate fixtures and budgets. Reservations always use the declared request.",
+    "kv_cache_bytes is declared so resolution never has to derive it; weights_bytes_estimate is only for the fit check in gen_budgets.py (weights + kv + 8 GiB margin <= request).",
+    "quantization and kv_cache_dtype are per engine family: null means the field is omitted and the engine detects it from the checkpoint. Whether an engine serves the anchor is unproven (G17).",
+    "M16 2026-09-23: SGLang's static pool is the request minus the 8 GiB placeholder margin (ADR 0014 section 5), so a request below weights + KV + 8 GiB leaves no KV cache and the engine refuses (live, s17-4 at 16 GiB: mem_fraction_static 0.068). q4 is 20 GiB and q14 42 GiB so the margin fits; M16 then measures the real peak.",
+    "M16 2026-09-23 engine findings: SGLang 0.5.20 refuses --language-model-only for Qwen3_5ForConditionalGeneration, so language_model_only is per engine and off for SGLang on q27/q27f; vLLM 0.29 on q30 ran the host out of memory in FlashInfer MoE JIT and passed with --moe-backend triton through extra arguments. The NVFP4 startup peak (about 130 GiB MemAvailable drop) is transient JIT, not the request.",
+    "2026-09-23 co-residence variant (gen_deployment.py --co): context 8192 and a smaller KV cache, sized so q30+q4 and q27f+q14+q4 fit the normal 80% budget (97.35 GiB) together. Each request is weights + KV + the 8 GiB margin with the remainder spread as headroom; they are planning values, not measurements. No startup peak is declared: the store's placeholder (request, or weights x 1.6 + 8 GiB with known weights) applies until a first run measures it. Set co.startup_bytes to declare one."
+  ],
+  "models": {
+    "4": {
+      "dir": "qwen3-4b-instruct",
+      "route": "qwen3-4b",
+      "request_bytes": 25769803776,
+      "kv_cache_bytes": 4294967296,
+      "weights_bytes_estimate": 8045000000,
+      "context_length": 16384,
+      "max_concurrent_requests": 16,
+      "dtype": "bfloat16",
+      "cuda_graphs": false,
+      "co": {
+        "context_length": 8192,
+        "kv_cache_bytes": 2147483648,
+        "request_bytes": 23622320128
+      }
+    },
+    "14": {
+      "dir": "qwen3-14b",
+      "route": "qwen3-14b",
+      "request_bytes": 49392123904,
+      "kv_cache_bytes": 6442450944,
+      "weights_bytes_estimate": 29540000000,
+      "context_length": 32768,
+      "max_concurrent_requests": 16,
+      "dtype": "bfloat16",
+      "cuda_graphs": false,
+      "co": {
+        "context_length": 8192,
+        "kv_cache_bytes": 2147483648,
+        "request_bytes": 44023414784
+      }
+    },
+    "27": {
+      "dir": "qwen3.8-27b",
+      "route": "qwen3.8-27b",
+      "request_bytes": 83751862272,
+      "kv_cache_bytes": 8589934592,
+      "weights_bytes_estimate": 55600000000,
+      "context_length": 32768,
+      "max_concurrent_requests": 16,
+      "dtype": "bfloat16",
+      "cuda_graphs": false,
+      "language_model_only": {
+        "vllm": true,
+        "sglang": false
+      },
+      "co": {
+        "context_length": 8192,
+        "kv_cache_bytes": 2147483648,
+        "request_bytes": 70866960384
+      }
+    },
+    "27f": {
+      "dir": "qwen3.8-27b-nvfp4",
+      "route": "qwen3.8-27b-nvfp4",
+      "request_bytes": 42949672960,
+      "kv_cache_bytes": 8589934592,
+      "weights_bytes_estimate": 23750000000,
+      "context_length": 32768,
+      "max_concurrent_requests": 16,
+      "dtype": "bfloat16",
+      "cuda_graphs": false,
+      "language_model_only": {
+        "vllm": true,
+        "sglang": false
+      },
+      "quantization": {
+        "vllm": null,
+        "sglang": "modelopt"
+      },
+      "kv_cache_dtype": {
+        "vllm": "fp8",
+        "sglang": "fp8_e4m3"
+      },
+      "co": {
+        "context_length": 8192,
+        "kv_cache_bytes": 2147483648,
+        "request_bytes": 35433480192
+      }
+    },
+    "30": {
+      "dir": "qwen3-30b-a3b",
+      "route": "qwen3-30b-a3b",
+      "request_bytes": 88046829568,
+      "kv_cache_bytes": 6442450944,
+      "weights_bytes_estimate": 61070000000,
+      "context_length": 32768,
+      "max_concurrent_requests": 16,
+      "dtype": "bfloat16",
+      "cuda_graphs": false,
+      "extra_args": {
+        "vllm": [
+          "--moe-backend",
+          "triton"
+        ],
+        "sglang": null
+      },
+      "co": {
+        "context_length": 8192,
+        "kv_cache_bytes": 4294967296,
+        "request_bytes": 79456894976
+      }
+    }
+  },
+  "identity_probe": {
+    "prompt": "Describe the city of Lisbon in exactly two sentences.",
+    "max_tokens": 32
+  }
+}

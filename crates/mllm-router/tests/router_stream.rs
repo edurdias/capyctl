@@ -6,9 +6,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use mllm_adapters::fake::FakeEngine;
+use mllm_testkit::FakeEngine;
 use mllm_controller::Controller;
 use mllm_router::admission::InFlight;
+use mllm_router::forwarders::StaticForwarders;
 use mllm_router::{QueueLimits, RouterDeps};
 use mllm_store::Store;
 use tower::ServiceExt;
@@ -19,16 +20,15 @@ async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
     let controller = Arc::new(Controller::new(
         shared.clone(),
         fake.clone() as Arc<dyn mllm_adapters::EngineAdapter>,
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     let inflight = Arc::new(InFlight::default());
     let deps = RouterDeps {
-        store: shared,
         controller: controller.clone(),
-        forwards: HashMap::from([(
+        forwards: Arc::new(StaticForwarders(HashMap::from([(
             "fake".to_string(),
             fake.clone() as Arc<dyn mllm_adapters::ChatForward>,
-        )]),
+        )]))),
         limits: QueueLimits { max_requests_per_deployment: 8, max_buffered_bytes_total: 64 * 1024 },
         api_key: Some("test-key".into()),
         inflight: Arc::new(mllm_router::admission::InFlight::default()),

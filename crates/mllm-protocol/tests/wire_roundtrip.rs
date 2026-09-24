@@ -86,6 +86,7 @@ async fn agent_control_roundtrip_over_real_channel() {
                 host_id: "host-1".into(),
                 protocol_version: PROTOCOL_VERSION.into(),
                 journal_resume_token: Vec::new(),
+                heartbeats: false,
                 envelope: Some(Envelope {
                     host_id: "host-1".into(),
                     operation_id: "op-1".into(),
@@ -108,12 +109,16 @@ async fn agent_control_roundtrip_over_real_channel() {
     };
     let envelope = launch.envelope.expect("envelope wired");
     assert_eq!(envelope.operation_id, "op-1");
-    assert_eq!(envelope.protocol_version, "1");
+    assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
 }
 
+// T34: the session protocol is version 2 (Park, Restore, load and exit
+// reports); command identities keep encoding version 1 so journaled command
+// digests stay verifiable across an agent upgrade.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, "1");
+    assert_eq!(PROTOCOL_VERSION, "2");
+    assert_eq!(mllm_protocol::COMMAND_ENCODING_VERSION, "1");
 }
 
 #[test]
@@ -121,4 +126,50 @@ fn deadline_enforced_with_skew_tolerance() {
     let now = now_unix_ms();
     assert!(deadline_ok(now - 10_000, now, SKEW_TOLERANCE_MS));
     assert!(!deadline_ok(now - 45_000, now, SKEW_TOLERANCE_MS));
+}
+
+// T34 (owner decision 2026-09-23): heartbeats are additive. A Connect and a
+// SessionReady from a peer that predates them decode as "no heartbeats", and
+// the heartbeat frame round-trips in both directions on new field numbers.
+#[test]
+fn heartbeat_fields_are_additive_and_default_off() {
+    use mllm_protocol::pb::{Heartbeat, SessionReady};
+    use prost::Message;
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldConnect {
+        #[prost(string, tag = "1")]
+        host_id: String,
+        #[prost(string, tag = "2")]
+        protocol_version: String,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldReady {
+        #[prost(string, tag = "1")]
+        controller_id: String,
+        #[prost(string, tag = "2")]
+        session_id: String,
+    }
+    let old = OldConnect { host_id: "h".into(), protocol_version: PROTOCOL_VERSION.into() };
+    let decoded = Connect::decode(old.encode_to_vec().as_slice()).unwrap();
+    assert!(!decoded.heartbeats);
+    let old = OldReady { controller_id: "c".into(), session_id: "s".into() };
+    let decoded = SessionReady::decode(old.encode_to_vec().as_slice()).unwrap();
+    assert_eq!((decoded.heartbeat_interval_ms, decoded.heartbeat_lost_after_ms), (0, 0));
+    let beat = Heartbeat { sent_at_unix_ms: 42 };
+    for frame in [
+        AgentToServer { msg: Some(agent_to_server::Msg::Heartbeat(beat)) }.encode_to_vec(),
+        ServerToAgent { msg: Some(server_to_agent::Msg::Heartbeat(beat)) }.encode_to_vec(),
+    ] {
+        assert!(!frame.is_empty());
+    }
+    let up = AgentToServer::decode(
+        AgentToServer { msg: Some(agent_to_server::Msg::Heartbeat(beat)) }.encode_to_vec().as_slice(),
+    )
+    .unwrap();
+    assert_eq!(up.msg, Some(agent_to_server::Msg::Heartbeat(beat)));
+    let down = ServerToAgent::decode(
+        ServerToAgent { msg: Some(server_to_agent::Msg::Heartbeat(beat)) }.encode_to_vec().as_slice(),
+    )
+    .unwrap();
+    assert_eq!(down.msg, Some(server_to_agent::Msg::Heartbeat(beat)));
 }

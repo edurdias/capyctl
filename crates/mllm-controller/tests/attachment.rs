@@ -12,12 +12,11 @@ fn controller() -> (Arc<Controller>, Arc<Mutex<Store>>) {
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
     let c = Arc::new(Controller::new(
         store.clone(),
-        Arc::new(mllm_adapters::fake::FakeEngine::new()),
-        Arc::new(mllm_adapters::fake::FakeLauncher::new()),
+        Arc::new(mllm_testkit::FakeEngine::new()),
+        Arc::new(mllm_testkit::FakeLauncher::new()),
     ));
     (c, store)
 }
-
 
 #[tokio::test]
 async fn attach_registers_route_and_rejects_lifecycle() {
@@ -66,7 +65,10 @@ async fn attached_usage_is_conservative_not_reclaimable() {
     // The attached deployment holds a reservation that admission treats as
     // charged (never reclaimable capacity without evidence).
     let reservations = store.lock().unwrap().reservations_for_owner(&id).unwrap();
-    assert!(!reservations.is_empty(), "attached usage charged conservatively");
+    assert!(
+        !reservations.is_empty(),
+        "attached usage charged conservatively"
+    );
 }
 
 #[tokio::test]

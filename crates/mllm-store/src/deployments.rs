@@ -26,6 +26,26 @@ pub struct Accepted {
 }
 
 /// A stored deployment as read back from the store.
+/// SPEC §8.2: a deployment's current effective configuration (raw, unredacted).
+#[derive(Debug, Clone)]
+pub struct EffectiveConfiguration {
+    pub deployment_id: String,
+    pub revision: i64,
+    pub effective: serde_json::Value,
+    /// ADR 0013 §3: each allowed host's resolution of this revision.
+    pub hosts: Vec<HostEffectiveConfiguration>,
+}
+
+/// One allowed host's resolution of a revision.
+#[derive(Debug, Clone)]
+pub struct HostEffectiveConfiguration {
+    pub host_id: String,
+    /// `resolved` or `refused`.
+    pub outcome: String,
+    pub effective: Option<serde_json::Value>,
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeploymentRow {
     pub id: String,
@@ -270,6 +290,21 @@ impl crate::Store {
         }
     }
 
+    /// The deployment's current effective revision.
+    ///
+    /// Commands fence on this, and it is not the same as `schema_version`: a caller
+    /// that confuses them gets a revision conflict rather than an obvious error.
+    pub fn current_revision(&self, id: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT revision FROM deployments WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, StoreError> {
         let raw: Option<RawDeploymentRow> = self
             .conn
@@ -293,8 +328,16 @@ impl crate::Store {
             )
             .optional()?;
         raw.map(
-            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version,
-              current_generation)| {
+            |(
+                id,
+                name,
+                kind,
+                route_model_id,
+                desired_state,
+                observed_state,
+                schema_version,
+                current_generation,
+            )| {
                 Ok(DeploymentRow {
                     id,
                     name,
@@ -325,6 +368,62 @@ impl crate::Store {
         Ok(())
     }
 
+    /// Whether the coordinator currently permits dispatch to this deployment's
+    /// engine. SPEC §13.2: a remote engine whose readiness is being re-proven
+    /// keeps its observed state but must not receive work. Absent reads false.
+    pub fn dispatch_enabled(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT dispatch_enabled=1 FROM deployments WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Close or open one deployment's own admission.
+    ///
+    /// ADR 0011 decision 4: a failed deployment stops itself. The coordinator's
+    /// process-wide `accepting` flag is for shutdown; one deployment's bad
+    /// configuration or failed step must not touch it.
+    pub fn set_admission_enabled(&self, id: &str, enabled: bool) -> Result<(), StoreError> {
+        // One savepoint: the instances and the deployment row change together or
+        // not at all, whether or not the caller already holds a transaction.
+        self.conn.execute_batch("SAVEPOINT set_admission_enabled")?;
+        let result = (|| {
+            // ADR 0013 §6: the deployment's admission switch covers every instance.
+            self.conn.execute(
+                "UPDATE deployment_instances SET admission_enabled=?2 WHERE deployment_id=?1",
+                params![id, enabled as i64],
+            )?;
+            let updated = self.conn.execute(
+                "UPDATE deployments
+                 SET admission_enabled = ?2,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?1",
+                params![id, enabled as i64],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::Conflict);
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE set_admission_enabled")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO set_admission_enabled; RELEASE set_admission_enabled",
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Append a journal entry (no inference bodies, ever — evidence only).
     pub fn record_journal(
         &self,
@@ -345,6 +444,22 @@ impl crate::Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Whether the lifecycle run behind an operation is retained as uncertain.
+    ///
+    /// An uncertain run is not terminal: the operation stays running, its arm is
+    /// kept, and the coordinator resolves it only against a gone-proof. It is still
+    /// a durable, observable condition, and a caller waiting on the operation must
+    /// be told it at once rather than after its own wait runs out (SPEC §13.2).
+    pub fn operation_is_uncertain(&self, operation_id: &str) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM lifecycle_runs WHERE operation_id=?1 AND state='uncertain')",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
     }
 
     /// All journal evidence recorded for an operation, in insertion order.
@@ -477,14 +592,164 @@ impl crate::Store {
             .map_err(StoreError::from)
     }
 
+    /// The routes a deployment's effective revision serves, in the order the frozen
+    /// configuration records them.
+    ///
+    /// SPEC §3: the first of them is the name the engine was launched to answer to,
+    /// so anything addressing that engine must use it rather than the public alias a
+    /// client asked for. The two are the same for a single-route deployment and
+    /// differ as soon as one carries aliases, which is exactly when guessing would
+    /// send an engine a model name it does not serve.
+    ///
+    /// Read by decoding the frozen revision's `routes` array, which is the same
+    /// JSON the launch plan renders `--served-model-name` from, so the router and
+    /// the engine cannot disagree about the name. `deployment_routes` cannot answer
+    /// this: its rows carry no ordinal, so the only order a query can impose on
+    /// them is route text, which is the configured order only by accident. Only the
+    /// `routes` field is decoded; nothing here re-resolves the model against the
+    /// host's store, which is work a request path should not do.
+    ///
+    /// A deployment created before managed configuration has no frozen revision and
+    /// keeps its single route in the column on its own row, so both forms are read.
+    /// An unknown deployment yields an empty list.
+    /// SPEC §8.2 (`inspect deployment --effective-config`): the current
+    /// revision's effective configuration, found by id or name, with each
+    /// allowed host's resolution of it (ADR 0013 §3). Raw stored values: the
+    /// management boundary redacts before anything leaves the service.
+    pub fn effective_configuration(
+        &self,
+        deployment: &str,
+    ) -> Result<Option<EffectiveConfiguration>, StoreError> {
+        let undecodable = |id: &str, e: serde_json::Error| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("deployment {id} has an undecodable frozen revision: {e}"),
+            ))
+        };
+        let row: Option<(String, i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT d.id, d.revision, e.effective_json FROM deployments d \
+                 JOIN effective_revisions e \
+                   ON e.deployment_id=d.id AND e.revision=d.revision \
+                 WHERE d.id=?1 OR d.name=?1 ORDER BY d.id=?1 DESC LIMIT 1",
+                params![deployment],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((deployment_id, revision, effective_json)) = row else {
+            return Ok(None);
+        };
+        let effective =
+            serde_json::from_str(&effective_json).map_err(|e| undecodable(&deployment_id, e))?;
+        let mut hosts = Vec::new();
+        let mut statement = self.conn.prepare(
+            "SELECT host_id, outcome, effective_json, diagnostic FROM host_effective_revisions \
+             WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id",
+        )?;
+        let rows = statement.query_map(params![deployment_id, revision], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (host_id, outcome, json, diagnostic) = row?;
+            let effective = json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|e| undecodable(&deployment_id, e))?;
+            hosts.push(HostEffectiveConfiguration {
+                host_id,
+                outcome,
+                effective,
+                diagnostic,
+            });
+        }
+        Ok(Some(EffectiveConfiguration {
+            deployment_id,
+            revision,
+            effective,
+            hosts,
+        }))
+    }
+
+    pub fn effective_routes(&self, deployment_id: &str) -> Result<Vec<String>, StoreError> {
+        let frozen: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT e.effective_json FROM deployments d \
+                 JOIN effective_revisions e \
+                   ON e.deployment_id=d.id AND e.revision=d.revision \
+                 WHERE d.id=?1",
+                params![deployment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(effective_json) = frozen {
+            let effective: serde_json::Value =
+                serde_json::from_str(&effective_json).map_err(|e| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "deployment {deployment_id} has an undecodable frozen revision: {e}"
+                        ),
+                    ))
+                })?;
+            let routes = effective
+                .get("routes")
+                .and_then(serde_json::Value::as_array)
+                .map(|routes| {
+                    routes
+                        .iter()
+                        .map(|route| route.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "deployment {deployment_id} froze a revision without a routes list"
+                        ),
+                    ))
+                })?
+                .ok_or_else(|| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("deployment {deployment_id} froze a route that is not a string"),
+                    ))
+                })?;
+            return Ok(routes);
+        }
+        let legacy: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT route_model_id FROM deployments WHERE id=?1",
+                params![deployment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(legacy.flatten().into_iter().collect())
+    }
+
     /// All enabled route ids for `/v1/models` (F1 design §5): enabled
     /// routes are listed without waking anything.
     pub fn list_enabled_route_ids(&self) -> Result<Vec<String>, StoreError> {
         self.conn
             .prepare(
-                "SELECT route_model_id FROM deployments \
-                 WHERE admission_enabled = 1 AND suspended = 0 AND route_model_id IS NOT NULL \
-                 ORDER BY route_model_id",
+                // A managed configuration records its routes in `deployment_routes`
+                // and clears the column, so both have to be read. The gate is the
+                // same for either: admission open and the deployment not suspended.
+                "SELECT route FROM (\
+                   SELECT route_model_id AS route, id AS deployment_id FROM deployments \
+                     WHERE route_model_id IS NOT NULL \
+                   UNION \
+                   SELECT route, deployment_id FROM deployment_routes\
+                 ) r JOIN deployments d ON d.id = r.deployment_id \
+                 WHERE d.admission_enabled = 1 AND d.suspended = 0 \
+                 ORDER BY route",
             )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()
@@ -493,13 +758,23 @@ impl crate::Store {
 
     /// Alias resolution: route_model_id → the deployment serving it (no
     /// model-name guessing — SPEC §10).
-    pub fn find_deployment_by_route(&self, route: &str) -> Result<Option<DeploymentRow>, StoreError> {
+    pub fn find_deployment_by_route(
+        &self,
+        route: &str,
+    ) -> Result<Option<DeploymentRow>, StoreError> {
         let raw: Option<RawDeploymentRow> = self
             .conn
             .query_row(
-                "SELECT id, name, kind, route_model_id, desired_state, observed_state,
-                        schema_version, current_generation
-                 FROM deployments WHERE route_model_id = ?1 ORDER BY updated_at DESC LIMIT 1",
+                // Either route form resolves to the same deployment. Managed
+                // creation refuses a route already claimed elsewhere, so a route
+                // cannot name two deployments across the two tables.
+                "SELECT d.id, d.name, d.kind, d.route_model_id, d.desired_state, d.observed_state,
+                        d.schema_version, d.current_generation
+                 FROM deployments d
+                 WHERE d.route_model_id = ?1
+                    OR EXISTS(SELECT 1 FROM deployment_routes
+                              WHERE route = ?1 AND deployment_id = d.id)
+                 ORDER BY d.updated_at DESC LIMIT 1",
                 [route],
                 |row| {
                     Ok((
@@ -516,8 +791,16 @@ impl crate::Store {
             )
             .optional()?;
         raw.map(
-            |(id, name, kind, route_model_id, desired_state, observed_state, schema_version,
-              current_generation)| {
+            |(
+                id,
+                name,
+                kind,
+                route_model_id,
+                desired_state,
+                observed_state,
+                schema_version,
+                current_generation,
+            )| {
                 Ok(DeploymentRow {
                     id,
                     name,
@@ -551,6 +834,13 @@ impl crate::Store {
                 |row| row.get(0),
             )
             .map_err(StoreError::from)?;
+        // ADR 0013 §5: the F1 bump fences the deployment's first instance, the
+        // one a single-instance deployment runs.
+        conn.execute(
+            "UPDATE deployment_instances SET generation=?2 WHERE deployment_id=?1 AND instance_index=0",
+            params![deployment_id, gen],
+        )
+        .map_err(StoreError::from)?;
         conn.execute(
             "INSERT INTO generation_history(deployment_id, generation) VALUES (?1, ?2)",
             params![deployment_id, gen],
@@ -560,7 +850,10 @@ impl crate::Store {
     }
 
     /// Generation history for a deployment (asc order).
-    pub fn generation_history(&self, deployment_id: &str) -> Result<Vec<GenerationRow>, StoreError> {
+    pub fn generation_history(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Vec<GenerationRow>, StoreError> {
         let conn = &self.conn;
         let mut stmt = conn.prepare(
             "SELECT generation, started_at, ended_at, outcome FROM generation_history
@@ -579,8 +872,40 @@ impl crate::Store {
         Ok(rows)
     }
 
-    /// Administrative suspension flag (T10): admin stop sets it; idle
-    /// eviction leaves it clear.
+    /// Whether an operator has stopped this deployment (T10, SPEC §6.3).
+    ///
+    /// Read only where automatic activation is decided. It is deliberately not the
+    /// `suspended` flag: that one means "eligible to proceed" everywhere in the
+    /// ordinary lifecycle, and setting it on a stop breaks the completion, replay
+    /// and expiry of the stop itself.
+    pub fn is_admin_stopped(&self, id: &str) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT admin_stopped FROM deployments WHERE id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .map_err(StoreError::from)
+    }
+
+    /// Clear or set the operator's stop intent outside an acceptance.
+    ///
+    /// An explicit Start uses this: SPEC §6.3 says a start enables the deployment,
+    /// so it must lift a previous administrative stop rather than be refused by it.
+    pub fn set_admin_stopped(&self, id: &str, stopped: bool) -> Result<(), StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE deployments SET admin_stopped = ?2 WHERE id = ?1",
+            params![id, stopped as i64],
+        )?;
+        if updated == 0 {
+            return Err(invalid_column("deployments"));
+        }
+        Ok(())
+    }
+
+    /// The F1 suspension flag. Nothing in production writes it; the ordinary
+    /// lifecycle reads it as an eligibility gate.
     pub fn set_suspended(&self, id: &str, suspended: bool) -> Result<(), StoreError> {
         let updated = self.conn.execute(
             "UPDATE deployments SET suspended = ?2 WHERE id = ?1",
@@ -622,14 +947,13 @@ impl crate::Store {
                     id: row.get(0)?,
                     deployment_id: row.get(1)?,
                     kind: row.get(2)?,
-                    state: OpState::parse(&row.get::<_, String>(3)?)
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })?,
+                    state: OpState::parse(&row.get::<_, String>(3)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
                     error_code: row.get(4)?,
                     accepted_at: row.get(5)?,
                     updated_at: row.get(6)?,
@@ -655,14 +979,10 @@ impl crate::Store {
 
     /// Deployments currently READY, excluding the named one — the pool
     /// holders the switching engine must drain (F1 design §5).
-    pub fn ready_deployments_excluding(
-        &self,
-        exclude: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    pub fn ready_deployments_excluding(&self, exclude: &str) -> Result<Vec<String>, StoreError> {
         let conn = &self.conn;
-        let mut stmt = conn.prepare(
-            "SELECT id FROM deployments WHERE observed_state = 'ready' AND id != ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM deployments WHERE observed_state = 'ready' AND id != ?1")?;
         let rows = stmt
             .query_map([exclude], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -675,17 +995,65 @@ impl crate::Store {
     pub fn has_supervisor_guarantee(&self, id: &str) -> Result<bool, StoreError> {
         let kind: String = self
             .conn
-            .query_row(
-                "SELECT kind FROM deployments WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT kind FROM deployments WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
             .map_err(StoreError::from)?;
         Ok(kind != "attached")
     }
 
-    /// Stale-generation check (T18): observed must be >= current.
+    /// ADR 0011 decision 4, ADR 0013 §6: close one instance's own admission.
+    /// An instance that gave up is a per-instance failure; its siblings keep
+    /// being admitted. `generation` names the instance incarnation that failed
+    /// (ADR 0013 §5: deployment and generation identify one incarnation).
+    ///
+    /// T18: when that incarnation is no longer current (a stop or a later
+    /// activation fenced it) the report is stale and nothing closes. There is
+    /// deliberately no deployment-wide fallback: one instance's failure must
+    /// never close its siblings. Prefer [`Self::close_instance_admission_at`],
+    /// which also names the instance.
+    pub fn close_instance_admission(
+        &self,
+        deployment_id: &str,
+        generation: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE deployment_instances SET admission_enabled=0 WHERE deployment_id=?1 AND generation=?2",
+            params![deployment_id, generation],
+        )?;
+        Ok(())
+    }
+
+    /// ADR 0011 decision 4, ADR 0013 §6: close exactly instance
+    /// `instance_index` of the deployment, fenced by the generation its plan
+    /// carried. Returns whether the instance was closed; `false` means the
+    /// incarnation is stale (T18) and nothing changed. Siblings and the
+    /// deployment-level switch are never touched.
+    pub fn close_instance_admission_at(
+        &self,
+        deployment_id: &str,
+        instance_index: i64,
+        generation: i64,
+    ) -> Result<bool, StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE deployment_instances SET admission_enabled=0
+             WHERE deployment_id=?1 AND instance_index=?2 AND generation=?3",
+            params![deployment_id, instance_index, generation],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Stale-generation check (T18): observed must be >= current. ADR 0013 §5:
+    /// a generation that is some instance's current one is current.
     pub fn check_generation(&self, deployment_id: &str, observed: i64) -> Result<i64, StoreError> {
+        let instance: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deployment_instances WHERE deployment_id=?1 AND generation=?2)",
+            params![deployment_id, observed],
+            |row| row.get(0),
+        )?;
+        if instance {
+            return Ok(observed);
+        }
         let current: i64 = self
             .conn
             .query_row(
@@ -718,15 +1086,19 @@ impl crate::Store {
                 row.domain_id,
                 row.bytes,
                 row.phase,
-                serde_json::to_string(&row.exclusive_devices)
-                    .map_err(|e| StoreError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?
+                serde_json::to_string(&row.exclusive_devices).map_err(|e| StoreError::Sql(
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+                ))?
             ],
         )
         .map_err(StoreError::from)?;
         Ok(())
     }
 
-    pub fn reservations_for_owner(&self, owner_id: &str) -> Result<Vec<ReservationRow>, StoreError> {
+    pub fn reservations_for_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<ReservationRow>, StoreError> {
         let conn = &self.conn;
         let mut stmt = conn.prepare(
             "SELECT owner_id, domain_id, bytes, phase, exclusive_devices
@@ -740,8 +1112,7 @@ impl crate::Store {
                     domain_id: row.get(1)?,
                     bytes: row.get(2)?,
                     phase: row.get(3)?,
-                    exclusive_devices: serde_json::from_str(&devices)
-                        .unwrap_or_default(),
+                    exclusive_devices: serde_json::from_str(&devices).unwrap_or_default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -765,6 +1136,122 @@ mod tests {
             idempotency_key: key.to_string(),
             initial_operation_id: OperationId(format!("op-{}", ulid::Ulid::new())),
         }
+    }
+
+    /// A managed deployment's routes live in `deployment_routes`; the column on
+    /// the deployment row is the legacy single-route form and managed creation
+    /// deliberately clears it. A router that reads only the column serves nothing
+    /// a managed configuration created, which is every deployment the CLI makes.
+    #[test]
+    fn a_managed_route_is_servable() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "UPDATE deployments SET admission_enabled=1,observed_state='ready' WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO deployment_routes(route,deployment_id) VALUES('managed-route',?1)",
+                [&id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.list_enabled_route_ids().unwrap(),
+            vec!["managed-route".to_string()],
+            "a managed route is listed"
+        );
+        let found = store
+            .find_deployment_by_route("managed-route")
+            .unwrap()
+            .expect("a managed route resolves to its deployment");
+        assert_eq!(found.id, id);
+    }
+
+    /// Suspension and closed admission still hide a managed route, exactly as they
+    /// hide a legacy one. The route's storage changed; the gate did not.
+    #[test]
+    fn a_suspended_managed_route_is_not_listed() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("managed", "managed")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO deployment_routes(route,deployment_id) VALUES('managed-route',?1)",
+                [&id],
+            )
+            .unwrap();
+        for sql in [
+            "UPDATE deployments SET admission_enabled=1,suspended=1 WHERE id=?1",
+            "UPDATE deployments SET admission_enabled=0,suspended=0 WHERE id=?1",
+        ] {
+            store.conn.execute(sql, [&id]).unwrap();
+            assert!(
+                store.list_enabled_route_ids().unwrap().is_empty(),
+                "a closed or suspended deployment offers no route"
+            );
+        }
+    }
+
+    /// SPEC §3: the engine is launched to answer to the frozen revision's first
+    /// route, so the name the router addresses it by has to come from that same
+    /// list in that same order. `deployment_routes` carries no ordinal, so a query
+    /// over it can only order by route text; here that would name "alpha" and every
+    /// request would reach an engine serving "zeta".
+    // T19
+    #[test]
+    fn the_served_name_is_the_frozen_revisions_first_route_not_the_alphabetical_one() {
+        let store = Store::open_in_memory().unwrap();
+        let accepted = store.accept_deployment(req("ordered", "ordered")).unwrap();
+        let id = accepted.deployment_id.to_string();
+        store
+            .conn
+            .execute(
+                "INSERT INTO effective_revisions(deployment_id,revision,effective_json,fingerprint) \
+                 VALUES(?1,1,?2,'fp')",
+                params![&id, r#"{"routes":["zeta","alpha"]}"#],
+            )
+            .unwrap();
+        for route in ["alpha", "zeta"] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO deployment_routes(route,deployment_id) VALUES(?1,?2)",
+                    params![route, &id],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.effective_routes(&id).unwrap(),
+            vec!["zeta".to_string(), "alpha".to_string()],
+            "the frozen revision's order is preserved"
+        );
+    }
+
+    /// A deployment that predates managed configuration has no frozen revision and
+    /// keeps its one route in the column, which is still the answer.
+    // T19
+    #[test]
+    fn a_legacy_deployment_without_a_frozen_revision_still_reports_its_route() {
+        let store = Store::open_in_memory().unwrap();
+        let mut request = req("legacy", "legacy");
+        request.route_model_id = Some("legacy-route".to_string());
+        let accepted = store.accept_deployment(request).unwrap();
+        assert_eq!(
+            store
+                .effective_routes(&accepted.deployment_id.to_string())
+                .unwrap(),
+            vec!["legacy-route".to_string()]
+        );
+        assert!(store.effective_routes("missing").unwrap().is_empty());
     }
 
     #[test]
@@ -857,5 +1344,86 @@ mod tests {
             .unwrap();
         assert_eq!(op.as_deref(), Some("op-1"));
         assert_eq!(evidence, "{}");
+    }
+
+    /// A two-instance managed deployment: instance 0 at generation 4 and
+    /// instance 1 at generation 5, both admitted.
+    fn two_admitted_instances(s: &Store) {
+        s.conn
+            .execute_batch(
+                r#"INSERT INTO deployments(id,name,kind,desired_state,observed_state,admission_enabled,dispatch_enabled,suspended,current_generation,schema_version,revision) VALUES('d','d','model','ready','ready',1,1,0,5,1,1);
+                INSERT INTO effective_revisions VALUES('d',1,'{}','f');
+                INSERT INTO deployment_revision_instances(deployment_id,revision,instances,placement_json) VALUES('d',1,2,'{"hosts":null,"selector":{},"strategy":"spread","max_per_host":null}');
+                INSERT INTO deployment_instances(deployment_id,instance_index) VALUES('d',1);
+                UPDATE deployment_instances SET revision=1,generation=4,desired_state='ready',observed_state='ready',admission_enabled=1,dispatch_enabled=1 WHERE deployment_id='d' AND instance_index=0;
+                UPDATE deployment_instances SET revision=1,generation=5,desired_state='ready',observed_state='ready',admission_enabled=1,dispatch_enabled=1 WHERE deployment_id='d' AND instance_index=1;"#,
+            )
+            .unwrap();
+    }
+
+    fn instance_admission(s: &Store) -> Vec<(i64, i64)> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT instance_index,admission_enabled FROM deployment_instances WHERE deployment_id='d' ORDER BY instance_index")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// ADR 0011 decision 4, ADR 0013 §6: one instance that gave up closes only
+    /// its own admission; its sibling and the deployment keep being admitted.
+    // T16 T29
+    #[test]
+    fn one_instance_failure_closes_only_that_instance() {
+        let s = Store::open_in_memory().unwrap();
+        two_admitted_instances(&s);
+        assert!(s.close_instance_admission_at("d", 1, 5).unwrap());
+        assert_eq!(instance_admission(&s), vec![(0, 1), (1, 0)]);
+        let deployment: i64 = s
+            .conn
+            .query_row("SELECT admission_enabled FROM deployments WHERE id='d'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deployment, 1, "the deployment keeps admitting through instance 0");
+    }
+
+    /// T18: a failure reported for an incarnation a later activation or a stop
+    /// already replaced is stale. It closes nothing, and never falls back to
+    /// closing every instance of the deployment.
+    // T16 T18
+    #[test]
+    fn a_stale_instance_failure_closes_nothing() {
+        let s = Store::open_in_memory().unwrap();
+        two_admitted_instances(&s);
+        // Generation 4 is instance 0's, not instance 1's.
+        assert!(!s.close_instance_admission_at("d", 1, 4).unwrap());
+        assert!(!s.close_instance_admission_at("d", 1, 3).unwrap());
+        assert_eq!(instance_admission(&s), vec![(0, 1), (1, 1)]);
+        // The generation-only form has no deployment-wide fallback either.
+        s.close_instance_admission("d", 3).unwrap();
+        assert_eq!(instance_admission(&s), vec![(0, 1), (1, 1)]);
+        s.close_instance_admission("d", 5).unwrap();
+        assert_eq!(instance_admission(&s), vec![(0, 1), (1, 0)]);
+    }
+
+    /// The deployment-level switch writes the instances and the deployment row
+    /// together or not at all.
+    // T16
+    #[test]
+    fn deployment_admission_switch_is_atomic() {
+        let s = Store::open_in_memory().unwrap();
+        two_admitted_instances(&s);
+        s.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_deployment_write BEFORE UPDATE OF updated_at ON deployments
+                 BEGIN SELECT RAISE(ABORT,'refused'); END;",
+            )
+            .unwrap();
+        assert!(s.set_admission_enabled("d", false).is_err());
+        assert_eq!(instance_admission(&s), vec![(0, 1), (1, 1)]);
+        s.conn.execute_batch("DROP TRIGGER refuse_deployment_write").unwrap();
+        s.set_admission_enabled("d", false).unwrap();
+        assert_eq!(instance_admission(&s), vec![(0, 0), (1, 0)]);
     }
 }

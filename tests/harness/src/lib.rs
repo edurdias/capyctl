@@ -4,8 +4,22 @@
 //! design (readiness gating, the deep-park policy gate, cancellation
 //! uncertainty, and handle ownership) against ANY [`EngineAdapter`] /
 //! [`Launcher`] pair. The F1/F2 real adapters run this suite in addition to
-//! their own tests; the fake engine in `mllm-adapters::fake` is the
-//! reference implementation these checks were developed against.
+//! their own tests; the Fake engine in `mllm-testkit` is the reference
+//! implementation these checks were developed against, and passing against it
+//! is never qualification of a native recipe.
+
+pub mod f2_pressure;
+pub mod f2_monitor;
+pub mod f2_metrics;
+pub mod f2_bounds;
+pub mod f2_correctness;
+pub mod f2_collected;
+pub mod f2_streamed;
+pub mod f2_sse;
+pub mod f2_timing;
+pub mod f2_records;
+#[cfg(target_os = "linux")]
+pub mod f2_artifacts;
 
 use mllm_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
@@ -332,7 +346,7 @@ fn check_handle_ownership(launcher: &dyn Launcher) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mllm_adapters::fake::{FakeEngine, FakeLauncher};
+    use mllm_testkit::{FakeEngine, FakeLauncher};
     use mllm_adapters::{
         CancellationOutcome, EngineState, ExitReport, LauncherError, ParkOutcome, Quiescence,
         ReloadOutcome, RestoreOutcome, WorkObservation,

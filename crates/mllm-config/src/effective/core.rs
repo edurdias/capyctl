@@ -1,4 +1,4 @@
-//! Private normalization shared by ordinary deployments and candidate manifests.
+//! Private normalization shared by the ordinary deployment paths.
 
 use super::*;
 
@@ -8,7 +8,6 @@ pub(super) struct NormalizedProfile {
     pub(super) executable: String,
     pub(super) build_fingerprint: String,
     pub(super) args: Vec<String>,
-    pub(super) launch_settings: ProfileLaunchSettings,
     pub(super) env: BTreeMap<String, String>,
     pub(super) security: Security,
     pub(super) log_policy: LogPolicy,
@@ -72,7 +71,10 @@ pub(super) fn normalize_profile(
             "runtime and admin credential references must differ",
         ));
     }
-    validate_profile_args(raw_profile.engine, &raw_profile.args)
+    // ADR 0014 §1, §3: host-fixed arguments are the installation's own; they
+    // are free of the approved-flag list but never of the reserved one.
+    let sleep_mode = raw_profile.security.deep_park.is_enabled() && residency.parks();
+    validate_profile_args(raw_profile.engine, &raw_profile.args, sleep_mode)
         .map_err(|e| invalid("runtime_profiles.args", e.to_string()))?;
     validate_profile_env(&raw_profile.env).map_err(|_| {
         invalid(
@@ -80,20 +82,53 @@ pub(super) fn normalize_profile(
             "environment name is not allowlisted",
         )
     })?;
-    let launch_settings = normalize_launch(
-        raw_profile.launch_settings.clone(),
-        raw_profile.engine,
-        residency,
-    )?;
-    let uses_experimental_controls = match &launch_settings {
-        ProfileLaunchSettings::Vllm(settings) => settings.enable_sleep_mode,
-        ProfileLaunchSettings::Sglang(settings) => settings.memory_saver,
-        ProfileLaunchSettings::Fake(_) => false,
-    };
-    if uses_experimental_controls && !raw_profile.security.experimental_controls {
+    // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
+    // with the checkpoint. There are models that need it, but a profile may only
+    // pass it where the host has said so in as many words.
+    if !raw_profile.security.trust_remote_code
+        && raw_profile
+            .args
+            .iter()
+            .any(|argument| normalize_option_name(argument) == "--trust-remote-code")
+    {
         return Err(invalid(
-            "runtime_profiles.security.experimental_controls",
-            "launch settings require explicit experimental controls policy",
+            "runtime_profiles.security.trust_remote_code",
+            "`--trust-remote-code` executes code shipped with the checkpoint; it \
+             requires security.trust_remote_code: true on this profile",
+        ));
+    }
+    // SPEC §9.1 / T21 / ADR 0012: deep park is on unless the host opts out. A
+    // deployment that asks to park on an opted-out profile is refused here rather
+    // than launched and then found unable to park, which would surface only under
+    // memory pressure.
+    if raw_profile.security.deep_park == DeepPark::Disabled && residency.parks() {
+        return Err(invalid(
+            "runtime_profiles.security.deep_park",
+            "a parking deployment cannot run on a profile that opts out of deep park \
+             (deep_park: disabled); use residency: restart_only or remove the opt-out",
+        ));
+    }
+    for path in &raw_profile.security.approved_paths {
+        if !Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)))
+        {
+            return Err(invalid(
+                "runtime_profiles.security.approved_paths",
+                "every approved path must be an absolute, normalized directory",
+            ));
+        }
+    }
+    if raw_profile
+        .security
+        .approved_options
+        .iter()
+        .any(|name| !name.starts_with("--") || name.len() <= 2 || name.contains('='))
+    {
+        return Err(invalid(
+            "runtime_profiles.security.approved_options",
+            "every approved option is a long option name such as `--tool-parser-plugin`",
         ));
     }
     let profile = NormalizedProfile {
@@ -102,7 +137,6 @@ pub(super) fn normalize_profile(
         executable: raw_profile.executable.clone(),
         build_fingerprint: raw_profile.build_fingerprint.clone(),
         args: raw_profile.args.clone(),
-        launch_settings,
         env: raw_profile.env.clone(),
         security: raw_profile.security.clone(),
         log_policy: LogPolicy {
@@ -111,6 +145,95 @@ pub(super) fn normalize_profile(
         },
     };
     Ok(profile)
+}
+
+/// Resolve a deployment's `model` block into its identity.
+///
+/// Spec §7: `path` and `source` are two spellings of the same thing and exactly
+/// one may appear. `store` is the host's model store, or `None` where no host is
+/// in hand — a command fingerprint is computed from the document alone, so it
+/// resolves nothing and every `resolved_path` is `None` there.
+///
+/// An absolute local path is used as written, including one that leaves the store.
+/// That is deliberate: the operator writing the host file decides where weights
+/// may live, and confining paths to the store would stop a host from serving a
+/// checkpoint it already has elsewhere.
+pub(super) fn normalize_model(
+    raw: RawModel,
+    store: Option<&Path>,
+) -> Result<ModelIdentity, ConfigError> {
+    let source = match (raw.path, raw.source) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "model",
+                "state either `path` or `source`, not both",
+            ))
+        }
+        (None, None) => return Err(invalid("model", "a model source is required")),
+        (Some(path), None) => ModelSource::Local { path },
+        (None, Some(source)) => source,
+    };
+    match &source {
+        ModelSource::Local { path } => {
+            if path.is_empty() {
+                return Err(invalid("model.source.path", "must not be empty"));
+            }
+        }
+        ModelSource::HuggingFace {
+            repo,
+            revision,
+            locked_commit,
+        } => {
+            if repo.is_empty() {
+                return Err(invalid("model.source.repo", "must not be empty"));
+            }
+            for (path, value) in [
+                ("model.source.revision", revision),
+                ("model.source.locked_commit", locked_commit),
+            ] {
+                if value.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid(path, "must not be empty when stated"));
+                }
+            }
+        }
+        ModelSource::Http { url, sha256 } => {
+            // Spec §7: weights fetched over plain HTTP could be replaced in flight,
+            // and a digest is the only thing that makes the fetch reproducible, so
+            // both are required rather than recommended.
+            if !url.starts_with("https://") || url.len() <= "https://".len() {
+                return Err(invalid("model.source.url", "must be an https:// URL"));
+            }
+            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid(
+                    "model.source.sha256",
+                    "must be 64 hexadecimal characters",
+                ));
+            }
+        }
+    }
+    let resolved_path = match (&source, store) {
+        (ModelSource::Local { path }, Some(store)) => {
+            let candidate = Path::new(path);
+            let resolved = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                store.join(candidate)
+            };
+            Some(
+                resolved
+                    .to_str()
+                    .ok_or_else(|| invalid("model.source.path", "must be valid UTF-8"))?
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    };
+    Ok(ModelIdentity {
+        source,
+        resolved_path,
+        content_fingerprint: raw.content_fingerprint,
+        revision: raw.revision,
+    })
 }
 
 pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
@@ -126,6 +249,32 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             return Err(invalid(path, "must not be empty"));
         }
     }
+    // The inventory digest is the host's published claim about its own NVIDIA
+    // device inventory (sglang_device's `mllm-nvidia-inventory-v1` material). It
+    // is versioned evidence the native placement gate asserts against, never a
+    // reinterpretation of the opaque hardware fingerprint, so it must be a
+    // lowercase hex digest exactly as the collector computes it.
+    if let Some(digest) = h.device_inventory_digest.as_ref() {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(invalid(
+                "host.device_inventory_digest",
+                "must be 64 lowercase hexadecimal characters",
+            ));
+        }
+    }
+    // Spec §7: the store anchors every relative model path, so it has to be a
+    // place, not a fragment that means something different per working directory.
+    let model_store = PathBuf::from(h.model_store.path);
+    if !model_store.is_absolute() {
+        return Err(invalid("host.model_store.path", "must be absolute"));
+    }
+    if let Some(labels) = &h.resource_policy.labels {
+        crate::instances::validate_labels(labels)?;
+    }
     let mut domains = BTreeMap::new();
     for (name, raw) in h.resource_policy.domains {
         let value = DomainPolicy {
@@ -133,6 +282,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             free_reserve: parse_bytes(&raw.free_reserve)?,
             host_kv_limit: raw.host_kv_limit.as_deref().map(parse_bytes).transpose()?,
             parked_limit: raw.parked_limit.as_deref().map(parse_bytes).transpose()?,
+            memory: raw.memory,
         };
         domains.insert(name, value);
     }
@@ -142,6 +292,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         max_buffered_bytes_total: None,
         request_deadline: None,
         admission_window: None,
+        stream_idle_timeout: None,
     });
     let queue = QueuePolicy {
         max_pending_per_deployment: raw_queue
@@ -166,6 +317,12 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             .map(parse_duration_ms)
             .transpose()?
             .unwrap_or(DEFAULT_ADMISSION_WINDOW_MS),
+        stream_idle_ms: raw_queue
+            .stream_idle_timeout
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()?
+            .unwrap_or(DEFAULT_STREAM_IDLE_MS),
     };
     let max_parked = h.resource_policy.max_parked.unwrap_or(DEFAULT_MAX_PARKED);
     let observation_ttl_ms = h
@@ -179,11 +336,25 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         .resource_policy
         .planner_max_states
         .unwrap_or(DEFAULT_PLANNER_STATES);
-    let qualification_policy = normalize_qualification_policy(h.qualification_policy)?;
+    // A published physical UUID is placement evidence the launcher sets the
+    // child's CUDA namespace from, so it must be the exact shape the inventory
+    // collector validates (`runtime/sglang_device.py`), not any opaque token.
+    for (name, device) in &h.resource_policy.devices {
+        if let Some(uuid) = device.physical_gpu_uuid.as_ref() {
+            if !is_physical_gpu_uuid(uuid) {
+                return Err(invalid(
+                    format!("resource_policy.devices.{name}.physical_gpu_uuid"),
+                    "must be a GPU- prefixed lowercase physical UUID",
+                ));
+            }
+        }
+    }
     let host = HostPolicy {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
         environment_fingerprint: h.environment_fingerprint,
+        device_inventory_digest: h.device_inventory_digest,
+        model_store,
         domains,
         devices: h.resource_policy.devices,
         max_parked,
@@ -192,7 +363,6 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
         endpoint_port_range: h.resource_policy.endpoint_port_range,
         planner_max_states,
         queue,
-        qualification_policy,
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)
@@ -249,8 +419,27 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
         &resources.wake,
     ] {
         for a in &p.allocations {
-            if !host.domains.contains_key(&a.domain) {
-                return Err(invalid("resources.allocations.domain", "unknown domain"));
+            let domain = host
+                .domains
+                .get(&a.domain)
+                .ok_or_else(|| invalid("resources.allocations.domain", "unknown domain"))?;
+            // SPEC §6.2's host-backed park retains a weight backup in host RAM. Where a
+            // domain's device and host memory are one pool, that allocates from the
+            // pool it is supposed to free, so the park succeeds and releases nothing.
+            // The failure is otherwise silent, which is why it is refused here rather
+            // than at first park. Every phase is checked, not just one, because this
+            // check should not depend on another validator's guarantee (elsewhere in
+            // this module) that every phase names the same domain set.
+            if d.residency == Residency::HostBacked && domain.memory == DomainMemory::Unified {
+                return Err(invalid(
+                    "residency",
+                    format!(
+                        "host_backed retains weights in host memory, but domain \
+                         '{}' declares device and host memory as one pool, so it \
+                         would free nothing; use deep or restart_only",
+                        a.domain
+                    ),
+                ));
             }
         }
     }
@@ -264,20 +453,53 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
 }
 
 pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), ConfigError> {
+    validate_identity_intrinsic(
+        &d.model,
+        &d.recipe,
+        &d.devices,
+        d.request_deadline_ms,
+    )?;
+    validate_resources_intrinsic(&d.resources, &d.devices)
+}
+
+/// The intrinsic rules that do not depend on resource phases. ADR 0014 §5: a
+/// deployment may omit `resources:`, and its command identity is then checked
+/// without them.
+pub(super) fn validate_identity_intrinsic(
+    model: &ModelIdentity,
+    recipe: &str,
+    devices: &[DeviceClaim],
+    request_deadline_ms: i64,
+) -> Result<(), ConfigError> {
     for (path, value) in [
-        ("model.path", &d.model.path),
-        ("model.content_fingerprint", &d.model.content_fingerprint),
-        ("model.revision", &d.model.revision),
-        ("recipe", &d.recipe),
+        ("model.content_fingerprint", model.content_fingerprint.as_str()),
+        ("model.revision", model.revision.as_str()),
+        ("recipe", recipe),
     ] {
         if value.is_empty() {
             return Err(invalid(path, "must not be empty"));
         }
     }
-    if !Path::new(&d.model.path).is_absolute() {
-        return Err(invalid("model.path", "must be absolute"));
+    // The model source itself is checked by `normalize_model`, which is the only
+    // way a `ModelIdentity` is built; there is no absolute-path rule left here
+    // because a relative local path is legal and resolves against the host store.
+    let selected: BTreeMap<_, _> = devices.iter().map(|x| (x.id.as_str(), x.sharing)).collect();
+    if selected.len() != devices.len() {
+        return Err(invalid("devices", "device IDs must be unique"));
     }
-    let resources = &d.resources;
+    if request_deadline_ms <= 0 {
+        return Err(invalid(
+            "request_deadline",
+            "deployment deadline may only shorten host limit",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_resources_intrinsic(
+    resources: &RecipeFootprints,
+    devices: &[DeviceClaim],
+) -> Result<(), ConfigError> {
     domain::validate_recipe(&domain::RecipeFootprints {
         cold: domain_phase(&resources.cold, domain::ResourcePhase::Cold),
         ready: domain_phase(&resources.ready, domain::ResourcePhase::Ready),
@@ -286,14 +508,7 @@ pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), Conf
         wake: domain_phase(&resources.wake, domain::ResourcePhase::Wake),
     })
     .map_err(|e| invalid("resources", e.to_string()))?;
-    let selected: BTreeMap<_, _> = d
-        .devices
-        .iter()
-        .map(|x| (x.id.as_str(), x.sharing))
-        .collect();
-    if selected.len() != d.devices.len() {
-        return Err(invalid("devices", "device IDs must be unique"));
-    }
+    let selected: BTreeMap<_, _> = devices.iter().map(|x| (x.id.as_str(), x.sharing)).collect();
     for p in [
         &resources.cold,
         &resources.ready,
@@ -310,23 +525,18 @@ pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), Conf
             }
         }
     }
-    if d.request_deadline_ms <= 0 {
-        return Err(invalid(
-            "request_deadline",
-            "deployment deadline may only shorten host limit",
-        ));
-    }
     Ok(())
 }
 
-pub(super) fn qualification_fingerprint(
+pub(super) fn recipe_fingerprint(
     d: &NormalizedRecipe,
     profile: &NormalizedProfile,
+    engine_config: &LaunchSettings,
     host: &HostPolicy,
 ) -> Result<String, ConfigError> {
     let resources = &d.resources;
     #[derive(Serialize)]
-    struct Qualification<'a> {
+    struct Recipe<'a> {
         model: &'a ModelIdentity,
         recipe: &'a str,
         residency: Residency,
@@ -340,16 +550,20 @@ pub(super) fn qualification_fingerprint(
         executable: &'a str,
         build_fingerprint: &'a str,
         args: &'a [String],
-        launch_settings: &'a ProfileLaunchSettings,
+        engine_config: &'a LaunchSettings,
         env: &'a BTreeMap<String, String>,
-        experimental_controls: bool,
+        deep_park: DeepPark,
+        trust_remote_code: bool,
+        extra_args_policy: ExtraArgsPolicy,
+        approved_options: &'a [String],
+        approved_paths: &'a [String],
         runtime_auth: bool,
         admin_auth: bool,
         log_policy: &'a LogPolicy,
         hardware_fingerprint: &'a str,
         environment_fingerprint: &'a str,
     }
-    let material = Qualification {
+    let material = Recipe {
         model: &d.model,
         recipe: &d.recipe,
         residency: d.residency,
@@ -363,17 +577,36 @@ pub(super) fn qualification_fingerprint(
         executable: &profile.executable,
         build_fingerprint: &profile.build_fingerprint,
         args: &profile.args,
-        launch_settings: &profile.launch_settings,
+        engine_config,
         env: &profile.env,
-        experimental_controls: profile.security.experimental_controls,
+        deep_park: profile.security.deep_park,
+        trust_remote_code: profile.security.trust_remote_code,
+        extra_args_policy: profile.security.extra_args,
+        approved_options: &profile.security.approved_options,
+        approved_paths: &profile.security.approved_paths,
         runtime_auth: profile.security.credential_ref.is_some(),
         admin_auth: profile.security.admin_credential_ref.is_some(),
         log_policy: &profile.log_policy,
         hardware_fingerprint: &host.hardware_fingerprint,
         environment_fingerprint: &host.environment_fingerprint,
     };
-    let qualification_fingerprint = hex::encode(Sha256::digest(
+    let recipe_fingerprint = hex::encode(Sha256::digest(
         serde_json::to_vec(&material).map_err(|e| invalid("fingerprint", e.to_string()))?,
     ));
-    Ok(qualification_fingerprint)
+    Ok(recipe_fingerprint)
+}
+
+/// The physical UUID shape `runtime/sglang_device.py` validates
+/// (`GPU-` + 8-4-4-4 lowercase hex, 32 hex digits in all). Both sides refuse
+/// exactly the same inputs, so a policy UUID the collector would not have
+/// observed never reaches the launcher.
+pub(super) fn is_physical_gpu_uuid(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("GPU-") else {
+        return false;
+    };
+    rest.len() == 36
+        && rest.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
 }

@@ -232,7 +232,14 @@ fn write_credentials_from(state_dir: &Path, entropy: &str) -> Result<bool, Confi
 }
 
 /// Render the SPEC §16.5 standalone default with per-user absolute paths.
+///
+/// SPEC §15.3: it states only what the standalone role honours
+/// ([`crate::standalone::check_honoured`]). The §16.5 example's `tls` block is
+/// left out because the standalone listeners serve plain HTTP on loopback.
 fn render_standalone(state_dir: &Path) -> String {
+    // SPEC §16.5: relative paths in the document would resolve against the
+    // configuration file, not the working directory, so state them absolute.
+    let state_dir = std::path::absolute(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
     let state = state_dir.to_string_lossy();
     format!(
         "schema_version: 1\n\
@@ -248,9 +255,6 @@ fn render_standalone(state_dir: &Path) -> String {
          \x20   inference:\n\
          \x20     bind: \"127.0.0.1:8443\"\n\
          \x20     authentication: api_key\n\
-         \x20 tls:\n\
-         \x20   mode: managed\n\
-         \x20   identity_dir: \"{state}/identity\"\n\
          host:\n\
          \x20 name: local\n\
          \x20 state_dir: \"{state}/host\"\n\
@@ -307,6 +311,16 @@ mod tests {
             std::env::temp_dir().join(format!("mllm-defaults-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // T02 T03 (SPEC §15.3): the generated standalone document states nothing the
+    // role would ignore.
+    #[test]
+    fn the_generated_standalone_document_is_honoured_in_full() {
+        let d = temp_dir();
+        let yaml = render_standalone(&d);
+        let document = crate::strict_yaml::parse_strict(ConfigKind::Standalone, &yaml).unwrap();
+        crate::standalone::check_honoured(&document, &d.join("config"), &d).unwrap();
     }
 
     #[test]

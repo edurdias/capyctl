@@ -1,116 +1,35 @@
-//! Embedded host supervision (F0): runs the fake engine adapter and fake
-//! launcher in-process against the controller's requests.
+//! Embedded host supervision: the doctor's host checks and the host memory
+//! observation the controller admits against.
 //!
-//! No enrollment, no network: the standalone deployment graph is
-//! server + host over one store. The host carries the deep-park security
-//! gate at its default [`ParkPolicy::Denied`] — experimental level-2 park
-//! and weight reload are deterministically denied unless a later phase
-//! explicitly opts the host in (design §9.1).
+//! The embedded fake host that used to live here left with the Fake engine: a
+//! host that supervises nothing real has no place in the shipped binary, and the
+//! tests that drove it now inject the Fake through the engine provider
+//! (`mllm-testkit`).
 
-use std::sync::Arc;
-
-use mllm_adapters::fake::{FakeEngine, FakeLauncher, ParkPolicy};
-
+// ADR 0014 §7 (WE3): checkpoint digest measured on the host.
+pub mod checkpoint;
 pub mod doctor;
+pub mod enrollment;
+// SPEC §13.2 (W13): exits of owned engine processes, reported to the controller.
+pub mod exits;
+pub mod identity;
+pub mod identity_storage;
+pub mod ingress;
+pub mod ingress_identity;
+// ADR 0008 (owner decision 2026-09-23): installation fingerprints and
+// launch-time capability probes, instead of pinned hashes.
+pub mod installation;
+pub mod load;
 pub mod memory;
-use mllm_adapters::{EngineAdapter, Launcher};
+// ADR 0007: per-process resident memory, sampled beside availability.
+pub mod process_residency;
+// SPEC §8.2 / T21: per-launch SGLang rendezvous directories, removed on gone.
+pub mod rendezvous;
+// SPEC §9.1, §13.3: mllm's runtime directory is what this account put there.
+pub mod runtime_integrity;
 
-/// An embedded, supervised host in F0: fake engine + fake launcher,
-/// both shared behind arcs so the controller can execute against them.
-#[derive(Debug)]
-pub struct Host {
-    engine: Arc<FakeEngine>,
-    launcher: Arc<FakeLauncher>,
-}
+pub mod journal;
 
-impl Host {
-    /// Boot an embedded host with the default (denied) deep-park policy.
-    pub fn new() -> Self {
-        Self {
-            engine: Arc::new(FakeEngine::new()),
-            launcher: Arc::new(FakeLauncher::new()),
-        }
-    }
+pub mod session;
 
-    /// The engine-side participant the controller executes operations against.
-    pub fn adapter(&self) -> Arc<dyn EngineAdapter> {
-        self.engine.clone()
-    }
-
-    /// The process-side participant used to spawn and terminate engines.
-    pub fn launcher(&self) -> Arc<dyn Launcher> {
-        self.launcher.clone()
-    }
-
-    /// The host's deep-park policy gate (F0 default: [`ParkPolicy::Denied`]).
-    pub fn park_policy(&self) -> ParkPolicy {
-        ParkPolicy::Denied
-    }
-}
-
-impl Default for Host {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mllm_adapters::{AdapterError, MemberRef, ParkLevel};
-
-    #[tokio::test]
-    async fn embedded_host_denies_experimental_deep_park_by_default() {
-        let host = Host::new();
-        assert_eq!(host.park_policy(), ParkPolicy::Denied);
-        let member = MemberRef { deployment_id: "d-1".into(), member_id: "m-1".into() };
-        let err = host
-            .adapter()
-            .park(&member, ParkLevel::Two)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AdapterError::PolicyDenied));
-    }
-
-    #[tokio::test]
-    async fn embedded_host_runs_the_fake_lifecycle_pieces() {
-        let host = Host::new();
-        let member = MemberRef { deployment_id: "d-1".into(), member_id: "m-1".into() };
-        // Startup is not readiness: inspect before any readiness check shows Startup.
-        assert_eq!(host.adapter().inspect(&member).await.unwrap().phase, mllm_adapters::Phase::Startup);
-        let cmd = host
-            .adapter()
-            .render_plan(&mllm_adapters::PlanInput {
-                deployment_id: "d-1".into(),
-                member_id: "m-1".into(),
-                park_level: None,
-                engine_api_key: None,
-            })
-            .await
-            .unwrap();
-        let handle = host.launcher().spawn(&cmd).unwrap();
-        assert_eq!(
-            host.launcher().verify_handle(&handle),
-            mllm_adapters::HandleStatus::Valid
-        );
-        assert_eq!(
-            host.adapter().check_readiness(&member).await.unwrap(),
-            mllm_adapters::Readiness::Ready
-        );
-        let parked = host
-            .adapter()
-            .park(&member, ParkLevel::One)
-            .await
-            .unwrap();
-        assert!(matches!(parked, mllm_adapters::ParkOutcome::Parked { .. }));
-        assert_eq!(
-            host.adapter().restore(&member).await.unwrap(),
-            mllm_adapters::RestoreOutcome::Restored
-        );
-        let report = host
-            .launcher()
-            .terminate(&handle, std::time::Duration::from_secs(1))
-            .unwrap();
-        assert_eq!(report.exit_code, Some(0));
-    }
-}
+pub mod native_execution;

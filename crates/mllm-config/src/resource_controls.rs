@@ -89,6 +89,7 @@ impl ResourceControls {
             || !(1..=3_600_000).contains(&self.queue.request_deadline_ms)
             || !(1..=30_000).contains(&self.queue.admission_window_ms)
             || self.queue.admission_window_ms > self.queue.request_deadline_ms
+            || !(1_000..=3_600_000).contains(&self.queue.stream_idle_ms)
         {
             return Err(invalid("invalid bounded resource controls"));
         }
@@ -114,7 +115,9 @@ impl ResourceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effective::{DevicePolicy, DomainPolicy, PortRange, QueuePolicy, Sharing};
+    use crate::effective::{
+        DevicePolicy, DomainMemory, DomainPolicy, PortRange, QueuePolicy, Sharing,
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     fn host() -> crate::effective::HostPolicy {
@@ -123,12 +126,15 @@ mod tests {
             name: context.host_id,
             hardware_fingerprint: "hardware-secret-owner".into(),
             environment_fingerprint: "environment-secret-owner".into(),
+            device_inventory_digest: None,
+            model_store: "/srv/models".into(),
             domains: controls.domains,
             devices: BTreeMap::from([(
                 "gpu0".into(),
                 DevicePolicy {
                     domain: "system".into(),
                     sharing: Sharing::Exclusive,
+                    physical_gpu_uuid: None,
                 },
             )]),
             max_parked: controls.max_parked,
@@ -137,7 +143,6 @@ mod tests {
             endpoint_port_range: context.endpoint_port_range,
             planner_max_states: controls.planner_max_states,
             queue: controls.queue,
-            qualification_policy: None,
         }
     }
 
@@ -159,6 +164,7 @@ mod tests {
                     free_reserve: 16 << 30,
                     host_kv_limit: Some(8 << 30),
                     parked_limit: Some(32 << 30),
+                    memory: DomainMemory::Distinct,
                 },
             )]),
             max_parked: 16,
@@ -170,6 +176,7 @@ mod tests {
                 max_buffered_bytes_total: 1 << 30,
                 request_deadline_ms: 3_600_000,
                 admission_window_ms: 30_000,
+                stream_idle_ms: 3_600_000,
             },
             device_sharing: Sharing::Shared,
             device_sharing_overrides: BTreeMap::from([("gpu0".into(), Sharing::Exclusive)]),

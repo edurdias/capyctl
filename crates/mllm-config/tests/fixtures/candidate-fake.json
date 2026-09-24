@@ -13,7 +13,7 @@
       "revision": "r1"
     },
     "recipe": "standard",
-    "residency": "warm",
+    "residency": "deep",
     "recovery": "reconcile",
     "runtime_profile": "local",
     "runtime_profile_revision": 7,

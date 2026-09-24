@@ -1,20 +1,54 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
-pub mod candidate;
+mod checkpoint;
 mod core;
+mod current_policy;
+mod engine_config;
+mod legacy;
+mod snapshot;
+mod startup;
+mod timeouts;
+pub use legacy::{
+    is_legacy_effective, legacy_engine_config, legacy_retained_deployment,
+    migrate_legacy_effective, strip_legacy_launch_settings, LegacyEffectiveMigration,
+    LegacyRefusal,
+};
+pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
+pub use engine_config::{
+    default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
+    MemoryInputs, ResolvedMemory, STARTUP_WEIGHTS_FACTOR,
+    PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES, VLLM_OVERHEAD_MARGIN_BYTES,
+};
+pub use snapshot::decode_effective_snapshot;
+// Owner decision 2026-09-23: the startup memory budget.
+pub use startup::{
+    measurable, startup_budget, validate_declared_startup, StartupBudget, StartupProvenance,
+};
+// Owner decision 2026-09-22 (1), ADR 0014 amendment A1: lifecycle timeouts.
+pub use timeouts::{
+    derived_initialize_ms, derived_wake_ms, lifecycle_windows, validate_declared_timeouts,
+    DeploymentTimeouts, TimeoutBasis, TimeoutSource, INITIALIZE_BASE_MS, INITIALIZE_CAP_MS,
+    INITIALIZE_PER_GB_MS, MIN_INITIALIZE_MS, MIN_WAKE_MS, PENDING_INITIALIZE_MS,
+    PENDING_WAKE_MS, STOP_WINDOW_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
+};
+// ADR 0014 §7 (WE3): checkpoint identity.
+pub use checkpoint::{
+    checkpoint_location, declared_checkpoint_digest, is_checkpoint_digest,
+    resolve_snapshot_with_checkpoint, CheckpointLocation, CHECKPOINT_DIGEST_PREFIX,
+};
 
-use crate::engine_policy::{validate_profile_args, validate_profile_env};
+use crate::engine_policy::{
+    normalize_option_name, validate_profile_args, validate_profile_env, ExtraArgsPolicy,
+};
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
-use mllm_domain::launch::{
-    FakeLaunchSettings, ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget,
-    VllmLaunchSettings, VllmRequestedBudget,
-};
+use engine_config::RawEngineConfig;
+use mllm_domain::launch::LaunchSettings;
 use mllm_domain::resources as domain;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn invalid(path: impl Into<String>, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
@@ -25,6 +59,9 @@ const DEFAULT_PENDING_TOTAL: u32 = 256;
 const DEFAULT_QUEUED_BYTES: i64 = 64 << 20;
 const DEFAULT_REQUEST_DEADLINE_MS: i64 = 600_000;
 const DEFAULT_ADMISSION_WINDOW_MS: i64 = 2_000;
+/// SPEC §10: how long a relayed stream may go without a backend event before
+/// the router gives up on it. Not a cap on a progressing stream's length.
+pub const DEFAULT_STREAM_IDLE_MS: i64 = 120_000;
 const DEFAULT_OBSERVATION_TTL_MS: i64 = 2_000;
 const DEFAULT_PLANNER_STATES: u32 = 4_096;
 const DEFAULT_MAX_PARKED: u32 = 16;
@@ -135,24 +172,98 @@ pub struct EffectiveDeployment {
     pub selected_devices: Vec<DeviceClaim>,
     pub resources: RecipeFootprints,
     pub request_deadline_ms: i64,
+    /// ADR 0014 amendment A1: the Initialize and wake timeouts, declared or
+    /// derived from the checkpoint's weights, with provenance (T14). Not part
+    /// of the recipe fingerprint: it bounds operations, not what is launched.
+    pub timeouts: DeploymentTimeouts,
+    /// ADR 0014 §1: the deployment's resolved engine configuration, with the
+    /// values mllm derived or defaulted named in its provenance (T14).
+    pub engine_config: LaunchSettings,
     pub profile: RuntimeProfile,
     pub host: HostPolicy,
-    pub qualification_fingerprint: String,
+    pub recipe_fingerprint: String,
+}
+
+/// Where a deployment's weights come from, per SPEC §7.
+///
+/// Only `Local` names a file the host already holds. `HuggingFace` and `Http`
+/// describe a fetch that a later slice performs; the resolver validates their
+/// shape and stops there, because a resolver that reached the network would make
+/// validating a configuration depend on a remote service being up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelSource {
+    /// A path on the host. Relative paths resolve against the host's model store;
+    /// an absolute path is taken as written.
+    Local { path: String },
+    /// A Hugging Face repository. `revision` is a branch or tag; `locked_commit`
+    /// is the immutable commit a fetch must end up at.
+    #[serde(rename = "huggingface")]
+    HuggingFace {
+        repo: String,
+        #[serde(default)]
+        revision: Option<String>,
+        #[serde(default)]
+        locked_commit: Option<String>,
+    },
+    /// An archive over HTTPS, pinned by content digest.
+    Http { url: String, sha256: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelIdentity {
-    pub path: String,
+    pub source: ModelSource,
+    /// The absolute local path the source resolves to, or `None` where it does not
+    /// resolve to one yet. Read it through [`ModelIdentity::require_resolved_path`]
+    /// rather than unwrapping, so a caller that needs a real file fails closed.
+    pub resolved_path: Option<String>,
     pub content_fingerprint: String,
     pub revision: String,
 }
 
+impl ModelIdentity {
+    /// The local path, or `NotMaterializable` for a source that has none.
+    ///
+    /// SPEC §13.3: a launch needs a directory on disk. Anything that cannot name
+    /// one must refuse rather than invent a cache location.
+    pub fn require_resolved_path(&self) -> Result<&str, ConfigError> {
+        self.resolved_path.as_deref().ok_or_else(|| {
+            ConfigError::new(
+                ConfigErrorCode::NotMaterializable,
+                "model.source",
+                "this model source names no local path; only a local source \
+                 resolves to one before the fetcher lands",
+            )
+        })
+    }
+}
+
+/// Which park a deployment asks for, per SPEC §6.2.
+///
+/// `auto` from the spec is deliberately absent: selecting a tier at runtime is a
+/// fallback ladder, and SGLang cannot implement one because its memory-saver and
+/// weights-CPU-backup are startup flags that a running engine cannot acquire.
+/// `deep_required` is absent for the same reason it is unnecessary — a declared tier
+/// the profile or host cannot deliver is already a validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Residency {
-    Warm,
+    /// Stop and initialize again. First-class behaviour, including for backends with
+    /// no qualified memory-release API.
     RestartOnly,
+    /// Weights retained in host RAM, KV dropped. Frees nothing where device and host
+    /// memory are one pool, which the host check refuses (ADR 0010 decision 5).
+    HostBacked,
+    /// Weights and KV released; weights re-read from the checkpoint on wake.
+    Deep,
+}
+
+impl Residency {
+    /// Whether this tier parks at all, as opposed to stopping and starting again.
+    pub fn parks(self) -> bool {
+        matches!(self, Self::HostBacked | Self::Deep)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,20 +308,147 @@ pub struct RuntimeProfile {
     pub revision: u64,
     pub executable: String,
     pub build_fingerprint: String,
-    pub qualification_id: String,
+    /// ADR 0014 §1: host-fixed arguments of the installation.
     pub args: Vec<String>,
-    pub launch_settings: ProfileLaunchSettings,
     pub env: BTreeMap<String, String>,
     pub security: Security,
     pub log_policy: LogPolicy,
 }
 
+/// Whether this profile may park at all.
+/// SPEC §9.1 / T21 / ADR 0012: deep parking is enabled unless host policy
+/// forbids it; `deep_park: disabled` is the host opt-out. Enablement never
+/// relaxes the mandatory controls (loopback engine listener, per-launch key,
+/// guard middleware, no control path through ingress or the router).
+/// Legacy `experimental_controls` remains rejected by `Security`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepPark {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+impl DeepPark {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// SPEC §7 / T14: where a profile's `deep_park` value came from. Derived at
+/// resolution, never declared: a host document naming it is refused as an
+/// unknown field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepParkSource {
+    /// The host policy declared `deep_park`.
+    #[default]
+    HostPolicy,
+    /// The host policy omitted it and the ADR 0012 default applied.
+    Default,
+}
+
+impl DeepParkSource {
+    pub fn is_host_policy(&self) -> bool {
+        matches!(self, Self::HostPolicy)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawSecurity")]
 pub struct Security {
-    pub experimental_controls: bool,
+    pub deep_park: DeepPark,
+    /// SPEC §7 / T14: shown only when the value was defaulted, so a profile that
+    /// declares the switch serializes exactly as it did before provenance existed.
+    #[serde(skip_serializing_if = "DeepParkSource::is_host_policy")]
+    pub deep_park_source: DeepParkSource,
+    /// Whether this profile may run an engine flag that executes Python shipped
+    /// inside a checkpoint. SPEC §3: off unless the host says otherwise.
+    pub trust_remote_code: bool,
     pub credential_ref: Option<String>,
     pub admin_credential_ref: Option<String>,
+    /// ADR 0014 §6 (owner decision Q10): deployment extra arguments are allowed
+    /// unless the host denies them.
+    pub extra_args: ExtraArgsPolicy,
+    /// ADR 0014 §8: security-sensitive options approved by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_options: Vec<String>,
+    /// ADR 0014 §8: directories an approved path option may name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_paths: Vec<String>,
+    /// ADR 0008 (owner decision 2026-09-23): what a launch does when the
+    /// installation no longer measures to the fingerprint recorded at
+    /// registration. Shown only when the host declared `refuse`, so a profile
+    /// without it serializes exactly as before.
+    #[serde(skip_serializing_if = "InstallationDrift::is_warn")]
+    pub installation_drift: InstallationDrift,
+}
+
+/// ADR 0008 (owner decision 2026-09-23): host policy for installation drift.
+/// `warn` (the default) flags drift in the host's status and the event journal
+/// and launches; `refuse` refuses the launch with the closed reason
+/// `installation_drift` before any effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationDrift {
+    #[default]
+    Warn,
+    Refuse,
+}
+
+impl InstallationDrift {
+    pub fn is_warn(&self) -> bool {
+        matches!(self, Self::Warn)
+    }
+}
+
+/// The declared shape of a profile's `security` block. `deep_park` is optional
+/// here so resolution can tell a declared value from the ADR 0012 default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecurity {
+    // An explicit `null` is not an omission: it is refused like any other
+    // value that is neither `enabled` nor `disabled`.
+    #[serde(default, deserialize_with = "declared_deep_park")]
+    deep_park: Option<DeepPark>,
+    #[serde(default)]
+    trust_remote_code: bool,
+    credential_ref: Option<String>,
+    admin_credential_ref: Option<String>,
+    #[serde(default)]
+    extra_args: ExtraArgsPolicy,
+    #[serde(default)]
+    approved_options: Vec<String>,
+    #[serde(default)]
+    approved_paths: Vec<String>,
+    #[serde(default)]
+    installation_drift: InstallationDrift,
+}
+
+fn declared_deep_park<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DeepPark>, D::Error> {
+    DeepPark::deserialize(deserializer).map(Some)
+}
+
+impl From<RawSecurity> for Security {
+    fn from(raw: RawSecurity) -> Self {
+        let (deep_park, deep_park_source) = match raw.deep_park {
+            Some(declared) => (declared, DeepParkSource::HostPolicy),
+            None => (DeepPark::default(), DeepParkSource::Default),
+        };
+        Self {
+            deep_park,
+            deep_park_source,
+            trust_remote_code: raw.trust_remote_code,
+            credential_ref: raw.credential_ref,
+            admin_credential_ref: raw.admin_credential_ref,
+            extra_args: raw.extra_args,
+            approved_options: raw.approved_options,
+            approved_paths: raw.approved_paths,
+            installation_drift: raw.installation_drift,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -224,6 +462,17 @@ pub struct HostPolicy {
     pub name: String,
     pub hardware_fingerprint: String,
     pub environment_fingerprint: String,
+    /// The host's published NVIDIA device inventory digest
+    /// (`runtime/sglang_device.collect_inventory()` schema
+    /// `mllm-nvidia-inventory-v1`), stated at boot like the fingerprints.
+    /// Optional: a host that has not published one launches with placement
+    /// unasserted and fails closed at the native placement gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_inventory_digest: Option<String>,
+    /// Absolute directory this host keeps model weights under. SPEC §7: a relative
+    /// local model path is resolved against it, so it is required rather than
+    /// defaulted — a guessed directory would resolve paths somewhere unnamed.
+    pub model_store: PathBuf,
     pub domains: BTreeMap<String, DomainPolicy>,
     pub devices: BTreeMap<String, DevicePolicy>,
     pub max_parked: u32,
@@ -232,73 +481,20 @@ pub struct HostPolicy {
     pub endpoint_port_range: PortRange,
     pub planner_max_states: u32,
     pub queue: QueuePolicy,
-    pub qualification_policy: Option<QualificationPolicy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct QualificationPolicy {
-    pub revision: i64,
-    pub allow_qualification_runs: bool,
-    pub allow_experimental_controls: bool,
-    pub allowed_manifest_digests: Vec<String>,
-    pub max_run_duration_ms: i64,
-    pub max_cleanup_duration_ms: i64,
-    pub max_cases: u32,
-    pub max_requests: u32,
-    pub max_request_body_bytes: i64,
-    pub max_input_tokens_per_request: u32,
-    pub max_output_tokens_per_request: u32,
-}
-
-impl QualificationPolicy {
-    /// Revalidates normalized policy data before a persistence boundary.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        let encoding_len = serde_json::to_vec(self)
-            .map_err(|_| invalid("qualification_policy", "policy could not be encoded"))?
-            .len();
-        if encoding_len > 1 << 20
-            || self.revision <= 0
-            || self.allowed_manifest_digests.len() > 1_024
-            || self.max_cases == 0
-            || self.max_cases > 128
-            || self.max_requests == 0
-            || self.max_requests > 4_096
-            || self.max_input_tokens_per_request == 0
-            || self.max_input_tokens_per_request > 131_072
-            || self.max_output_tokens_per_request == 0
-            || self.max_output_tokens_per_request > 16_384
-            || !(1..=86_400_000).contains(&self.max_run_duration_ms)
-            || !(1..=3_600_000).contains(&self.max_cleanup_duration_ms)
-            || !(1..=(1 << 20)).contains(&self.max_request_body_bytes)
-        {
-            return Err(invalid(
-                "qualification_policy",
-                "qualification policy exceeds bounded positive limits",
-            ));
-        }
-        if self.allowed_manifest_digests.iter().any(|digest| {
-            digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        }) {
-            return Err(invalid(
-                "qualification_policy.allowed_manifest_digests",
-                "manifest digest must be canonical lowercase SHA-256 hex",
-            ));
-        }
-        if self
-            .allowed_manifest_digests
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        {
-            return Err(invalid(
-                "qualification_policy.allowed_manifest_digests",
-                "manifest digests must be sorted and distinct",
-            ));
-        }
-        Ok(())
-    }
+/// Whether a domain's device memory and host memory are one physical pool.
+///
+/// On a unified-memory host such as a GB10, retaining a weight backup "in host RAM"
+/// allocates from the same pool the device allocates from, so it frees nothing. Only
+/// the operator registering the host knows this; it must not be inferred from a
+/// domain's name or from which limits are set. SPEC §6.2's host-backed park is
+/// meaningful only where this is `Distinct`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainMemory {
+    Unified,
+    Distinct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -307,12 +503,21 @@ pub struct DomainPolicy {
     pub free_reserve: i64,
     pub host_kv_limit: Option<i64>,
     pub parked_limit: Option<i64>,
+    pub memory: DomainMemory,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevicePolicy {
     pub domain: String,
     pub sharing: Sharing,
+    /// The device's physical GPU UUID as the `mllm-nvidia-inventory-v1`
+    /// collector observed it. Service-authorized placement evidence: the
+    /// guarded launcher sets the engine child's `CUDA_VISIBLE_DEVICES` from
+    /// it, and the native placement gate corroborates it against a freshly
+    /// collected inventory. Optional: a host that publishes no inventory
+    /// publishes no UUID, and placement then fails closed at the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_gpu_uuid: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -327,6 +532,15 @@ pub struct QueuePolicy {
     pub max_buffered_bytes_total: i64,
     pub request_deadline_ms: i64,
     pub admission_window_ms: i64,
+    /// SPEC §10: the idle bound between a relayed stream's backend events
+    /// (`queue.stream_idle_timeout`). Omitted from the encoding at its default,
+    /// so policies published before it existed keep their identity.
+    #[serde(skip_serializing_if = "is_default_stream_idle")]
+    pub stream_idle_ms: i64,
+}
+
+fn is_default_stream_idle(value: &i64) -> bool {
+    *value == DEFAULT_STREAM_IDLE_MS
 }
 
 #[derive(Deserialize)]
@@ -335,7 +549,7 @@ struct DeploymentInput {
     schema_version: u32,
     kind: String,
     name: String,
-    model: ModelIdentity,
+    model: RawModel,
     routes: Vec<String>,
     runtime_profile: String,
     runtime_profile_revision: u64,
@@ -343,9 +557,51 @@ struct DeploymentInput {
     residency: Residency,
     recovery: Recovery,
     devices: Vec<DeviceClaim>,
-    resources: RawRecipe,
+    /// ADR 0014 §5: optional; derived from `engine_config.memory` when omitted.
+    #[serde(default)]
+    resources: Option<RawRecipe>,
     request_deadline: Option<String>,
+    /// ADR 0014 amendment A1: optional; derived when omitted.
+    #[serde(default)]
+    timeouts: Option<timeouts::RawTimeouts>,
+    #[serde(default)]
+    engine_config: RawEngineConfig,
+    /// ADR 0013 §2: instance count, placement constraints and the `host`
+    /// shorthand are deployment-level and shared by every instance; they are
+    /// validated by `instances::parse_instance_spec` and never enter the
+    /// per-host recipe or its fingerprint.
+    #[serde(default, rename = "instances")]
+    _instances: Option<serde_json::Value>,
+    #[serde(default, rename = "placement")]
+    _placement: Option<serde_json::Value>,
+    #[serde(default, rename = "host")]
+    _host: Option<serde_json::Value>,
+    /// SPEC §6.5 (ADR 0013 amendment 2026-09-23): `lifecycle.warm` is a
+    /// deployment-level policy parsed with the instance spec; it never enters
+    /// the per-host recipe or its fingerprint.
+    #[serde(default, rename = "lifecycle")]
+    _lifecycle: Option<serde_json::Value>,
 }
+/// A deployment's `model` block as written. SPEC §7 accepts two spellings: the
+/// original `path`, and `source`, which can also name a remote origin. Exactly one
+/// of them must be present, so a file cannot state a path and a source that differ.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModel {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    source: Option<ModelSource>,
+    content_fingerprint: String,
+    revision: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelStore {
+    path: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRecipe {
@@ -376,27 +632,14 @@ struct HostInput {
     name: String,
     hardware_fingerprint: String,
     environment_fingerprint: String,
+    #[serde(default)]
+    device_inventory_digest: Option<String>,
+    model_store: RawModelStore,
     resource_policy: RawHostPolicy,
     runtime_profiles: BTreeMap<String, RawProfile>,
-    qualification_policy: Option<RawQualificationPolicy>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawQualificationPolicy {
-    revision: i64,
-    allow_qualification_runs: bool,
-    allow_experimental_controls: bool,
-    allowed_manifest_digests: Vec<String>,
-    max_run_duration: String,
-    max_cleanup_duration: String,
-    max_cases: u32,
-    max_requests: u32,
-    max_request_body_bytes: String,
-    max_input_tokens_per_request: u32,
-    max_output_tokens_per_request: u32,
-}
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHostPolicy {
     domains: BTreeMap<String, RawDomain>,
@@ -407,23 +650,108 @@ struct RawHostPolicy {
     endpoint_port_range: PortRange,
     planner_max_states: Option<u32>,
     queue: Option<RawQueue>,
+    /// ADR 0013 §2: placement labels, validated by
+    /// `instances::host_labels`; they select hosts and change no resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    labels: Option<BTreeMap<String, String>>,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDomain {
     managed_limit: String,
     free_reserve: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     host_kv_limit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parked_limit: Option<String>,
+    memory: DomainMemory,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawQueue {
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_pending_per_deployment: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_pending_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_buffered_bytes_total: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     request_deadline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     admission_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_idle_timeout: Option<String>,
+}
+
+/// Composes the `resource_policy` object of a host document's raw JSON shape from
+/// normalized resource controls, by constructing the same `Raw*` structs that
+/// `resolve_effective` parses rather than writing keys by hand. This is the one
+/// writer of that shape: a required field added to `RawDomain`, `RawHostPolicy`, or
+/// `RawQueue` breaks this struct literal at compile time instead of silently being
+/// omitted at runtime by an independent hand-built JSON writer.
+///
+/// SPEC §6.2: a domain's memory topology is a declared hardware fact, required on
+/// every domain, so it must round-trip through composition like the other required
+/// fields.
+pub fn compose_resource_policy(
+    controls: &crate::resource_controls::ResourceControls,
+    context: &crate::resource_controls::ResourceContext,
+) -> serde_json::Value {
+    let domains: BTreeMap<String, RawDomain> = controls
+        .domains
+        .iter()
+        .map(|(id, d)| {
+            (
+                id.clone(),
+                RawDomain {
+                    managed_limit: format!("{}B", d.managed_limit),
+                    free_reserve: format!("{}B", d.free_reserve),
+                    host_kv_limit: d.host_kv_limit.map(|n| format!("{n}B")),
+                    parked_limit: d.parked_limit.map(|n| format!("{n}B")),
+                    memory: d.memory,
+                },
+            )
+        })
+        .collect();
+    let devices: BTreeMap<String, DevicePolicy> = context
+        .device_domains
+        .iter()
+        .map(|(id, domain)| {
+            let sharing = controls
+                .device_sharing_overrides
+                .get(id)
+                .copied()
+                .unwrap_or(controls.device_sharing);
+            (
+                id.clone(),
+                DevicePolicy {
+                    domain: domain.clone(),
+                    sharing,
+                    physical_gpu_uuid: None,
+                },
+            )
+        })
+        .collect();
+    let raw = RawHostPolicy {
+        domains,
+        devices,
+        max_parked: Some(controls.max_parked),
+        observation_ttl: Some(format!("{}ms", controls.observation_ttl_ms)),
+        device_sharing: controls.device_sharing,
+        endpoint_port_range: context.endpoint_port_range.clone(),
+        planner_max_states: Some(controls.planner_max_states),
+        queue: Some(RawQueue {
+            max_pending_per_deployment: Some(controls.queue.max_pending_per_deployment),
+            max_pending_total: Some(controls.queue.max_pending_total),
+            max_buffered_bytes_total: Some(format!("{}B", controls.queue.max_buffered_bytes_total)),
+            request_deadline: Some(format!("{}ms", controls.queue.request_deadline_ms)),
+            admission_window: Some(format!("{}ms", controls.queue.admission_window_ms)),
+            stream_idle_timeout: (controls.queue.stream_idle_ms != DEFAULT_STREAM_IDLE_MS)
+                .then(|| format!("{}ms", controls.queue.stream_idle_ms)),
+        }),
+        labels: None,
+    };
+    serde_json::to_value(&raw).expect("Raw* composition types always encode to JSON")
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -432,62 +760,16 @@ struct RawProfile {
     revision: u64,
     executable: String,
     build_fingerprint: String,
-    #[serde(default)]
-    qualification_id: MissingAwareQualification,
     args: Vec<String>,
-    launch_settings: RawLaunchSettings,
     env: BTreeMap<String, String>,
     security: Security,
     log_policy: RawLogPolicy,
-}
-#[derive(Clone, Default)]
-enum MissingAwareQualification {
-    #[default]
-    Missing,
-    Present(Option<String>),
-}
-impl<'de> Deserialize<'de> for MissingAwareQualification {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Option::<String>::deserialize(deserializer).map(Self::Present)
-    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLogPolicy {
     max_file_bytes: String,
     retained_files: u32,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
-enum RawLaunchSettings {
-    Vllm {
-        tensor_parallel_size: u32,
-        pipeline_parallel_size: u32,
-        enable_sleep_mode: bool,
-        kv_cache_dtype: String,
-        block_size_tokens: u32,
-        cpu_offload_bytes: String,
-        requested_budget: RawVllmBudget,
-    },
-    Sglang {
-        recipe: String,
-        requested_budget: RawSglangBudget,
-    },
-    Fake,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawVllmBudget {
-    kv_cache_bytes: String,
-    swap_space_bytes: String,
-    gpu_utilization_pct: u8,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSglangBudget {
-    kv_cache_bytes: String,
-    static_memory_fraction_bps: u16,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(
@@ -539,155 +821,6 @@ fn decode<T: for<'de> Deserialize<'de>>(
     })
 }
 
-fn normalize_qualification_policy(
-    raw: Option<RawQualificationPolicy>,
-) -> Result<Option<QualificationPolicy>, ConfigError> {
-    let Some(mut raw) = raw else {
-        return Ok(None);
-    };
-    raw.allowed_manifest_digests.sort();
-    let max_run_duration_ms = parse_duration_ms(&raw.max_run_duration)?;
-    let max_cleanup_duration_ms = parse_duration_ms(&raw.max_cleanup_duration)?;
-    let max_request_body_bytes = parse_bytes(&raw.max_request_body_bytes)?;
-    let policy = QualificationPolicy {
-        revision: raw.revision,
-        allow_qualification_runs: raw.allow_qualification_runs,
-        allow_experimental_controls: raw.allow_experimental_controls,
-        allowed_manifest_digests: raw.allowed_manifest_digests,
-        max_run_duration_ms,
-        max_cleanup_duration_ms,
-        max_cases: raw.max_cases,
-        max_requests: raw.max_requests,
-        max_request_body_bytes,
-        max_input_tokens_per_request: raw.max_input_tokens_per_request,
-        max_output_tokens_per_request: raw.max_output_tokens_per_request,
-    };
-    policy.validate()?;
-    Ok(Some(policy))
-}
-
-fn normalize_launch(
-    raw: RawLaunchSettings,
-    engine: Engine,
-    residency: Residency,
-) -> Result<ProfileLaunchSettings, ConfigError> {
-    let settings = match raw {
-        RawLaunchSettings::Vllm {
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            enable_sleep_mode,
-            kv_cache_dtype,
-            block_size_tokens,
-            cpu_offload_bytes,
-            requested_budget,
-        } => {
-            if engine != Engine::Vllm {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.engine",
-                    "launch settings engine mismatch",
-                ));
-            }
-            let value = VllmLaunchSettings {
-                tensor_parallel_size,
-                pipeline_parallel_size,
-                enable_sleep_mode,
-                kv_cache_dtype,
-                block_size_tokens,
-                cpu_offload_bytes: parse_bytes(&cpu_offload_bytes)?,
-                requested_budget: VllmRequestedBudget {
-                    kv_cache_bytes: parse_bytes(&requested_budget.kv_cache_bytes)?,
-                    swap_space_bytes: parse_bytes(&requested_budget.swap_space_bytes)?,
-                    gpu_utilization_pct: requested_budget.gpu_utilization_pct,
-                },
-            };
-            if value.tensor_parallel_size == 0
-                || value.pipeline_parallel_size == 0
-                || value.block_size_tokens == 0
-                || value.kv_cache_dtype.is_empty()
-                || value.cpu_offload_bytes < 0
-                || value.requested_budget.kv_cache_bytes <= 0
-                || value.requested_budget.swap_space_bytes < 0
-                || !(1..=100).contains(&value.requested_budget.gpu_utilization_pct)
-            {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings",
-                    "invalid vLLM launch settings",
-                ));
-            }
-            if residency == Residency::Warm && !value.enable_sleep_mode {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.enable_sleep_mode",
-                    "warm vLLM requires sleep mode",
-                ));
-            }
-            ProfileLaunchSettings::Vllm(value)
-        }
-        RawLaunchSettings::Sglang {
-            recipe,
-            requested_budget,
-        } => {
-            if engine != Engine::Sglang {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.engine",
-                    "launch settings engine mismatch",
-                ));
-            }
-            const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
-            if recipe != RECIPE {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.recipe",
-                    "unsupported SGLang recipe",
-                ));
-            }
-            let budget = SglangRequestedBudget {
-                kv_cache_bytes: parse_bytes(&requested_budget.kv_cache_bytes)?,
-                static_memory_fraction_bps: requested_budget.static_memory_fraction_bps,
-            };
-            if budget.kv_cache_bytes <= 0
-                || !(1..=10_000).contains(&budget.static_memory_fraction_bps)
-            {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.requested_budget",
-                    "invalid SGLang requested budget",
-                ));
-            }
-            ProfileLaunchSettings::Sglang(SglangLaunchSettings {
-                recipe,
-                tensor_parallel_size: 1,
-                data_parallel_size: 1,
-                tokenizer_workers: 1,
-                model_dtype: "bfloat16".into(),
-                context_tokens: 4096,
-                max_running_requests: 8,
-                max_total_tokens: 4096,
-                prefill_cuda_graphs: false,
-                decode_cuda_graphs: false,
-                memory_saver: true,
-                cpu_weight_backup: false,
-                speculative_decoding: false,
-                lora: false,
-                trust_remote_code: false,
-                disaggregation: false,
-                external_cache: false,
-                cpu_kv_offload: false,
-                native_grpc: false,
-                weight_restore: "disk_reload".into(),
-                requested_budget: budget,
-            })
-        }
-        RawLaunchSettings::Fake => {
-            if engine != Engine::Fake {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.engine",
-                    "launch settings engine mismatch",
-                ));
-            }
-            ProfileLaunchSettings::Fake(FakeLaunchSettings)
-        }
-    };
-    Ok(settings)
-}
-
 fn phase(raw: RawPhase) -> Result<PhaseFootprint, ConfigError> {
     Ok(PhaseFootprint {
         allocations: raw
@@ -705,36 +838,46 @@ fn phase(raw: RawPhase) -> Result<PhaseFootprint, ConfigError> {
     })
 }
 
+fn raw_recipe(raw: RawRecipe) -> Result<RecipeFootprints, ConfigError> {
+    Ok(RecipeFootprints {
+        cold: phase(raw.cold)?,
+        ready: phase(raw.ready)?,
+        parking: phase(raw.parking)?,
+        parked: phase(raw.parked)?,
+        wake: phase(raw.wake)?,
+    })
+}
+
+/// Decode a host document, refusing moved fields with a pointer first.
+fn decode_host(host: &serde_json::Value) -> Result<HostInput, ConfigError> {
+    engine_config::refuse_moved_profile_fields(host)?;
+    decode(host, "host")
+}
+
 pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
 ) -> Result<EffectiveDeployment, ConfigError> {
-    if host
-        .get("qualification_policy")
-        .is_some_and(|policy| serde_json::to_vec(policy).is_ok_and(|bytes| bytes.len() > 1 << 20))
-    {
-        return Err(invalid(
-            "host.qualification_policy",
-            "qualification policy encoding exceeds 1MiB",
-        ));
-    }
+    resolve_effective_with_checkpoint(deployment, host, CheckpointFacts::default())
+}
+
+/// ADR 0014 §5, §7: resolve with what the checkpoint manifest says, so a memory
+/// request the deployment omitted can be derived from the weights' size. Both
+/// sides of a launch must resolve with the same facts to agree on the result.
+pub fn resolve_effective_with_checkpoint(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    facts: CheckpointFacts,
+) -> Result<EffectiveDeployment, ConfigError> {
     let d: DeploymentInput = decode(deployment, "deployment")?;
-    let h: HostInput = decode(host, "host")?;
+    let h: HostInput = decode_host(host)?;
+    // ADR 0013 §2–3: refuse an unplaceable or contradictory instance
+    // declaration before resolving anything against this host.
+    crate::instances::parse_instance_spec(deployment)?;
     if d.schema_version != 1 || d.kind != "deployment" {
         return Err(invalid(
             "schema_version",
             "schema version 1 and deployment kind required",
-        ));
-    }
-    if h.runtime_profiles.values().any(|profile| {
-        !matches!(
-            profile.qualification_id,
-            MissingAwareQualification::Present(Some(_))
-        )
-    }) {
-        return Err(invalid(
-            "runtime_profiles.qualification_id",
-            "qualification reference is required for ordinary host resolution",
         ));
     }
     if d.name.is_empty() {
@@ -750,30 +893,57 @@ pub fn resolve_effective(
         .runtime_profiles
         .get(&d.runtime_profile)
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
-    let qualification_id = match &raw_profile.qualification_id {
-        MissingAwareQualification::Present(Some(value)) if !value.is_empty() => value.clone(),
-        _ => {
-            return Err(invalid(
-                "runtime_profiles.qualification_id",
-                "selected qualification reference must be nonempty",
-            ))
-        }
-    };
     let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
     let host = core::normalize_host(h)?;
+    let model = core::normalize_model(d.model, Some(&host.model_store))?;
+    let declared_resources = d.resources.map(raw_recipe).transpose()?;
+    let declared_ready_total = declared_resources.as_ref().map(|resources| {
+        resources
+            .ready
+            .allocations
+            .iter()
+            .fold(0_i64, |total, a| total.saturating_add(a.bytes))
+    });
+    let mut engine_config = engine_config::normalize_engine_config(
+        d.engine_config,
+        engine_config::EngineInputs {
+            engine: profile.engine,
+            residency: d.residency,
+            security: &profile.security,
+            profile_args: &profile.args,
+            checkpoint_root: model.resolved_path.as_deref().map(Path::new),
+            declared_ready_total,
+            facts,
+        },
+    )?;
+    let resources = match declared_resources {
+        Some(resources) => resources,
+        None => {
+            let derived = engine_config::derive_resources(
+                engine_config.memory().request_bytes,
+                engine_config.memory().startup_bytes,
+                d.residency,
+                &d.devices,
+                &host,
+            )?;
+            let provenance = match &mut engine_config {
+                LaunchSettings::Vllm(settings) => &mut settings.provenance,
+                LaunchSettings::Sglang(settings) => &mut settings.provenance,
+            };
+            provenance.insert(
+                "resources".into(),
+                mllm_domain::launch::SettingSource::Derived,
+            );
+            derived
+        }
+    };
     let recipe = core::NormalizedRecipe {
-        model: d.model,
+        model,
         recipe: d.recipe,
         residency: d.residency,
         recovery: d.recovery,
         devices: d.devices,
-        resources: RecipeFootprints {
-            cold: phase(d.resources.cold)?,
-            ready: phase(d.resources.ready)?,
-            parking: phase(d.resources.parking)?,
-            parked: phase(d.resources.parked)?,
-            wake: phase(d.resources.wake)?,
-        },
+        resources,
         request_deadline_ms: d
             .request_deadline
             .as_deref()
@@ -782,7 +952,9 @@ pub fn resolve_effective(
             .unwrap_or(host.queue.request_deadline_ms),
     };
     core::validate_recipe(&recipe, &host)?;
-    let qualification_fingerprint = core::qualification_fingerprint(&recipe, &profile, &host)?;
+    let timeouts =
+        timeouts::resolve_timeouts(d.timeouts.as_ref(), recipe.request_deadline_ms, facts)?;
+    let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &engine_config, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,
         name: d.name,
@@ -794,21 +966,26 @@ pub fn resolve_effective(
         selected_devices: recipe.devices,
         resources: recipe.resources,
         request_deadline_ms: recipe.request_deadline_ms,
+        timeouts,
+        engine_config,
         profile: RuntimeProfile {
             engine: profile.engine,
             revision: profile.revision,
             executable: profile.executable,
             build_fingerprint: profile.build_fingerprint,
-            qualification_id,
             args: profile.args,
-            launch_settings: profile.launch_settings,
             env: profile.env,
             security: profile.security,
             log_policy: profile.log_policy,
         },
         host,
-        qualification_fingerprint,
+        recipe_fingerprint,
     })
+}
+
+/// SPEC §7: normalize a declared host policy without selecting or launching a model.
+pub fn normalize_host_policy(host: &serde_json::Value) -> Result<HostPolicy, ConfigError> {
+    core::normalize_host(decode_host(host)?)
 }
 
 pub fn binding_fingerprint(

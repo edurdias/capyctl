@@ -1,7 +1,27 @@
-pub mod fake;
+pub mod forward;
+// SPEC §§6.4, 13.2: the bounded summary of an engine that exited before readiness.
+pub mod launch_failure;
+// SPEC §9.1, §13.3 / T21 T37: the owner-only rule for mllm's runtime helpers.
+pub mod owner_only;
+pub mod policy;
+pub mod protected;
+pub mod resolve;
+pub mod sglang;
 pub mod traits;
 pub mod vllm;
 
+pub use policy::ParkPolicy;
+pub use protected::{ProtectedDescriptorError, ProtectedLaunchDescriptors};
+
+/// Where the park policy used to live, kept as a path only.
+///
+/// The Fake engine and the fake launcher left this crate for `mllm-testkit`; the
+/// owner's untracked live test still spells the policy's old location, and this
+/// branch may not edit that file. Nothing else may use this path.
+#[doc(hidden)]
+pub mod fake {
+    pub use crate::policy::ParkPolicy;
+}
 pub use traits::*;
 
 #[cfg(test)]
@@ -27,7 +47,11 @@ mod tests {
         async fn prepare_park(&self, _member: &MemberRef) -> Result<Quiescence, AdapterError> {
             Err(AdapterError::Uncertain("null adapter".into()))
         }
-        async fn park(&self, _member: &MemberRef, _level: ParkLevel) -> Result<ParkOutcome, AdapterError> {
+        async fn park(
+            &self,
+            _member: &MemberRef,
+            _level: ParkLevel,
+        ) -> Result<ParkOutcome, AdapterError> {
             Err(AdapterError::Uncertain("null adapter".into()))
         }
         async fn restore(&self, _member: &MemberRef) -> Result<RestoreOutcome, AdapterError> {
@@ -51,7 +75,10 @@ mod tests {
     }
 
     fn member() -> MemberRef {
-        MemberRef { deployment_id: "d-1".into(), member_id: "m-1".into() }
+        MemberRef {
+            deployment_id: "d-1".into(),
+            member_id: "m-1".into(),
+        }
     }
 
     #[tokio::test]
@@ -73,11 +100,18 @@ mod tests {
 
     #[test]
     fn payload_types_carry_the_fields_task_9_reads() {
-        let state = EngineState { phase: Phase::Ready, retained_bytes: 1024, build_fingerprint: None };
+        let state = EngineState {
+            phase: Phase::Ready,
+            retained_bytes: 1024,
+            build_fingerprint: None,
+        };
         assert_eq!(state.retained_bytes, 1024);
         assert_eq!(state.phase, Phase::Ready);
 
-        let handle = OwnedHandle { pid: 4242, start_identity: 0xdead_beef_u128 };
+        let handle = OwnedHandle {
+            pid: 4242,
+            start_identity: 0xdead_beef_u128,
+        };
         assert_eq!(handle.pid, 4242);
         assert_eq!(handle.start_identity, 0xdead_beef_u128);
 
@@ -99,7 +133,11 @@ mod tests {
             fn spawn(&self, _cmd: &RenderedCommand) -> Result<OwnedHandle, LauncherError> {
                 Err(LauncherError::SpawnFailed("null launcher".into()))
             }
-            fn terminate(&self, _h: &OwnedHandle, _grace: Duration) -> Result<ExitReport, LauncherError> {
+            fn terminate(
+                &self,
+                _h: &OwnedHandle,
+                _grace: Duration,
+            ) -> Result<ExitReport, LauncherError> {
                 Err(LauncherError::TerminateFailed("null launcher".into()))
             }
             fn verify_handle(&self, _h: &OwnedHandle) -> HandleStatus {
@@ -108,9 +146,15 @@ mod tests {
         }
 
         let l = NullLauncher;
-        let cmd = RenderedCommand { argv: vec!["engine".into()], env: Default::default() };
+        let cmd = RenderedCommand {
+            argv: vec!["engine".into()],
+            env: Default::default(),
+        };
         assert!(l.spawn(&cmd).is_err());
-        let h = OwnedHandle { pid: 1, start_identity: 1 };
+        let h = OwnedHandle {
+            pid: 1,
+            start_identity: 1,
+        };
         assert_eq!(l.verify_handle(&h), HandleStatus::Gone);
         assert!(l.terminate(&h, Duration::from_secs(1)).is_err());
     }

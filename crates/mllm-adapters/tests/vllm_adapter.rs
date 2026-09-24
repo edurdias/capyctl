@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::Json;
-use mllm_adapters::fake::{FakeLauncher, ParkPolicy};
+use harness::{run_conformance, ParkGateMode};
 use mllm_adapters::traits::EngineAdapter;
 use mllm_adapters::vllm::VllmAdapter;
+use mllm_adapters::ParkPolicy;
 use mllm_adapters::{MemberRef, ParkLevel, Readiness};
-use harness::{run_conformance, ParkGateMode};
+use mllm_testkit::FakeLauncher;
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -66,7 +67,10 @@ async fn spawn_mock() -> (SocketAddr, MockState) {
 }
 
 fn member() -> MemberRef {
-    MemberRef { deployment_id: "d".into(), member_id: "m".into() }
+    MemberRef {
+        deployment_id: "d".into(),
+        member_id: "m".into(),
+    }
 }
 
 #[tokio::test]
@@ -76,29 +80,64 @@ async fn readiness_requires_served_model_not_liveness() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     // Mock serves "toy-model" → Ready.
-    assert!(matches!(a.check_readiness(&member()).await.unwrap(), Readiness::Ready));
+    assert!(matches!(
+        a.check_readiness(&member()).await.unwrap(),
+        Readiness::Ready
+    ));
 }
 
+// T21: SPEC §9.1 security gate — deep-park is refused when the host disables it.
 #[tokio::test]
-async fn park_denied_by_default_without_engine_call() {
+async fn park_refused_when_disabled_without_engine_call() {
     let (addr, st) = spawn_mock().await;
     let a = VllmAdapter::new(
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     let out = a.park(&member(), ParkLevel::Two).await;
-    assert!(matches!(out, Err(mllm_adapters::AdapterError::PolicyDenied)));
-    assert_eq!(st.sleep_hits.load(Ordering::SeqCst), 0, "no engine call under denial");
+    assert!(matches!(
+        out,
+        Err(mllm_adapters::AdapterError::PolicyDenied)
+    ));
+    assert_eq!(
+        st.sleep_hits.load(Ordering::SeqCst),
+        0,
+        "no engine call under denial"
+    );
     // Level 1 (restart-level) is also policy-gated on the vllm-sleep profile:
     let out1 = a.park(&member(), ParkLevel::One).await;
-    assert!(matches!(out1, Err(mllm_adapters::AdapterError::PolicyDenied)));
+    assert!(matches!(
+        out1,
+        Err(mllm_adapters::AdapterError::PolicyDenied)
+    ));
+}
+
+// T21: SPEC §9.1 security gate — the default policy permits deep-park.
+#[tokio::test]
+async fn park_permitted_by_default() {
+    assert_eq!(ParkPolicy::default(), ParkPolicy::Enabled);
+    let (addr, st) = spawn_mock().await;
+    let a = VllmAdapter::new(
+        format!("http://{addr}").parse().unwrap(),
+        None,
+        "vllm-test-1".into(),
+        ParkPolicy::default(),
+        "toy-model".into(),
+    );
+    let out = a.park(&member(), ParkLevel::Two).await;
+    assert!(matches!(out, Ok(mllm_adapters::ParkOutcome::Parked { .. })));
+    assert_eq!(
+        st.sleep_hits.load(Ordering::SeqCst),
+        1,
+        "engine call made under default policy"
+    );
 }
 
 #[tokio::test]
@@ -108,7 +147,7 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::ExperimentalAllowed,
+        ParkPolicy::Enabled,
         "toy-model".into(),
     );
     let out = a.park(&member(), ParkLevel::Two).await.unwrap();
@@ -122,8 +161,15 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
 
     a.restore(&member()).await.unwrap();
     assert_eq!(st.wake_hits.load(Ordering::SeqCst), 1, "wake once");
-    assert_eq!(st.rpc_hits.load(Ordering::SeqCst), 1, "collective once via lead");
-    assert_eq!(*st.restore_events.lock().unwrap(), ["wake", "reload", "reset_cache"]);
+    assert_eq!(
+        st.rpc_hits.load(Ordering::SeqCst),
+        1,
+        "collective once via lead"
+    );
+    assert_eq!(
+        *st.restore_events.lock().unwrap(),
+        ["wake", "reload", "reset_cache"]
+    );
     let after = a.inspect(&member()).await.unwrap();
     assert!(matches!(after.phase, mllm_adapters::Phase::Ready));
 }
@@ -131,12 +177,23 @@ async fn allowed_policy_parks_and_restores_with_collective_once() {
 #[tokio::test]
 async fn rejected_cache_reset_does_not_release_parked_readiness() {
     let (addr, st) = spawn_mock().await;
-    let a = VllmAdapter::new(format!("http://{addr}").parse().unwrap(), None,
-        "vllm-test-1".into(), ParkPolicy::ExperimentalAllowed, "toy-model".into());
+    let a = VllmAdapter::new(
+        format!("http://{addr}").parse().unwrap(),
+        None,
+        "vllm-test-1".into(),
+        ParkPolicy::Enabled,
+        "toy-model".into(),
+    );
     a.park(&member(), ParkLevel::Two).await.unwrap();
     st.reset_rejected.store(true, Ordering::SeqCst);
-    assert!(a.restore(&member()).await.is_err(), "HTTP 200 with success=false is not restoration");
-    assert!(matches!(a.check_readiness(&member()).await.unwrap(), Readiness::Initializing));
+    assert!(
+        a.restore(&member()).await.is_err(),
+        "HTTP 200 with success=false is not restoration"
+    );
+    assert!(matches!(
+        a.check_readiness(&member()).await.unwrap(),
+        Readiness::Initializing
+    ));
 }
 
 #[tokio::test]
@@ -150,16 +207,25 @@ async fn park_state_is_per_member_not_per_profile() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::ExperimentalAllowed,
+        ParkPolicy::Enabled,
         "toy-model".into(),
     );
-    let ma = MemberRef { deployment_id: "da".into(), member_id: "da-head".into() };
-    let mb = MemberRef { deployment_id: "db".into(), member_id: "db-head".into() };
+    let ma = MemberRef {
+        deployment_id: "da".into(),
+        member_id: "da-head".into(),
+    };
+    let mb = MemberRef {
+        deployment_id: "db".into(),
+        member_id: "db-head".into(),
+    };
 
     // Member A parks (sleep applied → A's park flag set).
     a.park(&ma, ParkLevel::Two).await.unwrap();
     assert!(
-        matches!(a.check_readiness(&ma).await.unwrap(), Readiness::Initializing),
+        matches!(
+            a.check_readiness(&ma).await.unwrap(),
+            Readiness::Initializing
+        ),
         "A parked → never Ready (parked-state observability)"
     );
 
@@ -172,10 +238,19 @@ async fn park_state_is_per_member_not_per_profile() {
 
     // B parks independently; A stays parked until restored.
     a.park(&mb, ParkLevel::Two).await.unwrap();
-    assert!(matches!(a.check_readiness(&mb).await.unwrap(), Readiness::Initializing));
+    assert!(matches!(
+        a.check_readiness(&mb).await.unwrap(),
+        Readiness::Initializing
+    ));
     a.restore(&ma).await.unwrap();
-    assert!(matches!(a.check_readiness(&ma).await.unwrap(), Readiness::Ready));
-    assert!(matches!(a.check_readiness(&mb).await.unwrap(), Readiness::Initializing));
+    assert!(matches!(
+        a.check_readiness(&ma).await.unwrap(),
+        Readiness::Ready
+    ));
+    assert!(matches!(
+        a.check_readiness(&mb).await.unwrap(),
+        Readiness::Initializing
+    ));
 }
 
 #[tokio::test]
@@ -185,11 +260,15 @@ async fn cancel_without_ack_is_uncertain_no_call() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     let out = a
-        .cancel_work(&member(), &mllm_adapters::RequestRef { id: "r1".into() }, false)
+        .cancel_work(
+            &member(),
+            &mllm_adapters::RequestRef { id: "r1".into() },
+            false,
+        )
         .await
         .unwrap();
     assert!(matches!(out, mllm_adapters::CancellationOutcome::Uncertain));
@@ -202,11 +281,54 @@ async fn passes_conformance_suite() {
         format!("http://{addr}").parse().unwrap(),
         None,
         "vllm-test-1".into(),
-        ParkPolicy::Denied,
+        ParkPolicy::Disabled,
         "toy-model".into(),
     );
     let launcher = FakeLauncher::new();
     let results = run_conformance(&a, &launcher, ParkGateMode::ProfileGated).await;
     let failures: Vec<_> = results.iter().filter(|r| !r.passed()).collect();
     assert!(failures.is_empty(), "conformance failures: {failures:?}");
+}
+
+/// Spec §3 and SPEC §6.1: the engine guards `/v1` with the per-launch key, so the
+/// adapter's own readiness probe must present it. Found live on host-a: the
+/// probe went out without the key, the engine answered 401, and a healthy launch
+/// failed as uncertain. The guarded mock answers `/v1/models` only under the exact
+/// bearer token this adapter was given.
+// T10
+#[tokio::test]
+async fn readiness_probe_carries_the_engine_key() {
+    use axum::http::{HeaderMap, StatusCode};
+    const KEY: &str = "0f0e0d0c0b0a09080706050403020100ffeeddccbbaa99887766554433221100";
+    async fn guarded(headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
+        match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+            Some(value) if value == format!("Bearer {KEY}") => Ok(Json(serde_json::json!({
+                "object": "list", "data": [{"id": "toy-model"}]
+            }))),
+            _ => Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+    let app = axum::Router::new().route("/v1/models", get(guarded));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, app).await.unwrap();
+    });
+    let build = || {
+        VllmAdapter::new(
+            format!("http://{addr}").parse().unwrap(),
+            None,
+            "vllm-test-1".into(),
+            ParkPolicy::Disabled,
+            "toy-model".into(),
+        )
+    };
+    // Without the key the probe is refused, and a refusal is an error, never a
+    // quiet "still initializing" that a launch would wait out.
+    assert!(build().check_readiness(&member()).await.is_err());
+    let keyed = build().with_engine_key(KEY.into());
+    assert!(matches!(
+        keyed.check_readiness(&member()).await.unwrap(),
+        Readiness::Ready
+    ));
 }

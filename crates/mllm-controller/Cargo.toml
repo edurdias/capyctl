@@ -7,19 +7,34 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
+mllm-config = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = "1"
 serde = { workspace = true }
 ulid = { workspace = true }
 mllm-adapters = { workspace = true }
+# The adapter spec names a parsed URL; the launch plan needs its leased port.
+reqwest = { workspace = true }
 mllm-domain = { workspace = true }
 mllm-scheduler = { workspace = true }
 mllm-store = { workspace = true }
 mllm-launchers = { path = "../mllm-launchers" }
+async-trait = { workspace = true }
+
+mllm-agent.workspace = true
+mllm-protocol.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+tokio-stream = "0.1"
 
 [dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+# SPEC §17 (M80): a fake engine behind a real host ingress in the session tests.
+axum = { workspace = true }
+mllm-testkit = { workspace = true }
 rusqlite = { workspace = true }
-mllm-config = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }

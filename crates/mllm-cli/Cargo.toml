@@ -5,23 +5,33 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json = "1"
+mllm-domain = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 mllm-agent = { workspace = true }
 mllm-config = { workspace = true }
 mllm-controller = { workspace = true }
+mllm-management = { path = "../mllm-management" }
+ulid = { workspace = true }
 mllm-store = { workspace = true }
 mllm-router = { path = "../mllm-router" }
 mllm-adapters = { workspace = true }
 mllm-launchers = { path = "../mllm-launchers" }
 axum = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+mllm-protocol = { workspace = true }
+tempfile = { workspace = true }
+libc = "0.2"
+sha2 = { workspace = true }
 
 [dev-dependencies]
-serde_json = "1"
+mllm-testkit = { workspace = true }
 tempfile = { workspace = true }
-mllm-domain = { workspace = true }
 
 
 [[bin]]

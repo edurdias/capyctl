@@ -20,8 +20,8 @@ See [current gaps](docs/design/milestones/f1-open-items.md) and
 - [`docs/design/0000-full-picture.md`](docs/design/0000-full-picture.md) — approved
   decisions, crate layout, and milestone decomposition.
 - [`docs/design/adr/`](docs/design/adr/) — architecture decision records.
-- [`docs/examples/`](docs/examples/) — illustrative YAML sketches (parse-only, not
-  calibrated recipes).
+- [`docs/examples/`](docs/examples/) — example role and deployment documents that
+  `mllm validate config` accepts (checked by a test; not calibrated engine recipes).
 
 License: Apache-2.0 (see [ADR 0006](docs/design/adr/0006-license.md)); `LICENSE` file is
 added before publication.

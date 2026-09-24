@@ -8,7 +8,6 @@ fn fixture() -> (CompletionExpectation, CompletionEvidence) {
         generation: 7,
         operation_id: "op-a".into(),
         step_id: "park-a-1".into(),
-        qualification_id: "qualified-recipe-a".into(),
     };
     let identities = vec![
         ProcessIdentity {
@@ -74,11 +73,8 @@ fn stale_tokens_do_not_release_resources() {
     let mut changed = evidence.clone();
     changed.token.operation_id.push('x');
     invalid.push(changed);
-    let mut changed = evidence.clone();
-    changed.token.deployment_id.push('x');
-    invalid.push(changed);
     let mut changed = evidence;
-    changed.token.qualification_id.push('x');
+    changed.token.deployment_id.push('x');
     invalid.push(changed);
     for changed in invalid {
         assert_eq!(
@@ -205,4 +201,13 @@ fn invalid_target_footprint_is_rejected() {
         verify_completion(&expected, &evidence, 151, 60),
         Err(CompletionError::Invalid)
     );
+}
+
+// T24: a zero start identity cannot prove that an owned worker survived.
+#[test]
+fn missing_process_start_identity_cannot_complete() {
+    let (mut expected, mut evidence) = fixture();
+    expected.identities[1].start_ticks = 0;
+    evidence.identities[1].start_ticks = 0;
+    assert_eq!(verify_completion(&expected, &evidence, 151, 60), Err(CompletionError::RuntimeChanged));
 }

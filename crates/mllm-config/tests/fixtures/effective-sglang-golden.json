@@ -7,6 +7,11 @@
           "sharing": "shared"
         }
       ],
+      "engine_config": {
+        "memory": {
+          "kv_cache": "4GiB"
+        }
+      },
       "kind": "deployment",
       "model": {
         "content_fingerprint": "sha256:model",
@@ -17,7 +22,7 @@
       "recipe": "standard",
       "recovery": "reconcile",
       "request_deadline": "300s",
-      "residency": "warm",
+      "residency": "deep",
       "resources": {
         "cold": {
           "allocations": [
@@ -101,6 +106,9 @@
       "environment_fingerprint": "env-01",
       "hardware_fingerprint": "hw-01",
       "kind": "host",
+      "model_store": {
+        "path": "/srv/models"
+      },
       "name": "lab",
       "resource_policy": {
         "device_sharing": "shared",
@@ -115,6 +123,7 @@
             "free_reserve": "16GiB",
             "host_kv_limit": "4GiB",
             "managed_limit": "32GiB",
+            "memory": "unified",
             "parked_limit": "8GiB"
           }
         },
@@ -142,24 +151,15 @@
             "RUST_LOG": "info"
           },
           "executable": "/bin/true",
-          "launch_settings": {
-            "engine": "sglang",
-            "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-            "requested_budget": {
-              "kv_cache_bytes": "4GiB",
-              "static_memory_fraction_bps": 7500
-            }
-          },
           "log_policy": {
             "max_file_bytes": "16MiB",
             "retained_files": 3
           },
-          "qualification_id": "qualification-evidence-17",
           "revision": 7,
           "security": {
             "admin_credential_ref": "secret://admin-key",
             "credential_ref": "secret://engine-key",
-            "experimental_controls": true
+            "deep_park": "enabled"
           }
         }
       },
@@ -167,6 +167,32 @@
     }
   },
   "effective": {
+    "engine_config": {
+      "common": {
+        "cuda_graphs": false,
+        "language_model_only": false,
+        "trust_remote_code": false
+      },
+      "cpu_weight_backup": false,
+      "engine": "sglang",
+      "extra_args": [],
+      "memory": {
+        "kv_cache_bytes": 4294967296,
+        "margin_bytes": 8589934592,
+        "request_bytes": 8589934592
+      },
+      "memory_saver": true,
+      "provenance": {
+        "cpu_weight_backup": "derived",
+        "cuda_graphs": "mllm default",
+        "memory.request": "derived",
+        "memory_saver": "derived",
+        "sglang.tokenizer_workers": "mllm default",
+        "weight_restore": "derived"
+      },
+      "tokenizer_workers": 1,
+      "weight_restore": "disk_reload"
+    },
     "host": {
       "device_sharing": "shared",
       "devices": {
@@ -180,6 +206,7 @@
           "free_reserve": 17179869184,
           "host_kv_limit": 4294967296,
           "managed_limit": 34359738368,
+          "memory": "unified",
           "parked_limit": 8589934592
         }
       },
@@ -190,10 +217,10 @@
       "environment_fingerprint": "env-01",
       "hardware_fingerprint": "hw-01",
       "max_parked": 16,
+      "model_store": "/srv/models",
       "name": "lab",
       "observation_ttl_ms": 2000,
       "planner_max_states": 4096,
-      "qualification_policy": null,
       "queue": {
         "admission_window_ms": 2000,
         "max_buffered_bytes_total": 67108864,
@@ -204,8 +231,12 @@
     },
     "model": {
       "content_fingerprint": "sha256:model",
-      "path": "/srv/models/toy",
-      "revision": "r1"
+      "resolved_path": "/srv/models/toy",
+      "revision": "r1",
+      "source": {
+        "path": "/srv/models/toy",
+        "type": "local"
+      }
     },
     "name": "toy",
     "profile": {
@@ -216,50 +247,33 @@
         "RUST_LOG": "info"
       },
       "executable": "/bin/true",
-      "launch_settings": {
-        "context_tokens": 4096,
-        "cpu_kv_offload": false,
-        "cpu_weight_backup": false,
-        "data_parallel_size": 1,
-        "decode_cuda_graphs": false,
-        "disaggregation": false,
-        "engine": "sglang",
-        "external_cache": false,
-        "lora": false,
-        "max_running_requests": 8,
-        "max_total_tokens": 4096,
-        "memory_saver": true,
-        "model_dtype": "bfloat16",
-        "native_grpc": false,
-        "prefill_cuda_graphs": false,
-        "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-        "requested_budget": {
-          "kv_cache_bytes": 4294967296,
-          "static_memory_fraction_bps": 7500
-        },
-        "speculative_decoding": false,
-        "tensor_parallel_size": 1,
-        "tokenizer_workers": 1,
-        "trust_remote_code": false,
-        "weight_restore": "disk_reload"
-      },
       "log_policy": {
         "max_file_bytes": 16777216,
         "retained_files": 3
       },
-      "qualification_id": "qualification-evidence-17",
       "revision": 7,
       "security": {
         "admin_credential_ref": "secret://admin-key",
         "credential_ref": "secret://engine-key",
-        "experimental_controls": true
+        "deep_park": "enabled",
+        "extra_args": "allowed",
+        "trust_remote_code": false
       }
     },
-    "qualification_fingerprint": "b7863d64c7a21c4ed88c046154afdaa02f886e0ad723498ad58f267564913484",
     "recipe": "standard",
+    "recipe_fingerprint": "05f3d9886e8fc6a026489a9767e5c5d0a265db135bc6507afb8494bd9862a2bf",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
-    "residency": "warm",
+    "residency": "deep",
+    "timeouts": {
+      "basis": "checkpoint_digest_pending",
+      "initialize_ms": 300000,
+      "provenance": {
+        "initialize": "derived",
+        "wake": "derived"
+      },
+      "wake_ms": 300000
+    },
     "resources": {
       "cold": {
         "allocations": [

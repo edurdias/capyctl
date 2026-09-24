@@ -7,6 +7,11 @@
           "sharing": "shared"
         }
       ],
+      "engine_config": {
+        "memory": {
+          "kv_cache": "4GiB"
+        }
+      },
       "kind": "deployment",
       "model": {
         "content_fingerprint": "sha256:model",
@@ -17,7 +22,7 @@
       "recipe": "standard",
       "recovery": "reconcile",
       "request_deadline": "300s",
-      "residency": "warm",
+      "residency": "deep",
       "resources": {
         "cold": {
           "allocations": [
@@ -101,6 +106,9 @@
       "environment_fingerprint": "env-01",
       "hardware_fingerprint": "hw-01",
       "kind": "host",
+      "model_store": {
+        "path": "/srv/models"
+      },
       "name": "lab",
       "resource_policy": {
         "device_sharing": "shared",
@@ -115,6 +123,7 @@
             "free_reserve": "16GiB",
             "host_kv_limit": "4GiB",
             "managed_limit": "32GiB",
+            "memory": "unified",
             "parked_limit": "8GiB"
           }
         },
@@ -145,29 +154,14 @@
             "RUST_LOG": "info"
           },
           "executable": "/bin/true",
-          "launch_settings": {
-            "block_size_tokens": 16,
-            "cpu_offload_bytes": "0B",
-            "enable_sleep_mode": true,
-            "engine": "vllm",
-            "kv_cache_dtype": "auto",
-            "pipeline_parallel_size": 1,
-            "requested_budget": {
-              "gpu_utilization_pct": 75,
-              "kv_cache_bytes": "4GiB",
-              "swap_space_bytes": "0B"
-            },
-            "tensor_parallel_size": 1
-          },
           "log_policy": {
             "max_file_bytes": "16MiB",
             "retained_files": 3
           },
-          "qualification_id": "qualification-evidence-17",
           "revision": 7,
           "security": {
             "credential_ref": "secret://engine-key",
-            "experimental_controls": true
+            "deep_park": "enabled"
           }
         }
       },
@@ -175,6 +169,24 @@
     }
   },
   "effective": {
+    "engine_config": {
+      "common": {
+        "language_model_only": false,
+        "trust_remote_code": false
+      },
+      "enable_sleep_mode": true,
+      "engine": "vllm",
+      "extra_args": [],
+      "memory": {
+        "kv_cache_bytes": 4294967296,
+        "margin_bytes": 8589934592,
+        "request_bytes": 8589934592
+      },
+      "provenance": {
+        "enable_sleep_mode": "derived",
+        "memory.request": "derived"
+      }
+    },
     "host": {
       "device_sharing": "shared",
       "devices": {
@@ -188,6 +200,7 @@
           "free_reserve": 17179869184,
           "host_kv_limit": 4294967296,
           "managed_limit": 34359738368,
+          "memory": "unified",
           "parked_limit": 8589934592
         }
       },
@@ -198,10 +211,10 @@
       "environment_fingerprint": "env-01",
       "hardware_fingerprint": "hw-01",
       "max_parked": 16,
+      "model_store": "/srv/models",
       "name": "lab",
       "observation_ttl_ms": 2000,
       "planner_max_states": 4096,
-      "qualification_policy": null,
       "queue": {
         "admission_window_ms": 2000,
         "max_buffered_bytes_total": 67108864,
@@ -212,8 +225,12 @@
     },
     "model": {
       "content_fingerprint": "sha256:model",
-      "path": "/srv/models/toy",
-      "revision": "r1"
+      "resolved_path": "/srv/models/toy",
+      "revision": "r1",
+      "source": {
+        "path": "/srv/models/toy",
+        "type": "local"
+      }
     },
     "name": "toy",
     "profile": {
@@ -227,37 +244,33 @@
         "RUST_LOG": "info"
       },
       "executable": "/bin/true",
-      "launch_settings": {
-        "block_size_tokens": 16,
-        "cpu_offload_bytes": 0,
-        "enable_sleep_mode": true,
-        "engine": "vllm",
-        "kv_cache_dtype": "auto",
-        "pipeline_parallel_size": 1,
-        "requested_budget": {
-          "gpu_utilization_pct": 75,
-          "kv_cache_bytes": 4294967296,
-          "swap_space_bytes": 0
-        },
-        "tensor_parallel_size": 1
-      },
       "log_policy": {
         "max_file_bytes": 16777216,
         "retained_files": 3
       },
-      "qualification_id": "qualification-evidence-17",
       "revision": 7,
       "security": {
         "admin_credential_ref": null,
         "credential_ref": "secret://engine-key",
-        "experimental_controls": true
+        "deep_park": "enabled",
+        "extra_args": "allowed",
+        "trust_remote_code": false
       }
     },
-    "qualification_fingerprint": "8fca6812174ea5c21d212fce2b2923a52e6fcdd7ea38aef251a0a7ebf751a1ef",
     "recipe": "standard",
+    "recipe_fingerprint": "e011aa21a8961a1cc894d17e5ea69f147ffc93f17b20b3ee5675643174fdba75",
     "recovery": "reconcile",
     "request_deadline_ms": 300000,
-    "residency": "warm",
+    "residency": "deep",
+    "timeouts": {
+      "basis": "checkpoint_digest_pending",
+      "initialize_ms": 300000,
+      "provenance": {
+        "initialize": "derived",
+        "wake": "derived"
+      },
+      "wake_ms": 300000
+    },
     "resources": {
       "cold": {
         "allocations": [

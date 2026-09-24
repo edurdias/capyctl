@@ -69,7 +69,7 @@ pub(crate) fn decode(json: &str) -> Result<PhaseFootprint, ResourceStoreError> {
     Ok(footprint)
 }
 
-fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
+pub(crate) fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
     validate_footprint(footprint)?;
     let phase = match footprint.phase {
         ResourcePhase::Cold => "cold",
@@ -101,6 +101,10 @@ fn encode(footprint: &PhaseFootprint) -> Result<String, ResourceStoreError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantRequest {
     pub id: String,
+    /// ADR 0013 §5: the resource owner charged, `instance_owner_id` of the
+    /// deployment and the instance the fence names. Instance 0's owner is the
+    /// deployment id, as every reservation made before instances existed.
+    pub owner_id: String,
     pub deployment_id: String,
     pub operation_id: String,
     pub revision: i64,
@@ -184,6 +188,88 @@ pub(crate) fn read_snapshot(conn: &Connection) -> Result<LedgerSnapshot, Resourc
     Ok(snapshot)
 }
 
+/// The host a registered ledger key belongs to, or `None` when the key is not in
+/// the host-scoped registry.
+fn registered_host(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    ledger_key: &str,
+) -> Result<Option<String>, ResourceStoreError> {
+    Ok(transaction
+        .query_row(
+            "SELECT host_id FROM host_resource_keys WHERE kind=?1 AND ledger_key=?2",
+            params![kind, ledger_key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// SPEC §7 (T26, T27): one ledger holds every host's owners, but a host's
+/// admission is decided against that host's own limits and observations. An
+/// owner whose every domain and device key the host-scoped registry assigns to
+/// some other host cannot change this admission, so it is set aside here. It is
+/// not released or rewritten, and the epoch check above still covers the whole
+/// ledger. An owner with any unregistered key, or any key on a host in scope,
+/// stays in scope and is judged exactly as before, so an unknown charge still
+/// fails closed.
+fn scoped_to_context_hosts(
+    transaction: &Transaction<'_>,
+    snapshot: &LedgerSnapshot,
+    context: &AdmissionContext<'_>,
+) -> Result<LedgerSnapshot, ResourceStoreError> {
+    scoped_to_domain_hosts(
+        transaction,
+        snapshot,
+        context.limits.iter().map(|limit| limit.domain.as_str()),
+    )
+}
+
+/// The same scoping for any judgement made against one host's domains: the
+/// hosts owning `domains` are in scope, and an unregistered domain keeps the
+/// whole ledger (Phase B, SPEC §7, T26 T27). The resource-policy overcommit
+/// report and the park/switch planners use it as well as admission.
+pub(crate) fn scoped_to_domain_hosts<'a>(
+    transaction: &Transaction<'_>,
+    snapshot: &LedgerSnapshot,
+    domains: impl IntoIterator<Item = &'a str>,
+) -> Result<LedgerSnapshot, ResourceStoreError> {
+    let mut in_scope = std::collections::BTreeSet::new();
+    for domain in domains {
+        match registered_host(transaction, "domain", domain)? {
+            Some(host) => {
+                in_scope.insert(host);
+            }
+            // An unscoped limit (an unregistered ledger) keeps the whole ledger.
+            None => return Ok(snapshot.clone()),
+        }
+    }
+    let mut scoped = LedgerSnapshot {
+        epoch: snapshot.epoch,
+        owners: Default::default(),
+    };
+    for (owner, footprint) in &snapshot.owners {
+        let mut elsewhere = true;
+        let keys = footprint
+            .allocations
+            .iter()
+            .map(|a| ("domain", a.domain.as_str()))
+            .chain(footprint.devices.iter().map(|d| ("device", d.device.as_str())));
+        for (kind, key) in keys {
+            match registered_host(transaction, kind, key)? {
+                Some(host) if !in_scope.contains(&host) => {}
+                _ => {
+                    elsewhere = false;
+                    break;
+                }
+            }
+        }
+        if !elsewhere || (footprint.allocations.is_empty() && footprint.devices.is_empty()) {
+            scoped.owners.insert(owner.clone(), footprint.clone());
+        }
+    }
+    Ok(scoped)
+}
+
 pub(crate) fn reserve_increase_in_transaction(
     transaction: &Transaction<'_>,
     request: &GrantRequest,
@@ -192,31 +278,8 @@ pub(crate) fn reserve_increase_in_transaction(
     reserve_in_transaction(transaction, request, context, GrantTransition::Increase)
 }
 
-/// V3 candidate actions retain or increase their conservative reservation.
-/// Ordinary lifecycle phase transitions stay unchanged.
-pub(crate) fn reserve_retained_candidate_in_transaction(
-    transaction: &Transaction<'_>,
-    request: &GrantRequest,
-    context: AdmissionContext<'_>,
-) -> Result<GrantReceipt, ResourceStoreError> {
-    let allowed: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id JOIN lifecycle_claims c ON c.operation_id=o.id JOIN deployments d ON d.id=o.deployment_id JOIN qualification_runs q ON q.deployment_id=d.id WHERE r.operation_id=?1 AND r.action IN ('prepare','park','activate') AND r.state='queued' AND o.kind='candidate_action_v3' AND c.deployment_id=d.id AND c.revision=d.revision AND c.generation=d.current_generation AND d.id=?2 AND d.desired_state='stopped' AND d.admission_enabled=0 AND d.dispatch_enabled=0 AND q.state='running')",
-        params![request.operation_id, request.deployment_id], |r|r.get(0),
-    )?;
-    if !allowed {
-        return Err(ResourceStoreError::Conflict);
-    }
-    reserve_in_transaction(
-        transaction,
-        request,
-        context,
-        GrantTransition::RetainedCandidate,
-    )
-}
-
 enum GrantTransition {
     Increase,
-    RetainedCandidate,
 }
 fn reserve_in_transaction(
     transaction: &Transaction<'_>,
@@ -225,6 +288,7 @@ fn reserve_in_transaction(
     transition: GrantTransition,
 ) -> Result<GrantReceipt, ResourceStoreError> {
     if request.id.is_empty()
+        || request.owner_id.is_empty()
         || request.deployment_id.is_empty()
         || request.operation_id.is_empty()
         || request.revision < 1
@@ -255,20 +319,23 @@ fn reserve_in_transaction(
         let epoch = u64::try_from(epoch).map_err(|_| ResourceStoreError::Invalid)?;
         return Ok(GrantReceipt::Recorded { epoch });
     }
-    let state: Option<(i64, i64, String, String)> = transaction
+    // ADR 0013 §5: the fence names one instance, whose owner id is fixed.
+    let state: Option<(i64, i64, String, String, u32)> = transaction
         .query_row(
-            "SELECT d.revision, d.current_generation, d.kind, o.state
-         FROM deployments d JOIN operations o ON o.deployment_id=d.id
-         WHERE d.id=?1 AND o.id=?2",
-            params![request.deployment_id, request.operation_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            "SELECT i.revision, i.generation, d.kind, o.state, i.instance_index
+         FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id
+         JOIN operations o ON o.deployment_id=d.id
+         WHERE d.id=?1 AND o.id=?2 AND i.generation=?3",
+            params![request.deployment_id, request.operation_id, request.generation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((revision, generation, kind, operation_state)) = state else {
+    let Some((revision, generation, kind, operation_state, instance)) = state else {
         return Err(ResourceStoreError::Conflict);
     };
     if revision != request.revision
         || generation != request.generation
+        || request.owner_id != crate::instances::instance_owner_id(&request.deployment_id, instance)
         || kind != "model"
         || !matches!(operation_state.as_str(), "pending" | "running")
     {
@@ -280,40 +347,32 @@ fn reserve_in_transaction(
     }
     match transition {
         GrantTransition::Increase => {
-            ensure_increasing(snapshot.owners.get(&request.deployment_id), &request.next)?
+            ensure_increasing(snapshot.owners.get(&request.owner_id), &request.next)?
         }
-        GrantTransition::RetainedCandidate
+    }
+    let scoped = scoped_to_context_hosts(transaction, &snapshot, &context)?;
+    match admit_phase(&scoped, &request.owner_id, &request.next, context) {
+        Ok(()) => {}
+        // Found live 2026-09-23 (matrix M27): a phase that allocates nothing
+        // beyond what the owner holds (a park's parking phase) needs no free
+        // memory; its own charge is already in use and the host's published
+        // free memory cannot cover it a second time. The limits it could
+        // breach are the category ones, which admit_phase reports separately.
+        Err(mllm_domain::resources::ResourceError::Insufficient)
             if snapshot
                 .owners
-                .get(&request.deployment_id)
-                .is_some_and(|old| {
-                    old.phase == request.next.phase
-                        && old.allocations.iter().all(|a| {
-                            request.next.allocations.iter().any(|b| {
-                                b.domain == a.domain
-                                    && b.bytes >= a.bytes
-                                    && b.host_kv_bytes >= a.host_kv_bytes
-                            })
-                        })
-                        && old.devices.iter().all(|a| {
-                            request.next.devices.iter().any(|b| {
-                                b.device == a.device
-                                    && (b.sharing == a.sharing
-                                        || b.sharing == mllm_domain::resources::Sharing::Exclusive)
-                            })
-                        })
-                }) => {}
-        GrantTransition::RetainedCandidate => return Err(ResourceStoreError::Conflict),
+                .get(&request.owner_id)
+                .is_some_and(|current| !allocates_more(current, &request.next)) => {}
+        Err(error) => return Err(error.into()),
     }
-    admit_phase(&snapshot, &request.deployment_id, &request.next, context)?;
     let epoch = i64::try_from(snapshot.epoch)
         .ok()
         .and_then(|e| e.checked_add(1))
         .ok_or(ResourceStoreError::Invalid)?;
     transaction.execute(
-        "INSERT INTO resource_owners(owner_id, footprint_json) VALUES (?1, ?2)
+        "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id,instance_index) VALUES(?1,?2,?3,?4)
          ON CONFLICT(owner_id) DO UPDATE SET footprint_json=excluded.footprint_json",
-        params![request.deployment_id, encoded],
+        params![request.owner_id, encoded, request.deployment_id, instance],
     )?;
     transaction.execute(
         "UPDATE resource_ledger_meta SET epoch=?1 WHERE singleton=1",
@@ -326,6 +385,21 @@ fn reserve_in_transaction(
     Ok(GrantReceipt::New {
         epoch: epoch as u64,
     })
+}
+
+/// Whether `next` allocates anything `current` does not hold: more bytes or
+/// host KV in any domain, or a device claim it does not already have.
+pub(crate) fn allocates_more(current: &PhaseFootprint, next: &PhaseFootprint) -> bool {
+    next.allocations.iter().any(|wanted| {
+        !current.allocations.iter().any(|held| {
+            held.domain == wanted.domain
+                && held.bytes >= wanted.bytes
+                && held.host_kv_bytes >= wanted.host_kv_bytes
+        })
+    }) || next
+        .devices
+        .iter()
+        .any(|device| !current.devices.contains(device))
 }
 
 pub(crate) fn advance_completion_epoch(
@@ -346,25 +420,28 @@ pub(crate) fn advance_completion_epoch(
     )?;
     Ok(next as u64)
 }
-pub(crate) fn release_verified_candidate_owner(
-    tx: &rusqlite::Transaction<'_>,
-    deployment: &str,
-) -> Result<(), crate::lifecycle::LifecycleError> {
-    if tx.execute(
-        "DELETE FROM resource_owners WHERE owner_id=?1",
-        [deployment],
-    )? != 1
-    {
-        return Err(crate::lifecycle::LifecycleError::CorruptStoredData);
-    }
-    Ok(())
-}
 impl crate::Store {
     pub fn resource_snapshot(&self) -> Result<LedgerSnapshot, ResourceStoreError> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         let snapshot = read_snapshot(&transaction)?;
         transaction.commit()?;
         Ok(snapshot)
+    }
+
+    /// The ledger as one host's judgement sees it (SPEC §7, T26 T27): owners
+    /// whose every key belongs to another host are set aside, so a park or
+    /// switch plan for this host is not refused over another host's charges and
+    /// `max_parked` counts this host's parked owners only. The epoch is the whole
+    /// ledger's. An unregistered domain keeps every owner, failing closed.
+    pub fn host_scoped_resource_snapshot(
+        &self,
+        domains: &[&str],
+    ) -> Result<LedgerSnapshot, ResourceStoreError> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let snapshot = read_snapshot(&transaction)?;
+        let scoped = scoped_to_domain_hosts(&transaction, &snapshot, domains.iter().copied())?;
+        transaction.commit()?;
+        Ok(scoped)
     }
 
     pub fn reserve_increase(
@@ -460,6 +537,7 @@ mod transaction_fault_tests {
           INSERT INTO operations(id,deployment_id,kind,state) VALUES ('op-a','a','start','running');").unwrap();
         let request = GrantRequest {
             id: "grant-a".into(),
+            owner_id: "a".into(),
             deployment_id: "a".into(),
             operation_id: "op-a".into(),
             revision: 1,
@@ -700,6 +778,105 @@ mod transaction_fault_tests {
         ));
     }
 
+    /// Registers `host` with one domain and one device under host-scoped keys.
+    fn register_host(store: &crate::Store, host: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO host_resource_namespaces(host_id,policy_key,kind) VALUES (?1,?1,'remote')",
+                [host],
+            )
+            .unwrap();
+        for (kind, local) in [("domain", "unified"), ("device", "gpu0")] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO host_resource_keys(host_id,kind,local_id,ledger_key) VALUES (?1,?2,?3,?4)",
+                    params![host, kind, local, format!("{host}/{kind}/{local}")],
+                )
+                .unwrap();
+        }
+    }
+
+    // T26 T27: found live (Phase B, two hosts): a Ready SGLang deployment on
+    // host-b made every activation on host-a fail with "unknown physical
+    // domain", because the other host's charge was judged against this host's
+    // limits. Another host's owner is set aside; an unregistered charge is not.
+    #[test]
+    fn another_hosts_owner_does_not_block_admission_but_an_unknown_charge_still_does() {
+        let (store, mut request) = fixture();
+        register_host(&store, "host-a");
+        register_host(&store, "host-b");
+        store.conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,
+          admission_enabled,suspended,current_generation,schema_version)
+          VALUES ('b','b','model','ready',1,0,1,1);").unwrap();
+        let elsewhere = PhaseFootprint {
+            phase: ResourcePhase::Ready,
+            allocations: vec![Allocation {
+                domain: "host-b/domain/unified".into(),
+                bytes: 90,
+                host_kv_bytes: 0,
+            }],
+            devices: vec![DeviceClaim {
+                device: "host-b/device/gpu0".into(),
+                sharing: Sharing::Shared,
+            }],
+        };
+        store
+            .conn
+            .execute(
+                "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('b',?1,'b')",
+                [encode(&elsewhere).unwrap()],
+            )
+            .unwrap();
+        request.next.allocations[0].domain = "host-a/domain/unified".into();
+        let observations = [MemoryObservation {
+            domain: "host-a/domain/unified".into(),
+            capacity_bytes: 128,
+            available_bytes: 128,
+            sampled_at_ms: 100,
+        }];
+        let limits = [MemoryLimit {
+            domain: "host-a/domain/unified".into(),
+            managed_bytes: 96,
+            free_reserve_bytes: 12,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
+        assert_eq!(
+            store
+                .reserve_increase(&request, reservation_context(&observations, &limits))
+                .unwrap(),
+            GrantReceipt::New { epoch: 1 }
+        );
+        // The other host's owner is untouched, not released.
+        let snapshot = store.resource_snapshot().unwrap();
+        assert_eq!(snapshot.owners.get("b"), Some(&elsewhere));
+        assert_eq!(snapshot.owners.len(), 2);
+
+        // A charge whose domain no host registered still fails closed.
+        let (store, mut request) = fixture();
+        register_host(&store, "host-a");
+        store.conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,
+          admission_enabled,suspended,current_generation,schema_version)
+          VALUES ('b','b','model','ready',1,0,1,1);").unwrap();
+        let mut unknown = elsewhere;
+        unknown.allocations[0].domain = "unregistered".into();
+        unknown.devices.clear();
+        store
+            .conn
+            .execute(
+                "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('b',?1,'b')",
+                [encode(&unknown).unwrap()],
+            )
+            .unwrap();
+        request.next.allocations[0].domain = "host-a/domain/unified".into();
+        assert!(matches!(
+            store.reserve_increase(&request, reservation_context(&observations, &limits)),
+            Err(ResourceStoreError::Admission(ResourceError::UnknownDomain))
+        ));
+    }
+
     #[test]
     fn legacy_reservations_are_not_silently_ignored() {
         let (store, _) = fixture();
@@ -773,7 +950,7 @@ mod transaction_fault_tests {
         store
             .conn
             .execute(
-                "INSERT INTO resource_owners(owner_id,footprint_json) VALUES ('a','{}')",
+                "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('a','{}','a')",
                 [],
             )
             .unwrap();

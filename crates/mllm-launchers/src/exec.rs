@@ -178,17 +178,16 @@ impl Launcher for ExecLauncher {
             .split_first()
             .ok_or_else(|| LauncherError::SpawnFailed("empty argv".into()))?;
         let mut command = Command::new(program);
-        command.args(args);
+        // SPEC §13.3 / T21: the engine sees only its rendered environment.
+        command.args(args).env_clear();
         for (k, v) in &cmd.env {
             command.env(k, v);
         }
         // Engine output lands in the deployment's engine log when one is
         // requested (the runbook's evidence); otherwise discarded.
         if let Some(log) = cmd.env.get("MLLM_ENGINE_LOG") {
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log)
+            // SPEC §13.3 / T21: never through a symlink, always owner-only.
+            let f = crate::durable::open_private_log(std::path::Path::new(log))
                 .map_err(|e| LauncherError::SpawnFailed(format!("engine log {log}: {e}")))?;
             let log_clone = f
                 .try_clone()

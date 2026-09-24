@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mllm_adapters::traits::{
-    AdapterError, CancellationOutcome, EngineAdapter, MemberRef, ParkLevel,
-    ParkOutcome, Phase, PlanInput, Readiness, ReloadOutcome, RenderedCommand, RequestRef,
-    RestoreOutcome, WorkObservation,
+    AdapterError, CancellationOutcome, EngineAdapter, MemberRef, ParkLevel, ParkOutcome, Phase,
+    PlanInput, Readiness, ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
+    WorkObservation,
 };
 use mllm_controller::{Controller, DeployRequest};
 use mllm_domain::LifecycleState;
@@ -21,7 +21,10 @@ struct ProcAdapter;
 
 #[async_trait]
 impl EngineAdapter for ProcAdapter {
-    async fn inspect(&self, _: &MemberRef) -> Result<mllm_adapters::traits::EngineState, AdapterError> {
+    async fn inspect(
+        &self,
+        _: &MemberRef,
+    ) -> Result<mllm_adapters::traits::EngineState, AdapterError> {
         Ok(mllm_adapters::traits::EngineState {
             phase: Phase::Ready,
             retained_bytes: 0,
@@ -37,7 +40,10 @@ impl EngineAdapter for ProcAdapter {
     async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
         Ok(Readiness::Ready)
     }
-    async fn prepare_park(&self, _: &MemberRef) -> Result<mllm_adapters::traits::Quiescence, AdapterError> {
+    async fn prepare_park(
+        &self,
+        _: &MemberRef,
+    ) -> Result<mllm_adapters::traits::Quiescence, AdapterError> {
         Ok(mllm_adapters::traits::Quiescence { quiescent: true })
     }
     async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
@@ -85,13 +91,19 @@ fn req(name: &str) -> DeployRequest {
 async fn start_spawns_real_process_and_stop_terminates_it() {
     let (c, _store) = controller();
     let id = c.submit_deploy(req("proc-m")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
 
     let pid = c.live_pid(&id).expect("real process spawned");
     assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
 
-    let op2 = c.request_transition(&id, mllm_domain::LifecycleAction::Stop).await.unwrap();
+    let op2 = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Stop)
+        .await
+        .unwrap();
     c.wait_terminal(&op2).await.unwrap();
     assert!(c.live_pid(&id).is_none(), "handle released");
     // The process group was terminated: give the kernel a beat.
@@ -106,9 +118,15 @@ async fn start_spawns_real_process_and_stop_terminates_it() {
 async fn administrative_stop_blocks_autoactivation() {
     let (c, store) = controller();
     let id = c.submit_deploy(req("admin-m")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
-    let op2 = c.request_transition(&id, mllm_domain::LifecycleAction::Stop).await.unwrap();
+    let op2 = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Stop)
+        .await
+        .unwrap();
     c.wait_terminal(&op2).await.unwrap();
 
     // Administrative stop suspends: AUTO-ACTIVATION is blocked (T10) —
@@ -118,8 +136,13 @@ async fn administrative_stop_blocks_autoactivation() {
     let res = c.auto_activate(&id).await;
     assert!(res.is_err(), "suspended deployment rejects auto-activation");
     // The explicit operator start re-enables:
-    let res2 = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
-    assert!(res2.is_ok(), "explicit start re-enables a suspended deployment");
+    let res2 = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await;
+    assert!(
+        res2.is_ok(),
+        "explicit start re-enables a suspended deployment"
+    );
     c.wait_terminal(&res2.unwrap()).await.unwrap();
 }
 
@@ -127,7 +150,10 @@ async fn administrative_stop_blocks_autoactivation() {
 async fn idle_stop_leaves_on_demand_eligible() {
     let (c, store) = controller();
     let id = c.submit_deploy(req("idle-m")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
 
     // Idle eviction: stop the engine but keep the deployment on-demand
@@ -135,12 +161,24 @@ async fn idle_stop_leaves_on_demand_eligible() {
     let op2 = c.idle_stop(&id).await.unwrap();
     c.wait_terminal(&op2).await.unwrap();
     assert_eq!(
-        store.lock().unwrap().get_deployment(&id).unwrap().unwrap().observed_state,
+        store
+            .lock()
+            .unwrap()
+            .get_deployment(&id)
+            .unwrap()
+            .unwrap()
+            .observed_state,
         LifecycleState::Stopped
     );
-    assert!(!store.lock().unwrap().is_suspended(&id).unwrap(), "on-demand eligible");
+    assert!(
+        !store.lock().unwrap().is_suspended(&id).unwrap(),
+        "on-demand eligible"
+    );
 
     // A later Start succeeds (explicit activation after idle eviction).
-    let op3 = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op3 = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op3).await.unwrap();
 }

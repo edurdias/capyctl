@@ -9,7 +9,7 @@ routes: [toy]
 runtime_profile: local
 runtime_profile_revision: 7
 recipe: standard
-residency: warm
+residency: deep
 recovery: reconcile
 devices: []
 resources:

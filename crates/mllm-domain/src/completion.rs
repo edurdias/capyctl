@@ -30,7 +30,7 @@ pub struct StepExecutionContext {
     pub identities: ExecutionIdentities,
     pub completion_target: Option<PhaseFootprint>,
     pub grant_id: Option<String>,
-    pub launch_settings: Option<crate::launch::ProfileLaunchSettings>,
+    pub launch_settings: Option<crate::launch::LaunchSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +46,6 @@ pub struct TransitionToken {
     pub generation: i64,
     pub operation_id: String,
     pub step_id: String,
-    pub qualification_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,6 +54,19 @@ pub struct ProcessIdentity {
     pub pid: u32,
     pub boot_id: String,
     pub start_ticks: u64,
+}
+
+/// Whether a recorded process still exists, judged by pid, boot id and start ticks
+/// together. A pid alone is not an identity: the kernel reuses them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// The exact recorded process still exists. Never release.
+    Alive,
+    /// Proven absent: the boot differs, the pid is unused, or the pid was reused by
+    /// a different process. Only this authorises release.
+    Gone,
+    /// Could not be established. Treated as retained, never as absent.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -131,20 +143,9 @@ pub enum CompletionError {
 }
 
 fn identities_valid(identities: &[ProcessIdentity]) -> bool {
-    let mut roles = BTreeSet::new();
-    let mut processes = BTreeSet::new();
-    identities.iter().any(|identity| identity.role == "api")
-        && identities
-            .iter()
-            .any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
-        && identities.iter().all(|identity| {
-            !identity.role.is_empty()
-                && identity.pid > 0
-                && !identity.boot_id.is_empty()
-                && identity.boot_id == identities[0].boot_id
-                && roles.insert(identity.role.as_str())
-                && processes.insert((identity.boot_id.as_str(), identity.pid))
-        })
+    crate::group::validate_local_processes(identities).is_ok()
+        && identities.iter().any(|identity| identity.role == "api")
+        && identities.iter().any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
 }
 
 pub fn verify_completion(
@@ -157,7 +158,6 @@ pub fn verify_completion(
     if token.deployment_id.is_empty()
         || token.operation_id.is_empty()
         || token.step_id.is_empty()
-        || token.qualification_id.is_empty()
         || token.revision < 1
         || token.generation < 1
         || expected.issued_at_ms < 0
@@ -215,4 +215,34 @@ pub fn verify_completion(
         observed_at_ms: evidence.observed_at_ms,
         valid_until_ms: expiry,
     })
+}
+
+/// Observation data shared with trusted collectors. These values confer no authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectObservation {
+    pub token: TransitionToken,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<ProcessIdentity>,
+    pub observed_at_ms: i64,
+    pub receipt: String,
+    pub facts: Vec<Milestone>,
+}
+
+/// Local parked-state observation; no engine command or inference request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedStatusObservation {
+    pub token: TransitionToken,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<ProcessIdentity>,
+    pub observed_at_ms: i64,
+    pub receipt: String,
+    pub allocations: bool,
+    pub weights: bool,
+    pub cache: bool,
+    pub quiesced: bool,
+    pub unknown_work: bool,
+    pub activity_before: (u64, u64, u64),
+    pub activity_after: (u64, u64, u64),
 }
