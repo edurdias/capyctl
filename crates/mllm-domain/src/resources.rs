@@ -43,6 +43,21 @@ pub struct ResidentFloor {
     pub sampled_at_ms: i64,
 }
 
+/// ADR 0007: the memory one process holds, as its host sampled it together
+/// with the availability it reports (GPU memory the driver attributes to the
+/// process plus its anonymous resident pages). Bound to the process identity
+/// (pid, boot id and start ticks), never to a deployment: the lifecycle
+/// authority attributes it to an owner only by matching that identity against
+/// the runtime it recorded, and credits it only as a lower bound
+/// ([`ResidentFloor`]). A reading source cannot grant credit by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessResident {
+    pub pid: u32,
+    pub boot_id: String,
+    pub start_ticks: u64,
+    pub bytes: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryLimit {
     pub domain: String,

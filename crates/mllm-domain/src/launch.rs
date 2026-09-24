@@ -1,61 +1,146 @@
 //! Normalized, immutable engine launch choices. These are requests, not grants or evidence.
+//!
+//! ADR 0014 §1: a deployment owns its `engine_config`; the host installation owns
+//! only the executable, environment, security policy and host-fixed arguments.
+//! These types are the resolved form of a deployment's `engine_config`, plus the
+//! values mllm derives from residency and host policy. Settings mllm reserves
+//! (ports, devices, ranks, memory grants, keys) never appear here: adapters
+//! render them from the grant, placement and binding.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "engine", rename_all = "lowercase")]
-pub enum ProfileLaunchSettings {
+pub enum LaunchSettings {
     Vllm(VllmLaunchSettings),
     Sglang(SglangLaunchSettings),
 }
 
+impl LaunchSettings {
+    pub fn common(&self) -> &CommonEngineSettings {
+        match self {
+            Self::Vllm(settings) => &settings.common,
+            Self::Sglang(settings) => &settings.common,
+        }
+    }
+
+    pub fn memory(&self) -> &MemoryRequest {
+        match self {
+            Self::Vllm(settings) => &settings.memory,
+            Self::Sglang(settings) => &settings.memory,
+        }
+    }
+
+    pub fn extra_args(&self) -> &[String] {
+        match self {
+            Self::Vllm(settings) => &settings.extra_args,
+            Self::Sglang(settings) => &settings.extra_args,
+        }
+    }
+
+    pub fn provenance(&self) -> &BTreeMap<String, SettingSource> {
+        match self {
+            Self::Vllm(settings) => &settings.provenance,
+            Self::Sglang(settings) => &settings.provenance,
+        }
+    }
+}
+
+/// SPEC §7 / T14: where an effective value came from when the deployment did
+/// not state it. A value the deployment declared has no entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SettingSource {
+    /// ADR 0014 §4: a safe default mllm applies; the deployment may override it.
+    #[serde(rename = "mllm default")]
+    MllmDefault,
+    /// Computed by mllm from other declared values (residency, host policy,
+    /// memory arithmetic, checkpoint size). Not declarable.
+    #[serde(rename = "derived")]
+    Derived,
+}
+
+/// ADR 0014 §2: typed parameters common to every engine family. `None` means
+/// the engine's own default applies. mllm validates type and range only; whether
+/// the engine supports a value on this checkpoint is the user's responsibility
+/// (ADR 0011).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CommonEngineSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_graphs: Option<bool>,
+    pub language_model_only: bool,
+    pub trust_remote_code: bool,
+}
+
+/// ADR 0014 §5 (owner decision P2): the per-instance memory request.
+/// Reservations always use `request_bytes`, never a sampled value (SPEC §7.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct VllmLaunchSettings {
-    pub tensor_parallel_size: u32,
-    pub pipeline_parallel_size: u32,
-    pub enable_sleep_mode: bool,
-    pub kv_cache_dtype: String,
-    pub block_size_tokens: u32,
-    pub cpu_offload_bytes: i64,
-    pub requested_budget: VllmRequestedBudget,
+pub struct MemoryRequest {
+    /// The per-instance reservation, declared or derived.
+    pub request_bytes: i64,
+    /// The KV cache the engine is asked to size, declared or derived.
+    pub kv_cache_bytes: i64,
+    /// The per-family overhead margin used when anything was derived.
+    pub margin_bytes: i64,
+    /// Sum of weight-file sizes from the checkpoint manifest (ADR 0014 §7),
+    /// when known at resolution. Recorded so a snapshot re-derives identically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weights_bytes: Option<i64>,
+    /// Owner decision 2026-09-23 (startup memory budget): the per-instance
+    /// peak admission reserves from arm until Ready (the cold phase, ADR 0007),
+    /// declared as `memory.startup` or the conservative placeholder default.
+    /// A launch reached Ready drops to `request_bytes`. Absent when the
+    /// deployment declares its `resources:` phases, and in a revision resolved
+    /// before the budget existed (its cold phase is the request).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct VllmRequestedBudget {
-    pub kv_cache_bytes: i64,
-    pub swap_space_bytes: i64,
-    pub gpu_utilization_pct: u8,
+pub struct VllmLaunchSettings {
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_size_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_num_batched_tokens: Option<u32>,
+    /// Derived, reserved: sleep (development) mode is on only where the host
+    /// leaves deep parking enabled and the deployment parks (SPEC §6.2, §9.1).
+    pub enable_sleep_mode: bool,
+    /// ADR 0014 §6: ordinary engine arguments the deployment accepted, already
+    /// checked against the reserved and sensitive lists.
+    pub extra_args: Vec<String>,
+    pub provenance: BTreeMap<String, SettingSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SglangLaunchSettings {
-    pub recipe: String,
-    pub tensor_parallel_size: u32,
-    pub data_parallel_size: u32,
+    pub common: CommonEngineSettings,
+    pub memory: MemoryRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u32>,
+    /// SGLang accepts `-1` to disable chunked prefill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunked_prefill_size: Option<i32>,
+    /// ADR 0014 §4: mllm default 1 (live finding), overridable.
     pub tokenizer_workers: u32,
-    pub model_dtype: String,
-    pub context_tokens: u32,
-    pub max_running_requests: u32,
-    pub max_total_tokens: u32,
-    pub prefill_cuda_graphs: bool,
-    pub decode_cuda_graphs: bool,
+    /// Derived from residency (ADR 0010): SGLang takes its park strategy at
+    /// launch, so these are startup settings, not park parameters.
     pub memory_saver: bool,
     pub cpu_weight_backup: bool,
-    pub speculative_decoding: bool,
-    pub lora: bool,
-    pub trust_remote_code: bool,
-    pub disaggregation: bool,
-    pub external_cache: bool,
-    pub cpu_kv_offload: bool,
-    pub native_grpc: bool,
     pub weight_restore: String,
-    pub requested_budget: SglangRequestedBudget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SglangRequestedBudget {
-    pub kv_cache_bytes: i64,
-    pub static_memory_fraction_bps: u16,
+    pub extra_args: Vec<String>,
+    pub provenance: BTreeMap<String, SettingSource>,
 }
 
 /// Reviewed logical placement, not an observed CUDA index or physical UUID.
@@ -82,7 +167,6 @@ pub struct NativeDeviceSelection {
 pub struct NativeLaunchMetadata {
     pub engine: String,
     pub recipe: String,
-    pub source_revision: String,
     pub checkpoint_revision: String,
     pub binding_id: String,
     pub incarnation: String,

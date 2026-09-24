@@ -169,7 +169,9 @@ pub fn verify_parked(status: &ParkedStatus, expected: &ParkedExpectation) -> Res
     let mut owned = expected.owned.clone();
     owned.sort();
     if observed.is_empty() || observed != owned {
-        return Err(ParkError::NotParked("identities differ from the owned association"));
+        return Err(ParkError::NotParked(
+            "identities differ from the owned association",
+        ));
     }
     if status.allocations {
         return Err(ParkError::NotParked("allocations still resident"));
@@ -187,7 +189,9 @@ pub fn verify_parked(status: &ParkedStatus, expected: &ParkedExpectation) -> Res
         return Err(ParkError::NotParked("unknown work observed"));
     }
     if status.activity_before != status.activity_after {
-        return Err(ParkError::NotParked("activity counters moved during observation"));
+        return Err(ParkError::NotParked(
+            "activity counters moved during observation",
+        ));
     }
     if status.receipt.is_empty() {
         return Err(ParkError::NotParked("empty receipt"));
@@ -207,7 +211,12 @@ mod tests {
     use crate::completion::{Milestone, ProcessIdentity};
 
     fn identity() -> ProcessIdentity {
-        ProcessIdentity { role: "api".into(), pid: 7, boot_id: "boot".into(), start_ticks: 1 }
+        ProcessIdentity {
+            role: "api".into(),
+            pid: 7,
+            boot_id: "boot".into(),
+            start_ticks: 1,
+        }
     }
 
     fn parked() -> ParkedStatus {
@@ -240,13 +249,27 @@ mod tests {
         assert_eq!(effects(ParkAction::Park), [Effect::Drain, Effect::Park]);
         assert_eq!(
             effects(ParkAction::Restore),
-            [Effect::Restore, Effect::ReloadWeights, Effect::InvalidateCache, Effect::Probe]
+            [
+                Effect::Restore,
+                Effect::ReloadWeights,
+                Effect::InvalidateCache,
+                Effect::Probe
+            ]
         );
         assert_eq!(facts(Effect::Drain), Ok(vec![Milestone::Quiesced]));
         assert_eq!(facts(Effect::Park), Ok(vec![Milestone::MemoryReleased]));
-        assert_eq!(facts(Effect::Restore), Ok(vec![Milestone::AllocationsRestored]));
-        assert_eq!(facts(Effect::ReloadWeights), Ok(vec![Milestone::WeightsUsable]));
-        assert_eq!(facts(Effect::InvalidateCache), Ok(vec![Milestone::CacheValid]));
+        assert_eq!(
+            facts(Effect::Restore),
+            Ok(vec![Milestone::AllocationsRestored])
+        );
+        assert_eq!(
+            facts(Effect::ReloadWeights),
+            Ok(vec![Milestone::WeightsUsable])
+        );
+        assert_eq!(
+            facts(Effect::InvalidateCache),
+            Ok(vec![Milestone::CacheValid])
+        );
         assert_eq!(facts(Effect::Probe), Err(ParkError::ProbeCarriesNoFacts));
     }
 
@@ -262,22 +285,41 @@ mod tests {
             committed_epoch: 5,
         };
         assert_eq!(
-            validate_predecessors(ParkAction::Park, 2, std::slice::from_ref(&drained), 900, 1_300),
+            validate_predecessors(
+                ParkAction::Park,
+                2,
+                std::slice::from_ref(&drained),
+                900,
+                1_300
+            ),
             Ok(vec![Milestone::Quiesced])
         );
         // Epoch did not advance.
-        let stale = CommittedEffect { committed_epoch: 0, ..drained.clone() };
+        let stale = CommittedEffect {
+            committed_epoch: 0,
+            ..drained.clone()
+        };
         assert_eq!(
             validate_predecessors(ParkAction::Park, 2, &[stale], 900, 1_300).unwrap_err(),
             ParkError::PredecessorMismatch
         );
         // Observed after the effect being armed.
         assert_eq!(
-            validate_predecessors(ParkAction::Park, 2, std::slice::from_ref(&drained), 900, 999).unwrap_err(),
+            validate_predecessors(
+                ParkAction::Park,
+                2,
+                std::slice::from_ref(&drained),
+                900,
+                999
+            )
+            .unwrap_err(),
             ParkError::PredecessorMismatch
         );
         // Wrong facts for the effect.
-        let wrong = CommittedEffect { facts: vec![Milestone::MemoryReleased], ..drained };
+        let wrong = CommittedEffect {
+            facts: vec![Milestone::MemoryReleased],
+            ..drained
+        };
         assert_eq!(
             validate_predecessors(ParkAction::Park, 2, &[wrong], 900, 1_300).unwrap_err(),
             ParkError::PredecessorMismatch
@@ -291,12 +333,20 @@ mod tests {
         use crate::resources::{Allocation, PhaseFootprint, ResourcePhase};
         let mut base = PhaseFootprint {
             phase: ResourcePhase::Ready,
-            allocations: vec![Allocation { domain: "unified".into(), bytes: 10, host_kv_bytes: 2 }],
+            allocations: vec![Allocation {
+                domain: "unified".into(),
+                bytes: 10,
+                host_kv_bytes: 2,
+            }],
             devices: vec![],
         };
         let peak = PhaseFootprint {
             phase: ResourcePhase::Parking,
-            allocations: vec![Allocation { domain: "unified".into(), bytes: 4, host_kv_bytes: 8 }],
+            allocations: vec![Allocation {
+                domain: "unified".into(),
+                bytes: 4,
+                host_kv_bytes: 8,
+            }],
             devices: vec![],
         };
         join(&mut base, &peak).unwrap();
@@ -304,10 +354,17 @@ mod tests {
         assert_eq!(base.allocations[0].host_kv_bytes, 8);
         let foreign = PhaseFootprint {
             phase: ResourcePhase::Parking,
-            allocations: vec![Allocation { domain: "other".into(), bytes: 1, host_kv_bytes: 0 }],
+            allocations: vec![Allocation {
+                domain: "other".into(),
+                bytes: 1,
+                host_kv_bytes: 0,
+            }],
             devices: vec![],
         };
-        assert_eq!(join(&mut base, &foreign).unwrap_err(), ParkError::UnknownDomain);
+        assert_eq!(
+            join(&mut base, &foreign).unwrap_err(),
+            ParkError::UnknownDomain
+        );
     }
 
     /// The parked predicate: nothing resident, nothing running, same processes,
@@ -318,27 +375,92 @@ mod tests {
     fn parked_requires_every_condition() {
         assert_eq!(verify_parked(&parked(), &owned()), Ok(()));
         let cases: Vec<(&str, ParkedStatus, ParkedExpectation)> = vec![
-            ("allocations", ParkedStatus { allocations: true, ..parked() }, owned()),
-            ("weights", ParkedStatus { weights: true, ..parked() }, owned()),
-            ("cache", ParkedStatus { cache: true, ..parked() }, owned()),
-            ("quiesced", ParkedStatus { quiesced: false, ..parked() }, owned()),
-            ("unknown work", ParkedStatus { unknown_work: true, ..parked() }, owned()),
-            ("activity", ParkedStatus { activity_after: (2, 1, 1), ..parked() }, owned()),
-            ("receipt", ParkedStatus { receipt: String::new(), ..parked() }, owned()),
-            ("stale", ParkedStatus { observed_at_ms: 1_000, ..parked() }, owned()),
+            (
+                "allocations",
+                ParkedStatus {
+                    allocations: true,
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "weights",
+                ParkedStatus {
+                    weights: true,
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "cache",
+                ParkedStatus {
+                    cache: true,
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "quiesced",
+                ParkedStatus {
+                    quiesced: false,
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "unknown work",
+                ParkedStatus {
+                    unknown_work: true,
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "activity",
+                ParkedStatus {
+                    activity_after: (2, 1, 1),
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "receipt",
+                ParkedStatus {
+                    receipt: String::new(),
+                    ..parked()
+                },
+                owned(),
+            ),
+            (
+                "stale",
+                ParkedStatus {
+                    observed_at_ms: 1_000,
+                    ..parked()
+                },
+                owned(),
+            ),
             (
                 "identities",
-                ParkedStatus { identities: vec![], ..parked() },
+                ParkedStatus {
+                    identities: vec![],
+                    ..parked()
+                },
                 owned(),
             ),
             (
                 "leases",
                 parked(),
-                ParkedExpectation { outstanding_request_leases: 1, ..owned() },
+                ParkedExpectation {
+                    outstanding_request_leases: 1,
+                    ..owned()
+                },
             ),
         ];
         for (name, status, expectation) in cases {
-            assert!(verify_parked(&status, &expectation).is_err(), "{name} must refuse");
+            assert!(
+                verify_parked(&status, &expectation).is_err(),
+                "{name} must refuse"
+            );
         }
     }
 }

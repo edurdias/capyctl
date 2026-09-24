@@ -30,7 +30,7 @@ pub struct StepExecutionContext {
     pub identities: ExecutionIdentities,
     pub completion_target: Option<PhaseFootprint>,
     pub grant_id: Option<String>,
-    pub launch_settings: Option<crate::launch::ProfileLaunchSettings>,
+    pub launch_settings: Option<crate::launch::LaunchSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,20 +143,9 @@ pub enum CompletionError {
 }
 
 fn identities_valid(identities: &[ProcessIdentity]) -> bool {
-    let mut roles = BTreeSet::new();
-    let mut processes = BTreeSet::new();
-    identities.iter().any(|identity| identity.role == "api")
-        && identities
-            .iter()
-            .any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
-        && identities.iter().all(|identity| {
-            !identity.role.is_empty()
-                && identity.pid > 0
-                && !identity.boot_id.is_empty()
-                && identity.boot_id == identities[0].boot_id
-                && roles.insert(identity.role.as_str())
-                && processes.insert((identity.boot_id.as_str(), identity.pid))
-        })
+    crate::group::validate_local_processes(identities).is_ok()
+        && identities.iter().any(|identity| identity.role == "api")
+        && identities.iter().any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
 }
 
 pub fn verify_completion(
