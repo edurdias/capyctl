@@ -269,7 +269,9 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         if !chunk["choices"][0]["finish_reason"].is_null() {
             finish = chunk["choices"][0]["finish_reason"].clone();
         }
-        if chunk.get("usage").is_some() {
+        // SGLang sends `"usage": null` on tool-call deltas; only a present
+        // usage object replaces what was collected.
+        if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
             response["usage"] = chunk["usage"].clone();
         }
     }
@@ -678,9 +680,13 @@ impl<'a> Parser<'a> {
             // fields are still never passed through untested.
             // SPEC §10 also preserves tool calls: `tool_calls` deltas are relayed
             // once their shape is validated (see `valid_tool_call_deltas`).
+            // A null role is an absent role: SGLang 0.5.20 serializes every
+            // tool-call delta with `"role": null` (found live 2026-09-24).
             if delta.keys().any(|k| {
                 !matches!(k.as_str(), "role" | "content" | "reasoning_content" | "tool_calls")
-            }) || delta.get("role").is_some_and(|r| r != "assistant")
+            }) || delta
+                .get("role")
+                .is_some_and(|r| !r.is_null() && r != "assistant")
                 || ["content", "reasoning_content"].iter().any(|key| {
                     delta
                         .get(*key)
@@ -1056,6 +1062,46 @@ mod tests {
         assert!(relayed[0].contains("get_weather"), "{}", relayed[0]);
     }
 
+    /// SPEC §10, T19 (found live 2026-09-24): SGLang 0.5.20 serializes its
+    /// tool-call deltas through a pydantic model without dropping unset
+    /// fields, so every tool-call chunk carries `"role": null`, `"content":
+    /// null` and `"reasoning_content": null` beside the call, plus `logprobs`
+    /// and `matched_stop` on the choice and `"usage": null` on the chunk. Its
+    /// finish chunk carries `"reasoning_content": null` alone. These are the
+    /// exact bytes SGLang 0.5.20 emits for `--tool-call-parser qwen25`
+    /// (`serving_chat._process_tool_call_stream`, `sse_utils.build_sse_content`);
+    /// a null role is an absent role, not a different one.
+    // T19
+    #[tokio::test]
+    async fn sglang_tool_call_deltas_with_null_fields_are_relayed() {
+        let sse = [
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":null,"role":"assistant","content":""},"logprobs":null,"finish_reason":null,"matched_stop":null}]}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":"call_x","index":0,"type":"function","function":{"name":"get_weather","arguments":""}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":null,"content":null,"reasoning_content":null,"tool_calls":[{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":"{\"city\": \"Paris\"}"}}]},"logprobs":null,"finish_reason":null,"matched_stop":null}],"usage":null}"#,
+            r#"data: {"id":"abc","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":null},"logprobs":null,"finish_reason":"tool_calls","matched_stop":null}]}"#,
+            "data: [DONE]",
+        ]
+        .map(|line| format!("{line}\n\n"))
+        .concat();
+        let (url, _) = recording(sse).await;
+        let forward = crate::forward::engine_forwarder(url, "m".into(), None);
+        let request = serde_json::json!({"model":"public","messages":[],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
+            "tool_choice":{"type":"function","function":{"name":"get_weather"}}});
+        let mut relayed = Vec::new();
+        let end = forward
+            .forward_chat_stream(&request, &mut |chunk| relayed.push(chunk))
+            .await
+            .unwrap();
+        assert_eq!(end, crate::traits::StreamEnded::Completed);
+        assert_eq!(relayed.len(), 4);
+        let response = forward.forward_chat(&request).await.unwrap();
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(response["choices"][0]["message"]["tool_calls"], serde_json::json!([{
+            "id":"call_x","type":"function",
+            "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}]));
+    }
+
     /// SPEC §10, T19: a malformed `tool_calls` delta is not relayed as success.
     // T19
     #[tokio::test]
@@ -1065,6 +1111,8 @@ mod tests {
             serde_json::json!({"tool_calls":[{"index":0,"type":"shell"}]}),
             serde_json::json!({"tool_calls":[{"index":0,"function":{"name":1}}]}),
             serde_json::json!({"tool_calls":"x"}),
+            serde_json::json!({"role":"user","tool_calls":[{"index":0}]}),
+            serde_json::json!({"role":1,"tool_calls":[{"index":0}]}),
         ] {
             let sse = [tool_chunk(bad.clone(), serde_json::json!("tool_calls")),
                        "data: [DONE]\n\n".to_owned()].concat();
