@@ -20,9 +20,13 @@ tokio = { workspace = true }
 futures = { workspace = true }
 async-stream = "0.3"
 async-trait = { workspace = true }
+# SPEC §13.3: constant-time comparison of the inference API key.
+subtle = "2"
 
 [dev-dependencies]
 mllm-testkit = { workspace = true }
+# SPEC §17 (M80): host latency reports in the timing tests.
+mllm-protocol = { workspace = true }
 async-trait = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 futures = { workspace = true }

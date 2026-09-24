@@ -55,6 +55,7 @@ fn response(forward: Forward, counts: &Arc<InFlight>) -> axum::response::Respons
         Arc::new(forward),
         json!({"model":"m"}),
         counts.guard_arc("d"),
+        None,
     )
     .into_response()
 }
@@ -340,6 +341,7 @@ async fn backend_panic_keeps_abandoned_accounting() {
         Arc::new(PanicForward),
         json!({"model":"m"}),
         counts.guard_arc("d"),
+        None,
     )
     .into_response();
     assert!(
@@ -349,4 +351,166 @@ async fn backend_panic_keeps_abandoned_accounting() {
             .is_empty()
     );
     assert_eq!(counts.current("d"), 1);
+}
+
+/// Sends `chunks` events spaced by `gap`, optionally only reporting progress
+/// (a stream draining after its client left), then stalls for `stall` before
+/// its terminator.
+struct Paced {
+    chunks: usize,
+    gap: std::time::Duration,
+    stall: std::time::Duration,
+    deliver: bool,
+}
+
+#[async_trait]
+impl ChatForward for Paced {
+    async fn forward_chat(&self, _: &Value) -> Result<Value, AdapterError> {
+        unreachable!()
+    }
+    async fn forward_chat_stream_async(
+        &self,
+        _: &Value,
+        sink: &mut dyn mllm_adapters::traits::ChatSink,
+    ) -> Result<StreamEnded, AdapterError> {
+        for index in 0..self.chunks {
+            tokio::time::sleep(self.gap).await;
+            if self.deliver {
+                let _ = sink.send(format!("{index}")).await;
+            } else {
+                sink.progressed();
+            }
+        }
+        tokio::time::sleep(self.stall).await;
+        Ok(StreamEnded::Completed)
+    }
+}
+
+fn paced(forward: Paced, counts: &Arc<InFlight>, first_ms: u64, idle_ms: u64) -> axum::response::Response {
+    let bounds = mllm_router::stream::StreamBounds {
+        first_event_by: tokio::time::Instant::now() + std::time::Duration::from_millis(first_ms),
+        idle: std::time::Duration::from_millis(idle_ms),
+    };
+    mllm_router::stream::stream_planned_timed(
+        mllm_router::balance::Attempt::direct(Arc::new(forward), None),
+        None,
+        json!({"model":"m"}),
+        counts.guard_arc("d"),
+        mllm_router::timing::RequestTiming::untracked(),
+        bounds,
+    )
+    .into_response()
+}
+
+/// SPEC §10: found live 2026-09-23 (matrix M30, vLLM), a fixed 300 s cap cut a
+/// stream that was still producing and left its lease uncertain. A stream that
+/// keeps producing runs past its first-event deadline and completes.
+// T17 T19
+#[tokio::test]
+async fn progressing_stream_is_never_cut_at_a_fixed_wall_time() {
+    let counts = Arc::new(InFlight::default());
+    let response = paced(
+        Paced {
+            chunks: 12,
+            gap: std::time::Duration::from_millis(100),
+            stall: std::time::Duration::ZERO,
+            deliver: true,
+        },
+        &counts,
+        300,
+        400,
+    );
+    let started = std::time::Instant::now();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    assert!(started.elapsed() > std::time::Duration::from_millis(1000));
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("data: 11\n\n"), "{text}");
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(counts.current("d"), 0, "completion closes the accounting");
+}
+
+/// SPEC §10: a stream whose backend stops producing is cut after the idle
+/// bound, without a fake terminator; acceptance is unknown, so the charge
+/// stays conservative.
+// T17 T19
+#[tokio::test]
+async fn stalled_stream_is_cut_after_the_idle_bound_and_stays_uncertain() {
+    let counts = Arc::new(InFlight::default());
+    let response = paced(
+        Paced {
+            chunks: 1,
+            gap: std::time::Duration::ZERO,
+            stall: std::time::Duration::from_secs(30),
+            deliver: true,
+        },
+        &counts,
+        5_000,
+        300,
+    );
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 4096),
+    )
+    .await
+    .expect("the idle bound ends the stream")
+    .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("data: 0\n\n"), "{text}");
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert_eq!(counts.current("d"), 1);
+}
+
+/// SPEC §10: a backend that never produces a first event is cut at the
+/// request deadline, again without releasing the charge.
+// T17 T19
+#[tokio::test]
+async fn silent_stream_is_cut_at_the_request_deadline() {
+    let counts = Arc::new(InFlight::default());
+    let response = paced(
+        Paced {
+            chunks: 0,
+            gap: std::time::Duration::ZERO,
+            stall: std::time::Duration::from_secs(30),
+            deliver: true,
+        },
+        &counts,
+        300,
+        60_000,
+    );
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 4096),
+    )
+    .await
+    .expect("the request deadline ends the stream")
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("[DONE]"));
+    assert_eq!(counts.current("d"), 1);
+}
+
+/// SPEC §10: after the client left, backend progress still counts; a drain
+/// that keeps producing is not cut by the idle bound and its completion
+/// releases the charge.
+// T17
+#[tokio::test]
+async fn draining_stream_after_disconnect_is_bounded_by_backend_progress() {
+    let counts = Arc::new(InFlight::default());
+    drop(paced(
+        Paced {
+            chunks: 12,
+            gap: std::time::Duration::from_millis(100),
+            stall: std::time::Duration::ZERO,
+            deliver: false,
+        },
+        &counts,
+        300,
+        400,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while counts.current("d") != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the drain completes and releases");
 }

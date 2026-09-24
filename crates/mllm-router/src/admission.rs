@@ -7,14 +7,53 @@ use std::sync::{Arc, Mutex};
 
 use crate::RouterDeps;
 
+/// SPEC §10 (T19): requests waiting for an in-flight slot of one deployment,
+/// served strictly in arrival order.
+#[derive(Default)]
+struct SlotQueue {
+    /// Tickets of the requests waiting, oldest first.
+    waiting: std::collections::VecDeque<u64>,
+    next_ticket: u64,
+    /// Woken whenever a slot frees or the head of the queue changes.
+    changed: Arc<tokio::sync::Notify>,
+}
+
 /// Per-process in-flight registry. Server-restart durability is NOT
 /// promised (F1 design §5: bodies/streams don't survive router restarts).
 #[derive(Default)]
 pub struct InFlight {
     counts: Mutex<std::collections::HashMap<String, Arc<AtomicUsize>>>,
+    /// SPEC §10 (T19): per-deployment FIFO of requests waiting for a slot.
+    /// Lock order: `slots`, then `counts`.
+    slots: Mutex<std::collections::HashMap<String, SlotQueue>>,
+    /// ADR 0013 §10 (I3): per-instance routing counts and tie rotation. A
+    /// routing hint only; accounting is the per-deployment count above and the
+    /// durable lease.
+    pub(crate) instances: crate::balance::InstanceCounts,
+    /// SPEC §10 step 1 (W10): requests waiting for a deployment to become
+    /// servable, bounded by count and buffered bytes, each under a deadline.
+    pub waiting: Arc<crate::queue::WaitQueue>,
+    /// SPEC §17 (M80): the router's per-request latency distributions and
+    /// its timing-header switch.
+    pub latency: Arc<crate::timing::LatencyRecorder>,
 }
 
 impl InFlight {
+    /// SPEC §10 (W10): an in-flight registry whose waiting requests are
+    /// bounded by `limits`.
+    pub fn with_wait_limits(limits: crate::queue::WaitLimits) -> Self {
+        Self {
+            waiting: Arc::new(crate::queue::WaitQueue::new(limits)),
+            ..Self::default()
+        }
+    }
+
+    /// ADR 0013 §10: requests this router has outstanding on one instance
+    /// incarnation.
+    pub fn instance_in_flight(&self, deployment: &str, generation: i64) -> usize {
+        self.instances.current(deployment, generation)
+    }
+
     /// Atomic-conditional increment (T19): registers one slot only while
     /// the deployment's in-flight count is below `max`; `false` when the
     /// bound is reached — the check and the increment share the lock, so
@@ -39,6 +78,83 @@ impl InFlight {
         if let Some(c) = self.counts.lock().unwrap().get(deployment) {
             c.fetch_sub(1, Ordering::SeqCst);
         }
+        // SPEC §10 (T19): a freed slot goes to the oldest waiting request.
+        self.wake(deployment);
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, SlotQueue>> {
+        // Plain queues: a panic elsewhere leaves nothing half-written.
+        self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wake(&self, deployment: &str) {
+        if let Some(queue) = self.slots().get(deployment) {
+            queue.changed.notify_waiters();
+        }
+    }
+
+    /// Requests waiting for an in-flight slot of `deployment` now.
+    pub fn slot_waiters(&self, deployment: &str) -> usize {
+        self.slots().get(deployment).map_or(0, |q| q.waiting.len())
+    }
+
+    /// SPEC §10 (T19): take one in-flight slot of `deployment`, waiting in
+    /// arrival order until `deadline` when the bound is reached. A request
+    /// arriving while others wait queues behind them, so a fresh arrival never
+    /// bypasses one that has waited. `None` once the deadline passes; no
+    /// accounting was taken. Dropping the future leaves the queue.
+    pub async fn acquire_arc(
+        self: &Arc<Self>,
+        deployment: &str,
+        max: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<StaticStreamGuard> {
+        let (ticket, changed) = {
+            let mut slots = self.slots();
+            let queue = slots.entry(deployment.to_owned()).or_default();
+            if queue.waiting.is_empty() && self.try_increment(deployment, max) {
+                return Some(self.static_guard(deployment));
+            }
+            let ticket = queue.next_ticket;
+            queue.next_ticket += 1;
+            queue.waiting.push_back(ticket);
+            (ticket, queue.changed.clone())
+        };
+        let mut place = Place {
+            inflight: self,
+            deployment,
+            ticket,
+            queued: true,
+        };
+        loop {
+            // Registered before the check, so a slot freed in between wakes us.
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut slots = self.slots();
+                let queue = slots.entry(deployment.to_owned()).or_default();
+                if queue.waiting.front() == Some(&ticket) && self.try_increment(deployment, max) {
+                    queue.waiting.pop_front();
+                    place.queued = false;
+                    // The next in line may fit too.
+                    queue.changed.notify_waiters();
+                    return Some(self.static_guard(deployment));
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    fn static_guard(self: &Arc<Self>, deployment: &str) -> StaticStreamGuard {
+        StaticStreamGuard {
+            inflight: self.clone(),
+            deployment: deployment.to_string(),
+            abandoned: false,
+            released: false,
+        }
     }
 
     pub fn current(&self, deployment: &str) -> usize {
@@ -48,6 +164,28 @@ impl InFlight {
             .get(deployment)
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0)
+    }
+}
+
+/// A request's place in a deployment's slot queue; leaving it (a deadline,
+/// a disconnect) lets the next request move up.
+struct Place<'a> {
+    inflight: &'a InFlight,
+    deployment: &'a str,
+    ticket: u64,
+    queued: bool,
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        if !self.queued {
+            return;
+        }
+        let mut slots = self.inflight.slots();
+        if let Some(queue) = slots.get_mut(self.deployment) {
+            queue.waiting.retain(|t| *t != self.ticket);
+            queue.changed.notify_waiters();
+        }
     }
 }
 
@@ -117,6 +255,11 @@ impl InFlight {
         deployment: &str,
         max: usize,
     ) -> Option<StaticStreamGuard> {
+        // SPEC §10 (T19): never ahead of a request already waiting for a slot.
+        let slots = self.slots();
+        if slots.get(deployment).is_some_and(|q| !q.waiting.is_empty()) {
+            return None;
+        }
         if self.try_increment(deployment, max) {
             Some(StaticStreamGuard {
                 inflight: self.clone(),

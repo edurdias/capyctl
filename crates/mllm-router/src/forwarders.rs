@@ -54,16 +54,36 @@ pub enum ForwarderError {
 pub trait ForwarderSource: Send + Sync {
     /// The forwarder for this deployment's currently running engine.
     fn forwarder(&self, deployment: &str) -> Result<Arc<dyn ChatForward>, ForwarderError>;
+
+    /// ADR 0013 §10 (I3): the forwarder for exactly the instance incarnation
+    /// `generation` names, the one a request lease was just granted for. Never
+    /// another instance's: a lease and its forward name the same incarnation.
+    fn forwarder_for(
+        &self,
+        deployment: &str,
+        _generation: i64,
+    ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
+        self.forwarder(deployment)
+    }
 }
 
 /// Forwarders built from what the lifecycle authority reports is running.
 pub struct LiveForwarders {
     port: Arc<dyn LifecyclePort>,
-    /// Keyed by deployment and incarnation together. Keying by deployment alone
-    /// would hand a restarted deployment the forwarder built for the launch it
-    /// replaced, which is the exact failure this module exists to prevent.
-    cache: Mutex<HashMap<(String, String), Arc<dyn ChatForward>>>,
+    /// Keyed by deployment, instance generation and incarnation together.
+    /// Keying by deployment alone would hand a restarted deployment the
+    /// forwarder built for the launch it replaced, which is the exact failure
+    /// this module exists to prevent; and a deployment with several instances
+    /// (ADR 0013 §5) has one live incarnation per generation. The legacy
+    /// whole-deployment read has no generation (`None`).
+    cache: Mutex<HashMap<CacheKey, Arc<dyn ChatForward>>>,
 }
+
+type CacheKey = (String, Option<i64>, String);
+
+/// SPEC §17: the cache is bounded. Past this many entries it is emptied, which
+/// only costs rebuilding a forwarder; every entry is re-validated per request.
+const MAX_CACHED_FORWARDERS: usize = 1024;
 
 impl LiveForwarders {
     pub fn new(port: Arc<dyn LifecyclePort>) -> Self {
@@ -77,21 +97,23 @@ impl LiveForwarders {
     /// while it was held has left nothing half-written. Recovering the map is
     /// honest here; propagating a poisoning would turn an unrelated panic into a
     /// permanently unservable router.
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Arc<dyn ChatForward>>> {
+    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, Arc<dyn ChatForward>>> {
         self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-impl ForwarderSource for LiveForwarders {
-    fn forwarder(&self, deployment: &str) -> Result<Arc<dyn ChatForward>, ForwarderError> {
-        // Read the authority before taking the lock: the read can block on the
-        // coordinator's own store, and holding the cache across it would serialise
-        // every deployment's dispatch behind one of them.
-        let runtime = self
-            .port
-            .runtime_endpoint(deployment)?
-            .ok_or_else(|| ForwarderError::NoRuntime(deployment.to_string()))?;
-        let key = (deployment.to_string(), runtime.incarnation.clone());
+impl LiveForwarders {
+    /// Build or reuse the forwarder for one launch. A newer incarnation of the
+    /// same (deployment, generation) supersedes every earlier one: the entries
+    /// it replaces hold a retired key and a port returned to the lease pool, so
+    /// keeping them would only make a stale answer reachable.
+    fn build(
+        &self,
+        deployment: &str,
+        generation: Option<i64>,
+        runtime: mllm_controller::RuntimeEndpoint,
+    ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
+        let key = (deployment.to_string(), generation, runtime.incarnation.clone());
         let mut cache = self.cache();
         if let Some(existing) = cache.get(&key) {
             return Ok(existing.clone());
@@ -105,13 +127,39 @@ impl ForwarderSource for LiveForwarders {
             runtime.served_model.clone(),
             runtime.engine_key.clone(),
         );
-        // A newer incarnation supersedes every earlier one for this deployment. The
-        // entries it replaces hold a retired key and a port that has been returned
-        // to the lease pool, so keeping them would only make a stale answer
-        // reachable.
-        cache.retain(|(cached, _), _| cached != deployment);
+        cache.retain(|(cached, cached_generation, _), _| {
+            cached != deployment || *cached_generation != generation
+        });
+        if cache.len() >= MAX_CACHED_FORWARDERS {
+            cache.clear();
+        }
         cache.insert(key, forwarder.clone());
         Ok(forwarder)
+    }
+}
+
+impl ForwarderSource for LiveForwarders {
+    fn forwarder(&self, deployment: &str) -> Result<Arc<dyn ChatForward>, ForwarderError> {
+        // Read the authority before taking the lock: the read can block on the
+        // coordinator's own store, and holding the cache across it would serialise
+        // every deployment's dispatch behind one of them.
+        let runtime = self
+            .port
+            .runtime_endpoint(deployment)?
+            .ok_or_else(|| ForwarderError::NoRuntime(deployment.to_string()))?;
+        self.build(deployment, None, runtime)
+    }
+
+    fn forwarder_for(
+        &self,
+        deployment: &str,
+        generation: i64,
+    ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
+        let runtime = self
+            .port
+            .instance_endpoint(deployment, generation)?
+            .ok_or_else(|| ForwarderError::NoRuntime(deployment.to_string()))?;
+        self.build(deployment, Some(generation), runtime)
     }
 }
 
