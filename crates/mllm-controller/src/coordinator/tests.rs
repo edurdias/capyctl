@@ -9,6 +9,23 @@ mod cleanup;
 #[path = "tests_start_command.rs"]
 mod start_command;
 
+#[path = "tests_remote.rs"]
+mod remote;
+
+#[path = "tests_residency.rs"]
+mod residency;
+
+#[path = "tests_concurrency.rs"]
+mod concurrency;
+
+// Owner decision 2026-09-23: the startup memory budget and per-host gate.
+#[path = "tests_startup.rs"]
+mod startup;
+
+// W10: request-driven switching.
+#[path = "tests_switching.rs"]
+mod switching_tests;
+
 use mllm_testkit::{fixture, FakeEngine};
 
 struct Observations(Vec<MemoryObservation>);
@@ -116,20 +133,20 @@ impl EngineAdapter for Gate {
                     )
                     .unwrap();
             } else {
-            o.store()
-                .record_owned_launch(
-                    o.session(),
-                    &command.context.token.step_id,
-                    &OwnedLaunchReceipt {
-                        binding_id: observation.binding_id.clone(),
-                        incarnation: observation.incarnation.clone(),
-                        identities: observation.identities.clone(),
-                        observed_at_ms: observation.observed_at_ms,
-                        receipt: observation.receipt.clone(),
-                    },
-                    1900,
-                )
-                .unwrap();
+                o.store()
+                    .record_owned_launch(
+                        o.session(),
+                        &command.context.token.step_id,
+                        &OwnedLaunchReceipt {
+                            binding_id: observation.binding_id.clone(),
+                            incarnation: observation.incarnation.clone(),
+                            identities: observation.identities.clone(),
+                            observed_at_ms: observation.observed_at_ms,
+                            receipt: observation.receipt.clone(),
+                        },
+                        1900,
+                    )
+                    .unwrap();
             }
         }
         self.entered.add_permits(1);
@@ -204,9 +221,8 @@ fn spawn_fake(
             }
             let clock = observation_clock.clone();
             let engine = Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(move || {
-                clock().map_err(|_| {
-                    RuntimeError::Uncertain("service observation clock failed".into())
-                })
+                clock()
+                    .map_err(|_| RuntimeError::Uncertain("service observation clock failed".into()))
             })));
             let cleanup = engine.clone();
             Ok(Arc::new(Driver {
@@ -225,6 +241,7 @@ fn spawn_fake(
                 }),
                 // The Fake launches nothing, so there is nothing to terminate.
                 tools: None,
+                settle: None,
             }))
         }),
     )
@@ -266,6 +283,7 @@ fn test_driver(gate: Arc<Gate>) -> Arc<Driver> {
         // This builder launches nothing, so it has nothing to terminate: the
         // failure path pauses uncertain for it, as it does for the Fake.
         tools: None,
+        settle: None,
     })
 }
 async fn stopped(worker: &OwnedCoordinator) -> WorkerStatus {
@@ -379,7 +397,12 @@ async fn timeout_and_panic_retain_peak_and_never_stop_or_continue() {
     for panic in [false, true] {
         let (_dir, owner, fence, observations) = setup().await;
         let gate = Gate::new(panic);
-        let w = worker(owner.clone(), observations, gate.clone(), CoordinatorOptions::default());
+        let w = worker(
+            owner.clone(),
+            observations,
+            gate.clone(),
+            CoordinatorOptions::default(),
+        );
         // Spec §4: Initialize is bounded by the smaller of its own timeout and what
         // is left of the accepted deadline. The deadline is the short one here, so
         // the gate that never replies is abandoned 30 ms after the step arms.
@@ -886,15 +909,20 @@ async fn current_policy_race_and_observation_timeout_deny_send() {
 
 #[tokio::test]
 async fn clock_read_after_validation_preserves_arm_when_freshness_expires() {
-    let (_dir, owner, fence, observations) = setup().await;
+    let (dir, owner, fence, observations) = setup().await;
     let armed = Arc::new(AtomicBool::new(false));
     let arm_seen = armed.clone();
-    let clock_owner = owner.clone();
+    let runtime_thread = std::thread::current().id();
+    let sql = Mutex::new(rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap());
     // Service time advances only at the final clock read outside Store. This
     // simulates costly provenance validation consuming the observation window.
+    // ADR 0015: the scheduler's store jobs run beside the Initialize task, so a
+    // busy owner lock no longer marks a read made under it; store jobs run on
+    // blocking threads, the task's final clock read on this runtime thread.
     let clock = Arc::new(move || {
-        if let Ok(o) = clock_owner.try_lock() {
-            if !o.store().resource_snapshot().unwrap().owners.is_empty() {
+        if std::thread::current().id() == runtime_thread {
+            let armed: bool = sql.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE o.kind='initialize' AND s.state='armed')", [], |r| r.get(0)).unwrap();
+            if armed {
                 arm_seen.store(true, Ordering::SeqCst);
                 return Ok(9999);
             }
@@ -938,20 +966,22 @@ async fn stop_racing_completion_cannot_publish_ready() {
     }
     gate.release.add_permits(1);
     // ADR 0011 decision 4: the raced fence leaves this deployment's own binding
-    // retained with no tracked cleanup for it, so this deployment's admission
-    // closes — but that is this deployment's own accounting, not a process-wide
-    // fault, so the coordinator keeps running for every other deployment.
+    // retained with no tracked cleanup for it, and the start is given up on —
+    // but that is this deployment's own accounting, not a process-wide fault,
+    // so the coordinator keeps running for every other deployment. T18: the
+    // give-up names the incarnation the stop already fenced, so its closure is
+    // stale and closes nothing (there is no deployment-wide fallback).
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let closed: bool = sql
+            let given_up: bool = sql
                 .query_row(
-                    "SELECT admission_enabled=0 FROM deployments WHERE id=?1",
-                    [&fence.deployment_id],
+                    "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE operation_id=?1 AND state='given_up')",
+                    [a.operation_id()],
                     |r| r.get(0),
                 )
                 .unwrap();
-            if closed {
+            if given_up {
                 break;
             }
             assert_eq!(w.status(), WorkerStatus::Running);
@@ -1200,8 +1230,9 @@ async fn arm_context_is_not_reissued_and_pre_send_rejects_persisted_mutations() 
             "UPDATE lifecycle_claims SET generation=generation-1 WHERE operation_id=(SELECT operation_id FROM lifecycle_steps WHERE id=?1)",
         ),
         (
-            "UPDATE deployments SET dispatch_enabled=1 WHERE id=(SELECT deployment_id FROM lifecycle_steps WHERE id=?1)",
-            "UPDATE deployments SET dispatch_enabled=0 WHERE id=(SELECT deployment_id FROM lifecycle_steps WHERE id=?1)",
+            // ADR 0013 §5: dispatch is the instance's own gate.
+            "UPDATE deployment_instances SET dispatch_enabled=1 WHERE deployment_id=(SELECT deployment_id FROM lifecycle_steps WHERE id=?1)",
+            "UPDATE deployment_instances SET dispatch_enabled=0 WHERE deployment_id=(SELECT deployment_id FROM lifecycle_steps WHERE id=?1)",
         ),
         (
             "UPDATE resource_grants SET committed_epoch=committed_epoch+10 WHERE id=(SELECT grant_id FROM lifecycle_steps WHERE id=?1)",
@@ -1450,11 +1481,7 @@ async fn measure_full_validation_stages_with_unmodified_observation_evidence() {
             .unwrap()
     });
     stage(&owner, "discovery", |o| {
-        assert!(o
-            .store()
-            .next_initialize(o.session())
-            .unwrap()
-            .is_some());
+        assert!(o.store().next_initialize(o.session()).unwrap().is_some());
     });
     let limits: Vec<_> = controls
         .domains
@@ -1631,17 +1658,16 @@ async fn a_failed_start_is_retried_until_the_budget_is_spent() {
     assert_eq!(
         journal
             .iter()
-            .filter(|entry| entry
-                .contains(&format!("deployment {}: ", fence.deployment_id))
-                && entry.contains("injected recipe failure"))
+            .filter(
+                |entry| entry.contains(&format!("deployment {}: ", fence.deployment_id))
+                    && entry.contains("injected recipe failure")
+            )
             .count(),
         4,
         "three attempts and one give-up were not journaled: {journal:?}"
     );
     assert!(
-        journal
-            .iter()
-            .any(|entry| entry.contains("gave up: ")),
+        journal.iter().any(|entry| entry.contains("gave up: ")),
         "the give-up was not journaled: {journal:?}"
     );
     // The coordinator itself is unaffected, and nothing was armed for a fourth
@@ -1852,6 +1878,87 @@ async fn a_given_up_deployment_reads_closed_and_can_still_be_stopped() {
         unarmed.map(|r| r.operation_id),
         Some(receipt.operation_id.clone())
     );
+    drop(start);
+    w.shutdown().await.unwrap();
+}
+
+/// SPEC §6.1, §6.3: an operator's Stop of a deployment that gave up while it
+/// still holds its runtime binding and endpoint lease is the ordinary Stop, not a
+/// recorded one: accounting is released only when the worker completes that
+/// cleanup, and automatic activation stays suspended. T10 T32
+// T10 T32
+#[tokio::test]
+async fn an_operator_stop_of_a_given_up_deployment_holding_a_runtime_cleans_it_up() {
+    let (dir, owner, fence, observations) = setup().await;
+    let w = OwnedCoordinator::spawn(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            max_attempts: 1,
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Arc::new(move |_| Err(CoordinatorError::Service("injected recipe failure".into()))),
+    )
+    .unwrap();
+    let start = w.start(&fence, 10000).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !steps(&sql, &fence.deployment_id).1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the deployment never gave up");
+    let held = || {
+        sql.query_row(
+            "SELECT COUNT(*) FROM runtime_bindings b WHERE b.deployment_id=?1 AND b.state!='released'
+                 AND EXISTS(SELECT 1 FROM endpoint_leases e WHERE e.binding_id=b.id)",
+            [&fence.deployment_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(held(), 1, "the given-up start still holds its binding and lease");
+    let stop = w
+        .commands()
+        .administrative_stop("owner", &fence.deployment_id, fence.revision, "stop", 10000)
+        .expect("an operator Stop of a given-up deployment was refused");
+    let kind: String = sql
+        .query_row(
+            "SELECT kind FROM operations WHERE id=?1",
+            [stop.operation_id()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "ordinary_unarmed_stop", "held work is the ordinary Stop's");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let done: bool = sql
+                .query_row(
+                    "SELECT state='succeeded' FROM operations WHERE id=?1",
+                    [stop.operation_id()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Stop never completed");
+    {
+        let o = owner.lock().unwrap();
+        assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+        assert!(o.store().is_admin_stopped(&fence.deployment_id).unwrap());
+    }
+    assert_eq!(held(), 0, "the completed Stop released the binding and lease");
     drop(start);
     w.shutdown().await.unwrap();
 }
@@ -2120,6 +2227,7 @@ mod native {
                 options.terminate_grace,
             ),
             tools: Some(tools),
+            settle: None,
         })
     }
 
@@ -2135,10 +2243,7 @@ mod native {
 
     /// A builder that arms, records whatever the test asked it to, and then fails
     /// with `reason`.
-    fn failing_gate(
-        owner: Option<SharedCoordinatorState>,
-        reason: &str,
-    ) -> Arc<Gate> {
+    fn failing_gate(owner: Option<SharedCoordinatorState>, reason: &str) -> Arc<Gate> {
         let gate = Gate::new(false);
         *gate.association.lock().unwrap() = owner;
         *gate.failure.lock().unwrap() = Some(reason.into());
@@ -2285,12 +2390,7 @@ mod native {
         assert_eq!(binding_state, "released");
         {
             let o = owner.lock().unwrap();
-            assert!(o
-                .store()
-                .resource_snapshot()
-                .unwrap()
-                .owners
-                .is_empty());
+            assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
         }
         let secrets: i64 = sql
             .query_row("SELECT COUNT(*) FROM engine_secrets", [], |r| r.get(0))
@@ -2327,6 +2427,447 @@ mod native {
         );
         running(&w).await;
         assert_eq!(w.status(), WorkerStatus::Running);
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// A coordinator whose launches arm and then fail with "engine exited", and
+    /// the deployment whose one launch already failed and was released with
+    /// evidence: it holds nothing and reads FAILED (SPEC §6.1).
+    async fn failed_deployment() -> (
+        tempfile::TempDir,
+        SharedCoordinatorState,
+        DeploymentFence,
+        OwnedCoordinator,
+    ) {
+        let (dir, owner, fence, observations) = setup().await;
+        let gate = failing_gate(Some(owner.clone()), "engine exited");
+        let tools = ScriptedTool::proving();
+        let options = native_options();
+        let factory_owner = owner.clone();
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |work| {
+                {
+                    let o = factory_owner.lock().unwrap();
+                    o.store()
+                        .store_engine_key(
+                            work.binding_id(),
+                            work.incarnation(),
+                            &mllm_store::secrets::new_engine_key(),
+                            mllm_store::secrets::SecretRole::Inference,
+                        )
+                        .unwrap();
+                }
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Closed
+        );
+        drop(start);
+        assert_eq!(
+            deployment_states(&owner, &fence.deployment_id),
+            ("ready".into(), "failed".into())
+        );
+        (dir, owner, fence, w)
+    }
+
+    /// `(desired_state, observed_state)` as status reports them.
+    fn deployment_states(owner: &SharedCoordinatorState, id: &str) -> (String, String) {
+        let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+        let d = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+        (d.desired_state.clone(), d.observed_state.clone())
+    }
+
+    fn operation_state(owner: &SharedCoordinatorState, operation: &str) -> Option<String> {
+        let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+        snapshot
+            .operations
+            .iter()
+            .find(|op| op.id == operation)
+            .map(|op| op.state.clone())
+    }
+
+    /// SPEC §6.1, §6.3 (live M16, M53): an operator's Stop of a FAILED
+    /// deployment that holds nothing was refused as `Lifecycle state does not
+    /// permit this action`. It is accepted, recorded at once (automatic
+    /// activation suspended, desired `stopped`), releases nothing, replays its
+    /// receipt, and the deployment can then be deleted. T10 T32
+    // T10 T32
+    #[tokio::test]
+    async fn an_operator_stop_of_a_failed_deployment_holding_nothing_is_recorded_at_once() {
+        let (dir, owner, fence, w) = failed_deployment().await;
+        let id = fence.deployment_id.clone();
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        let history = |table: &str| {
+            sql.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        let (steps_before, runs_before) = (history("lifecycle_steps"), history("lifecycle_runs"));
+        let stop = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-failed", 10_000)
+            .expect("an operator Stop of a failed deployment was refused");
+        // Completed in the acceptance transaction: nothing to wait for.
+        assert_eq!(
+            operation_state(&owner, stop.operation_id()).as_deref(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            deployment_states(&owner, &id),
+            ("stopped".into(), "stopped".into())
+        );
+        {
+            let o = owner.lock().unwrap();
+            assert!(o.store().is_admin_stopped(&id).unwrap());
+            assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
+        }
+        // Nothing was executed: no step and no run was created for it.
+        assert_eq!(
+            (history("lifecycle_steps"), history("lifecycle_runs")),
+            (steps_before, runs_before)
+        );
+        // SPEC §17: the Stop is journaled with what it found.
+        let journal = journal(&owner, stop.operation_id());
+        assert!(
+            journal.iter().any(|entry| entry.contains("\"held\":\"nothing\"")),
+            "{journal:?}"
+        );
+        // T09: an exact retry returns the original receipt; the same key with
+        // another deadline is another command.
+        let replay = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-failed", 10_000)
+            .unwrap();
+        assert_eq!(replay, stop);
+        assert!(matches!(
+            w.commands()
+                .administrative_stop("owner", &id, fence.revision, "stop-failed", 10_001),
+            Err(CoordinatorCommandError::Lifecycle(
+                LifecycleError::IdempotencyConflict
+            ))
+        ));
+        // SPEC §6.3: the next inference request does not undo it.
+        use crate::port::LifecyclePort;
+        let port = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
+        assert!(matches!(
+            port.auto_activate(&id).await,
+            Err(crate::fault::LifecycleFault::Blocked(_))
+        ));
+        // The operator path the CLI reaches reads the same answer.
+        let handle = port
+            .request_transition(&id, mllm_domain::LifecycleAction::Stop)
+            .await
+            .expect("the port's Stop of a stopped deployment was refused");
+        assert_eq!(
+            port.wait_terminal(&handle).await.unwrap(),
+            mllm_domain::LifecycleState::Stopped
+        );
+        // SPEC §6.3 (W6): nothing is held, so the delete follows.
+        w.commands()
+            .delete("owner", &id, fence.revision, "delete", 10_000)
+            .expect("the delete after the Stop was refused");
+        w.shutdown().await.unwrap();
+    }
+
+    /// SPEC §6.3: `start deployment` on a FAILED deployment makes a fresh
+    /// attempt, before or after an operator's Stop, and lifts that Stop. T10
+    // T10
+    #[tokio::test]
+    async fn a_start_of_a_failed_deployment_re_attempts_before_and_after_a_stop() {
+        let (dir, owner, fence, w) = failed_deployment().await;
+        let id = fence.deployment_id.clone();
+        let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
+        let initializes = || {
+            sql.query_row(
+                "SELECT COUNT(*) FROM operations WHERE deployment_id=?1 AND kind='initialize'",
+                [&id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let settle = |operation: String| {
+            let owner = owner.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(60), async {
+                    while operation_state(&owner, &operation).as_deref() != Some("failed") {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the re-attempt never settled");
+            }
+        };
+        assert_eq!(initializes(), 1);
+        let again = w
+            .commands()
+            .start("owner", &id, fence.revision, "start-again", 10_000)
+            .expect("a start of a failed deployment was refused");
+        assert_eq!(initializes(), 2, "the start made a fresh attempt");
+        settle(again.operation_id().to_owned()).await;
+        assert_eq!(deployment_states(&owner, &id).1, "failed");
+
+        w.commands()
+            .administrative_stop("owner", &id, fence.revision, "stop", 10_000)
+            .unwrap();
+        assert_eq!(
+            deployment_states(&owner, &id),
+            ("stopped".into(), "stopped".into())
+        );
+        let after = w
+            .commands()
+            .start("owner", &id, fence.revision, "start-after-stop", 10_000)
+            .expect("a start after the Stop was refused");
+        assert_eq!(initializes(), 3);
+        assert!(
+            !owner.lock().unwrap().store().is_admin_stopped(&id).unwrap(),
+            "the start did not lift the operator's Stop"
+        );
+        settle(after.operation_id().to_owned()).await;
+        w.shutdown().await.unwrap();
+    }
+
+    fn operation_kind(owner: &SharedCoordinatorState, operation: &str) -> Option<(String, String)> {
+        let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
+        snapshot
+            .operations
+            .iter()
+            .find(|op| op.id == operation)
+            .map(|op| (op.action.clone(), op.state.clone()))
+    }
+
+    fn held_bindings(dir: &tempfile::TempDir, deployment: &str) -> i64 {
+        rusqlite::Connection::open(dir.path().join("srv.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?1 AND state!='released'",
+                [deployment],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    async fn until_operation(owner: &SharedCoordinatorState, operation: &str, state: &str) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while operation_state(owner, operation).as_deref() != Some(state) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("operation {operation} never reached {state}"));
+    }
+
+    /// The journaled follow-up Stop a resolved deferred Stop names.
+    fn follow_up(owner: &SharedCoordinatorState, operation: &str) -> String {
+        let entries = journal(owner, operation);
+        let resolved = entries
+            .iter()
+            .find_map(|entry| {
+                serde_json::from_str::<serde_json::Value>(entry)
+                    .ok()
+                    .and_then(|v| v["follow_up_operation_id"].as_str().map(str::to_owned))
+            })
+            .unwrap_or_else(|| panic!("no follow-up journaled: {entries:?}"));
+        resolved
+    }
+
+    /// SPEC §6.3 (live M47): an operator's Stop while a launch is in flight and
+    /// not yet associated was refused as `Lifecycle state does not permit this
+    /// action`. It is accepted and deferred: activation is suspended at once,
+    /// nothing is fenced or released while the launch runs, and once the launch
+    /// is Ready the Stop is carried out as an ordinary one, releasing the
+    /// runtime only on the cleanup's evidence. T10 T20
+    // T10 T20
+    #[tokio::test]
+    async fn an_operator_stop_during_an_unassociated_launch_is_deferred_until_it_settles() {
+        let (dir, owner, fence, observations) = setup().await;
+        let id = fence.deployment_id.clone();
+        let gate = Gate::new(false);
+        let w = worker(
+            owner.clone(),
+            observations,
+            gate.clone(),
+            CoordinatorOptions::default(),
+        );
+        let start = w.start(&fence, 10_000).unwrap();
+        gate.entered().await;
+        let stop = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-launching", 10_000)
+            .expect("an operator Stop during a launch was refused");
+        assert_eq!(
+            operation_kind(&owner, stop.operation_id()),
+            Some(("administrative_stop_deferred".into(), "pending".into()))
+        );
+        assert!(owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
+        assert_eq!(held_bindings(&dir, &id), 1, "nothing released while launching");
+        // T09: an exact retry answers the same receipt.
+        let replay = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-launching", 10_000)
+            .unwrap();
+        assert_eq!(replay, stop);
+        gate.release.add_permits(1);
+        // The launch completes (the deferred Stop never fenced it); an observer
+        // reading after the Stop is carried out sees it superseded by that Stop.
+        let observed = start.wait(Duration::from_secs(60)).await.unwrap();
+        assert!(
+            matches!(
+                observed,
+                InitializeStatus::Completed | InitializeStatus::Superseded
+            ),
+            "{observed:?}"
+        );
+        until_operation(&owner, stop.operation_id(), "succeeded").await;
+        let cleanup = follow_up(&owner, stop.operation_id());
+        assert_eq!(
+            operation_kind(&owner, &cleanup).map(|(kind, _)| kind).as_deref(),
+            Some("ordinary_cleanup")
+        );
+        until_operation(&owner, &cleanup, "succeeded").await;
+        assert_eq!(held_bindings(&dir, &id), 0);
+        assert_eq!(
+            deployment_states(&owner, &id),
+            ("stopped".into(), "stopped".into())
+        );
+        assert!(owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
+        let replay = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-launching", 10_000)
+            .unwrap();
+        assert_eq!(replay, stop, "the receipt replays after resolution");
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// SPEC §6.1, §6.3 (live M47): a deferred operator Stop whose launch then
+    /// fails is carried out once the failure is released with evidence; the
+    /// deployment reads stopped, not failed. T10 T20
+    // T10 T20
+    #[tokio::test]
+    async fn a_deferred_stop_whose_launch_fails_records_the_stop_after_the_release() {
+        let (_dir, owner, fence, observations) = setup().await;
+        let id = fence.deployment_id.clone();
+        let gate = Gate::new(false);
+        *gate.association.lock().unwrap() = Some(owner.clone());
+        *gate.failure.lock().unwrap() = Some("engine exited before readiness".into());
+        gate.api_only.store(true, Ordering::SeqCst);
+        let tools = ScriptedTool::proving();
+        let options = native_options();
+        let factory_owner = owner.clone();
+        let (driver_gate, driver_tools, driver_options) =
+            (gate.clone(), tools.clone(), options.clone());
+        let w = OwnedCoordinator::spawn(
+            owner.clone(),
+            Arc::new(Observations(observations)),
+            Arc::new(|| Ok(1900)),
+            options,
+            Arc::new(move |work| {
+                {
+                    let o = factory_owner.lock().unwrap();
+                    o.store()
+                        .store_engine_key(
+                            work.binding_id(),
+                            work.incarnation(),
+                            &mllm_store::secrets::new_engine_key(),
+                            mllm_store::secrets::SecretRole::Inference,
+                        )
+                        .unwrap();
+                }
+                Ok(native_driver(
+                    driver_gate.clone(),
+                    driver_tools.clone(),
+                    &driver_options,
+                ))
+            }),
+        )
+        .unwrap();
+        let start = w.start(&fence, 10_000).unwrap();
+        gate.entered().await;
+        let stop = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-launching", 10_000)
+            .expect("an operator Stop during a launch was refused");
+        assert_eq!(
+            operation_kind(&owner, stop.operation_id()),
+            Some(("administrative_stop_deferred".into(), "pending".into()))
+        );
+        gate.release.add_permits(1);
+        // Closed if observed before the deferred Stop is carried out,
+        // superseded after it; never an error.
+        let observed = start.wait(Duration::from_secs(60)).await.unwrap();
+        assert!(
+            matches!(
+                observed,
+                InitializeStatus::Closed | InitializeStatus::Superseded
+            ),
+            "{observed:?}"
+        );
+        until_operation(&owner, stop.operation_id(), "succeeded").await;
+        let recorded = follow_up(&owner, stop.operation_id());
+        assert_eq!(
+            operation_kind(&owner, &recorded),
+            Some(("administrative_stop_recorded".into(), "succeeded".into()))
+        );
+        assert_eq!(tools.terminations().len(), 1, "the failed launch was proven gone");
+        assert_eq!(
+            deployment_states(&owner, &id),
+            ("stopped".into(), "stopped".into())
+        );
+        // The recorded Stop fenced the instance: an observer of the failed
+        // start reads it superseded, never corrupt.
+        assert_eq!(status(&owner, start.step_id()), InitializeStatus::Superseded);
+        drop(start);
+        w.shutdown().await.unwrap();
+    }
+
+    /// SPEC §6.3: a Start accepted after a deferred Stop lifts the operator's
+    /// Stop, so the deferred one stops nothing and closes superseded. T10
+    // T10
+    #[tokio::test]
+    async fn a_start_after_a_deferred_stop_supersedes_it() {
+        let (dir, owner, fence, observations) = setup().await;
+        let id = fence.deployment_id.clone();
+        let gate = Gate::new(false);
+        let w = worker(
+            owner.clone(),
+            observations,
+            gate.clone(),
+            CoordinatorOptions::default(),
+        );
+        let start = w.start(&fence, 10_000).unwrap();
+        gate.entered().await;
+        let stop = w
+            .commands()
+            .administrative_stop("owner", &id, fence.revision, "stop-launching", 10_000)
+            .unwrap();
+        w.commands()
+            .start("owner", &id, fence.revision, "start-again", 10_000)
+            .expect("a start after a deferred stop was refused");
+        assert!(!owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
+        gate.release.add_permits(1);
+        assert_eq!(
+            start.wait(Duration::from_secs(60)).await.unwrap(),
+            InitializeStatus::Completed
+        );
+        until_operation(&owner, stop.operation_id(), "failed").await;
+        assert_eq!(held_bindings(&dir, &id), 1, "the started runtime keeps running");
+        assert_eq!(deployment_states(&owner, &id).1, "ready");
         drop(start);
         w.shutdown().await.unwrap();
     }
@@ -2390,7 +2931,10 @@ mod native {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((step_state.as_str(), binding_state.as_str()), ("cancelled", "released"));
+        assert_eq!(
+            (step_state.as_str(), binding_state.as_str()),
+            ("cancelled", "released")
+        );
         let secrets: i64 = sql
             .query_row("SELECT COUNT(*) FROM engine_secrets", [], |r| r.get(0))
             .unwrap();
@@ -2688,18 +3232,13 @@ mod native {
                     association
                         .persist_api_identity(&self.identity)
                         .map_err(|error| {
-                            mllm_adapters::traits::RuntimeError::Uncertain(
-                                error.to_string(),
-                            )
+                            mllm_adapters::traits::RuntimeError::Uncertain(error.to_string())
                         })?;
                 }
                 let _ = incarnation;
                 Ok(self.identity.clone())
             }
-            fn present(
-                &self,
-                _identity: &ProcessIdentity,
-            ) -> mllm_domain::completion::Presence {
+            fn present(&self, _identity: &ProcessIdentity) -> mllm_domain::completion::Presence {
                 mllm_domain::completion::Presence::Alive
             }
             fn observe_group(
@@ -2722,13 +3261,12 @@ mod native {
         /// every presented authorization, so the test can prove the builder
         /// spoke with the sealed inference key.
         async fn stub_engine(
-            port: u16,
+            listener: std::net::TcpListener,
             model: String,
             seen: Arc<Mutex<Vec<(String, String)>>>,
         ) {
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .expect("the leased endpoint is free");
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -2778,8 +3316,7 @@ mod native {
                     .push((format!("{method} {path}"), authorization));
                 let (body, content_type) = if path.starts_with("/v1/models") {
                     (
-                        json!({"object":"list","data":[{"id":model,"object":"model"}]})
-                            .to_string(),
+                        json!({"object":"list","data":[{"id":model,"object":"model"}]}).to_string(),
                         "application/json",
                     )
                 } else {
@@ -2823,16 +3360,32 @@ mod native {
             "../../../mllm-config/tests/fixtures/effective-sglang-golden.json"
         ))
         .unwrap();
-        let host = source["input"]["host"].clone();
-        let deployment = source["input"]["deployment"].clone();
+        let mut host = source["input"]["host"].clone();
+        let mut deployment = source["input"]["deployment"].clone();
+        // ADR 0014 §7 (WE3): the embedded launch measures a real checkpoint.
+        let models = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(models.path().join("toy")).unwrap();
+        std::fs::write(models.path().join("toy/config.json"), "{}").unwrap();
+        host["model_store"]["path"] = json!(models.path());
+        deployment["model"]["path"] = json!(models.path().join("toy"));
+        // The store probe-binds a free port of the host's range at lease time,
+        // and the stub engine then binds it. The golden fixture's fixed
+        // 8100-8199 range is shared with other tests running in parallel, so
+        // one could take the leased port in between; this test leases from a
+        // range of its own instead, chosen at random below 20000 (clear of the
+        // CLI tests' ports and of the kernel's ephemeral range, where outbound
+        // connections land).
+        const RANGE: u16 = 100;
+        let base = {
+            let seed = (std::process::id() as u64) ^ (realtime_ms() as u64);
+            10_000 + (seed % u64::from(10_000 - RANGE)) as u16
+        };
+        host["resource_policy"]["endpoint_port_range"] =
+            json!({"start": base, "end": base + RANGE - 1});
         let (dir, owner) = {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
-            std::fs::set_permissions(
-                dir.path(),
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let owner = Arc::new(Mutex::new(
                 crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
             ));
@@ -2898,21 +3451,24 @@ mod native {
         let (runtime_dir, log_dir) = {
             use std::os::unix::fs::PermissionsExt;
             let runtime_dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
-            std::fs::set_permissions(
-                runtime_dir.path(),
-                std::fs::Permissions::from_mode(0o700),
+            std::fs::set_permissions(runtime_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let wrapper = runtime_dir.path().join("sglang_entry.py");
+            std::fs::write(
+                &wrapper,
+                b"# never executed; the stub tools spawn nothing\n",
             )
             .unwrap();
-            let wrapper = runtime_dir.path().join("sglang_entry.py");
-            std::fs::write(&wrapper, b"# never executed; the stub tools spawn nothing\n").unwrap();
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o600)).unwrap();
             let log_dir = tempfile::tempdir().unwrap();
             (runtime_dir, log_dir)
         };
 
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("the leased endpoint is free");
         tokio::spawn(stub_engine(
-            port,
+            listener,
             // The golden fixture's first route: the served name is the
             // deployment's route name, which the stub must serve for the
             // readiness poll to settle.
@@ -2956,8 +3512,7 @@ mod native {
             )),
             Arc::new(move |association| {
                 *factory_tool.association.lock().unwrap() = Some(association);
-                factory_tool.clone()
-                    as Arc<dyn mllm_adapters::traits::OwnedProcessLaunch>
+                factory_tool.clone() as Arc<dyn mllm_adapters::traits::OwnedProcessLaunch>
             }),
         )
         .unwrap();
@@ -2968,8 +3523,9 @@ mod native {
                 match status(&owner, &step) {
                     InitializeStatus::Planned
                     | InitializeStatus::Armed
-                    | InitializeStatus::Expired => tokio::time::sleep(Duration::from_millis(100))
-                        .await,
+                    | InitializeStatus::Expired => {
+                        tokio::time::sleep(Duration::from_millis(100)).await
+                    }
                     settled => return settled,
                 }
             }
@@ -3021,10 +3577,9 @@ mod native {
             "the readiness poll did not present the sealed inference key: {presented:?}"
         );
         assert!(
-            presented
-                .iter()
-                .any(|(request, authorization)| request.contains("/v1/chat/completions")
-                    && *authorization == inference_bearer),
+            presented.iter().any(|(request, authorization)| request
+                .contains("/v1/chat/completions")
+                && *authorization == inference_bearer),
             "the probe did not present the sealed inference key: {presented:?}"
         );
         {
@@ -3142,4 +3697,113 @@ mod native {
         gate.release.add_permits(16);
         w.shutdown().await.unwrap();
     }
+}
+
+/// SPEC §4.3 / §13.3, ADR 0012 migration: an adopted embedded vLLM launch is
+/// rebuilt with exactly the keys the store sealed when it launched. A launch
+/// that predates the admin role sealed only an inference key; its engine is
+/// running with the single-key guard, so the rebuilt adapter keeps that one key
+/// and no admin key is invented for it (a fresh one would not match the running
+/// engine). A launch that sealed both roles is rebuilt with both. New keys are
+/// only ever issued by a new launch.
+// T21 T37
+#[tokio::test]
+async fn an_adopted_vllm_launch_uses_only_the_keys_it_launched_with() {
+    use crate::engine_bindings::ProfileBindings;
+    use mllm_adapters::resolve::AdapterSpec;
+    use mllm_store::secrets::SecretRole;
+
+    type SeenKeys = Vec<(Option<String>, Option<String>)>;
+    struct Capture {
+        profile: ProfileBindings,
+        seen: Mutex<SeenKeys>,
+    }
+    impl EngineBindings for Capture {
+        fn spec(&self, work: &InitializeWork) -> Result<AdapterSpec, CoordinatorError> {
+            self.profile.spec(work)
+        }
+        fn adapter(
+            &self,
+            _declared: Engine,
+            spec: AdapterSpec,
+            _tools: Arc<dyn OwnedProcessLaunch>,
+        ) -> Result<Arc<dyn EngineAdapter>, CoordinatorError> {
+            let AdapterSpec::Vllm {
+                engine_key,
+                admin_key,
+                ..
+            } = spec
+            else {
+                panic!("the fixture profile declares vllm");
+            };
+            self.seen.lock().unwrap().push((engine_key, admin_key));
+            Ok(Arc::new(FakeEngine::with_lifecycle()))
+        }
+    }
+
+    let (_dir, owner, fence, _observations) = setup().await;
+    let work = {
+        let o = owner.lock().unwrap();
+        o.store()
+            .accept_start(o.session(), &fence, 1800, 10_000)
+            .unwrap();
+        o.store()
+            .next_initialize(o.session())
+            .unwrap()
+            .expect("an accepted start plans initialize work")
+    };
+    let (inference, admin) = (
+        mllm_store::secrets::new_engine_key(),
+        mllm_store::secrets::new_engine_key(),
+    );
+    let seal = |key: &[u8; 32], role| {
+        owner
+            .lock()
+            .unwrap()
+            .store()
+            .store_engine_key(work.binding_id(), work.incarnation(), key, role)
+            .unwrap();
+    };
+    let bindings = Arc::new(Capture {
+        profile: ProfileBindings::new(
+            std::path::PathBuf::from("/tmp/mllm-test-logs"),
+            std::path::PathBuf::from("/tmp/mllm-test-runtime"),
+        ),
+        seen: Mutex::new(Vec::new()),
+    });
+    let factory = super::local_adoption::factory(
+        owner.clone(),
+        bindings.clone(),
+        mllm_testkit::fake_tools_factory(),
+        Arc::new(|| Ok(1900)),
+        Duration::from_secs(1),
+    );
+
+    // A launch recorded before the admin role existed: one key, the single-key
+    // guard, and nothing new sealed by adoption.
+    seal(&inference, SecretRole::Inference);
+    assert!(factory(&work).is_ok(), "a single-key launch is still adopted");
+    assert_eq!(
+        bindings.seen.lock().unwrap().pop().unwrap(),
+        (Some(hex::encode(inference)), None),
+        "the pre-migration launch keeps its single key and is given no admin key"
+    );
+    assert_eq!(
+        owner
+            .lock()
+            .unwrap()
+            .store()
+            .engine_key(work.binding_id(), work.incarnation(), SecretRole::Admin)
+            .unwrap(),
+        None,
+        "adoption must never seal a key the running engine was not given"
+    );
+
+    // A launch that sealed both roles is rebuilt with both.
+    seal(&admin, SecretRole::Admin);
+    assert!(factory(&work).is_ok());
+    assert_eq!(
+        bindings.seen.lock().unwrap().pop().unwrap(),
+        (Some(hex::encode(inference)), Some(hex::encode(admin))),
+    );
 }

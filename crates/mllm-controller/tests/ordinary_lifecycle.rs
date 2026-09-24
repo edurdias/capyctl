@@ -3,10 +3,9 @@
 //! created by the ordinary writers. These tests were ported out of the deleted
 //! qualification support directory; ADR 0011 removed that concept entirely.
 use mllm_adapters::traits::EngineAdapter;
-use mllm_testkit::FakeEngine;
-use mllm_controller::{RuntimeAction, RuntimeCommand};
 use mllm_controller::coordinator::{CoordinatorOptions, ServiceObservation};
 use mllm_controller::ownership::{OwnedCoordinatorState, SharedCoordinatorState};
+use mllm_controller::{RuntimeAction, RuntimeCommand};
 use mllm_domain::completion::{CleanupEvidence, CompletionEvidence, OwnedLaunchReceipt};
 use mllm_domain::resources::{MemoryLimit, MemoryObservation, ResourcePhase};
 use mllm_scheduler::residency::AdmissionContext;
@@ -15,6 +14,7 @@ use mllm_store::ordinary_lifecycle::cleanup::{CleanupExecutionContext, CleanupMo
 use mllm_store::ordinary_lifecycle::worker::InitializeStatus;
 use mllm_store::ordinary_lifecycle::Start;
 use mllm_store::Store;
+use mllm_testkit::FakeEngine;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,11 +92,10 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
         )
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .arm_step(&f.session, &accepted.step_id, context)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_step(&f.session, &accepted.step_id, context)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert!(f.store.resource_snapshot().unwrap().owners.is_empty());
     controls.domains.get_mut("unified").unwrap().managed_limit = previous;
@@ -114,11 +113,10 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
         .unwrap();
     let mut stale = context;
     stale.now_ms = 10001;
-    assert!(
-        f.store
-            .arm_step(&f.session, &accepted.step_id, stale)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_step(&f.session, &accepted.step_id, stale)
+        .is_err());
     assert!(matches!(
         f.store
             .arm_step(&f.session, &accepted.step_id, context)
@@ -159,24 +157,19 @@ async fn ordinary_policy_change_stop_and_restart_retain_peak_and_never_resend() 
         control_receipt: Some(observation.receipt),
         milestones: observation.facts,
     };
-    assert!(
-        f.store
-            .complete_step(&f.session, &accepted.step_id, &evidence, 2000, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_step(&f.session, &accepted.step_id, &evidence, 2000, f.ttl)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     let reopened = Store::open(&f._dir.path().join("ordinary.db")).unwrap();
     let session = reopened.begin_coordinator_session().unwrap();
-    assert!(
-        reopened
-            .arm_step(&session, &accepted.step_id, context)
-            .is_err()
-    );
-    assert!(
-        reopened
-            .arm_step(&f.session, &accepted.step_id, context)
-            .is_err()
-    );
+    assert!(reopened
+        .arm_step(&session, &accepted.step_id, context)
+        .is_err());
+    assert!(reopened
+        .arm_step(&f.session, &accepted.step_id, context)
+        .is_err());
     assert_eq!(
         reopened.resource_snapshot().unwrap().owners[&fence.deployment_id].phase,
         ResourcePhase::Cold
@@ -235,19 +228,17 @@ async fn ordinary_initialize_to_ready() {
     admission.now_ms = 1900;
     let mut stale = admission;
     stale.now_ms = 4000;
-    assert!(
-        f.store
-            .arm_step(&f.session, &accepted.step_id, stale)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_step(&f.session, &accepted.step_id, stale)
+        .is_err());
     let before = full_counts(&f.sql);
     let epoch_before = f.store.resource_snapshot().unwrap().epoch;
     f.sql.execute_batch("CREATE TRIGGER ordinary_arm_failure BEFORE UPDATE OF state ON lifecycle_steps WHEN NEW.state='armed' AND json_extract(NEW.step_json,'$.kind')='initialize' BEGIN SELECT RAISE(ABORT,'ordinary arm failure'); END;").unwrap();
-    assert!(
-        f.store
-            .arm_step(&f.session, &accepted.step_id, admission)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_step(&f.session, &accepted.step_id, admission)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch_before);
     assert!(f.store.resource_snapshot().unwrap().owners.is_empty());
@@ -276,11 +267,9 @@ async fn ordinary_initialize_to_ready() {
             .count(),
         1
     );
-    assert!(
-        results
-            .iter()
-            .all(|r| r.as_ref().is_ok_and(|r| r.step_id == accepted.step_id))
-    );
+    assert!(results
+        .iter()
+        .all(|r| r.as_ref().is_ok_and(|r| r.step_id == accepted.step_id)));
     assert_eq!(context.deadline_ms, 10000);
     assert_eq!(
         f.store.resource_snapshot().unwrap().owners[&fence.deployment_id].phase,
@@ -306,11 +295,10 @@ async fn ordinary_initialize_to_ready() {
         control_receipt: Some(observation.receipt.clone()),
         milestones: observation.facts,
     };
-    assert!(
-        f.store
-            .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
+        .is_err());
     f.store
         .record_owned_launch(
             &f.session,
@@ -350,30 +338,27 @@ async fn ordinary_initialize_to_ready() {
     wrong.observed_at_ms = 10001;
     mutations.push(wrong);
     for wrong in mutations {
-        assert!(
-            f.store
-                .complete_step(&f.session, &accepted.step_id, &wrong, 1950, f.ttl)
-                .is_err()
-        );
+        assert!(f
+            .store
+            .complete_step(&f.session, &accepted.step_id, &wrong, 1950, f.ttl)
+            .is_err());
         assert_eq!(full_counts(&f.sql), before);
         assert_eq!(f.store.resource_snapshot().unwrap().epoch, peak_epoch);
     }
     f.sql.execute("INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition) VALUES('ordinary-unknown',?1,1,1,?2,'uncertain')",rusqlite::params![fence.deployment_id,f.session.id()]).unwrap();
-    assert!(
-        f.store
-            .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, peak_epoch);
     f.sql
         .execute("DELETE FROM request_leases WHERE id='ordinary-unknown'", [])
         .unwrap();
     f.sql.execute_batch("CREATE TRIGGER ordinary_completion_failure BEFORE INSERT ON lifecycle_evidence WHEN NEW.step_id IN (SELECT id FROM lifecycle_steps WHERE json_extract(step_json,'$.kind')='initialize') BEGIN SELECT RAISE(ABORT,'ordinary completion failure'); END;").unwrap();
-    assert!(
-        f.store
-            .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_step(&f.session, &accepted.step_id, &evidence, 1950, f.ttl)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, peak_epoch);
     f.sql
@@ -396,11 +381,10 @@ async fn ordinary_initialize_to_ready() {
     assert_eq!(f.scalar("SELECT COUNT(*) FROM lifecycle_claims"), 0);
     let mut wrong = evidence.clone();
     wrong.observed_at_ms += 1;
-    assert!(
-        f.store
-            .complete_step(&f.session, &accepted.step_id, &wrong, 2000, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_step(&f.session, &accepted.step_id, &wrong, 2000, f.ttl)
+        .is_err());
 }
 
 #[tokio::test]
@@ -458,23 +442,14 @@ async fn worker_selects_oldest_current_generation_without_adopting_superseded_wo
 #[tokio::test]
 async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     let f = fixture::fixture();
-    assert!(
-        f.store
-            .next_initialize(&f.session)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f.store.next_initialize(&f.session).unwrap().is_none());
     let fence = fixture::managed(&f, "ordinary");
     let accepted = f
         .store
         .accept_start(&f.session, &fence, 1800, 10000)
         .unwrap();
     let before = full_counts(&f.sql);
-    let work = f
-        .store
-        .next_initialize(&f.session)
-        .unwrap()
-        .unwrap();
+    let work = f.store.next_initialize(&f.session).unwrap().unwrap();
     assert_eq!(work.operation_id(), accepted.operation_id);
     assert_eq!(work.step_id(), accepted.step_id);
     assert_eq!(work.binding_id(), accepted.binding_id);
@@ -504,11 +479,10 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
             rusqlite::params![accepted.step_id, stored_plan],
         )
         .unwrap();
-    assert!(
-        f.store
-            .mark_initialize_uncertain(&f.session, &accepted.step_id, 1900)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .mark_initialize_uncertain(&f.session, &accepted.step_id, 1900)
+        .is_err());
     let mut admission = f.admission();
     admission.now_ms = 1900;
     assert!(matches!(
@@ -517,19 +491,13 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
             .unwrap(),
         ArmResult::New { .. }
     ));
-    assert!(
-        f.store
-            .next_initialize(&f.session)
-            .unwrap()
-            .is_none()
-    );
+    assert!(f.store.next_initialize(&f.session).unwrap().is_none());
     let charged = f.store.resource_snapshot().unwrap();
     f.sql.execute_batch("CREATE TRIGGER uncertain_event_failure BEFORE INSERT ON management_events WHEN NEW.kind='initialize_uncertain' BEGIN SELECT RAISE(ABORT,'uncertain event failure'); END;").unwrap();
-    assert!(
-        f.store
-            .mark_initialize_uncertain(&f.session, &accepted.step_id, 10001)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .mark_initialize_uncertain(&f.session, &accepted.step_id, 10001)
+        .is_err());
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM lifecycle_steps WHERE state='armed'"),
         1
@@ -542,16 +510,14 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     f.sql
         .execute_batch("DROP TRIGGER uncertain_event_failure;")
         .unwrap();
-    assert!(
-        f.store
-            .mark_initialize_uncertain(&f.session, &accepted.step_id, 10001)
-            .unwrap()
-    );
-    assert!(
-        !f.store
-            .mark_initialize_uncertain(&f.session, &accepted.step_id, 10002)
-            .unwrap()
-    );
+    assert!(f
+        .store
+        .mark_initialize_uncertain(&f.session, &accepted.step_id, 10001)
+        .unwrap());
+    assert!(!f
+        .store
+        .mark_initialize_uncertain(&f.session, &accepted.step_id, 10002)
+        .unwrap());
     assert_eq!(f.store.resource_snapshot().unwrap(), charged);
     assert_eq!(
         f.scalar("SELECT COUNT(*) FROM lifecycle_steps WHERE state='uncertain'"),
@@ -560,9 +526,7 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     assert_eq!(f.scalar("SELECT COUNT(*) FROM lifecycle_claims"), 1);
     assert_eq!(f.scalar("SELECT COUNT(*) FROM endpoint_leases"), 1);
     assert_eq!(
-        f.scalar(
-            "SELECT COUNT(*) FROM management_events WHERE kind='initialize_uncertain'"
-        ),
+        f.scalar("SELECT COUNT(*) FROM management_events WHERE kind='initialize_uncertain'"),
         1
     );
     assert_eq!(
@@ -573,14 +537,12 @@ async fn worker_selection_and_uncertainty_preserve_exact_durable_intent() {
     );
     let session = f.store.begin_coordinator_session().unwrap();
     assert!(f.store.next_initialize(&f.session).is_err());
-    assert!(
-        f.store
-            .mark_initialize_uncertain(&session, &accepted.step_id, 10003)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .mark_initialize_uncertain(&session, &accepted.step_id, 10003)
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap(), charged);
 }
-
 
 // A real completed, promoted and cleaned-up qualification, copied without
 // modifying its evidence. Ownership is acquired before accepting ordinary work.
@@ -672,6 +634,75 @@ async fn owned_worker_initializes_once_for_joined_and_dropped_observers() {
     worker.shutdown().await.unwrap();
 }
 
+/// SPEC §9.1 / §13.3, ADR 0012: an embedded vLLM start seals two per-launch
+/// keys, inference and admin, before the builder runs, exactly as SGLang's two
+/// roles are sealed. The runtime endpoint the router and ingress read carries
+/// the inference key only, so the admin key never leaves the coordinator and
+/// the engine it launched. The Fake builder proves nothing about a native
+/// engine recipe; this covers mllm's own sealing and projection decisions.
+// T21 T37
+#[tokio::test]
+async fn an_embedded_vllm_start_seals_an_admin_key_that_ingress_never_sees() {
+    use mllm_controller::LifecyclePort as _;
+    use mllm_store::secrets::SecretRole;
+    let (_dir, owner, fence, observations) = owned_fixture().await;
+    let worker = mllm_testkit::spawn_fake_coordinator(
+        owner.clone(),
+        Arc::new(Observations(observations)),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions::default(),
+    )
+    .unwrap();
+    let start = worker.start(&fence, 10000).unwrap();
+    drop(start);
+    let (binding, incarnation) = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let live = {
+                let state = owner.lock().unwrap();
+                state
+                    .store()
+                    .runtime_binding(&fence.deployment_id)
+                    .unwrap()
+                    .filter(|b| b.state == "live")
+                    .map(|b| (b.id, b.incarnation))
+            };
+            if let Some(live) = live {
+                break live;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the embedded start reaches Ready");
+    let (inference, admin) = {
+        let state = owner.lock().unwrap();
+        let key = |role| {
+            state
+                .store()
+                .engine_key(&binding, &incarnation, role)
+                .unwrap()
+                .unwrap_or_else(|| panic!("the launch sealed no {role:?} key"))
+        };
+        (key(SecretRole::Inference), key(SecretRole::Admin))
+    };
+    assert_ne!(inference, admin, "the two roles carry distinct keys");
+
+    let endpoint = mllm_controller::CoordinatorLifecycle::new(worker.commands())
+        .runtime_endpoint(&fence.deployment_id)
+        .unwrap()
+        .expect("the Ready deployment retains a binding");
+    assert_eq!(
+        endpoint.engine_key.as_deref(),
+        Some(hex::encode(inference).as_str()),
+        "ingress presents the inference key"
+    );
+    assert_ne!(
+        endpoint.engine_key.as_deref(),
+        Some(hex::encode(admin).as_str()),
+        "the admin key must never reach ingress or the router"
+    );
+    worker.shutdown().await.unwrap();
+}
 
 struct CleanupFixture {
     store: Store,
@@ -840,33 +871,29 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
             .accept_ordinary_cleanup(&f.session, "owner", &resolved, "stop", 2001, 10000)
             .unwrap()
     );
-    assert!(
-        f.store
-            .accept_ordinary_cleanup(&f.session, "owner", &resolved, "different-key", 2001, 10000)
-            .is_err()
-    );
-    assert!(
-        f.store
-            .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2001, 11000)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_ordinary_cleanup(&f.session, "owner", &resolved, "different-key", 2001, 10000)
+        .is_err());
+    assert!(f
+        .store
+        .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2001, 11000)
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(
         f.store.pending_dispatches(&fence.deployment_id).unwrap()[0].id,
         ticket.id()
     );
-    assert!(
-        f.store
-            .resource_snapshot()
-            .unwrap()
-            .owners
-            .contains_key(&fence.deployment_id)
-    );
-    assert!(
-        f.store
-            .initialize_execution(&f.session, &start.step_id)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&fence.deployment_id));
+    assert!(f
+        .store
+        .initialize_execution(&f.session, &start.step_id)
+        .is_err());
     let (arm, context) = f
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
@@ -884,20 +911,18 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
         .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
         .unwrap();
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch + 1);
-    assert!(
-        !f.store
-            .resource_snapshot()
-            .unwrap()
-            .owners
-            .contains_key(&fence.deployment_id)
-    );
+    assert!(!f
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&fence.deployment_id));
     assert_eq!(f.scalar("SELECT COUNT(*) FROM management_events WHERE kind IN ('ordinary_cleanup_accepted','ordinary_cleanup_armed','ordinary_cleanup_completed')"), 3);
-    assert!(
-        f.store
-            .pending_dispatches(&fence.deployment_id)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(f
+        .store
+        .pending_dispatches(&fence.deployment_id)
+        .unwrap()
+        .is_empty());
     let counts = full_counts(&f.sql);
     f.store
         .complete_cleanup(&f.session, &stop.step_id, &gone, 90000, f.ttl)
@@ -905,11 +930,10 @@ async fn ordinary_cleanup_exact_stop_replay_retains_then_releases_once() {
     assert_eq!(full_counts(&f.sql), counts);
     let mut changed = gone;
     changed.receipt.push('x');
-    assert!(
-        f.store
-            .complete_cleanup(&f.session, &stop.step_id, &changed, 2150, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_cleanup(&f.session, &stop.step_id, &changed, 2150, f.ttl)
+        .is_err());
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch + 1);
     let golden: Value = serde_json::from_str(include_str!(
         "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
@@ -1022,11 +1046,10 @@ async fn ordinary_cleanup_rejects_missing_ready_evidence_before_fencing() {
         )
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert_eq!(
         f.store
@@ -1052,11 +1075,10 @@ async fn ordinary_cleanup_armed_and_uncertain_handoff_settles_only_after_verifie
             .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
             .unwrap();
         let before = full_counts(&f.sql);
-        assert!(
-            f.store
-                .complete_step(&f.session, &start.step_id, &evidence, 2010, f.ttl)
-                .is_err()
-        );
+        assert!(f
+            .store
+            .complete_step(&f.session, &start.step_id, &evidence, 2010, f.ttl)
+            .is_err());
         assert_eq!(full_counts(&f.sql), before);
         let (prior_state,history):(String,String)=f.sql.query_row("SELECT s.state,r.plan_json FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=?2 WHERE s.id=?1",rusqlite::params![start.step_id,stop.operation_id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(prior_state, if uncertain { "uncertain" } else { "armed" });
@@ -1067,8 +1089,7 @@ async fn ordinary_cleanup_armed_and_uncertain_handoff_settles_only_after_verifie
             .store
             .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
             .unwrap();
-        let gone = collect_cleanup(&fake, &context.unwrap(), 2100)
-            .unwrap();
+        let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
         f.store
             .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
             .unwrap();
@@ -1101,8 +1122,7 @@ async fn ordinary_cleanup_rejects_bad_evidence_and_rolls_back_release_failure() 
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     let before = full_counts(&f.sql);
     let epoch = f.store.resource_snapshot().unwrap().epoch;
     for mutation in 0..10 {
@@ -1134,11 +1154,10 @@ async fn ordinary_cleanup_rejects_bad_evidence_and_rolls_back_release_failure() 
         assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     }
     f.sql.execute_batch("CREATE TRIGGER ordinary_cleanup_release_failure BEFORE INSERT ON management_events WHEN NEW.kind='ordinary_cleanup_completed' BEGIN SELECT RAISE(ABORT,'cleanup release rollback'); END;").unwrap();
-    assert!(
-        f.store
-            .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(
@@ -1168,8 +1187,7 @@ async fn ordinary_cleanup_stale_sessions_keep_original_authority_bounded() {
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     f.store
         .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
         .unwrap();
@@ -1193,8 +1211,7 @@ async fn ordinary_cleanup_stale_sessions_keep_original_authority_bounded() {
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     let current = f.store.begin_coordinator_session().unwrap();
     let before = full_counts(&f.sql);
     assert_eq!(
@@ -1204,25 +1221,22 @@ async fn ordinary_cleanup_stale_sessions_keep_original_authority_bounded() {
         stop
     );
     for session in [&f.session, &current] {
-        assert!(
-            f.store
-                .complete_cleanup(session, &stop.step_id, &gone, 2150, f.ttl)
-                .is_err()
-        );
-        assert!(
-            f.store
-                .arm_ordinary_cleanup_with_context(session, &stop.step_id, 2200)
-                .is_err()
-        );
+        assert!(f
+            .store
+            .complete_cleanup(session, &stop.step_id, &gone, 2150, f.ttl)
+            .is_err());
+        assert!(f
+            .store
+            .arm_ordinary_cleanup_with_context(session, &stop.step_id, 2200)
+            .is_err());
     }
     assert_eq!(full_counts(&f.sql), before);
-    assert!(
-        f.store
-            .resource_snapshot()
-            .unwrap()
-            .owners
-            .contains_key(&fence.deployment_id)
-    );
+    assert!(f
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&fence.deployment_id));
 }
 
 #[tokio::test]
@@ -1297,17 +1311,15 @@ async fn ordinary_cleanup_unproven_lease_blocks_all_release_and_other_deployment
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     // Named corruption: an unexplained older incarnation/session lease.
-    f.sql.execute("INSERT INTO request_leases VALUES('unproven-prior-incarnation',?1,1,999,'unknown-session','uncertain')",[&fence.deployment_id]).unwrap();
+    f.sql.execute("INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition) VALUES('unproven-prior-incarnation',?1,1,999,'unknown-session','uncertain')",[&fence.deployment_id]).unwrap();
     let before = full_counts(&f.sql);
     let epoch = f.store.resource_snapshot().unwrap().epoch;
-    assert!(
-        f.store
-            .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert_eq!(f.store.resource_snapshot().unwrap().epoch, epoch);
     assert_eq!(
@@ -1331,13 +1343,12 @@ async fn ordinary_cleanup_unproven_lease_blocks_all_release_and_other_deployment
         f.store.pending_dispatches(&other.deployment_id).unwrap()[0].id,
         ticket.id()
     );
-    assert!(
-        f.store
-            .resource_snapshot()
-            .unwrap()
-            .owners
-            .contains_key(&other.deployment_id)
-    );
+    assert!(f
+        .store
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .contains_key(&other.deployment_id));
     assert_eq!(
         f.store
             .runtime_binding(&other.deployment_id)
@@ -1356,21 +1367,19 @@ async fn ordinary_cleanup_missing_ownership_and_unarmed_reservations_stay_retain
         .accept_start(&f.session, &fence, 1800, 10000)
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     f.store
         .arm_step(&f.session, &start.step_id, f.admission())
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_ordinary_cleanup(&f.session, "owner", &fence, "stop", 2000, 10000)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     assert_eq!(
         f.store
@@ -1393,8 +1402,7 @@ async fn ordinary_cleanup_terminal_corruption_never_becomes_recorded_arm_authori
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     f.store
         .complete_cleanup(&f.session, &stop.step_id, &gone, 2150, f.ttl)
         .unwrap();
@@ -1406,11 +1414,10 @@ async fn ordinary_cleanup_terminal_corruption_never_becomes_recorded_arm_authori
         )
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2300)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2300)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
 }
 
@@ -1425,8 +1432,7 @@ async fn ordinary_cleanup_strict_identity_kind_and_fence_corruption_retains_all_
         .store
         .arm_ordinary_cleanup_with_context(&f.session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     let original_ids: String = f
         .sql
         .query_row(
@@ -1615,10 +1621,7 @@ async fn start_receipt_faults_are_atomic_and_historical_corruption_is_rejected()
     let id = &source.fence.deployment_id;
     for (table, condition) in [
         ("command_receipts", "NEW.idempotency_key='start'"),
-        (
-            "management_events",
-            "NEW.kind='initialize_accepted'",
-        ),
+        ("management_events", "NEW.kind='initialize_accepted'"),
     ] {
         sql.execute_batch(&format!("CREATE TRIGGER fail_start BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'start rollback'); END;")).unwrap();
         let before = counts(&sql);
@@ -1813,8 +1816,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
     let (_, context) = store
         .arm_ordinary_cleanup_with_context(&session, &stop.step_id, 2050)
         .unwrap();
-    let gone =
-        collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
+    let gone = collect_cleanup(&fake, &context.unwrap(), 2100).unwrap();
     store
         .complete_cleanup(
             &session,
@@ -1892,15 +1894,7 @@ async fn start_receipt_observes_ready_cleanup_replacement_and_revoked_policy() {
         receipt
     );
     assert!(store
-        .accept_start_command(
-            &current,
-            "owner",
-            id,
-            replaced.revision,
-            "new",
-            2300,
-            10000
-        )
+        .accept_start_command(&current, "owner", id, replaced.revision, "new", 2300, 10000)
         .is_err());
     assert_eq!(counts(&sql), before);
     assert!(store
@@ -2004,9 +1998,7 @@ async fn start_receipt_acceptance_replay_join_and_scopes_have_no_execution_effec
         ("owner", id.as_str(), 1, "new-expired", 1800, 1800),
     ] {
         assert!(matches!(
-            store.accept_start_command(
-                &session, principal, target, revision, key, now, deadline
-            ),
+            store.accept_start_command(&session, principal, target, revision, key, now, deadline),
             Err(LifecycleError::Invalid)
         ));
     }
@@ -2227,7 +2219,8 @@ async fn expired_unarmed_rejects_contradictions_and_stale_ownership_without_rele
         .unwrap();
     for corruption in [
         "UPDATE deployments SET revision=revision+1 WHERE id=(SELECT deployment_id FROM operations WHERE id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry'))",
-        "UPDATE deployments SET current_generation=current_generation+1 WHERE id=(SELECT deployment_id FROM operations WHERE id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry'))",
+        // ADR 0013 §5: the fence is the instance's own generation and state.
+        "UPDATE deployment_instances SET generation=generation+1 WHERE deployment_id=(SELECT deployment_id FROM operations WHERE id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry'))",
         "UPDATE lifecycle_claims SET generation=generation+1",
         // A claim naming an operation that is not this one at all.
         "UPDATE lifecycle_claims SET operation_id='foreign-operation'",
@@ -2235,11 +2228,11 @@ async fn expired_unarmed_rejects_contradictions_and_stale_ownership_without_rele
         "UPDATE runtime_bindings SET identities_json='[{}]' WHERE state='reserved'",
         "UPDATE runtime_bindings SET incarnation='contradiction' WHERE state='reserved'",
         "UPDATE endpoint_leases SET port=port+1",
-        "UPDATE deployments SET dispatch_enabled=1 WHERE desired_state='ready'",
-        "UPDATE deployments SET observed_state='ready' WHERE desired_state='ready'",
-        "INSERT INTO request_leases SELECT 'retained-lease',deployment_id,revision,generation,session_id,'uncertain' FROM lifecycle_runs WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
+        "UPDATE deployment_instances SET dispatch_enabled=1 WHERE desired_state='ready'",
+        "UPDATE deployment_instances SET observed_state='ready' WHERE desired_state='ready'",
+        "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition) SELECT 'retained-lease',deployment_id,revision,generation,session_id,'uncertain' FROM lifecycle_runs WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
         "INSERT INTO resource_grants SELECT 'retained-grant',deployment_id,operation_id,'{}',999999 FROM lifecycle_runs WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
-        "INSERT INTO resource_owners SELECT deployment_id,'{}' FROM lifecycle_runs WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
+        "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) SELECT deployment_id,'{}',deployment_id FROM lifecycle_runs WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
         "INSERT INTO owned_launch_associations SELECT id,binding_id,'contradiction','{}' FROM lifecycle_steps WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
         "INSERT INTO lifecycle_evidence SELECT id,'{}',0 FROM lifecycle_steps WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
         "UPDATE lifecycle_steps SET grant_id='retained-grant' WHERE operation_id=(SELECT operation_id FROM command_receipts WHERE idempotency_key='expiry')",
@@ -2435,7 +2428,7 @@ async fn expired_unarmed_never_releases_armed_without_association_and_proves_ret
         "UPDATE lifecycle_steps SET state='planned' WHERE operation_id=?1",
         "UPDATE lifecycle_runs SET state='queued' WHERE operation_id=?1",
         "UPDATE runtime_bindings SET state='reserved' WHERE id=(SELECT binding_id FROM lifecycle_steps WHERE operation_id=?1)",
-        "INSERT INTO lifecycle_claims SELECT deployment_id,operation_id,revision,generation FROM lifecycle_runs WHERE operation_id=?1",
+        "INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) SELECT deployment_id,operation_id,revision,generation FROM lifecycle_runs WHERE operation_id=?1",
     ] {
         let copy = tempfile::tempdir().unwrap();
         let path = copy.path().join("terminal.sqlite3");
@@ -2577,10 +2570,10 @@ async fn unarmed_stop_terminal_history_rejects_contradictions() {
         "UPDATE lifecycle_steps SET state='planned' WHERE operation_id='$STOP'",
         "UPDATE lifecycle_runs SET plan_json=json_set(plan_json,'$.handoffs[0].steps[0].state','armed') WHERE operation_id='$STOP'",
         "UPDATE runtime_bindings SET state='reserved' WHERE id=(SELECT binding_id FROM lifecycle_steps WHERE operation_id='$SOURCE')",
-        "INSERT INTO lifecycle_claims SELECT deployment_id,operation_id,revision,generation FROM lifecycle_runs WHERE operation_id='$STOP'",
-        "INSERT INTO lifecycle_claims SELECT deployment_id,operation_id,revision,generation FROM lifecycle_runs WHERE operation_id='$SOURCE'",
-        "INSERT INTO resource_owners SELECT deployment_id,'{}' FROM lifecycle_runs WHERE operation_id='$SOURCE'",
-        "INSERT INTO request_leases SELECT 'old-lease',deployment_id,revision,generation,session_id,'uncertain' FROM lifecycle_runs WHERE operation_id='$SOURCE'",
+        "INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) SELECT deployment_id,operation_id,revision,generation FROM lifecycle_runs WHERE operation_id='$STOP'",
+        "INSERT INTO lifecycle_claims(deployment_id,operation_id,revision,generation) SELECT deployment_id,operation_id,revision,generation FROM lifecycle_runs WHERE operation_id='$SOURCE'",
+        "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) SELECT deployment_id,'{}',deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE'",
+        "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition) SELECT 'old-lease',deployment_id,revision,generation,session_id,'uncertain' FROM lifecycle_runs WHERE operation_id='$SOURCE'",
         "INSERT INTO lifecycle_evidence SELECT id,'{}',0 FROM lifecycle_steps WHERE operation_id='$STOP'",
         "UPDATE command_receipts SET response_json=json_set(response_json,'$.kind','unknown') WHERE idempotency_key='stop'",
         "UPDATE command_receipts SET response_json=json_set(response_json,'$.kind','ordinary_cleanup') WHERE idempotency_key='stop'",
@@ -2653,7 +2646,7 @@ async fn unarmed_stop_contradictions_fail_closed_at_acceptance_and_completion() 
         });
         for corruption in [
             "UPDATE deployments SET revision=revision+1 WHERE id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
-            "UPDATE deployments SET current_generation=current_generation+1 WHERE id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
+            "UPDATE deployment_instances SET generation=generation+1 WHERE deployment_id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
             "UPDATE lifecycle_claims SET generation=generation+1",
             "DELETE FROM lifecycle_claims",
             "UPDATE lifecycle_claims SET operation_id='wrong-claim'",
@@ -2665,12 +2658,12 @@ async fn unarmed_stop_contradictions_fail_closed_at_acceptance_and_completion() 
             "UPDATE runtime_bindings SET ownership='attached' WHERE state='reserved'",
             "UPDATE endpoint_leases SET port=port+1",
             "DELETE FROM endpoint_leases",
-            "UPDATE deployments SET dispatch_enabled=1 WHERE id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
-            "UPDATE deployments SET observed_state='ready' WHERE id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
+            "UPDATE deployment_instances SET dispatch_enabled=1 WHERE deployment_id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
+            "UPDATE deployment_instances SET observed_state='ready' WHERE deployment_id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
             "UPDATE deployments SET suspended=1 WHERE id=(SELECT deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE')",
-            "INSERT INTO request_leases SELECT 'retained-lease',deployment_id,revision,generation,session_id,'uncertain' FROM lifecycle_runs WHERE operation_id='$SOURCE'",
+            "INSERT INTO request_leases(id,deployment_id,revision,generation,session_id,disposition) SELECT 'retained-lease',deployment_id,revision,generation,session_id,'uncertain' FROM lifecycle_runs WHERE operation_id='$SOURCE'",
             "INSERT INTO resource_grants SELECT 'retained-grant',deployment_id,operation_id,'{}',999999 FROM lifecycle_runs WHERE operation_id='$SOURCE'",
-            "INSERT INTO resource_owners SELECT deployment_id,'{}' FROM lifecycle_runs WHERE operation_id='$SOURCE'",
+            "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) SELECT deployment_id,'{}',deployment_id FROM lifecycle_runs WHERE operation_id='$SOURCE'",
             "INSERT INTO owned_launch_associations SELECT id,binding_id,'contradiction','{}' FROM lifecycle_steps WHERE operation_id='$SOURCE'",
             "INSERT INTO lifecycle_evidence SELECT id,'{}',0 FROM lifecycle_steps WHERE operation_id='$SOURCE'",
             "UPDATE lifecycle_steps SET grant_id='retained-grant' WHERE operation_id='$SOURCE'",
@@ -2945,11 +2938,10 @@ async fn ordinary_rejects_revision_history_and_route_tampering() {
         )
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .accept_start(&f.session, &fence, 1800, 10000)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_start(&f.session, &fence, 1800, 10000)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
     f.sql
         .execute(
@@ -2964,11 +2956,10 @@ async fn ordinary_rejects_revision_history_and_route_tampering() {
         )
         .unwrap();
     let before = full_counts(&f.sql);
-    assert!(
-        f.store
-            .accept_start(&f.session, &fence, 1800, 10000)
-            .is_err()
-    );
+    assert!(f
+        .store
+        .accept_start(&f.session, &fence, 1800, 10000)
+        .is_err());
     assert_eq!(full_counts(&f.sql), before);
 }
 
@@ -3035,7 +3026,11 @@ async fn an_expired_unarmed_start_gives_up_its_engine_key() {
     assert!(store.runtime_binding(&id).unwrap().is_none());
     assert!(
         store
-            .engine_key(&binding, &incarnation, mllm_store::secrets::SecretRole::Inference)
+            .engine_key(
+                &binding,
+                &incarnation,
+                mllm_store::secrets::SecretRole::Inference
+            )
             .unwrap()
             .is_none(),
         "the released binding must not leave a sealed key behind"
@@ -3056,12 +3051,18 @@ async fn an_unarmed_stop_gives_up_the_starts_engine_key() {
         .accept_ordinary_stop_command(&session, "owner", &id, 1, "stop", 1900, 10_000)
         .unwrap();
 
-    assert!(store.complete_unarmed_stop(&session, &stop.step_id).unwrap());
+    assert!(store
+        .complete_unarmed_stop(&session, &stop.step_id)
+        .unwrap());
 
     assert!(store.runtime_binding(&id).unwrap().is_none());
     assert!(
         store
-            .engine_key(&binding, &incarnation, mllm_store::secrets::SecretRole::Inference)
+            .engine_key(
+                &binding,
+                &incarnation,
+                mllm_store::secrets::SecretRole::Inference
+            )
             .unwrap()
             .is_none(),
         "the released binding must not leave a sealed key behind"

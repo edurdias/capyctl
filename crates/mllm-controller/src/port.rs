@@ -11,11 +11,11 @@
 //! router's. Preserving that here is a mechanical extraction, not an endorsement —
 //! doing both at once would hide a behaviour change inside a refactor.
 
+use crate::fault::LifecycleFault;
 use async_trait::async_trait;
 use mllm_adapters::traits::WorkObservation;
 use mllm_domain::LifecycleState;
 use mllm_store::deployments::{DeploymentRow, OperationRow};
-use crate::fault::LifecycleFault;
 
 use crate::operations::{Controller, OperationHandle};
 use mllm_domain::LifecycleAction;
@@ -45,6 +45,41 @@ pub struct RuntimeEndpoint {
     pub incarnation: String,
 }
 
+/// ADR 0013 §10 (unit I3): one instance of a deployment that holds a runtime,
+/// with what the router's choice depends on.
+///
+/// Everything here is a hint for ranking. The lease grant re-checks the gate in
+/// its own transaction, and the forwarder is resolved for exactly `generation`,
+/// so a stale hint can cost a failover but never a request sent to the wrong
+/// incarnation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServingInstance {
+    pub instance_index: u32,
+    /// Identifies this incarnation alone (ADR 0013 §5); fences its lease.
+    pub generation: i64,
+    /// The instance's placed host, for logs.
+    pub host_id: Option<String>,
+    /// The enrolled host whose ingress serves it; `None` for an engine the
+    /// embedded role runs itself.
+    pub remote_host: Option<String>,
+    /// The launch the host reports this instance's load under.
+    pub launch_command_id: Option<String>,
+    /// Ready, admission and dispatch open, deployment not suspended.
+    pub dispatch_open: bool,
+    /// SPEC §13.2: a remote instance's host has a live control session. Always
+    /// true for an embedded engine.
+    pub host_live: bool,
+    /// Owner decision 2026-09-23: the host's session is up but its heartbeats
+    /// are silent past the suspend bound. Always false for an embedded engine.
+    pub host_unresponsive: bool,
+    /// SPEC §13.2 (W13): an owned process of this instance's engine exited;
+    /// its dispatch is closed and its cleanup is being settled.
+    pub engine_exited: bool,
+    /// The latest fresh load sample reported for exactly this instance by the
+    /// host that serves it, if any (W8). Absent is unknown load, never zero.
+    pub load: Option<crate::load_table::LoadView>,
+}
+
 #[async_trait]
 pub trait LifecyclePort: Send + Sync {
     // Reads. Named projections rather than a store handle: the coordinator owns
@@ -52,7 +87,10 @@ pub trait LifecyclePort: Send + Sync {
     // hand one out, and a handle hides which state the router actually depends on.
 
     /// Resolve a public route to its deployment.
-    fn find_deployment_by_route(&self, route: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
+    fn find_deployment_by_route(
+        &self,
+        route: &str,
+    ) -> Result<Option<DeploymentRow>, LifecycleFault>;
 
     /// Public route ids currently eligible for admission.
     fn list_enabled_route_ids(&self) -> Result<Vec<String>, LifecycleFault>;
@@ -61,7 +99,8 @@ pub trait LifecyclePort: Send + Sync {
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault>;
 
     /// The most recent operation accepted for a deployment.
-    fn latest_operation(&self, deployment_id: &str) -> Result<Option<OperationRow>, LifecycleFault>;
+    fn latest_operation(&self, deployment_id: &str)
+        -> Result<Option<OperationRow>, LifecycleFault>;
 
     /// Deployments currently READY other than this one. One exclusive pool means
     /// any other READY deployment holds it and must be released first.
@@ -75,10 +114,60 @@ pub trait LifecyclePort: Send + Sync {
     /// is "nothing is running", which is a different answer from a failure to look:
     /// a caller that cannot distinguish them would report an unstarted deployment as
     /// a broken one.
-    fn runtime_endpoint(
+    fn runtime_endpoint(&self, deployment: &str)
+        -> Result<Option<RuntimeEndpoint>, LifecycleFault>;
+
+    /// SPEC §10 (owner decision 2026-09-22): open a durable request lease for one
+    /// dispatch before anything reaches the engine. `Ok(None)` means this
+    /// authority keeps no durable request ledger at all; an authority that keeps
+    /// one never answers `None`.
+    async fn open_request_lease(
         &self,
         deployment: &str,
-    ) -> Result<Option<RuntimeEndpoint>, LifecycleFault>;
+        max_per_deployment: usize,
+    ) -> Result<Option<crate::request_leases::RequestLease>, crate::request_leases::LeaseRefused>;
+
+    /// Close a request lease on evidence, or retain it as uncertain. Never
+    /// called on a timer. An error leaves the lease charged.
+    async fn close_request_lease(
+        &self,
+        lease: crate::request_leases::RequestLease,
+        end: crate::request_leases::LeaseEnd,
+    ) -> Result<(), crate::request_leases::LeaseRefused>;
+
+    /// ADR 0013 §10 (I3): every instance of `deployment` that holds a runtime,
+    /// for the router to choose among. `Ok(None)` means this authority has no
+    /// instance view at all, and the router dispatches to the deployment as a
+    /// whole (`runtime_endpoint`, `open_request_lease`).
+    fn serving_instances(
+        &self,
+        _deployment: &str,
+    ) -> Result<Option<Vec<ServingInstance>>, LifecycleFault> {
+        Ok(None)
+    }
+
+    /// Where exactly the instance incarnation `generation` runs. `None` once it
+    /// holds no runtime: a lease granted for it is then closed as not accepted
+    /// and the request goes nowhere else under that lease.
+    fn instance_endpoint(
+        &self,
+        deployment: &str,
+        _generation: i64,
+    ) -> Result<Option<RuntimeEndpoint>, LifecycleFault> {
+        self.runtime_endpoint(deployment)
+    }
+
+    /// SPEC §10, ADR 0013 §10: open a durable lease charged to exactly the
+    /// instance incarnation `generation` names, only while its gate is open.
+    async fn open_instance_lease(
+        &self,
+        deployment: &str,
+        _generation: i64,
+        max_per_deployment: usize,
+    ) -> Result<Option<crate::request_leases::RequestLease>, crate::request_leases::LeaseRefused>
+    {
+        self.open_request_lease(deployment, max_per_deployment).await
+    }
 
     // Writes. These exist only because the router currently drives eviction: it
     // selects a victim, stops it, and clears its suspension itself. That is the
@@ -100,10 +189,7 @@ pub trait LifecyclePort: Send + Sync {
     ) -> Result<(), LifecycleFault>;
 
     /// What the engine can prove about work in flight for this deployment.
-    async fn observe_adapter(
-        &self,
-        deployment: &str,
-    ) -> Result<WorkObservation, LifecycleFault>;
+    async fn observe_adapter(&self, deployment: &str) -> Result<WorkObservation, LifecycleFault>;
 
     /// Request an idle stop. Distinct from an administrative stop: the deployment
     /// stays eligible for on-demand activation afterwards.
@@ -128,27 +214,69 @@ pub trait LifecyclePort: Send + Sync {
         action: LifecycleAction,
     ) -> Result<OperationHandle, LifecycleFault>;
 
+    /// SPEC §10 steps 2–7 (W10): bring `deployment` to a state a queued
+    /// request can dispatch to, waiting through any transition in progress
+    /// (SPEC §6.1: STARTING, WAKING, DRAINING and PARKING queue) and making
+    /// room by switching when its activation does not fit. `Ok` once an
+    /// instance serves. The router calls this once per waiting group, from a
+    /// task a client disconnect does not cancel.
+    ///
+    /// The default is an authority without switching: one on-demand
+    /// activation, awaited.
+    async fn activate_for_request(&self, deployment: &str) -> Result<(), LifecycleFault> {
+        let now_ready = self
+            .get_deployment(deployment)?
+            .is_some_and(|row| row.observed_state == LifecycleState::Ready);
+        if now_ready {
+            return Ok(());
+        }
+        let op = self.auto_activate(deployment).await?;
+        self.wait_terminal(&op).await.map(|_| ())
+    }
 }
 
 #[async_trait]
 impl LifecyclePort for Controller {
-    fn find_deployment_by_route(&self, route: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
-        self.store_ref().lock().unwrap().find_deployment_by_route(route).map_err(Into::into)
+    fn find_deployment_by_route(
+        &self,
+        route: &str,
+    ) -> Result<Option<DeploymentRow>, LifecycleFault> {
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .find_deployment_by_route(route)
+            .map_err(Into::into)
     }
     fn list_enabled_route_ids(&self) -> Result<Vec<String>, LifecycleFault> {
-        self.store_ref().lock().unwrap().list_enabled_route_ids().map_err(Into::into)
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .list_enabled_route_ids()
+            .map_err(Into::into)
     }
     fn get_deployment(&self, id: &str) -> Result<Option<DeploymentRow>, LifecycleFault> {
-        self.store_ref().lock().unwrap().get_deployment(id).map_err(Into::into)
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .get_deployment(id)
+            .map_err(Into::into)
     }
-    fn latest_operation(&self, deployment_id: &str) -> Result<Option<OperationRow>, LifecycleFault> {
-        self.store_ref().lock().unwrap().latest_operation(deployment_id).map_err(Into::into)
+    fn latest_operation(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<OperationRow>, LifecycleFault> {
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .latest_operation(deployment_id)
+            .map_err(Into::into)
     }
     fn ready_deployments_excluding(&self, deployment: &str) -> Result<Vec<String>, LifecycleFault> {
         self.store_ref()
             .lock()
             .unwrap()
-            .ready_deployments_excluding(deployment).map_err(Into::into)
+            .ready_deployments_excluding(deployment)
+            .map_err(Into::into)
     }
     fn runtime_endpoint(
         &self,
@@ -160,8 +288,30 @@ impl LifecyclePort for Controller {
         // and it is what keeps this authority from claiming a runtime it does not own.
         Ok(None)
     }
+    /// The F1 controller is a test authority with no coordinator session, so it
+    /// has no durable request ledger; it says so rather than pretending to one.
+    async fn open_request_lease(
+        &self,
+        _deployment: &str,
+        _max_per_deployment: usize,
+    ) -> Result<Option<crate::request_leases::RequestLease>, crate::request_leases::LeaseRefused>
+    {
+        Ok(None)
+    }
+    async fn close_request_lease(
+        &self,
+        _lease: crate::request_leases::RequestLease,
+        _end: crate::request_leases::LeaseEnd,
+    ) -> Result<(), crate::request_leases::LeaseRefused> {
+        // Unreachable: this authority never grants a lease to close.
+        Ok(())
+    }
     fn clear_suspension(&self, deployment: &str) -> Result<(), LifecycleFault> {
-        self.store_ref().lock().unwrap().set_suspended(deployment, false).map_err(Into::into)
+        self.store_ref()
+            .lock()
+            .unwrap()
+            .set_suspended(deployment, false)
+            .map_err(Into::into)
     }
     fn journal(
         &self,
@@ -173,32 +323,40 @@ impl LifecyclePort for Controller {
         self.store_ref()
             .lock()
             .unwrap()
-            .record_journal(host_id, operation_id, state, evidence).map_err(Into::into)
+            .record_journal(host_id, operation_id, state, evidence)
+            .map_err(Into::into)
     }
-    async fn observe_adapter(
-        &self,
-        deployment: &str,
-    ) -> Result<WorkObservation, LifecycleFault> {
-        Controller::observe_adapter(self, deployment).await.map_err(Into::into)
+    async fn observe_adapter(&self, deployment: &str) -> Result<WorkObservation, LifecycleFault> {
+        Controller::observe_adapter(self, deployment)
+            .await
+            .map_err(Into::into)
     }
     async fn idle_stop(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
-        Controller::idle_stop(self, deployment).await.map_err(Into::into)
+        Controller::idle_stop(self, deployment)
+            .await
+            .map_err(Into::into)
     }
     async fn wait_terminal(
         &self,
         handle: &OperationHandle,
     ) -> Result<LifecycleState, LifecycleFault> {
-        Controller::wait_terminal(self, handle).await.map_err(Into::into)
+        Controller::wait_terminal(self, handle)
+            .await
+            .map_err(Into::into)
     }
     async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
-        Controller::auto_activate(self, deployment).await.map_err(Into::into)
+        Controller::auto_activate(self, deployment)
+            .await
+            .map_err(Into::into)
     }
     async fn request_transition(
         &self,
         deployment: &str,
         action: LifecycleAction,
     ) -> Result<OperationHandle, LifecycleFault> {
-        Controller::request_transition(self, deployment, action).await.map_err(Into::into)
+        Controller::request_transition(self, deployment, action)
+            .await
+            .map_err(Into::into)
     }
 }
 

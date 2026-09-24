@@ -754,3 +754,137 @@ fn retained_recipe_matching_ignores_allocation_and_device_order() {
     f.initial.owners.get_mut("A").unwrap().devices[0].sharing = Sharing::Shared;
     assert_eq!(plan_activation(f.input(), "A"), Err(PlanError::Invalid));
 }
+
+mod host_scoped {
+    use super::*;
+    use mllm_config::effective::{
+        DevicePolicy, DomainMemory, DomainPolicy, HostPolicy, PortRange, QueuePolicy, Sharing,
+    };
+
+    fn host() -> HostPolicy {
+        HostPolicy {
+            name: "host".into(),
+            hardware_fingerprint: "hw".into(),
+            environment_fingerprint: "env".into(),
+            device_inventory_digest: None,
+            model_store: "/srv/models".into(),
+            domains: BTreeMap::from([(
+                "ram".into(),
+                DomainPolicy {
+                    managed_limit: 100,
+                    free_reserve: 0,
+                    host_kv_limit: None,
+                    parked_limit: None,
+                    memory: DomainMemory::Distinct,
+                },
+            )]),
+            devices: BTreeMap::from([(
+                "gpu0".into(),
+                DevicePolicy {
+                    physical_gpu_uuid: None,
+                    domain: "ram".into(),
+                    sharing: Sharing::Shared,
+                },
+            )]),
+            max_parked: 0,
+            observation_ttl_ms: 2_000,
+            device_sharing: Sharing::Shared,
+            endpoint_port_range: PortRange {
+                start: 20_000,
+                end: 20_100,
+            },
+            planner_max_states: 4_096,
+            queue: QueuePolicy {
+                max_pending_per_deployment: 64,
+                max_pending_total: 256,
+                max_buffered_bytes_total: 64 << 20,
+                request_deadline_ms: 600_000,
+                admission_window_ms: 2_000,
+                stream_idle_ms: mllm_config::effective::DEFAULT_STREAM_IDLE_MS,
+            },
+        }
+    }
+
+    fn scoped(owner_domain: &str, bytes: i64, phase: ResourcePhase) -> PhaseFootprint {
+        PhaseFootprint {
+            phase,
+            allocations: vec![Allocation {
+                domain: owner_domain.into(),
+                bytes,
+                host_kv_bytes: 0,
+            }],
+            devices: vec![],
+        }
+    }
+
+    // T26 T27 (Phase B follow-up): a park or switch plan on one host is judged
+    // against that host's owners. Another host's parked owner neither fails the
+    // plan as an unknown domain nor counts against this host's max_parked (0).
+    #[test]
+    fn a_plan_for_one_host_is_not_refused_over_another_hosts_parked_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let store = mllm_store::Store::open(&path).unwrap();
+        let session = store.begin_coordinator_session().unwrap();
+        let observed = vec![MemoryObservation {
+            domain: "ram".into(),
+            capacity_bytes: 100,
+            available_bytes: 100,
+            sampled_at_ms: 1_000,
+        }];
+        for id in ["host-one", "host-two"] {
+            store
+                .import_remote_resource_policy(&session, id, &host(), &observed, 1_500)
+                .unwrap();
+        }
+        let ours = store.host_resource_key("host-one", "domain", "ram").unwrap().unwrap();
+        let theirs = store.host_resource_key("host-two", "domain", "ram").unwrap().unwrap();
+        let parked = serde_json::json!({"version":1,"phase":"parked","allocations":[[theirs,60,0]],"devices":[]});
+        let sql = rusqlite::Connection::open(&path).unwrap();
+        sql.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('X','X','model',NULL,'stopped',1,0,1,1)", []).unwrap();
+        sql.execute(
+            "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES('X',?1,'X')",
+            [parked.to_string()],
+        )
+        .unwrap();
+
+        let recipe = |domain: &str| RecipeFootprints {
+            cold: scoped(domain, 50, ResourcePhase::Cold),
+            ready: scoped(domain, 40, ResourcePhase::Ready),
+            parking: scoped(domain, 50, ResourcePhase::Parking),
+            parked: scoped(domain, 10, ResourcePhase::Parked),
+            wake: scoped(domain, 60, ResourcePhase::Wake),
+        };
+        let mut plan_spec = spec(50);
+        plan_spec.recipe = recipe(&ours);
+        let owners: BTreeMap<String, OwnerPlanSpec> = [("B".to_string(), plan_spec)].into();
+        let observations = vec![MemoryObservation {
+            domain: ours.clone(),
+            capacity_bytes: 100,
+            available_bytes: 100,
+            sampled_at_ms: 100,
+        }];
+        let limits = vec![MemoryLimit {
+            domain: ours.clone(),
+            managed_bytes: 100,
+            free_reserve_bytes: 0,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        }];
+        let input = |initial| PlannerInput {
+            initial,
+            owners: &owners,
+            admission: AdmissionContext::new(&observations, &limits, 100, 10, 0),
+            max_expansions: 100,
+        };
+        // The whole ledger: the other host's owner is an unknown domain here.
+        let whole = store.resource_snapshot().unwrap();
+        assert!(plan_activation(input(&whole), "B").is_err());
+        // Scoped to this host: the plan proceeds, and max_parked 0 is not
+        // exhausted by the other host's parked owner.
+        let scoped_ledger = store.host_scoped_resource_snapshot(&[ours.as_str()]).unwrap();
+        assert!(!scoped_ledger.owners.contains_key("X"));
+        assert_eq!(scoped_ledger.epoch, whole.epoch);
+        assert!(plan_activation(input(&scoped_ledger), "B").is_ok());
+    }
+}

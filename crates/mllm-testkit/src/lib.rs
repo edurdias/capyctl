@@ -32,45 +32,81 @@ pub use provider::{
 };
 pub use scripted_tool::ScriptedTool;
 
-use mllm_domain::launch::{ProfileLaunchSettings, VllmLaunchSettings, VllmRequestedBudget};
+use mllm_domain::launch::{
+    CommonEngineSettings, LaunchSettings, MemoryRequest, SettingSource, SglangLaunchSettings,
+    VllmLaunchSettings,
+};
 
 /// The launch settings a test deployment carries.
 ///
 /// Test deployments describe a vLLM installation, because that is the family the
 /// product has: the Fake is injected as the adapter, not declared in a document.
 /// The injected builder reads none of these fields, so they only have to be a
-/// block the configuration layer accepts.
-pub fn vllm_launch_settings() -> ProfileLaunchSettings {
-    ProfileLaunchSettings::Vllm(VllmLaunchSettings {
-        tensor_parallel_size: 1,
-        pipeline_parallel_size: 1,
-        enable_sleep_mode: true,
-        kv_cache_dtype: "auto".into(),
-        block_size_tokens: 16,
-        cpu_offload_bytes: 0,
-        requested_budget: VllmRequestedBudget {
+/// value the configuration layer could produce.
+pub fn vllm_launch_settings() -> LaunchSettings {
+    LaunchSettings::Vllm(VllmLaunchSettings {
+        common: CommonEngineSettings::default(),
+        memory: MemoryRequest {
+            request_bytes: 8 << 30,
             kv_cache_bytes: 4 << 30,
-            swap_space_bytes: 0,
-            gpu_utilization_pct: 75,
+            margin_bytes: 8 << 30,
+            weights_bytes: None,
+            startup_bytes: None,
         },
+        block_size_tokens: None,
+        max_num_batched_tokens: None,
+        enable_sleep_mode: false,
+        extra_args: Vec::new(),
+        provenance: [
+            ("enable_sleep_mode".to_owned(), SettingSource::Derived),
+            ("memory.request".to_owned(), SettingSource::Derived),
+        ]
+        .into_iter()
+        .collect(),
     })
 }
 
-/// The same block as a host policy carries it: JSON, validated by the
-/// configuration layer rather than by a second parser here.
-pub fn vllm_launch_settings_json() -> serde_json::Value {
-    serde_json::json!({
-        "engine": "vllm",
-        "tensor_parallel_size": 1,
-        "pipeline_parallel_size": 1,
-        "enable_sleep_mode": true,
-        "kv_cache_dtype": "auto",
-        "block_size_tokens": 16,
-        "cpu_offload_bytes": "0B",
-        "requested_budget": {
-            "kv_cache_bytes": "4GiB",
-            "swap_space_bytes": "0B",
-            "gpu_utilization_pct": 75
-        }
-    })
+/// SGLang settings equivalent to the pinned Qwen3-4B recipe the protected entry
+/// still validates (ADR 0014 WE1 interim): a deep-parking deployment that states
+/// only its KV cache. Not qualification evidence.
+pub fn sglang_launch_settings() -> SglangLaunchSettings {
+    SglangLaunchSettings {
+        common: CommonEngineSettings {
+            cuda_graphs: Some(false),
+            ..CommonEngineSettings::default()
+        },
+        // Request = weights (4 GiB here) + KV + margin (ADR 0014 §5), so the
+        // static share SGLang sizes from the grant is 8 GiB.
+        memory: MemoryRequest {
+            request_bytes: 16 << 30,
+            kv_cache_bytes: 4 << 30,
+            margin_bytes: 8 << 30,
+            weights_bytes: None,
+            startup_bytes: None,
+        },
+        max_total_tokens: None,
+        chunked_prefill_size: None,
+        tokenizer_workers: 1,
+        memory_saver: true,
+        cpu_weight_backup: false,
+        weight_restore: "disk_reload".into(),
+        extra_args: Vec::new(),
+        provenance: [
+            ("cuda_graphs", SettingSource::MllmDefault),
+            ("sglang.tokenizer_workers", SettingSource::MllmDefault),
+            ("memory_saver", SettingSource::Derived),
+            ("cpu_weight_backup", SettingSource::Derived),
+            ("weight_restore", SettingSource::Derived),
+            ("memory.request", SettingSource::Derived),
+        ]
+        .into_iter()
+        .map(|(field, source)| (field.to_owned(), source))
+        .collect(),
+    }
+}
+
+/// The `engine_config` block a test deployment carries (ADR 0014 §2): JSON,
+/// validated by the configuration layer rather than by a second parser here.
+pub fn vllm_engine_config_json() -> serde_json::Value {
+    serde_json::json!({"memory": {"kv_cache": "4GiB"}})
 }

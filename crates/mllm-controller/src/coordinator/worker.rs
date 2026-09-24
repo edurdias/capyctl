@@ -1,22 +1,25 @@
 use super::permits_send;
 use crate::ownership::SharedCoordinatorState;
 use futures::FutureExt;
-use mllm_adapters::traits::{EngineAdapter, OwnedProcessLaunch, RuntimeError, RuntimeAction, RuntimeCommand};
+use mllm_adapters::traits::{
+    EngineAdapter, OwnedProcessLaunch, RuntimeError, RuntimeAction, RuntimeCommand,
+};
 use mllm_adapters::vllm::args::redact_text;
 use mllm_config::engine_policy::Engine;
-use mllm_launchers::{AssociationError, LaunchAssociation};
 use mllm_domain::{
     completion::{CleanupEvidence, CompletionEvidence, OwnedLaunchReceipt},
     resources::{MemoryLimit, MemoryObservation},
+};
+use mllm_launchers::{AssociationError, LaunchAssociation};
+use mllm_store::ordinary_lifecycle::park::{
+    PreinitializeReceipt, ResidencyArm, ResidencyKind, ResidencyReceipt, ResidencyWork, WakeScope,
 };
 use mllm_store::{
     lifecycle::{DeploymentFence, LifecycleError},
     ordinary_lifecycle::cleanup::CleanupExecutionContext,
     ordinary_lifecycle::cleanup::{OrdinaryCleanupReceipt, OrdinaryCleanupStatus},
     ordinary_lifecycle::unarmed_stop::OrdinaryStopReceipt,
-    ordinary_lifecycle::worker::{
-        InitializePoll, InitializeStatus, InitializeWork,
-    },
+    ordinary_lifecycle::worker::{InitializePoll, InitializeStatus, InitializeWork},
     ordinary_lifecycle::StartReceipt,
 };
 use std::{
@@ -39,6 +42,20 @@ mod tests;
 #[path = "native_failure.rs"]
 mod native_failure;
 
+#[path = "local_adoption.rs"]
+mod local_adoption;
+
+#[path = "cleanup_adoption.rs"]
+mod cleanup_adoption;
+
+// SPEC §10, ADR 0013 §8 (W10): request-driven switching commands.
+#[path = "switching.rs"]
+mod switching;
+
+// ADR 0015: per-instance concurrent lifecycle work.
+#[path = "scheduler.rs"]
+mod scheduler;
+use scheduler::run;
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum CoordinatorError {
@@ -52,15 +69,60 @@ pub enum CoordinatorError {
     Service(String),
     #[error("invalid coordinator options")]
     Invalid,
+    /// SPEC §6.5 (W5): the step was deferred without any effect (parked
+    /// instances are being reclaimed first); it stays planned and is not an
+    /// attempt.
+    #[error("deferred: {0}")]
+    Deferred(String),
 }
 
 pub type ObservationFuture =
     Pin<Box<dyn Future<Output = Result<Vec<MemoryObservation>, CoordinatorError>> + Send>>;
 
+/// Observations with the per-process resident memory sampled beside them.
+pub type ResidentObservationFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    (Vec<MemoryObservation>, Vec<mllm_domain::resources::ProcessResident>),
+                    CoordinatorError,
+                >,
+            > + Send,
+    >,
+>;
+
 /// Service-owned observation source. Implementations perform observations only;
 /// they cannot provide owner residency credit or choose resource limits.
 pub trait ServiceObservation: Send + Sync + 'static {
     fn observe(&self, host_id: String) -> ObservationFuture;
+
+    /// ADR 0007: the observations together with the memory each process on
+    /// the host held in the same sample, keyed by process identity. Only
+    /// evidence: the store attributes it to owners by the identities it
+    /// recorded, and credits it as a lower bound. A source that samples no
+    /// processes reports none, which credits nothing.
+    fn observe_with_residents(&self, host_id: String) -> ResidentObservationFuture {
+        let observed = self.observe(host_id);
+        Box::pin(async move { Ok((observed.await?, Vec::new())) })
+    }
+
+    /// ADR 0013 §4 step 1, W12: the hosts eligible for placement now (a live
+    /// reconciled session, not draining, an approved configuration and a
+    /// matching profile build). `None` when this source has no notion of
+    /// eligibility (the embedded host, which is its own); every allowed host
+    /// that resolved is then a candidate.
+    fn eligible_hosts(&self) -> Option<std::collections::BTreeSet<String>> {
+        None
+    }
+
+    /// Owner decision 4 (2026-09-22): the remote hosts reachable now (a live,
+    /// reconciled session). A planned cleanup of a remote binding whose host is
+    /// not among them is deferred, unarmed, until it is, instead of timing out
+    /// against an offline host. `None` when this source has no notion of
+    /// connectivity (the embedded host); nothing is deferred then.
+    fn online_hosts(&self) -> Option<std::collections::BTreeSet<String>> {
+        None
+    }
 }
 
 pub type ServiceClock = Arc<dyn Fn() -> Result<i64, CoordinatorError> + Send + Sync>;
@@ -86,6 +148,27 @@ pub struct CoordinatorOptions {
     /// Spec §5: how long a terminated process group is given to exit after
     /// `SIGTERM` before it is killed.
     pub terminate_grace: Duration,
+    /// SPEC §6.5 (W5): the controller-owned idle policy. Disabled by default:
+    /// a timer runs only when the server's configuration names one.
+    pub idle: mllm_store::ordinary_lifecycle::park::IdlePolicy,
+    /// ADR 0015: how many activation effects (Initialize, park, restore) may be
+    /// in flight at once across all instances, and separately how many
+    /// cleanups. One instance never has more than one effect in flight;
+    /// admission, reservations and the ledger stay serialized in the store.
+    pub max_concurrent_effects: usize,
+    /// Owner decision 2026-09-23: how often an Initialize samples its host's
+    /// published memory availability to measure its startup peak. `None`
+    /// measures nothing, and every start keeps its declared or placeholder
+    /// startup budget.
+    pub startup_sample_interval: Option<Duration>,
+    /// SPEC §6.3 ("drain, and terminate engine workers"), §10 ("normal
+    /// switches do not kill live requests"): how long a Stop's cleanup waits
+    /// for the requests already accepted by its instance to complete before
+    /// it terminates the engine. The operator's or policy's Stop is the
+    /// authorization to terminate once the bound has passed; the requests'
+    /// leases still settle on evidence. The default matches
+    /// `switching.drain_timeout`.
+    pub stop_drain_timeout: Duration,
 }
 impl Default for CoordinatorOptions {
     fn default() -> Self {
@@ -95,8 +178,14 @@ impl Default for CoordinatorOptions {
             max_observers: 256,
             max_attempts: 3,
             retry_cooldown: Duration::from_secs(30),
-            initialize_timeout: Duration::from_secs(900),
+            // ADR 0014 amendment A1: the step deadline (the deployment's
+            // `timeouts.initialize` or an override) governs; this is a ceiling.
+            initialize_timeout: Duration::from_secs(3600),
             terminate_grace: Duration::from_secs(15),
+            idle: Default::default(),
+            max_concurrent_effects: 8,
+            startup_sample_interval: Some(Duration::from_secs(1)),
+            stop_drain_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -118,15 +207,44 @@ pub enum WorkerStatus {
 
 struct Shared {
     clock: ServiceClock,
+    /// The service observation source, also the placement eligibility source.
+    observations: Arc<dyn ServiceObservation>,
     wake: Notify,
     changed: Notify,
     accepting: AtomicBool,
     cleanup_accepting: AtomicBool,
     shutdown_requested: AtomicBool,
+    /// Admission was closed by a service fault (a store fault, a poisoned
+    /// mutex, a refused binding), not by shutdown. A task that fails after it
+    /// reports the worker failed even though the scheduler, leaving on the
+    /// closed admission, has meanwhile signalled every task to stop.
+    faulted: AtomicBool,
     initializing: AtomicBool,
+    /// Whether this worker adopts retired sessions' remote launches at startup.
+    adopt_remote: bool,
+    /// SPEC §4.3 (P3): how an embedded worker rebuilds the runtime of a Ready
+    /// launch its retired session left running, so the restarted role re-attaches
+    /// it instead of stranding it. Only the resolved embedded worker has one.
+    local_adoption: Option<DriverFactory>,
     observers: Arc<Semaphore>,
     store_jobs: Arc<Semaphore>,
     retained: Mutex<BTreeMap<String, Arc<Driver>>>,
+    /// ADR 0015: uncertain launches, by binding, that pause new activations
+    /// until each is settled on evidence. Changed only under the owner mutex
+    /// (lock order: owner, then this), which is where admission reads the
+    /// `initializing` flag it drives.
+    paused: Mutex<BTreeMap<String, Paused>>,
+    /// SPEC §6.5 (W5): the last deferral reason of each deferred start, by
+    /// binding, and how many times in a row it repeated.
+    deferrals: Mutex<BTreeMap<String, (String, u32)>>,
+    /// SPEC §6.5 (W5): the router's last request time per instance incarnation
+    /// (`generation` -1: the deployment, instance unknown). Ephemeral: after a
+    /// restart idleness counts from the worker's start, never from before it.
+    activity: Mutex<BTreeMap<(String, i64), i64>>,
+    /// When this worker started, on its own clock: the idle timers' floor.
+    started_ms: i64,
+    /// When the idle policy last ran.
+    idle_checked_ms: std::sync::atomic::AtomicI64,
     options: CoordinatorOptions,
     // Drop retained adapters and queues before releasing process ownership.
     owner: SharedCoordinatorState,
@@ -185,8 +303,10 @@ impl CoordinatorCommands {
     /// other.
     pub fn owner_for_read(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, crate::ownership::OwnedCoordinatorState>, crate::fault::LifecycleFault>
-    {
+    ) -> Result<
+        std::sync::MutexGuard<'_, crate::ownership::OwnedCoordinatorState>,
+        crate::fault::LifecycleFault,
+    > {
         self.shared.owner.lock().map_err(|error| {
             drop(error);
             crate::fault::LifecycleFault::from(self.shared.fail("ownership mutex poisoned"))
@@ -320,6 +440,121 @@ impl CoordinatorCommands {
         )
     }
 
+    /// Owner decision Q7: stop one instance with verified cleanup. `None` when
+    /// the instance holds no runtime (recording the operator's stop was the
+    /// whole effect). An ordinary stop: the deployment stays eligible for
+    /// on-demand activation of its other instances (SPEC §6.3).
+    pub fn stop_instance(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        instance: u32,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<Option<OrdinaryStopReceipt>, CoordinatorCommandError> {
+        let _permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        let store_error = |error: LifecycleError| {
+            if matches!(
+                error,
+                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+            ) {
+                self.shared.fail_locked(&owner, error.to_string());
+            }
+            CoordinatorCommandError::Lifecycle(error)
+        };
+        if let Some(receipt) = owner
+            .store()
+            .instance_stop_command_receipt(
+                owner.session(),
+                principal,
+                deployment_id,
+                instance,
+                expected_revision,
+                key,
+                requested_deadline_ms,
+            )
+            .map_err(store_error)?
+        {
+            return Ok(Some(receipt));
+        }
+        if !self.shared.accepting.load(Ordering::Acquire) {
+            return Err(CoordinatorError::Stopped("worker is not admitting cleanup".into()).into());
+        }
+        let now = (self.shared.clock)()?;
+        let receipt = owner
+            .store()
+            .accept_instance_stop_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                instance,
+                expected_revision,
+                key,
+                now,
+                requested_deadline_ms,
+            )
+            .map_err(store_error)?;
+        drop(owner);
+        self.shared.wake.notify_one();
+        Ok(receipt)
+    }
+
+    /// SPEC §6.3 (W6): `delete deployment` removes a deployment whose cleanup
+    /// is already verified, in one store transaction. Nothing is executed and no accounting is
+    /// released: a deployment still holding a runtime, reservation, lease or
+    /// unresolved step on any instance is refused (`RuntimeRetained`), and the
+    /// operator stops it first. An exact retry returns the original receipt.
+    pub fn delete(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<mllm_store::delete::DeleteReceipt, CoordinatorCommandError> {
+        let _permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        let now = (self.shared.clock)()?;
+        owner
+            .store()
+            .accept_delete_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                now,
+                requested_deadline_ms,
+            )
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+                ) {
+                    self.shared.fail_locked(&owner, error.to_string());
+                }
+                CoordinatorCommandError::Lifecycle(error)
+            })
+    }
+
     fn stop_inner(
         &self,
         principal: &str,
@@ -390,6 +625,9 @@ impl CoordinatorCommands {
 
     /// Accept a scoped command and return observation-only committed history.
     /// Principal authentication belongs to the trusted service caller.
+    ///
+    /// Owner decision Q5 (ADR 0013 §9): an explicit start targets every
+    /// instance of the deployment, each placed on an eligible allowed host.
     pub fn start(
         &self,
         principal: &str,
@@ -398,6 +636,72 @@ impl CoordinatorCommands {
         key: &str,
         requested_deadline_ms: i64,
     ) -> Result<StartReceipt, CoordinatorCommandError> {
+        self.start_scoped(
+            principal,
+            deployment_id,
+            mllm_store::ordinary_lifecycle::placement::StartScope::All,
+            expected_revision,
+            key,
+            requested_deadline_ms,
+        )
+    }
+
+    /// Owner decision Q5: on-demand activation brings up one instance (the
+    /// lowest-index one the operator did not stop that fits) and the rest only
+    /// where they fit now; nothing is evicted.
+    pub fn start_on_demand(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<StartReceipt, CoordinatorCommandError> {
+        self.start_scoped(
+            principal,
+            deployment_id,
+            mllm_store::ordinary_lifecycle::placement::StartScope::OnDemand,
+            expected_revision,
+            key,
+            requested_deadline_ms,
+        )
+    }
+
+    /// Owner decision Q7: `start instance <n>`, placed like any other start.
+    pub fn start_instance(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        instance: u32,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<StartReceipt, CoordinatorCommandError> {
+        self.start_scoped(
+            principal,
+            deployment_id,
+            mllm_store::ordinary_lifecycle::placement::StartScope::Instance(instance),
+            expected_revision,
+            key,
+            requested_deadline_ms,
+        )
+    }
+
+    fn start_scoped(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        scope: mllm_store::ordinary_lifecycle::placement::StartScope,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<StartReceipt, CoordinatorCommandError> {
+        let instance = match scope {
+            mllm_store::ordinary_lifecycle::placement::StartScope::Instance(k) => Some(k),
+            _ => None,
+        };
+        // Read before the owner lock: the source keeps its own state.
+        let eligible = self.shared.observations.eligible_hosts();
         // Synchronous admission holds one existing observer slot only until the
         // receipt returns. There is no task or unbounded queue per command.
         let _permit = self
@@ -422,10 +726,11 @@ impl CoordinatorCommands {
         };
         if let Some(receipt) = owner
             .store()
-            .start_command_receipt(
+            .scoped_start_command_receipt(
                 owner.session(),
                 principal,
                 deployment_id,
+                instance,
                 expected_revision,
                 key,
                 requested_deadline_ms,
@@ -443,24 +748,223 @@ impl CoordinatorCommands {
         }
         let receipt = owner
             .store()
-            .accept_start_command(
+            .accept_scoped_start_command(
                 owner.session(),
                 principal,
                 deployment_id,
+                scope,
                 expected_revision,
                 key,
                 (self.shared.clock)()?,
                 requested_deadline_ms,
+                eligible.as_ref(),
             )
             .map_err(store_error)?;
         drop(owner);
         self.shared.wake.notify_one();
         Ok(receipt)
     }
+
+    /// SPEC §6.3 `park deployment` (W5): drain and park every READY instance
+    /// at the declared tier. Refused (`Unsupported`) for a restart-only
+    /// deployment or a host that opted out of deep parking.
+    pub fn park(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<ResidencyReceipt, CoordinatorCommandError> {
+        self.residency_command(false, |owner, now| {
+            owner.store().accept_park_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                now,
+                requested_deadline_ms,
+            )
+        })
+    }
+
+    /// SPEC §6.3 `start deployment` on parked instances, and on-demand
+    /// activation (owner decision Q5): restore the parked instances `scope`
+    /// names in place, on the host each parked on. `None` when none is
+    /// parked, so the caller starts cold instead.
+    pub fn wake(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        scope: WakeScope,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<Option<ResidencyReceipt>, CoordinatorCommandError> {
+        self.residency_command(true, |owner, now| {
+            owner.store().accept_restore_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                scope,
+                expected_revision,
+                key,
+                now,
+                requested_deadline_ms,
+            )
+        })
+    }
+
+    /// SPEC §6.3, §6.5 `preinitialize deployment` (W5): start, verify and
+    /// park each instance in turn. Refused (`Unsupported`) for a
+    /// restart-only deployment: it must fail rather than claim it prewarmed.
+    pub fn preinitialize(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        expected_revision: i64,
+        key: &str,
+        requested_deadline_ms: i64,
+    ) -> Result<PreinitializeReceipt, CoordinatorCommandError> {
+        self.residency_command(true, |owner, now| {
+            owner.store().accept_preinitialize_command(
+                owner.session(),
+                principal,
+                deployment_id,
+                expected_revision,
+                key,
+                now,
+                requested_deadline_ms,
+            )
+        })
+    }
+
+    /// SPEC §6.5 (W5): the router saw a request for this instance (or, with
+    /// no generation, for the deployment); the ready-idle timer restarts.
+    pub fn note_activity(&self, deployment_id: &str, generation: Option<i64>) {
+        let Ok(now) = (self.shared.clock)() else {
+            return;
+        };
+        let Ok(mut activity) = self.shared.activity.lock() else {
+            return;
+        };
+        // Bounded: entries a day old say nothing an idle timer needs.
+        if activity.len() >= 4096 {
+            activity.retain(|_, at| now.saturating_sub(*at) < 86_400_000);
+            if activity.len() >= 4096 {
+                activity.clear();
+            }
+        }
+        activity.insert((deployment_id.to_owned(), generation.unwrap_or(-1)), now);
+    }
+
+    /// One residency command, accepted synchronously under the owned store.
+    /// `increases` refuses it while the worker admits no Initialize (it waits
+    /// on an uncertain launch), exactly as a start is refused then.
+    fn residency_command<T>(
+        &self,
+        increases: bool,
+        accept: impl FnOnce(&crate::ownership::OwnedCoordinatorState, i64) -> Result<T, LifecycleError>,
+    ) -> Result<T, CoordinatorCommandError> {
+        let _permit = self
+            .shared
+            .observers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CoordinatorError::Busy)?;
+        let owner = self.shared.owner.lock().map_err(|error| {
+            drop(error);
+            self.shared.fail("ownership mutex poisoned")
+        })?;
+        if !self.shared.accepting.load(Ordering::Acquire)
+            || (increases && !self.shared.initializing.load(Ordering::Acquire))
+        {
+            return Err(CoordinatorError::Stopped("worker is not admitting this command".into()).into());
+        }
+        let now = (self.shared.clock)()?;
+        let receipt = accept(&owner, now).map_err(|error| {
+            if matches!(
+                error,
+                LifecycleError::Sql(_) | LifecycleError::CorruptStoredData
+            ) {
+                self.shared.fail_locked(&owner, error.to_string());
+            }
+            CoordinatorCommandError::Lifecycle(error)
+        })?;
+        drop(owner);
+        self.shared.wake.notify_one();
+        Ok(receipt)
+    }
 }
 
-type CleanupFuture =
+pub type CleanupFuture =
     Pin<Box<dyn Future<Output = Result<CleanupEvidence, CoordinatorError>> + Send>>;
+/// Host-specific cleanup must return authenticated physical evidence. An adapter
+/// shutdown acknowledgement or a local `/proc` lookup of a remote PID is not proof.
+pub type CleanupExecutor =
+    Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>;
+
+/// SPEC §§3, 13: execution transport belongs below the existing durable lifecycle.
+/// Construction supplies no arm/send authority; the worker still owns admission,
+/// persistence, fencing, dispatch, completion, and uncertainty accounting.
+pub struct ExecutionBinding {
+    engine: Arc<dyn EngineAdapter>,
+    cleanup: CleanupExecutor,
+    settle: Option<SettlementExecutor>,
+}
+impl ExecutionBinding {
+    /// Remote bindings deliberately have no local process tools. Their cleanup
+    /// callback must establish absence on the authenticated assigned host.
+    pub fn remote(engine: Arc<dyn EngineAdapter>, cleanup: CleanupExecutor) -> Self {
+        Self {
+            engine,
+            cleanup,
+            settle: None,
+        }
+    }
+
+    /// SPEC §§6, 13.2: how a launch that failed or went uncertain after arm is
+    /// settled when this binding has no local process tools. Without one, such
+    /// a launch pauses uncertain until an operator Stop resolves it.
+    pub fn with_settlement(mut self, settle: SettlementExecutor) -> Self {
+        self.settle = Some(settle);
+        self
+    }
+}
+
+/// One armed launch whose outcome was lost, as a settlement must act on it.
+///
+/// `identities` are exactly what the binding recorded, which is the set the
+/// returned evidence must prove gone; the store refuses any other set. The
+/// deadline bounds the settlement's own control, not the launch's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettlementContext {
+    pub fence: DeploymentFence,
+    pub operation_id: String,
+    pub step_id: String,
+    pub binding_id: String,
+    pub incarnation: String,
+    pub identities: Vec<mllm_domain::completion::ProcessIdentity>,
+    pub deadline_ms: i64,
+}
+
+/// Settles a failed remote launch: terminate it on the authenticated host and
+/// return that host's evidence that the owned launch is gone. An error, or no
+/// answer, retains everything (SPEC §6.1).
+pub type SettlementExecutor = Arc<dyn Fn(SettlementContext) -> CleanupFuture + Send + Sync>;
+pub trait ExecutionBindings: Send + Sync {
+    fn resolve(&self, work: &InitializeWork) -> Result<ExecutionBinding, CoordinatorError>;
+}
+impl<F> ExecutionBindings for F
+where
+    F: Fn(&InitializeWork) -> Result<ExecutionBinding, CoordinatorError> + Send + Sync,
+{
+    fn resolve(&self, work: &InitializeWork) -> Result<ExecutionBinding, CoordinatorError> {
+        self(work)
+    }
+}
+
 // Private bundle: the callbacks and the process tools belong to one immutable
 // runtime binding, so cleanup and the failure path act on exactly the engine that
 // was built for it.
@@ -471,6 +975,9 @@ struct Driver {
     /// processes it launched. A builder that only talks to an engine somebody else
     /// started has none, and neither terminates anything.
     tools: Option<Arc<dyn OwnedProcessLaunch>>,
+    /// SPEC §13.2: a remote builder's way to settle a failed launch through its
+    /// authenticated host, in place of local process tools.
+    settle: Option<SettlementExecutor>,
 }
 
 /// Builds the process tools for one launch around the association that records its
@@ -525,6 +1032,20 @@ pub trait EngineBindings: Send + Sync {
     /// the coordinator gaining a second lane; everything before this point — the
     /// frozen plan, the stored per-launch key, the process tools — is the same work
     /// the product does.
+    /// ADR 0014 §7 (WE3): the verifier that measures this host's checkpoints,
+    /// when the bindings build engines that read one. A builder that drives no
+    /// real engine (a test Fake) reads no checkpoint and has none.
+    fn checkpoint_verifier(&self) -> Option<Arc<mllm_agent::checkpoint::CheckpointVerifier>> {
+        None
+    }
+
+    /// ADR 0008 (owner decision 2026-09-23): the engine installation the
+    /// embedded host registered at boot, measured again before each Initialize
+    /// for drift. Bindings that keep no registration have none.
+    fn installation(&self) -> Option<Arc<crate::installation_gate::EmbeddedInstallation>> {
+        None
+    }
+
     fn adapter(
         &self,
         declared: Engine,
@@ -613,6 +1134,26 @@ impl OwnedCoordinator {
         }
     }
 
+    /// SPEC §§3, 13: share the same lifecycle worker and Store for host-scoped
+    /// execution. Never instantiate local launchers or infer remote process absence.
+    pub fn spawn_with_execution_bindings(
+        owner: SharedCoordinatorState,
+        observations: Arc<dyn ServiceObservation>,
+        clock: ServiceClock,
+        options: CoordinatorOptions,
+        bindings: Arc<dyn ExecutionBindings>,
+    ) -> Result<Self, CoordinatorError> {
+        Self::spawn_with(owner, observations, clock, options, Arc::new(move |work| {
+            let binding = bindings.resolve(work)?;
+            Ok(Arc::new(Driver {
+                engine: binding.engine,
+                cleanup: binding.cleanup,
+                tools: None,
+                settle: binding.settle,
+            }))
+        }), true, None)
+    }
+
     /// Spawn a coordinator that drives whichever engine family each binding
     /// declares, rather than the single Fake lane.
     ///
@@ -636,7 +1177,14 @@ impl OwnedCoordinator {
         let cleanup_clock = clock.clone();
         let grace = options.terminate_grace;
         let factory_owner = owner.clone();
-        Self::spawn(
+        let adoption = local_adoption::factory(
+            owner.clone(),
+            bindings.clone(),
+            tools_factory.clone(),
+            clock.clone(),
+            grace,
+        );
+        Self::spawn_with(
             owner,
             observations,
             clock,
@@ -664,26 +1212,48 @@ impl OwnedCoordinator {
                     match &mut spec {
                         mllm_adapters::resolve::AdapterSpec::Vllm {
                             engine_key: Some(key),
+                            admin_key,
                             ..
                         } => {
-                            let sealed: [u8; 32] = hex::decode(key)
-                                .ok()
-                                .and_then(|bytes| bytes.try_into().ok())
-                                .ok_or_else(|| {
-                                    CoordinatorError::Service("engine key is not 32 bytes".into())
-                                })?;
-                            store
-                                .store_engine_key(
-                                    work.binding_id(),
-                                    work.incarnation(),
-                                    &sealed,
-                                    mllm_store::secrets::SecretRole::Inference,
-                                )
-                                .map_err(|error| {
-                                    CoordinatorError::Service(format!(
-                                        "the engine key was not stored: {error}"
-                                    ))
-                                })?;
+                            // SPEC §9.1 / T21, ADR 0012: the admin role is sealed
+                            // beside the inference role, before the builder runs,
+                            // so an adopted engine can still be parked and woken.
+                            // The two keys must differ, or the guard would admit
+                            // the inference key on the control routes.
+                            if admin_key.as_deref() == Some(key.as_str()) {
+                                return Err(CoordinatorError::Service(
+                                    "the admin and inference engine keys are the same".into(),
+                                ));
+                            }
+                            let roles = std::iter::once((
+                                key.as_str(),
+                                mllm_store::secrets::SecretRole::Inference,
+                            ))
+                            .chain(admin_key.as_deref().map(|admin| {
+                                (admin, mllm_store::secrets::SecretRole::Admin)
+                            }));
+                            for (key, role) in roles {
+                                let sealed: [u8; 32] = hex::decode(key)
+                                    .ok()
+                                    .and_then(|bytes| bytes.try_into().ok())
+                                    .ok_or_else(|| {
+                                        CoordinatorError::Service(format!(
+                                            "the {role:?} engine key is not 32 bytes"
+                                        ))
+                                    })?;
+                                store
+                                    .store_engine_key(
+                                        work.binding_id(),
+                                        work.incarnation(),
+                                        &sealed,
+                                        role,
+                                    )
+                                    .map_err(|error| {
+                                        CoordinatorError::Service(format!(
+                                            "the engine key was not stored: {error}"
+                                        ))
+                                    })?;
+                            }
                         }
                         mllm_adapters::resolve::AdapterSpec::Sglang {
                             inference,
@@ -693,7 +1263,10 @@ impl OwnedCoordinator {
                         } => {
                             *session = Some(owner.session().id().to_owned());
                             for (key, role) in [
-                                (inference.as_str(), mllm_store::secrets::SecretRole::Inference),
+                                (
+                                    inference.as_str(),
+                                    mllm_store::secrets::SecretRole::Inference,
+                                ),
                                 (admin.as_str(), mllm_store::secrets::SecretRole::Admin),
                             ] {
                                 let sealed: [u8; 32] = hex::decode(key)
@@ -732,25 +1305,66 @@ impl OwnedCoordinator {
                     });
                 let tools = tools_factory(association);
                 let engine = bindings.adapter(declared, spec, tools.clone())?;
+                // ADR 0014 §7 (WE3): the embedded host verifies the checkpoint
+                // against the recorded digest before Initialize and Restore,
+                // exactly as a remote host agent does.
+                let engine = match bindings.checkpoint_verifier() {
+                    Some(checkpoints) => crate::checkpoint_digests::CheckpointGate::new(
+                        engine,
+                        factory_owner.clone(),
+                        checkpoints,
+                        work,
+                    ) as Arc<dyn EngineAdapter>,
+                    None => engine,
+                };
+                // ADR 0008: outermost, so a drifted installation under
+                // `installation_drift: refuse` is refused before anything else.
+                let engine = match bindings.installation() {
+                    Some(installation) => crate::installation_gate::InstallationGate::new(
+                        engine,
+                        factory_owner.clone(),
+                        installation,
+                        work,
+                    ) as Arc<dyn EngineAdapter>,
+                    None => engine,
+                };
                 Ok(Arc::new(Driver {
                     engine,
-                    cleanup: terminate_then_prove_gone(
-                        tools.clone(),
-                        cleanup_clock.clone(),
-                        grace,
-                    ),
+                    cleanup: terminate_then_prove_gone(tools.clone(), cleanup_clock.clone(), grace),
                     tools: Some(tools),
+                    settle: None,
                 }))
             }),
+            false,
+            Some(adoption),
         )
     }
 
+    /// A worker over a bare driver factory, with no adoption of either kind.
+    #[cfg(test)]
     fn spawn(
         owner: SharedCoordinatorState,
         observations: Arc<dyn ServiceObservation>,
         clock: ServiceClock,
         options: CoordinatorOptions,
         factory: DriverFactory,
+    ) -> Result<Self, CoordinatorError> {
+        Self::spawn_with(owner, observations, clock, options, factory, false, None)
+    }
+
+    /// `adopt_remote` lets this worker adopt retired sessions' remote launches
+    /// at startup (SPEC §13.2). `local_adoption` lets an embedded worker adopt
+    /// the Ready embedded launches its retired session left running (SPEC §4.3,
+    /// P3); their dispatch stays closed until the local readiness supervisor
+    /// collects fresh local proof.
+    fn spawn_with(
+        owner: SharedCoordinatorState,
+        observations: Arc<dyn ServiceObservation>,
+        clock: ServiceClock,
+        options: CoordinatorOptions,
+        factory: DriverFactory,
+        adopt_remote: bool,
+        local_adoption: Option<DriverFactory>,
     ) -> Result<Self, CoordinatorError> {
         if options.poll_interval.is_zero()
             || options.poll_interval > Duration::from_secs(1)
@@ -772,6 +1386,15 @@ impl OwnedCoordinator {
             // rather than discovered on the first Stop.
             || options.terminate_grace < Duration::from_secs(1)
             || options.terminate_grace + Duration::from_secs(5) >= options.protocol_timeout
+            // SPEC §6.5: an idle timer, when named, is a positive duration.
+            || options.idle.ready_idle_ms.is_some_and(|ms| ms <= 0)
+            || options.idle.parked_idle_ms.is_some_and(|ms| ms <= 0)
+            // ADR 0015: at least one effect at a time, and a bound.
+            // Owner decision 2026-09-23: a sampling period, when named, is
+            // positive.
+            || options.startup_sample_interval.is_some_and(|d| d.is_zero())
+            || options.max_concurrent_effects == 0
+            || options.max_concurrent_effects > 256
         {
             return Err(CoordinatorError::Invalid);
         }
@@ -784,18 +1407,29 @@ impl OwnedCoordinator {
                 "session already has an owned worker".into(),
             ));
         }
+        // SPEC §6.5: idleness is never counted from before this worker ran.
+        let started_ms = clock().unwrap_or(0);
         let shared = Arc::new(Shared {
             owner,
+            observations: observations.clone(),
             clock,
             wake: Notify::new(),
             changed: Notify::new(),
             accepting: AtomicBool::new(true),
             cleanup_accepting: AtomicBool::new(true),
             shutdown_requested: AtomicBool::new(false),
+            faulted: AtomicBool::new(false),
             initializing: AtomicBool::new(true),
+            adopt_remote,
+            local_adoption,
             observers: Arc::new(Semaphore::new(options.max_observers)),
             store_jobs: Arc::new(Semaphore::new(options.max_observers + 1)),
             retained: Mutex::new(BTreeMap::new()),
+            paused: Mutex::new(BTreeMap::new()),
+            deferrals: Mutex::new(BTreeMap::new()),
+            activity: Mutex::new(BTreeMap::new()),
+            started_ms,
+            idle_checked_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
             options,
         });
         let (stop, stop_rx) = watch::channel(false);
@@ -912,7 +1546,9 @@ impl OwnedCoordinator {
     }
 
     pub async fn shutdown(mut self) -> Result<WorkerStatus, CoordinatorError> {
-        self.shared.shutdown_requested.store(true, Ordering::Release);
+        self.shared
+            .shutdown_requested
+            .store(true, Ordering::Release);
         self.shared.close_admission();
         self.stop.send_replace(true);
         self.task
@@ -924,7 +1560,9 @@ impl OwnedCoordinator {
 }
 impl Drop for OwnedCoordinator {
     fn drop(&mut self) {
-        self.shared.shutdown_requested.store(true, Ordering::Release);
+        self.shared
+            .shutdown_requested
+            .store(true, Ordering::Release);
         self.shared.close_admission();
         self.stop.send_replace(true);
     }
@@ -956,16 +1594,12 @@ impl InitializeObserver {
                 let status = self
                     .shared
                     .read(move |owner, now| {
-                        owner
-                            .store()
-                            .initialize_status(owner.session(), &step, now)
+                        owner.store().initialize_status(owner.session(), &step, now)
                     })
                     .await?;
                 if !matches!(
                     status,
-                    InitializeStatus::Planned
-                        | InitializeStatus::Armed
-                        | InitializeStatus::Expired
+                    InitializeStatus::Planned | InitializeStatus::Armed | InitializeStatus::Expired
                 ) {
                     return Ok(status);
                 }
@@ -1048,11 +1682,6 @@ impl Shared {
         self.cleanup_accepting.store(false, Ordering::Release);
     }
 
-    fn set_initializing(&self, initializing: bool) {
-        let _owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
-        self.initializing.store(initializing, Ordering::Release);
-    }
-
     fn fail(&self, message: impl Into<String>) -> CoordinatorError {
         let owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
         self.fail_locked(&owner, message)
@@ -1064,6 +1693,7 @@ impl Shared {
         _owner: &crate::ownership::OwnedCoordinatorState,
         message: impl Into<String>,
     ) -> CoordinatorError {
+        self.faulted.store(true, Ordering::Release);
         self.accepting.store(false, Ordering::Release);
         self.cleanup_accepting.store(false, Ordering::Release);
         self.wake.notify_one();
@@ -1125,464 +1755,75 @@ impl Shared {
     }
 }
 
-async fn run(
-    shared: Arc<Shared>,
-    observations: Arc<dyn ServiceObservation>,
-    factory: DriverFactory,
-    mut stop: watch::Receiver<bool>,
-    status_tx: &watch::Sender<WorkerStatus>,
-) -> WorkerStatus {
-    let mut paused: Option<(String, WorkerStatus)> = None;
-    loop {
-        if *stop.borrow() {
-            return paused.map_or(WorkerStatus::Stopped, |(_, status)| status);
-        }
-        if !shared.accepting.load(Ordering::Acquire) {
-            return WorkerStatus::Failed("service stopped accepting work".into());
-        }
-        // This loop owns the sole Initialize task. Reaching discovery means
-        // that task has exited, including any pre-arm observation future.
-        let unarmed = shared
-            .read(|owner, _| {
-                let Some(work) = owner.store().next_unarmed_stop(owner.session())? else {
-                    return Ok(None);
-                };
-                owner
-                    .store()
-                    .complete_unarmed_stop(owner.session(), &work.step_id)?;
-                Ok(Some(work))
-            })
-            .await;
-        match unarmed {
-            Ok(Some(work)) => {
-                if paused
-                    .as_ref()
-                    .is_some_and(|(binding, _)| binding == &work.binding_id)
-                {
-                    paused = None;
-                    shared.set_initializing(true);
-                    status_tx.send_replace(WorkerStatus::Running);
-                }
-                shared.changed.notify_waiters();
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => return WorkerStatus::Failed(error.to_string()),
-        }
-        let cleanup = match shared
-            .read(|owner, _| owner.store().next_ordinary_cleanup(owner.session()))
-            .await
-        {
-            Ok(work) => work,
-            Err(error) => return WorkerStatus::Failed(error.to_string()),
-        };
-        if let Some(cleanup) = cleanup {
-            let result = AssertUnwindSafe(drive_cleanup(&shared, &cleanup, &mut stop))
-                .catch_unwind()
-                .await;
-            match result {
-                Ok(Ok(())) => {
-                    if paused
-                        .as_ref()
-                        .is_some_and(|(binding, _)| binding == &cleanup.binding_id)
-                    {
-                        paused = None;
-                        shared.set_initializing(true);
-                        status_tx.send_replace(WorkerStatus::Running);
-                    }
-                    shared.changed.notify_waiters();
-                }
-                failure => {
-                    let shutdown = matches!(&failure, Ok(Err(CoordinatorError::Stopped(_))));
-                    let reason = match failure {
-                        Ok(Err(error)) => error.to_string(),
-                        _ => "cleanup panicked; durable arm retained".into(),
-                    };
-                    return if shared.accepting.load(Ordering::Acquire) || shutdown {
-                        WorkerStatus::Uncertain {
-                            operation_id: cleanup.operation_id,
-                            reason,
-                        }
-                    } else {
-                        WorkerStatus::Failed(format!("{reason}; cleanup authority retained"))
-                    };
-                }
-            }
-            continue;
-        }
-        if paused.is_some() {
-            tokio::select! {
-                _ = stop.changed() => {},
-                _ = shared.wake.notified() => {},
-                _ = tokio::time::sleep(shared.options.poll_interval) => {},
-            }
-            continue;
-        }
-        let work = match shared
-            .read(|owner, now| {
-                owner
-                    .store()
-                    .next_initialize_or_expire(owner.session(), now)
-            })
-            .await
-        {
-            Ok(InitializePoll::Work(work)) => work,
-            Ok(InitializePoll::ExpiredUnarmed) => {
-                shared.changed.notify_waiters();
-                continue;
-            }
-            Ok(InitializePoll::Idle) => {
-                tokio::select! {
-                    _ = stop.changed() => {},
-                    _ = shared.wake.notified() => {},
-                    _ = tokio::time::sleep(shared.options.poll_interval) => {},
-                }
-                continue;
-            }
-            Err(error) => return WorkerStatus::Failed(error.to_string()),
-        };
-        let operation_id = work.operation_id().to_owned();
-        let step_id = work.step_id().to_owned();
-        // Catch both service and adapter panics. If an arm exists, the fenced
-        // annotation below preserves it; otherwise no effect has been allowed.
-        let result = AssertUnwindSafe(drive(&shared, &work, &*observations, &factory, &mut stop))
-            .catch_unwind()
-            .await;
-        match result {
-            Ok(Ok(())) => {
-                // ADR 0011 decision 5: a success resets the budget. This
-                // configuration reached Ready, so the failures it took to get
-                // there must not count against the next time it is started.
-                let fence = work.fence().clone();
-                if let Err(error) = shared
-                    .with_owner(move |owner| {
-                        owner
-                            .store()
-                            .clear_attempts(&fence)
-                            .map_err(|error| CoordinatorError::Service(error.to_string()))
-                    })
-                    .await
-                {
-                    return WorkerStatus::Failed(format!(
-                        "reached Ready but the attempt budget was not reset: {error}"
-                    ));
-                }
-                shared.changed.notify_waiters();
-            }
-            failure => {
-                shared.set_initializing(false);
-                let reason = match failure {
-                    Ok(Err(error)) => error.to_string(),
-                    _ => "worker step panicked".into(),
-                };
-                // SPEC §17: failures are recorded. The match below moves `reason`
-                // into the outcome, so keep a copy for the journal.
-                let recorded_reason = reason.clone();
-                let deployment_id = work.fence().deployment_id.clone();
-                let journal_operation = work.operation_id().to_owned();
-                let status_step = step_id.clone();
-                // Spec §6: a builder that owns its processes can be classified by
-                // proof instead of paused. Only a driver this worker retains for
-                // this exact binding qualifies, and only one with process tools.
-                let native = shared
-                    .retained
-                    .lock()
-                    .ok()
-                    .and_then(|retained| retained.get(work.binding_id()).cloned())
-                    .filter(|driver| driver.tools.is_some());
-                let is_native = native.is_some();
-                let status = shared
-                    .read(move |owner, now| {
-                        // Keep observation and annotation under the exact owned
-                        // lock. Stop cannot transfer the claim between these
-                        // transactions and strand its frozen predecessor.
-                        let status = owner.store().initialize_status(
-                            owner.session(),
-                            &status_step,
-                            now,
-                        )?;
-                        if status == InitializeStatus::Expired {
-                            owner.store().expire_unarmed_initialize(
-                                owner.session(),
-                                &status_step,
-                                now,
-                            )?;
-                            Ok(InitializeStatus::ExpiredUnarmed)
-                        } else if status == InitializeStatus::Armed {
-                            if is_native {
-                                // The annotation belongs to the settlement below,
-                                // which decides between a proven release and the
-                                // uncertain pause. Reporting it armed is what
-                                // carries that decision out of this transaction.
-                                Ok(InitializeStatus::Armed)
-                            } else {
-                                owner.store().mark_initialize_uncertain(
-                                    owner.session(),
-                                    &status_step,
-                                    now,
-                                )?;
-                                Ok(InitializeStatus::Uncertain)
-                            }
-                        } else {
-                            Ok(status)
-                        }
-                    })
-                    .await;
-                let mut settled_native = false;
-                let status = match (status, native) {
-                    (Ok(InitializeStatus::Armed), Some(driver)) => {
-                        let settled = native_failure::settle_failed_native_launch(
-                            &shared,
-                            &driver,
-                            &work,
-                            &recorded_reason,
-                        )
-                        .await;
-                        settled_native = matches!(settled, Ok(InitializeStatus::Closed));
-                        settled
-                    }
-                    (status, _) => status,
-                };
-                // SPEC §13.2: only a step the store still reports as planned is a
-                // failure known not to have landed. Nothing was armed, so nothing
-                // can be running, and the same step is still there to be driven
-                // again. Every other outcome is retained, not retried.
-                let unlanded = matches!(status, Ok(InitializeStatus::Planned));
-                let outcome = match status {
-                    Ok(InitializeStatus::ExpiredUnarmed) => {
-                        shared.set_initializing(true);
-                        shared.changed.notify_waiters();
-                        continue;
-                    }
-                    // Spec §6: the settlement terminated, proved, released, wrote
-                    // the redacted reason, closed this deployment's admission and
-                    // re-admitted every other one, all under a single lock. There
-                    // is nothing left for this loop to decide. Falling through to
-                    // the give-up branch would journal the same event a second
-                    // time, unredacted and labelled as an exhausted retry budget,
-                    // when ADR 0011 decision 5 says a launch that failed after arm
-                    // is terminal for that start with no retry: an operator would
-                    // read two different stories for one failure.
-                    Ok(InitializeStatus::Closed) if settled_native => {
-                        shared.changed.notify_waiters();
-                        continue;
-                    }
-                    Ok(InitializeStatus::Uncertain) => WorkerStatus::Uncertain {
-                        operation_id,
-                        reason,
-                    },
-                    Ok(InitializeStatus::Superseded) => {
-                        // Stop can transfer the claim while Initialize is still
-                        // running. Its frozen predecessor must remain unchanged;
-                        // validate the actual successor instead of annotating
-                        // through the now-stale Initialize fence.
-                        let predecessor = work.step_id().to_owned();
-                        match shared
-                            .read(move |owner, _| {
-                                if let Some(receipt) = owner
-                                    .store()
-                                    .unarmed_stop_for_predecessor(owner.session(), &predecessor)?
-                                {
-                                    return Ok(Some(receipt));
-                                }
-                                owner
-                                    .store()
-                                    .ordinary_cleanup_for_predecessor(owner.session(), &predecessor)
-                                    .map(|r| r.map(Into::into))
-                            })
-                            .await
-                        {
-                            Ok(Some(cleanup))
-                                if cleanup.binding_id == work.binding_id()
-                                    && cleanup.incarnation == work.incarnation() =>
-                            {
-                                WorkerStatus::Uncertain {
-                                    operation_id,
-                                    reason,
-                                }
-                            }
-                            Ok(_) => {
-                                WorkerStatus::Failed(format!("{reason}; superseded work retained"))
-                            }
-                            Err(error) => WorkerStatus::Failed(format!(
-                                "{reason}; cleanup validation failed: {error}"
-                            )),
-                        }
-                    }
-                    // ADR 0011 decision 4: a deployment that already closed its own
-                    // admission is blocked on that closure, not superseded by
-                    // someone else's work.
-                    Ok(
-                        InitializeStatus::Planned
-                        | InitializeStatus::Expired
-                        | InitializeStatus::Closed,
-                    ) => WorkerStatus::Blocked {
-                        operation_id,
-                        reason,
-                    },
-                    Ok(_) => WorkerStatus::Failed(format!("{reason}; superseded work retained")),
-                    Err(error) => {
-                        // SPEC §17: failures are recorded. This branch may leave an
-                        // armed step behind while the worker keeps running, so the
-                        // reason must survive even though the annotation did not.
-                        journal_failure(
-                            &shared,
-                            &deployment_id,
-                            &journal_operation,
-                            "attempt_not_annotated",
-                            &redact_text(&format!(
-                                "{recorded_reason}; durable arm retained if recorded: {error}"
-                            )),
-                        )
-                        .await;
-                        WorkerStatus::Failed(format!(
-                            "{reason}; durable arm retained if recorded: {error}"
-                        ))
-                    }
-                };
-                // Only a process-wide condition still halts the worker: closed
-                // global admission (poisoned mutex, corrupt store — store_error
-                // already closed it above) or requested shutdown.
-                if !shared.accepting.load(Ordering::Acquire) || *stop.borrow() {
-                    return outcome;
-                }
-                if matches!(outcome, WorkerStatus::Uncertain { .. }) {
-                    // Keep the same session and retained instance for explicit Stop.
-                    // No further Initialize is admitted or discovered until this
-                    // exact retained binding has a committed verified cleanup.
-                    status_tx.send_replace(outcome.clone());
-                    paused = Some((work.binding_id().into(), outcome));
-                    shared.changed.notify_waiters();
-                    continue;
-                }
-                // The worker is admitting Initialize again before anything about
-                // this deployment is written, not after. An observer that watches
-                // for the closed deployment would otherwise see it closed and still
-                // be refused a start for a healthy one, which is the blast radius
-                // this removes.
-                shared.set_initializing(true);
-                // SPEC §13.2 and ADR 0011 decision 5: a failure known not to have
-                // landed is retried. The attempt is counted against this exact
-                // configuration, and the deployment is given up on once the budget
-                // is spent. An uncertain outcome never reaches here: it pauses
-                // above and resolves through the gone-proof first.
-                // SPEC §13.2 and spec §6: a builder's reason quotes the engine's
-                // own output, and this journal is not the owner-only log, so every
-                // reason written from here is redacted at the coordinator rather
-                // than trusting whichever builder produced it to have done so.
-                let mut closing = redact_text(&format!("gave up: {recorded_reason}"));
-                if unlanded {
-                    let fence = work.fence().clone();
-                    let counting = shared.clone();
-                    let attempt_operation = journal_operation.clone();
-                    // SPEC §17: failures are recorded. The attempt and the reason
-                    // it failed are written in the same transaction, so a counted
-                    // attempt is never left without an explanation.
-                    let attempt_evidence = redact_text(&format!(
-                        "deployment {deployment_id}: attempt failed: {recorded_reason}"
-                    ));
-                    let record = match shared
-                        .with_owner(move |owner| {
-                            let now = (counting.clock)()?;
-                            let record = owner
-                                .store()
-                                .record_attempt(&fence, now)
-                                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
-                            owner
-                                .store()
-                                .record_journal(
-                                    None,
-                                    Some(&attempt_operation),
-                                    Some("attempt_failed"),
-                                    &attempt_evidence,
-                                )
-                                .map_err(|error| CoordinatorError::Service(error.to_string()))?;
-                            Ok(record)
-                        })
-                        .await
-                    {
-                        Ok(record) => record,
-                        Err(error) => {
-                            return WorkerStatus::Failed(format!(
-                                "{outcome:?}; attempt not recorded: {error}"
-                            ))
-                        }
-                    };
-                    if record.attempts < i64::from(shared.options.max_attempts) {
-                        // The step is still planned against its original
-                        // reservation, so the next poll rediscovers this exact
-                        // work. Nothing is released, no epoch advances and no
-                        // dispatch is replayed.
-                        let exponent = u32::try_from(record.attempts.saturating_sub(1))
-                            .unwrap_or(u32::MAX)
-                            .min(16);
-                        let wait = shared
-                            .options
-                            .retry_cooldown
-                            .saturating_mul(1u32.checked_shl(exponent).unwrap_or(u32::MAX));
-                        // ADR 0011 decision 5: retries happen within the start
-                        // command's deadline. Sleeping past it would only hand the
-                        // step to the expiry path mid-cooldown, so a deadline that
-                        // arrives before the budget is spent is terminal for this
-                        // start and the deployment closes its own admission now.
-                        let now = match (shared.clock)() {
-                            Ok(now) => now,
-                            Err(error) => {
-                                return WorkerStatus::Failed(format!(
-                                    "{outcome:?}; retry cooldown could not be bounded: {error}"
-                                ))
-                            }
-                        };
-                        let left = work.deadline_ms().saturating_sub(now);
-                        let left = Duration::from_millis(u64::try_from(left).unwrap_or(0));
-                        if left > wait {
-                            status_tx.send_replace(WorkerStatus::Running);
-                            shared.changed.notify_waiters();
-                            tokio::select! {
-                                _ = stop.changed() => {},
-                                _ = tokio::time::sleep(wait.min(left)) => {},
-                            }
-                            continue;
-                        }
-                        closing = redact_text(&format!(
-                            "deadline reached before the budget was spent: {recorded_reason}"
-                        ));
-                    }
-                }
-                // ADR 0011 decision 4: the budget is spent, the deadline arrived
-                // first, or the failure was not one that may be replayed. A
-                // deployment that is given up on closes its own admission, not the
-                // host's. Every other deployment keeps being served; only this one
-                // is no longer admitted until an operator reopens it.
-                let closed_deployment = deployment_id.clone();
-                let closing_operation = journal_operation.clone();
-                if let Err(error) = shared
-                    .with_owner(move |owner| {
-                        owner
-                            .store()
-                            .set_admission_enabled(&closed_deployment, false)
-                            .map_err(|error| CoordinatorError::Service(error.to_string()))?;
-                        // SPEC §17: failures are recorded.
-                        owner
-                            .store()
-                            .record_journal(
-                                None,
-                                Some(&closing_operation),
-                                Some("given_up"),
-                                &format!("deployment {closed_deployment}: {closing}"),
-                            )
-                            .map_err(|error| CoordinatorError::Service(error.to_string()))
-                    })
-                    .await
-                {
-                    return WorkerStatus::Failed(format!(
-                        "{outcome:?}; failed to close the deployment's own admission: {error}"
-                    ));
-                }
-                shared.changed.notify_waiters();
-            }
+/// A retained uncertain binding this worker waits on before admitting
+/// Initialize (ADR 0015: one entry per paused binding).
+struct Paused {
+    binding: String,
+    status: WorkerStatus,
+    /// A remote launch the worker keeps settling, and when it next tries.
+    retry: Option<(native_failure::LaunchRef, tokio::time::Instant)>,
+}
+impl Paused {
+    fn due(&self) -> Option<native_failure::LaunchRef> {
+        self.retry
+            .as_ref()
+            .filter(|(_, at)| tokio::time::Instant::now() >= *at)
+            .map(|(launch, _)| launch.clone())
+    }
+    fn retry_later(&mut self, after: Duration) {
+        if let Some((_, at)) = self.retry.as_mut() {
+            *at = tokio::time::Instant::now() + after;
         }
     }
+}
+
+/// SPEC §17: what a reconciliation pass did is recorded, one entry each.
+async fn journal_reconciled(
+    shared: &Arc<Shared>,
+    done: &[mllm_store::ordinary_lifecycle::reconcile::Reconciled],
+) {
+    use mllm_store::ordinary_lifecycle::reconcile::Reconciled;
+    let entries: Vec<(Option<String>, &'static str, String)> = done
+        .iter()
+        .map(|action| match action {
+            Reconciled::Stopped { deployment_id, instance, operation_id, reason } => (
+                Some(operation_id.clone()),
+                "instance_stop_requested",
+                format!("deployment {deployment_id}: instance {instance} stops ({reason}); cleanup completes only on gone evidence"),
+            ),
+            Reconciled::Started { deployment_id, instance, operation_id } => (
+                Some(operation_id.clone()),
+                "instance_start_placed",
+                format!("deployment {deployment_id}: pending instance {instance} was placed and started"),
+            ),
+            Reconciled::Deferred { deployment_id, instance, code } => (
+                None,
+                "instance_start_deferred",
+                format!("deployment {deployment_id}: instance {instance} fits no allowed host yet ({code})"),
+            ),
+            Reconciled::Expired { deployment_id, instance } => (
+                None,
+                "instance_start_expired",
+                format!("deployment {deployment_id}: instance {instance} was not placed before its start deadline"),
+            ),
+            Reconciled::Retired { deployment_id, instance } => (
+                None,
+                "instance_retired",
+                format!("deployment {deployment_id}: retired instance {instance} holds nothing and was removed"),
+            ),
+        })
+        .collect();
+    let _ = shared
+        .with_owner(move |owner| {
+            for (operation, state, evidence) in &entries {
+                owner
+                    .store()
+                    .record_journal(None, operation.as_deref(), Some(state), evidence)
+                    .map_err(|error| CoordinatorError::Service(error.to_string()))?;
+            }
+            Ok(())
+        })
+        .await;
 }
 
 /// Append one journal entry naming the deployment and why its attempt failed.
@@ -1629,18 +1870,69 @@ fn fresh(observations: &[MemoryObservation], now: i64, ttl: i64) -> bool {
             .all(|o| o.sampled_at_ms >= 0 && o.sampled_at_ms <= now && now - o.sampled_at_ms <= ttl)
 }
 
+/// Owner decision 2026-09-23: the startup peak of one Initialize, measured as
+/// the largest drop in its host's published availability of the domain its
+/// startup reservation charges, below what was available when it armed.
+struct StartupPeak {
+    domain: Option<String>,
+    baseline: Option<(i64, i64)>,
+    lowest: Option<i64>,
+}
+
+impl StartupPeak {
+    fn new(work: &InitializeWork, baseline: &[MemoryObservation]) -> Self {
+        let domain = match work.effective().resources.cold.allocations.as_slice() {
+            [allocation] => Some(allocation.domain.clone()),
+            _ => None,
+        };
+        let baseline = domain.as_ref().and_then(|domain| {
+            baseline
+                .iter()
+                .find(|o| &o.domain == domain)
+                .map(|o| (o.available_bytes, o.sampled_at_ms))
+        });
+        Self {
+            domain,
+            baseline,
+            lowest: None,
+        }
+    }
+
+    /// Take one sample. Only an observation sampled after the baseline counts.
+    fn sample(&mut self, observed: &[MemoryObservation]) {
+        let (Some(domain), Some((_, since))) = (&self.domain, self.baseline) else {
+            return;
+        };
+        if let Some(o) = observed
+            .iter()
+            .find(|o| &o.domain == domain && o.sampled_at_ms > since && o.available_bytes >= 0)
+        {
+            self.lowest = Some(self.lowest.map_or(o.available_bytes, |l| l.min(o.available_bytes)));
+        }
+    }
+
+    /// The measured peak, when a fresh sample showed availability dropping.
+    fn peak(&self) -> Option<i64> {
+        let (available, _) = self.baseline?;
+        available
+            .checked_sub(self.lowest?)
+            .filter(|drop| *drop > 0)
+    }
+}
+
 async fn drive(
     shared: &Arc<Shared>,
     work: &InitializeWork,
     source: &dyn ServiceObservation,
     factory: &DriverFactory,
     stop: &mut watch::Receiver<bool>,
+    contended: &AtomicBool,
 ) -> Result<(), CoordinatorError> {
     let bound = remaining(shared, work.deadline_ms())?;
-    let observed = tokio::select! {
+    let (observed, residents) = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown before arm".into())),
-        result = tokio::time::timeout(bound, source.observe(work.effective().host.name.clone())) => result.map_err(|_| CoordinatorError::Service("observation timeout".into()))??,
+        result = tokio::time::timeout(bound, source.observe_with_residents(work.effective().host.name.clone())) => result.map_err(|_| CoordinatorError::Service("observation timeout".into()))??,
     };
     if observed.is_empty()
         || observed.len() > 1024
@@ -1669,6 +1961,29 @@ async fn drive(
     let step = work.step_id().to_owned();
     let ttl = controls.observation_ttl_ms;
     let max_parked = controls.max_parked as usize;
+    // SPEC §6.5 (W5): a start that does not fit first reclaims the least
+    // recently parked instances on its host; it waits, planned, meanwhile.
+    let (reclaim_step, reclaim_observed, reclaim_limits, reclaim_residents) =
+        (step.clone(), observed.clone(), limits.clone(), residents.clone());
+    if let Some(reason) = shared
+        .read(move |owner, now| {
+            owner.store().reclaim_for_start_with_residents(
+                owner.session(),
+                &reclaim_step,
+                mllm_scheduler::residency::AdmissionContext::new(
+                    &reclaim_observed,
+                    &reclaim_limits,
+                    now,
+                    ttl,
+                    max_parked,
+                ),
+                &reclaim_residents,
+            )
+        })
+        .await?
+    {
+        return Err(CoordinatorError::Deferred(reason));
+    }
     let arm_observed = observed.clone();
     if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
         return Err(CoordinatorError::Stopped("shutdown before arm".into()));
@@ -1676,7 +1991,7 @@ async fn drive(
     remaining(shared, work.deadline_ms())?;
     let (result, context) = shared
         .read(move |owner, now| {
-            owner.store().arm_initialize_with_context(
+            owner.store().arm_initialize_with_residents(
                 owner.session(),
                 &step,
                 mllm_scheduler::residency::AdmissionContext::new(
@@ -1686,6 +2001,7 @@ async fn drive(
                     ttl,
                     max_parked,
                 ),
+                &residents,
             )
         })
         .await?;
@@ -1714,7 +2030,7 @@ async fn drive(
         || context.token.revision != work.fence().revision
         || context.token.generation != work.fence().generation
         || context.deadline_ms != work.deadline_ms()
-        || context.launch_settings.as_ref() != Some(&work.effective().profile.launch_settings)
+        || context.launch_settings.as_ref() != Some(&work.effective().engine_config)
     {
         return Err(CoordinatorError::Service("frozen binding mismatch".into()));
     }
@@ -1722,12 +2038,9 @@ async fn drive(
     let expected = context.clone();
     let ttl = shared
         .read(move |owner, now| {
-            owner.store().revalidate_initialize_send(
-                owner.session(),
-                &step,
-                &expected,
-                now,
-            )
+            owner
+                .store()
+                .revalidate_initialize_send(owner.session(), &step, &expected, now)
         })
         .await?;
     // A new clock read after ALL provenance/context/driver validation is required.
@@ -1751,12 +2064,36 @@ async fn drive(
         action: RuntimeAction::Initialize,
         context,
     };
+    // Owner decision 2026-09-23: sample the host's published availability
+    // while the engine starts, to measure its startup peak. Sampling never
+    // decides anything about this Initialize.
+    let mut peak = StartupPeak::new(work, &observed);
+    let host = work.effective().host.name.clone();
+    let interval = shared.options.startup_sample_interval;
+    let protocol_timeout = shared.options.protocol_timeout;
+    let sampling = async {
+        let Some(interval) = interval else {
+            return std::future::pending::<()>().await;
+        };
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if let Ok(Ok(observed)) =
+                tokio::time::timeout(protocol_timeout, source.observe(host.clone())).await
+            {
+                peak.sample(&observed);
+            }
+        }
+    };
     // No child task is spawned: timeout/cancellation drops this effect future
     // before recording uncertainty, so an effect task cannot outlive ownership.
     let observation = tokio::select! {
         biased;
         _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown during Initialize".into())),
         result = tokio::time::timeout(bound, driver.engine.execute_persisted(&command)) => result.map_err(|_| CoordinatorError::Service("Initialize timeout".into()))?.map_err(|e| CoordinatorError::Service(e.to_string()))?,
+        _ = sampling => unreachable!("sampling never ends"),
     };
     let step = work.step_id().to_owned();
     let receipt = OwnedLaunchReceipt {
@@ -1788,7 +2125,372 @@ async fn drive(
                 .complete_step(owner.session(), &step, &evidence, now, ttl)?;
             Ok(())
         })
-        .await
+        .await?;
+    // Owner decision 2026-09-23: a peak measured while nothing else changed
+    // the host's memory (no other activation or cleanup on it) is recorded
+    // for later starts of this revision there. A failure to record it costs
+    // nothing but the measurement.
+    if let Some(peak) = peak.peak().filter(|_| !contended.load(Ordering::Acquire)) {
+        let step = work.step_id().to_owned();
+        let _ = shared
+            .read(move |owner, now| {
+                owner
+                    .store()
+                    .record_startup_peak(owner.session(), &step, peak, now)
+            })
+            .await;
+    }
+    Ok(())
+}
+
+/// SPEC §§6.3, 9.1, 10, 13 (W5): arm and send one planned park or restore.
+/// Returns whether anything changed. A step whose runtime this worker does not
+/// retain, whose host cannot be observed now, that is still draining or that
+/// does not fit yet stays planned for a later pass (its deadline closes it
+/// without effect). ADR 0015: each runs on its instance's own task.
+async fn drive_residency(
+    shared: &Arc<Shared>,
+    source: &dyn ServiceObservation,
+    work: ResidencyWork,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<bool, CoordinatorError> {
+    if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
+        return Err(CoordinatorError::Stopped("shutdown before a residency arm".into()));
+    }
+    let driver = shared
+        .retained
+        .lock()
+        .map_err(|_| shared.fail("runtime registry poisoned"))?
+        .get(&work.binding_id)
+        .cloned();
+    let Some(driver) = driver else {
+        return Ok(false);
+    };
+    let now = (shared.clock)()?;
+    let bound = Duration::from_millis(u64::try_from(work.deadline_ms.saturating_sub(now)).unwrap_or(0))
+        .min(shared.options.protocol_timeout);
+    if bound.is_zero() {
+        return Ok(false);
+    }
+    let (observed, residents) = tokio::select! {
+        biased;
+        _ = stop.changed() => return Err(CoordinatorError::Stopped("shutdown before a residency arm".into())),
+        result = tokio::time::timeout(bound, source.observe_with_residents(work.host.clone())) => match result {
+            Ok(Ok(observed)) => observed,
+            _ => return Ok(false),
+        },
+    };
+    let (step, limits, ttl, max_parked) = (
+        work.step_id.clone(),
+        work.limits.clone(),
+        work.observation_ttl_ms,
+        work.max_parked,
+    );
+    let armed = shared
+        .read(move |owner, now| {
+            owner.store().arm_residency_with_residents(
+                owner.session(),
+                &step,
+                mllm_scheduler::residency::AdmissionContext::new(
+                    &observed, &limits, now, ttl, max_parked,
+                ),
+                &residents,
+            )
+        })
+        .await;
+    let context = match armed {
+        Ok(ResidencyArm::New(context)) => *context,
+        Ok(ResidencyArm::Reclaiming(_) | ResidencyArm::Refused(_)) => return Ok(true),
+        Ok(ResidencyArm::Draining) => return Ok(false),
+        Ok(ResidencyArm::Blocked(why)) => {
+            log_blocked_residency(&work.step_id, &why);
+            return Ok(false);
+        }
+        Err(error) => {
+            if !shared.accepting.load(Ordering::Acquire) {
+                return Err(error);
+            }
+            return Ok(false);
+        }
+    };
+    // SPEC §10 step 5: an embedded engine must be quiescent before it is
+    // parked (a remote host checks its own ingress and gauges, W4). The
+    // check is a read: an engine that is not, or cannot say, refuses the
+    // park before anything is sent, and the launch serves again.
+    if work.kind == ResidencyKind::Park && driver.tools.is_some() {
+        let member = mllm_adapters::traits::MemberRef {
+            deployment_id: work.deployment_id.clone(),
+            member_id: work.binding_id.clone(),
+        };
+        let refusal = match driver.engine.prepare_park(&member).await {
+            Ok(quiescence) if quiescence.quiescent => None,
+            Err(mllm_adapters::traits::AdapterError::UnsupportedCapability) => None,
+            Ok(_) => Some("the engine is not quiescent".to_string()),
+            Err(error) => Some(format!("engine quiescence is unknown: {error}")),
+        };
+        if let Some(reason) = refusal {
+            let step = work.step_id.clone();
+            shared
+                .read(move |owner, _| {
+                    owner
+                        .store()
+                        .refuse_residency(owner.session(), &step, &redact_text(&reason))
+                })
+                .await?;
+            return Ok(true);
+        }
+    }
+    execute_residency(shared, &driver, &work, context, stop).await?;
+    Ok(true)
+}
+
+/// Send one armed park or restore exactly once and record what it proved.
+async fn execute_residency(
+    shared: &Arc<Shared>,
+    driver: &Arc<Driver>,
+    work: &ResidencyWork,
+    context: mllm_domain::completion::StepExecutionContext,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), CoordinatorError> {
+    let now = (shared.clock)()?;
+    // A restore reloads weights and probes the model: bounded by its own
+    // deadline (the deployment's wake window), under the Initialize ceiling.
+    let bound = Duration::from_millis(u64::try_from(context.deadline_ms.saturating_sub(now)).unwrap_or(0))
+        .min(shared.options.initialize_timeout);
+    let outcome = tokio::select! {
+        biased;
+        _ = stop.changed() => None,
+        result = tokio::time::timeout(bound, residency_effect(driver, work.kind, context)) => Some(result),
+    };
+    let step = work.step_id.clone();
+    let verb = match work.kind {
+        ResidencyKind::Park => "park",
+        ResidencyKind::Restore => "restore",
+    };
+    let uncertain = |reason: String| {
+        let step = step.clone();
+        async move {
+            shared
+                .read(move |owner, _| {
+                    owner
+                        .store()
+                        .mark_residency_uncertain(owner.session(), &step, &redact_text(&reason))
+                })
+                .await
+                .map(|_| ())
+        }
+    };
+    match outcome {
+        None => {
+            uncertain(format!("the controller stopped during the {verb}")).await?;
+            return Err(CoordinatorError::Stopped(format!("shutdown during a {verb}")));
+        }
+        Some(Err(_)) => uncertain(format!("the {verb} outlived its deadline")).await?,
+        Some(Ok(Ok(observation))) => {
+            let step = step.clone();
+            let completed = shared
+                .read(move |owner, now| {
+                    owner
+                        .store()
+                        .complete_residency(owner.session(), &step, &observation, now)
+                })
+                .await;
+            if let Err(error) = completed {
+                if !shared.accepting.load(Ordering::Acquire) {
+                    return Err(error);
+                }
+                uncertain(format!("its evidence was not accepted: {error}")).await?;
+            }
+        }
+        // SPEC §13 (W4): refused before any effect: settled at once.
+        Some(Ok(Err(
+            error @ (RuntimeError::Unsupported
+            | RuntimeError::Refused(_)
+            | RuntimeError::StaleRevision
+            | RuntimeError::Missing),
+        ))) => {
+            let reason = redact_text(&error.to_string());
+            let step = step.clone();
+            shared
+                .read(move |owner, _| {
+                    owner
+                        .store()
+                        .refuse_residency(owner.session(), &step, &reason)
+                })
+                .await?;
+        }
+        Some(Ok(Err(RuntimeError::Uncertain(reason)))) => uncertain(reason).await?,
+        // A park or restore never launches; an engine reported gone here is
+        // an unexplained effect, so it stays uncertain with its accounting.
+        Some(Ok(Err(error @ RuntimeError::LaunchFailed(_)))) => {
+            uncertain(error.to_string()).await?
+        }
+    }
+    Ok(())
+}
+
+/// The engine effect of one park or restore. A remote host runs the whole
+/// restore contract as one command (W4) and answers with all four facts; an
+/// embedded vLLM engine runs SPEC §9.1's steps one persisted call each, then a
+/// fresh model probe, and any failure after the first effect is uncertain,
+/// never retried (T20). An embedded group must still be exactly the recorded
+/// processes (SPEC §13.2).
+async fn residency_effect(
+    driver: &Arc<Driver>,
+    kind: ResidencyKind,
+    context: mllm_domain::completion::StepExecutionContext,
+) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
+    use mllm_domain::completion::Milestone;
+    let action = match kind {
+        ResidencyKind::Park => RuntimeAction::Park,
+        ResidencyKind::Restore => RuntimeAction::Restore,
+    };
+    let mut observation = driver
+        .engine
+        .execute_persisted(&RuntimeCommand {
+            action,
+            context: context.clone(),
+        })
+        .await?;
+    if kind == ResidencyKind::Restore && observation.facts != kind.facts() {
+        if observation.facts != [Milestone::AllocationsRestored] {
+            return Err(RuntimeError::Uncertain(
+                "the restore reported unexpected evidence".into(),
+            ));
+        }
+        for (next, suffix) in [
+            (RuntimeAction::ReloadWeights, "reload"),
+            (RuntimeAction::InvalidateCache, "cache"),
+            (RuntimeAction::Probe, "probe"),
+        ] {
+            let mut sub = context.clone();
+            sub.token.step_id = format!("{}:{suffix}", context.token.step_id);
+            let step = driver
+                .engine
+                .execute_persisted(&RuntimeCommand {
+                    action: next,
+                    context: sub,
+                })
+                .await
+                .map_err(|error| match error {
+                    RuntimeError::Uncertain(reason) => RuntimeError::Uncertain(reason),
+                    other => RuntimeError::Uncertain(format!(
+                        "the restore stopped after its first effect: {other}"
+                    )),
+                })?;
+            observation.facts.extend(step.facts);
+            observation.observed_at_ms = step.observed_at_ms;
+            observation.receipt = step.receipt;
+        }
+        observation.token = context.token.clone();
+    }
+    if driver.tools.is_some() {
+        for identity in &observation.identities {
+            if mllm_launchers::process_absence::presence(identity)
+                != mllm_domain::completion::Presence::Alive
+            {
+                return Err(RuntimeError::Uncertain(format!(
+                    "recorded {} process {} is not the one alive",
+                    identity.role, identity.pid
+                )));
+            }
+        }
+    }
+    Ok(observation)
+}
+
+/// SPEC §6.5 (W5): advance open preinitializes and, at most once a second,
+/// the idle policy. Returns whether anything was accepted.
+async fn residency_policy(shared: &Arc<Shared>) -> Result<bool, CoordinatorError> {
+    if !shared.initializing.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    let eligible = shared.observations.eligible_hosts();
+    let progress = shared
+        .read(move |owner, now| {
+            owner
+                .store()
+                .advance_preinitialize(owner.session(), now, eligible.as_ref())
+        })
+        .await?;
+    let mut changed = !progress.is_empty();
+    let idle = shared.options.idle;
+    if idle.ready_idle_ms.is_none() && idle.parked_idle_ms.is_none() {
+        return Ok(changed);
+    }
+    let now = (shared.clock)()?;
+    let last = shared.idle_checked_ms.load(Ordering::Acquire);
+    if last != i64::MIN && now.saturating_sub(last) < 1_000 {
+        return Ok(changed);
+    }
+    shared.idle_checked_ms.store(now, Ordering::Release);
+    let activity = shared
+        .activity
+        .lock()
+        .map_err(|_| shared.fail("activity registry poisoned"))?
+        .clone();
+    let floor = shared.started_ms;
+    let actions = shared
+        .read(move |owner, now| {
+            let last = |deployment: &str, generation: i64| {
+                [generation, -1]
+                    .iter()
+                    .filter_map(|g| activity.get(&(deployment.to_owned(), *g)).copied())
+                    .max()
+            };
+            owner
+                .store()
+                .apply_idle_policy(owner.session(), now, idle, &last, floor)
+        })
+        .await?;
+    changed |= !actions.is_empty();
+    Ok(changed)
+}
+
+/// SPEC §6.3: a Stop drains before it terminates. Admission to the instance
+/// closed when the Stop was accepted; this waits, bounded by
+/// `stop_drain_timeout` and by the time the cleanup itself still needs before
+/// its deadline, for the requests already accepted to complete (their leases
+/// close). SPEC §10: live requests are not killed while the bound runs. When it
+/// passes with requests still charged, the Stop terminates anyway: an explicit
+/// or policy Stop is the separate authorization force termination needs. Their
+/// leases keep their accounting until they settle on evidence.
+async fn drain_before_terminate(
+    shared: &Arc<Shared>,
+    work: &OrdinaryCleanupReceipt,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), CoordinatorError> {
+    let now = (shared.clock)()?;
+    // Leave the cleanup its protocol bound before its deadline.
+    let budget = u64::try_from(
+        work.deadline_ms
+            .saturating_sub(now)
+            .saturating_sub(i64::try_from(shared.options.protocol_timeout.as_millis()).unwrap_or(i64::MAX)),
+    )
+    .unwrap_or(0);
+    let bound = shared
+        .options
+        .stop_drain_timeout
+        .min(Duration::from_millis(budget));
+    let until = tokio::time::Instant::now() + bound;
+    let poll = shared.options.poll_interval.min(Duration::from_millis(100));
+    loop {
+        let binding = work.binding_id.clone();
+        let outstanding = shared
+            .read(move |owner, _| owner.store().binding_outstanding_leases(&binding))
+            .await?
+            .unwrap_or(0);
+        if outstanding == 0 || tokio::time::Instant::now() >= until {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {
+                return Err(CoordinatorError::Stopped("shutdown while draining before cleanup".into()))
+            }
+            _ = tokio::time::sleep(poll) => {}
+        }
+    }
 }
 
 async fn drive_cleanup(
@@ -1796,8 +2498,9 @@ async fn drive_cleanup(
     work: &OrdinaryCleanupReceipt,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<(), CoordinatorError> {
-    // The single loop reaches here only after the predecessor's effect future
-    // has exited. Generation fencing or claim handoff never cancels that future.
+    // ADR 0015: the scheduler hands a cleanup to its instance's lane only after
+    // the predecessor's effect task has exited. Generation fencing or claim
+    // handoff never cancels that future.
     let driver = shared
         .retained
         .lock()
@@ -1805,7 +2508,9 @@ async fn drive_cleanup(
         .get(&work.binding_id)
         .cloned()
         .ok_or_else(|| {
-            CoordinatorError::Stopped("original runtime is not retained by this worker".into())
+            // Review finding: not a shutdown. The cleanup is unclassifiable
+            // here; its binding stays uncertain and pauses activations.
+            CoordinatorError::Service("original runtime is not retained by this worker".into())
         })?;
     remaining(shared, work.deadline_ms)?;
     if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
@@ -1813,6 +2518,7 @@ async fn drive_cleanup(
             "shutdown before cleanup arm".into(),
         ));
     }
+    drain_before_terminate(shared, work, stop).await?;
     let step = work.step_id.clone();
     let (arm, context) = shared
         .read(move |owner, now| {
@@ -1878,4 +2584,25 @@ async fn drive_cleanup(
         .map_err(|_| shared.fail("runtime registry poisoned"))?
         .remove(&work.binding_id);
     Ok(())
+}
+
+/// Found live 2026-09-23 (matrix M33): a wake held for capacity waited out its
+/// whole deadline with no trace of why. The reason (a fixed resource-policy
+/// message, never a credential) is logged once per step and reason.
+fn log_blocked_residency(step_id: &str, why: &str) {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::BTreeSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    if seen.len() > 4096 {
+        seen.clear();
+    }
+    if seen.insert((step_id.to_owned(), why.to_owned())) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"event": "residency_blocked", "step": step_id, "reason": why})
+        );
+    }
 }

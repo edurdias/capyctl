@@ -37,6 +37,12 @@ pub struct PreparationMember {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PlannerInput<'a> {
+    /// SPEC §7 (T26 T27): the ledger as this host's judgement sees it. A park,
+    /// switch or preparation plan is judged against one host's limits, so the
+    /// caller passes `Store::host_scoped_resource_snapshot` for that host's
+    /// domains, never the whole multi-host ledger: another host's owners would
+    /// otherwise fail `validate_admission_context` as unknown domains and count
+    /// against this host's `max_parked`.
     pub initial: &'a LedgerSnapshot,
     pub owners: &'a BTreeMap<String, OwnerPlanSpec>,
     pub admission: AdmissionContext<'a>,

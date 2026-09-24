@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use mllm_testkit::FakeEngine;
 use mllm_adapters::traits::RenderedCommand;
 use mllm_controller::{
     DurableRuntimeSupervisor, RuntimeAction, RuntimeBinding, RuntimeBindings, RuntimeError,
@@ -11,6 +10,7 @@ use mllm_domain::{DeploymentId, LifecycleState, OperationId};
 use mllm_launchers::DurableSpawnOutcome;
 use mllm_store::lifecycle::{DeploymentFence, ReserveBinding};
 use mllm_store::{AcceptDeployment, Store};
+use mllm_testkit::FakeEngine;
 
 struct NativeFixture {
     store: Store,
@@ -34,7 +34,7 @@ impl NativeFixture {
     fn new() -> Self {
         use mllm_config::effective::resolve_effective;
         use mllm_domain::resources::{MemoryLimit, MemoryObservation};
-        use serde_json::{Value, json};
+        use serde_json::{json, Value};
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let source: Value = serde_json::from_str(include_str!(
@@ -76,9 +76,7 @@ impl NativeFixture {
             revision: receipt.revision,
             generation: receipt.generation,
         };
-        let accepted = store
-            .accept_start(&session, &fence, 1100, 300000)
-            .unwrap();
+        let accepted = store.accept_start(&session, &fence, 1100, 300000).unwrap();
         let connection = rusqlite::Connection::open(root.join("native.db")).unwrap();
         let (incarnation, endpoint): (String, String) = connection
             .query_row(
@@ -134,19 +132,13 @@ impl NativeFixture {
     /// A frozen descriptor for this deployment's accepted initialize. The store
     /// holds none; the digest distinguishes one descriptor from another.
     fn descriptor(&self, digest: &str) -> mllm_domain::launch::NativeLaunch {
-        use mllm_config::effective::sglang::{
-            NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
-        };
-        use mllm_domain::launch::{
-            NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings,
-            SglangRequestedBudget,
-        };
+        use mllm_adapters::sglang::pinned::NATIVE_SGLANG_CONTRACT;
+        use mllm_domain::launch::{NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata};
         NativeLaunch::from_frozen_store(
             NativeLaunchMetadata {
                 engine: "sglang".into(),
-                recipe: NATIVE_SGLANG_RECIPE.into(),
-                source_revision: NATIVE_SGLANG_SOURCE_REVISION.into(),
-                checkpoint_revision: NATIVE_CHECKPOINT_REVISION.into(),
+                recipe: NATIVE_SGLANG_CONTRACT.into(),
+                checkpoint_revision: "sha256:ordinary".into(),
                 binding_id: self.binding.clone(),
                 incarnation: self.incarnation.clone(),
                 endpoint: format!("http://{}", self.endpoint),
@@ -165,31 +157,10 @@ impl NativeFixture {
             "/usr/bin/python3".into(),
             "secret://engine-key".into(),
             "secret://admin-key".into(),
-            SglangLaunchSettings {
-                recipe: NATIVE_SGLANG_RECIPE.into(),
-                tensor_parallel_size: 1,
-                data_parallel_size: 1,
-                tokenizer_workers: 1,
-                model_dtype: "bfloat16".into(),
-                context_tokens: 4096,
-                max_running_requests: 8,
-                max_total_tokens: 4096,
-                prefill_cuda_graphs: false,
-                decode_cuda_graphs: false,
-                memory_saver: true,
-                cpu_weight_backup: false,
-                speculative_decoding: false,
-                lora: false,
-                trust_remote_code: false,
-                disaggregation: false,
-                external_cache: false,
-                cpu_kv_offload: false,
-                native_grpc: false,
-                weight_restore: "disk_reload".into(),
-                requested_budget: SglangRequestedBudget {
-                    kv_cache_bytes: 1_i64 << 30,
-                    static_memory_fraction_bps: 9000,
-                },
+            {
+                let mut settings = mllm_testkit::sglang_launch_settings();
+                settings.memory.kv_cache_bytes = 1_i64 << 30;
+                settings
             },
         )
     }
@@ -431,16 +402,14 @@ fn native_launch_wrapper_permissions_rechecked_before_spawn_and_acknowledgement(
     .unwrap();
     assert_eq!(handoff.command().argv[2], path.to_str().unwrap());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-    assert!(
-        handoff
-            .persist_api_identity(&mllm_domain::completion::ProcessIdentity {
-                role: "api".into(),
-                pid: 42,
-                boot_id: "test-boot".into(),
-                start_ticks: 100,
-            })
-            .is_err()
-    );
+    assert!(handoff
+        .persist_api_identity(&mllm_domain::completion::ProcessIdentity {
+            role: "api".into(),
+            pid: 42,
+            boot_id: "test-boot".into(),
+            start_ticks: 100,
+        })
+        .is_err());
     assert_eq!(
         handoff
             .spawn(&mllm_launchers::DurableSpawn::new())
@@ -472,7 +441,8 @@ fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_c
     assert_eq!(
         &command.argv[1..4],
         [
-            "-IS",
+            // SPEC §9.1 / T21: -B, no bytecode is written beside checked source.
+            "-BIS",
             native_service(&source).wrapper.to_str().unwrap(),
             "--public-settings-json"
         ]
@@ -528,19 +498,17 @@ fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_c
         std::fs::read(format!("/proc/self/fd/{}", command.argv[10])).unwrap(),
         b"private-admin-token"
     );
-    assert!(
-        NativeLaunchHandoff::arm(
-            &fixture.store,
-            &fixture.session,
-            &fixture.step,
-            fixture.context(),
-            &|_| panic!("replay resolved credentials"),
-            &|_| panic!("replay preflight"),
-            native_service(&source),
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(NativeLaunchHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &|_| panic!("replay resolved credentials"),
+        &|_| panic!("replay preflight"),
+        native_service(&source),
+    )
+    .unwrap()
+    .is_none());
     assert!(matches!(
         RuntimeBindings::default().binding(&fixture.deployment, 1),
         Err(RuntimeError::Missing)
@@ -584,19 +552,17 @@ fn native_launch_handoff_is_single_use_secret_free_and_ordinary_dispatch_stays_c
         }
     }
     drop(handoff);
-    assert!(
-        NativeLaunchHandoff::arm(
-            &fixture.store,
-            &fixture.session,
-            &fixture.step,
-            fixture.context(),
-            &resolve_native_credential,
-            &|_| Ok(()),
-            native_service(&source),
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(NativeLaunchHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+        native_service(&source),
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[test]
@@ -620,19 +586,17 @@ fn native_launch_preflight_failure_consumes_authority_without_handoff_or_secret_
     let error = result.err().unwrap();
     assert!(checked.get());
     assert!(!format!("{error:?}").contains("private-checkpoint-secret"));
-    assert!(
-        NativeLaunchHandoff::arm(
-            &fixture.store,
-            &fixture.session,
-            &fixture.step,
-            fixture.context(),
-            &resolve_native_credential,
-            &|_| Ok(()),
-            native_service(&source),
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(NativeLaunchHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+        native_service(&source),
+    )
+    .unwrap()
+    .is_none());
     assert_eq!(
         fixture.store.resource_snapshot().unwrap().owners[&fixture.deployment].phase,
         ResourcePhase::Cold
@@ -735,8 +699,36 @@ fn native_launch_ambiguous_api_association_retains_endpoint_grant_and_closed_dis
         .unwrap_err();
     assert!(!format!("{error:?}").contains("private-association-detail"));
     fixture.assert_retained();
-    assert!(
-        NativeLaunchHandoff::arm(
+    assert!(NativeLaunchHandoff::arm(
+        &fixture.store,
+        &fixture.session,
+        &fixture.step,
+        fixture.context(),
+        &resolve_native_credential,
+        &|_| Ok(()),
+        native_service(&source),
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[test]
+fn native_launch_invalid_credentials_never_create_handoff_or_retry() {
+    use mllm_controller::runtime::NativeLaunchHandoff;
+    for secret in [b"duplicate-token".as_slice(), b"invalid\nsecret", b""] {
+        let fixture = NativeFixture::new();
+        let source = fixture.source();
+        assert!(NativeLaunchHandoff::arm(
+            &fixture.store,
+            &fixture.session,
+            &fixture.step,
+            fixture.context(),
+            &|_| Ok(secret.to_vec()),
+            &|_| Ok(()),
+            native_service(&source),
+        )
+        .is_err());
+        assert!(NativeLaunchHandoff::arm(
             &fixture.store,
             &fixture.session,
             &fixture.step,
@@ -746,41 +738,7 @@ fn native_launch_ambiguous_api_association_retains_endpoint_grant_and_closed_dis
             native_service(&source),
         )
         .unwrap()
-        .is_none()
-    );
-}
-
-#[test]
-fn native_launch_invalid_credentials_never_create_handoff_or_retry() {
-    use mllm_controller::runtime::NativeLaunchHandoff;
-    for secret in [b"duplicate-token".as_slice(), b"invalid\nsecret", b""] {
-        let fixture = NativeFixture::new();
-        let source = fixture.source();
-        assert!(
-            NativeLaunchHandoff::arm(
-                &fixture.store,
-                &fixture.session,
-                &fixture.step,
-                fixture.context(),
-                &|_| Ok(secret.to_vec()),
-                &|_| Ok(()),
-                native_service(&source),
-            )
-            .is_err()
-        );
-        assert!(
-            NativeLaunchHandoff::arm(
-                &fixture.store,
-                &fixture.session,
-                &fixture.step,
-                fixture.context(),
-                &resolve_native_credential,
-                &|_| Ok(()),
-                native_service(&source),
-            )
-            .unwrap()
-            .is_none()
-        );
+        .is_none());
     }
 }
 

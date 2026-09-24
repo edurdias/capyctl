@@ -74,6 +74,7 @@ impl CleanupGate {
                 })
             }),
             tools: None,
+            settle: None,
         })
     }
     async fn entered(&self) {
@@ -90,12 +91,17 @@ fn cleanup_worker(
     gate: Arc<CleanupGate>,
     options: CoordinatorOptions,
 ) -> OwnedCoordinator {
-    OwnedCoordinator::spawn(
+    // T10 / T38: host cleanup evidence travels through the production execution
+    // binding port, without evaluating these remote process IDs on this machine.
+    OwnedCoordinator::spawn_with_execution_bindings(
         owner,
         Arc::new(Observations(observations)),
         Arc::new(|| Ok(1900)),
         options,
-        Arc::new(move |_| Ok(gate.driver())),
+        Arc::new(move |_: &InitializeWork| {
+            let driver = gate.driver();
+            Ok(ExecutionBinding::remote(driver.engine.clone(), driver.cleanup.clone()))
+        }),
     )
     .unwrap()
 }
@@ -174,10 +180,7 @@ async fn cleanup_failures_keep_arm_accounting_instance_and_never_resend() {
                 o.store()
                     .arm_ordinary_cleanup_with_context(o.session(), stop.step_id(), 1900)
                     .unwrap(),
-                (
-                    mllm_store::lifecycle::ArmResult::AlreadyRecorded,
-                    None
-                )
+                (mllm_store::lifecycle::ArmResult::AlreadyRecorded, None)
             );
         }
         w.shutdown().await.unwrap();
@@ -396,7 +399,8 @@ async fn cleanup_completion_rollback_halts_without_releasing_any_authority() {
         .unwrap()
         .epoch;
     gate.release.add_permits(1);
-    assert!(matches!(stopped(&w).await, WorkerStatus::Failed(_)));
+    let status = stopped(&w).await;
+    assert!(matches!(status, WorkerStatus::Failed(_)), "{status:?}");
     retained_cleanup(&owner, &fence, stop.step_id());
     assert_eq!(
         owner
@@ -419,14 +423,18 @@ async fn cleanup_final_clock_expiry_denies_control_after_valid_store_check() {
     let (dir, owner, fence, observations) = setup().await;
     let gate = CleanupGate::new(CleanupOutcome::Success);
     let driver = gate.clone();
-    let clock_owner = owner.clone();
+    let runtime_thread = std::thread::current().id();
     let expired = Arc::new(AtomicBool::new(false));
     let hit = expired.clone();
     let sql = Arc::new(Mutex::new(
         rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap(),
     ));
     let clock = Arc::new(move || {
-        if clock_owner.try_lock().is_ok() {
+        // ADR 0015: the scheduler's own store jobs run beside the cleanup task,
+        // so a busy owner lock no longer identifies a read made under it. Store
+        // jobs run on blocking threads; the cleanup task's final clock read runs
+        // on this test's runtime thread.
+        if std::thread::current().id() == runtime_thread {
             let armed: bool = sql.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id WHERE o.kind='ordinary_cleanup' AND s.state='armed')", [], |r| r.get(0)).unwrap();
             if armed {
                 hit.store(true, Ordering::SeqCst);
@@ -551,8 +559,9 @@ async fn cleanup_send_revalidation_rejects_changed_context_and_current_fences() 
         let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
         for (mutation, restore) in [
             (
-                "UPDATE deployments SET current_generation=current_generation+1 WHERE id=?1",
-                "UPDATE deployments SET current_generation=current_generation-1 WHERE id=?1",
+                // ADR 0013 §5: the fence is the instance's generation.
+                "UPDATE deployment_instances SET generation=generation+1 WHERE deployment_id=?1",
+                "UPDATE deployment_instances SET generation=generation-1 WHERE deployment_id=?1",
             ),
             (
                 "UPDATE lifecycle_claims SET generation=generation+1 WHERE deployment_id=?1",
@@ -691,6 +700,7 @@ async fn stop_claim_handoff_waits_for_running_initialize_exit() {
                     })
                 }),
                 tools: None,
+                settle: None,
             }))
         }),
     )

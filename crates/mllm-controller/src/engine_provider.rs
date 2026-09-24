@@ -19,10 +19,10 @@ use crate::coordinator::{EngineBindings, ServiceClock, ToolsFactory};
 
 /// One engine a host actually has, described in the terms the host policy publishes.
 ///
-/// Spec §7: everything the published table needs and nothing a deployment decides.
-/// The launch settings arrive as JSON because they are a tagged family block that
-/// the configuration layer validates; building a typed value here would duplicate
-/// that validation in a second place where it could drift.
+/// Spec §7: everything the published table needs. ADR 0014 §1 moved engine
+/// tuning to the deployment; the one exception is [`Self::engine_config`], the
+/// block standalone's generated deployment carries, because standalone has no
+/// deployment file and its environment describes both documents.
 #[derive(Debug, Clone)]
 pub struct EngineInstallation {
     /// The engine family this installation is.
@@ -32,8 +32,11 @@ pub struct EngineInstallation {
     /// What the host says this build is. It pins the recipe, so it must identify
     /// the installed engine rather than the host that happens to run it.
     pub build_fingerprint: String,
-    /// The `launch_settings` block for this family, as the host policy carries it.
-    pub launch_settings: serde_json::Value,
+    /// The `engine_config` block (ADR 0014 §2) of the deployment standalone
+    /// generates, as JSON: the configuration layer validates it, so a typed
+    /// value here would duplicate that validation where it could drift. Not
+    /// part of the published host policy.
+    pub engine_config: serde_json::Value,
     /// Whether the deep-park controls may be called on this engine (SPEC §9.1, T21).
     pub deep_park: bool,
     /// Whether this installation may run an engine flag that executes Python
@@ -46,9 +49,17 @@ pub struct EngineInstallation {
     /// effective configuration: it is a property of this installation.
     pub runtime_dir: PathBuf,
     /// Startup flags the profile passes to the engine, beyond the ones mllm owns.
-    /// They belong to the profile rather than to `launch_settings`, which is a
-    /// closed per-family block.
+    /// ADR 0014 §1: host-fixed arguments belong to the installation; deployment
+    /// arguments go in `engine_config.extra_args`.
     pub args: Vec<String>,
+    /// ADR 0008 (owner decision 2026-09-23): what a launch does when this
+    /// installation no longer measures to the fingerprint registered at boot
+    /// (`security.installation_drift`, default `warn`).
+    pub installation_drift: mllm_config::effective::InstallationDrift,
+    /// SPEC §3: the loopback ports this host leases its engines, inclusive
+    /// (`resource_policy.endpoint_port_range`). A second role on the same
+    /// machine names its own range so their engines never collide.
+    pub engine_ports: (u16, u16),
 }
 
 #[derive(Debug, thiserror::Error)]

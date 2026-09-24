@@ -5,27 +5,51 @@
 #[cfg(test)]
 extern crate self as mllm_controller;
 
+// ADR 0014 §7 (WE3): checkpoint digests measured and recorded.
+pub mod checkpoint_digests;
 pub mod coordinator;
 pub mod coordinator_port;
 pub mod engine_bindings;
+// SPEC §13.2 (W13): an owned engine that exited is closed and settled.
+pub mod engine_exit;
+pub mod enrollment;
+pub mod host_publication;
+// ADR 0008: the embedded host's installation fingerprint and drift.
+pub mod installation_gate;
 pub mod engine_provider;
 pub mod fault;
+pub mod local_readiness;
 pub mod native_launch;
 pub mod operations;
 pub mod ownership;
 pub mod port;
+pub mod request_leases;
 pub mod runtime;
 pub mod sequence;
 pub mod sglang_observer;
+// Review finding 15: supervisor child tasks end with their supervisor.
+mod supervised;
+// SPEC §10, ADR 0013 §8 (W10): request-driven switching.
+pub mod switching;
 
-pub use mllm_domain::LifecycleAction;
-pub use mllm_domain::completion;
-pub use operations::{AttachRequest, Controller, ControllerError, DeployRequest, OperationHandle};
-pub use ownership::{OwnedCoordinatorState, OwnedStateError};
-pub use fault::LifecycleFault;
-pub use coordinator_port::CoordinatorLifecycle;
+pub use coordinator_port::{CoordinatorLifecycle, RoutingSignals};
 pub use engine_bindings::ProfileBindings;
 pub use engine_provider::{EngineInstallation, EngineProvider, ProviderError};
-pub use port::{LifecyclePort, RuntimeEndpoint};
-pub use runtime::{DurableRuntimeSupervisor, RuntimeBinding, RuntimeBindings, RuntimeOwnership};
+pub use fault::LifecycleFault;
 pub use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
+pub use mllm_domain::completion;
+pub use mllm_domain::LifecycleAction;
+pub use operations::{AttachRequest, Controller, ControllerError, DeployRequest, OperationHandle};
+pub use ownership::{OwnedCoordinatorState, OwnedStateError};
+pub use port::{LifecyclePort, RuntimeEndpoint, ServingInstance};
+pub use request_leases::{LeaseEnd, LeaseRefused, RequestLease};
+pub use runtime::{DurableRuntimeSupervisor, RuntimeBinding, RuntimeBindings, RuntimeOwnership};
+
+pub mod agent_sessions;
+
+pub mod latency_table;
+pub mod load_table;
+
+pub mod remote_execution;
+
+pub mod remote_readiness;

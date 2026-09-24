@@ -320,20 +320,18 @@ fn facts_from_another_binding_or_incarnation_are_unknown() {
 #[test]
 fn construction_rejects_a_malformed_saver_digest() {
     for digest in ["", "abc", &"g".repeat(64), &"A".repeat(64)] {
-        assert!(
-            NativeResidencyObserver::new(
-                token(),
-                "bind-1".into(),
-                "inc-1".into(),
-                identities(),
-                digest.into(),
-                Arc::new(Facts(Ok(vec![]))),
-                Arc::new(Work(Ok(0))),
-                Arc::new(Physical(None)),
-                Arc::new(Live(Ok(vec![]))),
-            )
-            .is_err()
-        );
+        assert!(NativeResidencyObserver::new(
+            token(),
+            "bind-1".into(),
+            "inc-1".into(),
+            identities(),
+            digest.into(),
+            Arc::new(Facts(Ok(vec![]))),
+            Arc::new(Work(Ok(0))),
+            Arc::new(Physical(None)),
+            Arc::new(Live(Ok(vec![]))),
+        )
+        .is_err());
     }
 }
 
@@ -412,15 +410,13 @@ fn store_sources_reject_a_foreign_deployment() {
     ));
     let sources = StoreSources::new(store, "dep-1".into()).unwrap();
     assert_eq!(sources.outstanding("dep-2"), Err(SourceUnavailable));
-    assert!(
-        StoreSources::new(
-            Arc::new(std::sync::Mutex::new(
-                mllm_store::Store::open_in_memory().unwrap()
-            )),
-            String::new()
-        )
-        .is_err()
-    );
+    assert!(StoreSources::new(
+        Arc::new(std::sync::Mutex::new(
+            mllm_store::Store::open_in_memory().unwrap()
+        )),
+        String::new()
+    )
+    .is_err());
 }
 
 /// An unknown binding is unavailable, not an empty history: empty would read as a

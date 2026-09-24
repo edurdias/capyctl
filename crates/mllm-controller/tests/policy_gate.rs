@@ -5,8 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use mllm_controller::{Controller, DeployRequest};
 use mllm_adapters::ParkPolicy;
+use mllm_controller::{Controller, DeployRequest};
 use mllm_store::Store;
 
 fn controller(policy: ParkPolicy) -> (Arc<Controller>, Arc<Mutex<Store>>) {
@@ -33,14 +33,33 @@ fn req(name: &str, kind: &str) -> DeployRequest {
 async fn vllm_sleep_profile_launch_denied_by_default() {
     let (c, store) = controller(ParkPolicy::Disabled);
     let id = c.submit_deploy(req("sleepy", "vllm-sleep")).await.unwrap();
-    let out = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await;
-    assert!(out.is_err(), "development-mode profile denied without opt-in (T21)");
+    let out = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await;
+    assert!(
+        out.is_err(),
+        "development-mode profile denied without opt-in (T21)"
+    );
     // Denial journaled as policy evidence.
-    let evidence = store.lock().unwrap().journal_evidence_of(&id).unwrap().join("\n");
-    assert!(evidence.contains("policy_denied"), "denial recorded: {evidence}");
+    let evidence = store
+        .lock()
+        .unwrap()
+        .journal_evidence_of(&id)
+        .unwrap()
+        .join("\n");
+    assert!(
+        evidence.contains("policy_denied"),
+        "denial recorded: {evidence}"
+    );
     // No operation ran: the deployment stays Stopped.
     assert_eq!(
-        store.lock().unwrap().get_deployment(&id).unwrap().unwrap().observed_state,
+        store
+            .lock()
+            .unwrap()
+            .get_deployment(&id)
+            .unwrap()
+            .unwrap()
+            .observed_state,
         mllm_domain::LifecycleState::Stopped
     );
 }
@@ -49,7 +68,10 @@ async fn vllm_sleep_profile_launch_denied_by_default() {
 async fn opt_in_enables_the_experimental_profile() {
     let (c, _store) = controller(ParkPolicy::Enabled);
     let id = c.submit_deploy(req("sleepy", "vllm-sleep")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     let state = c.wait_terminal(&op).await.unwrap();
     assert_eq!(state, mllm_domain::LifecycleState::Ready);
 }
@@ -58,7 +80,10 @@ async fn opt_in_enables_the_experimental_profile() {
 async fn stock_profile_launches_without_optin() {
     let (c, _store) = controller(ParkPolicy::Disabled);
     let id = c.submit_deploy(req("stock", "model")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     let state = c.wait_terminal(&op).await.unwrap();
     assert_eq!(state, mllm_domain::LifecycleState::Ready);
 }

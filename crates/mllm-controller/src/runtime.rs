@@ -110,8 +110,9 @@ impl<'a> DurableRuntimeSupervisor<'a> {
     ) -> Result<DurableSpawnOutcome, RuntimeError> {
         let binding = self
             .store
-            .runtime_binding(&fence.deployment_id)
+            .retained_binding(binding_id)
             .map_err(|error| RuntimeError::Uncertain(error.to_string()))?
+            .filter(|binding| binding.deployment_id == fence.deployment_id)
             .ok_or(RuntimeError::Missing)?;
         if binding.revision != fence.revision {
             return Err(RuntimeError::StaleRevision);

@@ -60,7 +60,7 @@ pub fn fake_installation() -> EngineInstallation {
         engine: Engine::Vllm,
         executable: PathBuf::from("/bin/true"),
         build_fingerprint: "fake-v1".into(),
-        launch_settings: crate::vllm_launch_settings_json(),
+        engine_config: crate::vllm_engine_config_json(),
         // SPEC §9.1, T21: this test host opts out of deep park; the product
         // default is enabled (owner decision 2026-09-17). Opting out is what keeps
         // a Fake-driven launch from rendering flags no Fake honours.
@@ -69,6 +69,8 @@ pub fn fake_installation() -> EngineInstallation {
         models_root: models_root(),
         runtime_dir: runtime_dir(),
         args: Vec::new(),
+        installation_drift: Default::default(),
+        engine_ports: (8100, 8199),
     }
 }
 

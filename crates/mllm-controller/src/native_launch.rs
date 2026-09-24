@@ -5,22 +5,14 @@
 
 use crate::coordinator::CoordinatorError;
 use mllm_adapters::traits::RuntimeError;
-use mllm_config::effective::sglang::{
-    NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
-};
-use mllm_config::engine_policy::Engine;
 use mllm_domain::completion::StepExecutionContext;
-use mllm_domain::launch::{
-    NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, ProfileLaunchSettings,
-    SglangLaunchSettings,
-};
+use mllm_domain::launch::NativeLaunch;
 use mllm_store::ordinary_lifecycle::worker::InitializeWork;
-use sha2::{Digest, Sha256};
 
 /// Builds the frozen native launch for an armed ordinary initialize.
 ///
-/// The pinned SGLang recipe constants identify the build and checkpoint the
-/// native contract was written against; the store work must name that engine.
+/// The SGLang descriptor contract constants name the entry's wire shape only
+/// (ADR 0008: no pinned build is audited); the store work must name that engine.
 /// The served name is the deployment's own route name, which the caller takes
 /// from `work.effective().routes.first()` and refuses to omit. Anything else
 /// is refused closed rather than adapted.
@@ -30,82 +22,10 @@ pub fn frozen_from_work(
     inference_ref: String,
     admin_ref: String,
 ) -> Result<NativeLaunch, CoordinatorError> {
-    let effective = work.effective();
-    let profile = &effective.profile;
-    let settings: &SglangLaunchSettings = match (&profile.engine, &profile.launch_settings) {
-        (Engine::Sglang, ProfileLaunchSettings::Sglang(settings)) => settings,
-        _ => {
-            return Err(CoordinatorError::Service(
-                "initialize work does not name the pinned native SGLang engine".into(),
-            ))
-        }
-    };
-    // SPEC §3: the launch carries exactly one reviewed logical placement. The
-    // native startup still resolves and corroborates it independently.
-    let [device] = effective.selected_devices.as_slice() else {
-        return Err(CoordinatorError::Service(
-            "initialize work must carry exactly one selected device".into(),
-        ));
-    };
-    let memory_domain = &effective
-        .host
-        .devices
-        .get(&device.id)
-        .ok_or_else(|| CoordinatorError::Service("selected device is not a host device".into()))?
-        .domain;
-    // The service-authorized physical UUID the guarded launcher sets the
-    // child's CUDA namespace from. Absent when the host published no
-    // inventory, which leaves the namespace unset and the placement gate
-    // fail-closed (runtime/sglang_device.py's guarded-service obligation).
-    let physical_gpu_uuid = effective
-        .host
-        .devices
-        .get(&device.id)
-        .and_then(|policy| policy.physical_gpu_uuid.clone());
-    // SPEC §13.3: a launch needs a directory on disk; an unresolved source is
-    // refused rather than invented.
-    let checkpoint_root = effective
-        .model
-        .require_resolved_path()
-        .map_err(|_| {
-            CoordinatorError::Service("initialize work resolves to no checkpoint root".into())
-        })?
-        .to_owned();
-    let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(settings)
-            .map_err(|_| CoordinatorError::Service("settings encoding failed".into()))?,
-    ));
-    let metadata = NativeLaunchMetadata {
-        engine: "sglang".into(),
-        recipe: NATIVE_SGLANG_RECIPE.into(),
-        source_revision: NATIVE_SGLANG_SOURCE_REVISION.into(),
-        checkpoint_revision: NATIVE_CHECKPOINT_REVISION.into(),
-        binding_id: work.binding_id().into(),
-        incarnation: work.incarnation().into(),
-        endpoint: format!("http://{}", work.endpoint()),
-        served_name,
-        rendered_settings_digest: digest,
-        // The host's published inventory digest (SPEC §3: reviewed logical
-        // placement) travels to the entry so its composition can assert
-        // placement against freshly collected inventory. Absent when the host
-        // published none, which leaves the gate unasserted and fail-closed.
-        placement_digest: effective.host.device_inventory_digest.clone(),
-        device: NativeDeviceSelection {
-            host_id: effective.host.name.clone(),
-            hardware_fingerprint: effective.host.hardware_fingerprint.clone(),
-            device_id: device.id.clone(),
-            memory_domain: memory_domain.clone(),
-            physical_gpu_uuid,
-        },
-    };
-    Ok(NativeLaunch::from_frozen_store(
-        metadata,
-        checkpoint_root,
-        profile.executable.clone(),
-        inference_ref,
-        admin_ref,
-        settings.clone(),
-    ))
+    mllm_adapters::sglang::frozen_from_effective(
+        work.effective(), work.binding_id(), work.incarnation(), work.endpoint(),
+        served_name, inference_ref, admin_ref,
+    ).map_err(|error| CoordinatorError::Service(error.to_string()))
 }
 
 /// The private launch descriptor `NativeLaunchHandoff::arm` sends on fd 3.

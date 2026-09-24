@@ -33,9 +33,7 @@ use mllm_adapters::{
     AdapterError, EngineAdapter, Launcher, LauncherError, MemberRef, OwnedHandle, PlanInput,
     Readiness, WorkObservation,
 };
-use mllm_domain::{
-    DeploymentId, LifecycleAction, LifecycleState, OperationId, OwnerAccountId,
-};
+use mllm_domain::{DeploymentId, LifecycleAction, LifecycleState, OperationId, OwnerAccountId};
 use mllm_scheduler::admission::{admit, BlockReason, Candidate};
 use mllm_scheduler::auto::{resolve_auto, OBSERVATION_TTL_SECS};
 use mllm_scheduler::ledger::{Domain, DomainKind, HostLimits};
@@ -254,6 +252,10 @@ pub struct Controller {
     /// state (`OPERATION_TIMEOUT` by default; shortened by tests to
     /// exercise the timeout branch deterministically).
     operation_timeout: Duration,
+    /// The operation tasks `submit` spawned, tracked so an owner can join
+    /// them at shutdown ([`Controller::shutdown`]) instead of leaving them
+    /// detached.
+    tasks: Arc<crate::supervised::Children>,
 }
 
 impl Controller {
@@ -262,7 +264,12 @@ impl Controller {
         adapter: Arc<dyn EngineAdapter>,
         launcher: Arc<dyn Launcher>,
     ) -> Self {
-        Self::new_with_policy(store, adapter, launcher, mllm_adapters::ParkPolicy::Disabled)
+        Self::new_with_policy(
+            store,
+            adapter,
+            launcher,
+            mllm_adapters::ParkPolicy::Disabled,
+        )
     }
 
     pub fn new_with_policy(
@@ -285,7 +292,15 @@ impl Controller {
                 mllm_adapters::ParkLevel::One
             },
             operation_timeout: OPERATION_TIMEOUT,
+            tasks: Default::default(),
         }
+    }
+
+    /// Wait up to `bound` for the operations still running, then abort the
+    /// rest. An aborted operation keeps its durable record in whatever state
+    /// it reached; it is not reported as finished.
+    pub async fn shutdown(&self, bound: Duration) {
+        self.tasks.join_within(bound).await;
     }
 
     /// Test hook: bound the `wait_terminal` deadline (real engines take
@@ -374,7 +389,8 @@ impl Controller {
         deployment: &str,
         action: LifecycleAction,
     ) -> Result<OperationHandle, ControllerError> {
-        self.request_transition_inner(deployment, action, false).await
+        self.request_transition_inner(deployment, action, false)
+            .await
     }
 
     /// Idle eviction (T10): stop the engine but keep the deployment
@@ -437,8 +453,8 @@ impl Controller {
                     .map(|r| (r.kind, r.observed_state))
                     .ok_or_else(|| ControllerError::UnknownDeployment(deployment.to_string()))?
             };
-            let qualified = kind == "vllm-sleep"
-                && self.park_policy == mllm_adapters::ParkPolicy::Enabled;
+            let qualified =
+                kind == "vllm-sleep" && self.park_policy == mllm_adapters::ParkPolicy::Enabled;
             if !qualified {
                 return Err(ControllerError::OperationFailed {
                     op: "preinitialize".to_string(),
@@ -447,9 +463,11 @@ impl Controller {
             }
             if observed != LifecycleState::Ready {
                 // Sequentially start, validate, then park (SPEC §6.3).
-                let start = Box::pin(
-                    self.request_transition_inner(deployment, LifecycleAction::Start, false),
-                )
+                let start = Box::pin(self.request_transition_inner(
+                    deployment,
+                    LifecycleAction::Start,
+                    false,
+                ))
                 .await?;
                 self.wait_terminal(&start).await?;
             }
@@ -517,9 +535,9 @@ impl Controller {
         let deployment = deployment.to_string();
         let op_for_task = op.clone();
         let dep_for_handle = deployment.clone();
-        tokio::spawn(async move {
+        self.tasks.track(tokio::spawn(async move {
             task.run(deployment, op_for_task, action, chain).await;
-        });
+        }));
         Ok(OperationHandle {
             operation_id: op,
             deployment_id: dep_for_handle,
@@ -541,7 +559,11 @@ impl Controller {
                 let store = self.store.lock().unwrap();
                 let row = store.get_operation(&handle.operation_id.0)?;
                 match row {
-                    None => return Err(ControllerError::UnknownDeployment(handle.operation_id.0.clone())),
+                    None => {
+                        return Err(ControllerError::UnknownDeployment(
+                            handle.operation_id.0.clone(),
+                        ))
+                    }
                     Some(row) => {
                         let observed = store
                             .get_deployment(&handle.deployment_id)?
@@ -759,11 +781,7 @@ impl ExecTask {
                 loop {
                     match self.adapter.check_readiness(&member).await {
                         Ok(Readiness::Ready) => {
-                            self.journal(
-                                op,
-                                state,
-                                r#"{"event":"ready"}"#.to_string(),
-                            );
+                            self.journal(op, state, r#"{"event":"ready"}"#.to_string());
                             break Ok(());
                         }
                         Ok(Readiness::Initializing) => {
@@ -776,15 +794,13 @@ impl ExecTask {
                     }
                 }
             }
-            Step::Restore => {
-                match self.adapter.restore(&member).await {
-                    Ok(_) => {
-                        self.journal(op, state, r#"{"event":"restored"}"#.to_string());
-                        Ok(())
-                    }
-                    Err(e) => Err((is_uncertain(&e), adapter_code(&e))),
+            Step::Restore => match self.adapter.restore(&member).await {
+                Ok(_) => {
+                    self.journal(op, state, r#"{"event":"restored"}"#.to_string());
+                    Ok(())
                 }
-            }
+                Err(e) => Err((is_uncertain(&e), adapter_code(&e))),
+            },
             Step::Quiesce => {
                 let work = self.adapter.observe_work(&member).await;
                 let quiescence = self.adapter.prepare_park(&member).await;
@@ -806,9 +822,7 @@ impl ExecTask {
                         );
                         Ok(())
                     }
-                    (Err(e), _) | (_, Err(e)) => {
-                        Err((is_uncertain(&e), adapter_code(&e)))
-                    }
+                    (Err(e), _) | (_, Err(e)) => Err((is_uncertain(&e), adapter_code(&e))),
                     _ => Err((false, "not_quiescent".to_string())),
                 }
             }
@@ -828,7 +842,11 @@ impl ExecTask {
             },
             Step::Park => match self.adapter.park(&member, self.park_level).await {
                 Ok(outcome) => {
-                    self.journal(op, state, format!(r#"{{"event":"parked","outcome":{outcome:?}}}"#));
+                    self.journal(
+                        op,
+                        state,
+                        format!(r#"{{"event":"parked","outcome":{outcome:?}}}"#),
+                    );
                     Ok(())
                 }
                 Err(e) => Err((is_uncertain(&e), adapter_code(&e))),
@@ -857,7 +875,12 @@ impl ExecTask {
                         // remain"). F3 adds restart-ownership reconciliation
                         // so a handle lost across controller restarts is
                         // recovered, not silently dropped.
-                        self.journal(op, state, r#"{"event":"no_live_handle","verified":"no owned handle"}"#.to_string());
+                        self.journal(
+                            op,
+                            state,
+                            r#"{"event":"no_live_handle","verified":"no owned handle"}"#
+                                .to_string(),
+                        );
                         Ok(())
                     }
                 }
@@ -892,7 +915,12 @@ impl ExecTask {
         outcome: Result<(), String>,
     ) {
         if std::env::var("MLLM_DEBUG").is_ok() {
-            eprintln!("DEBUG op {} action {:?} outcome {:?}", op.0, action, outcome.as_ref().err());
+            eprintln!(
+                "DEBUG op {} action {:?} outcome {:?}",
+                op.0,
+                action,
+                outcome.as_ref().err()
+            );
         }
         match outcome {
             Ok(()) => {
@@ -1010,6 +1038,7 @@ fn adapter_code(err: &AdapterError) -> String {
         AdapterError::UnsupportedCapability => "unsupported_capability".to_string(),
         AdapterError::Crash(phase) => format!("crash:{phase:?}"),
         AdapterError::UnsupportedCombination => "unsupported_combination".to_string(),
+        AdapterError::NotAccepted(detail) => format!("not_accepted:{detail}"),
     }
 }
 
@@ -1019,7 +1048,6 @@ fn spawn_code(err: &LauncherError) -> String {
         LauncherError::TerminateFailed(detail) => format!("terminate_failed:{detail}"),
     }
 }
-
 
 impl Controller {
     /// The shared store handle (tests and the router read generations).
@@ -1043,7 +1071,10 @@ impl Controller {
     /// Router-path auto-activation (T10): wakes an on-demand-eligible
     /// deployment, but NEVER undoes an administrative stop — a suspended
     /// deployment rejects activation here.
-    pub async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, ControllerError> {
+    pub async fn auto_activate(
+        &self,
+        deployment: &str,
+    ) -> Result<OperationHandle, ControllerError> {
         // The guard never crosses an await (MutexGuard is not Send).
         let suspended = {
             let store = self.store.lock().unwrap();
@@ -1061,17 +1092,17 @@ impl Controller {
 
     /// The live engine process PID for a deployment, if owned and running.
     pub fn live_pid(&self, deployment: &str) -> Option<u32> {
-        self.handles
-            .lock()
-            .unwrap()
-            .get(deployment)
-            .map(|h| h.pid)
+        self.handles.lock().unwrap().get(deployment).map(|h| h.pid)
     }
 
     /// Stale-generation dispatch check (T18): a dispatch carrying an older
     /// generation than the deployment's current one is rejected — the
     /// ingress gate refuses late/stale dispatch after its gate closes.
-    pub fn check_dispatch_generation(&self, deployment: &str, observed: i64) -> Result<i64, ControllerError> {
+    pub fn check_dispatch_generation(
+        &self,
+        deployment: &str,
+        observed: i64,
+    ) -> Result<i64, ControllerError> {
         let store = self.store.lock().unwrap();
         store
             .check_generation(deployment, observed)
@@ -1151,8 +1182,8 @@ mod tests {
     }
 
     use mllm_adapters::traits::{
-        CancellationOutcome, EngineState, ParkLevel, ParkOutcome, Quiescence,
-        ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
+        CancellationOutcome, EngineState, ParkLevel, ParkOutcome, Quiescence, ReloadOutcome,
+        RenderedCommand, RequestRef, RestoreOutcome,
     };
 
     async fn drive(
@@ -1222,7 +1253,12 @@ mod tests {
         async fn reload_weights(&self, m: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
             self.inner.reload_weights(m).await
         }
-        async fn cancel_work(&self, m: &MemberRef, r: &RequestRef, global: bool) -> Result<CancellationOutcome, AdapterError> {
+        async fn cancel_work(
+            &self,
+            m: &MemberRef,
+            r: &RequestRef,
+            global: bool,
+        ) -> Result<CancellationOutcome, AdapterError> {
             self.inner.cancel_work(m, r, global).await
         }
     }
@@ -1235,15 +1271,33 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let c = Controller::new(store.clone(), adapter.clone(), Arc::new(FakeLauncher::new()));
+        let c = Controller::new(
+            store.clone(),
+            adapter.clone(),
+            Arc::new(FakeLauncher::new()),
+        );
         let dep = c.submit_deploy(req("gated")).await.unwrap();
         for expected in [LifecycleState::Starting, LifecycleState::Waking] {
-            let op = c.request_transition(&dep, LifecycleAction::Start).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(2), adapter.entered.notified()).await.unwrap();
-            let observed = store.lock().unwrap().get_deployment(&dep).unwrap().unwrap().observed_state;
+            let op = c
+                .request_transition(&dep, LifecycleAction::Start)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), adapter.entered.notified())
+                .await
+                .unwrap();
+            let observed = store
+                .lock()
+                .unwrap()
+                .get_deployment(&dep)
+                .unwrap()
+                .unwrap()
+                .observed_state;
             adapter.release.notify_one();
             assert_eq!(c.wait_terminal(&op).await.unwrap(), LifecycleState::Ready);
-            assert_eq!(observed, expected, "incomplete activation must not admit inference");
+            assert_eq!(
+                observed, expected,
+                "incomplete activation must not admit inference"
+            );
             drive(&c, &dep, LifecycleAction::Park, Ok(LifecycleState::Parked)).await;
         }
     }
@@ -1253,7 +1307,13 @@ mod tests {
         let (c, engine, _launcher) = controller(FakeEngine::new().fail_at(Phase::Startup));
         let dep = c.submit_deploy(req("m1")).await.unwrap();
         drive(&c, &dep, LifecycleAction::Start, Err(())).await;
-        let row = c.store.lock().unwrap().get_deployment(&dep).unwrap().unwrap();
+        let row = c
+            .store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.observed_state, LifecycleState::Failed);
         // The crash was deterministic, but FAILED is still entered legally
         // through RECONCILING (any -> RECONCILING -> FAILED).
@@ -1266,7 +1326,13 @@ mod tests {
         let dep = c.submit_deploy(req("m1")).await.unwrap();
         drive(&c, &dep, LifecycleAction::Start, Ok(LifecycleState::Ready)).await;
         drive(&c, &dep, LifecycleAction::Park, Err(())).await;
-        let row = c.store.lock().unwrap().get_deployment(&dep).unwrap().unwrap();
+        let row = c
+            .store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap();
         // The park effect was applied but the ack was lost; F0 reconciliation
         // confirms only proven-Ready outcomes, so the deployment fails
         // conservatively instead of fabricating Parked.
@@ -1281,14 +1347,22 @@ mod tests {
         // the deployment never enters FAILED and never claims a prewarm.
         let (c, _engine, _launcher) = controller(FakeEngine::new());
         let dep = c.submit_deploy(req("m1")).await.unwrap();
-        let out = c.request_transition(&dep, LifecycleAction::Preinitialize).await;
+        let out = c
+            .request_transition(&dep, LifecycleAction::Preinitialize)
+            .await;
         match out {
             Err(ControllerError::OperationFailed { code, .. }) => {
                 assert_eq!(code, "unsupported_parking");
             }
             other => panic!("expected unsupported_parking, got {other:?}"),
         }
-        let row = c.store.lock().unwrap().get_deployment(&dep).unwrap().unwrap();
+        let row = c
+            .store
+            .lock()
+            .unwrap()
+            .get_deployment(&dep)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.observed_state, LifecycleState::Stopped);
     }
 
@@ -1296,14 +1370,26 @@ mod tests {
     async fn illegal_transition_leaves_no_operation_trace() {
         let (c, _engine, _launcher) = controller(FakeEngine::new());
         let dep = c.submit_deploy(req("m1")).await.unwrap();
-        let before = c.store.lock().unwrap().latest_operation(&dep).unwrap().unwrap();
+        let before = c
+            .store
+            .lock()
+            .unwrap()
+            .latest_operation(&dep)
+            .unwrap()
+            .unwrap();
         let err = c
             .request_transition(&dep, LifecycleAction::Stop)
             .await
             .unwrap_err();
         assert!(matches!(err, ControllerError::IllegalTransition { .. }));
         // No new operation was recorded for the illegal request.
-        let after = c.store.lock().unwrap().latest_operation(&dep).unwrap().unwrap();
+        let after = c
+            .store
+            .lock()
+            .unwrap()
+            .latest_operation(&dep)
+            .unwrap()
+            .unwrap();
         assert_eq!(before.id, after.id);
     }
 
@@ -1326,8 +1412,14 @@ mod tests {
             .request_transition(&dep, LifecycleAction::Start)
             .await
             .unwrap();
-        assert!(matches!(c.wait_terminal(&op).await, Err(ControllerError::Timeout)));
-        assert!(c.live_pid(&dep).is_none(), "orphaned handle terminated on timeout");
+        assert!(matches!(
+            c.wait_terminal(&op).await,
+            Err(ControllerError::Timeout)
+        ));
+        assert!(
+            c.live_pid(&dep).is_none(),
+            "orphaned handle terminated on timeout"
+        );
         let row = c
             .store_ref()
             .lock()
@@ -1344,7 +1436,10 @@ mod tests {
             .journal_evidence_of(&dep)
             .unwrap()
             .join("\n");
-        assert!(evidence.contains("timeout_terminated"), "evidence: {evidence}");
+        assert!(
+            evidence.contains("timeout_terminated"),
+            "evidence: {evidence}"
+        );
     }
 
     #[tokio::test]
@@ -1420,7 +1515,11 @@ mod tests {
     #[test]
     fn resubmit_resolves_to_the_same_durable_deployment() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let c = Controller::new(store, Arc::new(FakeEngine::new()), Arc::new(FakeLauncher::new()));
+        let c = Controller::new(
+            store,
+            Arc::new(FakeEngine::new()),
+            Arc::new(FakeLauncher::new()),
+        );
         let dep_id = DeploymentId::new();
         let key = idempotency_key("standalone", "m1", &req("m1").manifest);
         let accept = |id: DeploymentId| AcceptDeployment {

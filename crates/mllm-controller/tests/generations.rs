@@ -33,18 +33,42 @@ async fn transitions_bump_generation_and_write_history() {
     let (c, store) = controller();
     let id = c.submit_deploy(req("gen-m")).await.unwrap();
 
-    let gen0 = store.lock().unwrap().get_deployment(&id).unwrap().unwrap().current_generation;
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let gen0 = store
+        .lock()
+        .unwrap()
+        .get_deployment(&id)
+        .unwrap()
+        .unwrap()
+        .current_generation;
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
-    let gen1 = store.lock().unwrap().get_deployment(&id).unwrap().unwrap().current_generation;
-    assert!(gen1 > gen0, "generation bumps on transition ({gen0} -> {gen1})");
+    let gen1 = store
+        .lock()
+        .unwrap()
+        .get_deployment(&id)
+        .unwrap()
+        .unwrap()
+        .current_generation;
+    assert!(
+        gen1 > gen0,
+        "generation bumps on transition ({gen0} -> {gen1})"
+    );
 
     let op2 = c
         .request_transition(&id, mllm_domain::LifecycleAction::Park)
         .await
         .unwrap();
     c.wait_terminal(&op2).await.unwrap();
-    let gen2 = store.lock().unwrap().get_deployment(&id).unwrap().unwrap().current_generation;
+    let gen2 = store
+        .lock()
+        .unwrap()
+        .get_deployment(&id)
+        .unwrap()
+        .unwrap()
+        .current_generation;
     assert!(gen2 > gen1);
 
     let history = store.lock().unwrap().generation_history(&id).unwrap();
@@ -55,7 +79,10 @@ async fn transitions_bump_generation_and_write_history() {
 async fn stale_generation_dispatch_rejected() {
     let (c, _store) = controller();
     let id = c.submit_deploy(req("stale-m")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
 
     let gen_before = {
@@ -63,7 +90,10 @@ async fn stale_generation_dispatch_rejected() {
         let s = s.lock().unwrap();
         s.get_deployment(&id).unwrap().unwrap().current_generation
     };
-    let op2 = c.request_transition(&id, mllm_domain::LifecycleAction::Park).await.unwrap();
+    let op2 = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Park)
+        .await
+        .unwrap();
     c.wait_terminal(&op2).await.unwrap();
     let gen_after = {
         let s = c.store_ref();
@@ -82,9 +112,18 @@ async fn stale_generation_dispatch_rejected() {
 async fn generation_survives_new_controller_over_same_store() {
     let (c, store) = controller();
     let id = c.submit_deploy(req("persist-m")).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
-    let gen = store.lock().unwrap().get_deployment(&id).unwrap().unwrap().current_generation;
+    let gen = store
+        .lock()
+        .unwrap()
+        .get_deployment(&id)
+        .unwrap()
+        .unwrap()
+        .current_generation;
 
     // Fresh controller over the same store: generations continue (never reset).
     let c2 = Controller::new(
@@ -98,7 +137,13 @@ async fn generation_survives_new_controller_over_same_store() {
         .unwrap();
     let end = c2.wait_terminal(&op2).await.unwrap();
     assert_eq!(end, LifecycleState::Stopped);
-    let gen2 = store.lock().unwrap().get_deployment(&id).unwrap().unwrap().current_generation;
+    let gen2 = store
+        .lock()
+        .unwrap()
+        .get_deployment(&id)
+        .unwrap()
+        .unwrap()
+        .current_generation;
     assert!(gen2 > gen);
 }
 

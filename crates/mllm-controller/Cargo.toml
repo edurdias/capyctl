@@ -23,7 +23,17 @@ mllm-store = { workspace = true }
 mllm-launchers = { path = "../mllm-launchers" }
 async-trait = { workspace = true }
 
+mllm-agent.workspace = true
+mllm-protocol.workspace = true
+tonic = { workspace = true, features = ["tls-ring"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+tokio-stream = "0.1"
+
 [dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+# SPEC §17 (M80): a fake engine behind a real host ingress in the session tests.
+axum = { workspace = true }
 mllm-testkit = { workspace = true }
 rusqlite = { workspace = true }
 async-trait = { workspace = true }

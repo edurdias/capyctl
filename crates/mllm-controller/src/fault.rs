@@ -100,6 +100,8 @@ impl From<AdapterError> for LifecycleFault {
             // A crash is a definite outcome about the engine, not about whether a
             // request was accepted, so it is a failure rather than uncertainty.
             AdapterError::Crash(_) => Self::Failed(text),
+            // Nothing reached the engine; the refusal is retryable, not a failure.
+            AdapterError::NotAccepted(_) => Self::Unavailable(text),
         }
     }
 }
@@ -118,11 +120,16 @@ impl From<LifecycleError> for LifecycleFault {
             LifecycleError::RuntimeRetained
             | LifecycleError::HostPolicyDenied
             | LifecycleError::CapacityBlocked
+            | LifecycleError::StartupRequiresEmptyHost
             | LifecycleError::QueueFull
             | LifecycleError::Disabled
             | LifecycleError::Unsupported
             | LifecycleError::Invalid
             | LifecycleError::Rejected(_) => Self::Blocked(text),
+            // ADR 0014 §7 (WE3): a digest still being measured clears on its
+            // own; a checkpoint known not to match needs the operator.
+            LifecycleError::CheckpointDigestPending => Self::Unavailable(text),
+            LifecycleError::CheckpointMismatch => Self::Blocked(text),
             // The store cannot say what the current state is, so nothing about the
             // request was decided.
             LifecycleError::ReconciliationRequired
@@ -142,6 +149,8 @@ impl From<CoordinatorError> for LifecycleFault {
             CoordinatorError::Stopped(_) => Self::Unavailable(text),
             CoordinatorError::Service(_) => Self::Unavailable(text),
             CoordinatorError::Invalid => Self::Blocked(text),
+            // W5: deferred without effect; it proceeds once capacity is back.
+            CoordinatorError::Deferred(_) => Self::Unavailable(text),
             // The caller stopped waiting; the coordinator did not stop working. The
             // command may well have been accepted, so this is never a failure.
             CoordinatorError::CallerTimeout => Self::Uncertain(text),
@@ -162,7 +171,9 @@ impl From<ManagedConfigurationError> for LifecycleFault {
     fn from(error: ManagedConfigurationError) -> Self {
         let text = error.to_string();
         match error {
-            ManagedConfigurationError::Invalid => Self::Blocked(text),
+            ManagedConfigurationError::Invalid | ManagedConfigurationError::Rejected(_) => {
+                Self::Blocked(text)
+            }
             ManagedConfigurationError::RuntimeRetained => Self::Blocked(text),
             ManagedConfigurationError::StaleSession
             | ManagedConfigurationError::IdempotencyConflict
@@ -171,8 +182,9 @@ impl From<ManagedConfigurationError> for LifecycleFault {
             | ManagedConfigurationError::PolicyConflict => Self::Conflict(text),
             // The stored configuration cannot be read, so nothing about this request
             // was decided.
-            ManagedConfigurationError::CorruptStoredData
-            | ManagedConfigurationError::Sql(_) => Self::Unavailable(text),
+            ManagedConfigurationError::CorruptStoredData | ManagedConfigurationError::Sql(_) => {
+                Self::Unavailable(text)
+            }
         }
     }
 }

@@ -68,13 +68,25 @@ async fn unarmed_stop_waits_for_old_observation_and_worker_completes_later_work(
     assert_eq!(*gate.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
     gate.release.add_permits(1);
     completed(&owner, &later).await;
-    {
-        let o = owner.lock().unwrap();
-        assert!(o
+    // ADR 0015: the later start ran on its own lane beside the stopped one, so
+    // the unarmed Stop completes once the stopped start's task has exited,
+    // not necessarily before the later start reaches Ready.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while owner
+            .lock()
+            .unwrap()
             .store()
             .runtime_binding(&fence.deployment_id)
             .unwrap()
-            .is_none());
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the unarmed Stop completes after its predecessor's task exits");
+    {
+        let o = owner.lock().unwrap();
         assert_eq!(
             o.store()
                 .snapshot()
@@ -794,7 +806,10 @@ async fn scoped_start_cancelled_caller_cannot_cancel_committed_execution() {
     w.shutdown().await.unwrap();
 }
 
-#[tokio::test]
+// ADR 0015: the scheduler keeps polling the store while an Initialize is in
+// flight, so its own failed read also waits on the command's owner lock. A
+// second runtime thread keeps the test itself running meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scoped_start_store_queue_failure_waits_for_in_progress_admission() {
     let (dir, owner, fence, observations) = setup().await;
     let gate = Gate::new(false);
@@ -821,8 +836,8 @@ async fn scoped_start_store_queue_failure_waits_for_in_progress_admission() {
         Arc::new(move |_| Ok(test_driver(driver.clone()))),
     )
     .unwrap();
-    // Suspend the real worker inside Initialize, so its next Store read cannot
-    // compete with the deliberately failed outside-lock read below.
+    // Suspend the real worker's Initialize; its scheduler's own reads fail
+    // on the closed queue too, and must also wait for the in-progress command.
     let observer = w.start(&fence, 10000).unwrap();
     gate.entered().await;
     drop(observer);

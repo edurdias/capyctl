@@ -1,6 +1,6 @@
 use mllm_controller::OwnedCoordinatorState;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::Path;
 
 fn state_dir() -> tempfile::TempDir {

@@ -2,10 +2,10 @@
 //! descriptor builder. The descriptor JSON must stay byte-identical to what
 //! `NativeLaunchHandoff::arm` built inline before the extraction.
 
-use mllm_controller::native_launch::{frozen_from_work, private_descriptor};
 use mllm_controller::coordinator::CoordinatorError;
+use mllm_controller::native_launch::{frozen_from_work, private_descriptor};
 use mllm_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
-use mllm_domain::launch::ProfileLaunchSettings;
+use mllm_domain::launch::LaunchSettings;
 use mllm_store::ordinary_lifecycle::worker::InitializeWork;
 use mllm_store::Store;
 use serde_json::{json, Value};
@@ -59,9 +59,7 @@ fn accepted_work(fixture: &str, mutate: impl Fn(&mut Value, &mut Value)) -> Work
         revision: receipt.revision,
         generation: receipt.generation,
     };
-    store
-        .accept_start(&session, &fence, 1100, 300000)
-        .unwrap();
+    store.accept_start(&session, &fence, 1100, 300000).unwrap();
     let work = store.next_initialize(&session).unwrap().unwrap();
     drop(session);
     drop(store);
@@ -71,26 +69,21 @@ fn accepted_work(fixture: &str, mutate: impl Fn(&mut Value, &mut Value)) -> Work
     }
 }
 
-const SGLANG_GOLDEN: &str = include_str!(
-    "../../mllm-config/tests/fixtures/effective-sglang-golden.json"
-);
-const VLLM_GOLDEN: &str = include_str!(
-    "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
-);
+const SGLANG_GOLDEN: &str =
+    include_str!("../../mllm-config/tests/fixtures/effective-sglang-golden.json");
+const VLLM_GOLDEN: &str =
+    include_str!("../../mllm-config/tests/fixtures/effective-vllm-golden.json");
 
 // T02: metadata must carry every field a frozen descriptor is validated against.
 #[test]
 fn builder_produces_expected_metadata_for_the_golden_sglang_config() {
-    use mllm_config::effective::sglang::{
-        NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
-    };
+    use mllm_adapters::sglang::pinned::NATIVE_SGLANG_CONTRACT;
     let fixture = accepted_work(SGLANG_GOLDEN, |_, _| {});
     let work = &fixture.work;
-    let ProfileLaunchSettings::Sglang(settings) = &work.effective().profile.launch_settings else {
+    let LaunchSettings::Sglang(settings) = &work.effective().engine_config else {
         panic!("golden fixture must carry SGLang launch settings");
     };
-    let expected_digest =
-        hex::encode(Sha256::digest(serde_json::to_vec(settings).unwrap()));
+    let expected_digest = hex::encode(Sha256::digest(serde_json::to_vec(settings).unwrap()));
     let launch = frozen_from_work(
         work,
         // The route the golden deployment serves; the served name is the route
@@ -102,21 +95,23 @@ fn builder_produces_expected_metadata_for_the_golden_sglang_config() {
     .unwrap();
     let metadata = launch.metadata();
     assert_eq!(metadata.engine, "sglang");
-    assert_eq!(metadata.recipe, NATIVE_SGLANG_RECIPE);
-    assert_eq!(metadata.source_revision, NATIVE_SGLANG_SOURCE_REVISION);
-    assert_eq!(metadata.checkpoint_revision, NATIVE_CHECKPOINT_REVISION);
+    // ADR 0014 §9: no checkpoint recipe pin; the checkpoint is named by the
+    // deployment's fingerprint until WE3 records a digest.
+    assert_eq!(metadata.recipe, NATIVE_SGLANG_CONTRACT);
+    assert_eq!(
+        metadata.checkpoint_revision,
+        work.effective().model.content_fingerprint
+    );
     assert_eq!(metadata.binding_id, work.binding_id());
     assert_eq!(metadata.incarnation, work.incarnation());
     assert_eq!(metadata.endpoint, format!("http://{}", work.endpoint()));
     assert_eq!(metadata.served_name, "ordinary");
     assert_eq!(metadata.rendered_settings_digest, expected_digest);
     assert_eq!(metadata.rendered_settings_digest.len(), 64);
-    assert!(
-        metadata
-            .rendered_settings_digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    );
+    assert!(metadata
+        .rendered_settings_digest
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
     assert_eq!(metadata.device.host_id, "lab");
     assert_eq!(metadata.device.hardware_fingerprint, "hw-01");
     assert_eq!(metadata.device.device_id, "gpu0");
