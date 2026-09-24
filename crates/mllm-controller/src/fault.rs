@@ -65,6 +65,7 @@ impl From<StoreError> for LifecycleFault {
             // the authority being unavailable rather than the request failing.
             StoreError::Sql(_) => Self::Unavailable(error.to_string()),
             StoreError::Io(_) => Self::Unavailable(error.to_string()),
+            StoreError::FromNewerVersion { .. } => Self::Unavailable(error.to_string()),
         }
     }
 }

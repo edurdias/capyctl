@@ -106,18 +106,26 @@ fn join_reads_a_relative_invitation_from_the_working_directory() {
     let stderr = String::from_utf8_lossy(&joined.stderr);
     assert!(stderr.contains("Invalid join invitation"), "{stderr}");
 }
-// T03: invalid explicit config never generates state or falls back.
+// T03: invalid explicit config never generates state or falls back. SPEC
+// §15.2 (R13): the standalone role honours `--config` the same way; a missing
+// explicit document exits as invalid configuration (2).
 #[test]
 fn explicit_missing_role_config_has_no_side_effects() {
     let temp = root();
     let state = temp.path().join("state");
-    for role in ["server", "host"] {
+    for role in ["server", "host", "standalone"] {
         let result = refused_start(
             &state,
             &["start", role, "--config", "/definitely/missing/mllm.yaml"],
         );
         assert!(!result.status.success());
-        assert!(!state.exists());
+        assert!(!state.exists(), "{role}");
+        if role == "standalone" {
+            assert_eq!(result.status.code(), Some(2), "{result:?}");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains("/definitely/missing/mllm.yaml"), "{stderr}");
+            assert!(!stderr.contains("not_implemented"), "{stderr}");
+        }
     }
 }
 

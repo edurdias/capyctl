@@ -46,11 +46,6 @@ fn main() -> ExitCode {
     }
     // Standalone owns both listeners; client commands use its management API.
     if matches!(invocation.command, Command::Start(Role::Standalone)) {
-        if invocation.config.is_some() {
-            let err = StructuredError::not_yet_implemented("start standalone --config");
-            output::print_error(&err, format);
-            return ExitCode::from(roles::NOT_IMPLEMENTED_EXIT.0 as u8);
-        }
         // Set before constructing any runtime threads. A shell variable alone
         // cannot enable full native logs; the operator must pass the flag.
         std::env::remove_var("MLLM_DEBUG_ENGINE_LOGS");
@@ -58,7 +53,9 @@ fn main() -> ExitCode {
             std::env::set_var("MLLM_DEBUG_ENGINE_LOGS", "1");
             eprintln!("Full engine logs enabled in private log files; they may contain secrets.");
         }
-        return run_standalone(format);
+        // SPEC §15.2 (R13): `--config` names the role document; without it the
+        // implicit `<state_dir>/config/standalone.yaml` is loaded or generated.
+        return run_standalone(invocation.config.as_deref(), format);
     }
     // SPEC §4.3: explicit drain, through the server's or the standalone role's
     // management API. Stopping a role itself is a signal (SPEC §14 has no verb).
@@ -166,7 +163,7 @@ fn warn_development_controls(value: &serde_json::Value, format: OutputFormat) {
 }
 
 /// Foreground standalone boot with authenticated management and inference.
-fn run_standalone(format: OutputFormat) -> ExitCode {
+fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> ExitCode {
     let state_dir = default_state_dir();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -179,16 +176,12 @@ fn run_standalone(format: OutputFormat) -> ExitCode {
             return ExitCode::from(output::ExitCode::INTERNAL.0 as u8);
         }
     };
-    match runtime.block_on(serve_standalone(&state_dir)) {
+    match runtime.block_on(serve_standalone(&state_dir, config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let err: StructuredError = err.into();
             output::print_error(&err, format);
-            if err.code == "internal" {
-                ExitCode::from(output::ExitCode::INTERNAL.0 as u8)
-            } else {
-                ExitCode::from(output::ExitCode::INVALID_CONFIG.0 as u8)
-            }
+            ExitCode::from(err.exit_code().0 as u8)
         }
     }
 }
@@ -202,13 +195,20 @@ fn run_standalone(format: OutputFormat) -> ExitCode {
 /// joined, and the process exits 0 with every engine still running and owned.
 /// The next start adopts and re-proves them; `mllm drain standalone` is the
 /// explicit way to stop them.
-async fn serve_standalone(state_dir: &std::path::Path) -> Result<(), roles::StartError> {
+async fn serve_standalone(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> Result<(), roles::StartError> {
     use mllm_cli::shutdown;
-    let bound = shutdown::standalone_drain_bound(state_dir).map_err(roles::StartError::Setting)?;
+    let bound = match config {
+        Some(document) => shutdown::standalone_drain_bound_in(document),
+        None => shutdown::standalone_drain_bound(state_dir),
+    }
+    .map_err(roles::StartError::Setting)?;
     let inference_address = roles::standalone_inference_address()?;
     let management_address = roles::standalone_management_address()?;
     let mut signals = shutdown::Signals::install()?;
-    let app = roles::start_standalone(state_dir).await?;
+    let app = roles::start_standalone_from(state_dir, config).await?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
         eprintln!("warning: {notice}");

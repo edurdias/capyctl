@@ -39,6 +39,23 @@ pub async fn boot(state_dir: &std::path::Path) -> mllm_cli::roles::App {
     .expect("standalone boots")
 }
 
+/// As [`boot`], with the role document named by `--config`; the result is
+/// returned so a test can assert a refusal.
+pub async fn boot_configured(
+    state_dir: &std::path::Path,
+    config: &std::path::Path,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_configured(
+        state_dir,
+        Some(config),
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+        }),
+        test_memory(),
+    )
+    .await
+}
+
 /// The explicit host capacity every standalone test boots with: 32 GiB, all
 /// of it free. Standalone derives its limits and the default deployment's
 /// footprints from the observed capacity and admits against observed free

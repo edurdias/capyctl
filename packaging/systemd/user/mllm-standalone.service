@@ -27,11 +27,18 @@ Documentation=file://%h/.local/opt/mllm/current/docs/operations/install.md
 
 [Service]
 Type=simple
-# `start standalone` takes no --config yet (it refuses one as not
-# implemented). Its role document is <MLLM_STATE_DIR>/config/standalone.yaml,
-# generated there on first start, and its engine installation comes from the
-# environment (MLLM_VLLM_BIN or MLLM_SGLANG_BIN, MLLM_MODELS_ROOT, ...), which
-# belongs in the environment file. The leading '-' makes the file optional.
+# Without --config the role document is <MLLM_STATE_DIR>/config/standalone.yaml,
+# generated there on first start, so reinstalling this unit on upgrade never
+# depends on a file the operator has not written. To use an explicit document,
+# override ExecStart= in a drop-in (docs/operations/install.md, "Explicit
+# standalone document"):
+#   ExecStart=
+#   ExecStart=%h/.local/opt/mllm/current/bin/mllm start standalone --config <file>
+# A missing or invalid explicit file then fails the start (exit 2, not
+# restarted); it is never replaced by defaults (SPEC §15.2, R13).
+# The engine installation always comes from the environment (MLLM_VLLM_BIN or
+# MLLM_SGLANG_BIN, MLLM_MODELS_ROOT, ...), which belongs in the environment
+# file. The leading '-' makes the file optional.
 # MLLM_STATE_DIR is left unset: the role then uses ~/.local/state/mllm,
 # which is what `mllm drain standalone` run by the same user reads too.
 # mllm's runtime helpers: a real (non-symlinked) directory owned by the
@@ -58,7 +65,8 @@ TimeoutStartSec=90s
 Restart=on-failure
 RestartSec=5s
 # Invalid configuration (2), unauthorized/revoked identity (3) and unsupported
-# requests (5) do not heal by restarting.
+# requests (5, including state written by a newer mllm) do not heal by
+# restarting.
 RestartPreventExitStatus=2 3 5
 # An engine the kernel OOM-kills is the embedded host's to reconcile; it must
 # not stop the role (the default OOMPolicy stops the whole unit).

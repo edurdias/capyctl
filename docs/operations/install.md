@@ -237,10 +237,10 @@ which is also acceptable if you copy the runtime there instead.
 
 ### Standalone
 
-`mllm start standalone` does not accept `--config` yet. Its role document is
-`<MLLM_STATE_DIR>/config/standalone.yaml`, generated on first start, and its
-engine installation comes from the environment. Put that environment in
-`/etc/mllm/standalone.env`:
+Without `--config`, `mllm start standalone` loads its role document from
+`<MLLM_STATE_DIR>/config/standalone.yaml`, generating it (and the protected
+credentials) on first start. Its engine installation always comes from the
+environment. Put that environment in `/etc/mllm/standalone.env`:
 
 ```bash
 # /etc/mllm/standalone.env (root:mllm 0640)
@@ -256,6 +256,41 @@ The unit sets `MLLM_STATE_DIR=/var/lib/mllm/standalone` and
 `MLLM_RUNTIME_DIR=/opt/mllm/runtime`. Operator commands must use the same
 state directory (and the same `MLLM_STANDALONE_MANAGEMENT_ADDR`, if set):
 `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone /opt/mllm/current/bin/mllm status deployment <id>`.
+
+#### Explicit standalone document
+
+`mllm start standalone --config <file>` uses `<file>` as the role document
+instead (SPEC §15.2, R13). A missing or invalid explicit file refuses the
+start with exit code 2; it is never replaced by the generated default, and
+nothing is written under `<MLLM_STATE_DIR>/config`. On a state root that has
+never served, the first start creates the protected credentials there, as a
+first implicit start would; a state root that has served and lost its
+credentials refuses instead.
+
+Where each setting comes from, highest precedence first:
+
+| Setting | Source |
+|---|---|
+| Role document | `--config <file>`, else `<state root>/config/standalone.yaml`, else generated there. |
+| State root | `MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
+| Listener addresses | `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR` for one run (loopback only), else `127.0.0.1:8443` / `127.0.0.1:7443`. The document may state only those defaults. |
+| Engine installation | The environment only (`MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN`, `MLLM_MODELS_ROOT`, ...). |
+| Drain bound, switching, observability | The role document in use. |
+
+The packaged units start standalone without `--config`, so an upgrade that
+reinstalls them never depends on a file the operator has not written. To keep
+the document under `/etc/mllm` instead, write it (a generated one is a good
+start), validate it, and override `ExecStart=` in a drop-in:
+
+```bash
+install -m 0640 -o root -g mllm /var/lib/mllm/standalone/config/standalone.yaml /etc/mllm/standalone.yaml
+/opt/mllm/current/bin/mllm validate config --file /etc/mllm/standalone.yaml
+systemctl edit mllm-standalone
+#   [Service]
+#   ExecStart=
+#   ExecStart=/opt/mllm/current/bin/mllm start standalone --config /etc/mllm/standalone.yaml
+systemctl restart mllm-standalone
+```
 
 ### User services
 
@@ -370,9 +405,14 @@ migrate the state store (see below).
 
 The server store is SQLite with forward-only migrations
 (`crates/mllm-store/src/migrations.rs`): a new release upgrades the store on
-first start and no release migrates it back. An older binary does not refuse
-a store a newer one migrated; it applies nothing and runs against a schema it
-does not know. So:
+first start and no release migrates it back. An older binary refuses a store
+a newer one migrated (SPEC §13.2, T33): the role exits with code 5 and error
+`store_from_newer_version`, naming the store's schema version and the newest
+one the binary supports, and writes nothing. The host journal is refused the
+same way. The packaged units do not restart on exit code 5; the fix is the
+newer binary or a restored backup. Releases before this guard did not refuse,
+so rolling back to one of them runs silently against a schema it does not
+know. So:
 
 - Back up each role's state directory before an upgrade, with the role
   stopped (the tar above). Engines keep running meanwhile; the backup is

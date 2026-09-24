@@ -88,6 +88,11 @@ impl fmt::Display for OperationError {
     }
 }
 
+/// SPEC §13.2 / T33: the role's durable state (store or host journal) was
+/// written by a newer mllm. Exits as unsupported, which service managers are told
+/// not to restart: only a newer binary or a restored backup resolves it.
+pub const STORE_FROM_NEWER_VERSION: &str = "store_from_newer_version";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredError {
     pub code: &'static str,

@@ -38,6 +38,12 @@ fn error(message: &str) -> StructuredError {
         message: message.into(),
     }
 }
+fn from_newer_version(message: String) -> StructuredError {
+    StructuredError {
+        code: crate::output::STORE_FROM_NEWER_VERSION,
+        message,
+    }
+}
 fn unavailable() -> StructuredError {
     StructuredError {
         code: "management_unavailable",
@@ -288,8 +294,15 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         mllm_store::secrets::SecretsKey::load_or_create(&config.identity_dir.join("secrets.key"))
             .map_err(|_| unavailable())?;
     let owner = Arc::new(Mutex::new(
-        OwnedCoordinatorState::open_with_secrets(&config.state_dir, secrets)
-            .map_err(|_| error("Controller state is unsafe or already owned"))?,
+        OwnedCoordinatorState::open_with_secrets(&config.state_dir, secrets).map_err(
+            |failure| match failure {
+                // SPEC §13.2 / T33: say what happened and how to recover.
+                mllm_controller::OwnedStateError::Store(
+                    newer @ mllm_store::StoreError::FromNewerVersion { .. },
+                ) => from_newer_version(newer.to_string()),
+                _ => error("Controller state is unsafe or already owned"),
+            }
+        )?,
     ));
     let ca_pem = ca.certificate_pem().to_owned();
     let authority = Arc::new(EnrollmentAuthority::new(owner.clone(), ca));
@@ -592,7 +605,13 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         &identity.controller_id(),
         &host,
     )
-    .map_err(|_| error("Host journal is unsafe or owned by another process"))?;
+    .map_err(|failure| match failure {
+        // SPEC §13.2 / T33: say what happened and how to recover.
+        newer @ mllm_agent::journal::JournalError::FromNewerVersion { .. } => {
+            from_newer_version(newer.to_string())
+        }
+        _ => error("Host journal is unsafe or owned by another process"),
+    })?;
     let memory = mllm_agent::memory::read_host_memory().map_err(|_| error("Host memory inventory unavailable"))?.memory;
     let declared=config.document["resource_policy"]["domains"].as_object();
     let domains=if let Some(declared)=declared {

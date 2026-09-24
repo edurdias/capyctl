@@ -45,6 +45,15 @@ pub enum JournalError {
     Unauthorized,
     #[error("ownership is unresolved and remains retained")]
     Uncertain,
+    /// SPEC §13.2 / T33: the journal was written by a newer mllm. An older
+    /// binary never opens it, because it would read and write a schema it does
+    /// not know; the journal is left untouched.
+    #[error(
+        "host journal has schema version {found}, newer than the {supported} this mllm \
+         supports; it was written by a newer mllm. Run that newer mllm, or restore the \
+         journal from a backup taken before the upgrade. The journal was not modified"
+    )]
+    FromNewerVersion { found: i64, supported: i64 },
 }
 impl From<rusqlite::Error> for JournalError {
     fn from(_: rusqlite::Error) -> Self {
@@ -345,6 +354,13 @@ impl HostJournal {
         // schema) is initialized now; a complete schema that never held a
         // command nor a session only lacks its marker.
         let fresh = !marked && version == 0 && tables == 0;
+        // SPEC §13.2 / T33: refuse a newer schema before anything is written.
+        if version > JOURNAL_SCHEMA_VERSION {
+            return Err(JournalError::FromNewerVersion {
+                found: version,
+                supported: JOURNAL_SCHEMA_VERSION,
+            });
+        }
         if !marked && !fresh {
             let untouched = version == JOURNAL_SCHEMA_VERSION
                 && db.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))
