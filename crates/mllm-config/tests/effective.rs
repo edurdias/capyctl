@@ -1,15 +1,24 @@
 use mllm_config::effective::{
     binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, DeepPark, DomainMemory, Engine, ModelSource, Residency,
+    resolve_effective, DeepPark, DeepParkSource, DomainMemory, Engine, ModelSource, Residency,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
-use mllm_domain::launch::ProfileLaunchSettings;
+use mllm_domain::launch::{LaunchSettings, SettingSource};
 
 fn fixture() -> (serde_json::Value, serde_json::Value) {
     let all: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/f2-deployment.json")).expect("fixture JSON");
     (all["deployment"].clone(), all["host"].clone())
+}
+
+/// Point the lab host's only profile at an SGLang installation. ADR 0014 §1: the
+/// installation carries no tuning, so this is all an engine switch takes.
+fn sglang_profile(host: &mut serde_json::Value) {
+    let profile = &mut host["runtime_profiles"]["local"];
+    profile["engine"] = "sglang".into();
+    profile["args"] = serde_json::json!([]);
+    profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
 }
 
 /// ADR 0011: a runtime profile carries no qualification reference. A host file
@@ -48,7 +57,10 @@ fn a_domain_declares_whether_its_memory_is_one_pool() {
     ] {
         let host = host_with_domain_memory(declared);
         let resolved = resolve_effective(&deployment, &host).expect("valid host");
-        assert_eq!(resolved.host.domains["unified"].memory, expected, "{declared}");
+        assert_eq!(
+            resolved.host.domains["unified"].memory, expected,
+            "{declared}"
+        );
     }
 }
 
@@ -132,7 +144,11 @@ fn residency_auto_is_refused() {
     let (mut deployment, host) = fixture();
     deployment["residency"] = "auto".into();
     let error = resolve_effective(&deployment, &host).expect_err("auto must not resolve");
-    assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination, "{error:?}");
+    assert_eq!(
+        error.code,
+        ConfigErrorCode::UnsupportedCombination,
+        "{error:?}"
+    );
     assert_eq!(error.path, "deployment.residency", "{error:?}");
 }
 
@@ -142,38 +158,46 @@ fn residency_auto_is_refused() {
 /// that restarts instead of parking, which is a supported configuration rather
 /// than a rejected one. The switch that does refuse a parking deployment is
 /// `deep_park`, asserted separately below.
+// T14 T21
 #[test]
-fn a_parking_vllm_profile_resolves_without_sleep_mode() {
+fn a_parking_vllm_deployment_derives_sleep_mode() {
     for residency in ["host_backed", "deep"] {
         let (mut deployment, mut host) = fixture();
         deployment["residency"] = residency.into();
         host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
-        host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
-        resolve_effective(&deployment, &host)
+        let effective = resolve_effective(&deployment, &host)
             .unwrap_or_else(|error| panic!("{residency} must resolve: {error}"));
+        let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+            panic!("vLLM settings");
+        };
+        assert!(settings.enable_sleep_mode, "{residency}");
+        assert_eq!(
+            settings.provenance["enable_sleep_mode"],
+            SettingSource::Derived
+        );
     }
 }
 
-/// `restart_only` never parks, so it has nothing to gate on sleep mode: SPEC §6.2
-/// keeps restart-only first-class even for engines without a qualified release API.
+/// `restart_only` never parks, so mllm never renders development mode for it
+/// (SPEC §6.2): the switch is derived, not declared (ADR 0014 §3).
+// T14 T21
 #[test]
-fn restart_only_vllm_profile_is_accepted_without_sleep_mode() {
-    let (mut deployment, mut host) = fixture();
+fn restart_only_vllm_deployment_never_gets_sleep_mode() {
+    let (mut deployment, host) = fixture();
     deployment["residency"] = "restart_only".into();
-    host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
-    resolve_effective(&deployment, &host).expect("restart_only does not require sleep mode");
+    let effective = resolve_effective(&deployment, &host).expect("restart_only resolves");
+    let LaunchSettings::Vllm(settings) = &effective.engine_config else {
+        panic!("vLLM settings");
+    };
+    assert!(!settings.enable_sleep_mode);
 }
 
 #[test]
 fn ordinary_engine_compatibility_goldens() {
     for engine in ["vllm", "sglang"] {
         let (deployment, mut host) = fixture();
-        let profile = &mut host["runtime_profiles"]["local"];
         if engine != "vllm" {
-            profile["engine"] = engine.into();
-            profile["args"] = serde_json::json!([]);
-            profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
-            profile["launch_settings"] = serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}});
+            sglang_profile(&mut host);
         }
         let effective = resolve_effective(&deployment, &host).unwrap();
         let golden: serde_json::Value = serde_json::from_str(match engine {
@@ -216,10 +240,7 @@ fn resolves_complete_typed_configuration_without_claiming_qualification() {
     );
     assert_eq!(effective.host.observation_ttl_ms, 2_000);
     assert_eq!(effective.host.queue.max_pending_per_deployment, 64);
-    assert!(matches!(
-        effective.profile.launch_settings,
-        ProfileLaunchSettings::Vllm(_)
-    ));
+    assert!(matches!(effective.engine_config, LaunchSettings::Vllm(_)));
     assert_eq!(effective.recipe_fingerprint.len(), 64);
     assert!(!serde_json::to_string(&effective)
         .unwrap()
@@ -240,6 +261,8 @@ fn missing_host_bounds_use_named_product_defaults() {
     assert_eq!(effective.host.queue.max_buffered_bytes_total, 64 << 20);
     assert_eq!(effective.host.queue.request_deadline_ms, 600_000);
     assert_eq!(effective.host.queue.admission_window_ms, 2_000);
+    // SPEC §10: the idle bound between a relayed stream's events.
+    assert_eq!(effective.host.queue.stream_idle_ms, 120_000);
     assert_eq!(effective.host.observation_ttl_ms, 2_000);
     assert_eq!(effective.host.planner_max_states, 4096);
     assert_eq!(effective.host.max_parked, 16);
@@ -252,7 +275,7 @@ fn host_bounds_accept_limits_and_reject_zero_or_just_over() {
     policy["queue"] = serde_json::json!({
         "max_pending_per_deployment": 4096, "max_pending_total": 16384,
         "max_buffered_bytes_total": "1GiB", "request_deadline": "1h",
-        "admission_window": "30s"
+        "admission_window": "30s", "stream_idle_timeout": "1h"
     });
     policy["observation_ttl"] = "10s".into();
     policy["planner_max_states"] = 65536.into();
@@ -290,6 +313,12 @@ fn host_bounds_accept_limits_and_reject_zero_or_just_over() {
         let (deployment, mut host) = fixture();
         *host.pointer_mut(pointer).unwrap() = value;
         assert!(resolve_effective(&deployment, &host).is_err(), "{pointer}");
+    }
+    // SPEC §10: the stream idle bound is at least 1 s and at most 1 h.
+    for value in ["3601s", "999ms"] {
+        let (deployment, mut host) = fixture();
+        host["resource_policy"]["queue"]["stream_idle_timeout"] = value.into();
+        assert!(resolve_effective(&deployment, &host).is_err(), "{value}");
     }
     for pointer in [
         "/resource_policy/queue/max_pending_per_deployment",
@@ -337,71 +366,31 @@ fn profile_revision_and_fingerprint_are_exact() {
     let changed = resolve_effective(&deployment, &host).unwrap();
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
-    assert_ne!(
-        changed.recipe_fingerprint,
-        original.recipe_fingerprint
-    );
+    assert_ne!(changed.recipe_fingerprint, original.recipe_fingerprint);
 }
 
+// T14
 #[test]
-fn owned_launch_setting_mutations_change_recipe_identity() {
+fn engine_config_mutations_change_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host)
         .unwrap()
         .recipe_fingerprint;
-    for (pointer, value) in [
-        (
-            "/runtime_profiles/local/launch_settings/tensor_parallel_size",
-            serde_json::json!(2),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/pipeline_parallel_size",
-            serde_json::json!(2),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/kv_cache_dtype",
-            serde_json::json!("fp8"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/block_size_tokens",
-            serde_json::json!(32),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/cpu_offload_bytes",
-            serde_json::json!("1GiB"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/kv_cache_bytes",
-            serde_json::json!("5GiB"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/swap_space_bytes",
-            serde_json::json!("1GiB"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/gpu_utilization_pct",
-            serde_json::json!(76),
-        ),
+    for block in [
+        serde_json::json!({"memory": {"kv_cache": "5GiB"}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "kv_cache_dtype": "fp8"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "dtype": "bfloat16"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "quantization": "modelopt_fp4"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "max_concurrent_requests": 16}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "vllm": {"block_size_tokens": 32}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "accept_extra_args": true,
+            "extra_args": ["--reasoning-parser", "qwen3"]}),
     ] {
-        let mut changed_host = host.clone();
-        *changed_host.pointer_mut(pointer).unwrap() = value;
-        let changed = resolve_effective(&deployment, &changed_host).unwrap();
-        assert_ne!(original, changed.recipe_fingerprint, "{pointer}");
+        let mut changed = deployment.clone();
+        changed["engine_config"] = block.clone();
+        let changed = resolve_effective(&changed, &host).unwrap();
+        assert_ne!(original, changed.recipe_fingerprint, "{block}");
     }
-    let mut restart = deployment.clone();
-    restart["residency"] = "restart_only".into();
-    let baseline = resolve_effective(&restart, &host)
-        .unwrap()
-        .recipe_fingerprint;
-    let mut changed_host = host;
-    changed_host["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] =
-        false.into();
-    assert_ne!(
-        baseline,
-        resolve_effective(&restart, &changed_host)
-            .unwrap()
-            .recipe_fingerprint
-    );
 }
 
 #[test]
@@ -514,7 +503,6 @@ fn qualification_dimensions_fail_to_alias() {
     let mut restart = deployment.clone();
     restart["residency"] = "restart_only".into();
     let mut controls = host.clone();
-    controls["runtime_profiles"]["local"]["launch_settings"]["enable_sleep_mode"] = false.into();
     let enabled = resolve_effective(&restart, &controls)
         .unwrap()
         .recipe_fingerprint;
@@ -527,57 +515,36 @@ fn qualification_dimensions_fail_to_alias() {
     );
 }
 
+// T03 T14
 #[test]
-fn unsupported_launch_mutations_fail_closed() {
-    for (pointer, value) in [
-        (
-            "/runtime_profiles/local/launch_settings/tensor_parallel_size",
-            serde_json::json!(0),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/pipeline_parallel_size",
-            serde_json::json!(0),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/kv_cache_dtype",
-            serde_json::json!(""),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/block_size_tokens",
-            serde_json::json!(0),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/kv_cache_bytes",
-            serde_json::json!("0B"),
-        ),
-        (
-            "/runtime_profiles/local/launch_settings/requested_budget/gpu_utilization_pct",
-            serde_json::json!(101),
-        ),
+fn unsupported_engine_config_fails_closed() {
+    for block in [
+        serde_json::json!({"memory": {"kv_cache": "0B"}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "kv_cache_dtype": ""}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "kv_cache_dtype": "fp8 --port 1"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "dtype": "fp9"}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "context_length": 0}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "max_concurrent_requests": 0}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "vllm": {"block_size_tokens": 0}}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "surprise": true}),
+        serde_json::json!({"memory": {"kv_cache": "4GiB", "surprise": "1GiB"}}),
+        // Closed per family (Spec §7): an SGLang block on a vLLM installation.
+        serde_json::json!({"memory": {"kv_cache": "4GiB"}, "sglang": {"max_total_tokens": 4096}}),
     ] {
-        let (deployment, mut host) = fixture();
-        *host.pointer_mut(pointer).unwrap() = value;
-        assert!(resolve_effective(&deployment, &host).is_err(), "{pointer}");
+        let (mut deployment, host) = fixture();
+        deployment["engine_config"] = block.clone();
+        assert!(resolve_effective(&deployment, &host).is_err(), "{block}");
     }
-    // A profile that declares one family and carries another family's launch
-    // settings is refused: the block is closed per family (Spec §7).
-    let (deployment, mut host) = fixture();
-    host["runtime_profiles"]["local"]["launch_settings"]["engine"] = "sglang".into();
-    assert!(resolve_effective(&deployment, &host).is_err());
 }
 
 #[test]
 fn equivalent_byte_units_have_identical_recipe_identity() {
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
-    let mut equivalent = host;
-    equivalent["runtime_profiles"]["local"]["launch_settings"]["requested_budget"]
-        ["kv_cache_bytes"] = "4096MiB".into();
-    let normalized = resolve_effective(&deployment, &equivalent).unwrap();
-    assert_eq!(
-        original.recipe_fingerprint,
-        normalized.recipe_fingerprint
-    );
+    let mut equivalent = deployment;
+    equivalent["engine_config"]["memory"]["kv_cache"] = "4096MiB".into();
+    let normalized = resolve_effective(&equivalent, &host).unwrap();
+    assert_eq!(original.recipe_fingerprint, normalized.recipe_fingerprint);
 }
 
 #[test]
@@ -591,10 +558,7 @@ fn equivalent_resource_units_have_identical_normalized_controls() {
         ResourceControls::from_host(&original.host),
         ResourceControls::from_host(&normalized.host)
     );
-    assert_eq!(
-        original.recipe_fingerprint,
-        normalized.recipe_fingerprint
-    );
+    assert_eq!(original.recipe_fingerprint, normalized.recipe_fingerprint);
 }
 
 #[test]
@@ -649,56 +613,85 @@ fn resolved_snapshot_isolated_from_later_profile_edits() {
     host["runtime_profiles"]["local"]["build_fingerprint"] = "edited".into();
     let later = resolve_effective(&deployment, &host).unwrap();
     assert_eq!(bytes, serde_json::to_vec(&snapshot).unwrap());
-    assert_ne!(
-        snapshot.recipe_fingerprint,
-        later.recipe_fingerprint
-    );
+    assert_ne!(snapshot.recipe_fingerprint, later.recipe_fingerprint);
 }
 
+/// ADR 0014 §4, owner decision E1: SGLang no longer pins a recipe. Omitted
+/// fields stay omitted (the engine's default applies), mllm's safe defaults are
+/// shown with their provenance, and residency-derived switches say so.
+// T14
 #[test]
-fn sglang_recipe_expands_to_exact_normalized_settings() {
+fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     let (deployment, mut host) = fixture();
-    host["runtime_profiles"]["local"]["engine"] = "sglang".into();
-    host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
-    host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
-    host["runtime_profiles"]["local"]["launch_settings"] = serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}});
+    sglang_profile(&mut host);
     let effective = resolve_effective(&deployment, &host).unwrap();
-    let ProfileLaunchSettings::Sglang(settings) = effective.profile.launch_settings else {
+    let LaunchSettings::Sglang(settings) = &effective.engine_config else {
         panic!("sglang settings")
     };
-    assert_eq!(
-        (
-            settings.tensor_parallel_size,
-            settings.data_parallel_size,
-            settings.tokenizer_workers
-        ),
-        (1, 1, 1)
-    );
-    assert_eq!(
-        (
-            settings.model_dtype.as_str(),
-            settings.context_tokens,
-            settings.max_running_requests,
-            settings.max_total_tokens
-        ),
-        ("bfloat16", 4096, 8, 4096)
-    );
+    assert_eq!(settings.common.dtype, None);
+    assert_eq!(settings.common.context_length, None);
+    assert_eq!(settings.max_total_tokens, None);
+    assert_eq!(settings.tokenizer_workers, 1);
+    assert_eq!(settings.common.cuda_graphs, Some(false));
     assert!(settings.memory_saver);
+    assert!(!settings.cpu_weight_backup);
     assert_eq!(settings.weight_restore, "disk_reload");
-    assert!([
-        settings.prefill_cuda_graphs,
-        settings.decode_cuda_graphs,
-        settings.cpu_weight_backup,
-        settings.speculative_decoding,
-        settings.lora,
-        settings.trust_remote_code,
-        settings.disaggregation,
-        settings.external_cache,
-        settings.cpu_kv_offload,
-        settings.native_grpc,
-    ]
-    .into_iter()
-    .all(|value| !value));
+    let provenance = &settings.provenance;
+    assert_eq!(provenance["cuda_graphs"], SettingSource::MllmDefault);
+    assert_eq!(provenance["sglang.tokenizer_workers"], SettingSource::MllmDefault);
+    assert_eq!(provenance["memory_saver"], SettingSource::Derived);
+    assert_eq!(provenance["memory.request"], SettingSource::Derived);
+    assert!(!provenance.contains_key("memory.kv_cache"));
+    let shown = serde_json::to_value(&effective).unwrap();
+    assert_eq!(shown["engine_config"]["provenance"]["cuda_graphs"], "mllm default");
+    assert_eq!(shown["engine_config"]["engine"], "sglang");
+
+    // A deployment may override a safe default; the provenance entry goes away.
+    let (mut deployment, _) = fixture();
+    deployment["engine_config"]["cuda_graphs"] = true.into();
+    deployment["engine_config"]["sglang"] = serde_json::json!({"tokenizer_workers": 2});
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    let LaunchSettings::Sglang(settings) = &effective.engine_config else {
+        panic!("sglang settings")
+    };
+    assert_eq!(settings.common.cuda_graphs, Some(true));
+    assert_eq!(settings.tokenizer_workers, 2);
+    assert!(!settings.provenance.contains_key("cuda_graphs"));
+    assert!(!settings.provenance.contains_key("sglang.tokenizer_workers"));
+}
+
+/// Owner decision E1: every engine serves any model. The configuration layer
+/// accepts any checkpoint shape the typed schema can express, for both engines,
+/// with no recipe name and no pinned context or concurrency.
+// T14 T22
+#[test]
+fn any_model_shape_resolves_on_either_engine() {
+    for engine in ["vllm", "sglang"] {
+        let (mut deployment, mut host) = fixture();
+        if engine == "sglang" {
+            sglang_profile(&mut host);
+        } else {
+            // The lab profile fixes `--max-model-len`; the typed field replaces it.
+            host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
+        }
+        deployment["model"]["path"] = "/srv/models/qwen3.8-27b-nvfp4".into();
+        deployment["recipe"] = "anything".into();
+        let mut block = serde_json::json!({
+            "dtype": "bfloat16", "quantization": "modelopt_fp4", "kv_cache_dtype": "fp8_e4m3",
+            "context_length": 32768, "max_concurrent_requests": 16, "language_model_only": true,
+            "memory": {"kv_cache": "4GiB"},
+        });
+        block[engine] = if engine == "vllm" {
+            serde_json::json!({"block_size_tokens": 16, "max_num_batched_tokens": 8192})
+        } else {
+            serde_json::json!({"max_total_tokens": 65536, "chunked_prefill_size": -1})
+        };
+        deployment["engine_config"] = block;
+        let effective = resolve_effective(&deployment, &host)
+            .unwrap_or_else(|error| panic!("{engine}: {error}"));
+        assert_eq!(effective.engine_config.common().context_length, Some(32768));
+        assert!(effective.engine_config.common().language_model_only);
+    }
 }
 
 #[test]
@@ -708,10 +701,7 @@ fn credential_reference_values_do_not_change_recipe_identity() {
     let mut edited = host;
     edited["runtime_profiles"]["local"]["security"]["credential_ref"] = "secret://rotated".into();
     let rotated = resolve_effective(&deployment, &edited).unwrap();
-    assert_eq!(
-        original.recipe_fingerprint,
-        rotated.recipe_fingerprint
-    );
+    assert_eq!(original.recipe_fingerprint, rotated.recipe_fingerprint);
     assert_eq!(
         original.profile.security.credential_ref.as_deref(),
         Some("secret://engine-key")
@@ -734,22 +724,36 @@ fn sglang_requires_separate_admin_authority_reference() {
     let (deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["engine"] = "sglang".into();
     host["runtime_profiles"]["local"]["args"] = serde_json::json!([]);
-    host["runtime_profiles"]["local"]["launch_settings"] = serde_json::json!({
-        "engine": "sglang", "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-        "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500}
-    });
     assert!(resolve_effective(&deployment, &host).is_err());
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
     assert!(resolve_effective(&deployment, &host).is_ok());
 }
 
+/// ADR 0014 §1, §3: host-fixed arguments are the installation's own. The
+/// approved-flag list is gone, so an ordinary engine option passes; a reserved
+/// one never does, however it is spelled.
+// T03 T14
 #[test]
-fn resolver_rejects_owned_or_unapproved_profile_arguments() {
-    for argument in ["--api-key=secret-value", "--future-unsafe-flag"] {
+fn resolver_rejects_reserved_profile_arguments_and_accepts_ordinary_ones() {
+    for argument in [
+        "--api-key=secret-value",
+        "--api-k=secret-value",
+        "--port",
+        "--host=0.0.0.0",
+        "--no-enable-sleep-mode",
+        "--config=/etc/vllm.yaml",
+        "-q",
+    ] {
         let (deployment, mut host) = fixture();
         host["runtime_profiles"]["local"]["args"] = serde_json::json!([argument]);
-        assert!(resolve_effective(&deployment, &host).is_err(), "{argument}");
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(!error.to_string().contains("secret-value"), "{error}");
+        assert!(!error.to_string().contains("0.0.0.0"), "{error}");
     }
+    let (deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["args"] =
+        serde_json::json!(["--max-model-len", "4096", "--future-ordinary-flag"]);
+    resolve_effective(&deployment, &host).expect("ordinary host-fixed arguments pass");
 }
 
 #[test]
@@ -764,10 +768,7 @@ fn resolver_rejects_secret_device_and_unrecognized_environment_names() {
     let changed = resolve_effective(&deployment, &host).unwrap();
     let (deployment, host) = fixture();
     let original = resolve_effective(&deployment, &host).unwrap();
-    assert_ne!(
-        changed.recipe_fingerprint,
-        original.recipe_fingerprint
-    );
+    assert_ne!(changed.recipe_fingerprint, original.recipe_fingerprint);
 }
 
 #[test]
@@ -776,7 +777,6 @@ fn engines_without_reviewed_argument_allowlists_accept_only_empty_args() {
     let (deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["engine"] = engine.into();
     host["runtime_profiles"]["local"]["args"] = serde_json::json!(["--max-model-len", "4096"]);
-    host["runtime_profiles"]["local"]["launch_settings"] = serde_json::json!({"engine":"sglang", "recipe":"qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1", "requested_budget":{"kv_cache_bytes":"4GiB", "static_memory_fraction_bps":7500}});
     host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] = "secret://admin".into();
     assert!(resolve_effective(&deployment, &host).is_err(), "{engine}");
 }
@@ -845,24 +845,19 @@ fn sglang_launch_flags_follow_the_declared_tier() {
         deployment["residency"] = declared.into();
         // Same profile rewrite `ordinary_engine_compatibility_goldens` uses to point
         // the lab host at SGLang.
-        let profile = &mut host["runtime_profiles"]["local"];
-        profile["engine"] = "sglang".into();
-        profile["args"] = serde_json::json!([]);
-        profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
-        profile["launch_settings"] = serde_json::json!({
-            "engine": "sglang",
-            "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-            "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500}
-        });
+        sglang_profile(&mut host);
         // host_backed needs a host whose pools are distinct; ADR 0010 decision 5
         // refuses it otherwise, and this test is about the flags, not the host check.
         host["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
         let resolved = resolve_effective(&deployment, &host)
             .unwrap_or_else(|error| panic!("{declared} must resolve: {error}"));
-        let ProfileLaunchSettings::Sglang(settings) = &resolved.profile.launch_settings else {
+        let LaunchSettings::Sglang(settings) = &resolved.engine_config else {
             panic!("expected SGLang launch settings for {declared}");
         };
-        assert_eq!(settings.memory_saver, memory_saver, "memory_saver for {declared}");
+        assert_eq!(
+            settings.memory_saver, memory_saver,
+            "memory_saver for {declared}"
+        );
         assert_eq!(
             settings.cpu_weight_backup, cpu_weight_backup,
             "cpu_weight_backup for {declared}"
@@ -910,48 +905,110 @@ fn deep_park_disabled_with_parking_residency_is_refused() {
     resolve_effective(&deployment, &host).expect("restart_only does not park");
 }
 
-/// SPEC §9.1 / T21 and the current working agreement require explicit opt-in.
+/// SPEC §9.1 / ADR 0012: deep parking is enabled unless host policy forbids it,
+/// so a profile that omits the switch resolves a parking residency.
 // T21
 #[test]
-fn deep_park_defaults_to_disabled() {
+fn deep_park_defaults_to_enabled() {
     let (mut deployment, mut host) = fixture();
     host["runtime_profiles"]["local"]["security"]
         .as_object_mut()
         .unwrap()
         .remove("deep_park");
-    let error = resolve_effective(&deployment, &host).unwrap_err();
-    assert_eq!(error.path, "runtime_profiles.security.deep_park");
-    deployment["residency"] = "restart_only".into();
-    let effective = resolve_effective(&deployment, &host).unwrap();
-    assert_eq!(effective.profile.security.deep_park, DeepPark::Disabled);
-    host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
     deployment["residency"] = "deep".into();
-    assert!(resolve_effective(&deployment, &host).is_ok());
+    let effective = resolve_effective(&deployment, &host).expect("omitted policy enables");
+    assert_eq!(effective.profile.security.deep_park, DeepPark::Enabled);
+    assert_eq!(effective.residency, Residency::Deep);
 }
 
-// T21: host permission cannot expand the pinned SGLang recipe.
+/// SPEC §9.1 / ADR 0012: `deep_park: disabled` is the host opt-out, and it is
+/// honored whatever residency the deployment asks for: a parking tier is refused
+/// at resolution and the restart-only tier resolves without deep parking.
+// T21
 #[test]
-fn sglang_remote_code_is_rejected_during_configuration_validation() {
+fn an_explicit_opt_out_is_honored() {
+    let (mut deployment, mut host) = fixture();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "disabled".into();
+    deployment["residency"] = "deep".into();
+    let error = resolve_effective(&deployment, &host).expect_err("the opt-out refuses deep");
+    assert_eq!(error.path, "runtime_profiles.security.deep_park");
+    assert!(error.to_string().contains("opts out"), "{error}");
+    deployment["residency"] = "restart_only".into();
+    let effective = resolve_effective(&deployment, &host).expect("restart_only resolves");
+    assert_eq!(effective.profile.security.deep_park, DeepPark::Disabled);
+}
+
+/// SPEC §7: the effective configuration says where the deep-park value came
+/// from. A defaulted value is marked `default`; a value the host declared
+/// carries no marker, so every explicit profile serializes exactly as before.
+// T14 T21
+#[test]
+fn effective_configuration_shows_deep_park_provenance() {
+    let (mut deployment, mut host) = fixture();
+    deployment["residency"] = "restart_only".into();
+    for (declared, value) in [
+        ("enabled", DeepPark::Enabled),
+        ("disabled", DeepPark::Disabled),
+    ] {
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = declared.into();
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        assert_eq!(effective.profile.security.deep_park, value);
+        assert_eq!(
+            effective.profile.security.deep_park_source,
+            DeepParkSource::HostPolicy
+        );
+        let shown = serde_json::to_value(&effective).unwrap();
+        assert_eq!(shown["profile"]["security"]["deep_park"], declared);
+        assert!(shown["profile"]["security"]
+            .get("deep_park_source")
+            .is_none());
+    }
+    host["runtime_profiles"]["local"]["security"]
+        .as_object_mut()
+        .unwrap()
+        .remove("deep_park");
+    let effective = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(
+        effective.profile.security.deep_park_source,
+        DeepParkSource::Default
+    );
+    let shown = serde_json::to_value(&effective).unwrap();
+    assert_eq!(shown["profile"]["security"]["deep_park"], "enabled");
+    assert_eq!(shown["profile"]["security"]["deep_park_source"], "default");
+}
+
+/// T14: provenance is derived, never declared. A host document cannot claim a
+/// source for its own switch.
+// T14
+#[test]
+fn a_host_cannot_declare_deep_park_provenance() {
     let (deployment, mut host) = fixture();
-    let profile = &mut host["runtime_profiles"]["local"];
-    profile["engine"] = "sglang".into();
-    profile["args"] = serde_json::json!([]);
-    profile["security"]["admin_credential_ref"] = "secret://admin".into();
-    profile["security"]["trust_remote_code"] = true.into();
-    profile["launch_settings"] = serde_json::json!({
-        "engine": "sglang",
-        "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-        "requested_budget": {"kv_cache_bytes": "4GiB", "static_memory_fraction_bps": 7500},
-        "trust_remote_code": true
-    });
+    host["runtime_profiles"]["local"]["security"]["deep_park_source"] = "host_policy".into();
     let error = resolve_effective(&deployment, &host).unwrap_err();
-    assert_eq!(error.path, "runtime_profiles.launch_settings");
-    host["runtime_profiles"]["local"]["launch_settings"]["trust_remote_code"] = false.into();
-    assert!(resolve_effective(&deployment, &host).is_ok());
+    assert_eq!(error.code, ConfigErrorCode::UnknownField, "{error:?}");
+}
+
+/// ADR 0014 §8: remote code is a typed field behind the host's own switch, the
+/// same for both engines; host permission is necessary, not sufficient.
+// T21
+#[test]
+fn typed_remote_code_needs_the_host_switch() {
+    for engine in ["vllm", "sglang"] {
+        let (mut deployment, mut host) = fixture();
+        if engine == "sglang" {
+            sglang_profile(&mut host);
+        }
+        deployment["engine_config"]["trust_remote_code"] = true.into();
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "engine_config.trust_remote_code", "{engine}");
+        host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        assert!(effective.engine_config.common().trust_remote_code, "{engine}");
+    }
 }
 
 /// Spec §3: `--trust-remote-code` makes the engine execute Python that arrived with
-/// the checkpoint. It stays on the approved argument list, so the only thing that
+/// the checkpoint. A host-fixed argument may carry it, and the only thing that
 /// stops it being passed by habit is the host's own switch.
 // T21
 #[test]
@@ -1090,30 +1147,19 @@ fn huggingface_and_http_sources_validate_shape_but_are_not_materializable() {
 // T14
 #[test]
 fn requested_kv_above_ready_allocation_is_refused() {
-    // The lab fixture's Ready phase allocates 8GiB.
-    let (deployment, mut host) = fixture();
-    let budget = &mut host["runtime_profiles"]["local"]["launch_settings"]["requested_budget"];
-    budget["kv_cache_bytes"] = "8GiB".into();
+    // The lab fixture's Ready phase allocates 8GiB, which is the memory request.
+    let (mut deployment, host) = fixture();
+    deployment["engine_config"]["memory"]["kv_cache"] = "8GiB".into();
     resolve_effective(&deployment, &host).expect("a request equal to the allocation is accepted");
 
-    host["runtime_profiles"]["local"]["launch_settings"]["requested_budget"]["kv_cache_bytes"] =
-        "9GiB".into();
+    deployment["engine_config"]["memory"]["kv_cache"] = "9GiB".into();
     let error = resolve_effective(&deployment, &host).expect_err("9GiB exceeds the 8GiB Ready");
-    assert_eq!(
-        error.path, "runtime_profiles.launch_settings.requested_budget",
-        "{error:?}"
-    );
+    assert_eq!(error.path, "engine_config.memory.kv_cache", "{error:?}");
 
-    // The same bound applies to SGLang, which states its budget differently.
-    let (deployment, mut host) = fixture();
-    let profile = &mut host["runtime_profiles"]["local"];
-    profile["engine"] = "sglang".into();
-    profile["args"] = serde_json::json!([]);
-    profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
-    profile["launch_settings"] = serde_json::json!({
-        "engine": "sglang", "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-        "requested_budget": {"kv_cache_bytes": "9GiB", "static_memory_fraction_bps": 7500}
-    });
+    // The same bound applies to SGLang.
+    let (mut deployment, mut host) = fixture();
+    sglang_profile(&mut host);
+    deployment["engine_config"]["memory"]["kv_cache"] = "9GiB".into();
     assert!(resolve_effective(&deployment, &host).is_err(), "sglang");
 }
 
@@ -1148,7 +1194,6 @@ fn legacy_model_path_is_a_local_source() {
         .remove("path");
     assert!(resolve_effective(&deployment, &host).is_err(), "neither");
 }
-
 
 /// The host's published device inventory digest (`runtime/sglang_device`
 /// `mllm-nvidia-inventory-v1`) is optional host policy: present, it must be the

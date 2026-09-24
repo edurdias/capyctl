@@ -33,6 +33,8 @@ fn persisted_controls_replace_only_resource_controls_before_resolution() {
     controls.queue.max_buffered_bytes_total = 8192;
     controls.queue.request_deadline_ms = 350_000;
     controls.queue.admission_window_ms = 1000;
+    // SPEC §10: a configured stream idle bound survives composition.
+    controls.queue.stream_idle_ms = 90_000;
     let composed = compose_current_resource_controls(&host, &context, &controls).unwrap();
     assert_eq!(host, original);
     for key in [
@@ -99,4 +101,17 @@ fn mismatched_immutable_context_or_invalid_controls_fail_without_repair() {
     let mut malformed = host.clone();
     malformed["resource_policy"]["unreviewed"] = json!(true);
     assert!(compose_current_resource_controls(&malformed, &context, &controls).is_err());
+}
+
+// T16: changing resource controls must retain frozen physical placement.
+#[test]
+fn current_controls_preserve_physical_device_identity() {
+    let (deployment, mut host, context, mut controls) = fixture();
+    let uuid = "GPU-09631200-fdff-a345-295f-a1a6f84b2f84";
+    host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"] = json!(uuid);
+    controls.observation_ttl_ms = 1250;
+    let composed = compose_current_resource_controls(&host, &context, &controls).unwrap();
+    let effective = resolve_effective(&deployment, &composed).unwrap();
+    assert_eq!(effective.host.devices["gpu0"].physical_gpu_uuid.as_deref(), Some(uuid));
+    assert_eq!(ResourceControls::from_host(&effective.host), controls);
 }

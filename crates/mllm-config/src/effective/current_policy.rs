@@ -12,9 +12,12 @@ pub fn deployment_command_fingerprint(
     deployment: &Value,
     original_deadline_ms: i64,
 ) -> Result<String, ConfigError> {
-    use super::{parse_duration_ms, phase, DeploymentInput, RecipeFootprints};
+    use super::{engine_config, parse_duration_ms, raw_recipe, DeploymentInput, RecipeFootprints};
     use sha2::{Digest, Sha256};
-    let mut input: DeploymentInput = decode(deployment, "deployment")?;
+    // ADR 0013 §2: a claim stated by sharing mode alone names no device; its
+    // identity is its position, the same on every host.
+    let mut input: DeploymentInput =
+        decode(&crate::instances::identity_devices(deployment), "deployment")?;
     if input.schema_version != 1
         || input.kind != "deployment"
         || input.name.is_empty()
@@ -29,36 +32,53 @@ pub fn deployment_command_fingerprint(
     if input.routes.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(invalid("routes", "duplicate route"));
     }
-    let recipe = core::NormalizedRecipe {
-        // No host is in hand here, so nothing is resolved against a model store:
-        // a command's identity must depend on the command alone.
-        model: core::normalize_model(input.model, None)?,
-        recipe: input.recipe,
-        residency: input.residency,
-        recovery: input.recovery,
-        devices: input.devices,
-        resources: RecipeFootprints {
-            cold: phase(input.resources.cold)?,
-            ready: phase(input.resources.ready)?,
-            parking: phase(input.resources.parking)?,
-            parked: phase(input.resources.parked)?,
-            wake: phase(input.resources.wake)?,
-        },
-        request_deadline_ms: input
-            .request_deadline
-            .as_deref()
-            .map(parse_duration_ms)
-            .transpose()?
-            .unwrap_or(original_deadline_ms),
-    };
-    core::validate_recipe_intrinsic(&recipe)?;
-    let semantic = json!({
-        "version": 1, "name": input.name, "routes": input.routes,
+    // No host is in hand here, so nothing is resolved against a model store:
+    // a command's identity must depend on the command alone.
+    let model = core::normalize_model(input.model, None)?;
+    let request_deadline_ms = input
+        .request_deadline
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()?
+        .unwrap_or(original_deadline_ms);
+    core::validate_identity_intrinsic(&model, &input.recipe, &input.devices, request_deadline_ms)?;
+    // ADR 0014 §5: resources may be omitted and derived at resolution; the
+    // command identity then carries none.
+    let resources: Option<RecipeFootprints> = input.resources.map(raw_recipe).transpose()?;
+    if let Some(resources) = &resources {
+        core::validate_resources_intrinsic(resources, &input.devices)?;
+    }
+    // ADR 0014 §1: the deployment's engine configuration is part of what the
+    // command asks for, so two commands differing only there are different.
+    let engine_config = engine_config::declared_engine_config(&input.engine_config)?;
+    let instance_spec = crate::instances::parse_instance_spec(deployment)?;
+    let mut semantic = json!({
+        "version": 2, "name": input.name, "routes": input.routes,
         "runtime_profile": input.runtime_profile, "runtime_profile_revision": input.runtime_profile_revision,
-        "model": recipe.model, "recipe": recipe.recipe, "residency": recipe.residency,
-        "recovery": recipe.recovery, "devices": recipe.devices, "resources": recipe.resources,
-        "request_deadline_ms": recipe.request_deadline_ms,
+        "model": model, "recipe": input.recipe, "residency": input.residency,
+        "recovery": input.recovery, "devices": input.devices, "resources": resources,
+        "request_deadline_ms": request_deadline_ms, "engine_config": engine_config,
     });
+    // ADR 0013 §7: the instance count and placement are part of what the
+    // command asks for. The default adds nothing, so a command written before
+    // instances existed keeps its fingerprint across the upgrade.
+    if let Some(identity) = instance_spec.command_identity() {
+        semantic["instances"] = identity;
+    }
+    // ADR 0014 amendment A1: declared timeouts are part of what the command
+    // asks for. Omitted, they add nothing, so older commands keep their
+    // fingerprint.
+    if let Some(block) = deployment.get("timeouts") {
+        super::validate_declared_timeouts(deployment)?;
+        // Normalized, so `600s` and `10m` are the same command.
+        let mut normalized = serde_json::Map::new();
+        for field in ["initialize", "wake"] {
+            if let Some(text) = block.get(field).and_then(Value::as_str) {
+                normalized.insert(format!("{field}_ms"), json!(parse_duration_ms(text)?));
+            }
+        }
+        semantic["timeouts"] = Value::Object(normalized);
+    }
     let bytes = serde_json::to_vec(&semantic)
         .map_err(|_| invalid("deployment", "invalid deployment command"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -74,7 +94,7 @@ pub fn compose_current_resource_controls(
     context: &ResourceContext,
     controls: &ResourceControls,
 ) -> Result<Value, ConfigError> {
-    let raw: HostInput = decode(trusted_host, "host")?;
+    let raw: HostInput = super::decode_host(trusted_host)?;
     let normalized = core::normalize_host(raw)?;
     if ResourceContext::from_host(&normalized) != *context {
         return Err(invalid(
@@ -90,5 +110,12 @@ pub fn compose_current_resource_controls(
     // required field to `RawDomain` etc. cannot be silently omitted.
     let mut composed = trusted_host.clone();
     composed["resource_policy"] = compose_resource_policy(controls, context);
+    // SPEC §3 / T16: physical placement is trusted host context, not a mutable
+    // resource control. Preserve it when composing the current limits.
+    for (id, device) in &normalized.devices {
+        if let Some(uuid) = &device.physical_gpu_uuid {
+            composed["resource_policy"]["devices"][id]["physical_gpu_uuid"] = json!(uuid);
+        }
+    }
     Ok(composed)
 }

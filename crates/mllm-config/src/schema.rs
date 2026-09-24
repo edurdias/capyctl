@@ -73,7 +73,18 @@ pub enum FieldSpec {
     MapOf(&'static FieldSpec),
     /// Sequence of items, each validated against the given spec.
     Seq(&'static FieldSpec),
+    /// A field that used to live here and has moved (SPEC §15.3 strictness).
+    /// It is refused like an unknown field, with a message naming where the
+    /// setting lives now, so an old document fails with a pointer rather than
+    /// a bare "unknown field".
+    Moved(&'static str),
 }
+
+/// ADR 0014 §1: the host profile's engine tuning moved to the deployment.
+pub const LAUNCH_SETTINGS_MOVED: &str =
+    "engine tuning moved from the host profile's `launch_settings` to the deployment's \
+     `engine_config` (ADR 0014 §1); the host keeps executable, environment, security \
+     and host-fixed `args` only";
 
 /// Empty allowlist for nested blocks with no F0 consumer yet: rejects
 /// every unknown key, accepts only empty mappings.
@@ -166,13 +177,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("parked_limit", BYTES),
         ("memory", SCALAR),
     ]);
-    const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[("domain", SCALAR), ("sharing", SCALAR)]);
+    const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[("domain", SCALAR), ("sharing", SCALAR), ("physical_gpu_uuid", SCALAR)]);
     const QUEUE: &[(&str, FieldSpec)] = &[
         ("max_pending_per_deployment", SCALAR),
         ("max_pending_total", SCALAR),
         ("max_buffered_bytes_total", BYTES),
         ("request_deadline", DURATION),
         ("admission_window", DURATION),
+        // SPEC §10: idle bound between a relayed stream's backend events.
+        ("stream_idle_timeout", DURATION),
     ];
     const F2_RESOURCE_POLICY: &[(&str, FieldSpec)] = &[
         ("domains", FieldSpec::MapOf(&DOMAIN)),
@@ -186,62 +199,69 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ),
         ("planner_max_states", SCALAR),
         ("queue", FieldSpec::Struct(QUEUE)),
+        // ADR 0013 §2: host labels a deployment's `placement.selector` matches.
+        // Host policy, published with the host document; never asserted by a
+        // deployment.
+        ("labels", FieldSpec::MapOf(&SCALAR)),
     ];
     const SECURITY: &[(&str, FieldSpec)] = &[
         // Spec §3: `deep_park` replaces `experimental_controls`. It is a switch over
-        // one named capability rather than a blanket "I accept experiments", and it
-        // defaults to enabled, so omitting it keeps parking available.
+        // one named capability rather than a blanket "I accept experiments". SPEC
+        // §9.1 / ADR 0012: omitted means enabled; `disabled` is the host opt-out.
         ("deep_park", SCALAR),
         // Spec §3: executing checkpoint-supplied Python is opt-in per host.
         ("trust_remote_code", SCALAR),
         ("credential_ref", SCALAR),
         ("admin_credential_ref", SCALAR),
+        // ADR 0014 §6 (owner decision Q10): deployment extra arguments are
+        // allowed unless the host says `denied`.
+        ("extra_args", SCALAR),
+        // ADR 0014 §8: security-sensitive options this installation approves by
+        // name, and the directories an approved path option may name.
+        ("approved_options", FieldSpec::Seq(&SCALAR)),
+        ("approved_paths", FieldSpec::Seq(&SCALAR)),
+        // ADR 0008 (owner decision 2026-09-23): `warn` (default) or `refuse`
+        // when a launch finds the installation drifted from its registration.
+        ("installation_drift", SCALAR),
     ];
-    const REQUESTED_BUDGET: FieldSpec = FieldSpec::Struct(&[
-        ("kv_cache_bytes", BYTES),
-        ("swap_space_bytes", BYTES),
-        ("gpu_utilization_pct", SCALAR),
-        ("static_memory_fraction_bps", SCALAR),
-    ]);
-    const LAUNCH_SETTINGS: &[(&str, FieldSpec)] = &[
-        ("engine", SCALAR),
-        ("tensor_parallel_size", SCALAR),
-        ("pipeline_parallel_size", SCALAR),
-        ("enable_sleep_mode", SCALAR),
+    // ADR 0014 §2: a deployment's typed engine parameters. Common fields first,
+    // then one block per engine family; which family block is legal is decided
+    // against the selected installation at resolution.
+    const ENGINE_MEMORY: FieldSpec =
+        FieldSpec::Struct(&[("request", BYTES), ("kv_cache", BYTES), ("startup", BYTES)]);
+    const ENGINE_CONFIG: FieldSpec = FieldSpec::Struct(&[
+        ("dtype", SCALAR),
+        ("quantization", SCALAR),
         ("kv_cache_dtype", SCALAR),
-        ("block_size_tokens", SCALAR),
-        ("cpu_offload_bytes", BYTES),
-        ("recipe", SCALAR),
-        ("requested_budget", REQUESTED_BUDGET),
-        // The SGLang family's own settings. The pinned recipe validates the
-        // whole shape at launch, so the schema's job is to let a profile carry
-        // it at all; anything the recipe refuses is refused there, closed.
-        ("data_parallel_size", SCALAR),
-        ("tokenizer_workers", SCALAR),
-        ("model_dtype", SCALAR),
-        ("context_tokens", SCALAR),
-        ("max_running_requests", SCALAR),
-        ("max_total_tokens", SCALAR),
-        ("prefill_cuda_graphs", SCALAR),
-        ("decode_cuda_graphs", SCALAR),
-        ("memory_saver", SCALAR),
-        ("cpu_weight_backup", SCALAR),
-        ("speculative_decoding", SCALAR),
-        ("lora", SCALAR),
+        ("context_length", SCALAR),
+        ("max_concurrent_requests", SCALAR),
+        ("cuda_graphs", SCALAR),
+        ("language_model_only", SCALAR),
         ("trust_remote_code", SCALAR),
-        ("disaggregation", SCALAR),
-        ("external_cache", SCALAR),
-        ("cpu_kv_offload", SCALAR),
-        ("native_grpc", SCALAR),
-        ("weight_restore", SCALAR),
-    ];
+        ("memory", ENGINE_MEMORY),
+        (
+            "vllm",
+            FieldSpec::Struct(&[("block_size_tokens", SCALAR), ("max_num_batched_tokens", SCALAR)]),
+        ),
+        (
+            "sglang",
+            FieldSpec::Struct(&[
+                ("max_total_tokens", SCALAR),
+                ("chunked_prefill_size", SCALAR),
+                ("tokenizer_workers", SCALAR),
+            ]),
+        ),
+        ("accept_extra_args", SCALAR),
+        ("extra_args", FieldSpec::Seq(&SCALAR)),
+    ]);
     const PROFILE: FieldSpec = FieldSpec::Struct(&[
         ("engine", SCALAR),
         ("revision", SCALAR),
         ("executable", SCALAR),
         ("build_fingerprint", SCALAR),
+        // ADR 0014 §1: host-fixed arguments stay with the installation.
         ("args", FieldSpec::Seq(&SCALAR)),
-        ("launch_settings", FieldSpec::Struct(LAUNCH_SETTINGS)),
+        ("launch_settings", FieldSpec::Moved(LAUNCH_SETTINGS_MOVED)),
         ("env", FieldSpec::MapOf(&SCALAR)),
         ("security", FieldSpec::Struct(SECURITY)),
         (
@@ -256,7 +276,19 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("state_dir", SCALAR),
         ("listeners", LISTENERS),
         ("tls", FieldSpec::Struct(TLS)),
+        // SPEC §10 (W10): the switch drain bound of the embedded server.
+        ("switching", FieldSpec::Struct(SWITCHING)),
+        // SPEC §17 (M80): the router's per-request timing header.
+        ("observability", FieldSpec::Struct(OBSERVABILITY)),
     ];
+    /// SPEC §4.3 (owner decision P3): a role's shutdown drain bound, role-local
+    /// in the server, host and standalone documents.
+    const SHUTDOWN: &[(&str, FieldSpec)] = &[("drain_timeout", DURATION)];
+    /// SPEC §10 (W10): request-driven and `--evict` switching bounds.
+    const SWITCHING: &[(&str, FieldSpec)] = &[("drain_timeout", DURATION)];
+    /// SPEC §17 (M80): router observability. `timing_header` adds the
+    /// `x-mllm-timing` response header; off unless set.
+    const OBSERVABILITY: &[(&str, FieldSpec)] = &[("timing_header", SCALAR)];
     const STANDALONE_HOST: &[(&str, FieldSpec)] = &[
         ("name", SCALAR),
         ("state_dir", SCALAR),
@@ -279,6 +311,27 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("name", SCALAR),
                 ("listeners", LISTENERS),
                 ("scheduler", FieldSpec::Struct(SCHEDULER)),
+                ("state_dir", SCALAR),
+                ("identity_dir", SCALAR),
+                ("enrollment", FieldSpec::RequiredStruct(&[
+                    ("bootstrap_address", SCALAR),
+                    ("control_address", SCALAR),
+                ])),
+                ("shutdown", FieldSpec::Struct(SHUTDOWN)),
+                // SPEC §6.5, §16.1 (W5): the controller-owned idle policy.
+                ("lifecycle_defaults", FieldSpec::Struct(&[
+                    ("ready_idle_timeout", DURATION),
+                    ("parked_idle_timeout", DURATION),
+                ])),
+                // Owner decision 2026-09-23: control-session heartbeat bounds.
+                ("control", FieldSpec::Struct(&[
+                    ("heartbeat_suspend_after", DURATION),
+                    ("heartbeat_lost_after", DURATION),
+                ])),
+                // SPEC §10 (W10): the switch drain bound.
+                ("switching", FieldSpec::Struct(SWITCHING)),
+                // SPEC §17 (M80): router observability.
+                ("observability", FieldSpec::Struct(OBSERVABILITY)),
             ],
         },
         ConfigKind::Host => &KindSchema {
@@ -291,12 +344,19 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("kind", SCALAR),
                 ("name", SCALAR),
                 ("model_store", MODEL_STORE),
+                ("state_dir", SCALAR),
+                ("identity_dir", SCALAR),
+                ("runtime_dir", SCALAR),
+                ("ingress", FieldSpec::Struct(&[("bind", SCALAR), ("address", SCALAR), ("transport", SCALAR)])),
                 ("listeners", LISTENERS),
                 ("hardware_fingerprint", SCALAR),
                 ("environment_fingerprint", SCALAR),
                 ("device_inventory_digest", SCALAR),
                 ("resource_policy", FieldSpec::Struct(F2_RESOURCE_POLICY)),
                 ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
+                // Role-local: the period of the agent's engine load reports.
+                ("load_report_interval", DURATION),
+                ("shutdown", FieldSpec::Struct(SHUTDOWN)),
             ],
         },
         ConfigKind::Deployment => &KindSchema {
@@ -305,6 +365,18 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
+                // ADR 0013 §2: `host` is shorthand for `placement.hosts: [host]`.
+                ("host", SCALAR),
+                ("instances", SCALAR),
+                (
+                    "placement",
+                    FieldSpec::Struct(&[
+                        ("hosts", FieldSpec::Seq(&SCALAR)),
+                        ("selector", FieldSpec::MapOf(&SCALAR)),
+                        ("strategy", SCALAR),
+                        ("max_per_host", SCALAR),
+                    ]),
+                ),
                 ("model", FieldSpec::ScalarOrStruct(MODEL)),
                 ("routes", FieldSpec::Seq(&SCALAR)),
                 ("runtime_profile", SCALAR),
@@ -313,9 +385,21 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("residency", SCALAR),
                 ("recovery", SCALAR),
                 ("devices", FieldSpec::Seq(&DEVICE)),
+                // ADR 0014 §5: optional; when omitted the phases are derived
+                // from `engine_config.memory`.
                 ("resources", FieldSpec::Struct(RECIPE)),
+                ("engine_config", ENGINE_CONFIG),
                 ("request_deadline", DURATION),
+                // ADR 0014 amendment A1: deployment-level lifecycle bounds,
+                // beside `request_deadline`; derived when omitted.
+                (
+                    "timeouts",
+                    FieldSpec::Struct(&[("initialize", DURATION), ("wake", DURATION)]),
+                ),
                 ("env", FieldSpec::Struct(NO_FIELDS)),
+                // SPEC §6.5 (ADR 0013 amendment 2026-09-23): the warm-residency
+                // commitment, a deployment-level policy like `instances`.
+                ("lifecycle", FieldSpec::Struct(&[("warm", SCALAR)])),
             ],
         },
         ConfigKind::Standalone => &KindSchema {
@@ -326,6 +410,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("name", SCALAR),
                 ("server", FieldSpec::Struct(STANDALONE_SERVER)),
                 ("host", FieldSpec::Struct(STANDALONE_HOST)),
+                ("shutdown", FieldSpec::Struct(SHUTDOWN)),
             ],
         },
     }

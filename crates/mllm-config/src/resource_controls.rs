@@ -89,6 +89,7 @@ impl ResourceControls {
             || !(1..=3_600_000).contains(&self.queue.request_deadline_ms)
             || !(1..=30_000).contains(&self.queue.admission_window_ms)
             || self.queue.admission_window_ms > self.queue.request_deadline_ms
+            || !(1_000..=3_600_000).contains(&self.queue.stream_idle_ms)
         {
             return Err(invalid("invalid bounded resource controls"));
         }
@@ -114,7 +115,9 @@ impl ResourceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effective::{DevicePolicy, DomainMemory, DomainPolicy, PortRange, QueuePolicy, Sharing};
+    use crate::effective::{
+        DevicePolicy, DomainMemory, DomainPolicy, PortRange, QueuePolicy, Sharing,
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     fn host() -> crate::effective::HostPolicy {
@@ -129,9 +132,9 @@ mod tests {
             devices: BTreeMap::from([(
                 "gpu0".into(),
                 DevicePolicy {
-                    physical_gpu_uuid: None,
                     domain: "system".into(),
                     sharing: Sharing::Exclusive,
+                    physical_gpu_uuid: None,
                 },
             )]),
             max_parked: controls.max_parked,
@@ -173,6 +176,7 @@ mod tests {
                 max_buffered_bytes_total: 1 << 30,
                 request_deadline_ms: 3_600_000,
                 admission_window_ms: 30_000,
+                stream_idle_ms: 3_600_000,
             },
             device_sharing: Sharing::Shared,
             device_sharing_overrides: BTreeMap::from([("gpu0".into(), Sharing::Exclusive)]),

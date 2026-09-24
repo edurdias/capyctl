@@ -1,0 +1,172 @@
+{
+  "host": {
+    "device_sharing": "shared",
+    "devices": {
+      "gpu0": {
+        "domain": "unified",
+        "sharing": "shared"
+      }
+    },
+    "domains": {
+      "unified": {
+        "free_reserve": 17179869184,
+        "host_kv_limit": 4294967296,
+        "managed_limit": 34359738368,
+        "memory": "unified",
+        "parked_limit": 8589934592
+      }
+    },
+    "endpoint_port_range": {
+      "end": 8199,
+      "start": 8100
+    },
+    "environment_fingerprint": "env-01",
+    "hardware_fingerprint": "hw-01",
+    "max_parked": 16,
+    "model_store": "/srv/models",
+    "name": "lab",
+    "observation_ttl_ms": 2000,
+    "planner_max_states": 4096,
+    "queue": {
+      "admission_window_ms": 2000,
+      "max_buffered_bytes_total": 67108864,
+      "max_pending_per_deployment": 64,
+      "max_pending_total": 256,
+      "request_deadline_ms": 600000
+    }
+  },
+  "model": {
+    "content_fingerprint": "sha256:model",
+    "resolved_path": "/srv/models/toy",
+    "revision": "r1",
+    "source": {
+      "path": "/srv/models/toy",
+      "type": "local"
+    }
+  },
+  "name": "toy",
+  "profile": {
+    "args": [
+      "--max-model-len",
+      "4096"
+    ],
+    "build_fingerprint": "vllm-build-1",
+    "engine": "vllm",
+    "env": {
+      "RUST_LOG": "info"
+    },
+    "executable": "/bin/true",
+    "launch_settings": {
+      "block_size_tokens": 16,
+      "cpu_offload_bytes": 0,
+      "enable_sleep_mode": true,
+      "engine": "vllm",
+      "kv_cache_dtype": "auto",
+      "pipeline_parallel_size": 1,
+      "requested_budget": {
+        "gpu_utilization_pct": 75,
+        "kv_cache_bytes": 4294967296,
+        "swap_space_bytes": 0
+      },
+      "tensor_parallel_size": 1
+    },
+    "log_policy": {
+      "max_file_bytes": 16777216,
+      "retained_files": 3
+    },
+    "revision": 7,
+    "security": {
+      "admin_credential_ref": null,
+      "credential_ref": "secret://engine-key",
+      "deep_park": "enabled",
+      "trust_remote_code": false
+    }
+  },
+  "recipe": "standard",
+  "recipe_fingerprint": "751975f79429dadf0676247ee9a5c46c656bc07b374011841123128ad58871ce",
+  "recovery": "reconcile",
+  "request_deadline_ms": 300000,
+  "residency": "deep",
+  "resources": {
+    "cold": {
+      "allocations": [
+        {
+          "bytes": 10737418240,
+          "domain": "unified",
+          "host_kv_bytes": 1073741824
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    },
+    "parked": {
+      "allocations": [
+        {
+          "bytes": 2147483648,
+          "domain": "unified",
+          "host_kv_bytes": 0
+        }
+      ],
+      "devices": []
+    },
+    "parking": {
+      "allocations": [
+        {
+          "bytes": 9663676416,
+          "domain": "unified",
+          "host_kv_bytes": 1073741824
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    },
+    "ready": {
+      "allocations": [
+        {
+          "bytes": 8589934592,
+          "domain": "unified",
+          "host_kv_bytes": 1073741824
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    },
+    "wake": {
+      "allocations": [
+        {
+          "bytes": 10737418240,
+          "domain": "unified",
+          "host_kv_bytes": 1073741824
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    }
+  },
+  "routes": [
+    "toy"
+  ],
+  "schema_version": 1,
+  "selected_devices": [
+    {
+      "id": "gpu0",
+      "sharing": "shared"
+    }
+  ]
+}

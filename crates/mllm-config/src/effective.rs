@@ -1,19 +1,49 @@
 //! Pure resolution of strict manifests into immutable, serializable launch inputs.
 
+mod checkpoint;
 mod core;
 mod current_policy;
-pub mod sglang;
+mod engine_config;
+mod legacy;
 mod snapshot;
+mod startup;
+mod timeouts;
+pub use legacy::{
+    is_legacy_effective, legacy_engine_config, legacy_retained_deployment,
+    migrate_legacy_effective, strip_legacy_launch_settings, LegacyEffectiveMigration,
+    LegacyRefusal,
+};
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
+pub use engine_config::{
+    default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
+    MemoryInputs, ResolvedMemory, STARTUP_WEIGHTS_FACTOR,
+    PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES, VLLM_OVERHEAD_MARGIN_BYTES,
+};
 pub use snapshot::decode_effective_snapshot;
+// Owner decision 2026-09-23: the startup memory budget.
+pub use startup::{
+    measurable, startup_budget, validate_declared_startup, StartupBudget, StartupProvenance,
+};
+// Owner decision 2026-09-22 (1), ADR 0014 amendment A1: lifecycle timeouts.
+pub use timeouts::{
+    derived_initialize_ms, derived_wake_ms, lifecycle_windows, validate_declared_timeouts,
+    DeploymentTimeouts, TimeoutBasis, TimeoutSource, INITIALIZE_BASE_MS, INITIALIZE_CAP_MS,
+    INITIALIZE_PER_GB_MS, MIN_INITIALIZE_MS, MIN_WAKE_MS, PENDING_INITIALIZE_MS,
+    PENDING_WAKE_MS, STOP_WINDOW_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
+};
+// ADR 0014 §7 (WE3): checkpoint identity.
+pub use checkpoint::{
+    checkpoint_location, declared_checkpoint_digest, is_checkpoint_digest,
+    resolve_snapshot_with_checkpoint, CheckpointLocation, CHECKPOINT_DIGEST_PREFIX,
+};
 
-use crate::engine_policy::{normalize_option_name, validate_profile_args, validate_profile_env};
+use crate::engine_policy::{
+    normalize_option_name, validate_profile_args, validate_profile_env, ExtraArgsPolicy,
+};
 use crate::resource_controls::{ResourceContext, ResourceControls};
 use crate::{ConfigError, ConfigErrorCode};
-use mllm_domain::launch::{
-    ProfileLaunchSettings, SglangLaunchSettings, SglangRequestedBudget, VllmLaunchSettings,
-    VllmRequestedBudget,
-};
+use engine_config::RawEngineConfig;
+use mllm_domain::launch::LaunchSettings;
 use mllm_domain::resources as domain;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +59,9 @@ const DEFAULT_PENDING_TOTAL: u32 = 256;
 const DEFAULT_QUEUED_BYTES: i64 = 64 << 20;
 const DEFAULT_REQUEST_DEADLINE_MS: i64 = 600_000;
 const DEFAULT_ADMISSION_WINDOW_MS: i64 = 2_000;
+/// SPEC §10: how long a relayed stream may go without a backend event before
+/// the router gives up on it. Not a cap on a progressing stream's length.
+pub const DEFAULT_STREAM_IDLE_MS: i64 = 120_000;
 const DEFAULT_OBSERVATION_TTL_MS: i64 = 2_000;
 const DEFAULT_PLANNER_STATES: u32 = 4_096;
 const DEFAULT_MAX_PARKED: u32 = 16;
@@ -139,6 +172,13 @@ pub struct EffectiveDeployment {
     pub selected_devices: Vec<DeviceClaim>,
     pub resources: RecipeFootprints,
     pub request_deadline_ms: i64,
+    /// ADR 0014 amendment A1: the Initialize and wake timeouts, declared or
+    /// derived from the checkpoint's weights, with provenance (T14). Not part
+    /// of the recipe fingerprint: it bounds operations, not what is launched.
+    pub timeouts: DeploymentTimeouts,
+    /// ADR 0014 §1: the deployment's resolved engine configuration, with the
+    /// values mllm derived or defaulted named in its provenance (T14).
+    pub engine_config: LaunchSettings,
     pub profile: RuntimeProfile,
     pub host: HostPolicy,
     pub recipe_fingerprint: String,
@@ -268,21 +308,24 @@ pub struct RuntimeProfile {
     pub revision: u64,
     pub executable: String,
     pub build_fingerprint: String,
+    /// ADR 0014 §1: host-fixed arguments of the installation.
     pub args: Vec<String>,
-    pub launch_settings: ProfileLaunchSettings,
     pub env: BTreeMap<String, String>,
     pub security: Security,
     pub log_policy: LogPolicy,
 }
 
 /// Whether this profile may park at all.
-/// SPEC §9.1 / T21: the current working agreement requires explicit host opt-in.
+/// SPEC §9.1 / T21 / ADR 0012: deep parking is enabled unless host policy
+/// forbids it; `deep_park: disabled` is the host opt-out. Enablement never
+/// relaxes the mandatory controls (loopback engine listener, per-launch key,
+/// guard middleware, no control path through ingress or the router).
 /// Legacy `experimental_controls` remains rejected by `Security`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeepPark {
-    Enabled,
     #[default]
+    Enabled,
     Disabled,
 }
 
@@ -292,17 +335,120 @@ impl DeepPark {
     }
 }
 
+/// SPEC §7 / T14: where a profile's `deep_park` value came from. Derived at
+/// resolution, never declared: a host document naming it is refused as an
+/// unknown field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepParkSource {
+    /// The host policy declared `deep_park`.
+    #[default]
+    HostPolicy,
+    /// The host policy omitted it and the ADR 0012 default applied.
+    Default,
+}
+
+impl DeepParkSource {
+    pub fn is_host_policy(&self) -> bool {
+        matches!(self, Self::HostPolicy)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawSecurity")]
 pub struct Security {
-    #[serde(default)]
     pub deep_park: DeepPark,
+    /// SPEC §7 / T14: shown only when the value was defaulted, so a profile that
+    /// declares the switch serializes exactly as it did before provenance existed.
+    #[serde(skip_serializing_if = "DeepParkSource::is_host_policy")]
+    pub deep_park_source: DeepParkSource,
     /// Whether this profile may run an engine flag that executes Python shipped
     /// inside a checkpoint. SPEC §3: off unless the host says otherwise.
-    #[serde(default)]
     pub trust_remote_code: bool,
     pub credential_ref: Option<String>,
     pub admin_credential_ref: Option<String>,
+    /// ADR 0014 §6 (owner decision Q10): deployment extra arguments are allowed
+    /// unless the host denies them.
+    pub extra_args: ExtraArgsPolicy,
+    /// ADR 0014 §8: security-sensitive options approved by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_options: Vec<String>,
+    /// ADR 0014 §8: directories an approved path option may name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approved_paths: Vec<String>,
+    /// ADR 0008 (owner decision 2026-09-23): what a launch does when the
+    /// installation no longer measures to the fingerprint recorded at
+    /// registration. Shown only when the host declared `refuse`, so a profile
+    /// without it serializes exactly as before.
+    #[serde(skip_serializing_if = "InstallationDrift::is_warn")]
+    pub installation_drift: InstallationDrift,
+}
+
+/// ADR 0008 (owner decision 2026-09-23): host policy for installation drift.
+/// `warn` (the default) flags drift in the host's status and the event journal
+/// and launches; `refuse` refuses the launch with the closed reason
+/// `installation_drift` before any effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationDrift {
+    #[default]
+    Warn,
+    Refuse,
+}
+
+impl InstallationDrift {
+    pub fn is_warn(&self) -> bool {
+        matches!(self, Self::Warn)
+    }
+}
+
+/// The declared shape of a profile's `security` block. `deep_park` is optional
+/// here so resolution can tell a declared value from the ADR 0012 default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecurity {
+    // An explicit `null` is not an omission: it is refused like any other
+    // value that is neither `enabled` nor `disabled`.
+    #[serde(default, deserialize_with = "declared_deep_park")]
+    deep_park: Option<DeepPark>,
+    #[serde(default)]
+    trust_remote_code: bool,
+    credential_ref: Option<String>,
+    admin_credential_ref: Option<String>,
+    #[serde(default)]
+    extra_args: ExtraArgsPolicy,
+    #[serde(default)]
+    approved_options: Vec<String>,
+    #[serde(default)]
+    approved_paths: Vec<String>,
+    #[serde(default)]
+    installation_drift: InstallationDrift,
+}
+
+fn declared_deep_park<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DeepPark>, D::Error> {
+    DeepPark::deserialize(deserializer).map(Some)
+}
+
+impl From<RawSecurity> for Security {
+    fn from(raw: RawSecurity) -> Self {
+        let (deep_park, deep_park_source) = match raw.deep_park {
+            Some(declared) => (declared, DeepParkSource::HostPolicy),
+            None => (DeepPark::default(), DeepParkSource::Default),
+        };
+        Self {
+            deep_park,
+            deep_park_source,
+            trust_remote_code: raw.trust_remote_code,
+            credential_ref: raw.credential_ref,
+            admin_credential_ref: raw.admin_credential_ref,
+            extra_args: raw.extra_args,
+            approved_options: raw.approved_options,
+            approved_paths: raw.approved_paths,
+            installation_drift: raw.installation_drift,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -386,6 +532,15 @@ pub struct QueuePolicy {
     pub max_buffered_bytes_total: i64,
     pub request_deadline_ms: i64,
     pub admission_window_ms: i64,
+    /// SPEC §10: the idle bound between a relayed stream's backend events
+    /// (`queue.stream_idle_timeout`). Omitted from the encoding at its default,
+    /// so policies published before it existed keep their identity.
+    #[serde(skip_serializing_if = "is_default_stream_idle")]
+    pub stream_idle_ms: i64,
+}
+
+fn is_default_stream_idle(value: &i64) -> bool {
+    *value == DEFAULT_STREAM_IDLE_MS
 }
 
 #[derive(Deserialize)]
@@ -402,8 +557,30 @@ struct DeploymentInput {
     residency: Residency,
     recovery: Recovery,
     devices: Vec<DeviceClaim>,
-    resources: RawRecipe,
+    /// ADR 0014 §5: optional; derived from `engine_config.memory` when omitted.
+    #[serde(default)]
+    resources: Option<RawRecipe>,
     request_deadline: Option<String>,
+    /// ADR 0014 amendment A1: optional; derived when omitted.
+    #[serde(default)]
+    timeouts: Option<timeouts::RawTimeouts>,
+    #[serde(default)]
+    engine_config: RawEngineConfig,
+    /// ADR 0013 §2: instance count, placement constraints and the `host`
+    /// shorthand are deployment-level and shared by every instance; they are
+    /// validated by `instances::parse_instance_spec` and never enter the
+    /// per-host recipe or its fingerprint.
+    #[serde(default, rename = "instances")]
+    _instances: Option<serde_json::Value>,
+    #[serde(default, rename = "placement")]
+    _placement: Option<serde_json::Value>,
+    #[serde(default, rename = "host")]
+    _host: Option<serde_json::Value>,
+    /// SPEC §6.5 (ADR 0013 amendment 2026-09-23): `lifecycle.warm` is a
+    /// deployment-level policy parsed with the instance spec; it never enters
+    /// the per-host recipe or its fingerprint.
+    #[serde(default, rename = "lifecycle")]
+    _lifecycle: Option<serde_json::Value>,
 }
 /// A deployment's `model` block as written. SPEC §7 accepts two spellings: the
 /// original `path`, and `source`, which can also name a remote origin. Exactly one
@@ -473,6 +650,10 @@ struct RawHostPolicy {
     endpoint_port_range: PortRange,
     planner_max_states: Option<u32>,
     queue: Option<RawQueue>,
+    /// ADR 0013 §2: placement labels, validated by
+    /// `instances::host_labels`; they select hosts and change no resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    labels: Option<BTreeMap<String, String>>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -498,6 +679,8 @@ struct RawQueue {
     request_deadline: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admission_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_idle_timeout: Option<String>,
 }
 
 /// Composes the `resource_policy` object of a host document's raw JSON shape from
@@ -563,7 +746,10 @@ pub fn compose_resource_policy(
             max_buffered_bytes_total: Some(format!("{}B", controls.queue.max_buffered_bytes_total)),
             request_deadline: Some(format!("{}ms", controls.queue.request_deadline_ms)),
             admission_window: Some(format!("{}ms", controls.queue.admission_window_ms)),
+            stream_idle_timeout: (controls.queue.stream_idle_ms != DEFAULT_STREAM_IDLE_MS)
+                .then(|| format!("{}ms", controls.queue.stream_idle_ms)),
         }),
+        labels: None,
     };
     serde_json::to_value(&raw).expect("Raw* composition types always encode to JSON")
 }
@@ -575,7 +761,6 @@ struct RawProfile {
     executable: String,
     build_fingerprint: String,
     args: Vec<String>,
-    launch_settings: RawLaunchSettings,
     env: BTreeMap<String, String>,
     security: Security,
     log_policy: RawLogPolicy,
@@ -585,75 +770,6 @@ struct RawProfile {
 struct RawLogPolicy {
     max_file_bytes: String,
     retained_files: u32,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
-enum RawLaunchSettings {
-    Vllm {
-        tensor_parallel_size: u32,
-        pipeline_parallel_size: u32,
-        enable_sleep_mode: bool,
-        kv_cache_dtype: String,
-        block_size_tokens: u32,
-        cpu_offload_bytes: String,
-        requested_budget: RawVllmBudget,
-    },
-    Sglang {
-        recipe: String,
-        requested_budget: RawSglangBudget,
-        #[serde(default)]
-        tensor_parallel_size: Option<u32>,
-        #[serde(default)]
-        data_parallel_size: Option<u32>,
-        #[serde(default)]
-        tokenizer_workers: Option<u32>,
-        #[serde(default)]
-        model_dtype: Option<String>,
-        #[serde(default)]
-        context_tokens: Option<u32>,
-        #[serde(default)]
-        max_running_requests: Option<u32>,
-        #[serde(default)]
-        max_total_tokens: Option<u32>,
-        #[serde(default)]
-        prefill_cuda_graphs: Option<bool>,
-        #[serde(default)]
-        decode_cuda_graphs: Option<bool>,
-        #[serde(default)]
-        memory_saver: Option<bool>,
-        #[serde(default)]
-        cpu_weight_backup: Option<bool>,
-        #[serde(default)]
-        speculative_decoding: Option<bool>,
-        #[serde(default)]
-        lora: Option<bool>,
-        #[serde(default)]
-        trust_remote_code: Option<bool>,
-        #[serde(default)]
-        disaggregation: Option<bool>,
-        #[serde(default)]
-        external_cache: Option<bool>,
-        #[serde(default)]
-        cpu_kv_offload: Option<bool>,
-        #[serde(default)]
-        native_grpc: Option<bool>,
-        #[serde(default)]
-        weight_restore: Option<String>,
-    },
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawVllmBudget {
-    kv_cache_bytes: String,
-    swap_space_bytes: String,
-    gpu_utilization_pct: u8,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSglangBudget {
-    kv_cache_bytes: String,
-    static_memory_fraction_bps: u16,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(
@@ -705,208 +821,6 @@ fn decode<T: for<'de> Deserialize<'de>>(
     })
 }
 
-fn normalize_launch(
-    raw: RawLaunchSettings,
-    engine: Engine,
-    residency: Residency,
-) -> Result<ProfileLaunchSettings, ConfigError> {
-    let settings = match raw {
-        RawLaunchSettings::Vllm {
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            enable_sleep_mode,
-            kv_cache_dtype,
-            block_size_tokens,
-            cpu_offload_bytes,
-            requested_budget,
-        } => {
-            if engine != Engine::Vllm {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.engine",
-                    "launch settings engine mismatch",
-                ));
-            }
-            let value = VllmLaunchSettings {
-                tensor_parallel_size,
-                pipeline_parallel_size,
-                enable_sleep_mode,
-                kv_cache_dtype,
-                block_size_tokens,
-                cpu_offload_bytes: parse_bytes(&cpu_offload_bytes)?,
-                requested_budget: VllmRequestedBudget {
-                    kv_cache_bytes: parse_bytes(&requested_budget.kv_cache_bytes)?,
-                    swap_space_bytes: parse_bytes(&requested_budget.swap_space_bytes)?,
-                    gpu_utilization_pct: requested_budget.gpu_utilization_pct,
-                },
-            };
-            if value.tensor_parallel_size == 0
-                || value.pipeline_parallel_size == 0
-                || value.block_size_tokens == 0
-                || value.kv_cache_dtype.is_empty()
-                || value.cpu_offload_bytes < 0
-                || value.requested_budget.kv_cache_bytes <= 0
-                || value.requested_budget.swap_space_bytes < 0
-                || !(1..=100).contains(&value.requested_budget.gpu_utilization_pct)
-            {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings",
-                    "invalid vLLM launch settings",
-                ));
-            }
-            // Spec §3: sleep mode is no longer refused here when the deployment
-            // parks. The effective sleep behaviour is `enable_sleep_mode &&
-            // deep_park == Enabled`, derived where the launch is rendered; a
-            // profile that declares a parking residency with sleep mode off is a
-            // profile that will restart instead, not a configuration error.
-            ProfileLaunchSettings::Vllm(value)
-        }
-        RawLaunchSettings::Sglang {
-            recipe,
-            requested_budget,
-            tensor_parallel_size,
-            data_parallel_size,
-            tokenizer_workers,
-            model_dtype,
-            context_tokens,
-            max_running_requests,
-            max_total_tokens,
-            prefill_cuda_graphs,
-            decode_cuda_graphs,
-            memory_saver,
-            cpu_weight_backup,
-            speculative_decoding,
-            lora,
-            trust_remote_code,
-            disaggregation,
-            external_cache,
-            cpu_kv_offload,
-            native_grpc,
-            weight_restore,
-        } => {
-            if engine != Engine::Sglang {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.engine",
-                    "launch settings engine mismatch",
-                ));
-            }
-            const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
-            if recipe != RECIPE {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.recipe",
-                    "unsupported SGLang recipe",
-                ));
-            }
-            let budget = SglangRequestedBudget {
-                kv_cache_bytes: parse_bytes(&requested_budget.kv_cache_bytes)?,
-                static_memory_fraction_bps: requested_budget.static_memory_fraction_bps,
-            };
-            if budget.kv_cache_bytes <= 0
-                || !(1..=10_000).contains(&budget.static_memory_fraction_bps)
-            {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings.requested_budget",
-                    "invalid SGLang requested budget",
-                ));
-            }
-            // SGLang takes its park strategy at launch: --enable-memory-saver and
-            // --enable-weights-cpu-backup cannot be added to a running engine. The
-            // declared tier therefore has to reach the launch settings, unlike
-            // vLLM's level, which is a parameter of the sleep call.
-            let memory_saver_required = residency.parks();
-            let cpu_weight_backup_required = residency == Residency::HostBacked;
-            let weight_restore_derived = if cpu_weight_backup_required {
-                // --enable-weights-cpu-backup, available since SGLang v0.5: weights
-                // are copied to pinned host memory on sleep and restored from there.
-                "cpu_backup"
-            } else {
-                "disk_reload"
-            };
-            // SPEC §8.1: a profile may carry the recipe's own fields; a declared value must
-            // agree with the derived pinned shape, and drift is refused closed
-            // rather than silently reconciled (found live: a profile whose shape
-            // disagreed with its residency failed the frozen launch contract
-            // later, where the reason was harder to see).
-            const PINNED: [(&str, Option<bool>); 9] = [
-                ("prefill_cuda_graphs", Some(false)),
-                ("decode_cuda_graphs", Some(false)),
-                ("speculative_decoding", Some(false)),
-                ("lora", Some(false)),
-                ("disaggregation", Some(false)),
-                ("external_cache", Some(false)),
-                ("cpu_kv_offload", Some(false)),
-                ("native_grpc", Some(false)),
-                ("trust_remote_code", Some(false)),
-            ];
-            let mut mismatch = Vec::new();
-            for (name, expected) in PINNED {
-                let declared = match name {
-                    "prefill_cuda_graphs" => prefill_cuda_graphs,
-                    "decode_cuda_graphs" => decode_cuda_graphs,
-                    "speculative_decoding" => speculative_decoding,
-                    "lora" => lora,
-                    "disaggregation" => disaggregation,
-                    "external_cache" => external_cache,
-                    "cpu_kv_offload" => cpu_kv_offload,
-                    "trust_remote_code" => trust_remote_code,
-                    _ => native_grpc,
-                };
-                if declared.is_some() && declared != expected {
-                    mismatch.push(name);
-                }
-            }
-            if memory_saver.is_some_and(|value| value != memory_saver_required) {
-                mismatch.push("memory_saver");
-            }
-            if cpu_weight_backup.is_some_and(|value| value != cpu_weight_backup_required) {
-                mismatch.push("cpu_weight_backup");
-            }
-            if weight_restore.as_deref().is_some_and(|value| value != weight_restore_derived) {
-                mismatch.push("weight_restore");
-            }
-            if tensor_parallel_size.is_some_and(|value| value != 1)
-                || data_parallel_size.is_some_and(|value| value != 1)
-                || tokenizer_workers.is_some_and(|value| value != 1)
-                || model_dtype.as_deref().is_some_and(|value| value != "bfloat16")
-                || context_tokens.is_some_and(|value| value != 4096)
-                || max_running_requests.is_some_and(|value| value != 8)
-                || max_total_tokens.is_some_and(|value| value != 4096)
-            {
-                mismatch.push("a pinned-recipe field");
-            }
-            if !mismatch.is_empty() {
-                return Err(invalid(
-                    "runtime_profiles.launch_settings",
-                    "launch settings disagree with the pinned SGLang recipe",
-                ));
-            }
-            ProfileLaunchSettings::Sglang(SglangLaunchSettings {
-                recipe,
-                tensor_parallel_size: 1,
-                data_parallel_size: 1,
-                tokenizer_workers: 1,
-                model_dtype: "bfloat16".into(),
-                context_tokens: 4096,
-                max_running_requests: 8,
-                max_total_tokens: 4096,
-                prefill_cuda_graphs: false,
-                decode_cuda_graphs: false,
-                memory_saver: memory_saver_required,
-                cpu_weight_backup: cpu_weight_backup_required,
-                speculative_decoding: false,
-                lora: false,
-                trust_remote_code: false,
-                disaggregation: false,
-                external_cache: false,
-                cpu_kv_offload: false,
-                native_grpc: false,
-                weight_restore: weight_restore_derived.into(),
-                requested_budget: budget,
-            })
-        }
-    };
-    Ok(settings)
-}
-
 fn phase(raw: RawPhase) -> Result<PhaseFootprint, ConfigError> {
     Ok(PhaseFootprint {
         allocations: raw
@@ -924,12 +838,42 @@ fn phase(raw: RawPhase) -> Result<PhaseFootprint, ConfigError> {
     })
 }
 
+fn raw_recipe(raw: RawRecipe) -> Result<RecipeFootprints, ConfigError> {
+    Ok(RecipeFootprints {
+        cold: phase(raw.cold)?,
+        ready: phase(raw.ready)?,
+        parking: phase(raw.parking)?,
+        parked: phase(raw.parked)?,
+        wake: phase(raw.wake)?,
+    })
+}
+
+/// Decode a host document, refusing moved fields with a pointer first.
+fn decode_host(host: &serde_json::Value) -> Result<HostInput, ConfigError> {
+    engine_config::refuse_moved_profile_fields(host)?;
+    decode(host, "host")
+}
+
 pub fn resolve_effective(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
 ) -> Result<EffectiveDeployment, ConfigError> {
+    resolve_effective_with_checkpoint(deployment, host, CheckpointFacts::default())
+}
+
+/// ADR 0014 §5, §7: resolve with what the checkpoint manifest says, so a memory
+/// request the deployment omitted can be derived from the weights' size. Both
+/// sides of a launch must resolve with the same facts to agree on the result.
+pub fn resolve_effective_with_checkpoint(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    facts: CheckpointFacts,
+) -> Result<EffectiveDeployment, ConfigError> {
     let d: DeploymentInput = decode(deployment, "deployment")?;
-    let h: HostInput = decode(host, "host")?;
+    let h: HostInput = decode_host(host)?;
+    // ADR 0013 §2–3: refuse an unplaceable or contradictory instance
+    // declaration before resolving anything against this host.
+    crate::instances::parse_instance_spec(deployment)?;
     if d.schema_version != 1 || d.kind != "deployment" {
         return Err(invalid(
             "schema_version",
@@ -951,19 +895,55 @@ pub fn resolve_effective(
         .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
     let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
     let host = core::normalize_host(h)?;
+    let model = core::normalize_model(d.model, Some(&host.model_store))?;
+    let declared_resources = d.resources.map(raw_recipe).transpose()?;
+    let declared_ready_total = declared_resources.as_ref().map(|resources| {
+        resources
+            .ready
+            .allocations
+            .iter()
+            .fold(0_i64, |total, a| total.saturating_add(a.bytes))
+    });
+    let mut engine_config = engine_config::normalize_engine_config(
+        d.engine_config,
+        engine_config::EngineInputs {
+            engine: profile.engine,
+            residency: d.residency,
+            security: &profile.security,
+            profile_args: &profile.args,
+            checkpoint_root: model.resolved_path.as_deref().map(Path::new),
+            declared_ready_total,
+            facts,
+        },
+    )?;
+    let resources = match declared_resources {
+        Some(resources) => resources,
+        None => {
+            let derived = engine_config::derive_resources(
+                engine_config.memory().request_bytes,
+                engine_config.memory().startup_bytes,
+                d.residency,
+                &d.devices,
+                &host,
+            )?;
+            let provenance = match &mut engine_config {
+                LaunchSettings::Vllm(settings) => &mut settings.provenance,
+                LaunchSettings::Sglang(settings) => &mut settings.provenance,
+            };
+            provenance.insert(
+                "resources".into(),
+                mllm_domain::launch::SettingSource::Derived,
+            );
+            derived
+        }
+    };
     let recipe = core::NormalizedRecipe {
-        model: core::normalize_model(d.model, Some(&host.model_store))?,
+        model,
         recipe: d.recipe,
         residency: d.residency,
         recovery: d.recovery,
         devices: d.devices,
-        resources: RecipeFootprints {
-            cold: phase(d.resources.cold)?,
-            ready: phase(d.resources.ready)?,
-            parking: phase(d.resources.parking)?,
-            parked: phase(d.resources.parked)?,
-            wake: phase(d.resources.wake)?,
-        },
+        resources,
         request_deadline_ms: d
             .request_deadline
             .as_deref()
@@ -972,8 +952,9 @@ pub fn resolve_effective(
             .unwrap_or(host.queue.request_deadline_ms),
     };
     core::validate_recipe(&recipe, &host)?;
-    core::validate_requested_budget(&profile.launch_settings, &recipe.resources)?;
-    let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &host)?;
+    let timeouts =
+        timeouts::resolve_timeouts(d.timeouts.as_ref(), recipe.request_deadline_ms, facts)?;
+    let recipe_fingerprint = core::recipe_fingerprint(&recipe, &profile, &engine_config, &host)?;
     Ok(EffectiveDeployment {
         schema_version: 1,
         name: d.name,
@@ -985,13 +966,14 @@ pub fn resolve_effective(
         selected_devices: recipe.devices,
         resources: recipe.resources,
         request_deadline_ms: recipe.request_deadline_ms,
+        timeouts,
+        engine_config,
         profile: RuntimeProfile {
             engine: profile.engine,
             revision: profile.revision,
             executable: profile.executable,
             build_fingerprint: profile.build_fingerprint,
             args: profile.args,
-            launch_settings: profile.launch_settings,
             env: profile.env,
             security: profile.security,
             log_policy: profile.log_policy,
@@ -999,6 +981,11 @@ pub fn resolve_effective(
         host,
         recipe_fingerprint,
     })
+}
+
+/// SPEC §7: normalize a declared host policy without selecting or launching a model.
+pub fn normalize_host_policy(host: &serde_json::Value) -> Result<HostPolicy, ConfigError> {
+    core::normalize_host(decode_host(host)?)
 }
 
 pub fn binding_fingerprint(

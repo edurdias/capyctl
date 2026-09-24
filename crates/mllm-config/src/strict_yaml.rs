@@ -424,6 +424,11 @@ fn check_value(value: &Value, spec: &FieldSpec, path: &str) -> Result<(), Config
             }
             Ok(())
         }
+        FieldSpec::Moved(pointer) => Err(ConfigError::new(
+            ConfigErrorCode::UnknownField,
+            path,
+            *pointer,
+        )),
         FieldSpec::Seq(item) => {
             let seq = value.as_array().ok_or_else(|| {
                 ConfigError::new(ConfigErrorCode::SchemaVersion, path, "expected a sequence")
@@ -570,7 +575,9 @@ mod tests {
     #[test]
     fn event_builder_rejects_duplicate_keys_inside_array_objects() {
         assert_eq!(
-            build_value("items:\n  - id: one\n    id: two\n").unwrap_err().code,
+            build_value("items:\n  - id: one\n    id: two\n")
+                .unwrap_err()
+                .code,
             ConfigErrorCode::DuplicateKey
         );
     }
