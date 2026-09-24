@@ -29,6 +29,7 @@ Start with `AGENTS.md`, then `SPEC.md`.
 | `examples/deployment-single.yaml` | vLLM deployment on one host with `engine_config` and `timeouts`. |
 | `examples/deployment-multinode.yaml` | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
 | `examples/standalone.yaml` | Embedded local server/host shape, as `mllm start standalone` generates it. |
+| `operations/install.md` | Release tarball, systemd units per role, restart versus drain, upgrade and rollback. |
 
 Every example passes `mllm validate config` (deployments also against `examples/host.yaml`);
 `crates/mllm-cli/tests/validate_config.rs` checks this. They illustrate the schema and are

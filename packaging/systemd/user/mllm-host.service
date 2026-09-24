@@ -1,0 +1,79 @@
+# mllm host agent, as a user service (SPEC §4.3: foreground role, OS
+# service definition, no custom daemonization).
+#
+# Install: docs/operations/install.md. Customize with a drop-in
+# (`systemctl --user edit mllm-host`), never by editing this file in place.
+# Keep the user manager running while logged out: `loginctl enable-linger`;
+# otherwise logging out stops the role.
+#
+# Stopping or restarting this unit is a SERVICE RESTART, not a drain.
+# SIGTERM closes admission, lets admitted requests finish within the host
+# document's `shutdown.drain_timeout`, and exits without touching an engine.
+# The engines stay running in their own process groups and the next start
+# re-attaches them (crates/mllm-cli/src/shutdown.rs, owner decision P3). To
+# stop the engines on this host, drain it explicitly BEFORE stopping the unit:
+#
+#     mllm drain host <name> --config <server.yaml>   (on the server)
+#
+# There is deliberately no ExecStop= that drains: a package upgrade or a
+# `systemctl restart` must never stop deployments as a side effect.
+
+[Unit]
+Description=mllm host agent
+Documentation=file://%h/.local/opt/mllm/current/docs/operations/install.md
+
+[Service]
+Type=simple
+# Optional overrides (MLLM_CONFIG, RUST_LOG, ...). The leading '-' makes the
+# file optional.
+Environment=MLLM_CONFIG=%E/mllm/host.yaml
+EnvironmentFile=-%E/mllm/host.env
+ExecStart=%h/.local/opt/mllm/current/bin/mllm start host --config ${MLLM_CONFIG}
+
+# SPEC §4.3: engines must SURVIVE a restart of this unit. systemd's default
+# (control-group) and `mixed` both signal every process in the cgroup, which
+# would kill the engines the host launched. `process` signals the main mllm
+# process only; the engines, launched into their own process groups, keep
+# serving and are re-attached by the next start. They remain in this unit's
+# cgroup, which is why the resource limits below apply to them too.
+KillMode=process
+KillSignal=SIGTERM
+# Must cover the drain: `shutdown.drain_timeout` (default 30s, at most 600s)
+# plus the 2s cancellation grace and teardown. Keep it at least
+# drain_timeout + 60s; raise it in a drop-in when the host document raises
+# drain_timeout. Only the mllm process is killed if it expires.
+TimeoutStopSec=90s
+TimeoutStartSec=90s
+
+Restart=on-failure
+RestartSec=5s
+# Invalid configuration (2), unauthorized/revoked identity (3) and unsupported
+# requests (5) do not heal by restarting.
+RestartPreventExitStatus=2 3 5
+# An engine the kernel OOM-kills is the host's to reconcile; it must not stop
+# the agent (the default OOMPolicy stops the whole unit).
+OOMPolicy=continue
+
+# Engines inherit these limits (they run in this cgroup).
+# The user manager cannot raise the hard limit; keep within it.
+LimitNOFILE=65536:524288
+TasksMax=infinity
+
+# mllm's private state is owner-only (SPEC §13.3).
+UMask=0077
+# The state root, ~/.local/state/mllm (%S/mllm). Role state_dir values live
+# beneath it; it must be a real directory, not a symlink.
+StateDirectory=mllm mllm/tmp
+StateDirectoryMode=0700
+# Engines' temporary files (torch/triton compilation, sockets) go to a private
+# directory instead of the shared /tmp.
+Environment=TMPDIR=%S/mllm/tmp
+
+# User units get no file-system sandboxing: ProtectSystem= and friends need
+# privileges the per-user manager does not have (systemd.exec(5)). The service
+# runs with the invoking user's own rights; the system unit is the hardened
+# form.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

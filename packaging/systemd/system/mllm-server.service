@@ -1,0 +1,90 @@
+# mllm server (controller, scheduler, router), as a system service
+# (SPEC §4.3: foreground role, OS service definition, no custom
+# daemonization).
+#
+# Install: docs/operations/install.md. Customize with a drop-in
+# (`systemctl edit mllm-server`), never by editing this file in place.
+#
+# Stopping or restarting this unit is a SERVICE RESTART, not a drain.
+# SIGTERM closes admission, lets admitted requests finish within the server
+# document's `shutdown.drain_timeout`, and exits. Deployments are not deleted
+# and engines on the hosts keep running; the next start reconciles them
+# (crates/mllm-cli/src/shutdown.rs, owner decision P3). Stopping a host's
+# engines is the explicit `mllm drain host <name>`, run while this server is up.
+#
+# There is deliberately no ExecStop= that drains: a package upgrade or a
+# `systemctl restart` must never stop deployments as a side effect.
+
+[Unit]
+Description=mllm server
+Documentation=file:///opt/mllm/current/docs/operations/install.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mllm
+Group=mllm
+# Optional overrides (MLLM_CONFIG, RUST_LOG, ...). The leading '-' makes the
+# file optional.
+Environment=MLLM_CONFIG=/etc/mllm/server.yaml
+EnvironmentFile=-/etc/mllm/server.env
+ExecStart=/opt/mllm/current/bin/mllm start server --config ${MLLM_CONFIG}
+
+# The server launches no engines, so nothing but mllm runs in this cgroup.
+# `mixed` sends SIGTERM to mllm alone (the drain) and SIGKILL to any stray
+# process once it exits. Host and standalone units use `process` instead,
+# because their engines must outlive a restart.
+KillMode=mixed
+KillSignal=SIGTERM
+# Must cover the drain: `shutdown.drain_timeout` (default 30s, at most 600s)
+# plus the 2s cancellation grace and teardown. Keep it at least
+# drain_timeout + 60s; raise it in a drop-in when the server document raises
+# drain_timeout.
+TimeoutStopSec=90s
+TimeoutStartSec=90s
+
+Restart=on-failure
+RestartSec=5s
+# Invalid configuration (2), unauthorized (3) and unsupported (5) do not heal
+# by restarting.
+RestartPreventExitStatus=2 3 5
+
+LimitNOFILE=1048576
+
+# mllm's private state is owner-only (SPEC §13.3).
+UMask=0077
+# The state root, owned by the service user. The server document's state_dir
+# (for example /var/lib/mllm/server) lives beneath it; mllm creates it 0700.
+# /var/lib/mllm must be a real directory, not a symlink.
+StateDirectory=mllm
+StateDirectoryMode=0700
+
+# Hardening. The server needs no devices, no GPU and no engine environment,
+# so it takes the strict profile.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
