@@ -24,11 +24,15 @@ Start with `AGENTS.md`, then `SPEC.md`.
 | File | Purpose |
 |---|---|
 | `SPEC.md` | Consolidated architecture, requirements, interfaces, resource rules, configuration, milestones, and 40 acceptance scenarios. |
-| `examples/server.yaml` | Explicitly networked server configuration sketch. |
-| `examples/host.yaml` | Host aggregate boundaries and approved runtime profiles. |
-| `examples/deployment-single.yaml` | Single-host resource and lifecycle contract. |
-| `examples/deployment-multinode.yaml` | Two-host resource contract with a private host-cache tier. |
-| `examples/standalone.yaml` | Embedded local server/host shape with safe unresolved defaults. |
+| `examples/server.yaml` | Server role document: loopback management and inference, networked enrollment and control. |
+| `examples/host.yaml` | Host role document: unified-memory resource policy, labels, and vLLM and SGLang installations. |
+| `examples/deployment-single.yaml` | vLLM deployment on one host with `engine_config` and `timeouts`. |
+| `examples/deployment-multinode.yaml` | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
+| `examples/standalone.yaml` | Embedded local server/host shape, as `mllm start standalone` generates it. |
+
+Every example passes `mllm validate config` (deployments also against `examples/host.yaml`);
+`crates/mllm-cli/tests/validate_config.rs` checks this. They illustrate the schema and are
+not calibrated engine recipes.
 
 Revision 0.2 supersedes `mllm-initial-design.md` revision 0.1 and incorporates the subsequent design decisions. The old file is not repeated in the bundle to avoid conflicting instructions.
 

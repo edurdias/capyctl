@@ -5,10 +5,19 @@ inference engine on real hardware. Nothing else in the repository can stand in f
 it — the CPU and Fake-engine suites prove that the controller's machinery holds
 together, and passing them establishes nothing about a native recipe (SPEC §18).
 
-Every run of `scripts/live/run-on-spark.sh` appends one entry below, newest last.
-An entry names the commit it ran at, so the code that produced a result can be
-recovered; it never carries the output itself, which lives in
+Until 2026-09-23 every run of `scripts/live/run-on-spark.sh` appended one entry below,
+newest last. An entry names the commit it ran at, so the code that produced a result
+can be recovered; it never carries the output itself, which lives in
 `target/live/<stamp>/` on the machine that ran the script.
+
+That runner and the suites it ran (`crates/mllm-cli/tests/live_vllm.rs`,
+`live_sglang.rs`) drove standalone in process rather than the shipped binary. By owner
+decision (2026-09-22) they were replaced by matrix rows driven through the shipped CLI
+and roles (M38, M73, M74, M75 in
+`docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, harness
+`scripts/live/matrix/`) and deleted on 2026-09-23. The entries below are historical and
+their commands no longer exist; matrix results are recorded only in
+`docs/runbooks/f2-current-status.md`.
 
 Entry template:
 
@@ -91,6 +100,36 @@ this host with this model, and that a failed launch is terminated, proven gone a
 released with its key deleted. It does not establish parking (S2), SGLang (S3),
 restart re-attach (S1r) or any other model or engine build. CPU and Fake-engine
 runs remain no evidence of any of it.
+
+## 2026-09-19 — S1 run 6 — `74aa941`
+vLLM 0.29.0, qwen3-4b-instruct, host-a (GB10, 121 GiB unified, Linux
+6.17.0-1031-nvidia). Command: `scripts/live/run-on-spark.sh`. Evidence under
+`target/live/20260919T152154Z/`.
+
+The first green run after the whole-branch review's fix wave (`a7e72ff`..`44a3a42`)
+and the three re-review items in `74aa941` (identity-key read no longer mints a
+new key, `/`-leading runs are redacted segment by segment, gate-write reap uses
+the `killpg` backstop). Six of six, 137 s wall clock.
+
+| Scenario | Result | Timing / sample |
+| --- | --- | --- |
+| L1 launch | pass | cold start to Ready: 26.2 s |
+| L2 serve | pass | plain 0.1 s, streaming 0.5 s; sample "ready" |
+| L3 access control | pass | engine on 127.0.0.1:8100 only; off-host 100.64.0.10 refused; unkeyed control routes refused |
+| L4 stop | pass | 1.2 s, group empty |
+| L5 restart | pass | 25.6 s, new incarnation |
+| L6 bad source | pass | closed in 5.2 s; journal names the launch failure, redacted |
+| L7 recovery | pass | Ready in 25.6 s on the same controller; sample "ready" |
+| L8 engine exits at once | pass | closed in 0.6 s, no leftovers |
+| L9 deadline bound | pass | start refused, nothing launched |
+| L10 no engine | pass | NoEngineInstallation; release binary clean |
+| L11 memory returns | pass | before 116.83 GiB, at Ready 89.68 GiB, after stop 117.90 GiB |
+
+Failures and what changed: none. This run confirms the review-mandated changes
+without introducing a launch-path regression; the numbers are consistent with
+run 5 (`000b832`). Redaction is visible in L6's journal tail, where the venv path
+and this host's temp directory are blanked before the engine's pydantic error
+reaches the journal.
 
 ### vLLM auth scope, verified on host-a on 2026-09-17
 
