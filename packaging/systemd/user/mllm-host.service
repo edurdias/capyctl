@@ -20,7 +20,7 @@
 
 [Unit]
 Description=mllm host agent
-Documentation=file://%h/.local/opt/mllm/current/docs/operations/install.md
+Documentation=file://%h/.local/share/mllm/docs/operations/install.md
 
 [Service]
 Type=simple
@@ -28,7 +28,7 @@ Type=simple
 # file optional.
 Environment=MLLM_CONFIG=%E/mllm/host.yaml
 EnvironmentFile=-%E/mllm/host.env
-ExecStart=%h/.local/opt/mllm/current/bin/mllm start host --config ${MLLM_CONFIG}
+ExecStart=%h/.local/bin/mllm start host --config ${MLLM_CONFIG}
 
 # SPEC §4.3: engines must SURVIVE a restart of this unit. systemd's default
 # (control-group) and `mixed` both signal every process in the cgroup, which

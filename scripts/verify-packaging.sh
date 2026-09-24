@@ -11,9 +11,12 @@
 #    pointed at the release binary under test.
 # 4. The tarball: built twice with packaging/release.sh (same bytes both
 #    times), or the TARBALL given. Its entries must match the expected set
-#    exactly, with the expected owners and modes (runtime owner-only, no
-#    bytecode, no symlinks, no runtime tests); SHA256SUMS and the .sha256
-#    must verify; the binary must be stripped and report BUILDINFO's version.
+#    exactly, with the expected owners and modes (no runtime files: the
+#    runtime is compiled into the binary; no bytecode, no symlinks);
+#    SHA256SUMS and the .sha256 must verify; the binary must be stripped,
+#    report BUILDINFO's version and carry BUILDINFO's runtime manifest.
+# 5. packaging/install.sh against a file:// release holding that tarball
+#    (scripts/test-install.sh).
 #
 # A missing optional tool (shellcheck, systemd-analyze) is reported as
 # SKIPPED; set MLLM_VERIFY_STRICT=1 to fail instead. SHELLCHECK names the
@@ -45,7 +48,8 @@ done
 # --- 1. shellcheck -----------------------------------------------------------
 shellcheck_bin=${SHELLCHECK:-$(command -v shellcheck || true)}
 if [ -n "$shellcheck_bin" ]; then
-  if "$shellcheck_bin" packaging/release.sh scripts/verify-packaging.sh scripts/check-release-clean.sh; then
+  if "$shellcheck_bin" packaging/release.sh packaging/install.sh scripts/verify-packaging.sh \
+    scripts/check-release-clean.sh scripts/test-install.sh; then
     pass "shellcheck"
   else
     fail "shellcheck"
@@ -180,7 +184,7 @@ expected="$work/expected"
 actual="$work/actual"
 {
   printf '%s\n' bin/mllm BUILDINFO SHA256SUMS
-  git ls-files -- runtime ':(exclude)runtime/tests' packaging/systemd docs/examples docs/operations/install.md
+  git ls-files -- packaging/systemd docs/examples docs/operations/install.md
 } >"$work/files"
 # Every file plus each of its parent directories, under the package directory.
 {
@@ -216,10 +220,8 @@ mode_problems=$(tar --numeric-owner -tvzf "$tarball" | awk -v pkg="$name/" '
     if (owner != "0/0") print "owner " owner ": " path
     if (perms ~ /^l/ || perms ~ /^h/) print "link: " path
     if (path ~ /__pycache__|\.py[co]$/) print "bytecode: " path
-    if (rel ~ /^runtime\/tests(\/|$)/) print "runtime test shipped: " path
-    if (rel ~ /^runtime(\/|$)/) {
-      want = (perms ~ /^d/) ? "drwx------" : "-rw-------"
-    } else if (rel == "bin/mllm") {
+    if (rel ~ /^runtime(\/|$)/) print "runtime file shipped (it is embedded in bin/mllm): " path
+    if (rel == "bin/mllm") {
       want = "-rwxr-xr-x"
     } else {
       want = (perms ~ /^d/) ? "drwxr-xr-x" : "-rw-r--r--"
@@ -227,7 +229,7 @@ mode_problems=$(tar --numeric-owner -tvzf "$tarball" | awk -v pkg="$name/" '
     if (perms != want) print "mode " perms " (want " want "): " path
   }')
 if [ -z "$mode_problems" ]; then
-  pass "owners 0/0, runtime owner-only, no links or bytecode"
+  pass "owners 0/0, no runtime files, no links or bytecode"
 else
   fail "owner/mode problems:"
   echo "$mode_problems" >&2
@@ -237,6 +239,15 @@ if (cd "$(dirname "$tarball")" && sha256sum -c --quiet "$name.tar.gz.sha256"); t
   pass "$name.tar.gz.sha256"
 else
   fail "$name.tar.gz.sha256 does not verify"
+fi
+release_dir=$(dirname "$tarball")
+if [ -f "$release_dir/SHA256SUMS" ]; then
+  if (cd "$release_dir" && sha256sum -c --quiet SHA256SUMS) &&
+    grep -q "  $name.tar.gz\$" "$release_dir/SHA256SUMS" && grep -q '  install.sh$' "$release_dir/SHA256SUMS"; then
+    pass "release SHA256SUMS covers the tarball and install.sh"
+  else
+    fail "release SHA256SUMS does not verify or misses the tarball or install.sh"
+  fi
 fi
 if (cd "$pkg" && sha256sum -c --quiet SHA256SUMS); then
   pass "SHA256SUMS"
@@ -256,6 +267,13 @@ if [ "$("$pkg/bin/mllm" --version)" = "mllm $version" ]; then
 else
   fail "bin/mllm --version does not report BUILDINFO version $version"
 fi
+# SPEC §3.3 / ADR 0001: the runtime the binary embeds is the tracked one.
+manifest=$(sed -n 's/^runtime_manifest: //p' "$pkg/BUILDINFO")
+if [ -n "$manifest" ] && grep -qaF "$manifest" "$pkg/bin/mllm"; then
+  pass "bin/mllm embeds runtime manifest $manifest"
+else
+  fail "bin/mllm does not embed BUILDINFO's runtime manifest '$manifest'"
+fi
 if command -v readelf >/dev/null; then
   if readelf -S "$pkg/bin/mllm" | grep -q '\.symtab'; then
     fail "bin/mllm is not stripped"
@@ -264,6 +282,14 @@ if command -v readelf >/dev/null; then
   fi
 else
   skip "readelf not found; strip not checked"
+fi
+
+# --- 5. install.sh against this tarball ----------------------------------------
+if scripts/test-install.sh "$tarball" >"$work/test-install.log" 2>&1; then
+  pass "install.sh against a file:// release ($(grep -c '^ok:' "$work/test-install.log") checks)"
+else
+  fail "install.sh tests:"
+  cat "$work/test-install.log" >&2
 fi
 
 echo

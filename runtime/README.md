@@ -37,6 +37,18 @@ refuses only the dependent feature with the closed category
 Probes that pass are not evidence that a build serves a model or parks
 correctly.
 
+## Shipped inside the binary
+
+Every `runtime/*.py` here (never `runtime/tests`) is compiled into the `mllm`
+binary with a manifest of SHA-256 digests (`crates/mllm-agent/build.rs`;
+SPEC §3.3, ADR 0001, owner decision 2026-09-24). A host without a declared
+`runtime_dir`, and standalone without `MLLM_RUNTIME_DIR`, write them to the
+managed `<state_dir>/runtime` at `init` and every start, refreshing it after an
+upgrade and restoring it if it was changed; a directory without mllm's marker
+is refused, never overwritten (`crates/mllm-agent/src/embedded_runtime.rs`).
+A new module added here ships with the next build; an untracked one makes
+`packaging/release.sh` refuse the tree as dirty.
+
 ## Owner-only rule for mllm's own helpers
 
 `owner_only.py` mirrors `crates/mllm-adapters/src/owner_only.rs`: a file or

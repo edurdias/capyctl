@@ -4,6 +4,7 @@ pub mod device_inventory;
 pub mod drain;
 pub mod grammar;
 pub mod host_observation;
+pub mod managed_runtime;
 pub mod output;
 // SPEC §6.3, ADR 0008: `mllm prune sources`.
 pub mod prune;

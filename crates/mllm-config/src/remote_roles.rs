@@ -196,6 +196,10 @@ pub struct HostConfig {
     pub state_dir: PathBuf,
     pub identity_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    /// Whether the document names `runtime_dir`. Omitted, the runtime is the
+    /// managed `<state_dir>/runtime` the binary writes from its embedded copy
+    /// (SPEC §3.3, ADR 0001); declared, mllm never writes to it.
+    pub runtime_dir_declared: bool,
     pub ingress: Option<HostIngress>,
     pub profiles: Map<String, Value>,
     /// The period of the agent's engine load reports (`load_report_interval`).
@@ -387,7 +391,8 @@ impl HostConfig {
         if identity_dir != state_dir.join("identity") {
             return Err(invalid("identity_dir"));
         }
-        let runtime_dir = if document.get("runtime_dir").is_some() {
+        let runtime_dir_declared = document.get("runtime_dir").is_some();
+        let runtime_dir = if runtime_dir_declared {
             path(&document, "runtime_dir")?
         } else {
             state_dir.join("runtime")
@@ -439,6 +444,7 @@ impl HostConfig {
             state_dir,
             identity_dir,
             runtime_dir,
+            runtime_dir_declared,
             ingress,
             profiles,
             load_report_interval,

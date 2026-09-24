@@ -4,6 +4,52 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Distribution: one binary, GitHub Releases, install.sh — 2026-09-24 (branch `feat/distribution`)
+
+Owner decision 2026-09-24: one self-contained binary, GitHub Releases and
+`install.sh`; Homebrew deferred. Verified locally only (CPU tests and a
+file:// installer fixture; not qualification of any engine recipe).
+
+1. The runtime helpers are embedded. `crates/mllm-agent/build.rs` compiles
+   every `runtime/*.py` (not `runtime/tests`) into the binary with a SHA-256
+   manifest; `embedded_runtime::materialize` writes them to the managed
+   `<state_dir>/runtime` (0700, files 0600, marker `.mllm-managed-runtime`,
+   staged and renamed into place). `mllm init host`, `mllm start host`
+   (document without `runtime_dir`) and `mllm start standalone` (no
+   `MLLM_RUNTIME_DIR`) materialize it; a different manifest refreshes it, a
+   changed managed tree is restored with a warning, an unmarked directory is
+   refused, and a declared `runtime_dir` / `MLLM_RUNTIME_DIR` is never written.
+   The server has no runtime (it launches no engine). Standalone no longer
+   falls back to the checkout's `runtime/`.
+2. Releases. The workspace version is `0.1.0-rc.1`. `packaging/release.sh`
+   ships `bin/mllm`, units and docs (no `runtime/`), records the runtime
+   manifest in `BUILDINFO`, copies `install.sh` and writes the release
+   `SHA256SUMS`; `--sums DIR` rewrites it after gathering both architectures.
+   The units run `/usr/local/bin/mllm` (user: `~/.local/bin/mllm`) and the
+   standalone units no longer set `MLLM_RUNTIME_DIR`.
+3. `packaging/install.sh` (POSIX sh, shellcheck-clean): gh, GitHub API with
+   `GITHUB_TOKEN`, public URL or `MLLM_INSTALL_BASE_URL`; verifies the tarball
+   against `SHA256SUMS` and every file against the archive's own sums, refuses
+   on mismatch; `--system`, `--systemd <role>` (installed, never enabled),
+   `--version`, `--uninstall`. `scripts/test-install.sh` exercises it under
+   sh, dash and `bash --posix`; `scripts/verify-packaging.sh` runs it against
+   the built tarball.
+
+Draft release `v0.1.0-rc.1` (pre-release, unpublished; owner reviews before
+publishing) targets ee8ca2f: `mllm-0.1.0-rc.1-linux-x86_64.tar.gz` (built on
+control-host, sha256 `ee80c7c3…8114`), `mllm-0.1.0-rc.1-linux-aarch64.tar.gz` (built
+natively on host-a in `~/mllm-release-build`, nice 19, sha256
+`1cee96c3…38fd`), `install.sh` and `SHA256SUMS`. Both passed
+`scripts/verify-packaging.sh` on their own architecture; both binaries carry
+runtime manifest `80044870…ddee0`. The API and `gh` download paths of
+`install.sh` resolve published releases only, so they work once the draft is
+published; the target is a branch commit, so re-target or rebuild after merge
+if the release should point at `main`.
+
+Not established: no release binary has run a role on a Spark, and the matrix
+harness still declares `runtime_dir` (synced tree), so the managed runtime has
+not launched a live engine yet.
+
 ## Model sources — 2026-09-24 (branch `feat/model-sources`)
 
 Declared `huggingface` and `http` model sources are materialized by the host into

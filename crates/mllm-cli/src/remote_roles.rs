@@ -232,8 +232,18 @@ fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, Str
     {
         private_dir(&root.join("config"))?;
     }
+    // SPEC §3.3 / ADR 0001: the host template names no runtime_dir, so it
+    // runs from the managed copy of the embedded runtime.
+    let runtime = (role == InitTarget::Host).then(|| root.join("runtime"));
+    if let Some(dir) = &runtime {
+        crate::managed_runtime::prepare_for_role(dir)?;
+    }
     write_new(output, text.as_bytes())?;
-    Ok(json!({"config":output,"state_dir":root,"initialized":true}))
+    let mut result = json!({"config":output,"state_dir":root,"initialized":true});
+    if let Some(dir) = runtime {
+        result["runtime_dir"] = json!(dir);
+    }
+    Ok(result)
 }
 fn load_credentials(config: &ServerConfig) -> Result<Credentials, StructuredError> {
     let c: Credentials = serde_json::from_slice(&private_read(
@@ -592,6 +602,11 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
 const DRAIN_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
 async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
+    // SPEC §3.3 / ADR 0001: an undeclared runtime_dir is the managed copy of
+    // the embedded runtime, refreshed before anything can launch from it.
+    if !config.runtime_dir_declared {
+        crate::managed_runtime::prepare_for_role(&config.runtime_dir)?;
+    }
     let storage = IdentityDirectory::open(&config.identity_dir)
         .map_err(|_| error("Host identity is unsafe or in use; run join host before startup"))?;
     let identity = PendingEnrollment::load(&storage).map_err(|_| {

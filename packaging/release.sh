@@ -2,19 +2,26 @@
 # Build the mllm release tarball for the current architecture.
 #
 #   packaging/release.sh [OUT_DIR]        (default OUT_DIR: dist/)
+#   packaging/release.sh --sums OUT_DIR   (re)write OUT_DIR/SHA256SUMS only
 #
-# Produces OUT_DIR/mllm-<version>-linux-<arch>.tar.gz and its .sha256. The
-# archive unpacks into one directory, mllm-<version>-linux-<arch>/:
+# Produces OUT_DIR/mllm-<version>-linux-<arch>.tar.gz and its .sha256, copies
+# packaging/install.sh beside it, and rewrites OUT_DIR/SHA256SUMS over every
+# mllm-*.tar.gz and install.sh in OUT_DIR. Build each architecture into its
+# own directory, gather the tarballs into one, and run `--sums` there: that
+# SHA256SUMS is the release asset install.sh verifies against.
+#
+# The archive unpacks into one directory, mllm-<version>-linux-<arch>/:
 #
 #   bin/mllm                 stripped release binary (ADR 0001: one executable
-#                            per OS/architecture supplies every role)
-#   runtime/                 mllm's Python runtime helpers, owner-only modes
-#                            (directories 0700, files 0600; SPEC §13.3). The
-#                            tests under runtime/tests are not shipped.
+#                            per OS/architecture supplies every role). mllm's
+#                            Python runtime helpers are compiled into it and
+#                            written to <state_dir>/runtime at role start
+#                            (owner decision 2026-09-24; SPEC §3.3).
 #   packaging/systemd/       system and user service units (SPEC §4.3)
 #   docs/examples/           example role and deployment documents
 #   docs/operations/install.md
-#   BUILDINFO                version, commit, target, toolchain, build time
+#   BUILDINFO                version, commit, target, toolchain, build time,
+#                            embedded runtime manifest digest
 #   SHA256SUMS               digest of every file above
 #
 # Only files tracked by git are shipped, so no __pycache__, bytecode or local
@@ -24,18 +31,35 @@
 #
 # The build must pass scripts/check-release-clean.sh (no test engine in the
 # shipped binary). A dirty worktree is refused unless MLLM_RELEASE_ALLOW_DIRTY=1,
-# in which case BUILDINFO records it. Honours CARGO_TARGET_DIR.
+# in which case BUILDINFO records it. An untracked file under runtime/ counts
+# as dirty: the build embeds every runtime/*.py it finds. Honours
+# CARGO_TARGET_DIR.
 set -euo pipefail
 
 root=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
 cd "$root"
+
+# The release-level checksum file: every tarball and the installer.
+write_sums() {
+  (cd "$1" && find . -maxdepth 1 -type f \( -name 'mllm-*.tar.gz' -o -name install.sh \) -printf '%P\n' |
+    LC_ALL=C sort | xargs -r -d '\n' sha256sum) >"$1/SHA256SUMS.tmp"
+  mv "$1/SHA256SUMS.tmp" "$1/SHA256SUMS"
+}
+
+if [ "${1:-}" = --sums ]; then
+  [ -d "${2:-}" ] || { echo "usage: $0 --sums OUT_DIR" >&2; exit 2; }
+  write_sums "$2"
+  cat "$2/SHA256SUMS"
+  exit 0
+fi
 
 out_dir=${1:-dist}
 mkdir -p "$out_dir"
 out_dir=$(cd "$out_dir" && pwd)
 
 dirty=false
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+if [ -n "$(git status --porcelain --untracked-files=no)" ] ||
+  [ -n "$(git status --porcelain --untracked-files=all --ignored=no -- runtime)" ]; then
   dirty=true
   if [ "${MLLM_RELEASE_ALLOW_DIRTY:-0}" != 1 ]; then
     echo "worktree has uncommitted changes; commit them or set MLLM_RELEASE_ALLOW_DIRTY=1" >&2
@@ -85,11 +109,9 @@ copy_tracked() {
   done < <(git ls-files -z -- "$@")
 }
 
-# SPEC §13.3: mllm's runtime helpers are owner-only. The host refuses a
-# runtime tree holding bytecode, symlinks or other-writable modules
-# (crates/mllm-agent/src/runtime_integrity.rs).
-copy_tracked 0600 runtime ':(exclude)runtime/tests'
-find "$pkg/runtime" -type d -exec chmod 0700 {} +
+# The runtime helpers are not shipped as files: they are compiled into
+# bin/mllm (crates/mllm-agent/build.rs) and materialized owner-only at role
+# start (crates/mllm-agent/src/embedded_runtime.rs).
 copy_tracked 0644 packaging/systemd docs/examples docs/operations/install.md
 
 if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l \) -print -quit | grep -q .; then
@@ -98,6 +120,12 @@ if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l
 fi
 
 toolchain=$(rustc --version)
+# The same digest crates/mllm-agent/build.rs embeds: sha256 over
+# "<sha256>  <name>" lines of the shipped runtime/*.py, sorted by name.
+runtime_manifest=$(git ls-files -- 'runtime/*.py' ':(exclude)runtime/tests' | grep -v '/.*/' |
+  LC_ALL=C sort | while IFS= read -r path; do
+    printf '%s  %s\n' "$(sha256sum "$path" | cut -c1-64)" "${path#runtime/}"
+  done | sha256sum | cut -c1-64)
 build_time=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 cat >"$pkg/BUILDINFO" <<EOF
 name: mllm
@@ -108,6 +136,7 @@ os: $os
 arch: $arch
 toolchain: $toolchain
 source_date: $build_time
+runtime_manifest: $runtime_manifest
 EOF
 chmod 0644 "$pkg/BUILDINFO"
 
@@ -121,5 +150,7 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --format=gnu \
   --mtime="@$SOURCE_DATE_EPOCH" -C "$stage" -cf - "$name" | gzip -9 -n >"$tarball.tmp"
 mv "$tarball.tmp" "$tarball"
 (cd "$out_dir" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+install -m 0755 packaging/install.sh "$out_dir/install.sh"
+write_sums "$out_dir"
 
 echo "$tarball"

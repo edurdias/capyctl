@@ -19,7 +19,7 @@
 
 [Unit]
 Description=mllm server
-Documentation=file://%h/.local/opt/mllm/current/docs/operations/install.md
+Documentation=file://%h/.local/share/mllm/docs/operations/install.md
 
 [Service]
 Type=simple
@@ -27,7 +27,7 @@ Type=simple
 # file optional.
 Environment=MLLM_CONFIG=%E/mllm/server.yaml
 EnvironmentFile=-%E/mllm/server.env
-ExecStart=%h/.local/opt/mllm/current/bin/mllm start server --config ${MLLM_CONFIG}
+ExecStart=%h/.local/bin/mllm start server --config ${MLLM_CONFIG}
 
 # The server launches no engines, so nothing but mllm runs in this cgroup.
 # `mixed` sends SIGTERM to mllm alone (the drain) and SIGKILL to any stray

@@ -328,11 +328,26 @@ impl From<StartError> for StructuredError {
 /// deployment is qualified against is what the operator configured. Nothing is
 /// invented: without an executable and a model store there is no installation, and
 /// standalone refuses to boot rather than come up unable to run anything.
-pub struct EnvEngineProvider;
+pub struct EnvEngineProvider {
+    /// The managed runtime directory (`<state root>/runtime`) used when
+    /// `MLLM_RUNTIME_DIR` is unset. `None` means there is none, and a run
+    /// must name its runtime directory.
+    managed_runtime: Option<PathBuf>,
+}
 
 impl EnvEngineProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            managed_runtime: None,
+        }
+    }
+
+    /// SPEC §3.3 / ADR 0001: without `MLLM_RUNTIME_DIR`, the engine runs
+    /// from the binary's embedded runtime, written to `dir`.
+    pub fn with_managed_runtime(dir: PathBuf) -> Self {
+        Self {
+            managed_runtime: Some(dir),
+        }
     }
 }
 
@@ -474,7 +489,7 @@ impl EngineProvider for EnvEngineProvider {
             deep_park,
             trust_remote_code,
             models_root,
-            runtime_dir: runtime_dir(engine, deep_park)?,
+            runtime_dir: runtime_dir(engine, deep_park, self.managed_runtime.as_deref())?,
             args,
             installation_drift,
             engine_ports,
@@ -521,18 +536,32 @@ impl EngineProvider for EnvEngineProvider {
 /// Where mllm's own guard middleware lives.
 ///
 /// Spec §3: the guard is imported by the engine over `PYTHONPATH`, so a directory
-/// that does not contain it is not a runtime directory. The checkout layout is the
-/// default because standalone is run from one; an installed layout names its own.
+/// that does not contain it is not a runtime directory. SPEC §3.3 / ADR 0001
+/// (owner decision 2026-09-24): by default it is the managed copy of the
+/// runtime embedded in this binary, `<state root>/runtime`, written or
+/// refreshed here; `MLLM_RUNTIME_DIR` names another (development), which is
+/// never written to.
 ///
 /// `deep_park` is the host's switch: with it on, a parking vLLM deployment
 /// renders sleep mode, whose entry imports the capability probes (ADR 0008).
-fn runtime_dir(engine: Engine, deep_park: bool) -> Result<PathBuf, ProviderError> {
-    let dir = match env_value(RUNTIME_DIR) {
-        Some(declared) => PathBuf::from(declared),
-        None => Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("runtime"),
+fn runtime_dir(
+    engine: Engine,
+    deep_park: bool,
+    managed: Option<&Path>,
+) -> Result<PathBuf, ProviderError> {
+    let dir = match (env_value(RUNTIME_DIR), managed) {
+        (Some(declared), _) => PathBuf::from(declared),
+        (None, Some(managed)) => {
+            crate::managed_runtime::prepare(managed).map_err(|error| {
+                no_installation(format!("managed runtime directory: {error}"))
+            })?;
+            managed.to_path_buf()
+        }
+        (None, None) => {
+            return Err(no_installation(format!(
+                "no runtime directory: set {RUNTIME_DIR} to mllm's runtime directory"
+            )))
+        }
     };
     if !dir.join("mllm_vllm_guard.py").is_file() {
         return Err(no_installation(format!(
@@ -658,7 +687,7 @@ pub async fn start_standalone_from(
     start_standalone_inner(
         state_dir,
         config,
-        Arc::new(EnvEngineProvider::new()),
+        Arc::new(EnvEngineProvider::with_managed_runtime(state_dir.join("runtime"))),
         crate::host_observation::proc_meminfo(),
     )
     .await
