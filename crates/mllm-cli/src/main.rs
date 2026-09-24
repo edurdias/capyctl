@@ -248,7 +248,7 @@ async fn serve_standalone(state_dir: &std::path::Path) -> Result<(), roles::Star
         });
     }
     let started = std::time::Instant::now();
-    let drain = admission.drain(bound).await;
+    let drain = admission.drain_unless(bound, signals.forced()).await;
     stop.send_replace(true);
     let _ = shutdown::join_listeners(async {
         let _ = (&mut inference).await;

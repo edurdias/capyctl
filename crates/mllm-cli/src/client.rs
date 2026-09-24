@@ -19,6 +19,10 @@ const ENDPOINT: &str = "http://127.0.0.1:7443/management/v1";
 const LEGACY_WINDOW_MS: i64 = 900_000;
 /// How long `--wait` keeps polling after the operation's own deadline.
 const WAIT_MARGIN_MS: i64 = 10_000;
+/// SPEC §6.4: the first and largest delay between retries of a status read
+/// that failed transiently while `--wait` observes an operation.
+const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
     StructuredError {
@@ -270,8 +274,39 @@ impl Management {
         };
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
+        let mut backoff = FIRST_BACKOFF;
         loop {
-            let snapshot = self.snapshot().await?;
+            // SPEC §6.4: `--wait` observes the operation; a transient failure
+            // of one status read (the request did not complete, or the server
+            // was busy or unavailable) is retried with bounded backoff within
+            // the wait's bound instead of ending the wait early.
+            let snapshot = match self.exchange(Method::GET, "/snapshot", None).await {
+                Ok((status, snapshot)) if status.is_success() => {
+                    backoff = FIRST_BACKOFF;
+                    snapshot
+                }
+                Ok((status, value))
+                    if matches!(status.as_u16(), 429 | 502 | 503 | 504)
+                        || value["error"]["retryable"] == true =>
+                {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(refusal(status, &value));
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                Err(failure) if failure.code == "management_unavailable" => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(failure);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                Ok((status, value)) => return Err(refusal(status, &value)),
+                Err(failure) => return Err(failure),
+            };
             let result = snapshot["operations"]
                 .as_array()
                 .and_then(|ops| ops.iter().find(|op| op["id"] == operation));
@@ -925,5 +960,82 @@ mod tests {
             failure_message(&snapshot, "silent"),
             "Operation silent failed; inspect deployment status"
         );
+    }
+
+    /// SPEC §6.4: `--wait` observes its operation through transient status
+    /// failures. Two 503s from the snapshot are retried with backoff and the
+    /// wait still reports the succeeded operation; a non-retryable refusal
+    /// ends it at once.
+    // T08 T38
+    #[tokio::test]
+    async fn wait_retries_a_transient_snapshot_failure() {
+        use axum::{routing, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let app = Router::new()
+            .route(
+                "/management/v1/snapshot",
+                routing::get(move || {
+                    let read = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        match read {
+                            1 | 2 => (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                Json(json!({"error": {"code": "snapshot_unavailable", "retryable": true}})),
+                            ),
+                            _ => (
+                                axum::http::StatusCode::OK,
+                                Json(json!({
+                                    "operations": [{"id": "op", "state": "succeeded"}],
+                                    "deployments": [{"id": "d", "observed_state": "ready"}],
+                                })),
+                            ),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = Management {
+            client: Client::builder().no_proxy().build().unwrap(),
+            token: "token".into(),
+            endpoint: format!("http://{address}/management/v1"),
+            journal: None,
+            initialize_timeout_ms: None,
+            evict: false,
+            wait_start: true,
+        };
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 30_000;
+        let receipt = json!({"operation_id": "op", "deployment_id": "d"});
+        let done = api.wait(receipt, deadline).await.unwrap();
+        assert_eq!(done["deployment"]["observed_state"], "ready");
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+
+        // A refusal that is not transient ends the wait at once.
+        let denied = Router::new().route(
+            "/management/v1/snapshot",
+            routing::get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": {"code": "unauthenticated", "retryable": false}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, denied).await.unwrap() });
+        let api = Management { endpoint: format!("http://{address}/management/v1"), ..api };
+        let refused = api
+            .wait(json!({"operation_id": "op", "deployment_id": "d"}), deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "unauthorized");
     }
 }

@@ -289,3 +289,19 @@ fn revoke_host_parses_with_a_request_identity() {
     assert!(parse(["mllm", "revoke", "host"]).is_err());
     assert!(parse(["mllm", "revoke", "deployment", "d"]).is_err());
 }
+
+/// SPEC §6.4: `--wait` observes the accepted target operation. A deploy
+/// without `--activate` has no operation beyond its durable acceptance, which
+/// it already returns after, so `--wait` alone is refused with the reason
+/// instead of being silently ignored.
+// T08
+#[test]
+fn deploy_wait_without_activate_is_refused_with_its_reason() {
+    let refused = parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--wait"])
+        .expect_err("deploy --wait without --activate was accepted");
+    let message = refused.to_string();
+    assert!(message.contains("--wait requires --activate"), "{message}");
+    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--activate", "--wait"]).is_ok());
+    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml"]).is_ok());
+    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--revision", "2", "--wait"]).is_err());
+}

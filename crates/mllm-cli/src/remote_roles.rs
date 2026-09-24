@@ -549,7 +549,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         return Err(unavailable());
     }
     let started = std::time::Instant::now();
-    let drain = admission.drain(bound).await;
+    let drain = admission.drain_unless(bound, signals.forced()).await;
     stop.send_replace(true);
     let _ = crate::shutdown::join_listeners(&mut listeners).await;
     listeners.abort();
@@ -733,7 +733,7 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
     // SPEC §13: closing forwarding claims no native quiescence and releases
     // nothing; it only stops new work reaching the engines.
     let _ = gates.close_all();
-    let drain = admission.drain(bound).await;
+    let drain = admission.drain_unless(bound, signals.forced()).await;
     stop.send_replace(true);
     let _ = crate::shutdown::join_listeners(&mut ingress_server).await;
     ingress_server.abort();

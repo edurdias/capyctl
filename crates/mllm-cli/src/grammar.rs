@@ -651,6 +651,16 @@ where
                 | StartTarget::Instance { wait: true, .. },
         }
     );
+    // SPEC §6.4: `--wait` observes the accepted target operation. Without
+    // `--activate` a deploy's only operation is its durable acceptance, which
+    // the command already returns after, so there is nothing to wait for and
+    // the flag would be silently ignored. Refuse it instead.
+    if matches!(&cli.command, CliCommand::Deploy { resource: DeployArgs::Model { wait: true, activate: false, .. } }) {
+        return Err(CliError::Clap(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "deploy model --wait requires --activate: without it the deployment is accepted durably and the command returns its id at once; there is no activation to wait for (use status deployment <id> to observe it)\n",
+        )));
+    }
     let command:Command=cli.command.into();
     if cli.request_id.is_some() && !matches!(command,Command::Deploy {..} | Command::Drain {..} | Command::Revoke {..} | Command::InstanceLifecycle {..} | Command::Delete {..} | Command::Lifecycle {action:LifecycleAction::Start | LifecycleAction::Stop | LifecycleAction::Park | LifecycleAction::Preinitialize,..}) {
         return Err(CliError::Clap(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,"--request-id applies to deploy model, start, stop, park or preinitialize deployment, start or stop instance, delete deployment, drain and revoke host")));
