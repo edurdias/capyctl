@@ -230,7 +230,12 @@ impl DrainState {
                 let first = !std::mem::replace(&mut opened, true);
                 commands
                     .read(|store| match target {
-                        DrainHost::Remote(id) if first => store.begin_host_drain(id, key, now),
+                        // SPEC §4.3: the intent carries the drain's deadline,
+                        // so an abandoned one expires instead of holding the
+                        // host forever.
+                        DrainHost::Remote(id) if first => {
+                            store.begin_host_drain_until(id, key, now, Some(deadline_ms))
+                        }
                         _ => store.drain_candidates(target),
                     })
                     .map_err(|_| ConfigurationFailure::ReconciliationRequired)

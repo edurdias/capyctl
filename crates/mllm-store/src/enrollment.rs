@@ -17,6 +17,14 @@ pub struct Redemption {
     pub key_digest: String,
     pub csr_digest: String,
 }
+/// SPEC §4.1: the outcome of revoking one enrolled host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revocation {
+    pub host_id: String,
+    pub host_name: String,
+    /// False when the host was already revoked; the retry changed nothing.
+    pub newly_revoked: bool,
+}
 #[derive(serde::Serialize)]
 pub struct EnrolledHost {
     pub host_id: String,
@@ -214,18 +222,57 @@ impl Store {
         tx.commit()?;
         Ok(renewed)
     }
-    pub fn revoke_host(&self, host_id: &str) -> Result<(), StoreError> {
-        if !valid_name(host_id) {
+    /// SPEC §§4.1, 13.3: revoke an enrolled host, named by its id or, failing
+    /// that, by its unique name. Revocation is absorbing: revoking a revoked
+    /// host changes nothing and reports `newly_revoked: false`, so a retried
+    /// command is answered the same way (SPEC §6.4). The first revocation is
+    /// journaled in the same transaction. Nothing the host owns is released
+    /// here: its runtimes, reservations and leases stay accounted until
+    /// verified evidence settles them.
+    pub fn revoke_host(&self, host: &str) -> Result<Revocation, StoreError> {
+        if !valid_name(host) {
             return Err(StoreError::Conflict);
         }
-        if self.conn.execute(
-            "UPDATE enrolled_hosts SET revoked=1 WHERE host_id=?1",
-            [host_id],
-        )? != 1
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // An id is matched first, so a name can never shadow another host's id.
+        let found: Option<(String, String, bool)> = match tx
+            .query_row(
+                "SELECT host_id,host_name,revoked FROM enrolled_hosts WHERE host_id=?1",
+                [host],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
         {
-            return Err(StoreError::Conflict);
+            Some(found) => Some(found),
+            None => tx
+                .query_row(
+                    "SELECT host_id,host_name,revoked FROM enrolled_hosts WHERE host_name=?1",
+                    [host],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?,
+        };
+        let (host_id, host_name, already) = found.ok_or(StoreError::Conflict)?;
+        if !already {
+            tx.execute(
+                "UPDATE enrolled_hosts SET revoked=1 WHERE host_id=?1",
+                [&host_id],
+            )?;
+            crate::events::append_event(
+                &tx,
+                &crate::events::EventMetadata::HostRevoked {
+                    host_id: host_id.clone(),
+                    host_name: host_name.clone(),
+                },
+            )
+            .map_err(|_| StoreError::Conflict)?;
         }
-        Ok(())
+        tx.commit()?;
+        Ok(Revocation {
+            host_id,
+            host_name,
+            newly_revoked: !already,
+        })
     }
 }
 fn read_certificate(

@@ -65,13 +65,17 @@ impl EnrollmentAuthority {
     /// Owner decision 4 (2026-09-22): the enrolled hosts whose drain still has
     /// an unsettled Stop. `None` when the store cannot be read; callers fail
     /// closed and place nothing on any host then.
+    ///
+    /// SPEC §4.3: an abandoned drain intent (past its deadline, with no Stop
+    /// of its host still open) is completed and journaled first, so a server
+    /// that stopped mid-drain does not hold the host out forever. An expiry
+    /// that cannot be written leaves the intent open: fail closed.
     pub fn hosts_with_pending_drain(&self) -> Option<std::collections::BTreeSet<String>> {
-        self.state
-            .lock()
-            .ok()?
+        let owner = self.state.lock().ok()?;
+        let _ = owner
             .store()
-            .hosts_with_pending_drain()
-            .ok()
+            .expire_host_drain_intents(mllm_protocol::now_unix_ms());
+        owner.store().hosts_with_pending_drain().ok()
     }
     pub fn new(state: SharedCoordinatorState, ca: CertificateAuthority) -> Self {
         let (revocations, _) = watch::channel(0);
@@ -122,23 +126,41 @@ impl EnrollmentAuthority {
             ca_pem: self.ca.certificate_pem().into(),
         })
     }
-    pub fn revoke(&self, host_id: &str) -> Result<(), EnrollmentRefusal> {
-        if !mllm_store::enrollment::valid_name(host_id) {
+    /// SPEC §§4.1, 13.3: revoke a host by id or name. The revocation commits
+    /// first; every open control stream of the host then rechecks its
+    /// certificate and closes, and no command is dispatched to it again
+    /// (`AgentSessions::dispatch` reauthorizes the peer per command). Dispatch
+    /// to every Ready engine on it closes now; ownership, reservations and
+    /// request leases stay, and its engines count as unverified until an
+    /// operator stops or drains them with evidence. Idempotent: a retry of a
+    /// revoked host answers the same identity with `newly_revoked: false`.
+    pub fn revoke(&self, host: &str) -> Result<mllm_store::enrollment::Revocation, EnrollmentRefusal> {
+        if !mllm_store::enrollment::valid_name(host) {
             return Err(EnrollmentRefusal::Invalid);
         }
-        // Commit before notifying streams; their next authorization read is denied.
-        self.state
-            .lock()
-            .map_err(|_| EnrollmentRefusal::Internal)?
-            .store()
-            .revoke_host(host_id)
-            .map_err(|error| match error {
-                // A well-formed id that names no enrolled host.
+        let revocation = {
+            let owner = self.state.lock().map_err(|_| EnrollmentRefusal::Internal)?;
+            let revocation = owner.store().revoke_host(host).map_err(|error| match error {
+                // A well-formed name that names no enrolled host.
                 StoreError::Conflict => EnrollmentRefusal::NotFound,
                 _ => EnrollmentRefusal::Internal,
             })?;
+            // SPEC §13.3: revocation prevents new work. Close dispatch to the
+            // host's Ready engines in the same critical section; nothing is
+            // released. A store that cannot list them leaves the readiness
+            // supervisor to close them when the session ends.
+            if let Ok(launches) = owner.store().remote_ready_launches(owner.session()) {
+                for launch in launches.iter().filter(|launch| launch.host_id == revocation.host_id) {
+                    let _ = owner
+                        .store()
+                        .suspend_remote_dispatch(owner.session(), &launch.step_id);
+                }
+            }
+            revocation
+        };
+        // Committed before notifying streams; their next authorization read is denied.
         self.revocations.send_modify(|v| *v = v.wrapping_add(1));
-        Ok(())
+        Ok(revocation)
     }
     /// Active U4 streams select on this signal, then recheck their own registry
     /// entry. Every new command must also recheck; a cached handshake is insufficient.

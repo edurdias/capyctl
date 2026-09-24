@@ -33,6 +33,8 @@ pub const DEFAULT_DRAIN: Duration = mllm_config::remote_roles::DEFAULT_DRAIN_TIM
 /// After the bound, how long cancelled streams are given to observe the
 /// cancellation before the role stops waiting and exits anyway.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// As [`CANCEL_GRACE`], after a second signal forced the drain.
+const FORCED_GRACE: Duration = Duration::from_millis(200);
 
 /// The standalone role's drain bound: `shutdown.drain_timeout` of its role
 /// document (`<state_dir>/config/standalone.yaml`), 30 s when the document or
@@ -75,6 +77,14 @@ impl Signals {
             _ = self.interrupt.recv() => {}
         }
     }
+
+    /// SPEC §4.3: the next signal after the first, while the role drains. It
+    /// forces the drain short ([`Admission::drain_unless`]); engines stay
+    /// running and owned.
+    pub async fn forced(&mut self) {
+        self.recv().await;
+        eprintln!("second signal: cancelling in-flight requests now; engines are retained");
+    }
 }
 
 /// What one bounded drain observed.
@@ -86,6 +96,9 @@ pub struct DrainReport {
     pub cancelled: usize,
     /// Whether every admitted request finished on its own inside the bound.
     pub drained: bool,
+    /// SPEC §4.3: a second SIGTERM or SIGINT cut the drain short; whatever was
+    /// still streaming was cancelled at once. Engines are untouched either way.
+    pub forced: bool,
 }
 
 impl DrainReport {
@@ -94,6 +107,7 @@ impl DrainReport {
             "in_flight_at_close": self.in_flight_at_close,
             "cancelled": self.cancelled,
             "drained": self.drained,
+            "forced": self.forced,
         })
     }
 }
@@ -143,27 +157,55 @@ impl Admission {
     /// Whatever is still streaming at the bound is cancelled: its body ends where it
     /// is, and the role proceeds to exit without waiting on the client.
     pub async fn drain(&self, bound: Duration) -> DrainReport {
+        self.drain_unless(bound, std::future::pending::<()>()).await
+    }
+
+    /// As [`Admission::drain`], cut short when `force` completes first: the
+    /// operator signalled the role again while it drained (SPEC §4.3). Every
+    /// admitted stream is then cancelled at once and the role goes on to exit
+    /// within its remaining fixed bounds. Engines stay running and owned
+    /// either way; a forced drain only stops waiting for clients.
+    pub async fn drain_unless<F: Future>(&self, bound: Duration, force: F) -> DrainReport {
         self.close();
         let in_flight_at_close = self.active();
         let deadline = tokio::time::Instant::now() + bound;
-        if self.wait_idle(deadline).await {
+        tokio::pin!(force);
+        let forced = tokio::select! {
+            idle = self.wait_idle(deadline) => {
+                if idle {
+                    return DrainReport {
+                        in_flight_at_close,
+                        cancelled: 0,
+                        drained: true,
+                        forced: false,
+                    };
+                }
+                false
+            }
+            _ = &mut force => true,
+        };
+        if forced && self.active() == 0 {
             return DrainReport {
                 in_flight_at_close,
                 cancelled: 0,
                 drained: true,
+                forced: true,
             };
         }
         let cancelled = self.active();
         self.cancel.send_replace(true);
         // Cancelled bodies end on their next poll; give them a moment to be
-        // dropped so the count is honest, but never hold the exit on a client.
+        // dropped so the count is honest, but never hold the exit on a client,
+        // and not at all once the operator has asked twice.
+        let grace = if forced { FORCED_GRACE } else { CANCEL_GRACE };
         let _ = self
-            .wait_idle(tokio::time::Instant::now() + CANCEL_GRACE)
+            .wait_idle(tokio::time::Instant::now() + grace)
             .await;
         DrainReport {
             in_flight_at_close,
             cancelled,
             drained: false,
+            forced,
         }
     }
 
@@ -459,7 +501,8 @@ mod tests {
             DrainReport {
                 in_flight_at_close: 1,
                 cancelled: 0,
-                drained: true
+                drained: true,
+                forced: false,
             }
         );
     }
@@ -485,6 +528,37 @@ mod tests {
         assert_eq!(admission.active(), 0);
     }
 
+    // T12 T17 (SPEC §4.3): a second signal during the drain cuts it short:
+    // the stream still running is cancelled at once instead of at the bound,
+    // and the report says the drain was forced.
+    #[tokio::test]
+    async fn a_second_signal_forces_the_drain() {
+        let admission = Admission::new();
+        let (address, _stop) = served(&admission).await;
+        let streaming = reqwest::Client::new()
+            .get(format!("http://{address}/slow"))
+            .send()
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let report = admission
+            .drain_unless(
+                Duration::from_secs(60),
+                tokio::time::sleep(Duration::from_millis(100)),
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(report.forced && !report.drained);
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(report.to_json()["forced"], true);
+        let body = streaming.text().await.unwrap_or_default();
+        assert!(!body.contains("chunk 49"), "the stream was cut: {body}");
+        // Nothing left to wait for: a forced drain of an idle gate is clean.
+        let idle = Admission::new();
+        let report = idle.drain_unless(Duration::from_secs(60), async {}).await;
+        assert!(report.drained);
+    }
+
     // T01: an idle role drains at once.
     #[tokio::test]
     async fn an_idle_gate_drains_immediately() {
@@ -495,7 +569,8 @@ mod tests {
             DrainReport {
                 in_flight_at_close: 0,
                 cancelled: 0,
-                drained: true
+                drained: true,
+                forced: false,
             }
         );
     }

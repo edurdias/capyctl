@@ -137,3 +137,71 @@ fn a_drain_intent_names_a_host_and_a_key() {
     assert!(store.begin_host_drain("lab", "k", -1).is_err());
     assert!(!store.host_drain_pending("lab").unwrap());
 }
+
+fn expired_events(store: &Store) -> Vec<serde_json::Value> {
+    store
+        .events_after(None, 1000)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|e| e.kind == "host_drain_intent_expired")
+        .map(|e| serde_json::from_str(&e.payload_json).unwrap())
+        .collect()
+}
+
+// T10 T33 (SPEC §4.3): a drain whose server stopped after it opened its intent
+// and before it recorded any Stop no longer holds the host forever. Before its
+// deadline the intent holds; after it, with no Stop of the host open, it is
+// completed and journaled once, and the host is a candidate again.
+#[test]
+fn an_abandoned_intent_expires_after_its_deadline() {
+    let (_dir, _path, store) = store();
+    store.begin_host_drain_until("lab", "crashed", 1_000, Some(5_000)).unwrap();
+    assert!(store.expire_host_drain_intents(4_999).unwrap().is_empty());
+    assert!(store.host_drain_pending("lab").unwrap(), "held before its deadline");
+    assert_eq!(
+        store.expire_host_drain_intents(5_000).unwrap(),
+        vec![("lab".to_owned(), "crashed".to_owned())]
+    );
+    assert!(!store.host_drain_pending("lab").unwrap());
+    assert!(store.hosts_with_pending_drain().unwrap().is_empty());
+    assert!(store.expire_host_drain_intents(9_000).unwrap().is_empty(), "journaled once");
+    let events = expired_events(&store);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["host_id"], "lab");
+    assert_eq!(events[0]["drain_key"], "crashed");
+    assert_eq!(events[0]["deadline_ms"], 5_000);
+}
+
+// T10 T32 (SPEC §4.3, fail closed): an intent past its deadline stays open
+// while any Stop recorded for its host is unsettled; it expires only once
+// every one of them has settled.
+#[test]
+fn an_intent_past_its_deadline_holds_while_a_stop_is_open() {
+    let (_dir, path, store) = store();
+    store.begin_host_drain_until("lab", "crashed", 1_000, Some(5_000)).unwrap();
+    operation(&path, "op-a", "running");
+    store.record_host_drain("lab", &["op-a".to_string()], 2_000).unwrap();
+    assert!(store.expire_host_drain_intents(60_000).unwrap().is_empty());
+    assert!(store.host_drain_pending("lab").unwrap());
+    operation(&path, "op-a", "failed");
+    assert_eq!(store.expire_host_drain_intents(60_000).unwrap().len(), 1);
+    assert!(!store.host_drain_pending("lab").unwrap());
+}
+
+// T10 T33: an intent recorded without a deadline (before schema v31) expires
+// the drain window after its recording, and a retried drain keeps the first
+// deadline its key recorded.
+#[test]
+fn a_legacy_intent_expires_after_the_drain_window_and_retries_keep_the_deadline() {
+    let (_dir, _path, store) = store();
+    store.begin_host_drain("old", "v30", 1_000).unwrap();
+    let window = mllm_store::host_drain::LEGACY_INTENT_WINDOW_MS;
+    assert!(store.expire_host_drain_intents(1_000 + window - 1).unwrap().is_empty());
+    assert_eq!(store.expire_host_drain_intents(1_000 + window).unwrap().len(), 1);
+
+    store.begin_host_drain_until("lab", "key", 1_000, Some(5_000)).unwrap();
+    store.begin_host_drain_until("lab", "key", 2_000, Some(90_000)).unwrap();
+    assert_eq!(store.expire_host_drain_intents(5_000).unwrap().len(), 1);
+    assert!(store.begin_host_drain_until("lab", "key", 1, Some(-1)).is_err());
+}

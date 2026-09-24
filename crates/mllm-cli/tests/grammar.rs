@@ -271,3 +271,37 @@ fn start_takes_wait() {
     assert!(!parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--activate", "--wait"]).unwrap().wait);
     assert!(parse_invocation(["mllm", "stop", "deployment", "d", "--wait"]).is_err());
 }
+
+/// SPEC §§4.1, 13.3, 14: `revoke host <name|id>` is an action-first verb that
+/// takes a request identity like every other mutation.
+// T01 T06
+#[test]
+fn revoke_host_parses_with_a_request_identity() {
+    assert_eq!(
+        parse(["mllm", "revoke", "host", "host-a"]).unwrap(),
+        Command::Revoke { host: "host-a".into() }
+    );
+    let id = ulid::Ulid::new().to_string();
+    let invocation =
+        parse_invocation(["mllm", "revoke", "host", "host-a", "--request-id", &id]).unwrap();
+    assert_eq!(invocation.request_id.as_deref(), Some(id.as_str()));
+    assert_eq!(invocation.command.label(), "revoke host host-a");
+    assert!(parse(["mllm", "revoke", "host"]).is_err());
+    assert!(parse(["mllm", "revoke", "deployment", "d"]).is_err());
+}
+
+/// SPEC §6.4: `--wait` observes the accepted target operation. A deploy
+/// without `--activate` has no operation beyond its durable acceptance, which
+/// it already returns after, so `--wait` alone is refused with the reason
+/// instead of being silently ignored.
+// T08
+#[test]
+fn deploy_wait_without_activate_is_refused_with_its_reason() {
+    let refused = parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--wait"])
+        .expect_err("deploy --wait without --activate was accepted");
+    let message = refused.to_string();
+    assert!(message.contains("--wait requires --activate"), "{message}");
+    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--activate", "--wait"]).is_ok());
+    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml"]).is_ok());
+    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--revision", "2", "--wait"]).is_err());
+}

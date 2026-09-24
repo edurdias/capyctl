@@ -116,6 +116,12 @@ pub enum Command {
         host: Option<String>,
         wait: bool,
     },
+    /// SPEC §§4.1, 13.3: revoke an enrolled host's identity, by name or id.
+    /// Its control session closes, it takes no new commands or placements,
+    /// and dispatch to its engines closes; nothing it owns is released.
+    Revoke {
+        host: String,
+    },
 }
 
 impl Command {
@@ -179,6 +185,7 @@ impl Command {
                 host: Some(host), ..
             } => format!("drain host {host}"),
             Command::Drain { host: None, .. } => "drain standalone".to_string(),
+            Command::Revoke { host } => format!("revoke host {host}"),
         }
     }
 }
@@ -269,6 +276,21 @@ enum CliCommand {
         #[command(subcommand)]
         resource: DrainArgs,
     },
+    /// Revoke an enrolled host's identity. Its control session closes at once,
+    /// it can no longer reconnect, take commands or placements, and dispatch
+    /// to its engines closes. Engines it runs are not stopped and their
+    /// accounting is kept until an operator settles them with evidence.
+    Revoke {
+        #[command(subcommand)]
+        resource: RevokeArgs,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum RevokeArgs {
+    /// An enrolled host, by name or id. Revoking a revoked host changes
+    /// nothing and reports it (`newly_revoked: false`).
+    Host { host: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -561,6 +583,9 @@ impl From<CliCommand> for Command {
                     wait: false,
                 },
             },
+            CliCommand::Revoke {
+                resource: RevokeArgs::Host { host },
+            } => Command::Revoke { host },
         }
     }
 }
@@ -626,9 +651,19 @@ where
                 | StartTarget::Instance { wait: true, .. },
         }
     );
+    // SPEC §6.4: `--wait` observes the accepted target operation. Without
+    // `--activate` a deploy's only operation is its durable acceptance, which
+    // the command already returns after, so there is nothing to wait for and
+    // the flag would be silently ignored. Refuse it instead.
+    if matches!(&cli.command, CliCommand::Deploy { resource: DeployArgs::Model { wait: true, activate: false, .. } }) {
+        return Err(CliError::Clap(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "deploy model --wait requires --activate: without it the deployment is accepted durably and the command returns its id at once; there is no activation to wait for (use status deployment <id> to observe it)\n",
+        )));
+    }
     let command:Command=cli.command.into();
-    if cli.request_id.is_some() && !matches!(command,Command::Deploy {..} | Command::Drain {..} | Command::InstanceLifecycle {..} | Command::Delete {..} | Command::Lifecycle {action:LifecycleAction::Start | LifecycleAction::Stop | LifecycleAction::Park | LifecycleAction::Preinitialize,..}) {
-        return Err(CliError::Clap(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,"--request-id applies to deploy model, start, stop, park or preinitialize deployment, start or stop instance, delete deployment and drain")));
+    if cli.request_id.is_some() && !matches!(command,Command::Deploy {..} | Command::Drain {..} | Command::Revoke {..} | Command::InstanceLifecycle {..} | Command::Delete {..} | Command::Lifecycle {action:LifecycleAction::Start | LifecycleAction::Stop | LifecycleAction::Park | LifecycleAction::Preinitialize,..}) {
+        return Err(CliError::Clap(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,"--request-id applies to deploy model, start, stop, park or preinitialize deployment, start or stop instance, delete deployment, drain and revoke host")));
     }
     Ok(Invocation {
         debug_engine_logs,

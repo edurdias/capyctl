@@ -84,6 +84,29 @@ fn main() -> ExitCode {
             }
         };
     }
+    // SPEC §§4.1, 13.3: revoke an enrolled host through the server's
+    // management API; its session closes and it takes no new work.
+    if let Command::Revoke { host } = &invocation.command {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
+        };
+        return match runtime.block_on(mllm_cli::revoke::execute(
+            host,
+            &default_state_dir(),
+            invocation.config.as_deref(),
+            invocation.request_id.as_deref(),
+        )) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
     // SPEC §14 / §15.3: offline validation; no runtime, state, or network.
     if let Command::Validate { file, host } = &invocation.command {
         return match mllm_cli::validate::validate_config(file, host.as_deref()) {
@@ -225,7 +248,7 @@ async fn serve_standalone(state_dir: &std::path::Path) -> Result<(), roles::Star
         });
     }
     let started = std::time::Instant::now();
-    let drain = admission.drain(bound).await;
+    let drain = admission.drain_unless(bound, signals.forced()).await;
     stop.send_replace(true);
     let _ = shutdown::join_listeners(async {
         let _ = (&mut inference).await;

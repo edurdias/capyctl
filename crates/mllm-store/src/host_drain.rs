@@ -83,10 +83,38 @@ impl Store {
         key: &str,
         now_ms: i64,
     ) -> Result<Vec<DrainCandidate>, StoreError> {
-        if host.is_empty() || key.is_empty() || now_ms < 0 {
+        self.begin_host_drain_until(host, key, now_ms, None)
+    }
+
+    /// As [`Store::begin_host_drain`], recording the drain's own deadline
+    /// with its intent (SPEC §4.3). The first deadline recorded for a key is
+    /// kept: a retried drain carries the same one. An intent the request never
+    /// completed expires after it (`expire_host_drain_intents`); without one,
+    /// after [`LEGACY_INTENT_WINDOW_MS`] from its recording.
+    pub fn begin_host_drain_until(
+        &self,
+        host: &str,
+        key: &str,
+        now_ms: i64,
+        deadline_ms: Option<i64>,
+    ) -> Result<Vec<DrainCandidate>, StoreError> {
+        if host.is_empty() || key.is_empty() || now_ms < 0 || deadline_ms.is_some_and(|d| d < 0) {
             return Err(StoreError::Conflict);
         }
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM host_drain_intent_deadlines WHERE host_id=?1 AND drain_key!=?2
+               AND drain_key IN (SELECT drain_key FROM host_drain_intents
+                 WHERE host_id=?1 AND completed_at_ms IS NOT NULL)",
+            params![host, key],
+        )?;
+        if let Some(deadline) = deadline_ms {
+            tx.execute(
+                "INSERT OR IGNORE INTO host_drain_intent_deadlines(host_id,drain_key,deadline_ms)
+                   VALUES(?1,?2,?3)",
+                params![host, key, deadline],
+            )?;
+        }
         tx.execute(
             "DELETE FROM host_drain_intents WHERE host_id=?1 AND drain_key!=?2
                AND completed_at_ms IS NOT NULL",
@@ -197,6 +225,68 @@ impl Store {
         )?)
     }
 
+    /// SPEC §4.3: complete every open drain intent whose request was
+    /// abandoned: its deadline (or, for an intent recorded without one,
+    /// [`LEGACY_INTENT_WINDOW_MS`] after it was recorded) has passed, and no
+    /// Stop recorded for its host is still open. Each is journaled as
+    /// `host_drain_intent_expired`. An intent whose host still has an open
+    /// Stop stays open (fail closed); this releases, stops or settles nothing,
+    /// and an instance the abandoned drain named keeps running exactly as it
+    /// was. Returns the `(host, key)` pairs it completed.
+    pub fn expire_host_drain_intents(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        if now_ms < 0 {
+            return Err(StoreError::Conflict);
+        }
+        let select = format!(
+            "SELECT i.host_id, i.drain_key,
+                    COALESCE(d.deadline_ms, i.recorded_at_ms + {LEGACY_INTENT_WINDOW_MS})
+               FROM host_drain_intents i
+               LEFT JOIN host_drain_intent_deadlines d
+                 ON d.host_id=i.host_id AND d.drain_key=i.drain_key
+              WHERE i.completed_at_ms IS NULL
+                AND COALESCE(d.deadline_ms, i.recorded_at_ms + {LEGACY_INTENT_WINDOW_MS}) <= ?1
+                AND NOT EXISTS(SELECT 1 FROM host_drains h JOIN operations o ON o.id=h.operation_id
+                   WHERE h.host_id=i.host_id AND o.state NOT IN ({TERMINAL}))
+              ORDER BY i.host_id, i.drain_key LIMIT {MAX_CANDIDATES}"
+        );
+        let read = |conn: &rusqlite::Connection| -> Result<Vec<(String, String, i64)>, StoreError> {
+            Ok(conn
+                .prepare(&select)?
+                .query_map(params![now_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?)
+        };
+        // The common case, nothing abandoned, takes no write lock.
+        if read(&self.conn)?.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let expired = read(&tx)?;
+        for (host, key, deadline) in &expired {
+            tx.execute(
+                "UPDATE host_drain_intents SET completed_at_ms=?3
+                   WHERE host_id=?1 AND drain_key=?2 AND completed_at_ms IS NULL",
+                params![host, key, now_ms],
+            )?;
+            crate::events::append_event(
+                &tx,
+                &crate::events::EventMetadata::HostDrainIntentExpired {
+                    host_id: host.clone(),
+                    drain_key: key.clone(),
+                    deadline_ms: *deadline,
+                },
+            )
+            .map_err(|_| StoreError::Conflict)?;
+        }
+        tx.commit()?;
+        Ok(expired.into_iter().map(|(host, key, _)| (host, key)).collect())
+    }
+
     /// Every host with a pending drain (see `host_drain_pending`).
     pub fn hosts_with_pending_drain(
         &self,
@@ -213,6 +303,10 @@ impl Store {
         Ok(hosts)
     }
 }
+
+/// SPEC §4.3: how long after its recording a drain intent written without a
+/// deadline (before schema v31) may stay open: the operator CLI's drain window.
+pub const LEGACY_INTENT_WINDOW_MS: i64 = 900_000;
 
 /// The operation states in which a Stop has settled.
 const TERMINAL: &str = "'succeeded','failed','cancelled'";

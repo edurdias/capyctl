@@ -357,6 +357,16 @@ impl crate::Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let (p, e, association, host) = ready(&tx, s, id)?;
+        // SPEC §§4.1, 13.3: a revoked host takes no new work, whatever evidence
+        // arrives for it; its dispatch stays closed until an operator acts.
+        let revoked: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM enrolled_hosts WHERE host_id=?1 AND revoked=1)",
+            [&host],
+            |r| r.get(0),
+        )?;
+        if revoked {
+            return Err(LifecycleError::Rejected("host revoked".into()));
+        }
         current_admitted(&tx, s, &p, true, true)?;
         if evidence.binding_id != p.binding_id
             || evidence.incarnation != p.incarnation
