@@ -8,18 +8,16 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from runtime import sglang_entry as entry
-from runtime import checkpoint_preflight as preflight
 from runtime import sglang_native_composition as composition
 from runtime import sglang_device as device
 from runtime import sglang_server_args as server_args
-from runtime import sglang_source_preflight as source
 from runtime import sglang_startup_guards as guards
-import test_checkpoint_preflight as checkpoint_fixtures
 
 PLACEMENT_DIGEST = "0123456789abcdef" * 4
 PLACEMENT_UUID = "GPU-12345678-1234-1234-1234-123456789abc"
@@ -36,12 +34,24 @@ def finish_without_io(coroutine):
     raise AssertionError("unexpected I/O suspension")
 
 
+def settings():
+    """ADR 0014 §2: a deep-parking deployment stating only its memory."""
+    return {
+        "dtype": None, "quantization": None, "kv_cache_dtype": None,
+        "context_length": None, "max_running_requests": None, "cuda_graphs": False,
+        "language_model_only": False, "trust_remote_code": False,
+        "max_total_tokens": None, "chunked_prefill_size": None,
+        "tokenizer_workers": 1, "memory_saver": True, "cpu_weight_backup": False,
+        "weight_restore": "disk_reload",
+        "memory": {"request_bytes": 16 << 30, "kv_cache_bytes": 4 << 30,
+                   "margin_bytes": 8 << 30, "static_bytes": 8 << 30},
+        "extra_args": [],
+    }
+
+
 def public_settings():
     return {
-        "schema_version": 1, "kind": "sglang_launch", "engine": "sglang",
-        "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-        "source_revision": "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1",
-        "checkpoint_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+        "schema_version": 2, "kind": "sglang_launch", "engine": "sglang",
         "binding_id": "01K00000000000000000000001",
         "incarnation": "01K00000000000000000000099",
         "endpoint": "http://127.0.0.1:20001",
@@ -49,21 +59,23 @@ def public_settings():
         "rendered_settings_digest": "a" * 64,
         "device": {"host_id": "host-a", "hardware_fingerprint": "hardware-v1",
                    "device_id": "gpu0", "memory_domain": "uma"},
-        "settings": {
-            "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-            "tensor_parallel_size": 1, "data_parallel_size": 1, "tokenizer_workers": 1,
-            "model_dtype": "bfloat16", "context_tokens": 4096,
-            "max_running_requests": 8, "max_total_tokens": 4096,
-            "prefill_cuda_graphs": False, "decode_cuda_graphs": False,
-            "memory_saver": True, "cpu_weight_backup": False,
-            "speculative_decoding": False, "lora": False, "trust_remote_code": False,
-            "disaggregation": False, "external_cache": False,
-            "cpu_kv_offload": False, "native_grpc": False, "weight_restore": "disk_reload",
-            "requested_budget": {"kv_cache_bytes": 4294967296,
-                                 "static_memory_fraction_bps": 7500},
-        },
-        "minimum_kv_bytes": 603979776, "static_memory_fraction": "0.7500",
+        "settings": settings(),
     }
+
+
+class ScriptIdentityTests(unittest.TestCase):
+    # T22: production executes the wrapper as a script, unlike imported fixtures.
+    def test_script_and_helpers_share_the_launchspec_type(self):
+        wrapper = str(Path(entry.__file__).resolve())
+        script = """
+import runpy, sys
+namespace = runpy.run_path(sys.argv[1], run_name="__mp_main__")
+from runtime import sglang_server_args
+assert namespace["LaunchSpec"] is sglang_server_args.sglang_entry.LaunchSpec
+"""
+        result = subprocess.run([sys.executable, "-IS", "-c", script, wrapper],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class LaunchFixture:
@@ -128,17 +140,15 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         # The scope is private immutable metadata, not launch authority: the
         # boundary still refuses through the gates' own closed categories and
         # never reaches the audited argument mapper without a held contract.
-        with mock.patch.object(composition, "verify_sglang_sources", side_effect=lambda root: None), \
-                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=lambda previous: None), \
-                mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None):
-            with self.assertRaises(entry.LaunchError) as caught:
-                entry._verified_native_contract(spec, None)
-        self.assertEqual(caught.exception.code, "checkpoint_revalidation_failed")
+        with mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None):
+            contract = entry._verified_native_contract(spec)
+        self.assertFalse(contract.placement_asserted)
         with mock.patch.object(entry, "_guarded_engine_import", side_effect=lambda: (object(), object())), \
+                mock.patch.object(entry, "_require_capabilities"), \
                 mock.patch.object(server_args, "construct_server_args",
                                   side_effect=AssertionError("constructed")):
             with self.assertRaises((AttributeError, TypeError)):
-                entry._import_and_launch(spec, None, None)
+                entry._import_and_launch(spec, None)
         self.assertIsNone(self.build()._launch_scope_json)
 
     def test_placement_digest_is_an_optional_exact_v2_private_field(self):
@@ -226,7 +236,7 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         data = self.payloads()
         data[3] = data[3].replace(b'"schema_version": 1', b'"schema_version": 1, "schema_version": 1', 1)
         self.rejects(payloads=data)
-        for target in ("private", "public", "settings", "budget"):
+        for target in ("private", "public", "settings", "memory"):
             public = copy.deepcopy(self.public)
             private = json.loads(self.payloads()[3])
             if target == "private":
@@ -236,7 +246,7 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
             elif target == "settings":
                 public["settings"]["extra"] = True
             else:
-                public["settings"]["requested_budget"]["extra"] = 1
+                public["settings"]["memory"]["extra"] = 1
             private["public_settings"] = public
             data = self.payloads()
             data[3] = json.dumps(private).encode()
@@ -282,46 +292,86 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
             spec = self.build(self.argv(public), self.payloads(public))
             self.assertEqual(json.loads(spec._public_json)["served_name"], name)
 
-    def test_closed_recipe_types_and_bounds(self):
+    def test_closed_public_types_and_bounds(self):
+        # T14: the public descriptor is closed; the pinned recipe, checkpoint
+        # revision and Qwen3-4B KV bound are gone (ADR 0014 §9), and so is the
+        # source revision token (ADR 0008): any of them is an unknown key.
         mutations = [
-            ("source_revision", "main"), ("checkpoint_revision", "main"),
-            ("schema_version", True), ("schema_version", 1.0),
-            ("engine", "vllm"), ("recipe", "restart"),
+            ("source_revision", "94602c9c2b7cbdb8efd5c52802dac6a1c180089e"),
+            ("source_revision", "main"),
+            ("schema_version", 1), ("schema_version", True), ("schema_version", 2.0),
+            ("engine", "vllm"),
             ("binding_id", "ordinary"), ("incarnation", ""),
             # The retired kinds are invalid now, not deprecated aliases.
             ("kind", "sglang_candidate_launch"), ("kind", "sglang_candidate_private_launch"),
             ("endpoint", "http://0.0.0.0:20001"),
             ("endpoint", "http://127.0.0.1:020001"),
             ("endpoint", "http://127.0.0.1:65536"),
-            # The served name is the ASCII printable route token: empty,
-            # whitespace, non-ASCII, and over the 256-byte bound all refuse;
-            # no `candidate-` rule remains.
             ("served_name", ""), ("served_name", "has space"),
             ("served_name", "tab\tname"), ("served_name", "x" * 257),
             ("served_name", "caf\u00e9-route"), ("served_name", "route\u202ename"),
             ("rendered_settings_digest", "z" * 64),
-            ("minimum_kv_bytes", 603979775), ("static_memory_fraction", "0.75"),
         ]
         for key, value in mutations:
             with self.subTest(key=key, value=value):
                 public = copy.deepcopy(self.public)
                 public[key] = value
                 self.rejects(self.argv(public), self.payloads(public))
-        for key, original in self.public["settings"].items():
-            if key == "requested_budget":
-                continue
+        for retired in ("recipe", "checkpoint_revision", "minimum_kv_bytes",
+                        "static_memory_fraction"):
             public = copy.deepcopy(self.public)
-            public["settings"][key] = (not original if type(original) is bool else
-                                        original + 1 if type(original) is int else "other")
-            with self.subTest(setting=key):
+            public[retired] = "anything"
+            with self.subTest(retired=retired):
                 self.rejects(self.argv(public), self.payloads(public))
-        for key, value in (("kv_cache_bytes", 603979775), ("kv_cache_bytes", 2 ** 63),
-                           ("kv_cache_bytes", True), ("static_memory_fraction_bps", 0),
-                           ("static_memory_fraction_bps", 10001),
-                           ("static_memory_fraction_bps", 7500.0)):
-            public = copy.deepcopy(self.public)
-            public["settings"]["requested_budget"][key] = value
-            self.rejects(self.argv(public), self.payloads(public))
+
+    def test_typed_settings_accept_any_model_values_and_refuse_bad_shapes(self):
+        # E1 / ADR 0011: values pass as the engine spells them; only type,
+        # range and closure are checked here.
+        accepted = {"dtype": "float16", "quantization": "modelopt_fp4",
+                    "kv_cache_dtype": "fp8_e4m3", "context_length": 32768,
+                    "max_running_requests": 16, "cuda_graphs": True,
+                    "language_model_only": True, "trust_remote_code": True,
+                    "max_total_tokens": 65536, "chunked_prefill_size": -1,
+                    "tokenizer_workers": 4,
+                    "extra_args": ["--reasoning-parser", "qwen3"]}
+        public = copy.deepcopy(self.public)
+        public["settings"].update(accepted)
+        self.build(self.argv(public), self.payloads(public))
+        refused = [("dtype", "int8"), ("dtype", 1), ("quantization", "fp 8"),
+                   ("kv_cache_dtype", ""), ("context_length", 0),
+                   ("context_length", True), ("context_length", 2 ** 31),
+                   ("max_running_requests", -1), ("max_total_tokens", 1.0),
+                   ("chunked_prefill_size", 0), ("chunked_prefill_size", -2),
+                   ("cuda_graphs", 0), ("language_model_only", None),
+                   ("trust_remote_code", "false"), ("tokenizer_workers", 0),
+                   ("memory_saver", 1), ("cpu_weight_backup", None),
+                   ("weight_restore", "cpu_backup"), ("extra_args", "--x"),
+                   ("extra_args", [1]), ("extra_args", ["a\nb"]),
+                   ("extra_args", ["--x"] * 257)]
+        for key, value in refused:
+            with self.subTest(key=key, value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"][key] = value
+                self.rejects(self.argv(public), self.payloads(public))
+        public = copy.deepcopy(self.public)
+        public["settings"].update(cpu_weight_backup=True, weight_restore="cpu_backup")
+        self.build(self.argv(public), self.payloads(public))
+
+    def test_memory_request_is_closed_and_static_share_is_request_minus_margin(self):
+        for key, value in (("request_bytes", 0), ("request_bytes", True),
+                           ("kv_cache_bytes", 0), ("margin_bytes", -1),
+                           ("static_bytes", (16 << 30) - (8 << 30) + 1),
+                           ("kv_cache_bytes", 17 << 30),
+                           ("request_bytes", 2 ** 63)):
+            with self.subTest(key=key, value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["memory"][key] = value
+                self.rejects(self.argv(public), self.payloads(public))
+
+        # An explicit request below KV plus margin: the static pool is the KV.
+        public = copy.deepcopy(self.public)
+        public["settings"]["memory"].update(request_bytes=8 << 30, static_bytes=4 << 30)
+        self.build(self.argv(public), self.payloads(public))
 
     def test_unsafe_checkpoint_roots_and_bounded_utf8(self):
         for root in ("relative", "/", "//tmp", "/tmp/", "/tmp//qwen", "/tmp/./qwen",
@@ -386,7 +436,10 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
                 mock.patch.object(sys, "stderr", error):
             with self.assertRaises(SystemExit) as caught:
                 exec(compile(wrapper.read_bytes(), str(wrapper), "exec"), namespace)
-            self.assertEqual(sys.path, [str(wrapper.parent.parent)])
+            # SPEC §9.1 / T21: the wrapper's parent is never an import root;
+            # the package resolves from the runtime directory itself
+            # (test_runtime_imports.py runs the real bootstrap under -IS).
+            self.assertEqual(sys.path, [])
         self.assertEqual(caught.exception.code, 1)
         self.assertEqual(error.getvalue(), "sglang_startup_failed: invalid_descriptor\n")
 
@@ -401,7 +454,7 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
 
     def test_main_sanitizes_preflight_and_descriptor_errors(self):
         error = io.StringIO()
-        with mock.patch.object(entry, "verify_checkpoint", side_effect=RuntimeError(self.root)), \
+        with mock.patch.object(entry, "_verified_native_contract", side_effect=RuntimeError(self.root)), \
                 mock.patch.object(entry, "_import_and_launch", side_effect=AssertionError("launched")):
             status = entry.main(self.argv(), self.payloads().__getitem__, error)
         self.assertEqual(status, 1)
@@ -415,44 +468,69 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
 class StartupTests(LaunchFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        fixture = checkpoint_fixtures.StorageTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        self.root = str(fixture.root)
-        self.manifest = fixture.manifest()
+        # _import_and_launch pins the process environment (loopback_rendezvous).
+        environ = mock.patch.dict(os.environ)
+        environ.start()
+        self.addCleanup(environ.stop)
 
-    def test_failed_source_revalidation_denies_through_the_gates_own_category(self):
-        # A gate failure is the gate's own closed category from main; the
-        # retired blanket denial literal is gone, and the guarded launch
-        # boundary is never reached on any composition failure.
+    def _launch_recording_environment(self, drift=None):
+        """Run main to the launch seam; return (result, stderr, env at launch)."""
+        seen = {}
+        launch = mock.Mock()
+        launch.launch_server.side_effect = lambda *args, **kwargs: seen.update(os.environ)
+
+        def construct(spec, placement, constructor, **_):
+            if drift:
+                drift()
+            return mock.Mock()
+
         error = io.StringIO()
-        with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
-                mock.patch.object(composition, "verify_sglang_sources",
-                                  side_effect=source.SourcePreflightError("artifact_missing")), \
-                mock.patch.object(entry, "_import_and_launch", side_effect=AssertionError("launched")):
+        with mock.patch.object(entry, "_verified_native_contract", return_value=mock.Mock()), \
+                mock.patch.object(entry, "_guarded_engine_import",
+                                  side_effect=lambda: (mock.Mock(), launch)), \
+                mock.patch.object(entry, "_require_capabilities"), \
+                mock.patch.object(entry, "_observation_target", return_value=None), \
+                mock.patch.object(server_args, "construct_server_args", side_effect=construct):
             result = entry.main(self.argv(), self.payloads().__getitem__, error)
+        return result, error.getvalue(), seen
+
+    # T21: SPEC §8.2, found live 2026-09-23 (M08). SGLang 0.5.20's default
+    # rendezvous is a torch TCPStore, which listens on every interface; the
+    # engine now starts with a private file store and loopback transports.
+    def test_engine_starts_with_a_private_file_rendezvous(self):
+        os.environ["MASTER_ADDR"] = "0.0.0.0"
+        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+        result, error, seen = self._launch_recording_environment()
+        self.assertEqual((result, error), (0, ""))
+        method = seen["SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE"]
+        self.assertTrue(method.startswith("file:///"), method)
+        directory = os.path.dirname(method[len("file://"):])
+        self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+        self.assertEqual((seen["GLOO_SOCKET_IFNAME"], seen["NCCL_SOCKET_IFNAME"]), ("lo", "lo"))
+        self.assertNotIn("MASTER_ADDR", seen)
+        os.rmdir(directory)
+
+    # T21: a rendezvous input changed after pinning never reaches the engine.
+    def test_rendezvous_drift_before_launch_is_refused(self):
+        def drift():
+            os.environ["SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE"] = "tcp://0.0.0.0:29500"
+
+        result, error, seen = self._launch_recording_environment(drift)
         self.assertEqual(result, 1)
-        self.assertEqual(error.getvalue(), "sglang_startup_failed: source_revalidation_failed\n")
+        self.assertEqual(error, "sglang_startup_failed: loopback_rendezvous_failed\n")
+        self.assertEqual(seen, {})
 
     def _green_gate_patches(self, events, roots):
-        def verify(root):
-            events.append("verify")
-            roots.append(root)
-
-        def revalidate(previous):
-            events.append("revalidate")
-
+        # ADR 0008: no source audit gate; the capability probe runs after
+        # the guarded import (its own tests use synthetic package trees).
         def plugins():
             events.append("plugins")
 
-        def checkpoint(previous):
-            events.append("checkpoint")
-            return previous
+        def capabilities(spec, arguments, launch):
+            events.append("capabilities")
 
-        return (mock.patch.object(composition, "verify_sglang_sources", side_effect=verify),
-                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=revalidate),
-                mock.patch.object(composition, "enforce_closed_plugins", side_effect=plugins),
-                mock.patch.object(composition, "revalidate_checkpoint", side_effect=checkpoint))
+        return (mock.patch.object(composition, "enforce_closed_plugins", side_effect=plugins),
+                mock.patch.object(entry, "_require_capabilities", side_effect=capabilities))
 
     def test_held_contract_reaches_the_guarded_import_boundary_and_launches(self):
         events = []
@@ -471,15 +549,11 @@ class StartupTests(LaunchFixture, unittest.TestCase):
 
         placements = []
 
-        def recorded_construct(spec, placement, constructor):
+        def recorded_construct(spec, placement, constructor, **_):
             placements.append(placement)
             return checked
 
         patches = (*self._green_gate_patches(events, roots),
-                   mock.patch.object(entry, "verify_checkpoint",
-                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
-                   mock.patch.object(entry, "revalidate_checkpoint",
-                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
                    mock.patch.object(entry, "_guarded_engine_import", side_effect=guarded_import),
                    mock.patch.object(server_args, "construct_server_args",
                                      side_effect=recorded_construct))
@@ -493,10 +567,9 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(error.getvalue(), "")
         # The gates ran in composition's fixed order before the boundary, the
-        # package root is the launcher-selected interpreter's composed tree,
-        # and the unasserted placement is carried as None, never faked.
-        self.assertEqual(events, ["verify", "revalidate", "plugins", "checkpoint", "import"])
-        self.assertEqual(roots, [entry._trusted_package_root()])
+        # capabilities were probed after the guarded import, and the
+        # unasserted placement is carried as None, never faked.
+        self.assertEqual(events, ["plugins", "import", "capabilities"])
         self.assertEqual(placements, [None])
         launch_calls[0].launch_server.assert_called_once_with(native)
 
@@ -508,18 +581,14 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         events = []
         error = io.StringIO()
         launch = mock.Mock()
-        with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
-                mock.patch.object(entry, "revalidate_checkpoint", side_effect=lambda value: preflight._revalidate(value, self.manifest)), \
-                mock.patch.object(composition, "verify_sglang_sources", side_effect=lambda root: None), \
-                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=lambda previous: previous), \
-                mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
-                mock.patch.object(composition, "revalidate_checkpoint", side_effect=lambda previous: previous), \
+        with mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
+                mock.patch.object(entry, "_require_capabilities"), \
                 mock.patch.object(entry, "_guarded_engine_import",
                                   side_effect=lambda: (events.append("import"), (mock.Mock(), launch))[1]):
             result = entry.main(self.argv(), self.payloads().__getitem__, error)
         self.assertEqual(result, 1)
         self.assertEqual(events, ["import"])
-        self.assertEqual(error.getvalue(), "sglang_startup_failed: startup_error\n")
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_mismatch\n")
         launch.assert_not_called()
 
     def _asserted_placement_patches(self, events, inventory_digest, uuid=PLACEMENT_UUID):
@@ -557,15 +626,11 @@ class StartupTests(LaunchFixture, unittest.TestCase):
             launch_calls.append(launch)
             return arguments, launch
 
-        def recorded_construct(spec, placement, constructor):
+        def recorded_construct(spec, placement, constructor, **_):
             placements.append(placement)
             return checked
 
         patches = (*self._asserted_placement_patches(events, PLACEMENT_DIGEST),
-                   mock.patch.object(entry, "verify_checkpoint",
-                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
-                   mock.patch.object(entry, "revalidate_checkpoint",
-                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
                    mock.patch.object(entry, "_guarded_engine_import", side_effect=guarded_import),
                    mock.patch.object(server_args, "construct_server_args",
                                      side_effect=recorded_construct))
@@ -578,7 +643,7 @@ class StartupTests(LaunchFixture, unittest.TestCase):
                 patch.stop()
         self.assertEqual(result, 0)
         self.assertEqual(error.getvalue(), "")
-        self.assertEqual(events, ["verify", "revalidate", "plugins", "checkpoint", "import"])
+        self.assertEqual(events, ["plugins", "import", "capabilities"])
         self.assertEqual(len(placements), 1)
         placement = placements[0]
         self.assertEqual(placement.physical_gpu_uuid, PLACEMENT_UUID)
@@ -598,10 +663,6 @@ class StartupTests(LaunchFixture, unittest.TestCase):
                 events = []
                 error = io.StringIO()
                 patches = (*self._asserted_placement_patches(events, "f" * 64, uuid=uuid),
-                           mock.patch.object(entry, "verify_checkpoint",
-                                             side_effect=lambda root: preflight._verify(root, self.manifest)),
-                           mock.patch.object(entry, "revalidate_checkpoint",
-                                             side_effect=lambda value: preflight._revalidate(value, self.manifest)),
                            mock.patch.object(entry, "_import_and_launch",
                                              side_effect=AssertionError("launched")))
                 for patch in patches:
@@ -615,7 +676,7 @@ class StartupTests(LaunchFixture, unittest.TestCase):
                 self.assertEqual(result, 1)
                 # The earlier gates ran green; the placement gate is what
                 # refused, before any engine import.
-                self.assertEqual(events, ["verify", "revalidate", "plugins"])
+                self.assertEqual(events, ["plugins"])
                 self.assertEqual(error.getvalue(),
                                  "sglang_startup_failed: placement_failed\n")
 
@@ -627,10 +688,6 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         error = io.StringIO()
         patches = (*self._green_gate_patches(events, []),
                    mock.patch.dict(os.environ, {}, clear=True),
-                   mock.patch.object(entry, "verify_checkpoint",
-                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
-                   mock.patch.object(entry, "revalidate_checkpoint",
-                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
                    mock.patch.object(entry, "_import_and_launch",
                                      side_effect=AssertionError("launched")))
         for patch in patches:
@@ -641,7 +698,7 @@ class StartupTests(LaunchFixture, unittest.TestCase):
             for patch in reversed(patches):
                 patch.stop()
         self.assertEqual(result, 1)
-        self.assertEqual(events, ["verify", "revalidate", "plugins"])
+        self.assertEqual(events, ["plugins"])
         self.assertEqual(error.getvalue(), "sglang_startup_failed: placement_failed\n")
 
     def test_mapping_assembly_failure_folds_into_the_placement_category(self):
@@ -653,10 +710,6 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         events = []
         error = io.StringIO()
         patches = (*self._green_gate_patches(events, []),
-                   mock.patch.object(entry, "verify_checkpoint",
-                                     side_effect=lambda root: preflight._verify(root, self.manifest)),
-                   mock.patch.object(entry, "revalidate_checkpoint",
-                                     side_effect=lambda value: preflight._revalidate(value, self.manifest)),
                    mock.patch.object(entry, "_placement_mapping",
                                      side_effect=KeyError("device")),
                    mock.patch.object(entry, "_import_and_launch",
@@ -677,24 +730,14 @@ class StartupTests(LaunchFixture, unittest.TestCase):
     def test_each_gate_failure_surfaces_its_own_closed_category_from_main(self):
         cases = (
             ("plugin_closure_failed",
-             {"verify_sglang_sources": mock.Mock(),
-              "revalidate_sglang_sources": mock.Mock(),
-              "enforce_closed_plugins": mock.Mock(
+             {"enforce_closed_plugins": mock.Mock(
                   side_effect=guards.StartupGuardError("external_plugins_present"))}),
-            ("checkpoint_revalidation_failed",
-             {"verify_sglang_sources": mock.Mock(),
-              "revalidate_sglang_sources": mock.Mock(),
-              "enforce_closed_plugins": mock.Mock(),
-              "revalidate_checkpoint": mock.Mock(
-                  side_effect=preflight.CheckpointPreflightError("artifact_changed"))}),
         )
         for expected, overrides in cases:
             with self.subTest(expected=expected):
                 error = io.StringIO()
                 patches = [mock.patch.object(composition, name, value)
                            for name, value in overrides.items()]
-                patches.append(mock.patch.object(entry, "verify_checkpoint",
-                                                 side_effect=lambda root: preflight._verify(root, self.manifest)))
                 patches.append(mock.patch.object(entry, "_import_and_launch",
                                                  side_effect=AssertionError("launched")))
                 for patch in patches:
@@ -714,8 +757,6 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         error = io.StringIO()
         with mock.patch.object(composition, "compose",
                                side_effect=composition.NativeCompositionError("placement_failed")), \
-                mock.patch.object(entry, "verify_checkpoint",
-                                  side_effect=lambda root: preflight._verify(root, self.manifest)), \
                 mock.patch.object(entry, "_import_and_launch",
                                   side_effect=AssertionError("launched")):
             result = entry.main(self.argv(), self.payloads().__getitem__, error)
@@ -724,12 +765,7 @@ class StartupTests(LaunchFixture, unittest.TestCase):
 
     def test_failed_engine_import_denies_through_startup_error(self):
         error = io.StringIO()
-        with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
-                mock.patch.object(entry, "revalidate_checkpoint", side_effect=lambda value: preflight._revalidate(value, self.manifest)), \
-                mock.patch.object(composition, "verify_sglang_sources", side_effect=lambda root: None), \
-                mock.patch.object(composition, "revalidate_sglang_sources", side_effect=lambda previous: previous), \
-                mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
-                mock.patch.object(composition, "revalidate_checkpoint", side_effect=lambda previous: previous), \
+        with mock.patch.object(composition, "enforce_closed_plugins", side_effect=lambda: None), \
                 mock.patch.object(entry, "_guarded_engine_import", side_effect=ImportError("sglang")):
             result = entry.main(self.argv(), self.payloads().__getitem__, error)
         self.assertEqual(result, 1)
@@ -739,42 +775,41 @@ class StartupTests(LaunchFixture, unittest.TestCase):
         events = []
         error = io.StringIO()
 
-        def final_launch(spec, checkpoint, contract):
+        def final_launch(spec, contract, *_):
             events.append("launch")
-            self.assertEqual(checkpoint._root, self.root)
             self.assertEqual(contract, "synthetic-contract")
 
-        with mock.patch.object(entry, "verify_checkpoint", side_effect=lambda root: preflight._verify(root, self.manifest)), \
-                mock.patch.object(entry, "revalidate_checkpoint", side_effect=lambda value: preflight._revalidate(value, self.manifest)), \
-                mock.patch.object(entry, "_verified_native_contract", side_effect=prepare), \
+        with mock.patch.object(entry, "_verified_native_contract", side_effect=prepare), \
                 mock.patch.object(entry, "_import_and_launch", side_effect=final_launch):
             result = entry.main(self.argv(), self.payloads().__getitem__, error)
         return result, events, error.getvalue()
 
-    def test_inode_replacement_between_preflight_and_final_revalidation_denies_launch(self):
-        def prepare(spec, checkpoint):
-            leaf = Path(self.root) / "config.json"
-            old = leaf.read_bytes()
-            leaf.rename(leaf.with_name("old-config"))
-            leaf.write_bytes(old)
-            return "synthetic-contract"
-
-        result, events, error = self.run_with_contract(prepare)
-        self.assertEqual(result, 1)
-        self.assertEqual(events, [])
-        self.assertEqual(error, "sglang_startup_failed: artifact_changed\n")
-
-    def test_valid_revalidation_reaches_only_replaced_final_seam(self):
-        result, events, error = self.run_with_contract(lambda spec, checkpoint: "synthetic-contract")
+    def test_valid_contract_reaches_only_replaced_final_seam(self):
+        result, events, error = self.run_with_contract(lambda spec: "synthetic-contract")
         self.assertEqual((result, events, error), (0, ["launch"], ""))
 
     def test_missing_memory_saver_evidence_denies_final_seam(self):
-        def prepare(spec, checkpoint):
+        def prepare(spec):
             raise entry.LaunchError("memory_saver_unavailable")
 
         result, events, error = self.run_with_contract(prepare)
         self.assertEqual((result, events), (1, []))
         self.assertEqual(error, "sglang_startup_failed: memory_saver_unavailable\n")
+
+    def test_mapper_refusal_surfaces_its_closed_category(self):
+        # T14 T22: a reserved extra argument or a resolved-value drift reaches
+        # the operator as the mapper's own category, never a blanket error.
+        error = io.StringIO()
+        contract = mock.Mock()
+        with mock.patch.object(entry, "_verified_native_contract", return_value=contract), \
+                mock.patch.object(entry, "_guarded_engine_import",
+                                  side_effect=lambda: (mock.Mock(), mock.Mock())), \
+                mock.patch.object(entry, "_require_capabilities"), \
+                mock.patch.object(server_args, "construct_server_args",
+                                  side_effect=server_args.ServerArgsError("effective_args_mismatch")):
+            result = entry.main(self.argv(), self.payloads().__getitem__, error)
+        self.assertEqual(result, 1)
+        self.assertEqual(error.getvalue(), "sglang_startup_failed: effective_args_mismatch\n")
 
 
 class PreimportGuardTests(unittest.TestCase):
@@ -815,7 +850,7 @@ class PreimportGuardTests(unittest.TestCase):
         wrapper = Path(entry.__file__).resolve()
         text = wrapper.read_text()
         self.assertLess(text.index('if __name__ == "__mp_main__":'),
-                        text.index("from runtime.checkpoint_preflight import"))
+                        text.index("from runtime.sglang_launch_spec import"))
         with mock.patch.object(guards, "preimport_guard") as guard:
             namespace = self.spawned_namespace()
             with mock.patch.object(sys, "path", []):

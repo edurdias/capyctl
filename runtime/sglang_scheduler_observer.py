@@ -1,8 +1,8 @@
 """Process-local, one-slot scheduler observation bridge. No remote transport.
 
 Install on the enrolled scheduler thread after initialization and before its
-event loop. The caller must verify the pinned immutable scheduler source before
-installation. At fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1 the normal and overlap
+event loop. ADR 0008: the scheduler shape this hooks is probed at launch
+(engine_capabilities.py `observation`), not audited against pinned sources. At 94602c9c2b7cbdb8efd5c52802dac6a1c180089e the normal and overlap
 loops call process_input_requests before selecting the next batch, including
 while paused. Its successful return is a Python scheduling boundary, NOT a CUDA
 synchronization or proof that any local or global work is idle. The hook neither
@@ -41,6 +41,25 @@ class ObservationResult:
     observation: saver.SchedulerSaverObservation | None
 
 
+def _diagnose(stage, error):
+    """One line on the engine's own stderr: a fixed stage name and the exception
+class name, never its message, arguments or any native text."""
+    try:
+        import sys
+        kind = type(error).__name__ if error is not None else None
+        if kind is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", kind) is None:
+            kind = "unnamed"
+        # A binding error's code is from a closed set of fixed words.
+        code = getattr(error, "code", None)
+        if type(code) is not str or re.fullmatch(r"[a-z_]{1,32}", code) is None:
+            code = None
+        sys.stderr.write('{"event":"mllm_saver_observation_failed","stage":"%s","error":%s,"code":%s}\n'
+                         % (stage, '"%s"' % kind if kind else "null", '"%s"' % code if code else "null"))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _identifier(value):
     if type(value) is not str or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) is None:
         raise BridgeError("invalid")
@@ -66,12 +85,17 @@ request/poll/cancel are thread-safe. A request occupies the slot until poll
 consumes its terminal result, including cancellation. Request IDs are correlation
 labels, not durable replay fences; a future transport must enforce its own epochs.
 """
-    def __init__(self, scheduler, binding_id, incarnation_id, owner, build):
+    def __init__(self, scheduler, binding_id, incarnation_id, owner, build, observe=None,
+                 topology=None):
         self._scheduler = scheduler
         self._binding_id = binding_id
         self._incarnation_id = incarnation_id
         self._owner = owner
         self._build = build
+        # The installation-specific snapshot and topology readers; None keeps
+        # the patched-saver defaults (resolved at call time).
+        self._observe = observe
+        self._topology = topology
         self._thread = threading.get_ident()
         self._lock = threading.Lock()
         self._slot = None
@@ -131,15 +155,23 @@ labels, not durable replay fences; a future transport must enforce its own epoch
         finally:
             self._lock.release()
         observation = None
+        stage = "topology_before"
         try:
-            _topology(self._scheduler)
-            observation = observe_scheduler_saver(self._scheduler, expected_owner=self._owner,
-                                                   build=self._build)
-            _topology(self._scheduler)
+            topology = self._topology or _topology
+            observe = self._observe or observe_scheduler_saver
+            topology(self._scheduler)
+            stage = "observe"
+            observation = observe(self._scheduler, expected_owner=self._owner, build=self._build)
+            stage = "topology_after"
+            topology(self._scheduler)
             if type(observation) is not saver.SchedulerSaverObservation or observation.owner != self._owner:
+                _diagnose("result_shape", None)
                 observation = None
-        except Exception:
-            # Never emit native exception text or change successful dispatch semantics.
+        except Exception as error:
+            # Never emit native exception text or change successful dispatch
+            # semantics; the stage and exception class only (found live
+            # 2026-09-23, M28: an uncertain observation left no trace of why).
+            _diagnose(stage, error)
             observation = None
         finally:
             finished = time.monotonic_ns()
@@ -147,6 +179,8 @@ labels, not durable replay fences; a future transport must enforce its own epoch
                 try:
                     if self._slot is slot:
                         if slot["uncertain"] or finished >= slot["deadline"]:
+                            if observation is not None:
+                                _diagnose("deadline", None)
                             observation = None
                         slot["result"] = self._result(slot, started, finished, observation)
                 finally:
@@ -154,12 +188,16 @@ labels, not durable replay fences; a future transport must enforce its own epoch
             # If contended, the running slot expires uncertain; never retry a snapshot.
 
 
-def install_scheduler_observer(scheduler, *, binding_id, incarnation_id, expected_owner, build):
+def install_scheduler_observer(scheduler, *, binding_id, incarnation_id, expected_owner, build,
+                               observe=None, topology=None):
     """Install once on an existing exact Scheduler; never import or create one.
 
 Caller supplies service-enrolled binding/incarnation/process and reviewed build.
 These labels cannot establish trust by themselves. Only this instance changes;
 the upstream class, native controls, and engine entry gate remain untouched.
+`observe` and `topology` select the installation's snapshot and topology readers
+(sglang_saver_residency for SGLang 0.5.20 with torch-memory-saver 0.0.10); the
+defaults read the patched saver's snapshot export.
 """
     _identifier(binding_id)
     _identifier(incarnation_id)
@@ -170,7 +208,7 @@ the upstream class, native controls, and engine entry gate remain untouched.
         raise BridgeError("invalid")
     try:
         saver._exact(scheduler, "sglang.srt.managers.scheduler", "Scheduler")
-        _topology(scheduler)
+        (topology or _topology)(scheduler)
         values = saver._fields(scheduler)
         if "process_input_requests" in values:
             raise BridgeError("invalid")
@@ -179,7 +217,8 @@ the upstream class, native controls, and engine entry gate remain untouched.
             raise BridgeError("invalid")
     except saver.SaverBindingError:
         raise BridgeError("topology") from None
-    bridge = SchedulerObserverBridge(scheduler, binding_id, incarnation_id, expected_owner, build)
+    bridge = SchedulerObserverBridge(scheduler, binding_id, incarnation_id, expected_owner, build,
+                                     observe, topology)
 
     def process_input_requests(instance, *args, **kwargs):
         try:

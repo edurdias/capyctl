@@ -9,12 +9,22 @@ The two-second deadline bounds socket waits, not a stalled kernel procfs read or
 hostile in-process bridge. Same-UID peers are not inherently trusted: exact PID,
 boot ID and start ticks must match the separately enrolled controller.
 
+Key mode (version 2) replaces the enrolled controller identity with a per-launch
+key: every request carries an HMAC-SHA256 proof over the binding, incarnation
+and request ID, so a restarted host agent or controller (a new PID) can still
+observe the launch it owns while any other same-UID process without the key
+cannot. The key is derived from the launch's admin credential
+(`observation_key`), which only the engine and its host hold.
+
 Socket credential checks cannot prevent a trusted controller from handing its
 connected FD to another process. Service FD custody is a precondition. Results
 are point-in-time saver-map observations only, never readiness, global idleness,
 residency, release proof, or qualification. Unknown allocation tags fail closed.
 """
 from dataclasses import dataclass
+import collections
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -78,13 +88,37 @@ def _process_identity(pid):
     return identity
 
 
+_KEY_LABEL = b"mllm-sglang-observation-key-v1\0"
+_PROOF_LABEL = b"mllm-sglang-observation-request-v2\0"
+
+
+def observation_key(admin_key, binding_id, incarnation_id):
+    """The per-launch observation key, derived from the launch's admin credential.
+
+    Mirrors `observation_key` in crates/mllm-launchers/src/native_observation.rs.
+    """
+    if type(admin_key) is not str or not 0 < len(admin_key) <= 4096 or not admin_key.isascii():
+        raise _Denied()
+    message = (_KEY_LABEL + _identifier(binding_id).encode("ascii") + b"\0"
+               + _identifier(incarnation_id).encode("ascii"))
+    return hmac.new(admin_key.encode("ascii"), message, hashlib.sha256).digest()
+
+
+def request_proof(key, binding_id, incarnation_id, request_id):
+    """Hex HMAC-SHA256 proof a key-mode request carries."""
+    message = (_PROOF_LABEL + binding_id.encode("ascii") + b"\0"
+               + incarnation_id.encode("ascii") + b"\0" + request_id.encode("ascii"))
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
 @dataclass(frozen=True)
 class _Binding:
     binding_id: str
     incarnation_id: str
     owner: saver.ProcessIdentity
-    peer: saver.ProcessIdentity
+    peer: saver.ProcessIdentity | None
     uid: int
+    key: bytes | None = None
 
 
 def _pairs(pairs):
@@ -182,21 +216,40 @@ def _encode(value):
     return struct.pack("!I", len(data)) + data
 
 
+# SPEC §9.2 / T21: the replay fence remembers this many recent correlation IDs.
+_REPLAY_WINDOW = 4096
+
+
 class ObservationTransport:
-    """One active request and 4096 lifetime correlation IDs, with no eviction.
+    """One active request; a sliding replay fence over the last 4096 IDs.
+
+SPEC §9.2 / T21: a correlation ID seen among the most recent 4096 is refused.
+The oldest is forgotten to admit a new one, so a long-lived launch keeps
+answering; an ID that old is no longer fenced (every request is still
+authenticated per connection and, in key mode, by its own proof).
 
 Use one service-owned instance per enrolled bridge. Constructing another instance
 does not create a durable replay epoch. Cleanup failure permanently disables this
 instance; the service must reconcile the bridge before replacing it.
 """
-    def __init__(self, *, bridge, binding_id, incarnation_id, expected_owner, expected_peer):
+    def __init__(self, *, bridge, binding_id, incarnation_id, expected_owner, expected_peer=None,
+                 key=None):
         _identity(expected_owner)
-        _identity(expected_peer)
+        # Exactly one peer authentication: the enrolled controller identity
+        # (version 1) or the per-launch key (version 2).
+        if (expected_peer is None) == (key is None):
+            raise _Denied()
+        if expected_peer is not None:
+            _identity(expected_peer)
+        elif type(key) is not bytes or len(key) != 32:
+            raise _Denied()
         self._binding = _Binding(_identifier(binding_id), _identifier(incarnation_id),
-                                 expected_owner, expected_peer, os.getuid())
+                                 expected_owner, expected_peer, os.getuid(), key)
+        self._version = 1 if key is None else 2
         self._bridge = bridge
         self._lock = threading.Lock()
         self._seen = set()
+        self._order = collections.deque()
         self._poisoned = False
 
     def _authenticate(self, connection):
@@ -206,14 +259,18 @@ instance; the service must reconcile the bridge before replacing it.
                 or os.getuid() != binding.uid or os.geteuid() != binding.uid):
             raise _Denied()
         pid, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if (uid != binding.uid or pid != binding.peer.pid or os.getpid() != binding.owner.pid
-                or _process_identity(pid) != binding.peer
-                or _process_identity(os.getpid()) != binding.owner):
+        if uid != binding.uid or pid <= 0 or os.getpid() != binding.owner.pid:
+            raise _Denied()
+        # Key mode authenticates each request by its proof instead of a peer PID.
+        if binding.peer is not None and (pid != binding.peer.pid
+                                         or _process_identity(pid) != binding.peer):
+            raise _Denied()
+        if _process_identity(os.getpid()) != binding.owner:
             raise _Denied()
 
     def _uncertain(self, request_id):
         now = time.monotonic_ns()
-        return dict(version=1, binding_id=self._binding.binding_id,
+        return dict(version=self._version, binding_id=self._binding.binding_id,
                     incarnation_id=self._binding.incarnation_id, request_id=request_id,
                     owner=_identity(self._binding.owner), started_ns=now, finished_ns=now,
                     status="uncertain", observation=None)
@@ -273,18 +330,32 @@ close without a frame; no partial frame is a successful protocol result.
                 raise _Denied()
             request = json.loads(_receive(connection, length, deadline).decode("utf-8", errors="strict"),
                                  object_pairs_hook=_pairs)
-            if type(request) is not dict or set(request) != {"version", "request_id", "timeout_ms"}:
+            fields = {"version", "request_id", "timeout_ms"}
+            if self._version == 2:
+                fields.add("proof")
+            if type(request) is not dict or set(request) != fields:
                 raise _Denied()
-            if type(request["version"]) is not int or request["version"] != 1:
+            if type(request["version"]) is not int or request["version"] != self._version:
                 raise _Denied()
             candidate_id = _identifier(request["request_id"])
+            if self._version == 2:
+                proof = request["proof"]
+                expected = request_proof(self._binding.key, self._binding.binding_id,
+                                         self._binding.incarnation_id, candidate_id)
+                if (type(proof) is not str or len(proof) != 64
+                        or not hmac.compare_digest(proof.encode("ascii", "replace"),
+                                                   expected.encode("ascii"))):
+                    raise _Denied()
             timeout_ms = _integer(request["timeout_ms"], 1, 2000)
-            if candidate_id in self._seen or len(self._seen) >= 4096:
+            if candidate_id in self._seen:
                 raise _Denied()
             _quiet(connection)
             self._authenticate(connection)
             request_id = candidate_id
+            while len(self._order) >= _REPLAY_WINDOW:
+                self._seen.discard(self._order.popleft())
             self._seen.add(request_id)
+            self._order.append(request_id)
             deadline = min(deadline, time.monotonic() + timeout_ms / 1000)
             requested_ns = time.monotonic_ns()
             response = self._uncertain(request_id)

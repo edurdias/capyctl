@@ -17,7 +17,8 @@ import re
 import stat
 import sys
 
-from .checkpoint_preflight import _check_platform, _check_root, _open_chain
+from . import owner_only
+from .pinned_file_observation import _check_platform, _check_root, _open_chain
 from .memory_saver_observer import ObservationError, SaverObservation, observe_saver
 
 
@@ -156,12 +157,22 @@ def _chain(scheduler, build):
 
 
 def _protected(info):
-    if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
-        raise SaverBindingError("unsafe_library")
+    # Owner decision 2026-09-23: the service-reviewed saver build and the
+    # directories on the way to it follow the owner-only rule mllm applies to
+    # its own helpers; group write is the owner's only under its private group.
+    try:
+        owner_only.check(info, owners=(0, os.getuid()))
+    except owner_only.OwnerOnlyError:
+        raise SaverBindingError("unsafe_library") from None
 
 
-def _library(build, cdll):
-    """Correlate existing exports with the protected hashed backing-file inode."""
+def _library(build, cdll, exports=_EXPORTS):
+    """Correlate existing exports with the protected hashed backing-file inode.
+
+    `exports` names the symbols this installation's saver must serve from that
+    inode: the patched build adds tms_snapshot_v1, torch-memory-saver 0.0.10
+    exports none (sglang_saver_residency).
+    """
     try:
         _check_root(build.path)
         parent, _, leaf = build.path.rpartition("/")
@@ -174,7 +185,10 @@ def _library(build, cdll):
             stack.callback(os.close, fd)
             info = os.fstat(fd)
             _protected(info)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 64 * 1024 * 1024:
+            # No link-count rule: uv installs the library as a hard link into
+            # its cache (found live 2026-09-23, M28). The digest below and the
+            # export mapping bind the loaded inode itself (ADR 0008).
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 64 * 1024 * 1024:
                 raise SaverBindingError("unsafe_library")
             digest = hashlib.sha256()
             remaining = info.st_size
@@ -189,7 +203,7 @@ def _library(build, cdll):
             result = LoadedSaverLibrary(build.sha256, info.st_dev, info.st_ino,
                                         info.st_size, info.st_mtime_ns, info.st_ctime_ns)
             mappings = _read("/proc/self/maps", 4 * 1024 * 1024).splitlines()
-            for name in _EXPORTS:
+            for name in exports:
                 export = getattr(cdll, name)
                 address = ctypes.cast(export, ctypes.c_void_p).value
                 matches = []
@@ -225,8 +239,9 @@ def observe_scheduler_saver(scheduler, *, expected_owner, build):
     """Make one snapshot call; preserve unknown residency and downstream authority.
 
     Recheck the object chain, process, backing file and export mappings afterwards.
-    The caller must already have enrolled this exact process and verified immutable
-    SGLang and saver Python sources. These are point-in-time checks, not a lock on
+    The caller must already have enrolled this exact process. The installation's
+    identity is its registered fingerprint and the saver shapes are probed at
+    launch (ADR 0008); no pinned source audit precedes this. These are point-in-time checks, not a lock on
     arbitrary Python mutation. The recipe's backup flags and snapshot records are
     checked, but no future allocation policy or complete process footprint is proved.
     """

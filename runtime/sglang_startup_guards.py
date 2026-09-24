@@ -3,7 +3,8 @@
 Call contain_startup_output() in the fresh service-owned child BEFORE native
 imports or ServerArgs construction, then enforce_closed_plugins(). Never restore
 stdout/stderr: native buffers, threads and atexit handlers can outlive startup.
-Output is deliberately discarded, not heuristically redacted. Failure reporting
+Output is discarded by default, not heuristically redacted. Explicit operator
+--debug-engine-logs retains full private output for development. Failure reporting
 must use fixed exit/status categories, not native exception text or arguments.
 
 These are narrow controls, not a sandbox. The launcher must supply a clean isolated
@@ -22,22 +23,25 @@ __mp_main__ preparation, before native Process arguments are unpickled. Keeping
 that exact protected main path and spawn method is a startup composition duty;
 guarding only the scheduler target cannot protect argument-class imports.
 
-Pinned plugin contract fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1:
+Pinned plugin contract 94602c9c2b7cbdb8efd5c52802dac6a1c180089e:
 plugins.load_plugins_by_group discovers importlib.metadata entry_points for both
 sglang.srt.plugins and sglang.srt.platforms. platforms._resolve_platform also has
 a direct entry_points(...).load() path when SGLANG_PLATFORM is selected. Empty
 SGLANG_PLUGINS means unrestricted, NOT disabled. Reject BOTH installed groups and
-nonempty selectors without importing entry-point targets. Thus the pinned engine's
+nonempty selectors without importing entry-point targets. Thus the engine's
 load_plugins and platform defaults have no external plugin to execute, provided
-the immutable metadata/source preconditions hold. This does not deny built-in
-hooks, arbitrary package imports, or unreviewed/new loader paths. Source preflight
-must include the pinned plugins/platforms initializers, and be revalidated before
-imports. Source-file checks alone do not attest installed entry-point metadata or
-the complete import graph and cannot satisfy the immutable-package prerequisite.
+the installed metadata is what the host registered. This does not deny built-in
+hooks, arbitrary package imports, or unreviewed/new loader paths. ADR 0008
+(owner decision 2026-09-23): no pinned source audit backs this any more; the
+installation's registered fingerprint and drift flag, and the launch-time
+capability probes (engine_capabilities.py), take its place, and neither attests
+the complete import graph.
 """
 
 import importlib.metadata
+import logging
 import os
+import re
 import stat
 import sys
 
@@ -106,10 +110,60 @@ def enforce_closed_plugins():
         raise StartupGuardError("plugin_inventory_unavailable") from None
 
 
+# SPEC §13.3 / T21: a bearer value, or a run of credential-shaped characters as
+# long as mllm's keys (64 hex) or longer than any ordinary token. Mirrors
+# `crates/mllm-adapters/src/vllm/args.rs::redact_text`.
+_CREDENTIAL = re.compile(r"(?i)(bearer\s+)[^\s'\",;]+|[A-Za-z0-9+/=_-]{48,}")
+
+
+def scrub(text):
+    """The text with bearer values and credential-shaped runs redacted."""
+    return _CREDENTIAL.sub(lambda match: (match.group(1) or "") + "<redacted>", text)
+
+
+class _ScrubbingStream:
+    """A text stream whose Python-level writes are scrubbed (SPEC §13.3)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def write(self, text):
+        self._inner.write(scrub(text) if type(text) is str else text)
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def install_log_scrubber():
+    """SPEC §13.3 / T21: debug engine logs never carry a credential.
+
+    The engine formats its arguments (keys included) into log messages, so every
+    log record's message is scrubbed as it is created, and Python-level writes
+    to stdout and stderr are scrubbed too. Native writes to the descriptors are
+    not intercepted; the log file is private (0600) either way.
+    """
+    factory = logging.getLogRecordFactory()
+
+    def scrubbed(*args, **kwargs):
+        record = factory(*args, **kwargs)
+        try:
+            message = scrub(record.getMessage())
+        except Exception:
+            message = "<unformattable log message>"
+        record.msg, record.args = message, None
+        return record
+
+    logging.setLogRecordFactory(scrubbed)
+    sys.stdout = _ScrubbingStream(sys.stdout)
+    sys.stderr = _ScrubbingStream(sys.stderr)
+
+
 def preimport_guard():
     """One-call preimport safety for a freshly spawned interpreter.
 
-    Runs contain_startup_output() then enforce_closed_plugins(), in that order,
+    Normally runs contain_startup_output() then enforce_closed_plugins(), in that order.
+    Explicit debug opt-in skips output containment only. This runs
     at the top of a spawned interpreter's main before native Process arguments
     are unpickled. Raises a closed StartupGuardError category; the caller exits
     without rendering native details. The selector rejection and installed
@@ -118,5 +172,10 @@ def preimport_guard():
     paths (including children), the clean isolated interpreter and the closed
     environment remain launcher prerequisites that no child can self-attest.
     """
-    contain_startup_output()
+    # Explicit operator development opt-in; plugin checks remain mandatory, and
+    # the retained output is scrubbed of credentials (SPEC §13.3).
+    if os.environ.get("MLLM_DEBUG_ENGINE_LOGS") != "1":
+        contain_startup_output()
+    else:
+        install_log_scrubber()
     enforce_closed_plugins()

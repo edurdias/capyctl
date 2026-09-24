@@ -120,6 +120,45 @@ class StartupGuardsTests(unittest.TestCase):
             ''')
             self.assertEqual(child.returncode, 0, child.stderr)
 
+    def test_debug_opt_in_preserves_output_but_still_rejects_plugins(self):
+        child = self.child("""
+            from runtime.sglang_startup_guards import preimport_guard, StartupGuardError
+            import os
+            os.environ["MLLM_DEBUG_ENGINE_LOGS"] = "1"
+            os.environ["SGLANG_PLATFORM"] = "untrusted"
+            try:
+                preimport_guard()
+            except StartupGuardError as error:
+                assert error.code == "external_plugin_selection"
+                print("debug-visible")
+            else:
+                raise AssertionError("plugin gate bypassed")
+        """)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(child.stdout, b"debug-visible\n")
+
+    # T21: SPEC §13.3. Debug engine logs keep output but never a credential:
+    # log records and Python-level writes are scrubbed of bearer values and
+    # credential-shaped runs (mllm's keys are 64 hex characters).
+    def test_debug_output_is_scrubbed_of_credentials(self):
+        key = "ab" * 32
+        child = self.child(f"""
+            import logging, os, sys
+            os.environ["MLLM_DEBUG_ENGINE_LOGS"] = "1"
+            from runtime.sglang_startup_guards import preimport_guard
+            preimport_guard()
+            logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+            logging.getLogger("sglang").info("server_args=ServerArgs(api_key=%r)", "{key}")
+            print("Authorization: Bearer {key} and plain", flush=True)
+            print("ordinary line", flush=True)
+        """)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        output = child.stdout + child.stderr
+        self.assertNotIn(key.encode(), output)
+        self.assertIn(b"<redacted>", child.stderr)
+        self.assertIn(b"ordinary line", child.stdout)
+        self.assertIn(b"and plain", child.stdout)
+
     def test_prior_native_import_is_too_late(self):
         child = self.child('''
             from runtime.sglang_startup_guards import enforce_closed_plugins, StartupGuardError

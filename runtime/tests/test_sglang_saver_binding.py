@@ -164,6 +164,35 @@ uint32_t tms_snapshot_v1(uint32_t version, uint32_t size,
         finally:
             self.path.chmod(0o500)
 
+    # T21 T37: owner decision 2026-09-23. The reviewed saver build follows the
+    # owner-only rule: group write is trusted only under the owner's private
+    # group; under a shared group it is refused.
+    def test_group_writable_library_follows_the_owner_only_rule(self):
+        from runtime import owner_only
+        self.path.chmod(0o570)
+        try:
+            with mock.patch.object(owner_only, "system_private_group", return_value=True):
+                self.assertEqual(self.observe().library.sha256, self.digest)
+            with mock.patch.object(owner_only, "system_private_group", return_value=False):
+                with self.assertRaisesRegex(self.binding.SaverBindingError, "unsafe_library"):
+                    self.observe()
+        finally:
+            self.path.chmod(0o500)
+
+    # T21 T37: found live 2026-09-23 (M28 on host-b). uv installs the saver
+    # library as a hard link into its cache, so the installed file has several
+    # names. The digest and the export mapping still bind the loaded inode, and
+    # engine installation files carry no link-count rule (owner decision
+    # 2026-09-23, ADR 0008); the hard-linked library is accepted.
+    def test_hard_linked_library_is_accepted(self):
+        import os
+        link = self.root / "uv-cache-link.so"
+        os.link(self.path, link)
+        try:
+            self.assertEqual(self.observe().library.sha256, self.digest)
+        finally:
+            link.unlink()
+
     def test_export_from_another_mapping_rejected(self):
         callback = ctypes.CFUNCTYPE(None)(lambda: None)
         with mock.patch.object(self.library, "tms_pause", callback):

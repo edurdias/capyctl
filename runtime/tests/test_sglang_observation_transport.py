@@ -253,20 +253,35 @@ class ObservationTransportTests(unittest.TestCase):
         self.assertEqual(outcomes, ["denied"])
         self.assertEqual(self.bridge.calls, [])
 
-    def test_replay_capacity_never_evicts_previous_ids(self):
+    # T21 T16: SPEC §9.2. The replay fence is a sliding window over the most
+    # recent 4096 correlation IDs: a recent ID is never served twice, and a
+    # long-lived launch keeps answering new observations (a fence that never
+    # drained refused every Park once 4096 observations had been made).
+    def test_replay_window_slides_over_recent_ids(self):
         for index in range(4096):
             client, thread, outcomes = self.connect()
             client.sendall(self.frame(f"id-{index}"))
             self.assertEqual(self.read_response(client)["status"], "observed")
             thread.join(3)
             client.close()
-        for request_id in ("id-0", "new-id"):
+        client, thread, outcomes = self.connect()
+        client.sendall(self.frame("id-4095"))
+        self.assertIsNone(self.read_response(client))
+        thread.join(3)
+        self.assertEqual(outcomes, ["denied"])
+        for request_id in ("new-id", "newer-id"):
             client, thread, outcomes = self.connect()
             client.sendall(self.frame(request_id))
-            self.assertIsNone(self.read_response(client))
+            self.assertEqual(self.read_response(client)["status"], "observed")
             thread.join(3)
-            self.assertEqual(outcomes, ["denied"])
-        self.assertEqual(len(self.bridge.calls), 4096)
+            client.close()
+        # The newest IDs are inside the window and stay refused.
+        client, thread, outcomes = self.connect()
+        client.sendall(self.frame("new-id"))
+        self.assertIsNone(self.read_response(client))
+        thread.join(3)
+        self.assertEqual(outcomes, ["denied"])
+        self.assertEqual(len(self.bridge.calls), 4098)
 
     def test_peer_identity_rechecked_after_result_before_output(self):
         actual = self.module._process_identity
@@ -398,6 +413,39 @@ class ObservationTransportTests(unittest.TestCase):
             self.assertEqual(self.transport.serve(connection), "denied")
             self.assertEqual(connection.fileno(), -1)
         self.assertEqual(self.bridge.calls, [])
+
+    # T33: key mode authenticates each request by the per-launch key's proof,
+    # so a restarted host (any PID of the service UID) can observe; exactly one
+    # of the enrolled peer or the key is accepted at construction.
+    def test_key_mode_authenticates_requests_by_proof_not_peer_pid(self):
+        # The same vectors crates/mllm-adapters/src/sglang/observation.rs computes.
+        vector = self.module.observation_key("admin", "binding", "incarnation")
+        self.assertEqual(vector.hex(),
+                         "57fccc735da4dbf27df1429ffdd32592821c41c56fa440fe7ed32aa97411581e")
+        self.assertEqual(self.module.request_proof(vector, "binding", "incarnation", "r-1"),
+                         "ed01f094bf1dbca00b9ab32be46c29cc89768bbd5aed1cd0b4f567f1d89fadf3")
+        key = self.module.observation_key("admin-key", "binding-1", "incarnation-1")
+        self.assertEqual(len(key), 32)
+        self.assertNotEqual(key, self.module.observation_key("admin-key", "binding-1", "other"))
+        # Both, neither, or a malformed key.
+        for changes in (dict(key=key), dict(expected_peer=None), dict(key=b"short", expected_peer=None)):
+            with self.assertRaises(Exception):
+                self.make_transport(**changes)
+        keyed = self.make_transport(expected_peer=None, key=key)
+        for proof, expected in ((self.module.request_proof(key, "binding-1", "incarnation-1", "r-1"),
+                                 "observed"), ("0" * 64, None)):
+            client, thread, outcomes = self.connect(keyed)
+            request_id = "r-1" if expected else "r-2"
+            data = json.dumps(dict(version=2, request_id=request_id, timeout_ms=1000,
+                                   proof=proof)).encode()
+            client.sendall(struct.pack("!I", len(data)) + data)
+            response = self.read_response(client)
+            thread.join(3)
+            if expected is None:
+                self.assertIsNone(response)
+                self.assertEqual(outcomes, ["denied"])
+            else:
+                self.assertEqual((response["version"], response["status"]), (2, expected))
 
     def test_import_never_loads_engine_modules(self):
         result = subprocess.run(["python3", "-B", "-c",

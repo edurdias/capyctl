@@ -1,28 +1,51 @@
 # Runtime preflight
 
-## Selected SGLang source preflight
+## Installation identity and capability probes
 
-`sglang_source_preflight.verify_sglang_sources(root)` checks ten fixed Python
-sources under the installed `sglang/srt` directory against commit
-`fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`. The inventory covers server arguments,
-authentication, the saver adapter, scheduler, detokenizer, weight updater, engine
-startup, HTTP startup, plugin loader, and platform selector.
-`revalidate_sglang_sources(previous)` repeats the checks and rejects
-even byte-identical inode replacement. Roots stay out of observation repr; errors
-are closed categories. No engine module is imported.
+ADR 0008 (owner decision 2026-09-23) retired the pinned SGLang source audit
+(`sglang_source_preflight.py`) and the pinned saver source inventory
+(`saver_source_preflight.py`). No file of an engine installation is compared to
+hard-coded hashes, and no permission rule applies to installation files, so a
+custom, patched or group-writable build is not refused for being one.
 
-Every directory ancestor and source leaf must be root/service-owned and have no
-group/world write permission. Symlinks and nonregular sources are rejected;
-individual files are bounded to 16 MiB. Tests use private temporary directories
-beneath the service home because `/tmp` is not a protected installation ancestor.
+Instead the host agent records each installation's fingerprint at registration
+(the engine package's version and a `sha256:` digest over its files; see
+`crates/mllm-agent/src/installation.rs`) and flags drift when a later launch
+measures something else. Drift refuses a launch only under the installation's
+host policy `security.installation_drift: refuse`; the default is `warn`.
 
-These ten files are not the complete Python import graph or compiled runtime.
-The check neither attests the whole installed wheel nor proves the effective
-ServerArgs mapping, physical GPU identity, real saver, worker enrollment, or live
-compatibility. Native startup remains closed; production composition must select
-the protected installed package root and consume/revalidate this observation
-alongside the remaining gates. Same-service-user mutation after observation is
-outside its guarantee.
+`engine_capabilities.py` probes, by shape, the internals mllm hooks: the module
+imports, the attribute or method is callable, the record declares the field,
+the router serves the route, the metrics module names the gauge. Capabilities
+are `core`, `deep_park`, `metrics` and (SGLang) `observation`. A missing one
+refuses only the dependent feature with the closed category
+`capability_missing:<name>`:
+
+- `sglang_entry.py` probes after its guarded import: `core` for every launch,
+  `deep_park` (saver adapter, importable saver, release, resume, reload-from-disk
+  and flush routes) only when the memory saver is on, which is what `deep`
+  residency renders. A `restart_only` launch serves on a build without the
+  saver hooks.
+- `vllm_entry.py` probes `deep_park` (sleep and middleware destinations, sleep,
+  wake, collective RPC and prefix-cache routes) only when sleep mode is on.
+- The host agent runs `python -I -S engine_capabilities.py <engine>
+  <site-packages>` under the installation's own interpreter, bounded in time
+  and output, before admitting a launch whose tier depends on a gated feature,
+  and before a Park. The command prints one JSON report of missing probe
+  labels per capability; it never prints paths or exception text.
+
+Probes that pass are not evidence that a build serves a model or parks
+correctly.
+
+## Owner-only rule for mllm's own helpers
+
+`owner_only.py` mirrors `crates/mllm-adapters/src/owner_only.rs`: a file or
+directory mllm put there itself is trusted when owned by root or the service
+user, never writable by other, and group-writable only through the owning
+user's private group. It governs this directory's modules, the protected entry
+path, the reviewed saver library the scheduler binding reads, and the
+observation listener's ancestor directories. mllm's private state stays strict:
+the listener's own 0700 directory and 0600 socket admit no group write.
 
 ## Native startup output and external plugins
 
@@ -39,7 +62,15 @@ mounts and service-side mapping/namespace provisioning remain required.
 service-owned child only. `contain_startup_output()` permanently redirects stdout
 and stderr to `/dev/null`, including C output and descendants. It is not a
 context manager and must never run in the controlling service process. Report
-only fixed exit/status categories externally; native output is discarded.
+only fixed exit/status categories externally; native output is discarded by default.
+
+For development, the operator may explicitly run
+`mllm start standalone --debug-engine-logs`. This enables native debug verbosity
+and retains full output in the launcher's private engine log files. Those files
+may contain credentials or other sensitive data; they are not copied into
+management errors or journals. The flag is process-local and is not persisted.
+Restart without it to restore output containment. Plugin, capability,
+checkpoint, and placement checks remain enforced in either mode.
 
 `enforce_closed_plugins()` rejects already imported `sglang`, `torch`,
 `transformers`, or `torch_memory_saver` roots and submodules, nonempty
@@ -53,8 +84,7 @@ is not an upstream disable switch. An empty no-site metadata search is not proof
 that the eventual native package environment contains no plugins.
 
 These helpers do not block explicitly opened file/network/terminal logs, attest
-all imported code, or authorize native startup. No native entrypoint is enabled
-by their presence. Effective recipe checks, physical placement, worker enrollment,
+all imported code, or authorize native startup by their presence alone. Effective recipe checks, physical placement, worker enrollment,
 and actual saver/allocation evidence remain independent obligations.
 
 ## Scheduler allocation observation transport
@@ -63,13 +93,12 @@ The observation path composes an enrolled scheduler's existing saver instance,
 `sglang_scheduler_observer` safe-point bridge, `sglang_observation_transport`
 framing/authentication, and `sglang_observation_server` protected Unix listener.
 No helper imports an engine or converts allocation facts into Ready, idle,
-release, residency, or qualification evidence. Actual startup attachment and
-complete process enrollment remain required.
+release, residency, or qualification evidence; the host fuses them with its own.
 
 `SchedulerObservationServer.start(...)` requires the exact current scheduler
 identity and a separately enrolled live controller identity. It creates a new
-socket only, under a canonical service-owned 0700 directory with protected
-ancestors. Existing files/sockets are never adopted, replaced or repaired. The
+socket only, under a canonical service-owned 0700 directory whose ancestors
+follow the owner-only rule. Existing files/sockets are never adopted, replaced or repaired. The
 socket is 0600, descriptors are non-inheritable, and one worker handles accepted
 connections through one retained transport instance. The existing bounded replay
 set therefore spans connections rather than resetting on each accept.
@@ -82,80 +111,42 @@ socket; a replaced path is never unlinked. This is transport shutdown, not engin
 cleanup or proof of memory release. Root/service UID and descriptor custody remain
 trusted assumptions; the listener is not a sandbox against either.
 
+Production enrollment (SPEC §9.2). A memory-saver launch whose host supplies a
+private observation directory (`MLLM_OBSERVATION_DIR`, 0700) is started with
+`sglang_observation_enrollment.run_enrolled_scheduler` as SGLang's scheduler
+process target. In the scheduler process, after the Scheduler is built and
+before its event loop, it installs the bridge with the SGLang 0.5.20 and
+torch-memory-saver 0.0.10 reader (`sglang_saver_residency`), starts the listener
+at `<dir>/<binding>.sock` in key mode, and writes `<dir>/<binding>.json` (0600):
+binding, incarnation, the scheduler's process identity and the preload
+library's path and digest. torch-memory-saver 0.0.10 exports no allocation
+snapshot, so the reader takes the saver's per-tag MemPool segments and asks the
+CUDA driver (`cuMemRetainAllocationHandle`, libcuda only if already loaded)
+whether physical memory backs each one: a pause unmaps it, a resume maps it
+again. Key mode replaces the enrolled controller PID with a per-launch key
+derived from the admin credential, so a restarted host still observes the
+launch it owns. Any enrollment failure leaves the engine serving without an
+observation, and the host refuses Park unchanged. The host side is
+`crates/mllm-agent/src/native_execution/saver_source.rs`.
+
 The Rust `NativeObservationClient` interoperability fixture now uses this actual
 listener and transport with synthetic saver facts in an isolated CPU Python
-process. Those fixtures use synthetic allocation observations; they do not load
+process, in both the enrolled-peer and key modes. Those fixtures use synthetic allocation observations; they do not load
 a GPU or native engine. Current verification counts and installation limitations
 are tracked in [F2 continuation status](../docs/runbooks/f2-current-status.md).
 
-## Checkpoint verification contract
+## Checkpoint identity
 
-This module performs a bounded observation of one fixed checkpoint contract. It
-does not qualify an engine or authorize a launch.
+ADR 0014 §7 (WE3) retired the pinned checkpoint preflight
+(`checkpoint_manifest.py`, `checkpoint_preflight.py`). Checkpoint identity is
+now a `sha256:` digest over a canonical manifest of every file in the
+checkpoint (relative path, size and SHA-256), measured in Rust by the host that
+holds it (`crates/mllm-agent/src/checkpoint.rs`), recorded by the server when
+the deployment is accepted, and re-verified by the host before every launch and
+wake, for both engines. Nothing in this directory checks checkpoint files.
 
-## Public API
-
-```python
-from runtime.checkpoint_preflight import (
-    CheckpointPreflightError, verify_checkpoint, revalidate_checkpoint,
-)
-
-verified = verify_checkpoint("/path/to/checkpoint")
-# Immediately before native loading (and before any protected wrapper/effect):
-verified = revalidate_checkpoint(verified)
-```
-
-`verify_checkpoint(root: str) -> VerifiedCheckpoint` checks the compiled-in
-manifest for `Qwen/Qwen3-4B-Instruct-2507` at revision
-`cdbee75f17c01a7cc42f958dc650907174af0554`. It validates the expected artifact
-bytes, JSON, safetensors geometry and storage layout, while retaining only
-scoped immutable facts. `revalidate_checkpoint(previous: VerifiedCheckpoint) ->
-VerifiedCheckpoint` repeats the full check and requires the same root and file
-identities. Byte-identical replacement at a different inode is therefore
-rejected.
-
-The compiled-in manifest is fixed: callers cannot provide expected hashes,
-geometry, revision, or a test mode. The verifier uses descriptor-safe,
-bounded I/O and warms only the filesystem cache as a consequence of reading;
-it does not import or load models, tensors, or engines. It performs no network
-access, download, checkpoint mutation, engine initialization, or routing side
-effect.
-
-The supported root is a Linux-only, absolute, normalized path: it has no
-trailing or repeated separators and no `.` or `..` components. Symlink path
-components and leaves, and non-regular artifacts, are rejected. Reads are
-bounded to 1 MiB chunks and a 16 MiB limit for ancillary files. The verifier
-detects ordinary replacement and concurrent modification during its check, but
-does not establish immutable storage or close the interval after final
-revalidation if a later engine reopens pathnames. Same-user malicious writers
-remain outside this module's guarantee; a downstream launcher must retain
-trusted runtime and filesystem assumptions.
-
-The index's pinned advisory `total_size` is checked against the pinned payload
-relationship. This exact checkpoint has a known 655,360-byte discrepancy
-between the advisory total and tensor payload; that value is part of the fixed
-contract and is not a generic corruption tolerance.
-
-## Normal and failure usage
-
-```python
-try:
-    verified = verify_checkpoint("/path/to/checkpoint")
-    verified = revalidate_checkpoint(verified)
-except CheckpointPreflightError as error:
-    print(error.code)
-```
-
-Failures expose only one closed error-code set:
-
+The descriptor-safe open chain the preflight introduced lives on in
+`pinned_file_observation.py`, used only by the saver library binding
+(`sglang_saver_binding.py`). Its failures expose the closed codes
 `invalid_root`, `unsupported_platform`, `unsafe_file`, `artifact_missing`,
-`artifact_changed`, `artifact_mismatch`, `invalid_json`, `invalid_storage`,
-`unsupported_geometry`, and `io_error`.
-
-Synthetic CPU fixtures in `runtime/tests/test_checkpoint_preflight.py` exercise
-the verifier's safety and parsing seams, but they are not evidence that the
-real pinned model is present or loadable. The result is only an observation of
-checkpoint files at that moment. Future native composition must revalidate
-immediately before loading, before any protected wrapper/effect. A successful
-result grants no qualification, admission, runtime provenance, engine,
-phase-budget, or F2 authority.
+`artifact_changed`, `artifact_mismatch` and `io_error`.

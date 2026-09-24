@@ -1,8 +1,15 @@
 """Protected SGLang startup boundary, using only the standard library.
 
-The audited startup gates compose through sglang_native_composition before any
-engine import: pinned source revalidation, plugin closure, and checkpoint
-revalidation must hold as one native contract. Placement is asserted only when
+The startup gates compose through sglang_native_composition before any engine
+import: plugin closure and placement must hold as one native contract. ADR 0008
+(owner decision 2026-09-23): no pinned source audit runs; after the guarded
+import the internals this launch depends on are probed by shape
+(engine_capabilities.py), and a missing one refuses only the dependent feature
+with a closed `capability_missing:<name>` category. ADR 0014 §7, §9:
+checkpoint identity is a content digest the host (remote agent or embedded
+controller) measures against the recorded
+digest before it starts this entry, and again before a wake; this entry
+checks no pinned checkpoint manifest. Placement is asserted only when
 the descriptor carries the service-authorized device inventory digest the host
 policy published; the mapping is then assembled from the descriptor's
 service-frozen device selectors, that digest, and the inherited CUDA namespace,
@@ -15,17 +22,24 @@ validates shape and binds private inputs; it does not authorize a launch or
 qualify memory release. The controller retains those obligations.
 """
 
-from dataclasses import dataclass, field
 import hmac
 import json
 import os
 import stat
 import sys
 
-# The renderer invokes this file under python -IS. Resolve our own package from
-# the installed wrapper location, never the current directory or PYTHONPATH.
+# The renderer invokes this file under python -IS. SPEC §9.1 / T21: resolve our
+# own package from the verified runtime directory alone. The package `runtime`
+# is registered with exactly this directory as its search path; its parent is
+# never put on sys.path, where an unverified module could shadow a sibling or
+# the standard library.
 if __name__ in ("__main__", "__mp_main__") and not __package__:
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if "runtime" not in sys.modules:
+        import types as _types
+        _package = _types.ModuleType("runtime")
+        _package.__path__ = [os.path.dirname(os.path.abspath(__file__))]
+        _package.__package__ = "runtime"
+        sys.modules["runtime"] = _package
 
 # CPython spawn prepares this main script before unpickling the Process object.
 # Native argument classes can import SGLang during that unpickle, before any
@@ -40,33 +54,37 @@ if __name__ == "__mp_main__":
         # No native/input exception text, including if containment itself fails.
         raise SystemExit(1) from None
 
-from runtime.checkpoint_preflight import (
-    CheckpointPreflightError, verify_checkpoint, revalidate_checkpoint,
-)
-
-
 _MAX_DESCRIPTOR = 65536
-_RECIPE = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1"
-_SOURCE = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1"
-_CHECKPOINT = "cdbee75f17c01a7cc42f958dc650907174af0554"
-_MINIMUM_KV = 603979776
+_MAX_EXTRA_ARGS = 256
+_I64 = (1 << 63) - 1
+_I32 = (1 << 31) - 1
 _CODES = frozenset({"invalid_descriptor", "invalid_credentials", "descriptor_io",
                     "pinned_source_contract_unavailable", "memory_saver_unavailable",
                     "startup_error",
                     # The composition gates' own closed categories, surfaced
                     # verbatim through LaunchError when a gate refuses.
-                    "source_revalidation_failed", "plugin_closure_failed",
-                    "placement_failed", "checkpoint_revalidation_failed"})
-_SETTINGS = {
-    "recipe": _RECIPE, "tensor_parallel_size": 1, "data_parallel_size": 1,
-    "tokenizer_workers": 1, "model_dtype": "bfloat16", "context_tokens": 4096,
-    "max_running_requests": 8, "max_total_tokens": 4096,
-    "prefill_cuda_graphs": False, "decode_cuda_graphs": False,
-    "memory_saver": True, "cpu_weight_backup": False, "speculative_decoding": False,
-    "lora": False, "trust_remote_code": False, "disaggregation": False,
-    "external_cache": False, "cpu_kv_offload": False, "native_grpc": False,
-    "weight_restore": "disk_reload",
-}
+                    "invalid_launch_spec", "plugin_closure_failed",
+                    "placement_failed",
+                    # ADR 0008: a capability this launch depends on is missing
+                    # from the installation (engine_capabilities.py).
+                    "capability_missing:core", "capability_missing:deep_park",
+                    # The argument mapper's closed categories (ADR 0014 §6).
+                    "invalid_launch_inputs", "placement_mismatch",
+                    "server_args_construction_failed", "effective_args_mismatch",
+                    "invalid_extra_args", "memory_grant_unavailable",
+                    # ADR 0014 §8 / SPEC §8.2: a sensitive destination the host
+                    # did not approve, or a malformed approvals document.
+                    "sensitive_option_refused", "invalid_extra_approvals",
+                    # SPEC §8.2 / T21: the single-rank rendezvous stays off the
+                    # network (loopback_rendezvous.py).
+                    "loopback_rendezvous_failed"})
+# ADR 0014 §2: the typed settings a deployment may state. None means the
+# engine's own default applies; mllm validates type and range only (ADR 0011).
+_SETTINGS = ("dtype", "quantization", "kv_cache_dtype", "context_length",
+             "max_running_requests", "cuda_graphs", "language_model_only",
+             "trust_remote_code", "max_total_tokens", "chunked_prefill_size",
+             "tokenizer_workers", "memory_saver", "cpu_weight_backup",
+             "weight_restore", "memory", "extra_args")
 
 
 class LaunchError(Exception):
@@ -77,23 +95,7 @@ class LaunchError(Exception):
         super().__init__(self.code)
 
 
-@dataclass(frozen=True, repr=False)
-class LaunchSpec:
-    """Private process-local inputs, never a serialized or public DTO."""
-
-    _public_json: str = field(repr=False)
-    _checkpoint_root: str = field(repr=False)
-    _inference_key: str = field(repr=False)
-    _admin_key: str = field(repr=False)
-    # Version 1 has no scope and must never be promoted implicitly. Version 2
-    # carries immutable private metadata, not enrollment or execution authority,
-    # plus the optional service-authorized device inventory digest the host
-    # policy published; the entry never invents either.
-    _launch_scope_json: str | None = field(default=None, repr=False)
-    _placement_digest: str | None = field(default=None, repr=False)
-
-    def __repr__(self):
-        return "LaunchSpec(<private>)"
+from runtime.sglang_launch_spec import LaunchSpec
 
 
 def _reject():
@@ -162,15 +164,79 @@ def _ulid(value):
         _reject()
 
 
+def _optional_token(value, limit=64):
+    if value is None:
+        return
+    _text(value, limit)
+    if not value.isascii() or any(not (char.isalnum() or char in "_-.") for char in value):
+        _reject()
+
+
+def _optional_integer(value, low, high):
+    if value is not None:
+        _integer(value, low, high)
+
+
+def _boolean(value):
+    if type(value) is not bool:
+        _reject()
+
+
+def _validate_settings(settings):
+    """ADR 0014 §2, §5, §6: the closed typed settings object.
+
+    Values pass through as the engine spells them; this checks type, range and
+    closure only. Reserved settings never appear here: construct_server_args
+    renders them from the binding, placement and grant.
+    """
+    _exact_object(settings, _SETTINGS)
+    for name in ("dtype", "quantization", "kv_cache_dtype"):
+        _optional_token(settings[name])
+    if settings["dtype"] not in (None, "auto", "bfloat16", "float16", "float32"):
+        _reject()
+    for name in ("context_length", "max_running_requests", "max_total_tokens"):
+        _optional_integer(settings[name], 1, _I32)
+    chunked = settings["chunked_prefill_size"]
+    if chunked is not None:
+        _integer(chunked, -1, _I32)
+        if chunked == 0:
+            _reject()
+    if settings["cuda_graphs"] is not None:
+        _boolean(settings["cuda_graphs"])
+    for name in ("language_model_only", "trust_remote_code", "memory_saver",
+                 "cpu_weight_backup"):
+        _boolean(settings[name])
+    _integer(settings["tokenizer_workers"], 1, 1024)
+    expected_restore = "cpu_backup" if settings["cpu_weight_backup"] else "disk_reload"
+    _literal(settings["weight_restore"], expected_restore)
+    memory = settings["memory"]
+    _exact_object(memory, ("request_bytes", "kv_cache_bytes", "margin_bytes", "static_bytes"))
+    for name in ("request_bytes", "kv_cache_bytes", "static_bytes"):
+        _integer(memory[name], 1, _I64)
+    _integer(memory["margin_bytes"], 0, _I64)
+    # ADR 0014 §5: the static pool is the request minus the overhead margin,
+    # floored at the declared KV cache and never above the whole request (an
+    # explicit request below KV plus margin cannot honour the margin).
+    request, kv = memory["request_bytes"], memory["kv_cache_bytes"]
+    if kv > request or memory["static_bytes"] != min(max(request - memory["margin_bytes"], kv),
+                                                     request):
+        _reject()
+    extra = settings["extra_args"]
+    if type(extra) is not list or len(extra) > _MAX_EXTRA_ARGS:
+        _reject()
+    for token in extra:
+        _text(token, 4096)
+
+
 def _validate_public(value):
-    _exact_object(value, ("schema_version", "kind", "engine", "recipe", "source_revision",
-                         "checkpoint_revision", "binding_id", "incarnation", "endpoint",
-                         "served_name", "rendered_settings_digest", "settings",
-                         "minimum_kv_bytes", "static_memory_fraction", "device"))
-    for key, expected in (("schema_version", 1), ("kind", "sglang_launch"),
-                          ("engine", "sglang"), ("recipe", _RECIPE),
-                          ("source_revision", _SOURCE), ("checkpoint_revision", _CHECKPOINT),
-                          ("minimum_kv_bytes", _MINIMUM_KV)):
+    # ADR 0008 (owner decision 2026-09-23): no source revision token. The
+    # installed SGLang build is identified by the host's installation
+    # fingerprint and probed by shape (engine_capabilities.py), never pinned.
+    _exact_object(value, ("schema_version", "kind", "engine",
+                         "binding_id", "incarnation", "endpoint", "served_name",
+                         "rendered_settings_digest", "settings", "device"))
+    for key, expected in (("schema_version", 2), ("kind", "sglang_launch"),
+                          ("engine", "sglang")):
         _literal(value[key], expected)
     _ulid(value["binding_id"])
     _ulid(value["incarnation"])
@@ -185,8 +251,7 @@ def _validate_public(value):
     # binding artifact: an ASCII printable token, a non-empty run of at most
     # 256 bytes restricted to 0x21..=0x7E. This mirrors the coordinator's
     # `served_name_token` in crates/mllm-adapters/src/sglang/args.rs, so both
-    # validators refuse exactly the same inputs. The retired
-    # `candidate-{binding_id}` derivation is gone rather than deprecated.
+    # validators refuse exactly the same inputs.
     served = _text(value["served_name"], 256)
     if (not served.isascii() or not served.isprintable()
             or any(char.isspace() for char in served)):
@@ -200,16 +265,7 @@ def _validate_public(value):
     digest = _text(value["rendered_settings_digest"], 64)
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         _reject()
-    settings = value["settings"]
-    _exact_object(settings, (*_SETTINGS, "requested_budget"))
-    for key, expected in _SETTINGS.items():
-        _literal(settings[key], expected)
-    budget = settings["requested_budget"]
-    _exact_object(budget, ("kv_cache_bytes", "static_memory_fraction_bps"))
-    _integer(budget["kv_cache_bytes"], _MINIMUM_KV, (1 << 63) - 1)
-    fraction = budget["static_memory_fraction_bps"]
-    _integer(fraction, 1, 10000)
-    _literal(value["static_memory_fraction"], f"{fraction // 10000}.{fraction % 10000:04d}")
+    _validate_settings(value["settings"])
 
 
 def _credential(raw):
@@ -335,14 +391,13 @@ def build_launch(argv, descriptor_reader):
 
 
 def _trusted_package_root():
-    """Compose the pinned engine package root from the launcher's own selection.
+    """Compose the engine package root from the launcher's own selection.
 
     The rendered command (args.rs render_for_launcher) pins the engine
     interpreter as argv[0]; under -IS no site processing selects a package
     root, so the path is composed explicitly from that executable's
     environment prefix. Nothing is discovered from PATH, PYTHONPATH, or .pth
-    hooks. A wrong composition fails closed in source revalidation with that
-    gate's own category.
+    hooks. A wrong composition fails closed at the guarded import.
     """
     prefix = os.path.dirname(os.path.dirname(sys.executable))
     return os.path.join(prefix, "lib", "python%d.%d" % sys.version_info[:2],
@@ -370,14 +425,14 @@ def _placement_mapping(spec, digest):
         inventory_digest=digest)
 
 
-def _verified_native_contract(spec, checkpoint):
-    """Run the audited startup gates and hold the resulting native contract.
+def _verified_native_contract(spec):
+    """Run the startup gates and hold the resulting native contract.
 
-    The gates run in composition's fixed order — pinned source revalidation,
-    plugin closure, placement, checkpoint revalidation — and any failure
-    leaves through the gate's own closed category, never the retired blanket
-    denial. The entry supplies the package root composed from the
-    launcher-selected interpreter. When the descriptor carries the
+    The gates run in composition's fixed order — plugin closure, placement —
+    and any failure leaves through the gate's own closed category, never the
+    retired blanket denial. The installation's own package metadata is made
+    visible to the plugin closure from the launcher-selected interpreter's
+    tree. When the descriptor carries the
     service-authorized inventory digest, the entry passes it with a
     TrustedDeviceMapping assembled from the descriptor's service-frozen device
     selectors, that digest, and the inherited CUDA namespace, so placement is
@@ -389,11 +444,14 @@ def _verified_native_contract(spec, checkpoint):
     placement gate's own category.
     """
     from runtime import sglang_native_composition as composition
+    # SPEC §9.2: enumerate the selected installation's plugin metadata too.
+    # -IS omits it; no .pth processing or native imports are performed here.
+    search = os.path.dirname(os.path.dirname(_trusted_package_root()))
+    if search not in sys.path:
+        sys.path.append(search)
     try:
         if spec._placement_digest is None:
-            return composition.compose(spec, checkpoint,
-                                       package_root=_trusted_package_root(),
-                                       trusted_mapping=None, placement_digest=None)
+            return composition.compose(spec, trusted_mapping=None, placement_digest=None)
         try:
             # The mapping is the placement gate's own input, so an assembly
             # failure (for example a descriptor shape this boundary does not
@@ -402,9 +460,7 @@ def _verified_native_contract(spec, checkpoint):
             mapping = _placement_mapping(spec, spec._placement_digest)
         except Exception:
             raise composition.NativeCompositionError("placement_failed") from None
-        return composition.compose(spec, checkpoint,
-                                   package_root=_trusted_package_root(),
-                                   trusted_mapping=mapping,
+        return composition.compose(spec, trusted_mapping=mapping,
                                    placement_digest=spec._placement_digest)
     except composition.NativeCompositionError as error:
         raise LaunchError(error.code) from None
@@ -414,57 +470,176 @@ def _guarded_engine_import():
     """The single guarded native import seam; only the held contract reaches it.
 
     Composes the trusted search path explicitly — never site.main(), never
-    .pth hooks — and imports the pinned engine startup modules inside this
+    .pth hooks — and imports the engine startup modules inside this
     function only; every engine import in this process happens here. The
     search path is appended, so the stdlib and this protected package keep
     precedence over the verified tree. Tests substitute this seam; a failed
     import leaves through main's closed startup category.
     """
-    search = os.path.dirname(_trusted_package_root())
+    search = os.path.dirname(os.path.dirname(_trusted_package_root()))
     if search not in sys.path:
         sys.path.append(search)
-    import sglang.launch_server as launch
+    from runtime.sglang_startup_guards import preimport_guard
+    preimport_guard()
+    from sglang.srt.entrypoints import http_server as launch
     from sglang.srt import server_args as arguments
     return arguments, launch
 
 
-def _import_and_launch(spec, checkpoint, contract):
+def _require_capabilities(spec, arguments, launch):
+    """ADR 0008: probe, by shape, the internals this launch depends on.
+
+    `core` (the ServerArgs record, resolution and fields the mapper renders and
+    rechecks, and launch_server) is needed by every launch; `deep_park` (the
+    memory saver hooks and the release, resume, reload and flush routes) only
+    by a launch with the memory saver on, which is what `deep` residency
+    renders. A `restart_only` launch therefore serves on a build without the
+    saver hooks. Never file hashes, never permission bits.
+    """
+    from runtime import engine_capabilities, sglang_server_args
+    settings = json.loads(spec._public_json)["settings"]
+    reserved = (tuple(sglang_server_args._RESERVED_CONSTANT)
+                + tuple(sglang_server_args._RESERVED_BOUND)
+                + ("trust_remote_code", "tokenizer_worker_num"))
+    try:
+        engine_capabilities.require_sglang(settings, arguments, launch,
+                                           reserved_fields=reserved)
+    except engine_capabilities.CapabilityMissing as missing:
+        raise LaunchError(missing.code) from None
+
+
+def _import_and_launch(spec, contract, approvals=None):
     """The guarded launch boundary; the verified contract is the only key.
 
     The contract's placement is consumed exactly as composed: an unasserted
     digest is carried as placement=None and the audited argument mapper fails
     closed on it, never guessing a device. The scheduler observation bridge
-    and protected listener are engine-side wiring — they attach to an
-    initialized Scheduler inside the engine's own spawned interpreter, which
-    this parent process cannot reach — so no observation attachment happens
-    here and that enrollment remains required before any live launch. No
+    and protected listener attach to an initialized Scheduler inside the
+    engine's own spawned scheduler process, which this parent cannot reach:
+    SPEC §9.2, a memory-saver launch whose host supplied a private observation
+    directory hands SGLang the enrolling scheduler target
+    (sglang_observation_enrollment), which enrolls the observation there. No
     permissive fallback exists: an import or startup failure leaves through
     main's closed categories.
     """
-    from runtime import sglang_server_args
+    from runtime import loopback_rendezvous, sglang_server_args
+    # SPEC §8.2 / T21: pinned before any engine import, so no engine module
+    # reads a TCP rendezvous (torch's TCPStore binds every interface).
+    try:
+        rendezvous = loopback_rendezvous.pin("sglang")
+    except loopback_rendezvous.RendezvousError:
+        raise LaunchError("loopback_rendezvous_failed") from None
     arguments, launch = _guarded_engine_import()
-    checked = sglang_server_args.construct_server_args(
-        spec, contract.placement, arguments.ServerArgs)
-    launch.launch_server(checked._native)
+    _require_capabilities(spec, arguments, launch)
+    try:
+        checked = sglang_server_args.construct_server_args(
+            spec, contract.placement, arguments.ServerArgs, approvals=approvals)
+    except sglang_server_args.ServerArgsError as error:
+        # ADR 0014 §6: the mapper's closed category reaches the operator.
+        raise LaunchError(error.code) from None
+    if json.loads(spec._public_json)["settings"]["memory_saver"] is True:
+        # Only a memory-saver launch is ever woken by a disk reload.
+        _keep_served_name_on_reload()
+    target = _observation_target(spec, launch)
+    try:
+        # Rechecked last: the scheduler inherits exactly what was verified.
+        loopback_rendezvous.verify(rendezvous)
+    except loopback_rendezvous.RendezvousError:
+        raise LaunchError("loopback_rendezvous_failed") from None
+    if target is None:
+        launch.launch_server(checked._native)
+    else:
+        launch.launch_server(checked._native, run_scheduler_process_func=target)
+
+
+def _keep_served_name_on_reload():
+    """SPEC §3: the served name is mllm's (the route name), and stays so.
+
+    Found live 2026-09-23 (M28, SGLang 0.5.20): `update_weights_from_disk`, the
+    reload every deep wake performs, renames the served model to the checkpoint
+    path (`TokenizerManager._update_model_path_info`). /v1/models then no longer
+    listed the route name, the wake's fresh probe failed and the launch was
+    left uncertain. The model path still updates; only the served name is kept.
+    The tokenizer manager runs in this process, so the class is changed here,
+    before launch. Returns whether this installation has the rename to undo.
+    """
+    module = sys.modules.get("sglang.srt.managers.tokenizer_manager")
+    if module is None:
+        try:
+            from sglang.srt.managers import tokenizer_manager as module
+        except ImportError:
+            # No such manager in this installation: nothing renames there.
+            return False
+    manager = getattr(module, "TokenizerManager", None)
+    original = getattr(manager, "_update_model_path_info", None)
+    if manager is None or not callable(original):
+        return False
+
+    def update_model_path_info(self, *args, **kwargs):
+        served = self.served_model_name
+        result = original(self, *args, **kwargs)
+        self.served_model_name = served
+        return result
+
+    manager._update_model_path_info = update_model_path_info
+    return True
+
+
+def _observation_target(spec, launch):
+    """The enrolling scheduler target, or None when this launch enrolls nothing.
+
+    Only a memory-saver launch enrolls, only when the host supplied its private
+    observation directory (MLLM_OBSERVATION_DIR) and it validates, and only when
+    the installation's `launch_server` takes a scheduler target (the
+    `observation` capability, engine_capabilities.py). Anything else serves
+    without an observation, and the host refuses Park unchanged (fail closed).
+    """
+    from runtime import engine_capabilities, sglang_observation_enrollment as enrollment
+    # Children see only a scope this entry validated, never the raw input.
+    directory = os.environ.get(enrollment.ENV_DIR)
+    enrollment.clear_environment()
+    public = json.loads(spec._public_json)
+    if (directory is None or public["settings"]["memory_saver"] is not True
+            or not engine_capabilities.accepts_scheduler_target(launch)
+            or not enrollment.entry_environment(directory, public["binding_id"],
+                                                public["incarnation"])):
+        return None
+    return enrollment.run_enrolled_scheduler
 
 
 def main(argv=None, descriptor_reader=None, stderr=None):
     """Sanitized startup status; no credential or checkpoint exception rendering."""
     stderr = sys.stderr if stderr is None else stderr
     try:
+        # ADR 0014 §8: the host's approvals for sensitive extra arguments, read
+        # and removed before anything else so no engine child inherits them.
+        from runtime import extra_args_policy
+        try:
+            approvals = extra_args_policy.approvals_from_environment()
+        except extra_args_policy.Refused:
+            raise LaunchError("invalid_extra_approvals") from None
         spec = build_launch(sys.argv[1:] if argv is None else argv,
                             _read_descriptor if descriptor_reader is None else descriptor_reader)
-        checkpoint = verify_checkpoint(spec._checkpoint_root)
-        contract = _verified_native_contract(spec, checkpoint)
-        checkpoint = revalidate_checkpoint(checkpoint)
-        _import_and_launch(spec, checkpoint, contract)
+        contract = _verified_native_contract(spec)
+        _import_and_launch(spec, contract, approvals)
         return 0
-    except (LaunchError, CheckpointPreflightError) as error:
+    except LaunchError as error:
         code = error.code
     except Exception:
         code = "startup_error"
-    stderr.write("sglang_startup_failed: " + code + "\n")
+    stderr.write("sglang_startup_failed: " + code + _hint(code) + "\n")
     return 1
+
+
+def _hint(code):
+    """One fixed operator hint per capability category; never native detail."""
+    if code == "capability_missing:deep_park":
+        return (" (this SGLang installation lacks the memory saver hooks or routes"
+                " deep parking needs; declare residency restart_only, or use a build"
+                " that provides them)")
+    if code == "capability_missing:core":
+        return " (this SGLang installation lacks an interface every launch needs)"
+    return ""
 
 
 def _normalized_path(path):

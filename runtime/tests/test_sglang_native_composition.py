@@ -15,19 +15,16 @@ import time
 import unittest
 from unittest import mock
 
-from runtime import checkpoint_preflight as preflight
 from runtime import sglang_device as device
 from runtime import sglang_native_composition as composition
 from runtime import sglang_saver_binding as saver
 from runtime import sglang_server_args as server_args
-from runtime import sglang_source_preflight as source
 from runtime import sglang_startup_guards as guards
 from test_sglang_entry import LaunchFixture
 from test_sglang_observation_transport import BridgeFixture
 
 
 UUID = "GPU-09631200-fdff-a345-295f-a1a6f84b2f84"
-PACKAGE_ROOT = "/trusted/sglang/srt"
 DIGEST = "a" * 64
 NATIVE_ROOTS = ("sglang", "torch", "transformers", "torch_memory_saver")
 
@@ -44,11 +41,8 @@ class GatePatch:
     def __init__(self, **overrides):
         self.order = []
         self.calls = {
-            "verify_sglang_sources": lambda root: self.order.append("verify"),
-            "revalidate_sglang_sources": lambda previous: self.order.append("revalidate"),
             "enforce_closed_plugins": lambda: self.order.append("plugins"),
             "observe_placement": lambda spec, trusted: self.order.append("placement"),
-            "revalidate_checkpoint": lambda previous: self.order.append("checkpoint"),
         }
         self.calls.update(overrides)
         self._patches = None
@@ -70,13 +64,12 @@ class CompositionTests(LaunchFixture, unittest.TestCase):
         super().setUp()
         self.spec = self.build()
 
-    def compose(self, checkpoint=None, **changes):
-        values = dict(package_root=PACKAGE_ROOT, trusted_mapping=None, placement_digest=None)
+    def compose(self, **changes):
+        values = dict(trusted_mapping=None, placement_digest=None)
         values.update(changes)
-        return composition.compose(self.spec, object() if checkpoint is None else checkpoint,
-                                   **values)
+        return composition.compose(self.spec, **values)
 
-    def test_failing_placement_keeps_gate_order_and_stops_before_checkpoint(self):
+    def test_failing_placement_keeps_gate_order(self):
         def failing_placement(spec, trusted):
             gates.order.append("placement")
             raise device.DeviceObservationError()
@@ -85,67 +78,65 @@ class CompositionTests(LaunchFixture, unittest.TestCase):
             with self.assertRaises(composition.NativeCompositionError) as caught:
                 self.compose(trusted_mapping=mapping(), placement_digest=DIGEST)
         self.assertEqual(caught.exception.code, "placement_failed")
-        self.assertEqual(gates.order, ["verify", "revalidate", "plugins", "placement"])
+        self.assertEqual(gates.order, ["plugins", "placement"])
 
     def test_every_gate_failure_maps_to_its_closed_code_only(self):
-        def source_failure(root):
-            raise source.SourcePreflightError("artifact_changed")
-
         def plugin_failure():
             raise guards.StartupGuardError("external_plugins_present")
 
         def placement_failure(spec, trusted):
             raise device.DeviceObservationError()
 
-        def checkpoint_failure(previous):
-            raise preflight.CheckpointPreflightError("artifact_changed")
-
-        cases = (("source_revalidation_failed", {"verify_sglang_sources": source_failure}),
-                 ("plugin_closure_failed", {"enforce_closed_plugins": plugin_failure}),
-                 ("placement_failed", {"observe_placement": placement_failure}),
-                 ("checkpoint_revalidation_failed", {"revalidate_checkpoint": checkpoint_failure}))
+        cases = (("plugin_closure_failed", {"enforce_closed_plugins": plugin_failure}),
+                 ("placement_failed", {"observe_placement": placement_failure}))
         for expected, overrides in cases:
             with self.subTest(expected=expected), GatePatch(**overrides):
                 with self.assertRaises(composition.NativeCompositionError) as caught:
                     self.compose(trusted_mapping=mapping(), placement_digest=DIGEST)
             self.assertEqual(caught.exception.code, expected)
             self.assertEqual(str(caught.exception), expected)
-            self.assertNotIn(PACKAGE_ROOT, str(caught.exception))
 
     def test_asserted_digest_without_trusted_mapping_or_mismatched_is_placement_failure(self):
         with GatePatch() as gates:
             with self.assertRaises(composition.NativeCompositionError) as caught:
                 self.compose(trusted_mapping=None, placement_digest=DIGEST)
             self.assertEqual(caught.exception.code, "placement_failed")
-            self.assertEqual(gates.order, ["verify", "revalidate", "plugins"])
+            self.assertEqual(gates.order, ["plugins"])
         with GatePatch() as gates:
             with self.assertRaises(composition.NativeCompositionError) as caught:
                 self.compose(trusted_mapping=mapping(), placement_digest="b" * 64)
             self.assertEqual(caught.exception.code, "placement_failed")
-            self.assertEqual(gates.order, ["verify", "revalidate", "plugins"])
+            self.assertEqual(gates.order, ["plugins"])
 
     def test_success_contract_records_all_facts_and_explicit_unasserted_placement(self):
-        sentinel = object()
-
-        def returning(previous):
-            gates.order.append("checkpoint")
-            return sentinel
-
-        with GatePatch(revalidate_checkpoint=returning) as gates:
-            contract = self.compose(checkpoint=sentinel)
-        self.assertEqual(gates.order, ["verify", "revalidate", "plugins", "checkpoint"])
-        self.assertTrue(contract.sources_ok)
+        # ADR 0014 §7: no checkpoint gate remains here; the host agent's
+        # digest check (WE3) owns checkpoint identity. ADR 0008: no source
+        # audit either; installation internals are probed by shape later.
+        with GatePatch() as gates:
+            contract = self.compose()
+        self.assertEqual(gates.order, ["plugins"])
+        self.assertFalse(hasattr(contract, "checkpoint"))
+        self.assertFalse(hasattr(contract, "sources_ok"))
         self.assertTrue(contract.plugins_closed)
         self.assertFalse(contract.placement_asserted)
         self.assertIsNone(contract.placement_digest)
         self.assertIsNone(contract.placement)
-        self.assertIs(contract.checkpoint, sentinel)
         self.assertEqual(contract.binding_id, self.public["binding_id"])
         self.assertEqual(contract.incarnation, self.public["incarnation"])
         self.assertLessEqual(contract.observed_at, time.time())
-        self.assertNotIn(PACKAGE_ROOT, repr(contract))
         with self.assertRaises(dataclasses.FrozenInstanceError):
-            contract.sources_ok = False
+            contract.plugins_closed = False
+
+    # T21 T22: ADR 0008 (owner decision 2026-09-23). No gate audits the
+    # installation's files: composition takes no package root and the pinned
+    # source audit modules are gone, so a custom build is not refused here.
+    def test_no_gate_audits_installation_files(self):
+        import importlib.util
+        import inspect
+        self.assertNotIn("package_root", inspect.signature(composition.compose).parameters)
+        for retired in ("runtime.sglang_source_preflight", "runtime.saver_source_preflight"):
+            self.assertIsNone(importlib.util.find_spec(retired))
+        self.assertNotIn("source_revalidation_failed", composition._CODES)
 
     def test_asserted_placement_carries_authorized_digest_and_observation(self):
         placement = server_args.ObservedPlacement(
@@ -188,8 +179,8 @@ class EnrollmentTests(unittest.TestCase):
         self.identity = saver.current_process_identity()
         self.bridge = BridgeFixture(self.identity)
         self.contract = composition.NativeContract(
-            sources_ok=True, plugins_closed=True, placement_asserted=False,
-            placement_digest=None, placement=None, checkpoint=None,
+            plugins_closed=True, placement_asserted=False,
+            placement_digest=None, placement=None,
             binding_id="binding-1", incarnation="incarnation-1", observed_at=time.time())
 
     def handle(self, **changes):

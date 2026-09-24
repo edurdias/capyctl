@@ -11,6 +11,7 @@ import socket
 import stat
 import threading
 
+from . import owner_only
 from .sglang_observation_transport import ObservationTransport, _process_identity
 
 
@@ -57,14 +58,26 @@ class _Custody:
             raise ObservationServerError() from None
 
     def check_directories(self):
+        last = len(self.fds) - 1
         for index, fd in enumerate(self.fds):
             info = os.fstat(fd)
             linked = os.stat("/", follow_symlinks=False) if index == 0 else os.stat(
                 self.names[index - 1], dir_fd=self.fds[index - 1], follow_symlinks=False)
-            if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
-                    or info.st_mode & 0o022 or not _same(info, self.infos[index])
+            if (not stat.S_ISDIR(info.st_mode) or not _same(info, self.infos[index])
                     or not _same(info, linked)):
                 raise ObservationServerError()
+            if index == last:
+                # mllm private state: the socket's own 0700 directory stays
+                # strict (no group write at all, owner decision 2026-09-23).
+                if info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+                    raise ObservationServerError()
+                continue
+            # The directories on the way to it are the owner's: the owner-only
+            # rule, where a private group adds no writer.
+            try:
+                owner_only.check(info)
+            except owner_only.OwnerOnlyError:
+                raise ObservationServerError() from None
 
     def capture_socket(self):
         self.check_directories()
@@ -113,14 +126,19 @@ The listener never removes a replaced path and never adopts an existing socket.
         return "SchedulerObservationServer(<private>)"
 
     @classmethod
-    def start(cls, *, path, bridge, binding_id, incarnation_id, expected_owner, expected_peer):
+    def start(cls, *, path, bridge, binding_id, incarnation_id, expected_owner, expected_peer=None,
+              key=None):
         custody = None
         listener = None
         try:
+            # Exactly one of the enrolled controller identity or the per-launch
+            # key (version 2) authenticates requests; the transport enforces it.
             transport = ObservationTransport(bridge=bridge, binding_id=binding_id,
-                incarnation_id=incarnation_id, expected_owner=expected_owner, expected_peer=expected_peer)
+                incarnation_id=incarnation_id, expected_owner=expected_owner,
+                expected_peer=expected_peer, key=key)
             if (os.getuid() != os.geteuid() or _process_identity(os.getpid()) != expected_owner
-                    or _process_identity(expected_peer.pid) != expected_peer):
+                    or (expected_peer is not None
+                        and _process_identity(expected_peer.pid) != expected_peer)):
                 raise ObservationServerError()
             custody = _Custody(path)
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

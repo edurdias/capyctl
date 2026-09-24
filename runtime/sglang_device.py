@@ -170,6 +170,7 @@ def publish_inventory(stream):
     json.dump(
         {
             "schema": "mllm-nvidia-inventory-v1",
+            "host_id": inventory.host_id,
             "digest": inventory.digest,
             "devices": [
                 {

@@ -132,14 +132,49 @@ def websocket_accepted(client, path, headers=None):
 
 class RequireEngineKeyTests(unittest.TestCase):
     def setUp(self):
-        self._previous = os.environ.get("VLLM_API_KEY")
+        self._previous = {name: os.environ.get(name)
+                          for name in ("VLLM_API_KEY", "MLLM_VLLM_ADMIN_KEY")}
+        os.environ.pop("MLLM_VLLM_ADMIN_KEY", None)
         self.addCleanup(self._restore_env)
 
     def _restore_env(self):
-        if self._previous is None:
-            os.environ.pop("VLLM_API_KEY", None)
-        else:
-            os.environ["VLLM_API_KEY"] = self._previous
+        for name, value in self._previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    # T21: SPEC §9.1. With an admin key the development routes take it alone;
+    # the inference key reaches inference and metrics only, so a holder of the
+    # inference key cannot sleep, wake, reload or reset the engine.
+    def test_admin_key_separates_control_from_inference(self):
+        os.environ["VLLM_API_KEY"] = "infer"
+        os.environ["MLLM_VLLM_ADMIN_KEY"] = "admin"
+        client = make_client(RequireEngineKey(echo_app))
+        inference = {"Authorization": "Bearer infer"}
+        admin = {"Authorization": "Bearer admin"}
+        for path in ("/sleep", "/wake_up", "/collective_rpc", "/reset_prefix_cache",
+                     "/v1/../sleep", "/v1x", "/tokenize"):
+            with self.subTest(path=path):
+                self.assertEqual(client.post(path, headers=inference).status_code, 401)
+        self.assertEqual(client.get("/is_sleeping", headers=inference).status_code, 401)
+        for path in ("/sleep", "/wake_up", "/collective_rpc", "/reset_prefix_cache"):
+            with self.subTest(path=path):
+                self.assertEqual(client.post(path, headers=admin).status_code, 200)
+        self.assertEqual(client.get("/is_sleeping", headers=admin).status_code, 200)
+        self.assertEqual(client.get("/v1/models", headers=inference).status_code, 200)
+        self.assertEqual(client.post("/v1/chat/completions", headers=inference).status_code,
+                         200)
+        self.assertEqual(client.get("/metrics", headers=inference).status_code, 200)
+        self.assertEqual(client.get("/v1/models").status_code, 401)
+        self.assertEqual(client.get("/health").status_code, 200)
+
+    # T21: one key for both roles is refused when an admin key is named.
+    def test_an_admin_key_equal_to_the_inference_key_is_refused(self):
+        os.environ["VLLM_API_KEY"] = "same"
+        os.environ["MLLM_VLLM_ADMIN_KEY"] = "same"
+        with self.assertRaises(RuntimeError):
+            RequireEngineKey(echo_app)
 
     def test_dev_routes_require_the_engine_key(self):
         os.environ["VLLM_API_KEY"] = "k3y"
