@@ -72,6 +72,77 @@ fn initialize_server_and_host_without_engines_or_secret_output() {
     assert!(!offline.status.success());
     assert!(String::from_utf8_lossy(&offline.stderr).contains("join host"));
 }
+/// Every regular file under `dir`, with its bytes, for before/after checks.
+fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+// T21 T37: SPEC §3.3 / ADR 0001 (owner decision 2026-09-24). `init host`
+// writes the embedded runtime to the managed `<state_dir>/runtime`, owner-only
+// and marked; `start host` restores a tampered managed tree before anything
+// else, and never writes to a runtime_dir the document declares.
+#[test]
+fn the_host_runtime_is_managed_unless_the_document_declares_one() {
+    let temp = root();
+    let state = temp.path().join("host-state");
+    let config = temp.path().join("host.yaml");
+    let out = cli(&state, &["init", "host", "--output", config.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let runtime = state.join("runtime");
+    let reported: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reported["runtime_dir"], serde_json::json!(runtime));
+    assert_eq!(fs::metadata(&runtime).unwrap().permissions().mode() & 0o7777, 0o700);
+    let guard = runtime.join("mllm_vllm_guard.py");
+    assert_eq!(fs::metadata(&guard).unwrap().permissions().mode() & 0o7777, 0o600);
+    assert!(runtime.join(".mllm-managed-runtime").is_file());
+    assert!(runtime.join("sglang_entry.py").is_file());
+    assert!(!runtime.join("tests").exists(), "runtime tests are never shipped");
+    let pristine = tree(&runtime);
+
+    // Tampering is repaired at the next start, even one that then refuses.
+    fs::write(&guard, b"# rewritten by someone else\n").unwrap();
+    let offline = refused_start(&state, &["start", "host", "--config", config.to_str().unwrap()]);
+    assert!(!offline.status.success());
+    let stderr = String::from_utf8_lossy(&offline.stderr);
+    assert!(stderr.contains("restored"), "{stderr}");
+    assert!(!stderr.contains("rewritten by someone else"), "{stderr}");
+    assert_eq!(tree(&runtime), pristine);
+
+    // A declared runtime_dir is the operator's: never created, never written.
+    let operator = temp.path().join("operator-runtime");
+    fs::create_dir(&operator).unwrap();
+    fs::write(operator.join("vllm_entry.py"), b"# operator copy\n").unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    document["runtime_dir"] = serde_json::json!(operator);
+    let declared = temp.path().join("declared.yaml");
+    fs::write(&declared, document.to_string()).unwrap();
+    fs::set_permissions(&declared, fs::Permissions::from_mode(0o600)).unwrap();
+    let offline = refused_start(&state, &["start", "host", "--config", declared.to_str().unwrap()]);
+    assert!(!offline.status.success());
+    assert_eq!(tree(&operator), vec![("vllm_entry.py".to_owned(), b"# operator copy\n".to_vec())]);
+
+    // An unmarked directory at the managed path is refused, not overwritten.
+    fs::remove_dir_all(&runtime).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    fs::write(runtime.join("vllm_entry.py"), b"# copied by hand\n").unwrap();
+    let refused = refused_start(&state, &["start", "host", "--config", config.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("managed runtime directory"), "{stderr}");
+    assert_eq!(tree(&runtime), vec![("vllm_entry.py".to_owned(), b"# copied by hand\n".to_vec())]);
+}
 // T04 (W12, U5 live): `join host --join-file NAME` with a bare relative name
 // reads the invitation from the working directory. It used to fail before
 // reading anything because the empty parent could not be canonicalized.

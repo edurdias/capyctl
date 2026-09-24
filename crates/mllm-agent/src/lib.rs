@@ -9,6 +9,8 @@
 // ADR 0014 §7 (WE3): checkpoint digest measured on the host.
 pub mod checkpoint;
 pub mod doctor;
+// SPEC §3.3 / ADR 0001: the runtime helpers compiled into the one binary.
+pub mod embedded_runtime;
 pub mod enrollment;
 // SPEC §13.2 (W13): exits of owned engine processes, reported to the controller.
 pub mod exits;

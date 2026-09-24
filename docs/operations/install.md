@@ -1,12 +1,14 @@
 # Installing and operating mllm as a service
 
-This guide covers installing a release tarball, running each role under
-systemd, upgrading, and rolling back. It follows SPEC §3.3 (one executable per
-OS/architecture, ADR 0001), §4.3 (foreground roles, OS service definitions,
-restart distinct from drain) and §13.3 (owner-only runtime files).
+This guide covers installing a release with `install.sh`, running each role
+under systemd, upgrading, and rolling back. It follows SPEC §3.3 (one
+executable per OS/architecture, ADR 0001), §4.3 (foreground roles, OS service
+definitions, restart distinct from drain) and §13.3 (owner-only runtime
+files).
 
-What this guide does not establish: the unit files and the tarball are checked
-locally (`scripts/verify-packaging.sh`), not on a GPU host. Running a unit is
+What this guide does not establish: the unit files, the tarball and the
+installer are checked locally (`scripts/verify-packaging.sh`), not on a GPU
+host. Running a unit is
 not evidence that an engine recipe works; engine qualification stays with the
 live runbooks.
 
@@ -34,12 +36,12 @@ first, then stop the unit:
 
 ```bash
 # Remote host: from the server, as the service user.
-sudo -u mllm /opt/mllm/current/bin/mllm drain host host-a --config /etc/mllm/server.yaml
+sudo -u mllm mllm drain host host-a --config /etc/mllm/server.yaml
 sudo systemctl stop mllm-host           # on host-a
 
 # Standalone.
 sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone \
-  /opt/mllm/current/bin/mllm drain standalone
+  mllm drain standalone
 sudo systemctl stop mllm-standalone
 ```
 
@@ -90,68 +92,154 @@ as with any other restart.
 
 ## Release contents
 
-`packaging/release.sh` builds `mllm-<version>-linux-<arch>.tar.gz` and a
-`.sha256` beside it. The archive holds one directory:
+A release (owner decision 2026-09-24: one self-contained binary, GitHub
+Releases and `install.sh`; Homebrew is deferred) carries these assets:
+
+| Asset | Holds |
+|---|---|
+| `mllm-<version>-linux-x86_64.tar.gz` | The x86-64 build. |
+| `mllm-<version>-linux-aarch64.tar.gz` | The ARM64 build (DGX Spark). |
+| `install.sh` | The installer (POSIX `sh`). |
+| `SHA256SUMS` | SHA-256 of every tarball and of `install.sh`. |
+
+Each tarball holds one directory:
 
 ```text
 mllm-<version>-linux-<arch>/
-  bin/mllm                  stripped release binary, every role and the CLI
-  runtime/                  mllm's Python runtime helpers (0700 dirs, 0600 files)
+  bin/mllm                  stripped release binary: every role, the CLI and
+                            mllm's Python runtime helpers (embedded)
   packaging/systemd/system/ system units
   packaging/systemd/user/   user units
   docs/examples/            example role and deployment documents
   docs/operations/install.md
-  BUILDINFO                 version, commit, dirty flag, toolchain, source date
+  BUILDINFO                 version, commit, dirty flag, toolchain, source date,
+                            embedded runtime manifest digest
   SHA256SUMS                digest of every file in the directory
 ```
 
-Build it from a clean, committed tree (`packaging/release.sh [OUT_DIR]`,
-default `dist/`). The script builds with `--locked`, runs
-`scripts/check-release-clean.sh` (no test engine may reach the shipped
-binary), ships only files tracked by git (no `__pycache__`, no bytecode, no
-`runtime/tests`), and stamps entries with the commit time so a rebuild of the
-same commit and toolchain gives the same archive. Build on each target
-architecture (x86-64, aarch64); the archive is for the architecture it was
-built on.
+There is no `runtime/` directory in the release. mllm's Python helpers (the
+vLLM guard and entry, the SGLang entry and its modules, the capability
+probes) are compiled into `bin/mllm` with a manifest of their SHA-256 digests
+(`crates/mllm-agent/build.rs`), and each role that launches engines writes
+them to its own state directory; see "The managed runtime directory".
 
 Engines, engine Python environments, model weights and GPU drivers are not in
 the release and are never installed by it (SPEC §4.2, §15.2).
+
+### Building a release
+
+`packaging/release.sh [OUT_DIR]` (default `dist/`) builds the tarball for the
+machine it runs on, from a clean, committed tree: it builds with `--locked`,
+runs `scripts/check-release-clean.sh` (no test engine may reach the shipped
+binary), ships only files tracked by git, refuses untracked files under
+`runtime/` (the build embeds every `runtime/*.py` it finds), and stamps
+entries with the commit time so a rebuild of the same commit and toolchain
+gives the same archive. It copies `install.sh` beside the tarball and writes
+`SHA256SUMS`. Build on each architecture, gather the tarballs in one
+directory and run `packaging/release.sh --sums DIR` there to write the
+release's `SHA256SUMS`. `scripts/verify-packaging.sh` checks the units, the
+tarball and the installer locally.
+
+## Installing with install.sh
+
+The repository is private, so the installer needs a GitHub credential: a
+logged-in `gh` (preferred) or `GITHUB_TOKEN` with read access to the
+repository.
+
+```bash
+# As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
+gh release download v0.1.0-rc.1 -R edurdias/mllm -p install.sh
+sh install.sh --version 0.1.0-rc.1
+
+# Also install a user unit for a role (installed, not enabled).
+sh install.sh --version 0.1.0-rc.1 --systemd standalone
+
+# For every user: /usr/local/bin/mllm and system units.
+sudo sh install.sh --system --version 0.1.0-rc.1 --systemd host
+```
+
+Without `--version` the latest published release is installed; a draft or a
+pre-release is installed only by naming it. The installer:
+
+1. detects the OS (Linux) and architecture (`x86_64`, `aarch64`);
+2. downloads the tarball and `SHA256SUMS` with `gh release download`, else
+   through the GitHub API with `GITHUB_TOKEN`, else from the public download
+   URL (`MLLM_INSTALL_BASE_URL` names a mirror directory, `https://` or
+   `file://`, instead);
+3. refuses to install unless the tarball's SHA-256 matches `SHA256SUMS`, every
+   file in it matches the archive's own `SHA256SUMS`, and the binary reports
+   the requested version;
+4. replaces `<prefix>/bin/mllm` atomically (a running role keeps its open
+   executable) and keeps the units, examples and this guide under
+   `<prefix>/share/mllm/`;
+5. with `--systemd <server|host|standalone>`, writes that role's unit to
+   `~/.config/systemd/user/` (or `/etc/systemd/system/` with `--system`),
+   pointed at the installed binary, and runs `systemctl daemon-reload`. It
+   never enables or starts a unit, creates users or touches state.
+
+`sh install.sh --uninstall [--system]` removes the binary, `<prefix>/share/mllm`
+and the units the installer wrote. State directories are kept.
+
+To install from a downloaded tarball by hand instead:
+
+```bash
+V=0.1.0-rc.1; A=$(uname -m)
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf mllm-$V-linux-$A.tar.gz
+(cd mllm-$V-linux-$A && sha256sum -c --quiet SHA256SUMS)
+sudo install -m 0755 mllm-$V-linux-$A/bin/mllm /usr/local/bin/mllm
+```
 
 ## Layout
 
 | Path | Owner, mode | Holds |
 |---|---|---|
-| `/opt/mllm/releases/<version>/` | root, 0755 | An unpacked release, never edited. |
-| `/opt/mllm/current` | root symlink | Points at the active release; units run `/opt/mllm/current/bin/mllm`. |
-| `/opt/mllm/runtime/` | `mllm:mllm`, 0700 / files 0600 | The runtime helpers engines import. A real directory, not a symlink. |
+| `/usr/local/bin/mllm` (`~/.local/bin/mllm`) | root (you), 0755 | The binary. |
+| `/usr/local/share/mllm/` (`~/.local/share/mllm/`) | root (you), 0755 | Units, examples, this guide, `BUILDINFO` of the installed release. |
 | `/etc/mllm/<role>.yaml` | root:mllm, 0640 | Role documents (operator configuration). |
 | `/etc/mllm/<role>.env` | root:mllm, 0640 | Optional environment for the unit. |
 | `/var/lib/mllm/` | `mllm:mllm`, 0700 | State root (`StateDirectory=`); holds `server/`, `host/`, `standalone/`, `tmp/`. |
+| `/var/lib/mllm/host/runtime/` | `mllm:mllm`, 0700 / files 0600 | The managed runtime directory of the host role (standalone: `/var/lib/mllm/standalone/runtime/`). Written by mllm. |
 | model store (`/srv/models`) | readable by `mllm` | Checkpoints. Read-only to the host unit by default. |
 
-### The runtime directory rule
+### The managed runtime directory
 
 The engine imports mllm's own Python from the runtime directory, so a module
 another account can rewrite runs as the engine behind the controls it is meant
-to guard. A launch is refused unless (`crates/mllm-agent/src/runtime_integrity.rs`,
-`crates/mllm-adapters/src/owner_only.rs`, SPEC §13.3):
+to guard (SPEC §9.1, §13.3). The binary therefore writes that directory
+itself:
 
-- the directory, every subdirectory and every `.py` module are owned by the
-  service user that runs the host (not root: the host accepts only its own
-  user as owner of the runtime tree);
-- nothing is writable by other, and group write is allowed only through the
-  owning user's private group;
-- there are no symlinks, and nothing importable besides `.py` source: no
-  `__pycache__`/`.pyc`, `.so`, `.pth`, `.zip`;
-- every ancestor directory of the SGLang entry is owned by root or the service
-  user and not writable by others, and the path is canonical. This is why
-  `runtime_dir` must name a real directory such as `/opt/mllm/runtime`, not a
-  path through the `/opt/mllm/current` symlink.
+- **Where.** A host whose document does not name `runtime_dir` uses
+  `<state_dir>/runtime`. Standalone uses `<state root>/runtime` unless
+  `MLLM_RUNTIME_DIR` is set. The server launches no engine and has none.
+- **When.** `mllm init host` writes it; every `mllm start host` and
+  `mllm start standalone` checks it before anything can launch.
+- **How.** A 0700 directory owned by the service user, each module 0600,
+  and a marker file `.mllm-managed-runtime` naming the embedded manifest. It
+  is built in a sibling directory and renamed into place, so a launch never
+  sees a partial tree.
+- **Upgrade.** A binary with a different embedded manifest replaces the tree
+  at start and logs `runtime directory ... refreshed`. Engines already running
+  keep the modules they imported; the new ones apply to launches from then on.
+- **Tampering.** A managed tree whose modules, modes or entries differ from
+  the manifest (an edited module, a `__pycache__`, a loosened mode, a deleted
+  file) is restored from the embedded copy at start, with a warning naming
+  what differed (never contents).
+- **Not mllm's.** A directory at that path without the marker is refused, not
+  overwritten: remove it, or name it as `runtime_dir`. A directory named by
+  `runtime_dir` or `MLLM_RUNTIME_DIR` is never written; mllm only checks it.
 
-The release keeps the runtime at 0700/0600; installing it means copying it to
-`/opt/mllm/runtime` and giving it to the service user, as below. Never run
-`python` against the runtime directory as another user or without `-B`: a
-written `__pycache__` makes the next launch refuse until it is removed.
+Every launch still passes the integrity check
+(`crates/mllm-agent/src/runtime_integrity.rs`,
+`crates/mllm-adapters/src/owner_only.rs`): the directory, every subdirectory
+and every `.py` module owned by the service user, nothing writable by other,
+group write only through the owner's private group, no symlinks, nothing
+importable besides `.py` source, and every ancestor of the SGLang entry owned
+by root or the service user and not writable by others, on a canonical path.
+A `runtime_dir` you maintain yourself must meet the same rule. Never run
+`python` against a runtime directory without `-B`; the managed one is repaired
+at the next start, one of your own is refused until the `__pycache__` is
+removed.
 
 State directories are stricter still: `state_dir`, its `identity`,
 `observation` and `rendezvous` directories must be canonical paths, owned by
@@ -167,29 +255,14 @@ group-writable directory.
 Run as root on each machine.
 
 ```bash
-V=0.1.0; A=$(uname -m)
-sha256sum -c mllm-$V-linux-$A.tar.gz.sha256
-
 # Service user with a private group; its home is the state root, so engine
 # caches under $HOME (triton, flashinfer, ...) land in private state.
 useradd --system --user-group --home-dir /var/lib/mllm --shell /usr/sbin/nologin mllm
 install -d -o mllm -g mllm -m 0700 /var/lib/mllm
 
-# Unpack and verify the release.
-install -d -m 0755 /opt/mllm/releases
-tar -xzf mllm-$V-linux-$A.tar.gz -C /opt/mllm/releases --no-same-owner
-mv /opt/mllm/releases/mllm-$V-linux-$A /opt/mllm/releases/$V
-(cd /opt/mllm/releases/$V && sha256sum -c --quiet SHA256SUMS)
-ln -sfn releases/$V /opt/mllm/current
-
-# The runtime helpers, owned by the service user (see the rule above).
-cp -a /opt/mllm/releases/$V/runtime /opt/mllm/runtime
-chown -R mllm:mllm /opt/mllm/runtime
-
-# Units.
-install -m 0644 /opt/mllm/current/packaging/systemd/system/mllm-*.service /etc/systemd/system/
+# The binary and the role's unit (host shown; server and standalone alike).
+sh install.sh --system --version 0.1.0-rc.1 --systemd host
 install -d -m 0750 -g mllm /etc/mllm
-systemctl daemon-reload
 ```
 
 The service user also needs read access to the engine installations named in
@@ -204,42 +277,44 @@ inside the service; make sure the driver's device nodes exist at boot
 
 ```bash
 sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/server \
-  /opt/mllm/current/bin/mllm init server --output /var/lib/mllm/server/config/server.yaml
+  mllm init server --output /var/lib/mllm/server/config/server.yaml
 install -m 0640 -o root -g mllm /var/lib/mllm/server/config/server.yaml /etc/mllm/server.yaml
 # Edit /etc/mllm/server.yaml: bootstrap and control listeners, enrollment
 # addresses, shutdown.drain_timeout (see docs/examples/server.yaml).
-/opt/mllm/current/bin/mllm validate config --file /etc/mllm/server.yaml
+mllm validate config --file /etc/mllm/server.yaml
 systemctl enable --now mllm-server
 ```
 
 `init` creates the server identity and credentials under the state directory
 (owner-only); it prints file locations, never secrets. Client commands on the
 server machine run as the service user with the same document, for example
-`sudo -u mllm /opt/mllm/current/bin/mllm list hosts --config /etc/mllm/server.yaml`.
+`sudo -u mllm mllm list hosts --config /etc/mllm/server.yaml`.
 
 ### Host
 
 ```bash
 sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/host \
-  /opt/mllm/current/bin/mllm init host --output /var/lib/mllm/host/config/host.yaml
+  mllm init host --output /var/lib/mllm/host/config/host.yaml
 install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/host.yaml
-# Edit /etc/mllm/host.yaml: name, runtime_dir: /opt/mllm/runtime, model_store,
-# ingress, resource_policy, runtime_profiles (see docs/examples/host.yaml).
-/opt/mllm/current/bin/mllm validate config --file /etc/mllm/host.yaml
+# Edit /etc/mllm/host.yaml: name, model_store, ingress, resource_policy,
+# runtime_profiles (see docs/examples/host.yaml). Leave runtime_dir out.
+mllm validate config --file /etc/mllm/host.yaml
 
 # Enroll with an invitation created on the server (`mllm invite host`).
-sudo -u mllm /opt/mllm/current/bin/mllm join host --join-file host-a.join --config /etc/mllm/host.yaml
+sudo -u mllm mllm join host --join-file host-a.join --config /etc/mllm/host.yaml
 systemctl enable --now mllm-host
 ```
 
-Set `runtime_dir` explicitly. Left out, it defaults to `<state_dir>/runtime`,
-which is also acceptable if you copy the runtime there instead.
+`init host` prints the managed `runtime_dir` it wrote
+(`/var/lib/mllm/host/runtime`). Name `runtime_dir` in the document only to run
+from a directory you maintain yourself.
 
 ### Standalone
 
 Without `--config`, `mllm start standalone` loads its role document from
 `<MLLM_STATE_DIR>/config/standalone.yaml`, generating it (and the protected
-credentials) on first start. Its engine installation always comes from the
+credentials) on first start, and writes the managed runtime to
+`<MLLM_STATE_DIR>/runtime`. Its engine installation always comes from the
 environment. Put that environment in `/etc/mllm/standalone.env`:
 
 ```bash
@@ -252,10 +327,11 @@ MLLM_MODELS_ROOT=/srv/models
 systemctl enable --now mllm-standalone
 ```
 
-The unit sets `MLLM_STATE_DIR=/var/lib/mllm/standalone` and
-`MLLM_RUNTIME_DIR=/opt/mllm/runtime`. Operator commands must use the same
-state directory (and the same `MLLM_STANDALONE_MANAGEMENT_ADDR`, if set):
-`sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone /opt/mllm/current/bin/mllm status deployment <id>`.
+The unit sets `MLLM_STATE_DIR=/var/lib/mllm/standalone`. Operator commands must
+use the same state directory (and the same `MLLM_STANDALONE_MANAGEMENT_ADDR`,
+if set): `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm status deployment <id>`.
+`MLLM_RUNTIME_DIR` (development) makes standalone run from that directory
+instead of the managed one.
 
 #### Explicit standalone document
 
@@ -284,11 +360,11 @@ start), validate it, and override `ExecStart=` in a drop-in:
 
 ```bash
 install -m 0640 -o root -g mllm /var/lib/mllm/standalone/config/standalone.yaml /etc/mllm/standalone.yaml
-/opt/mllm/current/bin/mllm validate config --file /etc/mllm/standalone.yaml
+mllm validate config --file /etc/mllm/standalone.yaml
 systemctl edit mllm-standalone
 #   [Service]
 #   ExecStart=
-#   ExecStart=/opt/mllm/current/bin/mllm start standalone --config /etc/mllm/standalone.yaml
+#   ExecStart=mllm start standalone --config /etc/mllm/standalone.yaml
 systemctl restart mllm-standalone
 ```
 
@@ -296,17 +372,16 @@ systemctl restart mllm-standalone
 
 `packaging/systemd/user/` holds the same three roles for the per-user manager,
 for a single operator account without a dedicated service user. They run
-`~/.local/opt/mllm/current/bin/mllm`, read `~/.config/mllm/<role>.yaml` and
-`<role>.env`, keep state under `~/.local/state/mllm`, and expect the runtime
-at `~/.local/opt/mllm/runtime` (owned by that user). The ancestor rules above
-apply: with a umask of 002, `~/.local` and `~/.local/state` are created
-group-writable and must be fixed first (`chmod go-w ~ ~/.local ~/.local/state`).
-The standalone user unit leaves
-`MLLM_STATE_DIR` unset, so it and your shell both use `~/.local/state/mllm`.
+`~/.local/bin/mllm`, read `~/.config/mllm/<role>.yaml` and `<role>.env`, and
+keep state, including the managed runtime directory, under
+`~/.local/state/mllm`. The ancestor rules above apply: with a umask of 002,
+`~/.local` and `~/.local/state` are created group-writable and must be fixed
+first (`chmod go-w ~ ~/.local ~/.local/state`). The standalone user unit
+leaves `MLLM_STATE_DIR` unset, so it and your shell both use
+`~/.local/state/mllm`.
 
 ```bash
-install -m 0644 ~/.local/opt/mllm/current/packaging/systemd/user/mllm-host.service ~/.config/systemd/user/
-systemctl --user daemon-reload
+sh install.sh --version 0.1.0-rc.1 --systemd host
 systemctl --user enable --now mllm-host
 loginctl enable-linger "$USER"   # keep it running after logout
 ```
@@ -347,34 +422,23 @@ units is the check.
 A restart re-attaches running engines, so an upgrade does not need a drain.
 
 ```bash
-V=0.2.0; A=$(uname -m)
-sha256sum -c mllm-$V-linux-$A.tar.gz.sha256
-tar -xzf mllm-$V-linux-$A.tar.gz -C /opt/mllm/releases --no-same-owner
-mv /opt/mllm/releases/mllm-$V-linux-$A /opt/mllm/releases/$V
-(cd /opt/mllm/releases/$V && sha256sum -c --quiet SHA256SUMS)
-/opt/mllm/releases/$V/bin/mllm validate config --file /etc/mllm/host.yaml
-
 systemctl stop mllm-host                       # engines keep serving
 
 # Back up state (see "State and migrations").
 tar -C /var/lib/mllm -czf /var/backups/mllm-host-$(date +%Y%m%d%H%M).tar.gz \
   --warning=no-file-ignored host
 
-# Swap runtime helpers and binary.
-rm -rf /opt/mllm/runtime.prev
-cp -a /opt/mllm/releases/$V/runtime /opt/mllm/runtime.new
-chown -R mllm:mllm /opt/mllm/runtime.new
-mv /opt/mllm/runtime /opt/mllm/runtime.prev
-mv /opt/mllm/runtime.new /opt/mllm/runtime
-ln -sfn releases/$V /opt/mllm/current
-install -m 0644 /opt/mllm/current/packaging/systemd/system/mllm-*.service /etc/systemd/system/
-systemctl daemon-reload
+# Replace the binary (and refresh the installed unit).
+sh install.sh --system --version 0.2.0 --systemd host
+mllm validate config --file /etc/mllm/host.yaml
 
 systemctl start mllm-host                      # re-attaches running engines
 ```
 
-Do the same for the server and standalone roles (the server has no runtime
-directory to swap). Upgrade the server and its hosts to the same release; no
+The start refreshes the managed runtime directory from the new binary and
+logs `runtime directory ... refreshed`. A host whose document names its own
+`runtime_dir` must update that directory itself. Do the same for the server
+and standalone roles. Upgrade the server and its hosts to the same release; no
 compatibility between different releases of server and host is asserted.
 
 Running engines imported the previous runtime helpers when they launched; the
@@ -390,16 +454,13 @@ acting on it.
 
 ```bash
 systemctl stop mllm-host
-mv /opt/mllm/runtime /opt/mllm/runtime.bad
-mv /opt/mllm/runtime.prev /opt/mllm/runtime
-ln -sfn releases/<previous> /opt/mllm/current
-install -m 0644 /opt/mllm/current/packaging/systemd/system/mllm-*.service /etc/systemd/system/
-systemctl daemon-reload
+sh install.sh --system --version <previous> --systemd host
 systemctl start mllm-host
 ```
 
-Rolling back the binary alone is safe only if the newer release did not
-migrate the state store (see below).
+The previous binary rewrites the managed runtime directory with its own
+embedded helpers at start. Rolling back the binary alone is safe only if the
+newer release did not migrate the state store (see below).
 
 ## State and migrations
 

@@ -43,11 +43,14 @@ fn host_runtime_and_ingress_are_explicit_and_fail_closed() {
         serde_json::from_str(&HostConfig::template(root)).unwrap();
     let config = HostConfig::parse(&document.to_string()).unwrap();
     assert_eq!(config.runtime_dir, root.join("runtime"));
+    // SPEC §3.3 / ADR 0001: undeclared, it is the managed embedded runtime.
+    assert!(!config.runtime_dir_declared);
     assert!(config.ingress.is_none());
     document["runtime_dir"] = "/home/operator/mllm/runtime".into();
     document["ingress"] = serde_json::json!({"bind":"100.64.0.10:9443","address":"http://100.64.0.10:9443","transport":"trusted_private_link"});
     let config = HostConfig::parse(&document.to_string()).unwrap();
     assert_eq!(config.runtime_dir, Path::new("/home/operator/mllm/runtime"));
+    assert!(config.runtime_dir_declared);
     assert_eq!(config.ingress.unwrap().bind.port(), 9443);
     for address in [
         "http://0.0.0.0:9443",

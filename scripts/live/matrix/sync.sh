@@ -6,6 +6,10 @@
 #   sync.sh build [host..]  build target/release/mllm from the snapshot on control-host and on the Sparks,
 #                           then scripts/check-release-clean.sh on every binary built
 #   sync.sh runtime [host..] resync only runtime/ and verify files and permissions
+#                           (development only: the matrix host documents declare
+#                           runtime_dir, so hosts run the synced tree; a release
+#                           binary instead writes its embedded runtime to
+#                           <state_dir>/runtime when runtime_dir is left out)
 #   sync.sh all             snapshot, push, build, runtime check
 #
 # DRY_RUN=1 prints every command without running it.
@@ -95,5 +99,5 @@ case $cmd in
   build) build "$@" ;;
   runtime) runtime "$@" ;;
   all) snapshot; push "$@"; build "$@"; runtime "$@" ;;
-  *) sed -n '2,11p' "$0"; exit 2 ;;
+  *) sed -n '2,15p' "$0"; exit 2 ;;
 esac

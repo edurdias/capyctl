@@ -9,8 +9,10 @@ name: host-a
 state_dir: /var/lib/mllm/host
 # Must be `<state_dir>/identity`.
 identity_dir: /var/lib/mllm/host/identity
-# mllm's runtime helper scripts (owner-only files).
-runtime_dir: /opt/mllm/runtime
+# mllm's runtime helpers are compiled into the binary and written, owner-only,
+# to <state_dir>/runtime at every start. Name runtime_dir only to run from a
+# directory you maintain yourself (development); mllm never writes to it.
+# runtime_dir: /home/operator/mllm/runtime
 hardware_fingerprint: gb10-spark
 environment_fingerprint: spark-env-2026-09
 # Relative model paths in deployments resolve under this directory.

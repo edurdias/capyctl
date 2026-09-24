@@ -18,7 +18,7 @@
 
 [Unit]
 Description=mllm host agent
-Documentation=file:///opt/mllm/current/docs/operations/install.md
+Documentation=file:///usr/local/share/mllm/docs/operations/install.md
 Wants=network-online.target
 After=network-online.target
 
@@ -30,7 +30,7 @@ Group=mllm
 # file optional.
 Environment=MLLM_CONFIG=/etc/mllm/host.yaml
 EnvironmentFile=-/etc/mllm/host.env
-ExecStart=/opt/mllm/current/bin/mllm start host --config ${MLLM_CONFIG}
+ExecStart=/usr/local/bin/mllm start host --config ${MLLM_CONFIG}
 
 # SPEC §4.3: engines must SURVIVE a restart of this unit. systemd's default
 # (control-group) and `mixed` both signal every process in the cgroup, which

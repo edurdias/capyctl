@@ -21,7 +21,7 @@
 
 [Unit]
 Description=mllm standalone (server and embedded host)
-Documentation=file:///opt/mllm/current/docs/operations/install.md
+Documentation=file:///usr/local/share/mllm/docs/operations/install.md
 Wants=network-online.target
 After=network-online.target
 
@@ -35,18 +35,18 @@ Group=mllm
 # override ExecStart= in a drop-in (docs/operations/install.md, "Explicit
 # standalone document"):
 #   ExecStart=
-#   ExecStart=/opt/mllm/current/bin/mllm start standalone --config <file>
+#   ExecStart=/usr/local/bin/mllm start standalone --config <file>
 # A missing or invalid explicit file then fails the start (exit 2, not
 # restarted); it is never replaced by defaults (SPEC §15.2, R13).
 # The engine installation always comes from the environment (MLLM_VLLM_BIN or
 # MLLM_SGLANG_BIN, MLLM_MODELS_ROOT, ...), which belongs in the environment
 # file. The leading '-' makes the file optional.
 Environment=MLLM_STATE_DIR=/var/lib/mllm/standalone
-# mllm's runtime helpers: a real (non-symlinked) directory owned by the
-# service user; see docs/operations/install.md.
-Environment=MLLM_RUNTIME_DIR=/opt/mllm/runtime
+# mllm's runtime helpers are compiled into the binary and written to
+# /var/lib/mllm/standalone/runtime (owner-only) at every start; MLLM_RUNTIME_DIR, for
+# development, names another directory instead.
 EnvironmentFile=-/etc/mllm/standalone.env
-ExecStart=/opt/mllm/current/bin/mllm start standalone
+ExecStart=/usr/local/bin/mllm start standalone
 
 # SPEC §4.3: engines must SURVIVE a restart of this unit. systemd's default
 # (control-group) and `mixed` both signal every process in the cgroup, which

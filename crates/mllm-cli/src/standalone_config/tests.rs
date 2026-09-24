@@ -726,3 +726,58 @@ fn the_residency_follows_the_deep_park_switch_for_sglang_only() {
     assert_eq!(residency(Engine::Vllm, true), "restart_only");
     assert_eq!(residency(Engine::Vllm, false), "restart_only");
 }
+
+/// SPEC §3.3 / ADR 0001 (owner decision 2026-09-24): without
+/// `MLLM_RUNTIME_DIR`, standalone runs from the runtime embedded in the binary,
+/// written to its managed directory; with it, the named directory is used and
+/// the managed one is never created. A run with neither refuses.
+// T21 T37
+#[test]
+fn standalone_runs_from_the_embedded_runtime_unless_one_is_named() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    std::env::set_var("MLLM_VLLM_BIN", &bin);
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    std::env::remove_var("MLLM_RUNTIME_DIR");
+    std::env::remove_var("MLLM_DEEP_PARK");
+
+    let managed = dir.path().join("state").join("runtime");
+    let installation = crate::roles::EnvEngineProvider::with_managed_runtime(managed.clone())
+        .installation()
+        .expect("the embedded runtime is materialized");
+    assert_eq!(installation.runtime_dir, managed.canonicalize().expect("created"));
+    assert_eq!(
+        std::fs::metadata(&managed).expect("created").permissions().mode() & 0o7777,
+        0o700
+    );
+    for file in mllm_agent::embedded_runtime::files() {
+        assert_eq!(
+            std::fs::read(managed.join(file.name)).expect("a module"),
+            file.contents
+        );
+    }
+
+    let named = private_runtime(dir.path());
+    let other = dir.path().join("other-state").join("runtime");
+    std::env::set_var("MLLM_RUNTIME_DIR", &named);
+    let installation = crate::roles::EnvEngineProvider::with_managed_runtime(other.clone())
+        .installation()
+        .expect("the named runtime is used");
+    assert_eq!(installation.runtime_dir, named.canonicalize().expect("exists"));
+    assert!(!other.exists(), "a named runtime leaves the managed one alone");
+    assert!(!named.join(mllm_agent::embedded_runtime::MARKER).exists());
+
+    std::env::remove_var("MLLM_RUNTIME_DIR");
+    let message = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect_err("no managed directory and none named")
+        .to_string();
+    assert!(message.contains("MLLM_RUNTIME_DIR"), "{message}");
+    for name in ["MLLM_VLLM_BIN", "MLLM_MODELS_ROOT"] {
+        std::env::remove_var(name);
+    }
+}
