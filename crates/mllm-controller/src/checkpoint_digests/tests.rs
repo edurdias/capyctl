@@ -461,6 +461,52 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
     assert_eq!(record_of(&f).state, DigestState::Mismatch);
 }
 
+// T14 T15 T33: a first placement whose checkpoint does not measure to the
+// declared canonical fingerprint is refused with `checkpoint_mismatch` before
+// the launch is sent, not reported as uncertain ownership (M48 soak,
+// 2026-09-24). A matching measurement is recorded and launched with; a host
+// that cannot measure leaves the digest unrecorded and the launch uncertain.
+#[tokio::test]
+async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
+    let f = fixture(declared_other);
+    let refused = first_placement_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
+        Ok(Measured {
+            digest: format!("sha256:{}", "2".repeat(64)),
+            weights_bytes: 7,
+        })
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(refused, RuntimeError::Refused(ref reason) if reason == "checkpoint_mismatch"),
+        "{refused:?}"
+    );
+    assert_eq!(record_of(&f).state, DigestState::Mismatch);
+
+    let f = fixture(|_| {});
+    let unmeasured = first_placement_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
+        Err::<Measured, _>(MeasureError::Unavailable)
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(unmeasured, RuntimeError::Uncertain(_)), "{unmeasured:?}");
+    assert_ne!(record_of(&f).state, DigestState::Recorded);
+    let digest = format!("sha256:{}", "2".repeat(64));
+    let placed = first_placement_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || {
+        let digest = digest.clone();
+        async move {
+            Ok(Measured {
+                digest,
+                weights_bytes: 7,
+            })
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(placed, digest);
+    assert_eq!(record_of(&f).state, DigestState::Recorded);
+}
+
 // T14 T15 T33: the embedded gate wakes a legacy launch after measuring and
 // recording its digest, and refuses a mismatching one with
 // `checkpoint_mismatch` before the engine is asked anything.

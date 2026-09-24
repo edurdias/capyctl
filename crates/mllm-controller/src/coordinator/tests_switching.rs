@@ -753,6 +753,36 @@ async fn a_restart_only_victim_is_stopped_and_stays_on_demand_eligible() {
     lab.worker.shutdown().await.unwrap();
 }
 
+// T15 T16 (SPEC §6.3, owner decision Q5): a request for an explicitly stopped
+// deployment is refused before any switch is planned: the Ready incumbent keeps
+// serving and nothing is parked (M48 soak, 2026-09-24: the request parked A on
+// the tight host and was refused afterwards).
+#[tokio::test]
+async fn a_request_for_an_operator_stopped_deployment_evicts_nothing() {
+    let lab = lab(15, 50).await;
+    lab.ready(&lab.a).await;
+    let b = lab.c.deployment_id.clone();
+    lab.worker
+        .commands()
+        .read(|store| store.set_admin_stopped(&b, true))
+        .unwrap();
+    let port = lab.port(Duration::from_secs(5));
+    let refused = tokio::time::timeout(Duration::from_secs(30), port.activate_for_request(&b))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(refused, LifecycleFault::Blocked(ref m) if m.contains("explicitly stopped")),
+        "{refused:?}"
+    );
+    assert_eq!(lab.state(&lab.a.deployment_id), "ready");
+    assert!(lab.instance(&lab.a.deployment_id, 0).1, "A still admits");
+    assert_eq!(lab.engine.calls(RuntimeAction::Park, &lab.a.deployment_id), 0);
+    assert!(lab.switch_events().is_empty(), "no switch was planned");
+    assert_eq!(lab.state(&b), "stopped");
+    lab.worker.shutdown().await.unwrap();
+}
+
 // SPEC §7 (T23): when even releasing every eligible READY instance cannot
 // make B fit, nothing is released and the request gets a capacity refusal.
 #[tokio::test]

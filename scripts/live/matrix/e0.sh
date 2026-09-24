@@ -4,7 +4,7 @@
 #   e0.sh static <dir>          commit, snapshot digest, binary SHA-256 per machine, engine
 #                               versions and environment digests, boot ids, driver
 #   e0.sh checkpoints <dir>     checkpoint payload SHA-256 per model and host (slow; once per run);
-#                               also written to the run state for fixtures and I1
+#                               equality across hosts only: it is not the product's manifest digest
 #   e0.sh vparity <dir>         G12: read-only vLLM environment parity, host-a venv2 vs host-b 0.29 venv
 #   e0.sh snap <label> <dir>    status, hosts, ledger (read-only), per-host MemAvailable,
 #                               nvidia-smi compute processes, engine processes, listeners,
@@ -62,7 +62,7 @@ checkpoints() {
   for host in "${MATRIX_HOSTS[@]}"; do
     rsh "$host" "$script" >"$( dry && echo /dev/null || echo "$dir/checkpoints.$host.txt")"
   done
-  dry && { log_cmd control-host "merge checkpoints.<host>.txt into $dir/checkpoints.json and $RUNSTATE/checkpoints.json"; return 0; }
+  dry && { log_cmd control-host "merge checkpoints.<host>.txt into $dir/checkpoints.json and $RUNSTATE/payload-digests.json"; return 0; }
   python3 - "$dir" "${MATRIX_HOSTS[@]}" <<'PY'
 import json, sys
 out_dir, hosts = sys.argv[1], sys.argv[2:]
@@ -74,7 +74,11 @@ result["_equal_across_hosts"] = {d: len({result[h].get(d) for h in hosts}) == 1 
 json.dump(result, open(f"{out_dir}/checkpoints.json", "w"), indent=1, sort_keys=True)
 print(json.dumps(result["_equal_across_hosts"]))
 PY
-  mkdir -p "$RUNSTATE" && cp "$dir/checkpoints.json" "$RUNSTATE/checkpoints.json"
+  # Kept as E0 evidence only (payload-digests.json), never as $RUNSTATE/checkpoints.json:
+  # this is a payload digest, not the product's checkpoint manifest digest
+  # (mllm-agent checkpoint.rs), so a fixture that declared it as content_fingerprint
+  # was refused at first placement (found live by the M48 soak, 2026-09-24).
+  mkdir -p "$RUNSTATE" && cp "$dir/checkpoints.json" "$RUNSTATE/payload-digests.json"
 }
 
 vparity() {

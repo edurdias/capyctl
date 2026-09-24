@@ -27,4 +27,6 @@ mv "$pidfile.tmp" "$pidfile"
 trap 'kill -TERM "$child" 2>/dev/null || true' HUP INT
 status=0
 wait "$child" || status=$?
+# The role's exit status, for rows that judge a clean shutdown (M49, M72).
+printf '# %s exit %s\n' "$(date -u +%FT%TZ)" "$status" >>"$log"
 exit "$status"

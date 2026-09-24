@@ -117,17 +117,17 @@ impl RemoteEvidenceObserver for OwnershipObserver {
 }
 impl RemoteEngine {
     /// ADR 0014 §7 (WE3): measure the checkpoint on the launch's host, record
-    /// the digest, and return it for the launch plan. A refusal, a mismatch
-    /// with a declared or recorded digest, or no answer refuses the launch
-    /// before it is sent.
+    /// the digest, and return it for the launch plan. A mismatch with a
+    /// declared or recorded digest refuses the launch with
+    /// `checkpoint_mismatch`; a refusal or no answer leaves it unrecorded and
+    /// uncertain. Either way the launch is never sent
+    /// (`checkpoint_digests::first_placement_digest`).
     async fn first_placement(
         &self,
         c: &mllm_domain::completion::StepExecutionContext,
         plan: &SingleLaunchPlan,
     ) -> Result<String, RuntimeError> {
         let b = &self.binding;
-        let refused =
-            || RuntimeError::Uncertain("the checkpoint digest was not recorded before launch".into());
         let command = crate::checkpoint_digests::digest_command(
             &b.controller_id,
             &b.host_id,
@@ -139,24 +139,15 @@ impl RemoteEngine {
             plan.host_policy_fingerprint.clone(),
             c.deadline_ms,
         );
-        let result = self.sessions.execute(command).await.map_err(|_| refused())?;
-        let measured = crate::checkpoint_digests::measured_from(&result).map_err(|_| refused())?;
-        match crate::checkpoint_digests::record(
-            &self.owner,
-            &c.token.deployment_id,
-            c.token.revision,
-            &b.host_id,
-            &measured,
-        )
-        .map_err(|_| refused())?
-        {
-            mllm_store::checkpoint_digests::RecordOutcome::Recorded { digest, .. }
-                if digest == measured.digest =>
-            {
-                Ok(digest)
-            }
-            _ => Err(refused()),
-        }
+        let sessions = self.sessions.clone();
+        crate::checkpoint_digests::first_placement_digest(&self.owner, &c.token.deployment_id, c.token.revision, &b.host_id, || async move {
+            let result = sessions
+                .execute(command)
+                .await
+                .map_err(|_| crate::checkpoint_digests::MeasureError::Unavailable)?;
+            crate::checkpoint_digests::measured_from(&result)
+        })
+        .await
     }
 
     /// ADR 0014 §7, owner decision 5 (2026-09-22): the digest a remote wake
