@@ -1,17 +1,19 @@
 //! Secret-free input to the protected Python entrypoint, not native engine argv.
 //!
-//! The wrapper must validate this closed semantic descriptor and map every field
-//! through a verified pinned ServerArgs contract before any engine import. Native
-//! flag spellings are deliberately not inferred here. The final launcher owns the
+//! ADR 0014 §2, §6: the descriptor carries the deployment's typed settings, its
+//! memory request and its extra arguments. The wrapper maps them onto the
+//! installed ServerArgs (`runtime/sglang_server_args.py`), parses extra arguments
+//! with SGLang's own parser, renders the reserved subset itself and rechecks it
+//! after SGLang's resolution. Native flag spellings are deliberately not inferred
+//! here. The final launcher owns the
 //! private launch/root descriptor and the two credential descriptors; this module
 //! never resolves references, reads descriptors, or starts a process.
 
+use crate::sglang::pinned::NATIVE_SGLANG_CONTRACT;
 use crate::traits::{RenderedCommand, RuntimeError};
-use mllm_config::effective::sglang::{
-    NATIVE_CHECKPOINT_REVISION, NATIVE_SGLANG_RECIPE, NATIVE_SGLANG_SOURCE_REVISION,
-};
+use mllm_config::engine_policy::{validate_rendered_args, Engine};
 use mllm_domain::launch::{NativeLaunch, SglangLaunchSettings};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{fmt, path::Path};
 
 /// Inherited descriptor numbers selected by the final launcher. This validates
@@ -74,9 +76,8 @@ impl SglangLaunch {
                 && !value.chars().any(|c| c.is_whitespace() || c.is_control())
         };
         if m.engine != "sglang"
-            || m.recipe != NATIVE_SGLANG_RECIPE
-            || m.source_revision != NATIVE_SGLANG_SOURCE_REVISION
-            || m.checkpoint_revision != NATIVE_CHECKPOINT_REVISION
+            || m.recipe != NATIVE_SGLANG_CONTRACT
+            || !served_name_token(&m.checkpoint_revision)
             || !ulid(&m.binding_id)
             || !ulid(&m.incarnation)
             || !served_name_token(&m.served_name)
@@ -102,40 +103,20 @@ impl SglangLaunch {
         {
             return Err(RuntimeError::Unsupported);
         }
-        validate_settings(s)?;
-
-        // Qwen3-4B's pinned geometry: 36 layers, 8 KV heads, head dimension
-        // 128, K and V, two-byte BF16. This excludes allocator overhead and is
-        // only a necessary lower bound, never allocation or grant evidence.
-        let minimum_kv_bytes = [8, 128, 2, 2, u64::from(s.max_total_tokens)]
-            .into_iter()
-            .try_fold(36_u64, u64::checked_mul)
-            .ok_or(RuntimeError::Unsupported)?;
-        let budget = u64::try_from(s.requested_budget.kv_cache_bytes)
-            .map_err(|_| RuntimeError::Unsupported)?;
-        if budget < minimum_kv_bytes {
-            return Err(RuntimeError::Unsupported);
-        }
-        let bps = s.requested_budget.static_memory_fraction_bps;
-        // Integer-only decimal rendering preserves every basis point; bytes
-        // remain integer bytes and are never converted into a native CLI flag.
-        let fraction = format!("{}.{:04}", bps / 10000, bps % 10000);
+        let settings = public_settings(s)?;
+        // The checkpoint revision stays out of the public descriptor: the
+        // entry no longer pins a checkpoint (ADR 0014 §9; WE3 verifies a digest).
         let public = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "sglang_launch",
             "engine": m.engine,
-            "recipe": m.recipe,
-            "source_revision": m.source_revision,
-            "checkpoint_revision": m.checkpoint_revision,
             "binding_id": m.binding_id,
             "incarnation": m.incarnation,
             "endpoint": m.endpoint,
             "served_name": m.served_name,
             "rendered_settings_digest": m.rendered_settings_digest,
             "device": m.device,
-            "settings": s,
-            "minimum_kv_bytes": minimum_kv_bytes,
-            "static_memory_fraction": fraction,
+            "settings": settings,
         });
         Ok(Self {
             executable: frozen.executable().into(),
@@ -164,7 +145,9 @@ impl SglangLaunch {
                 // Installed .pth/sitecustomize hooks otherwise run before our
                 // protected entry, even in isolated mode. Trusted package paths
                 // must be composed explicitly without invoking site processing.
-                "-IS".into(),
+                // SPEC §9.1 / T21: -B, so no bytecode is written beside the
+                // checked source for a later import to prefer.
+                "-BIS".into(),
                 wrapper.to_str().ok_or(RuntimeError::Unsupported)?.into(),
                 "--public-settings-json".into(),
                 public,
@@ -180,10 +163,23 @@ impl SglangLaunch {
     }
 
     /// Service configuration supplies this path, never a candidate or HTTP request.
-    /// The file and its directory chain must be owned by root or the service user
-    /// and unwritable by other users. Owner writes remain inside the service trust
-    /// boundary. Recheck immediately before passing protected descriptors to a child.
+    /// The file and its directory chain are mllm's own runtime helpers, so they
+    /// follow the owner-only rule (owner decision 2026-09-23,
+    /// `crate::owner_only`): owned by root or the service user, never writable
+    /// by other, and group-writable only through the owner's private group.
+    /// Owner writes remain inside the service trust boundary. Recheck
+    /// immediately before passing protected descriptors to a child.
     pub fn validate_wrapper_path(path: &Path) -> Result<(), RuntimeError> {
+        Self::validate_wrapper_path_with(path, &crate::owner_only::system_private_group)
+    }
+
+    /// `validate_wrapper_path` with the private-group lookup supplied, so the
+    /// rule is testable without editing the account database.
+    #[doc(hidden)]
+    pub fn validate_wrapper_path_with(
+        path: &Path,
+        private_group: &crate::owner_only::PrivateGroup,
+    ) -> Result<(), RuntimeError> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
@@ -196,19 +192,17 @@ impl SglangLaunch {
             let service_uid = std::fs::metadata("/proc/self").map_err(|_| reject())?.uid();
             for (index, component) in path.ancestors().enumerate() {
                 let metadata = std::fs::symlink_metadata(component).map_err(|_| reject())?;
-                if (index == 0 && !metadata.is_file())
-                    || (index != 0 && !metadata.is_dir())
-                    || ![0, service_uid].contains(&metadata.uid())
-                    || metadata.mode() & 0o022 != 0
-                {
+                if (index == 0 && !metadata.is_file()) || (index != 0 && !metadata.is_dir()) {
                     return Err(reject());
                 }
+                crate::owner_only::check(&metadata, &[0, service_uid], private_group)
+                    .map_err(|_| reject())?;
             }
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = path;
+            let _ = (path, private_group);
             Err(RuntimeError::Unsupported)
         }
     }
@@ -220,41 +214,105 @@ impl fmt::Display for SglangLaunch {
     }
 }
 
-fn validate_settings(s: &SglangLaunchSettings) -> Result<(), RuntimeError> {
-    let SglangLaunchSettings {
-        recipe,
-        tensor_parallel_size: 1,
-        data_parallel_size: 1,
-        tokenizer_workers: 1,
-        model_dtype,
-        context_tokens: 4096,
-        max_running_requests: 8,
-        max_total_tokens: 4096,
-        prefill_cuda_graphs: false,
-        decode_cuda_graphs: false,
-        memory_saver: true,
-        cpu_weight_backup: false,
-        speculative_decoding: false,
-        lora: false,
-        trust_remote_code: false,
-        disaggregation: false,
-        external_cache: false,
-        cpu_kv_offload: false,
-        native_grpc: false,
-        weight_restore,
-        requested_budget,
-    } = s
-    else {
-        return Err(RuntimeError::Unsupported);
-    };
-    if recipe != NATIVE_SGLANG_RECIPE
-        || model_dtype != "bfloat16"
-        || weight_restore != "disk_reload"
-        || !(1..=10000).contains(&requested_budget.static_memory_fraction_bps)
+/// Most extra arguments the entry accepts (`runtime/sglang_entry.py`).
+const MAX_EXTRA_ARGS: usize = 256;
+
+/// ADR 0014 §2: the dtypes mllm accepts by name, as the entry does.
+const DTYPES: &[&str] = &["auto", "bfloat16", "float16", "float32"];
+
+/// An engine-spelled value (quantization method, KV dtype): a short ASCII token.
+fn engine_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn positive_i32(value: Option<u32>) -> bool {
+    value.is_none_or(|value| value >= 1 && i32::try_from(value).is_ok())
+}
+
+/// ADR 0014 §2, §5, §6: the closed typed settings object the entry validates.
+/// mllm checks type, range and closure; whether the engine supports a value on
+/// this checkpoint is the user's responsibility (ADR 0011). Reserved settings
+/// are absent: the entry renders them from the binding, placement and grant.
+fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
+    let common = &s.common;
+    let memory = &s.memory;
+    // ADR 0014 §5: SGLang's static pool (weights plus KV) is the request minus
+    // the overhead margin; the entry turns it into `mem_fraction_static`. An
+    // explicit request smaller than KV plus the placeholder margin (a declared
+    // `resources:` Ready phase) cannot honour the margin: the static pool then
+    // gets the declared KV cache, and never more than the whole request.
+    if memory.request_bytes <= 0
+        || memory.kv_cache_bytes <= 0
+        || memory.kv_cache_bytes > memory.request_bytes
+        || memory.margin_bytes < 0
     {
         return Err(RuntimeError::Unsupported);
     }
-    Ok(())
+    let static_bytes = (memory.request_bytes - memory.margin_bytes)
+        .max(memory.kv_cache_bytes)
+        .min(memory.request_bytes);
+    let expected_restore = if s.cpu_weight_backup {
+        "cpu_backup"
+    } else {
+        "disk_reload"
+    };
+    if common
+        .dtype
+        .as_deref()
+        .is_some_and(|dtype| !DTYPES.contains(&dtype))
+        || common
+            .quantization
+            .as_deref()
+            .is_some_and(|q| !engine_token(q))
+        || common
+            .kv_cache_dtype
+            .as_deref()
+            .is_some_and(|k| !engine_token(k))
+        || !positive_i32(common.context_length)
+        || !positive_i32(common.max_concurrent_requests)
+        || !positive_i32(s.max_total_tokens)
+        || s.chunked_prefill_size
+            .is_some_and(|size| size == 0 || size < -1)
+        || !(1..=1024).contains(&s.tokenizer_workers)
+        || s.weight_restore != expected_restore
+        || s.extra_args.len() > MAX_EXTRA_ARGS
+        || s.extra_args.iter().any(|token| {
+            token.is_empty() || token.len() > 4096 || token.chars().any(char::is_control)
+        })
+    {
+        return Err(RuntimeError::Unsupported);
+    }
+    // SPEC §8.2 / ADR 0014 §3: reserved names, configuration files and
+    // duplicates are refused again at render; the entry rechecks after parsing.
+    validate_rendered_args(Engine::Sglang, &s.extra_args, false)
+        .map_err(|_| RuntimeError::Unsupported)?;
+    Ok(json!({
+        "dtype": common.dtype,
+        "quantization": common.quantization,
+        "kv_cache_dtype": common.kv_cache_dtype,
+        "context_length": common.context_length,
+        "max_running_requests": common.max_concurrent_requests,
+        "cuda_graphs": common.cuda_graphs,
+        "language_model_only": common.language_model_only,
+        "trust_remote_code": common.trust_remote_code,
+        "max_total_tokens": s.max_total_tokens,
+        "chunked_prefill_size": s.chunked_prefill_size,
+        "tokenizer_workers": s.tokenizer_workers,
+        "memory_saver": s.memory_saver,
+        "cpu_weight_backup": s.cpu_weight_backup,
+        "weight_restore": s.weight_restore,
+        "memory": {
+            "request_bytes": memory.request_bytes,
+            "kv_cache_bytes": memory.kv_cache_bytes,
+            "margin_bytes": memory.margin_bytes,
+            "static_bytes": static_bytes,
+        },
+        "extra_args": s.extra_args,
+    }))
 }
 
 fn selector(value: &str) -> bool {
@@ -300,9 +358,7 @@ fn ulid(value: &str) -> bool {
 pub(crate) fn served_name_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
-        && value
-            .chars()
-            .all(|c| matches!(c, '\u{21}'..='\u{7E}'))
+        && value.chars().all(|c| matches!(c, '\u{21}'..='\u{7E}'))
 }
 
 fn private_endpoint(value: &str) -> bool {

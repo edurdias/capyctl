@@ -29,7 +29,7 @@ use mllm_domain::completion::{
     ExecutionIdentities, Milestone, Presence, ProcessIdentity, StepExecutionContext,
     TransitionToken,
 };
-use mllm_domain::launch::{ProfileLaunchSettings, VllmLaunchSettings, VllmRequestedBudget};
+use mllm_domain::launch::LaunchSettings;
 
 // ---------------------------------------------------------------- stub engine
 
@@ -276,8 +276,6 @@ fn plan(port: u16) -> PlanInputVllm {
         served_model_name: "gate-m".into(),
         tensor_parallel_size: 1,
         pipeline_parallel_size: 1,
-        kv_cache_dtype: "auto".into(),
-        block_size_tokens: 16,
         cpu_offload_bytes: 0,
         granted: GrantedBudget::default(),
         engine_args: vec![],
@@ -286,7 +284,8 @@ fn plan(port: u16) -> PlanInputVllm {
         api_key: None,
         engine_path_extra: Some("/opt/venv/bin".into()),
         engine_log: None,
-        runtime_dir: None,
+        runtime_dir: Some("/opt/mllm/runtime".into()),
+        ..PlanInputVllm::default()
     }
 }
 
@@ -315,19 +314,7 @@ fn initialize_command(deadline_in_ms: i64) -> RuntimeCommand {
             identities: ExecutionIdentities::OwnedLaunch,
             completion_target: None,
             grant_id: Some("g-1".into()),
-            launch_settings: Some(ProfileLaunchSettings::Vllm(VllmLaunchSettings {
-                tensor_parallel_size: 1,
-                pipeline_parallel_size: 1,
-                enable_sleep_mode: false,
-                kv_cache_dtype: "auto".into(),
-                block_size_tokens: 16,
-                cpu_offload_bytes: 0,
-                requested_budget: VllmRequestedBudget {
-                    kv_cache_bytes: 0,
-                    swap_space_bytes: 0,
-                    gpu_utilization_pct: 75,
-                },
-            })),
+            launch_settings: Some(mllm_testkit::vllm_launch_settings()),
         },
     }
 }
@@ -395,6 +382,49 @@ async fn initialize_spawns_waits_probes_and_reports_the_group() {
     assert!(!observation.receipt.contains("k3y"));
 }
 
+/// SPEC §13.3 / T21: the engine's environment is a closed allowlist. Nothing
+/// of the agent's own environment beyond it reaches vLLM; its plugins are
+/// pinned off, it writes no bytecode, and with an admin key the development
+/// routes are keyed apart from inference (the guard reads it).
+// T21
+#[tokio::test]
+async fn the_engine_environment_is_a_closed_allowlist() {
+    let (_stub, port) = stub_engine("gate-m", 2, "k3y").await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let mut launch = plan(port);
+    launch.sleep_flags = vec!["--enable-sleep-mode".into()];
+    launch.extra_approvals = Some(r#"{"options":[],"paths":[],"trust_remote_code":false}"#.into());
+    let adapter = adapter(port, Some("k3y"))
+        .with_launch(launch)
+        .with_tools(tool.clone())
+        .with_engine_key("k3y".into())
+        .with_admin_key("adm1n".into());
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    let spawned = tool.spawned.lock().unwrap();
+    let env = &spawned[0].env;
+    let allowed = [
+        "PATH", "HOME", "CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+        "VLLM_API_KEY", "MLLM_VLLM_ADMIN_KEY", "VLLM_SERVER_DEV_MODE", "PYTHONPATH",
+        "VLLM_PLUGINS", "PYTHONDONTWRITEBYTECODE", "MLLM_ENGINE_LOG", "MLLM_EXTRA_APPROVALS",
+    ];
+    for name in env.keys() {
+        assert!(allowed.contains(&name.as_str()), "{name} is not on the allowlist");
+    }
+    assert_eq!(env.get("VLLM_PLUGINS").map(String::as_str), Some(""));
+    assert_eq!(env.get("PYTHONDONTWRITEBYTECODE").map(String::as_str), Some("1"));
+    assert_eq!(env.get("VLLM_API_KEY").map(String::as_str), Some("k3y"));
+    assert_eq!(env.get("MLLM_VLLM_ADMIN_KEY").map(String::as_str), Some("adm1n"));
+    assert!(env.contains_key("MLLM_EXTRA_APPROVALS"));
+    // PATH is the engine's own bin and fixed system directories only.
+    assert_eq!(
+        env.get("PATH").map(String::as_str),
+        Some("/opt/venv/bin:/usr/local/bin:/usr/bin:/bin")
+    );
+}
+
 /// Spec §4 step 4: a process that dies before readiness ends the step with the
 /// log tail, so the operator reads the engine's own reason for leaving.
 // T10
@@ -424,9 +454,15 @@ async fn a_process_gone_before_readiness_fails_with_the_log_tail() {
         .await
         .unwrap_err();
 
-    let RuntimeError::Uncertain(message) = error else {
-        panic!("a dead engine is uncertain ownership, got {error:?}");
+    // SPEC §§6.4, 13.2: an engine gone before readiness is a launch failure
+    // whose first line is the bounded summary; the log tail follows it.
+    let RuntimeError::LaunchFailed(message) = error else {
+        panic!("a dead engine is a launch failure, got {error:?}");
     };
+    assert!(
+        message.starts_with("the engine exited before readiness"),
+        "{message}"
+    );
     for line in [
         "loading weights",
         "CUDA out of memory",
@@ -693,8 +729,10 @@ async fn the_engine_key_is_the_one_presented() {
         .is_ok());
 }
 
-/// Actions other than Initialize stay refused until the S2 slice implements them:
-/// an adapter must never appear to grant a control path it does not have.
+/// Actions other than Initialize are refused for a launch-shaped step: Stop and
+/// Probe have no persisted vLLM path, and Park and Restore (W4, `vllm_residency.rs`)
+/// require retained identities and no launch settings. An adapter must never
+/// appear to grant a control path it does not have.
 #[tokio::test]
 async fn other_actions_are_still_unsupported() {
     let (_stub, port) = stub_engine("gate-m", 0, "k3y").await;
@@ -760,8 +798,7 @@ async fn a_context_that_is_not_an_owned_vllm_launch_is_unsupported() {
     ));
 
     let mut other_family = initialize_command(30_000);
-    other_family.context.launch_settings =
-        Some(ProfileLaunchSettings::Sglang(sglang_settings()));
+    other_family.context.launch_settings = Some(LaunchSettings::Sglang(sglang_settings()));
     assert!(matches!(
         adapter.execute_persisted(&other_family).await,
         Err(RuntimeError::Unsupported)
@@ -771,30 +808,5 @@ async fn a_context_that_is_not_an_owned_vllm_launch_is_unsupported() {
 /// Another family's launch settings, for the check that a vLLM builder refuses a
 /// command carrying a plan it was never verified against.
 fn sglang_settings() -> mllm_domain::launch::SglangLaunchSettings {
-    mllm_domain::launch::SglangLaunchSettings {
-        recipe: "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1".into(),
-        tensor_parallel_size: 1,
-        data_parallel_size: 1,
-        tokenizer_workers: 1,
-        model_dtype: "bfloat16".into(),
-        context_tokens: 4096,
-        max_running_requests: 8,
-        max_total_tokens: 4096,
-        prefill_cuda_graphs: false,
-        decode_cuda_graphs: false,
-        memory_saver: true,
-        cpu_weight_backup: false,
-        speculative_decoding: false,
-        lora: false,
-        trust_remote_code: false,
-        disaggregation: false,
-        external_cache: false,
-        cpu_kv_offload: false,
-        native_grpc: false,
-        weight_restore: "disk_reload".into(),
-        requested_budget: mllm_domain::launch::SglangRequestedBudget {
-            kv_cache_bytes: 4_294_967_296,
-            static_memory_fraction_bps: 7500,
-        },
-    }
+    mllm_testkit::sglang_launch_settings()
 }

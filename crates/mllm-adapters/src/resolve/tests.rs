@@ -11,6 +11,7 @@ fn vllm() -> AdapterSpec {
         model_id: "m".into(),
         launch: None,
         engine_key: None,
+        admin_key: None,
     }
 }
 

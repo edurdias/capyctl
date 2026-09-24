@@ -1,16 +1,34 @@
-//! Argument rendering for the vLLM adapter (F1 design §4, T14): mllm
-//! controls reserved settings with explicit units; reviewed profile arguments are
-//! appended after the controlled block; security-sensitive flags are
-//! reserved and their values redacted in recorded fingerprints.
+//! Argument rendering for the vLLM adapter (F1 design §4, T14; ADR 0014 §2, §6):
+//! mllm controls reserved settings with explicit units; typed deployment fields,
+//! host-fixed profile arguments and accepted extra arguments follow a marker the
+//! protected entry (`runtime/vllm_entry.py`, owner decision Q11) splits on. The
+//! entry parses both blocks with vLLM's own parser and refuses any change to a
+//! reserved field before serving; security-sensitive values are redacted in
+//! recorded fingerprints.
 
 use crate::traits::RenderedCommand;
-use mllm_config::engine_policy::{validate_profile_args, Engine, ProfileArgError};
+use mllm_config::engine_policy::{
+    normalize_option_name, validate_rendered_args, Engine, ProfileArgError,
+};
 
 /// Flags mllm owns: user pass-through conflicts fail validation (T14) and
 /// the adapter renders them from granted budgets/contracts.
 pub use mllm_config::engine_policy::VLLM_RESERVED_FLAGS as RESERVED_FLAGS;
 
-#[derive(Debug, Clone)]
+/// The protected entry's file name inside the host runtime directory.
+pub const VLLM_ENTRY: &str = "vllm_entry.py";
+
+/// Separates the reserved block from everything the deployment or host chose.
+/// Must match `runtime/vllm_entry.py` `MARKER`; no user token may start with
+/// `--mllm-`.
+pub const USER_ARGS_MARKER: &str = "--mllm-user-args";
+
+/// ADR 0014 §8, SPEC §8.2: the deployment's own extra arguments follow this
+/// second marker, so the entry gates exactly the destinations they resolve to.
+/// Must match `runtime/vllm_entry.py` `EXTRA_MARKER`.
+pub const EXTRA_ARGS_MARKER: &str = "--mllm-extra-args";
+
+#[derive(Clone, Default)]
 pub struct PlanInputVllm {
     /// The engine executable (profile-owned launch context, SPEC §8.1).
     pub engine_bin: String,
@@ -22,14 +40,35 @@ pub struct PlanInputVllm {
     pub served_model_name: String,
     pub tensor_parallel_size: u32,
     pub pipeline_parallel_size: u32,
-    pub kv_cache_dtype: String,
-    pub block_size_tokens: u32,
+    /// ADR 0014 §2 typed fields. `None`/`false` renders nothing, so the
+    /// engine's own default applies.
+    pub dtype: Option<String>,
+    pub quantization: Option<String>,
+    pub kv_cache_dtype: Option<String>,
+    pub block_size_tokens: Option<u32>,
+    /// `--max-model-len`.
+    pub context_length: Option<u32>,
+    /// `--max-num-seqs`.
+    pub max_concurrent_requests: Option<u32>,
+    pub max_num_batched_tokens: Option<u32>,
+    /// `cuda_graphs: false` renders `--enforce-eager`.
+    pub enforce_eager: bool,
+    pub language_model_only: bool,
+    /// Host-approved at deploy time (ADR 0014 §8).
+    pub trust_remote_code: bool,
     /// CPU-offload budget in bytes; rendered as whole GiB (vLLM's unit).
     /// Zero means "no offload flag" (Step 3, Spec §3).
     pub cpu_offload_bytes: i64,
     pub granted: GrantedBudget,
-    /// Engine-native arguments approved by the selected profile policy.
+    /// Host-fixed engine arguments (the approved profile's own).
     pub engine_args: Vec<String>,
+    /// The deployment's accepted extra arguments (ADR 0014 §6). Rendered after
+    /// [`EXTRA_ARGS_MARKER`], where the entry gates their parsed destinations.
+    pub extra_args: Vec<String>,
+    /// The host's approvals for sensitive extra arguments, as the JSON document
+    /// the entry reads from `MLLM_EXTRA_APPROVALS` (ADR 0014 §8). `None`
+    /// approves nothing.
+    pub extra_approvals: Option<String>,
     /// Development/sleep startup flags — rendered only when the profile is
     /// policy-gated in (F1 design §7).
     pub sleep_flags: Vec<String>,
@@ -54,6 +93,40 @@ pub struct PlanInputVllm {
     pub runtime_dir: Option<String>,
 }
 
+/// SPEC §13.3: the engine key is never formatted.
+impl std::fmt::Debug for PlanInputVllm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanInputVllm")
+            .field("engine_bin", &self.engine_bin)
+            .field("model_path", &self.model_path)
+            .field("port", &self.port)
+            .field("served_model_name", &self.served_model_name)
+            .field("tensor_parallel_size", &self.tensor_parallel_size)
+            .field("pipeline_parallel_size", &self.pipeline_parallel_size)
+            .field("dtype", &self.dtype)
+            .field("quantization", &self.quantization)
+            .field("kv_cache_dtype", &self.kv_cache_dtype)
+            .field("block_size_tokens", &self.block_size_tokens)
+            .field("context_length", &self.context_length)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("max_num_batched_tokens", &self.max_num_batched_tokens)
+            .field("enforce_eager", &self.enforce_eager)
+            .field("language_model_only", &self.language_model_only)
+            .field("trust_remote_code", &self.trust_remote_code)
+            .field("cpu_offload_bytes", &self.cpu_offload_bytes)
+            .field("granted", &self.granted)
+            .field("engine_args", &self.engine_args)
+            .field("extra_args", &self.extra_args)
+            .field("extra_approvals", &self.extra_approvals)
+            .field("sleep_flags", &self.sleep_flags)
+            .field("api_key", &crate::traits::redacted(self.api_key.is_some()))
+            .field("engine_path_extra", &self.engine_path_extra)
+            .field("engine_log", &self.engine_log)
+            .field("runtime_dir", &self.runtime_dir)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GrantedBudget {
     pub kv_cache_bytes: Option<i64>,
@@ -75,20 +148,59 @@ pub enum ArgsError {
     UnexpectedArgument(String),
     #[error("invalid granted budget: {0}")]
     InvalidBudget(String),
-    #[error("development mode (sleep flags) requires a runtime dir for mllm's guard middleware (Spec §3)")]
+    #[error("a vLLM launch requires the runtime dir holding mllm's protected entry and guard (Spec §3, ADR 0014 §6)")]
     MissingRuntimeDir,
+    #[error("the engine executable has no directory to find its interpreter in")]
+    NoInterpreter,
 }
 
 pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsError> {
-    // The shared profile policy owns normalization, allowlisting, reserved
-    // conflicts, value shape, and duplicate detection.
-    validate_profile_args(Engine::Vllm, &input.engine_args).map_err(|error| match error {
-        ProfileArgError::Reserved(flag) => ArgsError::ReservedConflict(flag),
-        ProfileArgError::Duplicate(flag) => ArgsError::DuplicateFlag(flag),
-        ProfileArgError::Unsupported(flag) => ArgsError::UnsupportedFlag(flag),
-        ProfileArgError::MissingValue(flag) => ArgsError::MissingValue(flag),
-        ProfileArgError::UnexpectedArgument(argument) => ArgsError::UnexpectedArgument(argument),
-    })?;
+    // ADR 0014 §3, §6: the shared policy owns normalization, reserved
+    // conflicts (exact, abbreviated or negated), value shape, and duplicate
+    // detection over the complete pass-through vector. The approved-flag list
+    // is gone; deploy-time checks already refused sensitive options the host
+    // did not approve.
+    let dev_mode_requested = input.sleep_flags.iter().any(|f| f == "--enable-sleep-mode");
+    let pass_through: Vec<String> = input
+        .engine_args
+        .iter()
+        .chain(&input.extra_args)
+        .cloned()
+        .collect();
+    validate_rendered_args(Engine::Vllm, &pass_through, dev_mode_requested).map_err(
+        |error| match error {
+            ProfileArgError::Reserved(flag) | ProfileArgError::ConfigFile(flag) => {
+                ArgsError::ReservedConflict(flag)
+            }
+            ProfileArgError::Duplicate(flag) => ArgsError::DuplicateFlag(flag),
+            ProfileArgError::MissingValue(flag) => ArgsError::MissingValue(flag),
+            ProfileArgError::UnexpectedArgument(index) => {
+                ArgsError::UnexpectedArgument(format!("position {index}"))
+            }
+            ProfileArgError::ShortOption(flag) => ArgsError::UnexpectedArgument(flag),
+            other => ArgsError::UnsupportedFlag(other.to_string()),
+        },
+    )?;
+    // ADR 0014 §2: one way to say each thing. A typed field the deployment set
+    // cannot also arrive in the pass-through vector; the marker is mllm's own.
+    let typed = typed_args(input);
+    let typed_names: Vec<String> = typed
+        .iter()
+        .filter(|token| token.starts_with("--"))
+        .map(|token| normalize_option_name(token))
+        .collect();
+    for name in pass_through
+        .iter()
+        .filter(|argument| argument.starts_with("--"))
+        .map(|argument| normalize_option_name(argument))
+    {
+        if name.starts_with("--mllm-") {
+            return Err(ArgsError::ReservedConflict(name));
+        }
+        if typed_names.contains(&name) {
+            return Err(ArgsError::DuplicateFlag(name));
+        }
+    }
     // Validate granted budgets are finite and in range.
     if let Some(pct) = input.granted.gpu_utilization_pct {
         if pct == 0 || pct > 100 {
@@ -115,16 +227,22 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             input.cpu_offload_bytes
         )));
     }
-    // Spec §3: development mode always ships with mllm's own guard
-    // middleware, which needs a runtime dir to load from; without one the
-    // dev routes would otherwise be reachable unguarded.
+    // Spec §3 / ADR 0014 §6: every launch runs through mllm's protected entry,
+    // and development mode also loads mllm's guard middleware from the same
+    // runtime directory; without one neither can be loaded.
     let dev_mode = input.sleep_flags.iter().any(|f| f == "--enable-sleep-mode");
-    if dev_mode && input.runtime_dir.is_none() {
-        return Err(ArgsError::MissingRuntimeDir);
-    }
+    let runtime_dir = input
+        .runtime_dir
+        .clone()
+        .ok_or(ArgsError::MissingRuntimeDir)?;
 
+    // Owner decision Q11: the installation's own interpreter runs the entry,
+    // which runs the server in process with vLLM's own parser.
     let mut argv: Vec<String> = vec![
-        input.engine_bin.clone(),
+        interpreter_for(&input.engine_bin)?,
+        // SPEC §9.1 / T21: no bytecode is written beside the checked source.
+        "-B".into(),
+        format!("{}/{VLLM_ENTRY}", runtime_dir.trim_end_matches('/')),
         "serve".into(),
         input.model_path.clone(),
     ];
@@ -135,7 +253,11 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     // Spec §3: mllm owns the listener address and the served name; a
     // profile's engine_args cannot set them (they are reserved flags).
     push(&mut argv, "--host", "127.0.0.1".into());
-    push(&mut argv, "--served-model-name", input.served_model_name.clone());
+    push(
+        &mut argv,
+        "--served-model-name",
+        input.served_model_name.clone(),
+    );
     // The five validated launch settings, rendered unconditionally except
     // the CPU-offload budget, which is omitted rather than sent as zero.
     push(
@@ -148,8 +270,6 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         "--pipeline-parallel-size",
         input.pipeline_parallel_size.to_string(),
     );
-    push(&mut argv, "--kv-cache-dtype", input.kv_cache_dtype.clone());
-    push(&mut argv, "--block-size", input.block_size_tokens.to_string());
     if input.cpu_offload_bytes > 0 {
         push(
             &mut argv,
@@ -166,17 +286,15 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         );
     }
     if let Some(kv) = input.granted.kv_cache_bytes {
-        // vLLM 0.29 renders explicit KV bytes via `--kv-cache-memory` (the
-        // gpu-memory-utilization heuristic misbehaves on unified-memory
-        // hosts — live capture, Spark 2026-09-12). The granted budget maps
-        // to bytes with the unit explicit (SPEC §7.5).
-        push(&mut argv, "--kv-cache-memory", kv.to_string());
+        // vLLM 0.29 renders explicit KV bytes via `--kv-cache-memory-bytes`
+        // (the gpu-memory-utilization heuristic misbehaves on unified-memory
+        // hosts — live capture, Spark 2026-09-12). The full spelling, verified
+        // in the installed arg_utils.py, replaces the abbreviation S1 used;
+        // both resolve to `kv_cache_memory_bytes`. Unit explicit (SPEC §7.5).
+        push(&mut argv, "--kv-cache-memory-bytes", kv.to_string());
     }
-    if let Some(swap) = input.granted.swap_space_bytes {
-        // vLLM's --swap-space is expressed in GiB; convert from bytes with
-        // the unit named explicitly (SPEC §7.5).
-        push(&mut argv, "--swap-space", format!("{}", swap_gib(swap)));
-    }
+    // SPEC §7.5 / T14: vLLM 0.29 has no `--swap-space` (its parser refuses it),
+    // so a swap budget is validated above and never rendered.
     // Development/sleep flags render only when the profile is gated in
     // (empty list otherwise): the gate is the profile, not the flag.
     for f in &input.sleep_flags {
@@ -192,32 +310,102 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     .into_iter()
     .collect();
     if dev_mode {
-        // Presence already checked above (MissingRuntimeDir otherwise).
-        let runtime_dir = input.runtime_dir.clone().expect("checked above");
-        push(&mut argv, "--middleware", "mllm_vllm_guard.RequireEngineKey".into());
-        let existing = std::env::var("PYTHONPATH").ok().filter(|p| !p.is_empty());
-        let python_path = match existing {
-            Some(existing) => format!("{runtime_dir}:{existing}"),
-            None => runtime_dir,
-        };
-        env.insert("PYTHONPATH".into(), python_path);
+        push(
+            &mut argv,
+            "--middleware",
+            "mllm_vllm_guard.RequireEngineKey".into(),
+        );
+        // SPEC §9.1 / T21: the verified runtime directory alone; nothing of
+        // the agent's own PYTHONPATH reaches the engine's import path.
+        env.insert("PYTHONPATH".into(), runtime_dir);
     }
+    // ADR 0014 §6: everything after the marker is parsed by vLLM, and the entry
+    // refuses it if any reserved field above resolves differently.
+    argv.push(USER_ARGS_MARKER.into());
+    argv.extend(typed);
     // The engine key is never rendered on argv (Spec §3): it is delivered
     // through the environment by the builder (see `PlanInputVllm::api_key`
     // doc comment), never as a `--api-key` command-line value.
-    // Reviewed engine-native arguments render last.
+    // Host-fixed arguments, then the deployment's accepted extras after their
+    // own marker (ADR 0014 §8: the entry gates what those resolve to).
     argv.extend(input.engine_args.iter().cloned());
+    if !input.extra_args.is_empty() {
+        argv.push(EXTRA_ARGS_MARKER.into());
+        argv.extend(input.extra_args.iter().cloned());
+    }
+    if let Some(approvals) = &input.extra_approvals {
+        env.insert(
+            mllm_config::engine_policy::EXTRA_APPROVALS_ENV.into(),
+            approvals.clone(),
+        );
+    }
     // vLLM gates its HTTP sleep/wake/reload routes separately from the
     // allocator flag. Explicitly disable them for stock profiles too, so
     // an inherited development environment cannot bypass the host opt-in.
     Ok(RenderedCommand { argv, env })
 }
 
-/// Bytes → whole GiB (vLLM swap-space unit).
-fn swap_gib(b: i64) -> i64 {
-    b / (1024 * 1024 * 1024)
+/// ADR 0014 §2: typed deployment fields in vLLM 0.29.0 spellings (verified in
+/// the installed `vllm/engine/arg_utils.py`). Omitted fields render nothing.
+fn typed_args(input: &PlanInputVllm) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut value = |flag: &str, value: Option<String>| {
+        if let Some(value) = value {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+    };
+    value("--dtype", input.dtype.clone());
+    value("--quantization", input.quantization.clone());
+    value("--kv-cache-dtype", input.kv_cache_dtype.clone());
+    value(
+        "--block-size",
+        input.block_size_tokens.map(|v| v.to_string()),
+    );
+    value(
+        "--max-model-len",
+        input.context_length.map(|v| v.to_string()),
+    );
+    value(
+        "--max-num-seqs",
+        input.max_concurrent_requests.map(|v| v.to_string()),
+    );
+    value(
+        "--max-num-batched-tokens",
+        input.max_num_batched_tokens.map(|v| v.to_string()),
+    );
+    for (flag, on) in [
+        ("--enforce-eager", input.enforce_eager),
+        ("--language-model-only", input.language_model_only),
+        ("--trust-remote-code", input.trust_remote_code),
+    ] {
+        if on {
+            args.push(flag.into());
+        }
+    }
+    args
 }
 
+/// The installation's interpreter: the executable itself when it is a Python
+/// interpreter, otherwise the `python3` beside it (a virtual environment's
+/// `bin`, where the `vllm` console script lives). The path is not resolved, so
+/// a venv interpreter keeps its environment.
+pub fn interpreter_for(engine_bin: &str) -> Result<String, ArgsError> {
+    let path = std::path::Path::new(engine_bin);
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("python"))
+    {
+        return Ok(engine_bin.to_owned());
+    }
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join("python3").to_string_lossy().into_owned())
+        .ok_or(ArgsError::NoInterpreter)
+}
+
+/// Bytes → whole GiB (vLLM swap-space unit).
 /// The shortest run of credential-shaped characters that is redacted on sight.
 /// mllm issues 32-byte keys, hex-encoded to 64 characters, so 48 covers every key
 /// it issues with room to spare while leaving a 40-character git commit id — which

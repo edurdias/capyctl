@@ -4,7 +4,8 @@
 
 use mllm_adapters::traits::RenderedCommand;
 use mllm_adapters::vllm::args::{
-    fingerprint_of, render_command, ArgsError, GrantedBudget, PlanInputVllm, RESERVED_FLAGS,
+    fingerprint_of, interpreter_for, render_command, ArgsError, GrantedBudget, PlanInputVllm,
+    EXTRA_ARGS_MARKER, RESERVED_FLAGS, USER_ARGS_MARKER,
 };
 
 fn base_input() -> PlanInputVllm {
@@ -15,8 +16,6 @@ fn base_input() -> PlanInputVllm {
         served_model_name: "gate-m".into(),
         tensor_parallel_size: 1,
         pipeline_parallel_size: 1,
-        kv_cache_dtype: "auto".into(),
-        block_size_tokens: 16,
         cpu_offload_bytes: 0,
         granted: GrantedBudget {
             kv_cache_bytes: Some(16 * 1024 * 1024 * 1024),
@@ -28,7 +27,8 @@ fn base_input() -> PlanInputVllm {
         engine_path_extra: None,
         engine_log: None,
         api_key: None,
-        runtime_dir: None,
+        runtime_dir: Some("/opt/mllm/runtime".into()),
+        ..PlanInputVllm::default()
     }
 }
 
@@ -59,11 +59,19 @@ fn budgets_render_with_explicit_units() {
         .position(|a| a == "--gpu-memory-utilization")
         .unwrap();
     assert_eq!(argv[util + 1], "0.75");
-    let kv = argv.iter().position(|a| a == "--kv-cache-memory").unwrap();
+    let kv = argv
+        .iter()
+        .position(|a| a == "--kv-cache-memory-bytes")
+        .unwrap();
     assert_eq!(argv[kv + 1], (16u64 * 1024 * 1024 * 1024).to_string());
-    // User pass-through args come after the mllm-controlled block:
+    // User pass-through args come after the mllm-controlled block and the
+    // marker the protected entry splits on (ADR 0014 §6):
+    let marker = argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
     let max_len = argv.iter().position(|a| a == "--max-model-len").unwrap();
-    assert!(max_len > kv, "user args after controlled args");
+    assert!(
+        marker > kv && max_len > marker,
+        "user args after controlled args"
+    );
 }
 
 #[test]
@@ -84,6 +92,7 @@ fn reserved_flags_are_normalized_and_equals_form_conflicts() {
         "--served_model_name=other",
         "--tensor_parallel_size=2",
         "--disable-log-requests",
+        "--mllm-user-args",
         "--api_key=secret",
     ] {
         let mut input = base_input();
@@ -109,33 +118,54 @@ fn aliases_normalize_before_duplicate_detection() {
     ));
 }
 
+/// ADR 0014 §6: mllm does not know an option's arity, so a reserved option in
+/// the value position of an ordinary one is still read as an option and refused.
+// T14
 #[test]
 fn reserved_flag_cannot_hide_in_a_missing_ordinary_value() {
     let mut input = base_input();
     input.engine_args = vec!["--max-model-len".into(), "--port=9999".into()];
     assert!(matches!(
         render_command(&input),
-        Err(ArgsError::MissingValue(f)) if f == "--max-model-len"
+        Err(ArgsError::ReservedConflict(f)) if f == "--port"
     ));
 }
 
+/// ADR 0014 §6 (owner decision Q10): ordinary engine options pass through and
+/// render after mllm's block; reserved ones never do, however abbreviated.
+// T14 T21
 #[test]
-fn unreviewed_flags_are_not_arbitrary_passthrough() {
+fn ordinary_flags_pass_through_and_reserved_abbreviations_do_not() {
     let mut input = base_input();
-    input.engine_args = vec!["--future-unsafe-flag".into()];
-    assert!(matches!(
-        render_command(&input),
-        Err(ArgsError::UnsupportedFlag(f)) if f == "--future-unsafe-flag"
-    ));
+    input.engine_args = vec!["--future-ordinary-flag".into(), "1".into()];
+    let argv = render_command(&input).unwrap().argv;
+    assert_eq!(&argv[argv.len() - 2..], ["--future-ordinary-flag", "1"]);
+    for reserved in [
+        "--gpu-memory-util=0.9",
+        "--no-enable-sleep-mode",
+        "--config=x",
+    ] {
+        input.engine_args = vec![reserved.into()];
+        assert!(
+            matches!(render_command(&input), Err(ArgsError::ReservedConflict(_))),
+            "{reserved}"
+        );
+    }
 }
 
 #[test]
 fn standalone_positionals_and_empty_values_are_rejected() {
     let mut input = base_input();
     input.engine_args = vec!["unreviewed-positional".into()];
-    assert!(matches!(render_command(&input), Err(ArgsError::UnexpectedArgument(_))));
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::UnexpectedArgument(_))
+    ));
     input.engine_args = vec!["--max-model-len=".into()];
-    assert!(matches!(render_command(&input), Err(ArgsError::MissingValue(_))));
+    assert!(matches!(
+        render_command(&input),
+        Err(ArgsError::MissingValue(_))
+    ));
 }
 
 #[test]
@@ -243,18 +273,14 @@ fn render_emits_host_and_served_name() {
 /// Spec §3: every validated launch setting reaches the engine.
 // T14
 #[test]
-fn render_emits_the_five_launch_settings() {
+fn render_emits_the_reserved_launch_settings() {
     let mut p = plan();
     p.tensor_parallel_size = 2;
     p.pipeline_parallel_size = 1;
-    p.kv_cache_dtype = "fp8".into();
-    p.block_size_tokens = 32;
     p.cpu_offload_bytes = 4 * 1024 * 1024 * 1024;
     let cmd = render_command(&p).unwrap();
     assert_flag(&cmd, "--tensor-parallel-size", "2");
     assert_flag(&cmd, "--pipeline-parallel-size", "1");
-    assert_flag(&cmd, "--kv-cache-dtype", "fp8");
-    assert_flag(&cmd, "--block-size", "32");
     assert_flag(&cmd, "--cpu-offload-gb", "4");
 
     let mut none = plan();
@@ -263,6 +289,124 @@ fn render_emits_the_five_launch_settings() {
         .unwrap()
         .argv
         .contains(&"--cpu-offload-gb".to_string()));
+}
+
+/// ADR 0014 §2: every typed field renders in vLLM 0.29.0's spelling, after
+/// the marker; omitted fields render nothing so the engine default applies.
+// T14 T22
+#[test]
+fn typed_fields_render_after_the_marker_and_omitted_ones_do_not() {
+    let mut p = plan();
+    p.engine_args.clear();
+    let bare = render_command(&p).unwrap().argv;
+    for flag in [
+        "--dtype",
+        "--quantization",
+        "--kv-cache-dtype",
+        "--block-size",
+        "--max-model-len",
+        "--max-num-seqs",
+        "--max-num-batched-tokens",
+        "--enforce-eager",
+        "--language-model-only",
+        "--trust-remote-code",
+    ] {
+        assert!(!bare.contains(&flag.to_string()), "{flag} rendered unasked");
+    }
+    assert_eq!(bare.last().map(String::as_str), Some(USER_ARGS_MARKER));
+    p.dtype = Some("bfloat16".into());
+    p.quantization = Some("modelopt_fp4".into());
+    p.kv_cache_dtype = Some("fp8".into());
+    p.block_size_tokens = Some(32);
+    p.context_length = Some(32768);
+    p.max_concurrent_requests = Some(16);
+    p.max_num_batched_tokens = Some(8192);
+    p.enforce_eager = true;
+    p.language_model_only = true;
+    p.trust_remote_code = true;
+    let cmd = render_command(&p).unwrap();
+    let marker = cmd.argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
+    for (flag, value) in [
+        ("--dtype", "bfloat16"),
+        ("--quantization", "modelopt_fp4"),
+        ("--kv-cache-dtype", "fp8"),
+        ("--block-size", "32"),
+        ("--max-model-len", "32768"),
+        ("--max-num-seqs", "16"),
+        ("--max-num-batched-tokens", "8192"),
+    ] {
+        assert_flag(&cmd, flag, value);
+        let at = cmd.argv.iter().position(|a| a == flag).unwrap();
+        assert!(at > marker, "{flag} after the marker");
+    }
+    for flag in [
+        "--enforce-eager",
+        "--language-model-only",
+        "--trust-remote-code",
+    ] {
+        assert!(cmd.argv.contains(&flag.to_string()), "{flag}");
+    }
+}
+
+/// ADR 0014 §2: a typed field the deployment set cannot be said again by a
+/// host-fixed or extra argument; unset, the same option is ordinary.
+// T14
+#[test]
+fn typed_fields_are_not_duplicated_by_pass_through_arguments() {
+    let mut p = plan();
+    p.context_length = Some(4096);
+    assert!(matches!(
+        render_command(&p),
+        Err(ArgsError::DuplicateFlag(f)) if f == "--max-model-len"
+    ));
+    let mut p = plan();
+    p.enforce_eager = true;
+    p.engine_args = vec!["--enforce_eager".into()];
+    assert!(matches!(
+        render_command(&p),
+        Err(ArgsError::DuplicateFlag(_))
+    ));
+    let mut p = plan();
+    p.engine_args = vec!["--kv-cache-dtype".into(), "fp8".into()];
+    assert!(render_command(&p).is_ok());
+}
+
+/// Owner decision Q11: the installation's interpreter runs mllm's protected
+/// entry, which parses with vLLM's own parser and serves in process.
+// T14 T21
+#[test]
+fn every_launch_execs_through_the_protected_entry() {
+    let cmd = render_command(&plan()).unwrap();
+    assert_eq!(
+        &cmd.argv[..5],
+        [
+            "/opt/vllm/bin/python3",
+            // SPEC §9.1 / T21: no bytecode is written beside checked source.
+            "-B",
+            "/opt/mllm/runtime/vllm_entry.py",
+            "serve",
+            "/srv/models/toy-model"
+        ]
+    );
+    assert_eq!(
+        cmd.argv.iter().filter(|a| *a == USER_ARGS_MARKER).count(),
+        1
+    );
+    assert_eq!(
+        interpreter_for("/venv/bin/python3.12").unwrap(),
+        "/venv/bin/python3.12"
+    );
+    assert_eq!(
+        interpreter_for("/venv/bin/vllm").unwrap(),
+        "/venv/bin/python3"
+    );
+    assert!(interpreter_for("vllm").is_err());
+    let mut p = plan();
+    p.runtime_dir = None;
+    assert!(matches!(
+        render_command(&p),
+        Err(ArgsError::MissingRuntimeDir)
+    ));
 }
 
 /// Spec §3: a positive CPU-offload budget below 1 GiB would silently round
@@ -292,11 +436,11 @@ fn dev_mode_renders_the_guard_middleware() {
         cmd.env.get("VLLM_SERVER_DEV_MODE").map(String::as_str),
         Some("1")
     );
-    assert!(cmd
-        .env
-        .get("PYTHONPATH")
-        .unwrap()
-        .starts_with("/opt/mllm/runtime"));
+    // SPEC §9.1 / T21: the runtime directory alone, never an inherited path.
+    assert_eq!(
+        cmd.env.get("PYTHONPATH").map(String::as_str),
+        Some("/opt/mllm/runtime")
+    );
 
     let mut off = plan();
     off.sleep_flags.clear();
@@ -399,4 +543,42 @@ fn redaction_leaves_ordinary_engine_output_alone() {
     let redacted = redact_text(&in_path);
     assert_eq!(redacted, "GET /v1/models/<redacted>/info refused");
     assert_eq!(redact_text("/a/b/"), "/a/b/");
+}
+
+/// ADR 0014 §8, SPEC §8.2: the deployment's own extras follow a second marker,
+/// after the typed and host-fixed arguments, and the host's approvals ride the
+/// environment, so the entry gates exactly what the extras resolved to.
+// T21 T22
+#[test]
+fn extras_follow_their_own_marker_with_the_host_approvals() {
+    let mut p = plan();
+    p.extra_args = vec!["--reasoning-parser".into(), "qwen3".into()];
+    p.extra_approvals = Some(r#"{"options":[],"paths":[],"trust_remote_code":false}"#.into());
+    let cmd = render_command(&p).unwrap();
+    let user = cmd.argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
+    let extra = cmd.argv.iter().position(|a| a == EXTRA_ARGS_MARKER).unwrap();
+    let fixed = cmd.argv.iter().position(|a| a == "--max-model-len").unwrap();
+    assert!(user < fixed && fixed < extra);
+    assert_eq!(&cmd.argv[extra + 1..], ["--reasoning-parser", "qwen3"]);
+    assert_eq!(
+        cmd.env.get("MLLM_EXTRA_APPROVALS").map(String::as_str),
+        p.extra_approvals.as_deref()
+    );
+    // An extra restating a host-fixed or typed option is a duplicate.
+    let mut dup = plan();
+    dup.extra_args = vec!["--max-model-len".into(), "1".into()];
+    assert!(render_command(&dup).is_err());
+    // Without extras there is no second marker.
+    assert!(!render_command(&plan()).unwrap().argv.contains(&EXTRA_ARGS_MARKER.to_string()));
+}
+
+/// SPEC §7.5 / T14: vLLM 0.29 has no `--swap-space`; a swap budget is never
+/// rendered, so the parser never sees an option it would refuse.
+// T14
+#[test]
+fn swap_space_is_never_rendered() {
+    let mut p = plan();
+    p.granted.swap_space_bytes = Some(4 << 30);
+    let cmd = render_command(&p).unwrap();
+    assert!(!cmd.argv.iter().any(|a| a == "--swap-space"));
 }

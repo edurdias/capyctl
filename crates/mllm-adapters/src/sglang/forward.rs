@@ -18,6 +18,13 @@ impl ChatForward for SglangAdapter {
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward.collect(body).await
     }
+    async fn forward_chat_observed(
+        &self,
+        body: &serde_json::Value,
+        observer: &mut dyn crate::traits::ChatSink,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.forward.collect_observed(body, observer, None).await
+    }
     async fn forward_chat_stream(
         &self,
         body: &serde_json::Value,

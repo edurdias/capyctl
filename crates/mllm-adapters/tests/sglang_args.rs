@@ -1,16 +1,14 @@
-use mllm_adapters::RuntimeError;
 use mllm_adapters::sglang::{ProtectedDescriptorFds, SglangLaunch};
-use mllm_domain::launch::{
-    NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
-};
-use serde_json::{Value, json};
+use mllm_adapters::RuntimeError;
+use mllm_domain::launch::{NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings};
+use serde_json::{json, Value};
 
 const CHECKPOINT: &str = "/private/checkpoints/qwen";
 const INFERENCE_REF: &str = "private://inference-reference";
 const ADMIN_REF: &str = "private://admin-reference";
-const SOURCE: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
-const REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
-const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+/// The deployment's checkpoint fingerprint; no longer a pinned revision.
+const REVISION: &str = "sha256:any-model";
+const RECIPE: &str = "sglang_engine_config_v2";
 
 fn wrapper() -> &'static std::path::Path {
     static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -26,7 +24,6 @@ fn metadata(index: u16) -> NativeLaunchMetadata {
     NativeLaunchMetadata {
         engine: "sglang".into(),
         recipe: RECIPE.into(),
-        source_revision: SOURCE.into(),
         checkpoint_revision: REVISION.into(),
         served_name: format!("route-{index}"),
         binding_id: binding,
@@ -44,33 +41,9 @@ fn metadata(index: u16) -> NativeLaunchMetadata {
     }
 }
 
+/// ADR 0014: a deep-parking deployment stating only its KV cache.
 fn settings() -> SglangLaunchSettings {
-    SglangLaunchSettings {
-        recipe: RECIPE.into(),
-        tensor_parallel_size: 1,
-        data_parallel_size: 1,
-        tokenizer_workers: 1,
-        model_dtype: "bfloat16".into(),
-        context_tokens: 4096,
-        max_running_requests: 8,
-        max_total_tokens: 4096,
-        prefill_cuda_graphs: false,
-        decode_cuda_graphs: false,
-        memory_saver: true,
-        cpu_weight_backup: false,
-        speculative_decoding: false,
-        lora: false,
-        trust_remote_code: false,
-        disaggregation: false,
-        external_cache: false,
-        cpu_kv_offload: false,
-        native_grpc: false,
-        weight_restore: "disk_reload".into(),
-        requested_budget: SglangRequestedBudget {
-            kv_cache_bytes: 4_294_967_296,
-            static_memory_fraction_bps: 7500,
-        },
-    }
+    mllm_testkit::sglang_launch_settings()
 }
 
 fn frozen(meta: NativeLaunchMetadata, config: SglangLaunchSettings) -> NativeLaunch {
@@ -95,7 +68,8 @@ fn public_args(launch: &SglangLaunch) -> Value {
         &command.argv[..4],
         [
             "/opt/sglang/bin/python3",
-            "-IS",
+            // SPEC §9.1 / T21: -B, no bytecode is written beside checked source.
+            "-BIS",
             wrapper().to_str().unwrap(),
             "--public-settings-json"
         ]
@@ -132,7 +106,7 @@ fn wrapper_command_cannot_resolve_through_daemon_working_directory() {
 
 #[test]
 fn wrapper_rejects_relative_symlink_nonregular_and_untrusted_writes() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{symlink, PermissionsExt};
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Directory(std::path::PathBuf);
     impl Drop for Directory {
@@ -168,15 +142,36 @@ fn wrapper_rejects_relative_symlink_nonregular_and_untrusted_writes() {
     ] {
         assert!(matches!(render(path), Err(RuntimeError::Unsupported)));
     }
-    for mode in [0o620, 0o602, 0o666] {
+    for mode in [0o602, 0o666] {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
         assert!(matches!(render(&file), Err(RuntimeError::Unsupported)));
     }
+    // T21 T37, owner decision 2026-09-23: the entry is mllm's own helper, so
+    // group write is trusted only through the owner's private group.
+    let private = |_: u32, _: u32| Some(true);
+    let shared = |_: u32, _: u32| Some(false);
+    let undetermined = |_: u32, _: u32| None;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o620)).unwrap();
+    SglangLaunch::validate_wrapper_path_with(&file, &private).unwrap();
+    for lookup in [&shared as &mllm_adapters::owner_only::PrivateGroup, &undetermined] {
+        assert!(matches!(
+            SglangLaunch::validate_wrapper_path_with(&file, lookup),
+            Err(RuntimeError::Unsupported)
+        ));
+    }
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    for mode in [0o720, 0o702, 0o777] {
+    for mode in [0o702, 0o777] {
         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(mode)).unwrap();
         assert!(matches!(render(&file), Err(RuntimeError::Unsupported)));
     }
+    // An ancestor directory writable by the owner's private group is the
+    // owner's; the same directory under a shared group is refused.
+    std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o770)).unwrap();
+    SglangLaunch::validate_wrapper_path_with(&file, &private).unwrap();
+    assert!(matches!(
+        SglangLaunch::validate_wrapper_path_with(&file, &shared),
+        Err(RuntimeError::Unsupported)
+    ));
     std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(render(&file).is_ok());
 }
@@ -191,10 +186,19 @@ fn two_frozen_bindings_keep_distinct_endpoints_and_served_names() {
     assert_eq!(b["endpoint"], "http://127.0.0.1:20002");
     assert_eq!(a["served_name"], "route-1");
     assert_eq!(b["served_name"], "route-2");
-    assert_eq!(a["schema_version"], 1);
+    assert_eq!(a["schema_version"], 2);
     assert_eq!(a["kind"], "sglang_launch");
-    assert_eq!(a["source_revision"], SOURCE);
-    assert_eq!(a["checkpoint_revision"], REVISION);
+    // ADR 0014 §9: the retired recipe, checkpoint pin and Qwen3-4B KV bound
+    // never reach the entry; ADR 0008: nor does a source revision token.
+    for retired in [
+        "source_revision",
+        "recipe",
+        "checkpoint_revision",
+        "minimum_kv_bytes",
+        "static_memory_fraction",
+    ] {
+        assert!(a.get(retired).is_none(), "{retired}");
+    }
     assert_eq!(
         a["device"],
         json!({"host_id":"host-a", "hardware_fingerprint":"hardware-v1", "device_id":"gpu0", "memory_domain":"uma"})
@@ -202,20 +206,17 @@ fn two_frozen_bindings_keep_distinct_endpoints_and_served_names() {
     assert_eq!(
         a["settings"],
         json!({
-            "recipe": RECIPE,
-            "tensor_parallel_size": 1, "data_parallel_size": 1, "tokenizer_workers": 1,
-            "model_dtype": "bfloat16", "context_tokens": 4096,
-            "max_running_requests": 8, "max_total_tokens": 4096,
-            "prefill_cuda_graphs": false, "decode_cuda_graphs": false,
-            "memory_saver": true, "cpu_weight_backup": false,
-            "speculative_decoding": false, "lora": false, "trust_remote_code": false,
-            "disaggregation": false, "external_cache": false, "cpu_kv_offload": false,
-            "native_grpc": false, "weight_restore": "disk_reload",
-            "requested_budget": {"kv_cache_bytes": 4294967296_i64, "static_memory_fraction_bps": 7500}
+            "dtype": null, "quantization": null, "kv_cache_dtype": null,
+            "context_length": null, "max_running_requests": null, "cuda_graphs": false,
+            "language_model_only": false, "trust_remote_code": false,
+            "max_total_tokens": null, "chunked_prefill_size": null,
+            "tokenizer_workers": 1, "memory_saver": true, "cpu_weight_backup": false,
+            "weight_restore": "disk_reload",
+            "memory": {"request_bytes": 17179869184_i64, "kv_cache_bytes": 4294967296_i64,
+                       "margin_bytes": 8589934592_i64, "static_bytes": 8589934592_i64},
+            "extra_args": []
         })
     );
-    assert_eq!(a["minimum_kv_bytes"], 603_979_776);
-    assert_eq!(a["static_memory_fraction"], "0.7500");
 }
 
 #[test]
@@ -236,37 +237,71 @@ fn frozen_device_selection_is_required_and_never_inferred_from_gpu_zero() {
     assert_eq!(public_args(&launch)["device"]["device_id"], "gpu7");
 }
 
+/// E1 / ADR 0014 §2: any model's typed settings render as the engine spells
+/// them; nothing is refused for not matching a pinned checkpoint recipe.
+// T14 T22
 #[test]
-fn unsafe_settings_and_unsupported_topology_fail_before_rendering() {
+fn typed_settings_and_extra_arguments_render_for_any_model() {
+    let mut config = settings();
+    config.common.dtype = Some("bfloat16".into());
+    config.common.quantization = Some("modelopt_fp4".into());
+    config.common.kv_cache_dtype = Some("fp8_e4m3".into());
+    config.common.context_length = Some(32768);
+    config.common.max_concurrent_requests = Some(16);
+    config.common.cuda_graphs = Some(true);
+    config.common.language_model_only = true;
+    config.common.trust_remote_code = true;
+    config.max_total_tokens = Some(65536);
+    config.chunked_prefill_size = Some(-1);
+    config.tokenizer_workers = 2;
+    config.cpu_weight_backup = true;
+    config.weight_restore = "cpu_backup".into();
+    config.extra_args = vec!["--reasoning-parser".into(), "qwen3".into()];
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+    let settings = &public_args(&launch)["settings"];
+    assert_eq!(settings["dtype"], "bfloat16");
+    assert_eq!(settings["quantization"], "modelopt_fp4");
+    assert_eq!(settings["kv_cache_dtype"], "fp8_e4m3");
+    assert_eq!(settings["context_length"], 32768);
+    assert_eq!(settings["max_running_requests"], 16);
+    assert_eq!(settings["cuda_graphs"], true);
+    assert_eq!(settings["language_model_only"], true);
+    assert_eq!(settings["max_total_tokens"], 65536);
+    assert_eq!(settings["chunked_prefill_size"], -1);
+    assert_eq!(settings["weight_restore"], "cpu_backup");
+    assert_eq!(
+        settings["extra_args"],
+        json!(["--reasoning-parser", "qwen3"])
+    );
+}
+
+/// Shapes the entry would refuse are refused before rendering; reserved
+/// extra arguments are refused again here (ADR 0014 §3, §6).
+// T14 T21
+#[test]
+fn malformed_settings_and_reserved_extra_arguments_fail_before_rendering() {
     let changes: &[fn(&mut SglangLaunchSettings)] = &[
-        |s| s.memory_saver = false,
-        |s| s.cpu_weight_backup = true,
-        |s| s.prefill_cuda_graphs = true,
-        |s| s.decode_cuda_graphs = true,
-        |s| s.speculative_decoding = true,
-        |s| s.lora = true,
-        |s| s.trust_remote_code = true,
-        |s| s.disaggregation = true,
-        |s| s.external_cache = true,
-        |s| s.cpu_kv_offload = true,
-        |s| s.native_grpc = true,
-        |s| s.tensor_parallel_size = 2,
-        |s| s.data_parallel_size = 2,
-        |s| s.tokenizer_workers = 2,
-        |s| s.model_dtype = "float16".into(),
-        |s| s.recipe = "other".into(),
+        |s| s.common.dtype = Some("int8".into()),
+        |s| s.common.quantization = Some("fp 8".into()),
+        |s| s.common.kv_cache_dtype = Some(String::new()),
+        |s| s.common.context_length = Some(0),
+        |s| s.common.context_length = Some(u32::MAX),
+        |s| s.common.max_concurrent_requests = Some(0),
+        |s| s.max_total_tokens = Some(0),
+        |s| s.chunked_prefill_size = Some(0),
+        |s| s.chunked_prefill_size = Some(-2),
+        |s| s.tokenizer_workers = 0,
         |s| s.weight_restore = "cpu_backup".into(),
-        |s| s.context_tokens = u32::MAX,
-        |s| s.max_running_requests = u32::MAX,
-        |s| s.max_total_tokens = u32::MAX,
-        |s| s.context_tokens = 0,
-        |s| s.max_running_requests = 0,
-        |s| s.max_total_tokens = 0,
-        |s| s.requested_budget.kv_cache_bytes = -1,
-        |s| s.requested_budget.kv_cache_bytes = 603_979_775,
-        |s| s.requested_budget.static_memory_fraction_bps = 0,
-        |s| s.requested_budget.static_memory_fraction_bps = 10_001,
-        |s| s.requested_budget.static_memory_fraction_bps = u16::MAX,
+        |s| s.memory.kv_cache_bytes = 0,
+        // ADR 0014 §5: a KV cache larger than the whole request is refused.
+        |s| s.memory.request_bytes = 2 << 30,
+        |s| s.memory.margin_bytes = -1,
+        |s| s.extra_args = vec!["--port".into(), "1".into()],
+        |s| s.extra_args = vec!["--mem-fraction".into(), "0.9".into()],
+        |s| s.extra_args = vec!["--enable-metrics".into()],
+        |s| s.extra_args = vec!["--config".into(), "/tmp/c.yaml".into()],
+        |s| s.extra_args = vec!["--x".into(); 257],
+        |s| s.extra_args = vec!["--x\n".into()],
     ];
     for change in changes {
         let mut config = settings();
@@ -278,26 +313,33 @@ fn unsafe_settings_and_unsupported_topology_fail_before_rendering() {
     }
 }
 
+/// ADR 0014 §3: the static memory share is exact integer bytes; the entry
+/// turns it into `mem_fraction_static` against the launch-time baseline.
+// T14
 #[test]
-fn exact_budget_bounds_do_not_round_or_narrow_public_values() {
-    for (bps, expected) in [(1, "0.0001"), (7501, "0.7501"), (10000, "1.0000")] {
-        let mut config = settings();
-        config.requested_budget.static_memory_fraction_bps = bps;
-        config.requested_budget.kv_cache_bytes = 603_979_776;
-        let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
-        let args = public_args(&launch);
-        assert_eq!(args["static_memory_fraction"], expected);
-        assert_eq!(
-            args["settings"]["requested_budget"]["kv_cache_bytes"],
-            603_979_776
-        );
-    }
+fn memory_request_renders_exact_bytes() {
     let mut config = settings();
-    config.requested_budget.kv_cache_bytes = i64::MAX;
+    config.memory.request_bytes = i64::MAX;
+    config.memory.kv_cache_bytes = i64::MAX;
+    // KV equals the request: the static pool is the whole request.
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+    let memory = &public_args(&launch)["settings"]["memory"];
+    assert_eq!(memory["request_bytes"].as_i64(), Some(i64::MAX));
+    assert_eq!(memory["static_bytes"].as_i64(), Some(i64::MAX));
+    // Request minus margin, when it covers the declared KV cache.
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), settings())).unwrap();
+    assert_eq!(
+        public_args(&launch)["settings"]["memory"]["static_bytes"].as_i64(),
+        Some(8 << 30)
+    );
+    // An explicit request below KV plus margin cannot honour the placeholder
+    // margin: the static pool is the declared KV cache, within the request.
+    let mut config = settings();
+    config.memory.request_bytes = 8 << 30;
     let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
     assert_eq!(
-        public_args(&launch)["settings"]["requested_budget"]["kv_cache_bytes"].as_i64(),
-        Some(i64::MAX)
+        public_args(&launch)["settings"]["memory"]["static_bytes"].as_i64(),
+        Some(4 << 30)
     );
 }
 
@@ -306,8 +348,8 @@ fn ordinary_missing_and_malformed_candidate_metadata_is_rejected() {
     let changes: &[fn(&mut NativeLaunchMetadata)] = &[
         |m| m.engine = "vllm".into(),
         |m| m.recipe = "other".into(),
-        |m| m.source_revision = "unverified".into(),
-        |m| m.checkpoint_revision = "main".into(),
+        |m| m.checkpoint_revision.clear(),
+        |m| m.checkpoint_revision = "has space".into(),
         |m| m.binding_id.clear(),
         |m| m.binding_id = "ordinary-binding".into(),
         |m| m.incarnation.clear(),
@@ -441,4 +483,3 @@ fn launcher_descriptors_must_be_distinct_nonstandard_and_exact_native_integers()
         .unwrap();
     assert_eq!(command.argv[6], "2147483647");
 }
-

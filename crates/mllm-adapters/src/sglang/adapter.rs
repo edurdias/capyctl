@@ -40,6 +40,19 @@ pub struct SglangRuntimeObservation {
     pub cache: bool,
 }
 
+/// What the adapter lends its observer for one read: the launch's own loopback
+/// endpoint, installation and credentials. An observer built once per launch
+/// (the embedded host) takes them from here, so credentials recovered after a
+/// restart are the ones used, never a copy taken before.
+pub struct ObservationAccess<'a> {
+    pub binding_id: &'a str,
+    pub incarnation: &'a str,
+    pub endpoint: &'a str,
+    pub executable: &'a str,
+    pub inference_key: &'a str,
+    pub admin_key: &'a str,
+}
+
 /// The coordinator supplies this trusted seam. Each call must inspect current
 /// persisted ownership and current local process/saver facts. Cached facts,
 /// caller-authored request fields, and endpoint success are insufficient.
@@ -47,6 +60,30 @@ pub struct SglangRuntimeObservation {
 #[async_trait]
 pub trait SglangRuntimeObserver: Send + Sync {
     async fn observe(&self) -> Result<SglangRuntimeObservation, RuntimeError>;
+
+    /// The observation around one persisted step: before its engine effect
+    /// (`after == false`) and after it. An observer built for exactly one step
+    /// keeps the default; one that serves a whole launch binds the step here.
+    async fn observe_step(
+        &self,
+        _command: &RuntimeCommand,
+        _after: bool,
+        _access: &ObservationAccess<'_>,
+    ) -> Result<SglangRuntimeObservation, RuntimeError> {
+        self.observe().await
+    }
+
+    /// SPEC §10 step 4 before an embedded Park, with no engine effect: the
+    /// engine proves quiescence and a fully mapped saver. Unknown is `false`.
+    async fn quiescent(&self, _access: &ObservationAccess<'_>) -> bool {
+        false
+    }
+
+    /// SPEC §9.2: the host's private directory a memory-saver launch enrolls
+    /// its saver observation in (`MLLM_OBSERVATION_DIR`), if this host has one.
+    fn observation_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -113,6 +150,18 @@ pub struct SglangAdapter {
     /// descriptors and appear in no argv, env, log or receipt (SPEC §13.3).
     inference_key: Option<String>,
     admin_key: Option<String>,
+    /// The installation interpreter the frozen launch names (its prefix bounds
+    /// where the saver library an observation reports may live).
+    executable: String,
+    /// SPEC §9.2: the private directory an enrolling launch publishes its saver
+    /// observation in; the observer's own directory when this is unset.
+    observation_dir: Option<PathBuf>,
+    /// SPEC §8.2 / T21: the host-named directory the entry keeps its file
+    /// rendezvous in, so the host can remove it once the group is gone.
+    rendezvous_dir: Option<PathBuf>,
+    /// ADR 0014 §8, SPEC §8.2: the host's approvals for sensitive extra
+    /// arguments, delivered as `MLLM_EXTRA_APPROVALS`. `None` approves nothing.
+    extra_approvals: Option<String>,
     /// The launch this adapter instance owns: the binding and incarnation it
     /// claimed. The claim is taken before a process exists, so a step that
     /// failed mid-launch still holds it and a repeat cannot start a second
@@ -156,8 +205,66 @@ impl SglangAdapter {
             session: None,
             inference_key: None,
             admin_key: None,
+            executable: frozen.executable().into(),
+            observation_dir: None,
+            rendezvous_dir: None,
+            extra_approvals: None,
             launched: Mutex::new(None),
         })
+    }
+
+    /// SPEC §9.2: the host's private directory (0700, service-owned) where a
+    /// memory-saver launch enrolls its saver observation. Delivered to the
+    /// entry as `MLLM_OBSERVATION_DIR`; the entry revalidates it.
+    pub fn with_observation_dir(mut self, dir: PathBuf) -> Self {
+        self.observation_dir = Some(dir);
+        self
+    }
+
+    /// SPEC §8.2 / T21: the per-launch rendezvous directory the host names
+    /// (inside its private root) and removes on gone evidence. Delivered to
+    /// the entry as `MLLM_RENDEZVOUS_DIR`; the entry creates it 0700 and
+    /// refuses one that already exists.
+    pub fn with_rendezvous_dir(mut self, dir: PathBuf) -> Self {
+        self.rendezvous_dir = Some(dir);
+        self
+    }
+
+    /// ADR 0014 §8, SPEC §8.2: the host's approvals document
+    /// (`mllm_config::engine_policy::extra_approvals_document`), which the entry
+    /// applies to the destinations the extras resolve to.
+    pub fn with_extra_approvals(mut self, approvals: String) -> Self {
+        self.extra_approvals = Some(approvals);
+        self
+    }
+
+    pub(super) fn extra_approvals(&self) -> Option<&str> {
+        self.extra_approvals.as_deref()
+    }
+
+    pub(super) fn rendezvous_dir(&self) -> Option<&std::path::Path> {
+        self.rendezvous_dir.as_deref()
+    }
+
+    /// The observation directory an Initialize hands the entry, if any.
+    pub(super) fn observation_dir(&self) -> Option<PathBuf> {
+        self.observation_dir
+            .clone()
+            .or_else(|| self.observer.as_ref().and_then(|o| o.observation_dir()))
+    }
+
+    fn access(&self) -> Result<ObservationAccess<'_>, RuntimeError> {
+        match (&self.inference_key, &self.admin_key) {
+            (Some(inference), Some(admin)) => Ok(ObservationAccess {
+                binding_id: &self.binding_id,
+                incarnation: &self.incarnation,
+                endpoint: self.base.as_str(),
+                executable: &self.executable,
+                inference_key: inference,
+                admin_key: admin,
+            }),
+            _ => Err(uncertain()),
+        }
     }
 
     /// Attach the per-launch credentials (Spec §3). They are delivered to the
@@ -390,7 +497,11 @@ impl SglangAdapter {
         timeout: std::time::Duration,
     ) -> Result<EffectObservation, RuntimeError> {
         let observer = self.require_observer()?;
-        let before = observer.observe().await.map_err(|_| uncertain())?;
+        let access = self.access()?;
+        let before = observer
+            .observe_step(command, false, &access)
+            .await
+            .map_err(|_| uncertain())?;
         self.validate_observation(command, &before)?;
         let valid = match command.action {
             RuntimeAction::Drain => before.quiesced && !before.unknown_work,
@@ -417,7 +528,10 @@ impl SglangAdapter {
                 .execute(command.action, timeout)
                 .await?;
         }
-        let after = observer.observe().await.map_err(|_| uncertain())?;
+        let after = observer
+            .observe_step(command, true, &access)
+            .await
+            .map_err(|_| uncertain())?;
         self.validate_observation(command, &after)?;
         let (valid, fact) = match command.action {
             RuntimeAction::Drain => (after.quiesced, Milestone::Quiesced),
@@ -557,7 +671,13 @@ impl EngineAdapter for SglangAdapter {
         }
     }
     async fn prepare_park(&self, _member: &MemberRef) -> Result<Quiescence, AdapterError> {
-        Ok(Quiescence { quiescent: false })
+        // SPEC §10 step 4: only the observer can prove quiescence and a fully
+        // mapped saver; without one (or without credentials) it is not.
+        let quiescent = match (&self.observer, self.access()) {
+            (Some(observer), Ok(access)) => observer.quiescent(&access).await,
+            _ => false,
+        };
+        Ok(Quiescence { quiescent })
     }
     async fn park(
         &self,

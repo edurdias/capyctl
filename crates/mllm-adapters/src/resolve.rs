@@ -42,8 +42,15 @@ pub enum AdapterSpec {
         /// resolved adapter then refuses Initialize.
         launch: Option<crate::vllm::PlanInputVllm>,
         /// The per-launch engine credential (Spec §3). It reaches the engine
-        /// through the child's environment; nothing renders it on argv.
+        /// through the child's environment; nothing renders it on argv. It is
+        /// the inference key: `/v1` takes it, and so does ingress.
         engine_key: Option<String>,
+        /// SPEC §9.1 / T21, ADR 0012: the per-launch admin credential. It
+        /// reaches the child as `MLLM_VLLM_ADMIN_KEY`, the guard keys the
+        /// development and control routes with it, and the adapter presents it
+        /// on those routes only. `None` is the single-key guard an engine
+        /// launched before the admin role keeps until it restarts.
+        admin_key: Option<String>,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch
     /// it was verified against, the two per-launch credentials, and — when the
@@ -71,6 +78,9 @@ pub enum AdapterSpec {
         /// The coordinator session ULID the private descriptor's launch scope
         /// names. Threaded by the resolved-spawn factory, never invented here.
         session: Option<String>,
+        /// ADR 0014 §8, SPEC §8.2: the host's approvals for sensitive extra
+        /// arguments; `None` approves nothing.
+        extra_approvals: Option<String>,
     },
 }
 
@@ -112,6 +122,7 @@ pub fn resolve(
             model_id,
             launch,
             engine_key,
+            admin_key,
         } => {
             let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id);
             if let Some(launch) = launch {
@@ -123,6 +134,9 @@ pub fn resolve(
             if let Some(engine_key) = engine_key {
                 adapter = adapter.with_engine_key(engine_key);
             }
+            if let Some(admin_key) = admin_key {
+                adapter = adapter.with_admin_key(admin_key);
+            }
             Box::new(adapter)
         }
         AdapterSpec::Sglang {
@@ -133,6 +147,7 @@ pub fn resolve(
             wrapper,
             log,
             session,
+            extra_approvals,
         } => {
             let mut adapter = SglangAdapter::from_frozen(&frozen, observer)
                 .map_err(|error| match error {
@@ -155,6 +170,9 @@ pub fn resolve(
             }
             if let Some(session) = session {
                 adapter = adapter.with_session(session);
+            }
+            if let Some(approvals) = extra_approvals {
+                adapter = adapter.with_extra_approvals(approvals);
             }
             if let Some(tools) = tools {
                 adapter = adapter.with_tools(tools);

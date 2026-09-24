@@ -6,20 +6,13 @@ use std::time::Duration;
 struct Minimal;
 
 impl OwnedProcessLaunch for Minimal {
-    fn spawn_durable(
-        &self,
-        _: &str,
-        _: &RenderedCommand,
-    ) -> Result<ProcessIdentity, RuntimeError> {
+    fn spawn_durable(&self, _: &str, _: &RenderedCommand) -> Result<ProcessIdentity, RuntimeError> {
         Err(RuntimeError::Unsupported)
     }
     fn present(&self, _: &ProcessIdentity) -> Presence {
         Presence::Unknown
     }
-    fn observe_group(
-        &self,
-        _: &ProcessIdentity,
-    ) -> Result<Vec<ProcessIdentity>, RuntimeError> {
+    fn observe_group(&self, _: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, RuntimeError> {
         Err(RuntimeError::Unsupported)
     }
     fn terminate_owned(&self, _: &[ProcessIdentity], _: Duration) -> Result<(), RuntimeError> {

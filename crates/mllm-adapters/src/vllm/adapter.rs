@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use crate::policy::ParkPolicy;
 use crate::traits::{
     AdapterError, CancellationOutcome, EngineAdapter, EngineState, MemberRef, OwnedProcessLaunch,
-    ParkLevel, ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome, RenderedCommand,
-    RequestRef, RestoreOutcome, RuntimeAction, RuntimeCommand, RuntimeError, WorkObservation,
+    ParkLevel, ParkOutcome, Phase, PlanInput, Quiescence, Readiness, ReloadOutcome,
+    RenderedCommand, RequestRef, RestoreOutcome, RuntimeAction, RuntimeCommand, RuntimeError,
+    WorkObservation,
 };
 use crate::vllm::http::{EngineHttp, HttpError};
 
@@ -65,6 +66,21 @@ pub struct VllmAdapter {
     /// The per-launch engine credential. It reaches the engine through the
     /// child's environment and appears in no argv, log or receipt (Spec §3).
     engine_key: Option<String>,
+    /// SPEC §9.1 / T21: the per-launch admin credential the guard keys the
+    /// development routes with, apart from inference. Every new launch, embedded
+    /// or remote, has one; `None` is only an engine launched before the admin
+    /// role, which keeps its single-key guard until it restarts (ADR 0012).
+    admin_key: Option<String>,
+    /// The residency-step fence (SPEC §13.2): one step at a time, each step id
+    /// once, and nothing further after a step whose outcome is unknown.
+    residency: Mutex<ResidencyFence>,
+}
+
+#[derive(Default)]
+struct ResidencyFence {
+    active: bool,
+    uncertain: bool,
+    steps: std::collections::HashSet<String>,
 }
 
 impl VllmAdapter {
@@ -87,6 +103,51 @@ impl VllmAdapter {
             tools: None,
             launched: Mutex::new(None),
             engine_key: None,
+            admin_key: None,
+            residency: Mutex::new(ResidencyFence::default()),
+        }
+    }
+
+    /// Whether the host's deep-park policy admits sleep, wake and collective
+    /// calls for this launch (SPEC §9.1 / T21).
+    /// The served model name a fresh probe addresses (SPEC §6.1).
+    pub(super) fn served_model(&self) -> &str {
+        &self.model_id
+    }
+
+    pub(super) fn deep_park_enabled(&self) -> bool {
+        self.policy == ParkPolicy::Enabled
+    }
+
+    /// The engine control client, keyed with this launch's engine credential.
+    pub(super) fn http(&self) -> &EngineHttp {
+        &self.http
+    }
+
+    pub(super) fn mark_parked(&self, member: &MemberRef, parked: bool) {
+        self.set_parked(member, parked);
+    }
+
+    /// Admit one residency step: none running, this step id never seen, and
+    /// no earlier step left uncertain. Refusal here precedes any engine call.
+    pub(super) fn begin_residency_step(&self, step_id: &str) -> Result<(), RuntimeError> {
+        let mut fence = self
+            .residency
+            .lock()
+            .map_err(|_| RuntimeError::Unsupported)?;
+        if fence.active || fence.uncertain || fence.steps.len() >= 64 || fence.steps.contains(step_id)
+        {
+            return Err(RuntimeError::Unsupported);
+        }
+        fence.steps.insert(step_id.to_string());
+        fence.active = true;
+        Ok(())
+    }
+
+    pub(super) fn end_residency_step(&self, succeeded: bool) {
+        if let Ok(mut fence) = self.residency.lock() {
+            fence.active = false;
+            fence.uncertain |= !succeeded;
         }
     }
 
@@ -119,8 +180,26 @@ impl VllmAdapter {
             Some(engine_key.clone()),
         );
         self.http = EngineHttp::new(base, Some(engine_key.clone()));
+        if let Some(admin) = &self.admin_key {
+            self.http = self.http.clone().with_admin_key(admin.clone());
+        }
         self.engine_key = Some(engine_key);
         self
+    }
+
+    /// SPEC §9.1 / T21: a separate per-launch admin credential. It reaches the
+    /// child as `MLLM_VLLM_ADMIN_KEY`, the guard keys the development routes
+    /// with it, and this adapter presents it on its control calls only; the
+    /// engine key stays the inference key.
+    pub fn with_admin_key(mut self, admin_key: String) -> Self {
+        self.http = self.http.clone().with_admin_key(admin_key.clone());
+        self.admin_key = Some(admin_key);
+        self
+    }
+
+    /// The admin credential an Initialize hands the child, if any.
+    pub(super) fn admin_key(&self) -> Option<&str> {
+        self.admin_key.as_deref()
     }
 
     /// The engine's build fingerprint, for the receipt an Initialize records.
@@ -207,15 +286,23 @@ impl VllmAdapter {
 
 #[async_trait]
 impl EngineAdapter for VllmAdapter {
-    /// Spec §4: the builder performs Initialize end to end. Every other action
-    /// stays refused until the slice that implements it lands — an adapter must
-    /// never appear to grant a control path it does not have.
+    /// Spec §4: the builder performs Initialize end to end. SPEC §9.1: a deep
+    /// park and its restoration are four persisted steps (`residency.rs`).
+    /// Every other action stays refused — an adapter must never appear to
+    /// grant a control path it does not have.
     async fn execute_persisted(
         &self,
         command: &RuntimeCommand,
     ) -> Result<mllm_domain::completion::EffectObservation, RuntimeError> {
         match command.action {
             RuntimeAction::Initialize => crate::vllm::initialize::initialize(self, command).await,
+            RuntimeAction::Park
+            | RuntimeAction::Restore
+            | RuntimeAction::ReloadWeights
+            | RuntimeAction::InvalidateCache
+            | RuntimeAction::Probe => {
+                crate::vllm::residency::execute(self, command).await
+            }
             _ => Err(RuntimeError::Unsupported),
         }
     }
@@ -320,11 +407,14 @@ impl EngineAdapter for VllmAdapter {
 
     async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError> {
         // Quiescence = what the adapter can prove: no live work observed.
-        match self.observe_work(member).await? {
-            WorkObservation::Idle => Ok(Quiescence { quiescent: true }),
-            WorkObservation::Streaming { .. } => Ok(Quiescence { quiescent: false }),
-            WorkObservation::Unknown => Ok(Quiescence { quiescent: false }),
+        if self.is_parked(member) {
+            return Ok(Quiescence { quiescent: true });
         }
+        // SPEC §10 step 4, §9.2: the engine's own running and waiting gauges
+        // must both read zero. An unreadable or missing gauge is unknown work,
+        // which is never quiescence.
+        let quiescent = matches!(self.http.work_counts().await, Ok(Some((running, waiting))) if running == 0.0 && waiting == 0.0);
+        Ok(Quiescence { quiescent })
     }
 
     async fn park(
@@ -421,6 +511,13 @@ impl crate::traits::ChatForward for VllmAdapter {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
         self.forward.collect(body).await
+    }
+    async fn forward_chat_observed(
+        &self,
+        body: &serde_json::Value,
+        observer: &mut dyn crate::traits::ChatSink,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.forward.collect_observed(body, observer, None).await
     }
     async fn forward_chat_stream(
         &self,

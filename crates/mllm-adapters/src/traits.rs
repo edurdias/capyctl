@@ -32,6 +32,31 @@ pub enum RuntimeError {
     Unsupported,
     #[error("runtime ownership is uncertain: {0}")]
     Uncertain(String),
+    /// SPEC §13: the owning host's policy refused the step before any effect,
+    /// with one closed category (for example `checkpoint_mismatch`). Nothing
+    /// was started or claimed; this is evidence, not uncertainty.
+    #[error("host policy refused the launch before any effect: {0}{hint}", hint = refusal_hint(.0))]
+    Refused(String),
+    /// SPEC §§6.1, 6.4, 13.2: the engine process exited before readiness. The
+    /// text is the launch failure summary (`launch_failure::summary`), then,
+    /// on the embedded path only, the redacted log tail on later lines. This
+    /// is what happened, not ownership uncertainty; the launch is still
+    /// released only on verified absence of the recorded processes.
+    #[error("engine launch failed: {0}")]
+    LaunchFailed(String),
+}
+
+/// ADR 0008 (owner decision 2026-09-23): the operator's next step for a
+/// capability or drift refusal. Fixed text per closed category, never detail.
+fn refusal_hint(reason: &str) -> String {
+    match reason {
+        "capability_missing:deep_park" | "capability_missing:core" | "installation_drift" => {
+            mllm_domain::diagnostics::operator_hint(reason)
+                .map(|hint| format!(" ({hint})"))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Identifies one member of a deployment to the engine adapter.
@@ -64,7 +89,7 @@ pub enum Phase {
 }
 
 /// A request to render a concrete launch command for a member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlanInput {
     pub deployment_id: String,
     pub member_id: String,
@@ -74,11 +99,63 @@ pub struct PlanInput {
     pub engine_api_key: Option<String>,
 }
 
+/// SPEC §13.3: the key is never formatted.
+impl std::fmt::Debug for PlanInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanInput")
+            .field("deployment_id", &self.deployment_id)
+            .field("member_id", &self.member_id)
+            .field("park_level", &self.park_level)
+            .field("engine_api_key", &redacted(self.engine_api_key.is_some()))
+            .finish()
+    }
+}
+
 /// The concrete command a launcher can spawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RenderedCommand {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
+}
+
+/// SPEC §13.3: a rendered environment carries the engine key (`VLLM_API_KEY`),
+/// so Debug names the variables and never their values.
+impl std::fmt::Debug for RenderedCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderedCommand")
+            .field("argv", &self.argv)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// How a redacting Debug shows a secret: whether one is set, never its bytes.
+pub fn redacted(set: bool) -> &'static str {
+    if set { "<redacted>" } else { "none" }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    // T21: SPEC §13.3, no key reaches a formatted value.
+    #[test]
+    fn debug_never_formats_a_key() {
+        let command = RenderedCommand {
+            argv: vec!["vllm".into()],
+            env: BTreeMap::from([("VLLM_API_KEY".into(), "secret-engine-key".into())]),
+        };
+        let shown = format!("{command:?}");
+        assert!(shown.contains("VLLM_API_KEY"));
+        assert!(!shown.contains("secret-engine-key"));
+        let plan = PlanInput {
+            deployment_id: "d".into(),
+            member_id: "m".into(),
+            park_level: None,
+            engine_api_key: Some("secret-engine-key".into()),
+        };
+        assert!(!format!("{plan:?}").contains("secret-engine-key"));
+    }
 }
 
 /// Whether the engine is ready to accept work.
@@ -154,6 +231,10 @@ pub enum AdapterError {
     Crash(Phase),
     /// The combination of arguments/states is not supported.
     UnsupportedCombination,
+    /// SPEC §10: evidence shows the request never reached the engine (a host
+    /// ingress refused it before forwarding because it is shutting down). Unlike
+    /// `Uncertain`, nothing can be running on its behalf.
+    NotAccepted(String),
 }
 
 /// Spec §3: an adapter error is quoted into failure reasons that reach a journal,
@@ -172,6 +253,7 @@ impl std::fmt::Display for AdapterError {
             AdapterError::UnsupportedCombination => {
                 f.write_str("unsupported combination of arguments or states")
             }
+            AdapterError::NotAccepted(reason) => write!(f, "not accepted: {reason}"),
         }
     }
 }
@@ -195,7 +277,7 @@ pub trait EngineAdapter: Send + Sync {
     async fn check_readiness(&self, member: &MemberRef) -> Result<Readiness, AdapterError>;
     async fn prepare_park(&self, member: &MemberRef) -> Result<Quiescence, AdapterError>;
     async fn park(&self, member: &MemberRef, level: ParkLevel)
-    -> Result<ParkOutcome, AdapterError>;
+        -> Result<ParkOutcome, AdapterError>;
     async fn restore(&self, member: &MemberRef) -> Result<RestoreOutcome, AdapterError>;
     async fn reload_weights(&self, member: &MemberRef) -> Result<ReloadOutcome, AdapterError>;
     async fn observe_work(&self, member: &MemberRef) -> Result<WorkObservation, AdapterError>;
@@ -279,8 +361,10 @@ pub trait OwnedProcessLaunch: Send + Sync {
         Err(RuntimeError::Unsupported)
     }
     /// Live now, with the same start identity: boot id and start ticks, not pid alone.
-    fn present(&self, identity: &mllm_domain::completion::ProcessIdentity)
-        -> mllm_domain::completion::Presence;
+    fn present(
+        &self,
+        identity: &mllm_domain::completion::ProcessIdentity,
+    ) -> mllm_domain::completion::Presence;
     /// Every live member of the process group the recorded API process led: the API
     /// process first when it is still live, workers named `worker-0`, `worker-1`, ...
     /// in start order, and an empty list when no member is live. Empty is an answer,
@@ -315,6 +399,10 @@ pub struct DeliveryFailed;
 #[async_trait]
 pub trait ChatSink: Send {
     async fn send(&mut self, chunk: String) -> Result<(), DeliveryFailed>;
+    /// SPEC §10: the backend produced one more event, whether or not it is
+    /// delivered (a stream still drains after its client left). The caller that
+    /// bounds a stream measures idleness from these, never from wall time.
+    fn progressed(&mut self) {}
 }
 
 /// Inference forwarding: how the router reaches a deployment's engine
@@ -323,8 +411,11 @@ pub trait ChatSink: Send {
 #[async_trait]
 pub trait ChatForward: Send + Sync {
     /// Await delivery in order. On sink failure or timeout, stop delivery and
-    /// drain the backend within its existing limits. Completed describes only
-    /// the backend protocol terminator, never successful downstream delivery.
+    /// drain the backend, reporting each backend event through
+    /// [`ChatSink::progressed`]. Completed describes only the backend protocol
+    /// terminator, never successful downstream delivery. The caller bounds the
+    /// stream (SPEC §10: the router's request deadline and idle bound); this
+    /// method adds no wall-clock cap of its own.
     /// No synchronous fallback: implementations must explicitly support this.
     async fn forward_chat_stream_async(
         &self,
@@ -338,6 +429,19 @@ pub trait ChatForward: Send + Sync {
         &self,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError>;
+    /// SPEC §10: non-streaming chat completion whose backend events are
+    /// reported through [`ChatSink::progressed`] on `observer` (nothing is sent
+    /// to it), so the caller bounds it like a relayed stream: the request
+    /// deadline for the first event and an idle bound after it. Adds no
+    /// wall-clock cap of its own. The default has no progress to report and
+    /// answers as [`ChatForward::forward_chat`].
+    async fn forward_chat_observed(
+        &self,
+        body: &serde_json::Value,
+        _observer: &mut dyn ChatSink,
+    ) -> Result<serde_json::Value, AdapterError> {
+        self.forward_chat(body).await
+    }
     /// Streaming chat completion: yields data payloads in order; the final
     /// `[DONE]` marker is consumed by the forwarder.
     async fn forward_chat_stream(

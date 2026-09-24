@@ -7,8 +7,15 @@ mod args;
 mod forward;
 mod http;
 mod initialize;
+// SPEC §9.2, §10: the observation key and engine gauges a host reads.
+pub mod observation;
+pub mod pinned;
 
 pub use adapter::{
-    SglangAdapter, SglangLaunchHandle, SglangRuntimeObservation, SglangRuntimeObserver,
+    ObservationAccess, SglangAdapter, SglangLaunchHandle, SglangRuntimeObservation,
+    SglangRuntimeObserver,
 };
 pub use args::{ProtectedDescriptorFds, SglangLaunch};
+
+mod frozen;
+pub use frozen::frozen_from_effective;

@@ -32,8 +32,8 @@ use mllm_domain::completion::{
     TransitionToken,
 };
 use mllm_domain::launch::{
-    NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, ProfileLaunchSettings,
-    SglangLaunchSettings, SglangRequestedBudget,
+    LaunchSettings, NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata,
+    SglangLaunchSettings,
 };
 use serde_json::{json, Value};
 
@@ -47,9 +47,8 @@ const MODEL: &str = "toy";
 const INFERENCE: &str = "inference-secret";
 const ADMIN: &str = "admin-secret";
 const CHECKPOINT: &str = "/private/checkpoints/qwen";
-const SOURCE: &str = "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1";
 const REVISION: &str = "cdbee75f17c01a7cc42f958dc650907174af0554";
-const RECIPE: &str = "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1";
+const RECIPE: &str = "sglang_engine_config_v2";
 
 // ---------------------------------------------------------------- stub engine
 
@@ -297,32 +296,7 @@ fn wrapper() -> &'static std::path::Path {
 }
 
 fn settings() -> SglangLaunchSettings {
-    SglangLaunchSettings {
-        recipe: RECIPE.into(),
-        tensor_parallel_size: 1,
-        data_parallel_size: 1,
-        tokenizer_workers: 1,
-        model_dtype: "bfloat16".into(),
-        context_tokens: 4096,
-        max_running_requests: 8,
-        max_total_tokens: 4096,
-        prefill_cuda_graphs: false,
-        decode_cuda_graphs: false,
-        memory_saver: true,
-        cpu_weight_backup: false,
-        speculative_decoding: false,
-        lora: false,
-        trust_remote_code: false,
-        disaggregation: false,
-        external_cache: false,
-        cpu_kv_offload: false,
-        native_grpc: false,
-        weight_restore: "disk_reload".into(),
-        requested_budget: SglangRequestedBudget {
-            kv_cache_bytes: 4_294_967_296,
-            static_memory_fraction_bps: 7500,
-        },
-    }
+    mllm_testkit::sglang_launch_settings()
 }
 
 fn frozen_launch(port: u16) -> NativeLaunch {
@@ -336,7 +310,6 @@ fn frozen_launch_with_device(port: u16, physical_gpu_uuid: Option<&str>) -> Nati
         NativeLaunchMetadata {
             engine: "sglang".into(),
             recipe: RECIPE.into(),
-            source_revision: SOURCE.into(),
             checkpoint_revision: REVISION.into(),
             served_name: MODEL.into(),
             binding_id: BINDING.into(),
@@ -385,7 +358,7 @@ fn initialize_command(deadline_in_ms: i64) -> RuntimeCommand {
             identities: ExecutionIdentities::OwnedLaunch,
             completion_target: None,
             grant_id: Some("g-1".into()),
-            launch_settings: Some(ProfileLaunchSettings::Sglang(settings())),
+            launch_settings: Some(LaunchSettings::Sglang(settings())),
         },
     }
 }
@@ -485,7 +458,8 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     let (_stub, port) = serve_stub(MODEL, 2, INFERENCE, 0).await;
     let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
     let launch = frozen_launch(port);
-    let adapter = equipped(launch, tool.clone(), &log);
+    let adapter = equipped(launch, tool.clone(), &log)
+        .with_extra_approvals(r#"{"options":[],"paths":[],"trust_remote_code":false}"#.into());
 
     let command = initialize_command(30_000);
     let observation = adapter.execute_persisted(&command).await.unwrap();
@@ -522,7 +496,8 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
         &argv[..4],
         [
             "/opt/sglang/bin/python3",
-            "-IS",
+            // SPEC §9.1 / T21: -B, no bytecode is written beside checked source.
+            "-BIS",
             wrapper().to_str().unwrap(),
             "--public-settings-json"
         ]
@@ -548,6 +523,13 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
     assert_eq!(
         env.get("MLLM_ENGINE_LOG").map(String::as_str),
         Some(log.to_string_lossy().as_ref())
+    );
+    // T21: SPEC §9.1, no bytecode beside checked runtime source.
+    assert_eq!(env.get("PYTHONDONTWRITEBYTECODE").map(String::as_str), Some("1"));
+    // T21: ADR 0014 §8, the host approvals the entry gates extras with.
+    assert_eq!(
+        env.get("MLLM_EXTRA_APPROVALS").map(String::as_str),
+        Some(r#"{"options":[],"paths":[],"trust_remote_code":false}"#)
     );
     let rendered = argv.join(" ");
     for secret in [INFERENCE, ADMIN] {
@@ -698,9 +680,15 @@ async fn an_engine_gone_before_readiness_fails_with_a_redacted_log_tail() {
         .await
         .unwrap_err();
 
-    let RuntimeError::Uncertain(message) = error else {
-        panic!("a dead engine is uncertain ownership, got {error:?}");
+    // SPEC §§6.4, 13.2: an engine gone before readiness is a launch failure
+    // whose first line is the bounded summary; the log tail follows it.
+    let RuntimeError::LaunchFailed(message) = error else {
+        panic!("a dead engine is a launch failure, got {error:?}");
     };
+    assert!(
+        message.starts_with("the engine exited before readiness"),
+        "{message}"
+    );
     for line in [
         "loading weights",
         "CUDA out of memory",
@@ -834,21 +822,7 @@ async fn a_context_that_is_not_an_owned_sglang_launch_is_unsupported() {
     ));
 
     let mut other_family = initialize_command(30_000);
-    other_family.context.launch_settings = Some(ProfileLaunchSettings::Vllm(
-        mllm_domain::launch::VllmLaunchSettings {
-            tensor_parallel_size: 1,
-            pipeline_parallel_size: 1,
-            enable_sleep_mode: false,
-            kv_cache_dtype: "auto".into(),
-            block_size_tokens: 16,
-            cpu_offload_bytes: 0,
-            requested_budget: mllm_domain::launch::VllmRequestedBudget {
-                kv_cache_bytes: 0,
-                swap_space_bytes: 0,
-                gpu_utilization_pct: 75,
-            },
-        },
-    ));
+    other_family.context.launch_settings = Some(mllm_testkit::vllm_launch_settings());
     assert!(matches!(
         adapter.execute_persisted(&other_family).await,
         Err(RuntimeError::Unsupported)
@@ -904,6 +878,9 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
     let public_device_keys;
     {
         let spawned = tool.spawned.lock().unwrap();
+        // T22: compiler tools resolve in the selected environment, not shell PATH.
+        let engine_bin = std::path::Path::new(&spawned[0].argv[0]).parent().unwrap();
+        assert_eq!(spawned[0].env["PATH"], format!("{}:/usr/bin:/bin", engine_bin.display()));
         assert_eq!(
             spawned[0]
                 .env
@@ -956,4 +933,31 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
         "no mapping, no namespace"
     );
     std::fs::remove_file(&log).ok();
+}
+
+/// SPEC §8.2 / T21 (found live 2026-09-23): the host-named rendezvous directory
+/// reaches the entry as `MLLM_RENDEZVOUS_DIR`; without one none is set and the
+/// entry makes its own.
+// T21
+#[tokio::test]
+async fn a_host_named_rendezvous_directory_reaches_the_entry() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    for named in [Some("/state/rendezvous/01K00000000000000000000002"), None] {
+        let (_stub, port) = serve_stub(MODEL, 2, INFERENCE, 0).await;
+        let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+        let mut adapter = equipped(frozen_launch(port), tool.clone(), &log);
+        if let Some(dir) = named {
+            adapter = adapter.with_rendezvous_dir(dir.into());
+        }
+        adapter
+            .execute_persisted(&initialize_command(30_000))
+            .await
+            .unwrap();
+        let spawned = tool.spawned.lock().unwrap();
+        assert_eq!(
+            spawned[0].env.get("MLLM_RENDEZVOUS_DIR").map(String::as_str),
+            named
+        );
+    }
 }

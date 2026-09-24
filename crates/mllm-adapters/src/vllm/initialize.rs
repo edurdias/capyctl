@@ -37,6 +37,61 @@ const LOG_TAIL_LINES: usize = 20;
 /// dying must not be read into memory to explain itself.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
+/// SPEC §13.3 / T21: variables an engine may take from the agent's own
+/// environment. Everything else it sees is named here by mllm.
+const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"];
+
+/// Fixed system tool directories after the engine's own bin.
+const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Every variable a vLLM engine may be started with (SPEC §13.3 / T21). The
+/// launcher clears the agent's environment, so this is all the engine sees.
+pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+    "VLLM_API_KEY", "MLLM_VLLM_ADMIN_KEY", "VLLM_SERVER_DEV_MODE", "PYTHONPATH",
+    "VLLM_PLUGINS", "PYTHONDONTWRITEBYTECODE", "MLLM_ENGINE_LOG", "MLLM_EXTRA_APPROVALS",
+];
+
+/// The closed environment one vLLM launch starts with: the rendered variables,
+/// the keys, the engine's tool path, a few named pass-throughs, and the pins
+/// (no plugins, no bytecode). Anything outside the allowlist is dropped.
+fn engine_environment(
+    rendered: &std::collections::BTreeMap<String, String>,
+    plan: &crate::vllm::args::PlanInputVllm,
+    key: &str,
+    admin: Option<&str>,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    for name in PASS_THROUGH {
+        if let Some(value) = inherited(name) {
+            env.insert((*name).to_string(), value);
+        }
+    }
+    env.extend(rendered.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // Spec §3: the keys ride the environment, never argv.
+    env.insert("VLLM_API_KEY".into(), key.to_string());
+    if let Some(admin) = admin {
+        env.insert("MLLM_VLLM_ADMIN_KEY".into(), admin.to_string());
+    }
+    // The engine's runtime PATH carries its own venv bin (the JIT compile step
+    // needs the venv's tools), then fixed system directories only.
+    let path = match &plan.engine_path_extra {
+        Some(extra) => format!("{extra}:{SYSTEM_PATH}"),
+        None => SYSTEM_PATH.to_string(),
+    };
+    env.insert("PATH".into(), path);
+    // ADR 0012 / T21: no vLLM plugin loads; SPEC §9.1: no bytecode is
+    // written beside mllm's checked runtime source.
+    env.insert("VLLM_PLUGINS".into(), String::new());
+    env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    if let Some(log) = &plan.engine_log {
+        env.insert("MLLM_ENGINE_LOG".into(), log.clone());
+    }
+    env.retain(|name, _| ENGINE_ENV_ALLOWLIST.contains(&name.as_str()));
+    env
+}
+
 pub(super) async fn initialize(
     adapter: &VllmAdapter,
     command: &RuntimeCommand,
@@ -47,7 +102,7 @@ pub(super) async fn initialize(
     let (mut plan, tools, key) = adapter.launch_parts()?;
     if !matches!(
         context.launch_settings,
-        Some(mllm_domain::launch::ProfileLaunchSettings::Vllm(_))
+        Some(mllm_domain::launch::LaunchSettings::Vllm(_))
     ) || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
         return Err(RuntimeError::Unsupported);
@@ -60,16 +115,13 @@ pub(super) async fn initialize(
     plan.api_key = None;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    cmd.env.insert("VLLM_API_KEY".into(), key.clone());
-    if let Some(extra) = &plan.engine_path_extra {
-        // The engine's runtime PATH carries its own venv bin: the JIT compile step
-        // needs the venv's tools.
-        let system = std::env::var("PATH").unwrap_or_default();
-        cmd.env.insert("PATH".into(), format!("{extra}:{system}"));
-    }
-    if let Some(log) = &plan.engine_log {
-        cmd.env.insert("MLLM_ENGINE_LOG".into(), log.clone());
-    }
+    cmd.env = engine_environment(
+        &cmd.env,
+        &plan,
+        &key,
+        adapter.admin_key(),
+        &|name| std::env::var(name).ok(),
+    );
 
     // The tool is synchronous on purpose (mllm-launchers has no runtime), so every
     // call into it leaves the async threads free.
@@ -107,11 +159,14 @@ pub(super) async fn initialize(
             .map_err(|_| RuntimeError::Uncertain("presence task failed".into()))?
         {
             Presence::Alive => {}
+            // SPEC §§6.4, 13.2: an engine that left before readiness is a
+            // launch failure with its own reason, not ownership uncertainty.
             Presence::Gone => {
-                return Err(RuntimeError::Uncertain(format!(
-                    "engine exited before readiness; log tail:\n{}",
-                    log_tail(plan.engine_log.as_deref(), LOG_TAIL_LINES)
-                )))
+                let tail = log_tail(plan.engine_log.as_deref(), LOG_TAIL_LINES);
+                return Err(RuntimeError::LaunchFailed(format!(
+                    "{}; log tail:\n{tail}",
+                    crate::launch_failure::summary(&tail, None)
+                )));
             }
             // Unknown is retained, never absent: the step fails but says why.
             Presence::Unknown => {

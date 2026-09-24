@@ -17,7 +17,7 @@ use mllm_domain::{
     completion::{
         ExecutionIdentities, Milestone, ProcessIdentity, StepExecutionContext, TransitionToken,
     },
-    launch::{NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget},
+    launch::{NativeLaunch, NativeLaunchMetadata},
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -82,8 +82,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
             endpoint,
             served_name: MODEL.into(),
             engine: "sglang".into(),
-            recipe: "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1".into(),
-            source_revision: "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1".into(),
+            recipe: "sglang_engine_config_v2".into(),
             checkpoint_revision: "cdbee75f17c01a7cc42f958dc650907174af0554".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
@@ -99,32 +98,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
         "/opt/sglang/python".into(),
         "inference-ref".into(),
         "admin-ref".into(),
-        SglangLaunchSettings {
-            recipe: "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1".into(),
-            tensor_parallel_size: 1,
-            data_parallel_size: 1,
-            tokenizer_workers: 1,
-            model_dtype: "bfloat16".into(),
-            context_tokens: 4096,
-            max_running_requests: 8,
-            max_total_tokens: 4096,
-            prefill_cuda_graphs: false,
-            decode_cuda_graphs: false,
-            memory_saver: true,
-            cpu_weight_backup: false,
-            speculative_decoding: false,
-            lora: false,
-            trust_remote_code: false,
-            disaggregation: false,
-            external_cache: false,
-            cpu_kv_offload: false,
-            native_grpc: false,
-            weight_restore: "disk_reload".into(),
-            requested_budget: SglangRequestedBudget {
-                kv_cache_bytes: 4_294_967_296,
-                static_memory_fraction_bps: 7500,
-            },
-        },
+        mllm_testkit::sglang_launch_settings(),
     )
 }
 

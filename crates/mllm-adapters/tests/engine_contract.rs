@@ -3,7 +3,7 @@ use mllm_adapters::sglang::{SglangAdapter, SglangRuntimeObservation, SglangRunti
 use mllm_adapters::RuntimeError;
 use mllm_adapters::{fake::ParkPolicy, vllm::VllmAdapter, ChatForward, StreamEnded};
 use mllm_domain::launch::{
-    NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings, SglangRequestedBudget,
+    NativeLaunch, NativeLaunchMetadata,
 };
 use serde_json::{json, Value};
 const BINDING: &str = "01K00000000000000000000001";
@@ -164,8 +164,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
             endpoint,
             served_name: MODEL.into(),
             engine: "sglang".into(),
-            recipe: "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1".into(),
-            source_revision: "fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1".into(),
+            recipe: "sglang_engine_config_v2".into(),
             checkpoint_revision: "cdbee75f17c01a7cc42f958dc650907174af0554".into(),
             rendered_settings_digest: "a".repeat(64),
             placement_digest: None,
@@ -181,32 +180,7 @@ fn frozen(endpoint: String) -> NativeLaunch {
         "/opt/sglang/python".into(),
         "inference-ref".into(),
         "admin-ref".into(),
-        SglangLaunchSettings {
-            recipe: "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1".into(),
-            tensor_parallel_size: 1,
-            data_parallel_size: 1,
-            tokenizer_workers: 1,
-            model_dtype: "bfloat16".into(),
-            context_tokens: 4096,
-            max_running_requests: 8,
-            max_total_tokens: 4096,
-            prefill_cuda_graphs: false,
-            decode_cuda_graphs: false,
-            memory_saver: true,
-            cpu_weight_backup: false,
-            speculative_decoding: false,
-            lora: false,
-            trust_remote_code: false,
-            disaggregation: false,
-            external_cache: false,
-            cpu_kv_offload: false,
-            native_grpc: false,
-            weight_restore: "disk_reload".into(),
-            requested_budget: SglangRequestedBudget {
-                kv_cache_bytes: 4_294_967_296,
-                static_memory_fraction_bps: 7500,
-            },
-        },
+        mllm_testkit::sglang_launch_settings(),
     )
 }
 
@@ -342,7 +316,7 @@ async fn rejects_changed_response_identity_duplicate_fields_and_trailing_generat
             ),
             format!(
                 "{}data: [DONE]\n\n",
-                chunk("x", json!("stop")).replace("\"content\":\"x\"", "\"tool_calls\":[]")
+                chunk("x", json!("stop")).replace("\"content\":\"x\"", "\"tool_calls\":[{\"index\":\"a\"}]")
             ),
             format!("data: {}\n\n", "x".repeat(65536)),
         ] {
@@ -398,7 +372,9 @@ async fn unsupported_multi_choice_and_tool_requests_do_not_report_success() {
         .await;
         for body in [
             json!({"model":"public","n":2}),
-            json!({"model":"public","tools":[]}),
+            // SPEC §10 preserves tool calls, so `tools` is forwarded; the
+            // deprecated `functions` pair is refused before sending.
+            json!({"model":"public","functions":[]}),
             json!({"model":""}),
             json!([]),
         ] {
@@ -692,4 +668,55 @@ async fn an_unknown_delta_field_is_still_rejected() {
         "untested fields must not pass through"
     );
     drop(task);
+}
+
+/// Counts backend progress separately from delivery.
+struct ProgressSink {
+    delivered: usize,
+    progressed: usize,
+}
+#[async_trait::async_trait]
+impl mllm_adapters::traits::ChatSink for ProgressSink {
+    async fn send(&mut self, _: String) -> Result<(), mllm_adapters::traits::DeliveryFailed> {
+        self.delivered += 1;
+        // The client leaves after the first chunk.
+        Err(mllm_adapters::traits::DeliveryFailed)
+    }
+    fn progressed(&mut self) {
+        self.progressed += 1;
+    }
+}
+
+/// SPEC §10: the router bounds a stream by idleness between backend events,
+/// never by fixed wall time (found live 2026-09-23, matrix M30: a fixed 300 s
+/// cap cut a progressing stream and left its lease uncertain). A stream that
+/// keeps draining after its client left still reports each backend event,
+/// so the router's idle bound does not cut a drain that is progressing.
+// T17
+#[tokio::test]
+async fn draining_stream_reports_backend_progress_after_delivery_failed() {
+    for sglang in [false, true] {
+        let (adapter, task) = engine(
+            sglang,
+            format!(
+                "{}{}{}data: [DONE]\n\n",
+                chunk("one", Value::Null),
+                chunk("two", Value::Null),
+                chunk("three", json!("stop"))
+            ),
+        )
+        .await;
+        let mut sink = ProgressSink {
+            delivered: 0,
+            progressed: 0,
+        };
+        let result = adapter
+            .forward_chat_stream_async(&json!({"model":"public"}), &mut sink)
+            .await;
+        assert_eq!(result.unwrap(), StreamEnded::Completed);
+        assert_eq!(sink.delivered, 1, "delivery stops at the first failure");
+        // Three events and the terminator, all observed while draining.
+        assert_eq!(sink.progressed, 4);
+        task.abort();
+    }
 }

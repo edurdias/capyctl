@@ -109,7 +109,10 @@ pub(super) fn reasoning_not_separated() -> RuntimeError {
 pub(super) fn action_timeout(action: RuntimeAction) -> Result<Duration, RuntimeError> {
     let seconds = match action {
         RuntimeAction::Park | RuntimeAction::Restore => 60,
-        RuntimeAction::ReloadWeights => 300,
+        // A disk reload scales with the checkpoint (61 GB took about 350 s
+        // live, M27): the step's deadline, the deployment's wake timeout,
+        // bounds it. This cap only keeps the value finite.
+        RuntimeAction::ReloadWeights => 3600,
         RuntimeAction::InvalidateCache => 10,
         RuntimeAction::Probe => 30,
         RuntimeAction::Drain => 10,
@@ -361,5 +364,25 @@ impl ControlHttp {
         } else {
             Err(uncertain())
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_bound_tests {
+    use super::*;
+
+    // T16 T20: found live 2026-09-23 (matrix M27, host-a). A deep wake of
+    // qwen3-30b-a3b reloaded 61 GB from disk in about 350 s; a fixed 300 s
+    // bound on the reload left the wake uncertain although the engine
+    // finished. The step's own deadline (the deployment's wake timeout) is the
+    // bound; the reload has no shorter fixed cap of its own.
+    #[test]
+    fn a_weight_reload_is_bounded_by_its_step_deadline_not_a_fixed_cap() {
+        let cap = action_timeout(RuntimeAction::ReloadWeights).unwrap();
+        assert!(cap >= Duration::from_secs(3600), "{cap:?}");
+        assert_eq!(
+            action_timeout(RuntimeAction::Park).unwrap(),
+            Duration::from_secs(60)
+        );
     }
 }

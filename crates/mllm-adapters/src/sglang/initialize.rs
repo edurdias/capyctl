@@ -15,7 +15,7 @@ use mllm_domain::completion::{
     EffectObservation, ExecutionIdentities, Milestone, Presence, ProcessIdentity,
     StepExecutionContext,
 };
-use mllm_domain::launch::ProfileLaunchSettings;
+use mllm_domain::launch::LaunchSettings;
 
 use crate::protected::ProtectedLaunchDescriptors;
 use crate::traits::{
@@ -99,7 +99,7 @@ pub(super) async fn initialize(
     let (launch, tools, inference, admin) = adapter.launch_parts()?;
     if !matches!(
         context.launch_settings,
-        Some(ProfileLaunchSettings::Sglang(_))
+        Some(LaunchSettings::Sglang(_))
     ) || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
         return Err(RuntimeError::Unsupported);
@@ -130,8 +130,47 @@ pub(super) async fn initialize(
         i64::from(admin_fd),
     )?;
     let mut cmd = launch.rendered.render_for_launcher(fds, &wrapper)?;
+    // SPEC §13.3: tools come from the selected installation and fixed system
+    // directories, never the caller's shell PATH. FlashInfer needs venv ninja.
+    let engine_bin = std::path::Path::new(launch.frozen.executable())
+        .parent().ok_or(RuntimeError::Unsupported)?;
+    let tool_path = std::env::join_paths([
+        engine_bin, std::path::Path::new("/usr/bin"), std::path::Path::new("/bin"),
+    ]).map_err(|_| RuntimeError::Unsupported)?
+        .into_string().map_err(|_| RuntimeError::Unsupported)?;
+    cmd.env.insert("PATH".into(), tool_path);
+    // SPEC §9.1 / T21: neither the entry nor any engine child writes bytecode
+    // beside mllm's checked runtime source.
+    cmd.env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    // ADR 0014 §8, SPEC §8.2: the host's approvals for sensitive extras.
+    if let Some(approvals) = adapter.extra_approvals() {
+        cmd.env.insert(
+            mllm_config::engine_policy::EXTRA_APPROVALS_ENV.into(),
+            approvals.into(),
+        );
+    }
+    let debug_logs = std::env::var("MLLM_DEBUG_ENGINE_LOGS").as_deref() == Ok("1");
+    if debug_logs {
+        cmd.env.insert("MLLM_DEBUG_ENGINE_LOGS".into(), "1".into());
+    }
     if let Some(log) = adapter.engine_log() {
         cmd.env.insert("MLLM_ENGINE_LOG".into(), log.to_string());
+    }
+    // SPEC §9.2: a memory-saver launch enrolls its saver observation in the
+    // host's private directory (the entry revalidates it and scopes it to this
+    // binding); without one the launch serves and Park is refused unchanged.
+    if let (true, Some(dir)) = (
+        launch.frozen.settings().memory_saver,
+        adapter.observation_dir(),
+    ) {
+        let dir = dir.to_str().ok_or(RuntimeError::Unsupported)?;
+        cmd.env.insert("MLLM_OBSERVATION_DIR".into(), dir.into());
+    }
+    // SPEC §8.2 / T21: a host-named rendezvous directory, removed by the host
+    // on gone evidence; without one the entry makes its own temporary one.
+    if let Some(dir) = adapter.rendezvous_dir() {
+        let dir = dir.to_str().ok_or(RuntimeError::Unsupported)?;
+        cmd.env.insert("MLLM_RENDEZVOUS_DIR".into(), dir.into());
     }
     // SPEC §3: the profile env allowlist rejects `CUDA_VISIBLE_DEVICES` by name
     // (`engine_policy.rs::SAFE_ENV`), so the guarded launcher sets it here as a
@@ -167,8 +206,7 @@ pub(super) async fn initialize(
         // and the builder's remaining budget: one stalled answer must become a
         // reported poll failure, never a hang past the coordinator's bound.
         let remaining_ms = (stop_at - now_ms()?).max(0) as u64;
-        let poll_budget =
-            Duration::from_millis(remaining_ms).min(super::http::MODELS_TIMEOUT);
+        let poll_budget = Duration::from_millis(remaining_ms).min(super::http::MODELS_TIMEOUT);
         match tokio::time::timeout(poll_budget, adapter.check_readiness(&member)).await {
             // Spec §4: the builder's own bound ends first, so its reason, not a
             // bare coordinator timeout, is what gets recorded.
@@ -197,11 +235,18 @@ pub(super) async fn initialize(
             .map_err(|_| RuntimeError::Uncertain("presence task failed".into()))?
         {
             Presence::Alive => {}
+            // SPEC §§6.4, 13.2: an engine that left before readiness is a
+            // launch failure with its own reason, not ownership uncertainty.
+            // The summary names refused options only, never values, so it is
+            // read from the tail even when the full log is retained privately.
             Presence::Gone => {
-                return Err(RuntimeError::Uncertain(format!(
-                    "engine exited before readiness; log tail:\n{}",
-                    log_tail(adapter.engine_log(), LOG_TAIL_LINES)
-                )))
+                let tail = log_tail(adapter.engine_log(), LOG_TAIL_LINES);
+                let summary = crate::launch_failure::summary(&tail, None);
+                return Err(RuntimeError::LaunchFailed(format!(
+                    "{summary}; log tail:\n{}",
+                    if debug_logs { "full native log retained privately; omitted from public diagnostics".into() }
+                    else { tail }
+                )));
             }
             // Unknown is retained, never absent: the step fails but says why.
             Presence::Unknown => {
