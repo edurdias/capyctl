@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M48 (T15, T16, T26, T27; G01-G15): seeded random-walk soak on both Sparks.
 #   KEEP_FAILED=1 SOAK_SEED=<n> SOAK_STEPS=200 run_row.sh M48
-#   resume: KEEP_FAILED=1 SOAK_RESUME=1 SOAK_PLAN=<plan.json> SOAK_SEED=<n> SOAK_FROM_STEP=<k> run_row.sh M48 --tag r<k>
+#   resume: KEEP_FAILED=1 SOAK_RESUME=1 SOAK_SEED=<n> SOAK_FROM_STEP=<k> run_row.sh M48 --tag r<k>
 #
 # Setup: server and both hosts online, host-b on the tight policy
 # (roles.sh host-doc host-b tight; host-down; host-up) and host-a on
@@ -12,11 +12,13 @@
 # its tool parser through accept_extra_args, rows/TC.sh):
 #   v92-4-sk   vLLM q4 on host-a (hermes)        s92-14-sk  SGLang q14 on host-a (qwen25)
 #   s17-4-sk   SGLang q4 on host-b (qwen25)      v17-14-sk  vLLM q14 on host-b (hermes)
+#   v17-4-sk   vLLM q4 on host-b (hermes), deployed stopped
 #   s92-4-rep  SGLang q4, two instances spread over both hosts, replica route
 #              qwen3-4b (qwen25); s92-4-rep.one.yaml is its count-only revision
 # host-a (normal, 97.35 GiB) holds all three of its charges at once (94 GiB);
-# host-b (tight, 84 GiB) holds two of its three, so a request for the third
-# switches automatically.
+# host-b (tight, 84 GiB) holds any two of its three single-instance deployments,
+# so the walk's switch operation starts two and requests the third, which must
+# park or stop one of them.
 #
 # soak.py then walks SOAK_STEPS steps (seed SOAK_SEED, resumable with
 # SOAK_FROM_STEP) and checks the invariants after every step; see its docstring.
@@ -40,6 +42,7 @@ for name, fixture, engine, model, hosts in (
         ("v92-4-sk", "v92-4", "vllm", "4", ["host-a"]),
         ("s92-14-sk", "s92-14", "sglang", "14", ["host-a"]),
         ("s17-4-sk", "s17-4", "sglang", "4", ["host-b"]),
+        ("v17-4-sk", "v17-4", "vllm", "4", ["host-b"]),
         ("v17-14-sk", "v17-14", "vllm", "14", ["host-b"])):
     path = f"{fx}/{fixture}.sk.yaml"
     d = doc(path)
@@ -67,6 +70,7 @@ soak_setup() {
   step variant-s92-14 variant s92-14 sk --engine-config-json "$SOAK_TC_SGLANG" || return 1
   step variant-s17-4 variant s17-4 sk --engine-config-json "$SOAK_TC_SGLANG" || return 1
   step variant-v17-14 variant v17-14 sk --engine-config-json "$SOAK_TC_VLLM" || return 1
+  step variant-v17-4 variant v17-4 sk --engine-config-json "$SOAK_TC_VLLM" || return 1
   step variant-rep variant s92-4 rep --route "$SOAK_REP_ROUTE" --engine-config-json "$SOAK_TC_SGLANG" \
     --document-json '{"host": null, "instances": 2, "placement": {"strategy": "spread", "max_per_host": 1}}' || return 1
   step plan soak_plan "$EVID/plan.json" || return 1
@@ -86,13 +90,21 @@ row_main() {
     dry || grep '^before-' "$EVID/mem.txt" >"$RUNSTATE/soak-baseline-mem.txt"
     FIXTURE_VARIANT=sk step deploy-s17-4 deploy s17-4 --activate --wait || rc=1
     FIXTURE_VARIANT=sk step deploy-v17-14 deploy v17-14 --activate --wait || rc=1
+    FIXTURE_VARIANT=sk step deploy-v17-4 deploy v17-4 || rc=1
     FIXTURE_VARIANT=sk step deploy-v92-4 deploy v92-4 --activate --wait || rc=1
     FIXTURE_VARIANT=sk step deploy-s92-14 deploy s92-14 --activate --wait || rc=1
     FIXTURE_VARIANT=rep step deploy-rep deploy s92-4 || rc=1
     [ "$rc" = 0 ] || { step errors-92 engine_errors host-a; step errors-17 engine_errors host-b; return 1; }
   else
-    # Resume a stopped walk on the same deployments (SOAK_PLAN: the earlier plan.json).
-    cp "${SOAK_PLAN:?SOAK_PLAN is the plan.json of the walk being resumed}" "$EVID/plan.json"
+    # Resume a stopped walk on the deployments it left: same fixtures and plan,
+    # and any plan deployment that does not exist yet is deployed stopped.
+    soak_setup || return 1
+    local f
+    for f in v92-4 s92-14 s17-4 v17-14 v17-4; do
+      status_dep "$f-sk" >/dev/null 2>&1 || { FIXTURE_VARIANT=sk step "deploy-$f" deploy "$f" || rc=1; }
+    done
+    status_dep s92-4-rep >/dev/null 2>&1 || { FIXTURE_VARIANT=rep step deploy-rep deploy s92-4 || rc=1; }
+    [ "$rc" = 0 ] || return 1
   fi
   dry && return 0
   export LRD SERVER_CFG SERVER_DB MLLM EVID RUNSTATE RRD REMOTE_TREE HOST_ID_92 HOST_ID_17 MLLM_API_KEY

@@ -16,7 +16,7 @@ M49_MEM_SLACK_KB=${M49_MEM_SLACK_KB:-$((4 * 1024 * 1024))}
 live_deployments() {
   cli list deployments --output json | python3 -c 'import json,sys
 d=json.load(sys.stdin)
-for x in d.get("deployments", d if isinstance(d, list) else []):
+for x in (d if isinstance(d, list) else d["deployments"]):
     n=x.get("name","")
     if n and not n.startswith("deleted/"): print(n, x.get("id",""))'
 }
@@ -62,7 +62,10 @@ pgrep -af 'mllm[ ]start' && { echo 'FINDING: an mllm role still runs'; exit 1; }
 
 row_main() {
   local rc=0 name id
-  step before-list live_deployments
+  # A listing that cannot be read stops the row before anything is deleted or
+  # any role is signalled (the first M49 run read none and took the roles down
+  # with engines still retained).
+  step before-list live_deployments || return 1
   while read -r name id; do
     [ -n "$name" ] || continue
     echo "$name $id" >>"$EVID/deleted.txt"

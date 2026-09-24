@@ -344,6 +344,9 @@ class Soak:
         ok = rec.get("status") == 200 and str(a + b) in (rec.get("content") or "") and (
             not stream or rec.get("sse_well_formed"))
         rec["verdict"] = "ok" if ok else "failed"
+        # An operator stop is sticky: a request never reactivates it (closed 429).
+        if rec.get("status") == 429 and "explicitly stopped" in json.dumps(rec.get("error") or ""):
+            rec["verdict"] = "refused"
         matrixhttp.append_jsonl(os.path.join(self.out, "requests.jsonl"), rec)
         return ok, {k: rec.get(k) for k in ("status", "content", "elapsed_s", "verdict", "error", "transport_error",
                                             "sse_well_formed", "finish_reason", "marker")}
@@ -365,7 +368,7 @@ class Soak:
         before = self.inst_states(sts[name])
         kind = "infer" if self.ready(sts[name]) else "activate-on-request"
         ok, rec = self.request(name, stream=stream)
-        return ("ok" if ok else "failed"), {"target": name, "kind": kind, "before": before, "request": rec}
+        return ("ok" if ok else rec["verdict"]), {"target": name, "kind": kind, "before": before, "request": rec}
 
     def op_stream(self, rng, sts, led):
         return self.op_infer(rng, sts, led, stream=True)
@@ -391,6 +394,8 @@ class Soak:
             rec = json.loads(proc.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             rec = {"raw": proc.stdout[-500:], "err": proc.stderr[-500:]}
+        if rec.get("status") == 429 and "explicitly stopped" in json.dumps(rec.get("error") or ""):
+            return "refused", {"target": name, "choice": choice, "stream": stream, "error": rec.get("error")}
         detail = {"target": name, "choice": choice, "stream": stream,
                   "status": rec.get("status"), "verdict": rec.get("verdict"),
                   "tool_calls": rec.get("tool_calls"), "finish_reason": rec.get("finish_reason"), "error": rec.get("error")}
@@ -453,26 +458,52 @@ class Soak:
                                             "kept": len(keep)}
 
     def op_switch(self, rng, sts, led):
+        """Request-driven switching on the tight host: its single-instance
+        deployments fit two at a time, so with two Ready a request for the third
+        must park or stop one of them (M27/M31). Incumbents are started first when
+        needed; when every candidate target is operator-stopped the switch is the
+        operator's `start --evict` instead."""
         hid = host_id("host-b")
+        trio = sorted(n for n, d in self.deps.items() if d["hosts"] == ["host-b"] and sts.get(n))
+        if len(trio) < 3:
+            return "skipped", {"why": "fewer than three single-instance deployments on host-b"}
+
+        def op_stopped(n):
+            s = sts[n] or {}
+            return s.get("desired_state") == "stopped" or any(i.get("operator_stopped") for i in s.get("instances", []))
+
+        idle = [n for n in trio if not self.ready(sts[n])]
+        if not idle:
+            idle = trio
+        free = [n for n in idle if not op_stopped(n)]
+        target = self.pick(rng, free or idle)
+        prepared = []
+        for n in trio:
+            if n != target and not self.ready(self.status(n) or {}):
+                rc, data, err = cli("start", "deployment", n, "--wait", "--output", "json")
+                prepared.append({"start": n, "rc": rc, "err": err[-300:]})
+        led = ledger()
         charged, _ = self.charged_on(led, hid)
         limit = self.limits["host-b"]["managed_limit"]
-        cands = []
-        for n, s in sts.items():
-            if not s or "host-b" not in self.deps[n]["hosts"]:
-                continue
-            here = [i for i in s.get("instances", []) if i.get("host_id") == hid]
-            if any(i.get("observed_state") == "ready" for i in s.get("instances", [])):
-                continue
-            if here and charged + self.deps[n]["request_bytes"] > limit:
-                cands.append(n)
-        name = self.pick(rng, cands)
-        if not name:
-            return "skipped", {"why": "no host-b deployment needs a switch"}
-        before = {n: self.inst_states(s) for n, s in sts.items()}
-        ok, rec = self.request(name, stream=rng.random() < 0.3)
+        target_st = self.status(target) or {}
+        needs = not self.ready(target_st) and charged + self.deps[target]["request_bytes"] > limit
+        before = {n: self.inst_states(self.status(n)) for n in self.deps}
+        if self.ready(target_st):
+            # Every one was already up (the replica held no host-b charge): park one to request back.
+            return "skipped", {"why": "target already ready", "prepared": prepared}
+        if op_stopped(target):
+            rc, data, err = cli("start", "deployment", target, "--evict", "--wait", "--output", "json")
+            ok, rec = rc == 0, {"rc": rc, "out": data, "err": err[-600:]}
+            kind = "operator-evict"
+        else:
+            ok, rec = self.request(target, stream=rng.random() < 0.3)
+            kind = "request"
         after = {n: self.inst_states(self.status(n)) for n in self.deps}
-        return ("ok" if ok else "failed"), {"target": name, "charged_before": charged, "limit": limit,
-                                            "request": rec, "before": before, "after": after}
+        victims = [n for n in trio if n != target and any(st == "ready" for _, st, _ in before[n])
+                   and not any(st == "ready" for _, st, _ in after[n])]
+        return ("ok" if ok else "failed"), {"target": target, "kind": kind, "needed_switch": needs,
+                                            "charged_before": charged, "limit": limit, "prepared": prepared,
+                                            "victims": victims, "request": rec, "before": before, "after": after}
 
     def op_count(self, rng, sts, led):
         rep = self.plan.get("replica")
@@ -497,8 +528,12 @@ class Soak:
         if state in ("ready", "parked"):
             dead = self.identities_of(led, s["id"], hid)
             rc, data, err = cli("stop", "instance", target, "--output", "json")
-            done = self.wait_until(rep, lambda x: any(i.get("index") == idx and i.get("observed_state") == "stopped"
-                                                      for i in x.get("instances", [])), 900)
+            # A count-only revision keeps a running instance on its old index; once
+            # it stops, that index is retired and status lists index 0 in its place
+            # (ADR 0013 section 7; found live in the first soak, step 54). So the
+            # stop is done when that index is stopped or gone.
+            done = self.wait_until(rep, lambda x: not any(i.get("index") == idx and i.get("observed_state") != "stopped"
+                                                          for i in x.get("instances", [])), 900)
             if rc == 0 and done:
                 self.expect_dead += dead
             return ("ok" if rc == 0 and done else "refused" if rc else "failed"), {
@@ -639,7 +674,7 @@ class Soak:
 
     OPS = [
         ("infer", 14), ("stream", 10), ("toolcall", 5), ("start", 6), ("stop", 7), ("park", 7),
-        ("wake", 6), ("switch", 6), ("count", 3), ("instance", 5), ("delete_redeploy", 3),
+        ("wake", 6), ("switch", 8), ("count", 3), ("instance", 5), ("delete_redeploy", 3),
         ("drain", 2), ("agent_restart", 2), ("engine_kill", 3), ("freeze", 2),
     ]
 
@@ -715,9 +750,15 @@ class Soak:
         for n, s in sts.items():
             if not s:
                 continue
+            # A stopped instance keeps its last host, and a sibling may since have
+            # been placed there (live, step 41 of the first soak): a binding on that
+            # host belongs to the instance that is not stopped.
+            active_hosts = {i.get("host_id") for i in s.get("instances", []) if i.get("observed_state") != "stopped"}
             for i in s.get("instances", []):
                 st, hid, owner = i.get("observed_state"), i.get("host_id"), i.get("reservation_owner")
                 b = bindings.get((s["id"], hid))
+                if st == "stopped" and hid in active_hosts:
+                    b = None
                 o = owners.get(owner)
                 tag = f"{n}/{i.get('index')}@{host_name(hid)}"
                 if b:
