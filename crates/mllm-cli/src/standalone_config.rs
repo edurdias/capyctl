@@ -22,6 +22,8 @@ const MANAGED_FRACTION: i64 = 50;
 const FREE_RESERVE_FRACTION: i64 = 20;
 const PARKED_FRACTION: i64 = 25;
 const HOST_KV_FRACTION: i64 = 10;
+/// ADR 0014 §5: the default KV cache, below the Ready allocation (15%).
+const KV_CACHE_FRACTION: i64 = 10;
 
 /// The name the published table uses for an engine family.
 fn engine_name(engine: Engine) -> &'static str {
@@ -34,9 +36,9 @@ fn engine_name(engine: Engine) -> &'static str {
 /// The host policy standalone publishes: the one engine installation it offers, the
 /// store its weights live under, and the limits it will admit against.
 ///
-/// Spec §7: the published table states the installation's own launch settings, the
-/// flags its profile passes, whether deep park is available on it, and where models
-/// are kept. Every one of those comes from the installation the provider found, so
+/// Spec §7: the published table states the flags the installation's profile
+/// passes, whether deep park is available on it, and where models are kept. ADR
+/// 0014 §1: engine tuning is the deployment's, so no launch settings are published. Every one of those comes from the installation the provider found, so
 /// what is published and what would be launched cannot disagree.
 ///
 /// `environment_fingerprint` names the surrounding environment the installation was
@@ -61,27 +63,26 @@ pub fn host_policy(
     if let Some(uuid) = inventory.and_then(|published| published.physical_gpu_uuid.as_deref()) {
         gpu0["physical_gpu_uuid"] = json!(uuid);
     }
-    // SPEC §13.3: an SGLang launch seals two per-launch keys under distinct
-    // roles, so its profile names both references; the coordinator resolves
-    // them per launch, never from the profile itself.
-    let security = if installation.engine == Engine::Sglang {
-        json!({
-            "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
-            "trust_remote_code": installation.trust_remote_code,
-            "credential_ref": "secret://engine-key",
-            "admin_credential_ref": "secret://admin-key"
-        })
-    } else {
-        json!({
-            "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
-            "trust_remote_code": installation.trust_remote_code,
-            "credential_ref": "secret://engine-key"
-        })
-    };
+    // SPEC §13.3, §9.1 / T21, ADR 0012: every launch seals two per-launch
+    // keys under distinct roles, inference and admin, so the profile names
+    // both references; the coordinator resolves them per launch, never from
+    // the profile itself. A vLLM launch keys its development and control
+    // routes with the admin key, apart from the inference key ingress holds.
+    let mut security = json!({
+        "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
+        "trust_remote_code": installation.trust_remote_code,
+        "credential_ref": "secret://engine-key",
+        "admin_credential_ref": "secret://admin-key"
+    });
+    // ADR 0008 (owner decision 2026-09-23): stated only when the host refuses
+    // drift, so a default document is unchanged.
+    if installation.installation_drift == mllm_config::effective::InstallationDrift::Refuse {
+        security["installation_drift"] = json!("refuse");
+    }
     json!({
         "schema_version": 1,
         "kind": "host",
-        "name": "standalone",
+        "name": inventory.map_or("standalone", |published| published.host_id.as_str()),
         "hardware_fingerprint": format!("standalone-{engine}"),
         "environment_fingerprint": environment_fingerprint,
         // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
@@ -99,7 +100,6 @@ pub fn host_policy(
                 "build_fingerprint": installation.build_fingerprint,
                 "args": installation.args,
                 "env": {},
-                "launch_settings": installation.launch_settings,
                 "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
                 "security": security
             }
@@ -120,7 +120,10 @@ pub fn host_policy(
             "device_sharing": "shared",
             "max_parked": 4,
             "observation_ttl": "2s",
-            "endpoint_port_range": {"start": 8100, "end": 8199},
+            "endpoint_port_range": {
+                "start": installation.engine_ports.0,
+                "end": installation.engine_ports.1
+            },
             "planner_max_states": 4096,
             "queue": {
                 "admission_window": "2s",
@@ -149,10 +152,19 @@ pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
 /// Phase footprints are declared because admission compares a transition's peak
 /// against the ceiling, not its steady state.
 ///
+/// ADR 0014 §2, §5: the document carries an `engine_config` whose KV cache is a
+/// tenth of capacity, inside the Ready allocation that is its memory request.
+/// Standalone replaces it with the installation's configured block
+/// ([`EngineInstallation::engine_config`]) when it deploys.
+///
 /// `request_deadline` is a parameter rather than a constant because the deadline is
 /// a property of the deployment an operator asks for, and the live suite has to be
 /// able to state a short one to see what the bound does. Ordinary callers pass
 /// [`DEFAULT_REQUEST_DEADLINE`].
+///
+/// `deep_park` is the host's switch ([`EngineInstallation::deep_park`]). ADR 0012:
+/// deep parking is on by default and a host opts out, so the generated residency
+/// has to follow that switch rather than state a tier the host's profile refuses.
 pub fn deployment_document(
     name: &str,
     route: &str,
@@ -160,17 +172,21 @@ pub fn deployment_document(
     engine: Engine,
     capacity_bytes: i64,
     request_deadline: &str,
+    deep_park: bool,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
-    // The pinned SGLang recipe parks by mechanism: `normalize_launch` derives
-    // `memory_saver` from the declared residency, and the frozen launch
-    // contract refuses a recipe shape without it (found live: the restart_only
-    // template made every standalone SGLang launch fail the frozen-shape
-    // check). vLLM keeps the restart-only fallback (SPEC §6.2), which is the
-    // residency its sleep-mode launch does not need.
+    // ADR 0012: deep parking is on by default and a host opts out. SGLang parks
+    // by mechanism, and engine configuration resolution derives `memory_saver`
+    // from the declared residency (ADR 0014 §4), so a deep-parking host declares
+    // `deep`. SPEC §6.2: restart_only is a first-class residency, not a failure
+    // mode; an opted-out SGLang host declares it, launches without the memory
+    // saver, and its park is refused `unchanged`. A `deep` deployment on an
+    // opted-out host would be refused at resolution (T21). vLLM stays
+    // restart_only either way; its sleep-mode launch does not need a tier.
     let residency = match engine {
-        Engine::Sglang => "deep",
+        Engine::Sglang if deep_park => "deep",
+        Engine::Sglang => "restart_only",
         Engine::Vllm => "restart_only",
     };
     let allocation = |percent: i64, kv: i64| json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}]);
@@ -184,9 +200,8 @@ pub fn deployment_document(
         "runtime_profile": STANDALONE_PROFILE,
         "runtime_profile_revision": 1,
         "recipe": "standalone",
-        // ADR 0010 makes the residency declarable; SGLang's pinned recipe is a
-        // deep-parking recipe and the template states the tier its profile can
-        // deliver, while vLLM keeps the restart-only fallback (SPEC §6.2).
+        // ADR 0010 makes the residency declarable; the template states the tier
+        // the host's profile can deliver (see `residency` above).
         "residency": residency,
         "recovery": "reconcile",
         // Ordered: activation window <= deployment deadline <= host ceiling.
@@ -197,6 +212,7 @@ pub fn deployment_document(
             "revision": "r1"
         },
         "devices": devices,
+        "engine_config": {"memory": {"kv_cache": share(KV_CACHE_FRACTION)}},
         "resources": {
             "cold":    {"allocations": allocation(20, 2), "devices": devices},
             "ready":   {"allocations": allocation(15, 2), "devices": devices},

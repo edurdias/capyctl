@@ -4,6 +4,8 @@
 //! here are expected rather than a sign of dead code.
 #![allow(dead_code)]
 
+pub mod process;
+
 use std::sync::Arc;
 
 use axum::response::IntoResponse as _;
@@ -26,9 +28,74 @@ pub fn safe_state_dir() -> tempfile::TempDir {
 /// engine the developer's environment happens to name. Passing this one is not
 /// qualification of a native recipe and must never be reported as one (SPEC §18).
 pub async fn boot(state_dir: &std::path::Path) -> mllm_cli::roles::App {
-    mllm_cli::roles::start_standalone_with(state_dir, mllm_testkit::fake_provider())
-        .await
-        .expect("standalone boots")
+    mllm_cli::roles::start_standalone_with_memory(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+        }),
+        test_memory(),
+    )
+    .await
+    .expect("standalone boots")
+}
+
+/// The explicit host capacity every standalone test boots with: 32 GiB, all
+/// of it free. Standalone derives its limits and the default deployment's
+/// footprints from the observed capacity and admits against observed free
+/// memory (SPEC §7), so reading the suite machine's own `/proc/meminfo` made
+/// these tests fail on a machine with little memory free (found 2026-09-23 on
+/// control-host: `a1_gate` and three standalone tests).
+pub const TEST_CAPACITY_BYTES: i64 = 32 << 30;
+
+/// The capacity a test that drives the real `mllm` binary sizes its
+/// deployment documents from. The binary observes this machine's own memory,
+/// which a test cannot state, so the deployment is sized from a small explicit
+/// capacity instead of from `/proc/meminfo`: its footprints then fit under the
+/// limits standalone derives from any real machine's capacity and under the
+/// memory free on a busy one (a document sized from the whole machine asked
+/// for a fifth of it at cold start).
+pub const BINARY_TEST_CAPACITY_BYTES: i64 = 4 << 30;
+
+pub fn test_memory() -> mllm_cli::host_observation::MemoryReader {
+    mllm_cli::host_observation::fixed_memory(TEST_CAPACITY_BYTES, TEST_CAPACITY_BYTES)
+}
+
+/// A per-test engine port range: eight consecutive loopback ports that were
+/// free when chosen, below the kernel's ephemeral range (`process::free_ports`).
+/// Standalone leases engine endpoints from the bottom of its range, so a fixed
+/// range (the 8100 default) makes every test that stands a stub engine up at
+/// its leased endpoint collide with every other such test running in parallel.
+pub fn engine_ports() -> (u16, u16) {
+    let ports = process::free_ports(8, true);
+    (ports[0], ports[7])
+}
+
+/// The testkit's Fake installation on a per-test engine port range.
+struct PortedProvider {
+    ports: (u16, u16),
+}
+
+impl mllm_controller::EngineProvider for PortedProvider {
+    fn installation(
+        &self,
+    ) -> Result<mllm_controller::EngineInstallation, mllm_controller::ProviderError> {
+        let mut installation = mllm_testkit::fake_installation();
+        installation.engine_ports = self.ports;
+        Ok(installation)
+    }
+
+    fn bindings(
+        &self,
+        clock: mllm_controller::coordinator::ServiceClock,
+        log_dir: std::path::PathBuf,
+        runtime_dir: std::path::PathBuf,
+    ) -> Arc<dyn mllm_controller::coordinator::EngineBindings> {
+        mllm_testkit::fake_bindings(clock, log_dir, runtime_dir)
+    }
+
+    fn tools_factory(&self) -> mllm_controller::coordinator::ToolsFactory {
+        mllm_testkit::fake_tools_factory()
+    }
 }
 
 /// A minimal engine at the endpoint the coordinator recorded for a deployment.

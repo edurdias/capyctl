@@ -84,7 +84,11 @@ async fn router_serves_models_and_chat_over_http() {
         .unwrap();
     assert_eq!(models.status(), 200);
     let ids: serde_json::Value = models.json().await.unwrap();
-    assert!(ids["data"].as_array().unwrap().iter().any(|m| m["id"] == "http-m"));
+    assert!(ids["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "http-m"));
 
     let chat = client
         .post(format!("http://{addr}/v1/chat/completions"))

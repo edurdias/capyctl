@@ -3,12 +3,12 @@
 
 mod support;
 
-use mllm_config::effective::ModelSource;
-use mllm_controller::LifecyclePort as _;
 use mllm_cli::roles::App;
-use support::{boot, safe_state_dir};
+use mllm_config::effective::ModelSource;
 use mllm_controller::DeployRequest;
+use mllm_controller::LifecyclePort as _;
 use mllm_domain::{LifecycleAction, LifecycleState};
+use support::{boot, safe_state_dir};
 
 fn req_fake_engine(name: &str) -> DeployRequest {
     DeployRequest {
@@ -29,10 +29,21 @@ fn req_fake_engine(name: &str) -> DeployRequest {
 async fn standalone_boot_runs_the_restart_only_lifecycle() {
     let dir = safe_state_dir();
     let app = boot(dir.path()).await; // in-process server+host
-    let dep = app.deploy("m1", ModelSource::Local { path: "/models/m1".into() }).unwrap();
+    let dep = app
+        .deploy(
+            "m1",
+            ModelSource::Local {
+                path: "/models/m1".into(),
+            },
+        )
+        .unwrap();
     assert!(app.store.get_deployment(&dep).unwrap().is_some());
     async fn run(app: &App, dep: &str, action: LifecycleAction, want: LifecycleState) {
-        let op = app.controller.request_transition(dep, action).await.unwrap();
+        let op = app
+            .controller
+            .request_transition(dep, action)
+            .await
+            .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             app.controller.wait_terminal(&op),
@@ -55,32 +66,61 @@ async fn standalone_boot_runs_the_restart_only_lifecycle() {
 async fn resubmitting_the_same_request_is_idempotent() {
     let dir = safe_state_dir();
     let app = boot(dir.path()).await;
-    let first = app.controller.submit_deploy("standalone", &req_fake_engine("m1")).unwrap();
-    let second = app.controller.submit_deploy("standalone", &req_fake_engine("m1")).unwrap();
+    let first = app
+        .controller
+        .submit_deploy("standalone", &req_fake_engine("m1"))
+        .unwrap();
+    let second = app
+        .controller
+        .submit_deploy("standalone", &req_fake_engine("m1"))
+        .unwrap();
     assert_eq!(first, second);
     assert_eq!(app.store.deployment_count().unwrap(), 1);
 }
 
+/// SPEC §6.1, §6.3 (live M16, M53): an operator's Stop is always accepted.
+/// Nothing was ever started, so there is nothing to clean up; the Stop records
+/// the operator's intent at once (automatic activation suspended) instead of
+/// being refused as a stale-view conflict, and a later Start lifts it. This
+/// replaces the earlier pin `stop_is_illegal_from_stopped`, a deliberate change.
+// T10
 #[tokio::test]
-async fn stop_is_illegal_from_stopped() {
+async fn stop_from_stopped_is_recorded_at_once() {
     let dir = safe_state_dir();
     let app = boot(dir.path()).await;
-    let dep = app.deploy("m1", ModelSource::Local { path: "/models/m1".into() }).unwrap();
-    let err = app
+    let dep = app
+        .deploy(
+            "m1",
+            ModelSource::Local {
+                path: "/models/m1".into(),
+            },
+        )
+        .unwrap();
+    let op = app
         .controller
         .request_transition(&dep, LifecycleAction::Stop)
         .await
-        .unwrap_err();
-    // There is nothing to stop: no runtime was ever started, so no cleanup can be
-    // accepted against one. What matters is that it is refused rather than reported
-    // as a stop that did nothing.
-    //
-    // It is reported as a conflict, which reads as "your view is stale, re-read and
-    // retry" — and re-reading will not help, because nothing was ever started. The
-    // honest vocabulary is a refusal. Pinned here so a change is deliberate; the
-    // question is recorded in the status runbook.
-    assert!(
-        matches!(err, mllm_controller::LifecycleFault::Conflict(_)),
-        "{err:?}"
-    );
+        .expect("an operator Stop of a stopped deployment was refused");
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.controller.wait_terminal(&op),
+    )
+    .await
+    .expect("the Stop settles rather than hanging")
+    .unwrap();
+    assert_eq!(state, LifecycleState::Stopped);
+    assert!(app.store.is_admin_stopped(&dep).unwrap());
+    let op = app
+        .controller
+        .request_transition(&dep, LifecycleAction::Start)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.controller.wait_terminal(&op),
+    )
+    .await
+    .expect("the Start settles rather than hanging")
+    .unwrap();
+    assert!(!app.store.is_admin_stopped(&dep).unwrap());
 }

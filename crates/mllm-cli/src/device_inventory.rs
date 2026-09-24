@@ -28,6 +28,8 @@ const MODULE: &str = "runtime.sglang_device";
 /// What a boot publishes about the host's NVIDIA devices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryPublication {
+    /// Host identity observed in the same inventory as its digest.
+    pub host_id: String,
     /// The collector's `mllm-nvidia-inventory-v1` digest, as the host policy's
     /// `device_inventory_digest` carries it.
     pub digest: String,
@@ -56,7 +58,11 @@ pub fn collect_with(
 
 /// Runs the collector and returns its stdout, bounded.
 fn run_collector(runtime_root: &Path) -> std::io::Result<String> {
+    // SPEC §9.1 / T21: no bytecode is written into mllm's runtime tree, whose
+    // integrity check refuses any it finds.
     let mut child = Command::new("python3")
+        .arg("-B")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .arg("-m")
         .arg(MODULE)
         .current_dir(runtime_root)
@@ -100,6 +106,12 @@ fn run_collector(runtime_root: &Path) -> std::io::Result<String> {
 /// a document the host does not publish from.
 pub fn publication(raw: &str) -> Option<InventoryPublication> {
     let document: Value = serde_json::from_str(raw.trim()).ok()?;
+    let host_id = document["host_id"].as_str()?;
+    if host_id.is_empty() || host_id.len() > 253
+        || !host_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    {
+        return None;
+    }
     let digest = document["digest"].as_str()?;
     if digest.len() != 64
         || !digest
@@ -129,6 +141,7 @@ pub fn publication(raw: &str) -> Option<InventoryPublication> {
         _ => None,
     };
     Some(InventoryPublication {
+        host_id: host_id.to_owned(),
         digest: digest.to_owned(),
         physical_gpu_uuid,
     })

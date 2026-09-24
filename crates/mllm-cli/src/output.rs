@@ -98,14 +98,16 @@ impl StructuredError {
     pub fn not_yet_implemented(action: &str) -> Self {
         Self {
             code: "not_implemented",
-            message: format!("{action} is not yet implemented; role wiring lands with the standalone exit gate"),
+            message: format!(
+                "{action} is not yet implemented; role wiring lands with the standalone exit gate"
+            ),
         }
     }
 
     pub fn exit_code(&self) -> ExitCode {
         match self.code {
-            "internal" => ExitCode::INTERNAL,
-            "invalid_config" => ExitCode::INVALID_CONFIG,
+            "internal" | "management_unavailable" | "operation_failed" => ExitCode::INTERNAL,
+            "invalid_config" | "command_rejected" | "not_found" => ExitCode::INVALID_CONFIG,
             "unauthorized" => ExitCode::UNAUTHORIZED,
             "insufficient_resources" => ExitCode::INSUFFICIENT_RESOURCES,
             "unreconciled" => ExitCode::UNRECONCILED,
@@ -160,6 +162,135 @@ pub fn print_error(err: &StructuredError, format: OutputFormat) {
 pub fn exit_code_for_cli_error(err: &CliError) -> ExitCode {
     match err {
         CliError::Clap(_) => ExitCode::INVALID_CONFIG,
+    }
+}
+
+/// SPEC §9.1 / T21 / ADR 0012 / owner decision P4: human-readable warnings
+/// for every deployment and host installation in a status, inspect or list
+/// view whose launch exposes vLLM development controls, and for any whose
+/// exposure could not be derived. The server derives the mark from effective
+/// configuration; this only renders it. Printed to stderr in text mode, so the
+/// JSON result on stdout is unchanged.
+pub fn development_controls_notices(view: &serde_json::Value) -> Vec<String> {
+    let mut notices = Vec::new();
+    collect_notices(view, &mut notices);
+    notices
+}
+
+fn collect_notices(view: &serde_json::Value, notices: &mut Vec<String>) {
+    use serde_json::Value;
+    match view {
+        Value::Array(items) => items.iter().for_each(|item| collect_notices(item, notices)),
+        Value::Object(object) => {
+            if let Some(hosts) = object.get("hosts") {
+                collect_notices(hosts, notices);
+            }
+            if let Some(deployments) = object.get("deployments") {
+                collect_notices(deployments, notices);
+            }
+            let Some(controls) = object.get("development_controls") else {
+                return;
+            };
+            let label = object
+                .get("name")
+                .or_else(|| object.get("id"))
+                .or_else(|| object.get("host_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            if object.contains_key("host_id") {
+                let installations = controls["installations"].as_array();
+                for installation in installations.into_iter().flatten() {
+                    let profile = installation["profile"].as_str().unwrap_or("?");
+                    push_notice(
+                        &format!("host {label} installation {profile}"),
+                        installation,
+                        notices,
+                    );
+                }
+                if controls["state"] == "unknown"
+                    && installations.is_none_or(|all| all.iter().all(|i| i["state"] != "unknown"))
+                {
+                    notices.push(format!(
+                        "warning: host {label}: development-control exposure is unknown (no readable published configuration)"
+                    ));
+                }
+            } else {
+                push_notice(&format!("deployment {label}"), controls, notices);
+                // ADR 0013 §6 (W14 per-instance marking): an instance carries the
+                // mark of the revision as resolved on its own host. Only a mark
+                // that differs from the deployment's is repeated.
+                for instance in object
+                    .get("instances")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let mark = &instance["development_controls"];
+                    if !mark.is_null() && mark != controls {
+                        let index = instance["index"].as_u64().unwrap_or(0);
+                        push_notice(&format!("deployment {label} instance {index}"), mark, notices);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_notice(subject: &str, controls: &serde_json::Value, notices: &mut Vec<String>) {
+    let list = |key: &str| {
+        controls[key]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    };
+    match controls["state"].as_str() {
+        Some("exposed") => {
+            let deep_park = controls["deep_park"].as_str().unwrap_or("?");
+            let source = controls["deep_park_source"].as_str().unwrap_or("host_policy");
+            // ADR 0014 §4: an installation's mark applies to the parking
+            // deployments launched on it, where sleep mode is derived on.
+            let scope = match controls["applies_to"].as_str() {
+                Some("parking_deployments") => " for parking deployments",
+                _ => "",
+            };
+            notices.push(format!(
+                "warning: {subject} launches{scope} with vLLM development mode on (deep_park {deep_park} ({source}), sleep mode); \
+                 exposed controls: {}; mitigations in force: {}; not production-safe (SPEC §9.1)",
+                list("surface"),
+                list("mitigations"),
+            ));
+        }
+        Some("unknown") => notices.push(format!(
+            "warning: {subject}: development-control exposure is unknown (effective configuration unavailable)"
+        )),
+        _ => {}
+    }
+    // Owner decision 2026-09-22 (T21): SGLang exempts `/metrics` from its API
+    // key. Accepted, and noted wherever the server derived the mark.
+    let surfaces = &controls["unauthenticated_local_surfaces"];
+    if surfaces.is_object() {
+        let routes = surfaces["surface"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        notices.push(format!(
+            "note: {subject} serves {routes} without authentication on its {} listener ({}; accepted by owner decision)",
+            surfaces["listener"].as_str().unwrap_or("?"),
+            surfaces["access"].as_str().unwrap_or("?"),
+        ));
     }
 }
 

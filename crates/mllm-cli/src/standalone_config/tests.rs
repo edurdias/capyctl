@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use mllm_config::effective::{DeepPark, ModelSource};
 use mllm_config::engine_policy::Engine;
 use mllm_controller::{EngineInstallation, EngineProvider as _};
-use mllm_domain::launch::ProfileLaunchSettings;
+use mllm_domain::launch::{LaunchSettings, SettingSource};
 
 const CAPACITY: i64 = 128 * 1024 * 1024 * 1024;
 
@@ -20,12 +20,14 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         engine,
         executable: executable.into(),
         build_fingerprint: "fp-1".into(),
-        launch_settings: mllm_testkit::vllm_launch_settings_json(),
+        engine_config: mllm_testkit::vllm_engine_config_json(),
         deep_park: false,
         trust_remote_code: false,
         models_root: "/srv/models".into(),
         runtime_dir: "/opt/mllm/runtime".into(),
         args: Vec::new(),
+        installation_drift: Default::default(),
+        engine_ports: (8100, 8199),
     }
 }
 
@@ -55,7 +57,9 @@ fn the_host_declares_exactly_one_engine_installation() {
 }
 
 /// Deep-park paths are the host's decision, not the adapter's (SPEC §9.1, T21), so
-/// the profile must carry the opt-in rather than leaving it to be re-derived.
+/// the profile must carry the host's switch, including an opt-out, rather than
+/// leaving it to be re-derived.
+// T21
 #[test]
 fn the_deep_park_switch_is_carried_by_the_profile() {
     for allowed in [false, true] {
@@ -69,6 +73,20 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
     }
 }
 
+/// SPEC §9.1 / §13.3, ADR 0012: an embedded vLLM launch seals an admin key
+/// apart from its inference key, as SGLang does, so the published profile names
+/// both references for every engine family, and the two differ.
+// T21 T37
+#[test]
+fn every_engine_profile_names_distinct_inference_and_admin_references() {
+    for engine in [Engine::Vllm, Engine::Sglang] {
+        let host = host_policy(&installed(engine, "/opt/engine"), "env-1", CAPACITY, None);
+        let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
+        assert_eq!(security["credential_ref"], "secret://engine-key", "{engine:?}");
+        assert_eq!(security["admin_credential_ref"], "secret://admin-key", "{engine:?}");
+    }
+}
+
 /// Spec §3: running Python that arrived inside a checkpoint is the host's decision
 /// too, and it is a separate one from parking.
 #[test]
@@ -79,6 +97,38 @@ fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
     let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
     assert_eq!(security["trust_remote_code"], true);
     assert_eq!(security["deep_park"], "disabled");
+}
+
+/// ADR 0008 (owner decision 2026-09-23): the standalone host's
+/// `installation_drift` policy reaches the resolved profile a launch is gated
+/// on; the default `warn` leaves the published document unchanged.
+// T21 T22
+#[test]
+fn the_installation_drift_policy_is_carried_by_the_profile() {
+    use mllm_config::effective::InstallationDrift;
+    for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
+        let mut installation = installed(Engine::Vllm, "/opt/vllm");
+        installation.installation_drift = policy;
+        let host = host_policy(&installation, "env-1", CAPACITY, None);
+        let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
+        match policy {
+            InstallationDrift::Warn => assert!(security.get("installation_drift").is_none()),
+            InstallationDrift::Refuse => assert_eq!(security["installation_drift"], "refuse"),
+        }
+        let deployment = deployment_document(
+            "d",
+            "d",
+            &local("/srv/models/d"),
+            Engine::Vllm,
+            CAPACITY,
+            DEFAULT_REQUEST_DEADLINE,
+            false,
+        );
+        let mut deployment = deployment;
+        deployment["engine_config"] = installation.engine_config.clone();
+        let effective = mllm_config::effective::resolve_effective(&deployment, &host).unwrap();
+        assert_eq!(effective.profile.security.installation_drift, policy);
+    }
 }
 
 /// Spec §7: a relative model path resolves against the store the host names, so the
@@ -147,6 +197,7 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
+        true,
     );
     let resources = d["resources"].as_object().unwrap();
     for phase in ["cold", "ready", "parking", "parked", "wake"] {
@@ -181,6 +232,7 @@ fn a_parked_deployment_holds_no_device() {
         Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
+        true,
     );
     assert_eq!(
         d["resources"]["parked"]["devices"]
@@ -206,6 +258,7 @@ fn the_deployment_names_its_installation() {
         Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
+        true,
     );
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
@@ -222,6 +275,7 @@ fn the_deployment_states_its_model_source() {
         Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
+        true,
     );
     assert_eq!(d["model"]["source"]["type"], "local");
     assert_eq!(d["model"]["source"]["path"], "/models/m");
@@ -237,6 +291,7 @@ fn the_deployment_states_its_model_source() {
         Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
+        true,
     );
     assert_eq!(fetched["model"]["source"]["type"], "huggingface");
     assert_eq!(fetched["model"]["source"]["repo"], "org/model");
@@ -271,8 +326,29 @@ fn a_standalone_deployment_is_restart_only() {
         Engine::Vllm,
         1 << 40,
         DEFAULT_REQUEST_DEADLINE,
+        true,
     );
     assert_eq!(deployment["residency"], "restart_only");
+}
+
+/// A copy of mllm's runtime modules the way a prepared installation carries
+/// them (SPEC §9.1 / T21): this user's, not group- or other-writable, whatever
+/// the umask of the checkout they come from.
+fn private_runtime(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+    let runtime = dir.join("runtime");
+    std::fs::create_dir_all(&runtime).expect("a runtime directory");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    for entry in std::fs::read_dir(&source).expect("the checkout runtime") {
+        let path = entry.expect("an entry").path();
+        if path.extension().is_some_and(|extension| extension == "py") {
+            let copy = runtime.join(path.file_name().expect("a name"));
+            std::fs::copy(&path, &copy).expect("a module copy");
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        }
+    }
+    runtime
 }
 
 /// An executable that prints a version, as an engine installation's would.
@@ -286,9 +362,10 @@ fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
     bin
 }
 
-/// Spec §7: the host policy built from the environment carries the full vLLM launch
-/// settings, the model store, deep park disabled by default and the flags the
-/// profile passes — and it resolves, which is what a deployment is qualified
+/// Spec §7: the host policy built from the environment carries the model store,
+/// the deep-park switch and the flags the profile passes, and the deployment
+/// standalone generates carries the engine configuration (ADR 0014 §1) — and
+/// together they resolve, which is what a deployment is qualified
 /// against. A table that merely looked complete but did not resolve would refuse
 /// every start at the point where the refusal is hardest to read.
 #[test]
@@ -304,7 +381,7 @@ fn host_policy_from_env_is_complete() {
     std::env::set_var("MLLM_MODELS_ROOT", &models);
     std::env::set_var(
         "MLLM_RUNTIME_DIR",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
+        private_runtime(dir.path()),
     );
     for name in [
         "MLLM_ENGINE_FINGERPRINT",
@@ -324,29 +401,39 @@ fn host_policy_from_env_is_complete() {
     assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
 
     let host = host_policy(&installation, "env-1", CAPACITY, None);
-    let deployment = deployment_document(
+    // ADR 0014 §1: the published profile carries no engine tuning.
+    assert!(host["runtime_profiles"][STANDALONE_PROFILE]
+        .get("launch_settings")
+        .is_none());
+    let mut deployment = deployment_document(
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
         Engine::Vllm,
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
+        installation.deep_park,
     );
+    deployment["engine_config"] = installation.engine_config.clone();
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("the published table resolves");
 
-    let ProfileLaunchSettings::Vllm(settings) = &resolved.profile.launch_settings else {
+    let LaunchSettings::Vllm(settings) = &resolved.engine_config else {
         panic!("the installation is vLLM, so its launch settings are vLLM's");
     };
-    assert_eq!(settings.tensor_parallel_size, 1);
-    assert_eq!(settings.pipeline_parallel_size, 1);
-    assert_eq!(settings.kv_cache_dtype, "auto");
-    assert_eq!(settings.block_size_tokens, 16);
-    assert_eq!(settings.requested_budget.kv_cache_bytes, 16 << 30);
-    assert_eq!(settings.requested_budget.swap_space_bytes, 0);
-    assert_eq!(settings.requested_budget.gpu_utilization_pct, 10);
+    // The environment's default KV cache; the request is the Ready allocation.
+    assert_eq!(settings.memory.kv_cache_bytes, 16 << 30);
+    assert_eq!(
+        settings.memory.request_bytes,
+        resolved.resources.ready.allocations[0].bytes
+    );
+    assert_eq!(settings.common.kv_cache_dtype, None);
+    // SPEC §9.1 / ADR 0012: an unset `MLLM_DEEP_PARK` leaves deep parking on;
+    // sleep mode is derived, and the restart-only standalone vLLM deployment
+    // never parks, so it gets none (SPEC §6.2).
     assert!(!settings.enable_sleep_mode);
-    assert_eq!(resolved.profile.security.deep_park, DeepPark::Disabled);
+    assert_eq!(settings.provenance["enable_sleep_mode"], SettingSource::Derived);
+    assert_eq!(resolved.profile.security.deep_park, DeepPark::Enabled);
     assert!(!resolved.profile.security.trust_remote_code);
     assert_eq!(resolved.profile.args, ["--max-model-len", "4096"]);
     assert_eq!(resolved.profile.executable, bin.to_string_lossy());
@@ -364,10 +451,12 @@ fn host_policy_from_env_is_complete() {
     std::env::remove_var("MLLM_RUNTIME_DIR");
 }
 
-/// SPEC §9.1: only an explicit opt-in enables experimental controls.
-// T21
+/// SPEC §9.1 / ADR 0012: standalone deep parking is on unless the host opts out
+/// with `MLLM_DEEP_PARK=off`. SPEC §15.3: any other value is a configuration
+/// error, never a silent guess in either direction.
+// T21 T03
 #[test]
-fn deep_park_requires_explicit_host_opt_in() {
+fn deep_park_is_on_unless_the_host_opts_out() {
     let _guard = ENVIRONMENT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -377,19 +466,33 @@ fn deep_park_requires_explicit_host_opt_in() {
     std::env::set_var("MLLM_MODELS_ROOT", dir.path());
     std::env::set_var(
         "MLLM_RUNTIME_DIR",
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
+        private_runtime(dir.path()),
     );
     std::env::set_var("MLLM_DEEP_PARK", "off");
     std::env::set_var("MLLM_TRUST_REMOTE_CODE", "1");
 
-    for (value, enabled) in [("off", false), ("", false), ("typo", false), ("on", true)] {
-        std::env::set_var("MLLM_DEEP_PARK", value);
+    for (value, enabled) in [(None, true), (Some("on"), true), (Some("off"), false)] {
+        match value {
+            Some(value) => std::env::set_var("MLLM_DEEP_PARK", value),
+            None => std::env::remove_var("MLLM_DEEP_PARK"),
+        }
         let installation = crate::roles::EnvEngineProvider::new()
             .installation()
             .expect("the environment declares an installation");
         assert_eq!(installation.deep_park, enabled, "{value:?}");
         assert!(installation.trust_remote_code);
-        assert_eq!(installation.launch_settings["enable_sleep_mode"], enabled);
+        assert_eq!(installation.engine_config["memory"]["kv_cache"], "16GiB");
+    }
+    // An empty export is the shape a mistyped opt-out leaves behind; it must not
+    // be read as "unset" and silently leave deep parking on.
+    for value in ["", "typo", "ON", "true", "1", "disabled"] {
+        std::env::set_var("MLLM_DEEP_PARK", value);
+        let refusal = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect_err("an unrecognized value is refused");
+        let message = refusal.to_string();
+        assert!(message.contains("MLLM_DEEP_PARK"), "{value:?}: {message}");
+        assert!(message.contains("off"), "{value:?}: {message}");
     }
 
     for name in [
@@ -401,4 +504,224 @@ fn deep_park_requires_explicit_host_opt_in() {
     ] {
         std::env::remove_var(name);
     }
+}
+
+/// ADR 0008 (owner decision 2026-09-23): `MLLM_INSTALLATION_DRIFT` is the
+/// standalone host's drift policy; unset is `warn`. SPEC §15.3: any other
+/// value is refused, never guessed.
+// T22 T03
+#[test]
+fn installation_drift_is_warn_unless_the_host_refuses() {
+    use mllm_config::effective::InstallationDrift;
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    std::env::set_var("MLLM_VLLM_BIN", &bin);
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    std::env::set_var("MLLM_RUNTIME_DIR", private_runtime(dir.path()));
+    for (value, policy) in [
+        (None, InstallationDrift::Warn),
+        (Some("warn"), InstallationDrift::Warn),
+        (Some("refuse"), InstallationDrift::Refuse),
+    ] {
+        match value {
+            Some(value) => std::env::set_var("MLLM_INSTALLATION_DRIFT", value),
+            None => std::env::remove_var("MLLM_INSTALLATION_DRIFT"),
+        }
+        let installation = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect("the environment declares an installation");
+        assert_eq!(installation.installation_drift, policy, "{value:?}");
+    }
+    for value in ["", "Refuse", "off", "deny"] {
+        std::env::set_var("MLLM_INSTALLATION_DRIFT", value);
+        let message = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect_err("an unrecognized value is refused")
+            .to_string();
+        assert!(message.contains("MLLM_INSTALLATION_DRIFT"), "{value:?}: {message}");
+    }
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_MODELS_ROOT",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_INSTALLATION_DRIFT",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+/// SPEC §3, §15.2: the engines' loopback port range is 8100-8199 unless this
+/// run names another, which the published host's resource policy then carries;
+/// SPEC §15.3: a malformed range is refused.
+// T03
+#[test]
+fn the_engine_port_range_can_be_named_for_one_run() {
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    std::env::set_var("MLLM_VLLM_BIN", &bin);
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    std::env::set_var("MLLM_RUNTIME_DIR", private_runtime(dir.path()));
+    for (value, ports) in [(None, (8100, 8199)), (Some("20100-20107"), (20100, 20107))] {
+        match value {
+            Some(value) => std::env::set_var(crate::roles::ENGINE_PORTS_ENV, value),
+            None => std::env::remove_var(crate::roles::ENGINE_PORTS_ENV),
+        }
+        let installation = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect("the environment declares an installation");
+        assert_eq!(installation.engine_ports, ports, "{value:?}");
+        let host = host_policy(&installation, "env-1", CAPACITY, None);
+        let range = &host["resource_policy"]["endpoint_port_range"];
+        assert_eq!((range["start"].as_u64(), range["end"].as_u64()),
+            (Some(ports.0.into()), Some(ports.1.into())));
+    }
+    for value in ["", "8100", "8199-8100", "80-90", "8100-70000", "a-b"] {
+        std::env::set_var(crate::roles::ENGINE_PORTS_ENV, value);
+        let message = crate::roles::EnvEngineProvider::new()
+            .installation()
+            .expect_err("a malformed range is refused")
+            .to_string();
+        assert!(message.contains(crate::roles::ENGINE_PORTS_ENV), "{value:?}: {message}");
+    }
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_MODELS_ROOT",
+        "MLLM_RUNTIME_DIR",
+        crate::roles::ENGINE_PORTS_ENV,
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+/// ADR 0008: with deep parking on, a parking vLLM deployment renders sleep
+/// mode, whose entry imports the capability probes, so a runtime directory
+/// without `engine_capabilities.py` is refused at boot; an opted-out vLLM host
+/// never imports them.
+// T21 T22 T37
+#[test]
+fn the_capability_probe_is_required_when_vllm_may_sleep() {
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    let runtime = private_runtime(dir.path());
+    std::fs::remove_file(runtime.join("engine_capabilities.py")).expect("the probe copy");
+    std::env::set_var("MLLM_VLLM_BIN", &bin);
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    std::env::set_var("MLLM_RUNTIME_DIR", &runtime);
+    std::env::remove_var("MLLM_DEEP_PARK");
+    let message = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect_err("deep parking on needs the probes")
+        .to_string();
+    assert!(message.contains("engine_capabilities.py"), "{message}");
+    std::env::set_var("MLLM_DEEP_PARK", "off");
+    crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect("an opted-out vLLM host never imports the probes");
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_MODELS_ROOT",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_DEEP_PARK",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+/// ADR 0012: deep parking is on by default and a host opts out. SPEC §6.2:
+/// restart_only is a first-class residency, so an SGLang host that opts out must
+/// get a restart_only deployment that still resolves, rather than a deep
+/// deployment its own profile then refuses. The residency follows the host's
+/// switch; it is not a constant of the engine.
+// T21 T22
+#[test]
+fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
+    let _guard = ENVIRONMENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).expect("a model store");
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_KV_CACHE_BYTES",
+        "MLLM_ENGINE_ARGS",
+        "MLLM_TRUST_REMOTE_CODE",
+    ] {
+        std::env::remove_var(name);
+    }
+    std::env::set_var("MLLM_SGLANG_BIN", &bin);
+    std::env::set_var("MLLM_ENGINE_FINGERPRINT", "sglang 0.5.0");
+    std::env::set_var("MLLM_MODELS_ROOT", &models);
+    std::env::set_var(
+        "MLLM_RUNTIME_DIR",
+        private_runtime(dir.path()),
+    );
+    std::env::set_var("MLLM_DEEP_PARK", "off");
+
+    let installation = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect("the environment declares an installation");
+    assert_eq!(installation.engine, Engine::Sglang);
+    assert!(!installation.deep_park, "the host opted out");
+
+    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let mut deployment = deployment_document(
+        "m",
+        "m",
+        &local(models.join("m").to_str().expect("a utf-8 path")),
+        installation.engine,
+        CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
+        installation.deep_park,
+    );
+    deployment["engine_config"] = installation.engine_config.clone();
+    assert_eq!(deployment["residency"], "restart_only");
+    let resolved = mllm_config::effective::resolve_effective(&deployment, &host);
+
+    for name in [
+        "MLLM_SGLANG_BIN",
+        "MLLM_ENGINE_FINGERPRINT",
+        "MLLM_MODELS_ROOT",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_DEEP_PARK",
+    ] {
+        std::env::remove_var(name);
+    }
+
+    let resolved = resolved.expect("an opted-out SGLang host's deployment resolves");
+    assert_eq!(resolved.profile.security.deep_park, DeepPark::Disabled);
+    assert!(matches!(resolved.engine_config, LaunchSettings::Sglang(_)));
+}
+
+/// With deep parking left on, SGLang keeps the deep residency its memory saver
+/// delivers (ADR 0014 §4); vLLM stays restart_only either way (SPEC §6.2).
+// T21
+#[test]
+fn the_residency_follows_the_deep_park_switch_for_sglang_only() {
+    let residency = |engine, deep_park| {
+        deployment_document(
+            "m",
+            "m",
+            &local("/models/m"),
+            engine,
+            CAPACITY,
+            DEFAULT_REQUEST_DEADLINE,
+            deep_park,
+        )["residency"]
+            .clone()
+    };
+    assert_eq!(residency(Engine::Sglang, true), "deep");
+    assert_eq!(residency(Engine::Sglang, false), "restart_only");
+    assert_eq!(residency(Engine::Vllm, true), "restart_only");
+    assert_eq!(residency(Engine::Vllm, false), "restart_only");
 }

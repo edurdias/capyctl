@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use mllm_cli::device_inventory::{collect_with, is_physical_uuid, publication};
+use mllm_cli::device_inventory::{collect_with, is_physical_uuid};
 use mllm_cli::standalone_config;
 use mllm_config::engine_policy::Engine;
 use mllm_controller::EngineInstallation;
@@ -21,6 +21,7 @@ const UUID: &str = "GPU-09631200-fdff-a345-295f-a1a6f84b2f84";
 fn inventory_json(devices: serde_json::Value) -> String {
     serde_json::json!({
         "schema": "mllm-nvidia-inventory-v1",
+        "host_id": "host-a",
         "digest": DIGEST,
         "devices": devices,
     })
@@ -31,17 +32,15 @@ fn installation() -> EngineInstallation {
     EngineInstallation {
         engine: Engine::Sglang,
         executable: "/opt/venv/bin/python3".into(),
-        build_fingerprint: "0.5.19".into(),
-        launch_settings: serde_json::json!({
-            "engine": "sglang",
-            "recipe": "qwen3_4b_instruct2507_tp1_dp1_bf16_disk_reload_v1",
-            "requested_budget": {"kv_cache_bytes": "16GiB", "static_memory_fraction_bps": 7500}
-        }),
-        deep_park: false,
+        build_fingerprint: "0.5.20".into(),
+        engine_config: serde_json::json!({"memory": {"kv_cache": "16GiB"}}),
+        deep_park: true,
         trust_remote_code: false,
         models_root: "/srv/models".into(),
         runtime_dir: "/opt/mllm/runtime".into(),
         args: Vec::new(),
+        installation_drift: Default::default(),
+        engine_ports: (8100, 8199),
     }
 }
 
@@ -58,10 +57,12 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
     })
     .expect("a well-formed inventory publishes");
     assert_eq!(published.digest, DIGEST);
+    assert_eq!(published.host_id, "host-a");
     assert_eq!(published.physical_gpu_uuid.as_deref(), Some(UUID));
 
     let host = standalone_config::host_policy(&installation(), "env-1", 1 << 40, Some(&published));
     assert_eq!(host["device_inventory_digest"], DIGEST);
+    assert_eq!(host["name"], "host-a");
     assert_eq!(
         host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"],
         UUID
@@ -75,8 +76,10 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
             &mllm_config::effective::ModelSource::Local {
                 path: "/srv/models/m".into(),
             },
+            Engine::Sglang,
             1 << 40,
             standalone_config::DEFAULT_REQUEST_DEADLINE,
+            true,
         ),
         &host,
     )
@@ -89,10 +92,7 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
 #[test]
 fn a_boot_without_an_inventory_publishes_nothing() {
     let outcomes: Vec<std::io::Result<String>> = vec![
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "the collector refused",
-        )),
+        Err(std::io::Error::other("the collector refused")),
         Ok(String::new()),
         Ok("device_observation_denied".to_string()),
         Ok(inventory_json(serde_json::json!([]))),
@@ -148,9 +148,11 @@ fn a_multi_device_inventory_publishes_the_digest_but_names_no_device() {
     })
     .expect("a real inventory publishes its digest");
     assert_eq!(published.digest, DIGEST);
+    assert_eq!(published.host_id, "host-a");
     assert_eq!(published.physical_gpu_uuid, None);
     let host = standalone_config::host_policy(&installation(), "env-1", 1 << 40, Some(&published));
     assert_eq!(host["device_inventory_digest"], DIGEST);
+    assert_eq!(host["name"], "host-a");
     assert!(host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"].is_null());
 }
 
