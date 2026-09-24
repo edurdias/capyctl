@@ -455,6 +455,12 @@ Commands carry host/deployment identity, assignment generation, operation ID, pr
 
 The agent enforces monotonic assignments, authorized server identity, and one local resource registry lock. It rejects stale commands, incompatible protocol/schema versions, and unapproved profiles. Reconnection carries inventory and resumable operation history with bounded retention; do not place inference bodies in that journal.
 
+> **Amended by [ADR 0017](design/adr/0017-version-skew-and-capability-gating.md)** (owner decision 2026-09-24).
+
+Release compatibility within the session protocol is a SemVer skew policy. The host reports its release version on connect (strict SemVer; a missing or unparseable version counts as incompatible). Patch, pre-release and build-metadata differences on the server's `major.minor` line are fully compatible. A host one minor release behind the server, on the same major, is supported, with an upgrade recommended. A host older than that, or on another major, is connected **drain-only**: the server may still stop, drain, revoke, terminate, probe and inspect what it owns there, and MUST NOT place, start, wake, park, digest or materialize anything on it; status and host listings show `upgrade_required` with the reason. A host newer than the server (any minor or major ahead) MUST be refused with a clear "upgrade the server first"; the host logs it and reconnects with backoff. Upgrade order is the server first, then hosts one at a time. For 0.x as for later releases, a change affecting the protocol or durable state ships only in a minor or major release; a patch release never changes the protocol.
+
+Every protocol feature added after the protocol version 2 baseline is a named capability the host declares on connect. The server MUST NOT send a field or action a host did not declare; it refuses that operation for that host, before anything is sent, with the typed reason `host_capability_missing:<name>` (or `host_upgrade_required` for a drain-only host), and placement excludes a host lacking a capability every launch needs. Absent additive fields encode exactly as before, so journaled command digests stay verifiable.
+
 ### 13.2 Process and controller failures
 
 Track PID plus start identity, process-tree/service/container handles, deployment generation, and ownership record. Never kill by executable name or adopt whatever occupies a port. Detect PID reuse. Foreground wrappers and process groups are a baseline; complete isolation/cleanup capabilities must be explicit for the chosen platform.
@@ -885,7 +891,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T31 | Head crash with surviving worker | Worker agent supplies ownership evidence and cleanup; no competing activation. |
 | T32 | Lost worker connection or expired lease | Reservation remains unavailable until evidence/fencing resolves state. |
 | T33 | Controller/agent restart and PID reuse | Reconciliation from durable records; no arbitrary process adoption or killing. |
-| T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. |
+| T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. A newer host is refused ("upgrade the server first"), an older-than-N-1 or unversioned host is drain-only, and a command needing a capability the host did not declare is refused typed and never sent (ADR 0017). |
 | T35 | KV persistence across park and restart | Observed hit/miss behavior correct; incompatible data never reused. |
 | T36 | Required versus optional cache outage | Required blocks; optional uses declared fallback, not improvised live reconfiguration. |
 | T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. mllm's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). |

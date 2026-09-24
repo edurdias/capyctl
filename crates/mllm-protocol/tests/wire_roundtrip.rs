@@ -94,6 +94,8 @@ async fn agent_control_roundtrip_over_real_channel() {
                     ..Default::default()
                 }),
                 model_sources: true,
+                binary_version: mllm_protocol::version::BINARY_VERSION.into(),
+                capabilities: mllm_protocol::capabilities::agent_capabilities(),
             })),
         })
         .await

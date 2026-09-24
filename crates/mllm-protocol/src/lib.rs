@@ -1,5 +1,7 @@
+pub mod capabilities;
 pub mod execution;
 pub mod reports;
+pub mod version;
 pub mod pb {
     #![allow(clippy::result_large_err)]
     // Generated message layouts: the member result (with WE3's checkpoint

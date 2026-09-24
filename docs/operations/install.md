@@ -421,6 +421,31 @@ units is the check.
 
 A restart re-attaches running engines, so an upgrade does not need a drain.
 
+**Order: the server first, then the hosts one at a time** (ADR 0017). The
+server judges each host's release against its own when the host connects:
+
+| Host release, relative to the server | `compatibility` | What the server does |
+|---|---|---|
+| Same `major.minor` (any patch, pre-release or build) | `supported` | Everything. |
+| One minor release behind (N-1) | `upgrade_recommended` | Everything; upgrade the host soon. |
+| Older than N-1, another major, or no version | `upgrade_required` | Drain-only: stop, drain, revoke, probe and inspect only; no new placement, start, wake or park. |
+| Newer than the server | `refused` | Refuses the session; the host logs "upgrade the server first" and retries. |
+
+Upgrading the server first therefore never leaves a host refused: every host
+is at worst drain-only until its own upgrade, and its Ready engines keep
+serving. Hosts running a release that predates this policy report no version,
+so after the first server upgrade to a release that has it they are
+drain-only until they are upgraded too. Check the verdicts with
+`mllm list hosts` (`server_version`, and per host `binary_version`,
+`compatibility`, `compatibility_reason`); `mllm status deployment <id>` shows the
+same per allowed host. A host listing a `capabilities_missing` entry that a
+launch needs is left out of placement; the operation it lacks is refused as
+`host_capability_missing:<name>`.
+
+Release rule: a change that affects the protocol or durable state ships only
+in a minor (or major) release; a patch release never changes the protocol,
+so patch releases of server and hosts mix freely.
+
 ```bash
 systemctl stop mllm-host                       # engines keep serving
 
@@ -438,8 +463,8 @@ systemctl start mllm-host                      # re-attaches running engines
 The start refreshes the managed runtime directory from the new binary and
 logs `runtime directory ... refreshed`. A host whose document names its own
 `runtime_dir` must update that directory itself. Do the same for the server
-and standalone roles. Upgrade the server and its hosts to the same release; no
-compatibility between different releases of server and host is asserted.
+(first) and standalone roles. The skew policy above is the only compatibility
+asserted between different releases of server and host.
 
 Running engines imported the previous runtime helpers when they launched; the
 new helpers apply to launches from the restart on. If a release's notes say

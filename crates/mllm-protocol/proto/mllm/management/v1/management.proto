@@ -129,6 +129,19 @@ message Connect {
   // ADR 0008 (additive): this agent executes MaterializeSource. A peer without
   // it is never sent one; its remote sources stay pending.
   bool model_sources = 6;
+  // ADR 0017 (additive): this agent's build version, a strict SemVer 2.0
+  // string (its Cargo package version). The server applies its version skew
+  // policy to it: same minor line supported, one minor behind supported with
+  // an upgrade recommended, older or another major drain-only, newer refused.
+  // Empty from an agent that predates the policy, which is drain-only.
+  string binary_version = 7;
+  // ADR 0017 (additive): every protocol feature added after the protocol
+  // version 2 baseline that this agent implements, by name
+  // (`mllm_protocol::capabilities`). The server never sends a field or action
+  // a host did not declare; it refuses that operation for the host instead
+  // (`host_capability_missing:<name>`). The `heartbeats` and `model_sources`
+  // flags above count as declarations of the same names.
+  repeated string capabilities = 8;
 }
 message ReportInventory {
   repeated DomainObservation domains = 1;

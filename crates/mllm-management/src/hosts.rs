@@ -74,7 +74,10 @@ async fn hosts(State(state): State<Arc<HostState>>) -> Response {
                         .ok()
                         .flatten()
                         .and_then(|p| serde_json::from_str(&p.config_json).ok());
-                    (host, development_controls(document.as_ref()))
+                    // ADR 0017: the version and skew verdict of the host's
+                    // latest session, kept while it is offline.
+                    let version = store.host_version(&host.host_id).ok().flatten();
+                    (host, development_controls(document.as_ref()), version)
                 })
                 .collect::<Vec<_>>(),
         )
@@ -90,14 +93,23 @@ async fn hosts(State(state): State<Arc<HostState>>) -> Response {
             )
         }
     };
-    let hosts: Vec<_> = hosts.into_iter().map(|(host, controls)| {
+    let hosts: Vec<_> = hosts.into_iter().map(|(host, controls, version)| {
         let session = state.sessions.inspect(&host.host_id);
+        // ADR 0017: `binary_version`, `compatibility` (supported,
+        // upgrade_recommended, upgrade_required, refused) and its reason, from
+        // the host's latest session; absent for a host not seen since.
+        let (binary_version, compatibility, reason) = match &version {
+            Some(v) => (Some(v.binary_version.clone()), Some(v.compatibility.clone()), (!v.reason.is_empty()).then(|| v.reason.clone())),
+            None => (None, None, None),
+        };
         serde_json::json!({"host_id":host.host_id,"name":host.host_name,"revoked":host.revoked,
             "online":session.as_ref().is_some_and(|s| s.online && !host.revoked),
             "eligible":session.as_ref().is_some_and(|s| s.eligible && !host.revoked),"session":session,
+            "binary_version":binary_version,"compatibility":compatibility,"compatibility_reason":reason,
+            "capabilities":version.map(|v| v.capabilities),
             "development_controls":controls})
     }).collect();
-    Json(serde_json::json!({"api_version":"1","hosts":hosts})).into_response()
+    Json(serde_json::json!({"api_version":"1","server_version":mllm_controller::agent_sessions::SERVER_VERSION,"hosts":hosts})).into_response()
 }
 
 /// SPEC §9.1 / T21 / ADR 0012 / P4: mark every runtime profile (engine
