@@ -11,7 +11,7 @@ mod support;
 use mllm_config::effective::ModelSource;
 use mllm_controller::LifecyclePort as _;
 
-use support::{boot, safe_state_dir};
+use support::{boot, boot_configured, safe_state_dir};
 
 #[tokio::test]
 async fn a_declared_deployment_accepts_a_start_command() {
@@ -184,4 +184,125 @@ async fn standalone_reports_nothing_ignored_for_the_current_generated_document()
     let dir = safe_state_dir();
     let app = boot(dir.path()).await;
     assert!(app.config_notices().is_empty(), "{:?}", app.config_notices());
+}
+
+/// Nothing a refused explicit document could have produced exists under the
+/// state root: no generated document, no credentials, no store.
+fn assert_untouched(state: &std::path::Path) {
+    for leaf in ["config/standalone.yaml", "identity/credentials", "server/srv.sqlite3"] {
+        assert!(!state.join(leaf).exists(), "{leaf} was created");
+    }
+}
+
+/// T03 (SPEC §15.2, R13): `start standalone --config` naming a file that does
+/// not exist refuses, names the path, and is never replaced by the generated
+/// default.
+#[tokio::test]
+async fn an_explicit_standalone_document_that_is_missing_refuses_without_fallback() {
+    let dir = safe_state_dir();
+    let missing = dir.path().join("elsewhere").join("standalone.yaml");
+    let error = boot_configured(dir.path(), &missing)
+        .await
+        .err()
+        .expect("a missing explicit document refuses the boot");
+    assert!(matches!(error, mllm_cli::roles::StartError::Config(_)), "{error:?}");
+    assert!(error.to_string().contains("does not exist"), "{error}");
+    assert_eq!(mllm_cli::output::StructuredError::from(error).code, "invalid_config");
+    assert_untouched(dir.path());
+}
+
+/// T03 (SPEC §§15.2, 15.3, R13): an invalid explicit document (here a
+/// duplicate key) refuses, even when a valid implicit document exists; the
+/// implicit one is not used in its place and neither file is rewritten.
+#[tokio::test]
+async fn an_explicit_standalone_document_that_is_invalid_is_not_replaced_by_the_implicit_one() {
+    let dir = safe_state_dir();
+    let (implicit, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, dir.path()).unwrap();
+    let implicit_before = std::fs::read_to_string(&implicit).unwrap();
+    let explicit = dir.path().join("explicit.yaml");
+    let invalid = "schema_version: 1\nkind: standalone\nname: local\nname: again\n";
+    std::fs::write(&explicit, invalid).unwrap();
+    let error = boot_configured(dir.path(), &explicit)
+        .await
+        .err()
+        .expect("an invalid explicit document refuses the boot");
+    assert!(matches!(error, mllm_cli::roles::StartError::Config(_)), "{error:?}");
+    assert_eq!(std::fs::read_to_string(&explicit).unwrap(), invalid);
+    assert_eq!(std::fs::read_to_string(&implicit).unwrap(), implicit_before);
+    assert!(!dir.path().join("server/srv.sqlite3").exists());
+}
+
+/// T03 (SPEC §15.3): an explicit document naming another state directory is
+/// refused before any side effect; the state root comes from the environment.
+#[tokio::test]
+async fn an_explicit_standalone_document_naming_another_state_dir_refuses() {
+    let dir = safe_state_dir();
+    let explicit = dir.path().join("explicit.yaml");
+    std::fs::write(
+        &explicit,
+        "schema_version: 1\nkind: standalone\nname: local\nserver:\n  name: local\n  state_dir: /somewhere/else\n",
+    )
+    .unwrap();
+    let error = boot_configured(dir.path(), &explicit)
+        .await
+        .err()
+        .expect("another state directory refuses the boot");
+    assert!(error.to_string().contains("server.state_dir"), "{error}");
+    assert_untouched(dir.path());
+}
+
+/// T02 T03 (SPEC §15.2, R13): a valid explicit document is the one honoured.
+/// On a state root that has never served, the boot creates the protected
+/// credentials once and the store, but generates no implicit document. The
+/// explicit document here is the legacy generated shape, whose `server.tls`
+/// block is reported as ignored, which shows it is the file that was read.
+#[tokio::test]
+async fn standalone_honours_a_valid_explicit_document() {
+    let dir = safe_state_dir();
+    let explicit = dir.path().join("explicit.yaml");
+    let text = legacy_generated(&dir.path().to_string_lossy());
+    std::fs::write(&explicit, &text).unwrap();
+
+    let app = boot_configured(dir.path(), &explicit)
+        .await
+        .expect("a valid explicit document boots");
+
+    let notices = app.config_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("server.tls"), "{notices:?}");
+    assert_eq!(std::fs::read_to_string(&explicit).unwrap(), text, "not rewritten");
+    assert!(
+        !dir.path().join("config/standalone.yaml").exists(),
+        "no implicit document is generated beside an explicit one"
+    );
+    let credentials = dir.path().join("identity/credentials");
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_eq!(
+        std::fs::metadata(&credentials).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!app.api_key().is_empty() && app.api_key() != "mllm-local");
+}
+
+/// T03 T33 (SPEC §15.2): a state root that has served and lost its
+/// credentials is not repaired by an explicit document; it refuses for
+/// recovery instead of minting a new identity.
+#[tokio::test]
+async fn an_explicit_document_does_not_recreate_lost_credentials() {
+    let dir = safe_state_dir();
+    let explicit = dir.path().join("explicit.yaml");
+    std::fs::write(&explicit, "schema_version: 1\nkind: standalone\nname: local\n").unwrap();
+    let app = boot_configured(dir.path(), &explicit).await.expect("first boot");
+    let _ = app.shutdown().await;
+    std::fs::remove_file(dir.path().join("identity/credentials")).unwrap();
+    let error = boot_configured(dir.path(), &explicit)
+        .await
+        .err()
+        .expect("lost credentials refuse the boot");
+    assert!(
+        matches!(error, mllm_cli::roles::StartError::MissingCredentials),
+        "{error:?}"
+    );
+    assert!(!dir.path().join("identity/credentials").exists());
 }

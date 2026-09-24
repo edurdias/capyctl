@@ -1126,3 +1126,39 @@ fn an_interrupted_initialization_is_completed_not_bricked() {
     std::fs::remove_file(marker(d.path())).unwrap();
     assert!(HostJournal::open(d.path(), "controller", "host").is_err());
 }
+
+// T33: a journal written by a newer mllm is refused with a typed error naming
+// both versions, and the refusal writes nothing: its version and retained
+// history are exactly what the newer binary left.
+#[test]
+fn journal_from_a_newer_version_is_refused_and_left_unmodified() {
+    let supported = mllm_agent::journal::JOURNAL_SCHEMA_VERSION;
+    let d = directory();
+    let j = HostJournal::open(d.path(), "controller", "host").unwrap();
+    let s = j.connect().unwrap();
+    drop(fresh(j.accept(s, &command("kept"), 10, &Policy).unwrap()));
+    drop(j);
+    let db = rusqlite::Connection::open(d.path().join("commands.sqlite")).unwrap();
+    db.execute_batch(&format!(
+        "CREATE TABLE from_the_future(x INTEGER); PRAGMA user_version={};",
+        supported + 1
+    ))
+    .unwrap();
+    drop(db);
+    match HostJournal::open(d.path(), "controller", "host") {
+        Err(JournalError::FromNewerVersion { found, supported: known }) => {
+            assert_eq!((found, known), (supported + 1, supported));
+        }
+        Err(other) => panic!("expected FromNewerVersion, got {other}"),
+        Ok(_) => panic!("an older binary opened a newer journal"),
+    }
+    let db = rusqlite::Connection::open(d.path().join("commands.sqlite")).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, supported + 1);
+    let commands: i64 = db
+        .query_row("SELECT count(*) FROM commands", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(commands, 1);
+}

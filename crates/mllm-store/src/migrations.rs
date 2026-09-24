@@ -2,6 +2,8 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::StoreError;
+
 use crate::schema::{
     SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V30, SCHEMA_V31,
     SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
@@ -37,12 +39,23 @@ pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V31,
 ];
 
+/// The newest schema version this binary knows how to read and write.
+pub fn latest_version() -> i64 {
+    MIGRATIONS.len() as i64
+}
+
 /// Applies every migration newer than the recorded schema version.
 /// Each migration runs in its own transaction together with its
 /// version stamp, so a failed apply leaves the store untouched.
 /// The `schema_migrations` table itself is created by v1, so on a
 /// fresh (unmigrated) store its absence means version 0.
-pub fn apply(conn: &Connection) -> Result<(), rusqlite::Error> {
+///
+/// SPEC §13.2 / T33, ADR 0002: a store stamped with a version newer than
+/// [`latest_version`] was migrated by a newer mllm. This binary does not know
+/// that schema, so it refuses to open the store rather than read or write it
+/// under assumptions that no longer hold. Nothing is written before the
+/// refusal.
+pub fn apply(conn: &Connection) -> Result<(), StoreError> {
     let migrations_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
@@ -60,6 +73,12 @@ pub fn apply(conn: &Connection) -> Result<(), rusqlite::Error> {
     } else {
         0
     };
+    if current > latest_version() {
+        return Err(StoreError::FromNewerVersion {
+            found: current,
+            supported: latest_version(),
+        });
+    }
     for (index, sql) in MIGRATIONS.iter().enumerate() {
         let version = (index + 1) as i64;
         if version <= current {

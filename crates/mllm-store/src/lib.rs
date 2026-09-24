@@ -55,6 +55,15 @@ pub enum StoreError {
     IdempotencyConflict,
     #[error("stale generation")]
     StaleGeneration,
+    /// SPEC §13.2 / T33: the store was migrated by a newer mllm. An older
+    /// binary never opens it, because it would read and write a schema it does
+    /// not know.
+    #[error(
+        "the state store has schema version {found}, newer than the {supported} this mllm \
+         supports; it was written by a newer mllm. Run that newer mllm, or restore the \
+         store from a backup taken before the upgrade. The store was not modified"
+    )]
+    FromNewerVersion { found: i64, supported: i64 },
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -151,6 +160,69 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fk, 1);
+    }
+
+    // T33: a store migrated by a newer mllm is refused by an older binary, and
+    // the refusal writes nothing, so the newer binary can still open it.
+    #[test]
+    fn store_from_a_newer_version_is_refused_and_left_unmodified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("srv.sqlite3");
+        let latest = migrations::latest_version();
+        {
+            let s = Store::open(&path).unwrap();
+            // What a newer binary leaves behind: its own stamp and a table this
+            // binary has never heard of.
+            s.conn
+                .execute_batch("CREATE TABLE from_the_future(x INTEGER);")
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?1)",
+                    [latest + 1],
+                )
+                .unwrap();
+        }
+        match Store::open(&path) {
+            Err(StoreError::FromNewerVersion { found, supported }) => {
+                assert_eq!((found, supported), (latest + 1, latest));
+            }
+            Err(other) => panic!("expected FromNewerVersion, got {other}"),
+            Ok(_) => panic!("an older binary opened a newer store"),
+        }
+        let message = StoreError::FromNewerVersion {
+            found: latest + 1,
+            supported: latest,
+        }
+        .to_string();
+        assert!(message.contains("newer mllm"), "{message}");
+        assert!(message.contains("backup"), "{message}");
+        let conn = Connection::open(&path).unwrap();
+        let (max, stamps): (i64, i64) = conn
+            .query_row(
+                "SELECT MAX(version), COUNT(*) FROM schema_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((max, stamps), (latest + 1, latest + 1));
+        let future: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='from_the_future'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(future, 1);
+    }
+
+    // T33: the store at exactly this binary's version reopens normally.
+    #[test]
+    fn store_at_the_latest_version_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("srv.sqlite3");
+        drop(Store::open(&path).unwrap());
+        drop(Store::open(&path).unwrap());
     }
 
     #[test]

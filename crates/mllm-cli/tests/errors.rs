@@ -73,3 +73,29 @@ fn internal_failures_exit_13_not_invalid_config() {
     assert_eq!(config.exit_code(), ExitCode(2));
     assert_ne!(internal.exit_code(), config.exit_code());
 }
+
+// T33 (SPEC §13.2): a store written by a newer mllm is reported with its own
+// code and a recovery hint, and exits as unsupported (5), which the packaged
+// service units do not restart: restarting the same binary never heals it.
+#[test]
+fn a_store_from_a_newer_version_is_a_non_restartable_refusal() {
+    let newer = mllm_store::StoreError::FromNewerVersion {
+        found: 99,
+        supported: 31,
+    };
+    for error in [
+        mllm_cli::roles::StartError::Store(newer),
+        mllm_cli::roles::StartError::Ownership(mllm_controller::OwnedStateError::Store(
+            mllm_store::StoreError::FromNewerVersion {
+                found: 99,
+                supported: 31,
+            },
+        )),
+    ] {
+        let e = StructuredError::from(error);
+        assert_eq!(e.code, mllm_cli::output::STORE_FROM_NEWER_VERSION);
+        assert_eq!(e.exit_code(), ExitCode(5));
+        assert!(e.message.contains("99") && e.message.contains("31"), "{}", e.message);
+        assert!(e.message.contains("backup"), "{}", e.message);
+    }
+}

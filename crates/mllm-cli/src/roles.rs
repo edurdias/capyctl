@@ -304,6 +304,12 @@ impl From<ProviderError> for StartError {
 impl From<StartError> for StructuredError {
     fn from(err: StartError) -> Self {
         let code = match err {
+            // SPEC §13.2 / T33: a store written by a newer mllm is not a
+            // transient fault; restarting this binary never heals it.
+            StartError::Store(mllm_store::StoreError::FromNewerVersion { .. })
+            | StartError::Ownership(mllm_controller::OwnedStateError::Store(
+                mllm_store::StoreError::FromNewerVersion { .. },
+            )) => crate::output::STORE_FROM_NEWER_VERSION,
             StartError::Config(_) => "invalid_config",
             StartError::NoEngineInstallation(_) => "invalid_config",
             StartError::Setting(_) => "invalid_config",
@@ -634,8 +640,24 @@ fn probe_fingerprint(executable: &Path) -> Result<String, ProviderError> {
 /// Boot the embedded standalone graph (SPEC §15.2 no-config matrix) against the
 /// engine installation this host's environment declares.
 pub async fn start_standalone(state_dir: &Path) -> Result<App, StartError> {
+    start_standalone_from(state_dir, None).await
+}
+
+/// As [`start_standalone`], with the role document named by `--config` when
+/// `config` is given.
+///
+/// SPEC §15.2 (R13): an explicit document is the one that is honoured. A
+/// missing or invalid explicit document refuses the boot; it is never replaced
+/// by the generated default, and nothing is written under
+/// `<state_dir>/config`. The state root is still `state_dir`, so a document
+/// that names another `state_dir` is refused (SPEC §15.3).
+pub async fn start_standalone_from(
+    state_dir: &Path,
+    config: Option<&Path>,
+) -> Result<App, StartError> {
     start_standalone_inner(
         state_dir,
+        config,
         Arc::new(EnvEngineProvider::new()),
         crate::host_observation::proc_meminfo(),
     )
@@ -648,7 +670,8 @@ pub async fn start_standalone_with(
     state_dir: &Path,
     provider: Arc<dyn EngineProvider>,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, provider, crate::host_observation::proc_meminfo()).await
+    start_standalone_inner(state_dir, None, provider, crate::host_observation::proc_meminfo())
+        .await
 }
 
 /// As [`start_standalone_with`], reading host memory through `memory`. SPEC
@@ -660,11 +683,23 @@ pub async fn start_standalone_with_memory(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, provider, memory).await
+    start_standalone_inner(state_dir, None, provider, memory).await
+}
+
+/// As [`start_standalone_with_memory`], with an explicit role document
+/// (`--config`); see [`start_standalone_from`].
+pub async fn start_standalone_configured(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+) -> Result<App, StartError> {
+    start_standalone_inner(state_dir, config, provider, memory).await
 }
 
 async fn start_standalone_inner(
     state_dir: &Path,
+    config: Option<&Path>,
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
@@ -673,8 +708,11 @@ async fn start_standalone_inner(
     // for a boot that generated the config (and its credentials) this run
     // — an existing state dir missing its credentials refuses to serve
     // instead of serving with a guessable key.
-    let outcome = resolve_startup(ConfigKind::Standalone, None, state_dir)?;
-    let created_this_boot = matches!(
+    //
+    // SPEC §15.2 (R13): an explicit `--config` that is missing or invalid is an
+    // error here; it is never replaced by a generated default.
+    let outcome = resolve_startup(ConfigKind::Standalone, config, state_dir)?;
+    let mut created_this_boot = matches!(
         outcome,
         LoadOutcome::Generated {
             created_identity: true,
@@ -711,6 +749,17 @@ async fn start_standalone_inner(
         )
     };
     let db_path = state_dir.join("server").join("srv.sqlite3");
+    // SPEC §15.2: an explicit document is operator configuration, not state,
+    // so it does not bring the credentials a generated default would. A state
+    // root that has never served (no store, no credentials) gets them now, once,
+    // exactly as a first implicit start would. A root that has served and lost
+    // its credentials is not repaired: it refuses below (MissingCredentials).
+    if config.is_some()
+        && !db_path.try_exists()?
+        && !state_dir.join("identity").join("credentials").try_exists()?
+    {
+        created_this_boot = mllm_config::defaults::create_standalone_credentials(state_dir)?;
+    }
     let store = Rc::new(Store::open(&db_path)?);
     let api_key = match read_api_key(state_dir) {
         Some(k) => k,

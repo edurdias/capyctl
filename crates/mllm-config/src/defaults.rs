@@ -183,6 +183,15 @@ fn ensure_private_dir(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// SPEC §15.2: create the standalone role's protected credentials under a
+/// private `state_dir` without generating a configuration document. Used when
+/// an explicit `--config` names the document for a state root that has never
+/// served. Returns whether this call created them (`false` when they exist).
+pub fn create_standalone_credentials(state_dir: &Path) -> Result<bool, ConfigError> {
+    ensure_private_dir(state_dir).map_err(io_err)?;
+    write_credentials(state_dir)
+}
+
 /// Write `state_dir/identity/credentials` (0600) exactly once.
 ///
 /// The credentials file itself is the creation marker:

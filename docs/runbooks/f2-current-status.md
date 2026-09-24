@@ -4,6 +4,26 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Schema downgrade guard and standalone `--config` — 2026-09-24 (branch `fix/schema-guard-standalone-config`)
+
+Closes the two gaps the packaging guide found, verified locally only (CPU
+tests; not qualification of any engine recipe).
+
+1. An older binary now refuses state written by a newer one (SPEC §13.2, T33).
+   `migrations::apply` returns `StoreError::FromNewerVersion { found, supported }`
+   when the recorded schema version exceeds the binary's latest, before writing
+   anything; the host journal returns `JournalError::FromNewerVersion` the same
+   way. Roles report `store_from_newer_version` with a restore-backup or
+   use-newer-binary hint and exit 5, which the units do not restart. Guard logic
+   only: no schema version was added or renumbered.
+2. `mllm start standalone --config <file>` is implemented (SPEC §15.2, R13). The
+   explicit document is the one honoured; a missing or invalid one refuses with
+   exit 2 and is never replaced by the generated or implicit document. The state
+   root still comes from `MLLM_STATE_DIR`, a pristine root gets its credentials
+   once, and a served root that lost them refuses. The packaged units keep
+   starting without `--config`; `docs/operations/install.md` documents the
+   precedence and the drop-in for an explicit document.
+
 ## Service packaging — 2026-09-24 (branch `feat/service-packaging`)
 
 SPEC §4.3 service definitions and an F5-direction release tarball, verified
@@ -22,10 +42,10 @@ modes and digests. Operator guide: `docs/operations/install.md`.
 Not established: no unit has run on a Spark. Whether the host unit's
 hardening lets vLLM and SGLang start, park and wake, and whether engines
 survive `systemctl restart mllm-host` and are re-attached, needs a live run.
-Found while writing the guide: an older binary does not refuse a state store
-migrated by a newer one (`crates/mllm-store/src/migrations.rs` skips versions
-it does not know), so rollback across a schema change needs a state backup;
-`mllm start standalone --config` is still refused as not implemented.
+Found while writing the guide: an older binary did not refuse a state store
+migrated by a newer one, and `mllm start standalone --config` was refused as
+not implemented; both are closed on `fix/schema-guard-standalone-config`.
+Rollback across a schema change still needs a state backup.
 
 ## Post-merge live smoke — 2026-09-24 (branch `fix/live-smoke-2026-09-24`)
 

@@ -42,9 +42,15 @@ const FORCED_GRACE: Duration = Duration::from_millis(200);
 /// startup rather than being read as the default, because an operator who set
 /// it meant something by it.
 pub fn standalone_drain_bound(state_dir: &std::path::Path) -> Result<Duration, String> {
-    let path = state_dir.join("config").join("standalone.yaml");
+    standalone_drain_bound_in(&state_dir.join("config").join("standalone.yaml"))
+}
+
+/// As [`standalone_drain_bound`], reading the role document at `path` (the
+/// explicit `--config`). A missing document gives the default here; the boot
+/// itself then refuses it (SPEC §15.2, R13).
+pub fn standalone_drain_bound_in(path: &std::path::Path) -> Result<Duration, String> {
     let refused = |error: mllm_config::ConfigError| format!("{}: {error}", path.display());
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DEFAULT_DRAIN),
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -594,5 +600,22 @@ mod tests {
             let error = standalone_drain_bound(state.path()).unwrap_err();
             assert!(error.contains("shutdown.drain_timeout"), "{error}");
         }
+    }
+
+    // T03 (SPEC §15.2, R13): with `--config` the drain bound comes from the
+    // explicit document, not from the implicit one under the state root.
+    #[test]
+    fn the_standalone_drain_bound_follows_an_explicit_document() {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(state.path().join("config")).unwrap();
+        let base = "schema_version: 1\nkind: standalone\nname: local\n";
+        std::fs::write(
+            state.path().join("config/standalone.yaml"),
+            format!("{base}shutdown:\n  drain_timeout: 7s\n"),
+        )
+        .unwrap();
+        let explicit = state.path().join("explicit.yaml");
+        std::fs::write(&explicit, format!("{base}shutdown:\n  drain_timeout: 45s\n")).unwrap();
+        assert_eq!(standalone_drain_bound_in(&explicit), Ok(Duration::from_secs(45)));
     }
 }
