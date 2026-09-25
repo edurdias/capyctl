@@ -256,6 +256,91 @@ impl Management {
         Ok(value)
     }
 
+    /// Owner decision 2026-09-25: `start deployment --wait` waits for every
+    /// instance the start targets, not only the one whose operation the
+    /// receipt names. It succeeds only once each active instance has been
+    /// Ready; an instance that ends without becoming Ready (not placed before
+    /// the start's deadline, a failed launch) fails the wait, and so does the
+    /// deadline passing with an instance still queued. Never a success on a
+    /// partial start.
+    async fn wait_all(&self, receipt: Value, deadline_ms: i64) -> Result<Value, StructuredError> {
+        let first = self.wait(receipt.clone(), deadline_ms).await?;
+        let id = receipt["deployment_id"].as_str().unwrap_or("").to_owned();
+        let mut seen = std::collections::BTreeSet::new();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|now| i64::try_from(now.as_millis()).ok())
+            .unwrap_or(0);
+        let remaining = if deadline_ms > 0 {
+            deadline_ms
+                .saturating_sub(now_ms)
+                .saturating_add(WAIT_MARGIN_MS)
+                .max(WAIT_MARGIN_MS)
+        } else {
+            LEGACY_WINDOW_MS + WAIT_MARGIN_MS
+        };
+        let until = tokio::time::Instant::now()
+            + Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
+        let mut view = first["deployment"].clone();
+        loop {
+            match replicas(&view, &mut seen) {
+                Replicas::AllReady => {
+                    return Ok(json!({"receipt": first["receipt"], "deployment": view}))
+                }
+                Replicas::Failed(failure) => return Err(failure),
+                Replicas::Pending => {}
+            }
+            if tokio::time::Instant::now() >= until {
+                let queued: Vec<String> = view["instances"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|i| {
+                        !seen.contains(&i["index"].as_u64().unwrap_or(0))
+                            && i["lifecycle"] != "retiring"
+                    })
+                    .map(|i| {
+                        format!(
+                            "instance {} {}{}",
+                            i["index"],
+                            i["observed_state"].as_str().unwrap_or("unknown"),
+                            i["last_error"]
+                                .as_str()
+                                .map(|e| format!(" ({e})"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                let placement = view["instances"].as_array().into_iter().flatten().any(|i| {
+                    i["last_error"]
+                        .as_str()
+                        .is_some_and(|e| e.starts_with("placement:"))
+                });
+                return Err(error(
+                    if placement { "insufficient_resources" } else { "activation_timeout" },
+                    format!(
+                        "Wait expired before every instance was ready: {}; the start is partial and was not cancelled",
+                        queued.join(", ")
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // SPEC §6.4: a transient status failure is retried within the bound.
+            match self.exchange(Method::GET, "/snapshot", None).await {
+                Ok((status, snapshot)) if status.is_success() => {
+                    view = deployment(&snapshot, &id)?.clone();
+                }
+                Ok((status, value))
+                    if matches!(status.as_u16(), 429 | 502 | 503 | 504)
+                        || value["error"]["retryable"] == true => {}
+                Err(failure) if failure.code == "management_unavailable" => {}
+                Ok((status, value)) => return Err(refusal(status, &value)),
+                Err(failure) => return Err(failure),
+            }
+        }
+    }
+
     async fn wait(&self, receipt: Value, deadline_ms: i64) -> Result<Value, StructuredError> {
         let operation = receipt["operation_id"]
             .as_str()
@@ -328,6 +413,71 @@ impl Management {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+}
+
+/// Owner decision 2026-09-25: what `start deployment --wait` concludes from
+/// one status read once the start's own operation succeeded. `seen` holds the
+/// instances observed Ready so far during this wait.
+#[derive(Debug, PartialEq, Eq)]
+enum Replicas {
+    /// Every active instance has been Ready during the wait.
+    AllReady,
+    /// Some instance is still queued, starting or waking.
+    Pending,
+    /// An instance the start targets ended without becoming Ready.
+    Failed(StructuredError),
+}
+
+fn replicas(deployment: &Value, seen: &mut std::collections::BTreeSet<u64>) -> Replicas {
+    // A server that reports no instances: the start's operation is the answer.
+    let Some(instances) = deployment["instances"].as_array() else {
+        return Replicas::AllReady;
+    };
+    let mut pending = false;
+    for instance in instances.iter().filter(|i| i["lifecycle"] != "retiring") {
+        let index = instance["index"].as_u64().unwrap_or(0);
+        let state = instance["observed_state"].as_str().unwrap_or("");
+        if state == "ready" {
+            seen.insert(index);
+        }
+        if seen.contains(&index) {
+            continue;
+        }
+        match state {
+            // Ended without becoming Ready: a start that could not be placed
+            // before its deadline, a failed launch, or stopped meanwhile.
+            "stopped" | "failed" | "parked" => {
+                let last_error = instance["last_error"].as_str().unwrap_or("");
+                let reason = instance["latest_operation"]["reason"]
+                    .as_str()
+                    .filter(|_| state == "failed")
+                    .unwrap_or(last_error);
+                let code = if last_error.starts_with("placement:") {
+                    "insufficient_resources"
+                } else {
+                    "operation_failed"
+                };
+                let why = if reason.is_empty() {
+                    "status shows no reason".to_owned()
+                } else {
+                    reason.to_owned()
+                };
+                return Replicas::Failed(error(
+                    code,
+                    format!(
+                        "Instance {index} of deployment {} did not become ready ({state}): {why}; the start is partial",
+                        deployment["name"].as_str().or(deployment["id"].as_str()).unwrap_or("")
+                    ),
+                ));
+            }
+            _ => pending = true,
+        }
+    }
+    if pending {
+        Replicas::Pending
+    } else {
+        Replicas::AllReady
     }
 }
 
@@ -447,6 +597,9 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
     let code = match server {
         _ if status == reqwest::StatusCode::UNAUTHORIZED => "unauthorized",
         "capacity_blocked" | "startup_requires_empty_host" => "insufficient_resources",
+        // Owner decision 2026-09-25: no allowed host is eligible for
+        // placement; neither a capacity block nor the operator's input.
+        "host_ineligible" => "host_ineligible",
         "reconciliation_required" => "unreconciled",
         "unsupported_capability" => "unsupported",
         "not_found" => "not_found",
@@ -655,7 +808,7 @@ pub async fn execute_with_start_options(
                 .ok_or_else(|| error("internal", "Missing deployment identity"))?;
             let (action, deadline) = api.action(id, "start").await?;
             if *wait {
-                api.wait(action, deadline).await
+                api.wait_all(action, deadline).await
             } else {
                 Ok(action)
             }
@@ -686,7 +839,7 @@ pub async fn execute_with_start_options(
             )?;
             let (receipt, deadline) = api.action(id, action).await?;
             if api.wait_start && action == "start" {
-                return api.wait(receipt, deadline).await;
+                return api.wait_all(receipt, deadline).await;
             }
             Ok(receipt)
         }
@@ -912,6 +1065,12 @@ mod tests {
             (StatusCode::NOT_FOUND, "not_found", ExitCode::INVALID_CONFIG),
             (StatusCode::UNAUTHORIZED, "unauthorized", ExitCode::UNAUTHORIZED),
             (StatusCode::CONFLICT, "revision_conflict", ExitCode::INVALID_CONFIG),
+            // Owner decision 2026-09-25: not a capacity block, not bad input.
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "host_ineligible",
+                ExitCode::HOST_INELIGIBLE,
+            ),
         ];
         for (status, code, exit) in cases {
             let refused = refusal(status, &body(code));

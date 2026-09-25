@@ -68,6 +68,58 @@ pub enum SwitchPlan {
     Impossible(String),
 }
 
+/// Owner decision 2026-09-25: one instance of an evicting start that needs
+/// victims released before it can activate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartStep {
+    pub host: String,
+    pub instance: u32,
+    /// The instance is parked on `host` and wakes in place.
+    pub wake: bool,
+    pub victims: Vec<SwitchVictim>,
+    /// The host's bounded, non-resetting admission window (SPEC §10).
+    pub admission_window_ms: i64,
+}
+
+/// Owner decision 2026-09-25: what an evicting start of a whole deployment
+/// needs before every instance it targets can be placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartSwitchPlan {
+    /// Release each step's victims on its host; an empty list means every
+    /// targeted instance fits (or serves) as the ledger stands.
+    Steps(Vec<StartStep>),
+    /// Instance `instance` fits on no allowed host even after releasing every
+    /// eligible READY instance and the earlier instances' victims. `code` is
+    /// the closed placement diagnostic; `detail` names each host's shortfall.
+    Impossible {
+        instance: u32,
+        code: String,
+        detail: String,
+    },
+}
+
+/// What the plan for earlier instances of the same evicting start already
+/// assumed (owner decision 2026-09-25).
+#[derive(Default)]
+struct Assumed {
+    /// (host, owner, steady footprint) of each instance planned so far.
+    charges: Vec<(String, String, PhaseFootprint)>,
+    /// Owners of the victims planned so far: out of the ledger.
+    released: BTreeSet<String>,
+}
+
+/// One instance's plan (see [`plan_in`]).
+enum Planned {
+    /// It serves, its activation is in flight, or nothing is startable.
+    Settled,
+    /// It fits as the ledger stands, on the host placement would choose.
+    Fits { host: Option<String> },
+    /// Release victims first.
+    Evict(SwitchPlan),
+    /// It fits nowhere even with eviction.
+    Impossible { code: String, detail: String },
+}
+
 /// A victim's accepted release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwitchRelease {
@@ -225,7 +277,50 @@ impl crate::Store {
     ) -> Result<SwitchPlan, LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         check_session(&tx, s)?;
-        let plan = plan_in(&tx, target, only, explicit, eligible, protected, activity)?;
+        let plan = match plan_in(
+            &tx,
+            target,
+            only,
+            explicit,
+            eligible,
+            protected,
+            activity,
+            &Assumed::default(),
+        )? {
+            Planned::Settled | Planned::Fits { .. } => SwitchPlan::FitsNow,
+            Planned::Evict(plan) => plan,
+            Planned::Impossible { code, .. } => SwitchPlan::Impossible(code),
+        };
+        tx.commit()?;
+        Ok(plan)
+    }
+
+    /// Owner decision 2026-09-25 (`start deployment --evict`): plan the
+    /// releases that let every instance the start targets activate, not only
+    /// the first. Read only; nothing is closed, parked or reserved.
+    ///
+    /// Instances are planned in the order the start activates them (parked
+    /// ones wake first, then cold ones start, lowest index first). Each is
+    /// planned against the ledger as the earlier ones leave it: an earlier
+    /// instance is charged its steady footprint on the host it goes to (as
+    /// placement charges a start accepted but not yet armed), and an earlier
+    /// instance's victims are already out of the ledger and never chosen
+    /// twice. Each instance's own victim set is minimal, so the start never
+    /// evicts beyond what placement needs. When any instance cannot be placed
+    /// even with eviction the whole plan is `Impossible` and names it, so the
+    /// caller refuses before releasing anyone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_start_switch(
+        &self,
+        s: &CoordinatorSession,
+        target: &str,
+        eligible: placement::Eligible<'_>,
+        protected: &BTreeSet<String>,
+        activity: &dyn Fn(&str, i64) -> Option<i64>,
+    ) -> Result<StartSwitchPlan, LifecycleError> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let plan = plan_start_in(&tx, target, eligible, protected, activity)?;
         tx.commit()?;
         Ok(plan)
     }
@@ -658,7 +753,8 @@ fn plan_in(
     eligible: placement::Eligible<'_>,
     protected: &BTreeSet<String>,
     activity: &dyn Fn(&str, i64) -> Option<i64>,
-) -> Result<SwitchPlan, LifecycleError> {
+    assumed: &Assumed,
+) -> Result<Planned, LifecycleError> {
     // Rule 1: a dispatch-open READY instance serves; an activation in flight
     // is joined, never planned twice (T15). `only` (an explicit `start
     // instance --evict`) narrows both to that instance.
@@ -673,7 +769,7 @@ fn plan_in(
         |r| r.get(0),
     )?;
     if settled {
-        return Ok(SwitchPlan::FitsNow);
+        return Ok(Planned::Settled);
     }
     let revision: i64 = tx
         .query_row(
@@ -720,7 +816,7 @@ fn plan_in(
                 .optional()?;
             // Nothing startable: the activation answers with its own refusal.
             let Some(k) = cold else {
-                return Ok(SwitchPlan::FitsNow);
+                return Ok(Planned::Settled);
             };
             (k, false)
         }
@@ -736,6 +832,25 @@ fn plan_in(
             c.footprint = peak.clone();
         }
     }
+    // Owner decision 2026-09-25: earlier instances of the same evicting start
+    // are charged where they go, and their victims are already released.
+    for c in &mut hosts {
+        for released in &assumed.released {
+            c.ledger.owners.remove(released);
+        }
+        for (on, charged, footprint) in &assumed.charges {
+            if *on == c.host_id {
+                c.ledger.owners.insert(charged.clone(), footprint.clone());
+                c.instances_here += 1;
+            }
+        }
+        if c.occupied && !assumed.released.is_empty() {
+            let occupants = host_occupants(tx, &c.host_id, target, instance)?;
+            if occupants.iter().all(|o| assumed.released.contains(o)) {
+                c.occupied = false;
+            }
+        }
+    }
     struct HostChoice {
         host: String,
         instances_here: u32,
@@ -743,21 +858,46 @@ fn plan_in(
     }
     let mut best: Option<(HostChoice, Vec<SwitchVictim>)> = None;
     let mut refusals: Vec<&'static str> = Vec::new();
+    // Owner decision 2026-09-25: each host's reason, for the operator.
+    let mut notes: Vec<String> = Vec::new();
     for c in &hosts {
         if !c.eligible {
             refusals.push("host_ineligible");
+            notes.push(format!("host {} is not eligible for placement", c.host_id));
             continue;
         }
         if !wake && spec.max_per_host.is_some_and(|max| c.instances_here >= max) {
             refusals.push("max_per_host");
+            notes.push(format!(
+                "host {} already runs max_per_host instances",
+                c.host_id
+            ));
             continue;
         }
         // Owner decision 2026-09-23 (solo first start): a whole-host start
         // fits only where no other owner holds a charge.
         let alone = !c.whole_host || c.ledger.owners.keys().all(|other| *other == owner);
         if fits(&c.ledger, &owner, &c.footprint, &c.limits, c.max_parked).is_ok() && !c.occupied && alone {
-            // Rule 2: it fits without eviction; placement takes it.
-            return Ok(SwitchPlan::FitsNow);
+            // Rule 2: it fits without eviction; placement takes it, on the
+            // host placement's own order chooses.
+            let last_host: Option<String> = tx
+                .query_row(
+                    "SELECT host_id FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2",
+                    params![target, instance],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let chosen = mllm_scheduler::placement::place(
+                &hosts,
+                &owner,
+                placement::strategy(&spec),
+                if wake { None } else { spec.max_per_host },
+                last_host.as_deref(),
+            )
+            .map(|p| p.host_id)
+            .unwrap_or_else(|_| c.host_id.clone());
+            return Ok(Planned::Fits { host: Some(chosen) });
         }
         let rows: Vec<(String, u32, i64)> = tx
             .prepare(&format!(
@@ -815,6 +955,10 @@ fn plan_in(
         };
         if occupants.iter().any(|o| !by_owner.contains_key(o)) {
             refusals.push("host_occupied");
+            notes.push(format!(
+                "host {} runs a launch that cannot be released for it",
+                c.host_id
+            ));
             continue;
         }
         let mut freed = c.ledger.clone();
@@ -856,7 +1000,10 @@ fn plan_in(
                 .map(|more| occupants.iter().cloned().chain(more).collect::<Vec<_>>())
         };
         match decided {
-            Ok(chosen) if chosen.is_empty() => refusals.push("host_occupied"),
+            Ok(chosen) if chosen.is_empty() => {
+                refusals.push("host_occupied");
+                notes.push(format!("host {} cannot take another launch", c.host_id));
+            }
             Ok(chosen) => {
                 let mut victims = Vec::new();
                 for victim_owner in &chosen {
@@ -902,7 +1049,18 @@ fn plan_in(
                     best = Some((candidate, victims));
                 }
             }
-            Err(refusal) => refusals.push(refusal.code()),
+            Err(refusal) => {
+                refusals.push(refusal.code());
+                notes.push(shortfall(
+                    &c.host_id,
+                    &freed,
+                    &owner,
+                    &c.footprint,
+                    &c.limits,
+                    &by_owner.keys().cloned().collect(),
+                    refusal.code(),
+                ));
+            }
         }
     }
     let Some((choice, mut victims)) = best else {
@@ -911,15 +1069,40 @@ fn plan_in(
             [first, rest @ ..] if rest.iter().all(|r| r == first) => *first,
             _ => "no_host_fits",
         };
-        return Ok(SwitchPlan::Impossible(code.to_string()));
+        if notes.is_empty() {
+            notes.push("no allowed host resolved the deployment's revision".into());
+        }
+        return Ok(Planned::Impossible {
+            code: code.to_string(),
+            detail: notes.join("; "),
+        });
     };
-    // Rule 5: a victim is its deployment's last READY instance when no READY,
-    // dispatch-open instance of that deployment outside this release remains.
+    mark_last_ready(tx, &mut victims)?;
+    let admission_window_ms = read_selected_policy(tx, &choice.host)
+        .map_err(resource)?
+        .map_or(DEFAULT_ADMISSION_WINDOW_MS, |p| {
+            p.controls.queue.admission_window_ms
+        });
+    Ok(Planned::Evict(SwitchPlan::Evict {
+        host: choice.host,
+        instance,
+        wake,
+        victims,
+        admission_window_ms,
+    }))
+}
+
+/// Rule 5: a victim is its deployment's last READY instance when no READY,
+/// dispatch-open instance of that deployment outside this release remains.
+fn mark_last_ready(
+    tx: &Transaction<'_>,
+    victims: &mut [SwitchVictim],
+) -> Result<(), LifecycleError> {
     let released: BTreeSet<(String, u32)> = victims
         .iter()
         .map(|v| (v.deployment_id.clone(), v.instance))
         .collect();
-    for victim in &mut victims {
+    for victim in victims.iter_mut() {
         let others: Vec<u32> = tx
             .prepare(
                 "SELECT instance_index FROM deployment_instances WHERE deployment_id=?1
@@ -931,16 +1114,164 @@ fn plan_in(
             .iter()
             .all(|k| released.contains(&(victim.deployment_id.clone(), *k)));
     }
-    let admission_window_ms = read_selected_policy(tx, &choice.host)
-        .map_err(resource)?
-        .map_or(DEFAULT_ADMISSION_WINDOW_MS, |p| {
-            p.controls.queue.admission_window_ms
-        });
-    Ok(SwitchPlan::Evict {
-        host: choice.host,
-        instance,
-        wake,
-        victims,
-        admission_window_ms,
-    })
+    Ok(())
+}
+
+/// Bytes shown to the operator, in GiB with one decimal.
+fn gib(bytes: i64) -> String {
+    format!("{:.1} GiB", bytes.max(0) as f64 / (1u64 << 30) as f64)
+}
+
+/// Owner decision 2026-09-25: why one host cannot take the instance even with
+/// eviction, in the operator's terms: on the domain with the least slack, what
+/// the instance needs, what is free as the ledger stands and what releasing
+/// every eligible READY instance there would add.
+fn shortfall(
+    host: &str,
+    ledger: &mllm_domain::resources::LedgerSnapshot,
+    owner: &str,
+    footprint: &PhaseFootprint,
+    limits: &[MemoryLimit],
+    evictable: &BTreeSet<String>,
+    code: &str,
+) -> String {
+    let bytes = |f: &PhaseFootprint, domain: &str| -> i64 {
+        f.allocations
+            .iter()
+            .filter(|a| a.domain == domain)
+            .map(|a| a.bytes)
+            .sum()
+    };
+    let worst = limits
+        .iter()
+        .filter(|l| bytes(footprint, &l.domain) > 0)
+        .map(|l| {
+            let need = bytes(footprint, &l.domain);
+            let used: i64 = ledger
+                .owners
+                .iter()
+                .filter(|(id, _)| id.as_str() != owner)
+                .map(|(_, f)| bytes(f, &l.domain))
+                .sum();
+            let free = (l.managed_bytes - used).max(0);
+            let released: i64 = ledger
+                .owners
+                .iter()
+                .filter(|(id, _)| evictable.contains(id.as_str()))
+                .map(|(_, f)| bytes(f, &l.domain))
+                .sum();
+            (free + released - need, need, free, released)
+        })
+        .min();
+    match worst {
+        Some((_, need, free, released)) => format!(
+            "host {host} needs {}, {} free and {} evictable ({code})",
+            gib(need),
+            gib(free),
+            gib(released)
+        ),
+        None => format!("host {host}: {code}"),
+    }
+}
+
+/// See [`crate::Store::plan_start_switch`].
+fn plan_start_in(
+    tx: &Transaction<'_>,
+    target: &str,
+    eligible: placement::Eligible<'_>,
+    protected: &BTreeSet<String>,
+    activity: &dyn Fn(&str, i64) -> Option<i64>,
+) -> Result<StartSwitchPlan, LifecycleError> {
+    let revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM deployments WHERE id=?1",
+            [target],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or(LifecycleError::NotFound)?;
+    // SPEC §6.3 "Restore if parked, initialize if stopped": the start wakes
+    // every parked instance first, then starts the cold ones in index order.
+    let order: Vec<u32> = tx
+        .prepare(&format!(
+            "SELECT i.instance_index FROM deployment_instances i
+              WHERE i.deployment_id=?1 AND i.state='active' AND NOT {}
+                AND (i.observed_state='parked'
+                     OR NOT EXISTS(SELECT 1 FROM runtime_bindings b WHERE b.deployment_id=i.deployment_id
+                                    AND b.instance_index=i.instance_index AND b.state!='released'))
+              ORDER BY i.observed_state!='parked', i.instance_index",
+            open_runs_clause("i")
+        ))?
+        .query_map([target], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut assumed = Assumed::default();
+    let mut steps: Vec<StartStep> = Vec::new();
+    for k in order {
+        let host = match plan_in(
+            tx,
+            target,
+            Some(k),
+            true,
+            eligible,
+            protected,
+            activity,
+            &assumed,
+        )? {
+            Planned::Settled => continue,
+            Planned::Fits { host } => host,
+            Planned::Evict(SwitchPlan::Evict {
+                host,
+                instance,
+                wake,
+                victims,
+                admission_window_ms,
+            }) => {
+                for v in &victims {
+                    assumed
+                        .released
+                        .insert(instance_owner_id(&v.deployment_id, v.instance));
+                }
+                steps.push(StartStep {
+                    host: host.clone(),
+                    instance,
+                    wake,
+                    victims,
+                    admission_window_ms,
+                });
+                Some(host)
+            }
+            Planned::Evict(_) => continue,
+            Planned::Impossible { code, detail } => {
+                return Ok(StartSwitchPlan::Impossible {
+                    instance: k,
+                    code,
+                    detail,
+                })
+            }
+        };
+        // Charged as placement charges a start accepted but not yet armed.
+        if let Some(host) = host {
+            let (raw, _) = frozen_on_host(tx, target, revision, Some(&host))?;
+            let e =
+                decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+            assumed.charges.push((
+                host,
+                instance_owner_id(target, k),
+                super::startup::steady(&e),
+            ));
+        }
+    }
+    // Rule 5 over the whole start: a deployment losing several instances to
+    // it keeps its fairness window on the last of them.
+    let mut all: Vec<SwitchVictim> = steps.iter().flat_map(|s| s.victims.clone()).collect();
+    mark_last_ready(tx, &mut all)?;
+    let mut marked = all.into_iter();
+    for step in &mut steps {
+        for victim in &mut step.victims {
+            if let Some(m) = marked.next() {
+                victim.last_ready = m.last_ready;
+            }
+        }
+    }
+    Ok(StartSwitchPlan::Steps(steps))
 }

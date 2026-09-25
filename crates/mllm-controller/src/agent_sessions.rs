@@ -1318,6 +1318,62 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                 .unwrap_or_default(),
         )
     }
+    /// Owner decision 2026-09-25: why each host with a session is not a
+    /// placement candidate, so a refused start names the cause instead of
+    /// reporting capacity. The checks mirror `eligible_hosts`, most specific
+    /// first; the version skew reason carries both versions (ADR 0017).
+    fn ineligible_hosts(&self) -> std::collections::BTreeMap<String, String> {
+        let pending = self.authority.hosts_with_pending_drain();
+        let server = mllm_protocol::version::BINARY_VERSION;
+        self.sessions
+            .lock()
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter_map(|(host, s)| {
+                        let version = if s.view.binary_version.is_empty() {
+                            "unreported".to_owned()
+                        } else {
+                            s.view.binary_version.clone()
+                        };
+                        let reason = if s.drain_only {
+                            format!(
+                                "is drain-only ({}): host version {version}, server version {server}; {}",
+                                s.view.compatibility,
+                                if s.view.compatibility_reason.is_empty() {
+                                    "upgrade the host"
+                                } else {
+                                    s.view.compatibility_reason.as_str()
+                                }
+                            )
+                        } else if !s.view.online {
+                            "is offline".to_owned()
+                        } else if s.draining {
+                            "is draining (it announced a graceful shutdown)".to_owned()
+                        } else if pending.is_none() {
+                            "is not a candidate while the drain state cannot be read".to_owned()
+                        } else if pending.as_ref().is_some_and(|p| p.contains(host)) {
+                            "is being drained (a drain's stop has not settled)".to_owned()
+                        } else if s.unresponsive {
+                            "is unresponsive (its heartbeats are silent)".to_owned()
+                        } else if !s.view.reconciled {
+                            "is still reconciling its control session".to_owned()
+                        } else if !s.placeable {
+                            format!(
+                                "lacks a placement capability (host version {version}, server version {server}): {}",
+                                s.view.capabilities_missing.join(", ")
+                            )
+                        } else if !s.view.eligible {
+                            "is not prepared: no approved configuration carries a runtime profile whose build it reported".to_owned()
+                        } else {
+                            return None;
+                        };
+                        Some((host.clone(), format!("host {host} {reason}")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     /// Owner decision 4: hosts with a live, reconciled session, to which a
     /// cleanup Terminate can be delivered now.
     fn online_hosts(&self) -> Option<std::collections::BTreeSet<String>> {

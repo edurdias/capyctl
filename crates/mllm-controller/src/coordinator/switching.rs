@@ -2,7 +2,9 @@
 //! switching. Each is one store transaction under the owned session; the
 //! sequence that drives them lives in `crate::switching`.
 use super::*;
-use mllm_store::ordinary_lifecycle::switching::{SwitchPlan, SwitchRecord, SwitchRelease};
+use mllm_store::ordinary_lifecycle::switching::{
+    StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchRelease,
+};
 use std::collections::BTreeSet;
 
 impl CoordinatorCommands {
@@ -54,6 +56,53 @@ impl CoordinatorCommands {
                 .store()
                 .plan_switch(owner.session(), target, only, explicit, eligible.as_ref(), protected, &last)
         })
+    }
+
+    /// Owner decision 2026-09-25 (`start deployment --evict`): plan the
+    /// releases every instance of `target` the start activates needs, against
+    /// the hosts eligible now and the router's recent activity.
+    pub fn plan_start_switch(
+        &self,
+        target: &str,
+        protected: &BTreeSet<String>,
+    ) -> Result<StartSwitchPlan, CoordinatorCommandError> {
+        let eligible = self.shared.observations.eligible_hosts();
+        let activity = self
+            .shared
+            .activity
+            .lock()
+            .map_err(|_| self.shared.fail("activity registry poisoned"))?
+            .clone();
+        let last = |deployment: &str, generation: i64| {
+            [generation, -1]
+                .iter()
+                .filter_map(|g| activity.get(&(deployment.to_owned(), *g)).copied())
+                .max()
+        };
+        self.owned(|owner| {
+            owner.store().plan_start_switch(
+                owner.session(),
+                target,
+                eligible.as_ref(),
+                protected,
+                &last,
+            )
+        })
+    }
+
+    /// Owner decision 2026-09-25: the hosts eligible for placement now
+    /// (`None`: every resolving host is a candidate) and why each other host
+    /// with a session is not. Read without the owner lock held.
+    pub fn eligibility(
+        &self,
+    ) -> (
+        Option<BTreeSet<String>>,
+        std::collections::BTreeMap<String, String>,
+    ) {
+        (
+            self.shared.observations.eligible_hosts(),
+            self.shared.observations.ineligible_hosts(),
+        )
     }
 
     /// When the router last sent this deployment's instance a request, on

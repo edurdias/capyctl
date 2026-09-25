@@ -41,7 +41,7 @@ pub(crate) enum Prepared {
     Unplaceable(&'static str),
 }
 
-fn strategy(placement: &Placement) -> Strategy {
+pub(super) fn strategy(placement: &Placement) -> Strategy {
     match placement.strategy {
         PlacementStrategy::Spread => Strategy::Spread,
         PlacementStrategy::Pack => Strategy::Pack,
@@ -391,6 +391,20 @@ fn active(
 }
 
 impl crate::Store {
+    /// ADR 0013 §4 step 1: the allowed hosts that resolved the deployment's
+    /// current revision, the ones placement considers. Owner decision
+    /// 2026-09-25: a start refused because none of them is eligible names them.
+    pub fn resolved_hosts(&self, deployment_id: &str) -> Result<Vec<String>, LifecycleError> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT h.host_id FROM host_effective_revisions h JOIN deployments d ON d.id=h.deployment_id
+                  WHERE h.deployment_id=?1 AND h.revision=d.revision AND h.outcome='resolved' ORDER BY h.host_id",
+            )?
+            .query_map([deployment_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Accept the start of the instances `scope` names in one transaction and
     /// return the start a caller observes: the first instance's, joined or new.
     /// Starts of the other instances are their own operations, accepted in the
@@ -420,6 +434,10 @@ impl crate::Store {
         // Owner decision 2026-09-23: whether every instance that fit nowhere
         // was refused only because its solo first start needs an empty host.
         let mut needs_empty_host = true;
+        // Owner decision 2026-09-25: whether every instance that fit nowhere
+        // was refused only because no allowed host is eligible now. That is
+        // reported as `HostIneligible`, never masked as a capacity block.
+        let mut only_ineligible = true;
         for instance in targets {
             // Q5: on demand, one instance is brought up; the rest only fill in
             // where they fit, so a failure to fit is not queued for them.
@@ -470,6 +488,7 @@ impl crate::Store {
                 Prepared::Unplaceable(code) => {
                     blocked = true;
                     needs_empty_host &= code == "startup_requires_empty_host";
+                    only_ineligible &= code == "host_ineligible";
                     let until = (scope != StartScope::OnDemand).then_some(deadline);
                     if !filling {
                         defer(tx, deployment_id, instance, code, until)?;
@@ -491,6 +510,9 @@ impl crate::Store {
             Some(start) => Ok(start),
             None if blocked && refusal.is_none() && needs_empty_host => {
                 Err(LifecycleError::StartupRequiresEmptyHost)
+            }
+            None if blocked && refusal.is_none() && only_ineligible => {
+                Err(LifecycleError::HostIneligible)
             }
             None if blocked && refusal.is_none() => Err(LifecycleError::CapacityBlocked),
             None => Err(refusal.unwrap_or(LifecycleError::CapacityBlocked)),

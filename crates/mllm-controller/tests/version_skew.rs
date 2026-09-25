@@ -305,7 +305,23 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
     assert!(view.compatibility_reason.contains("drain-only"), "{}", view.compatibility_reason);
     assert!(!view.eligible, "a drain-only host takes no new placement");
     assert!(!h.sessions.eligible_hosts().unwrap().contains(&h.host));
-    assert!(h.sessions.online_hosts().unwrap().contains(&h.host), "it can still be stopped");
+    // Owner decision 2026-09-25: a start refused for it names the host and
+    // why, with both versions, rather than reporting capacity.
+    let why = h.sessions.ineligible_hosts();
+    let why = why.get(&h.host).expect("the drain-only host has a reason");
+    assert!(
+        why.starts_with(&format!("host {} is drain-only (upgrade_required)", h.host)),
+        "{why}"
+    );
+    assert!(why.contains("host version unreported"), "{why}");
+    assert!(
+        why.contains(&format!("server version {BINARY_VERSION}")),
+        "{why}"
+    );
+    assert!(
+        h.sessions.online_hosts().unwrap().contains(&h.host),
+        "it can still be stopped"
+    );
     // Status evidence survives in the store.
     let record = h.state.lock().unwrap().store().host_version(&h.host).unwrap().unwrap();
     assert_eq!(record.compatibility, "upgrade_required");

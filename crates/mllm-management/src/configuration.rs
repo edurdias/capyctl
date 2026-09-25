@@ -55,6 +55,13 @@ pub enum ConfigurationFailure {
     ReconciliationRequired,
     HostPolicyDenied,
     CapacityBlocked,
+    /// Owner decision 2026-09-25: a capacity block with its reason (which
+    /// instance, which host, what it needs and what eviction could free).
+    CapacityBlockedBecause(String),
+    /// Owner decision 2026-09-25: nothing could be placed because no allowed
+    /// host is eligible now; the message names each host and why (for a
+    /// drain-only host, both versions). Not a capacity block.
+    HostIneligible(String),
     /// Owner decision 2026-09-23: an unmeasured model too large to measure
     /// beside anything else starts only on an empty host (`--evict`).
     StartupRequiresEmptyHost,
@@ -86,8 +93,33 @@ impl ConfigurationFailure {
             )
                 .into_response();
         }
+        let detailed = |status: StatusCode, code: &str, message: &str| {
+            (
+                status,
+                Json(serde_json::json!({"api_version":"1","error":{
+                    "code":code,"message":message,"retryable":true,
+                    "operation_id":null,"details":{}}})),
+            )
+                .into_response()
+        };
+        match &self {
+            CapacityBlockedBecause(reason) => {
+                return detailed(StatusCode::SERVICE_UNAVAILABLE, "capacity_blocked", reason)
+            }
+            HostIneligible(reason) => {
+                let message = if reason.is_empty() {
+                    "No allowed host is eligible for placement now; `mllm list hosts` shows each host's state"
+                } else {
+                    reason.as_str()
+                };
+                return detailed(StatusCode::SERVICE_UNAVAILABLE, "host_ineligible", message);
+            }
+            _ => {}
+        }
         let (status, code, message, retryable) = match self {
-            InvalidConfigReason { .. } => unreachable!("answered above"),
+            InvalidConfigReason { .. } | CapacityBlockedBecause(_) | HostIneligible(_) => {
+                unreachable!("answered above")
+            }
             LifecycleConflict => (
                 StatusCode::CONFLICT,
                 "lifecycle_conflict",
