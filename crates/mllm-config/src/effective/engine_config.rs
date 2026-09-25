@@ -457,13 +457,17 @@ fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, Confi
     };
     // Discrete GPU design §3: the host_backed copy is the checkpoint's weight
     // bytes. Unknown weights leave nothing to charge, and an uncharged copy is an
-    // overcommit of host RAM, so the tier is refused rather than guessed.
+    // overcommit of host RAM, so the footprint is not materializable until the
+    // checkpoint digest measures them (ADR 0014 §5, §7): acceptance freezes it
+    // provisional and re-resolves it with the measured weights, exactly as a
+    // memory request derived from the weights.
     let copy = match residency {
         Residency::HostBacked => weights_bytes.ok_or_else(|| {
-            invalid(
-                "residency",
-                "host_backed_unavailable: the checkpoint's weight size is unknown, so the \
-                 host RAM copy cannot be charged; use deep or restart_only",
+            ConfigError::new(
+                ConfigErrorCode::NotMaterializable,
+                "engine_config.memory",
+                "cannot charge the host_backed weights copy: the checkpoint's weight size \
+                 is not known yet (ADR 0014 §5, §7)",
             )
         })?,
         _ => 0,

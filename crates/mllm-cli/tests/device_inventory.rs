@@ -97,11 +97,14 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
                 path: "/srv/models/m".into(),
             },
             Engine::Sglang,
-            1 << 40,
+            &mllm_cli::standalone_config::TemplateMemory::Unified {
+                capacity_bytes: 1 << 40,
+            },
             standalone_config::DEFAULT_REQUEST_DEADLINE,
             true,
             "local",
-        ),
+        )
+        .expect("the unified template"),
         &host,
     )
     .expect("the published host resolves with its placement evidence");

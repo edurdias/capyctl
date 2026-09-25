@@ -291,18 +291,48 @@ impl App {
             .into_iter()
             .next()
             .ok_or_else(|| StartError::Deploy("the host publishes no engine".into()))?;
+        // Design §3: a discrete host sizes the deployment from the checkpoint's
+        // weights; a unified host from its observed capacity, as before.
+        let memory = match &self.gpu_shape {
+            HostShape::Discrete(gpus) => {
+                let weights = checkpoint_weights(&first.installation.models_root, &source)?;
+                crate::standalone_config::discrete_template_memory(
+                    gpus,
+                    self.capacity_bytes,
+                    weights,
+                )
+                .ok_or_else(|| StartError::Deploy("the host publishes no GPU".into()))?
+            }
+            HostShape::Unified | HostShape::NoGpu => {
+                crate::standalone_config::TemplateMemory::Unified {
+                    capacity_bytes: self.capacity_bytes,
+                }
+            }
+        };
+        // Spec §3, §11: a request the device cannot hold is refused here,
+        // before anything is stored.
         let mut deployment = crate::standalone_config::deployment_document(
             name,
             name,
             &source,
             first.installation.engine,
-            self.capacity_bytes,
+            &memory,
             request_deadline,
             first.installation.deep_park,
             &first.profile,
-        );
-        // ADR 0014 §2: the engine configuration the environment asked for.
+        )
+        .map_err(StartError::Template)?;
+        // ADR 0014 §2: the engine configuration the environment asked for. On a
+        // discrete host its memory block is the template's: the device request
+        // is sized from the checkpoint, not from a unified KV default.
+        let template = deployment["engine_config"]["memory"].take();
         deployment["engine_config"] = first.installation.engine_config.clone();
+        if matches!(
+            memory,
+            crate::standalone_config::TemplateMemory::Device { .. }
+        ) {
+            deployment["engine_config"]["memory"] = template;
+        }
         let receipt = self
             .controller
             .create_configuration(
@@ -348,6 +378,39 @@ pub enum StartError {
     /// boot, not guessed at (`unsupported_gpu_topology`).
     #[error("{0}")]
     GpuTopology(mllm_agent::gpu_memory::GpuShapeError),
+    /// Spec §3, §11: the generated deployment cannot fit this host's device
+    /// (`insufficient_device_memory`).
+    #[error("{0}")]
+    Template(crate::standalone_config::TemplateError),
+}
+
+/// ADR 0014 §5: the sum of a local checkpoint's weight-file sizes, sized with
+/// the same bounded, confined walk the digest uses (a stat per file, no hash).
+/// A relative path resolves against the model store (spec §7).
+///
+/// Design §3: a discrete deployment's device request is sized from these
+/// weights, so a checkpoint that cannot be sized here (a remote source not yet
+/// fetched, a path outside the store, a missing directory) is refused rather
+/// than given a guessed request.
+fn checkpoint_weights(models_root: &Path, source: &ModelSource) -> Result<i64, StartError> {
+    let ModelSource::Local { path } = source else {
+        return Err(StartError::Deploy(
+            "a discrete GPU deployment is sized from its checkpoint's weights; standalone \
+             sizes only a local checkpoint in the model store"
+                .into(),
+        ));
+    };
+    let checkpoint = models_root.join(path);
+    mllm_agent::checkpoint::CheckpointVerifier::in_memory()
+        .size(models_root, &checkpoint)
+        .map(|size| size.weights_bytes)
+        .map_err(|error| {
+            StartError::Deploy(format!(
+                "the checkpoint at {} could not be sized ({error:?}); a discrete GPU \
+                 deployment is sized from its weights",
+                checkpoint.display()
+            ))
+        })
 }
 
 impl From<ProviderError> for StartError {
@@ -373,6 +436,7 @@ impl From<StartError> for StructuredError {
             StartError::ProfileExists(_) => "profile_exists",
             StartError::Setting(_) => "invalid_config",
             StartError::GpuTopology(error) => error.code(),
+            StartError::Template(ref error) => error.code(),
             _ => "internal",
         };
         StructuredError {
@@ -841,13 +905,10 @@ pub async fn start_standalone_from(
             state_dir.join("runtime"),
         )),
         crate::host_observation::proc_meminfo(),
-        // Design §1: the production boot samples the GPUs with
-        // `mllm_agent::gpu_memory::sample`. It observes no GPU until the
-        // standalone deployment template can allocate in a discrete host's
-        // device domains (Task 8 of the discrete GPU plan switches it on);
-        // until then a discrete host would publish domains its own template
-        // cannot name, and refuse to boot.
-        no_gpu(),
+        // Design §1: the production boot samples the GPUs with the bounded
+        // `nvidia-smi` collector. A machine without one samples nothing and
+        // publishes the unified shape, exactly as before.
+        Arc::new(mllm_agent::gpu_memory::sample),
     )
     .await
 }
@@ -1048,6 +1109,23 @@ async fn start_standalone_inner(
             inventory.as_ref(),
             &gpu_shape,
         );
+        // Design §3: on a discrete host the probe is the discrete template,
+        // sized for an empty checkpoint, on the GPU the picker would choose
+        // first; its resolution states those zero weights.
+        let (memory, facts) = match &gpu_shape {
+            HostShape::Discrete(gpus) => (
+                crate::standalone_config::discrete_template_memory(gpus, capacity_bytes, 0)
+                    .ok_or_else(|| StartError::Deploy("host policy invalid: no GPU".into()))?,
+                mllm_config::effective::CheckpointFacts {
+                    weights_bytes: Some(0),
+                    ..Default::default()
+                },
+            ),
+            HostShape::Unified | HostShape::NoGpu => (
+                crate::standalone_config::TemplateMemory::Unified { capacity_bytes },
+                mllm_config::effective::CheckpointFacts::default(),
+            ),
+        };
         let probe = crate::standalone_config::deployment_document(
             "policy-probe",
             "policy-probe",
@@ -1055,12 +1133,17 @@ async fn start_standalone_inner(
                 path: "/dev/null".into(),
             },
             installation.engine,
-            capacity_bytes,
+            &memory,
             crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
             installation.deep_park,
             &named[0].profile,
-        );
-        mllm_config::effective::resolve_effective(&probe, &host)
+        )
+        .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?;
+        let probe = mllm_config::instances::device_choices(&probe, &host)
+            .ok()
+            .and_then(|choices| choices.into_iter().next())
+            .map_or(probe, |(_, chosen)| chosen);
+        mllm_config::effective::resolve_effective_with_checkpoint(&probe, &host, facts)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
             .host
     };

@@ -46,6 +46,7 @@ pub async fn try_boot_on(
             ports,
             deep_park: false,
             members: None,
+            models_root: None,
         }),
         test_memory(),
     )
@@ -64,6 +65,29 @@ pub async fn try_boot_with_gpu(
             ports: engine_ports(),
             deep_park: false,
             members: None,
+            models_root: None,
+        }),
+        test_memory(),
+        Arc::new(gpu),
+    )
+    .await
+}
+
+/// As [`try_boot_with_gpu`], with deep parking set by `deep_park` and the
+/// model store at `models_root`, so a test can size a checkpoint it wrote.
+pub async fn try_boot_discrete(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+    models_root: &std::path::Path,
+    deep_park: bool,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_with_gpu(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park,
+            members: None,
+            models_root: Some(models_root.to_path_buf()),
         }),
         test_memory(),
         Arc::new(gpu),
@@ -89,6 +113,7 @@ pub async fn boot_deep_parking(
             ports: engine_ports(),
             deep_park: true,
             members: Some(members),
+            models_root: None,
         }),
         test_memory(),
     )
@@ -120,6 +145,7 @@ pub async fn boot_configured_on(
             ports,
             deep_park: false,
             members: None,
+            models_root: None,
         }),
         test_memory(),
     )
@@ -143,6 +169,44 @@ pub const TEST_CAPACITY_BYTES: i64 = 32 << 30;
 /// for a fifth of it at cold start).
 pub const BINARY_TEST_CAPACITY_BYTES: i64 = 4 << 30;
 
+/// The template memory a test that drives the real `mllm` binary sizes its
+/// deployment document from.
+///
+/// Design §1: the binary samples this machine's GPUs with `nvidia-smi`, and a
+/// test cannot hand a sampler to another process, so it samples them the same
+/// way and generates the template for the shape the binary will publish: a
+/// machine without a GPU (or a unified one) gets the unified template sized
+/// from [`BINARY_TEST_CAPACITY_BYTES`]; a discrete one gets a device request
+/// sized for a small stated card, so it fits under the limits the binary
+/// derives from any real card and the memory free on a busy one. The toy
+/// checkpoint's weights are negligible.
+pub fn binary_template_memory() -> mllm_cli::standalone_config::TemplateMemory {
+    use mllm_agent::gpu_memory::{shape, GpuMemory, HostShape};
+    match shape(mllm_agent::gpu_memory::sample().as_ref()) {
+        Ok(HostShape::Discrete(_)) => {
+            let card = GpuMemory {
+                total_bytes: BINARY_TEST_DEVICE_BYTES,
+                used_bytes: 0,
+                free_bytes: BINARY_TEST_DEVICE_BYTES,
+            };
+            let limits = mllm_cli::standalone_config::device_limits(&card, 4);
+            mllm_cli::standalone_config::TemplateMemory::Device {
+                managed_limit: limits.managed_limit,
+                device_total: card.total_bytes,
+                weights_bytes: 0,
+                system_parked_limit: BINARY_TEST_CAPACITY_BYTES / 4,
+            }
+        }
+        _ => mllm_cli::standalone_config::TemplateMemory::Unified {
+            capacity_bytes: BINARY_TEST_CAPACITY_BYTES,
+        },
+    }
+}
+
+/// The card a binary test sizes a discrete deployment for (see
+/// [`binary_template_memory`]).
+pub const BINARY_TEST_DEVICE_BYTES: i64 = 4 << 30;
+
 pub fn test_memory() -> mllm_cli::host_observation::MemoryReader {
     mllm_cli::host_observation::fixed_memory(TEST_CAPACITY_BYTES, TEST_CAPACITY_BYTES)
 }
@@ -164,6 +228,8 @@ struct PortedProvider {
     deep_park: bool,
     /// Real processes the Fake reports as its launched group, if any.
     members: Option<Vec<mllm_domain::completion::ProcessIdentity>>,
+    /// The model store, when the test states one.
+    models_root: Option<std::path::PathBuf>,
 }
 
 impl mllm_controller::EngineProvider for PortedProvider {
@@ -173,6 +239,9 @@ impl mllm_controller::EngineProvider for PortedProvider {
         let mut installation = mllm_testkit::fake_installation();
         installation.engine_ports = self.ports;
         installation.deep_park = self.deep_park;
+        if let Some(root) = &self.models_root {
+            installation.models_root = root.clone();
+        }
         Ok(installation)
     }
 

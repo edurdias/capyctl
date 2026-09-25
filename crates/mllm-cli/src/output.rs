@@ -141,7 +141,11 @@ impl StructuredError {
             "internal" | "management_unavailable" | "operation_failed" => ExitCode::INTERNAL,
             "invalid_config" | "command_rejected" | "not_found" => ExitCode::INVALID_CONFIG,
             "unauthorized" => ExitCode::UNAUTHORIZED,
-            "insufficient_resources" => ExitCode::INSUFFICIENT_RESOURCES,
+            // Discrete GPU design §11: a device domain that cannot hold the
+            // allocation uses the existing insufficient-resources exit.
+            "insufficient_resources" | "insufficient_device_memory" => {
+                ExitCode::INSUFFICIENT_RESOURCES
+            }
             "unreconciled" => ExitCode::UNRECONCILED,
             "device_conflict" => ExitCode::DEVICE_CONFLICT,
             "category_limit" => ExitCode::CATEGORY_LIMIT,

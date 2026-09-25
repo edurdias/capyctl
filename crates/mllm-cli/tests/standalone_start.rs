@@ -412,3 +412,117 @@ async fn standalone_on_a_unified_host_keeps_the_unified_shape() {
         .expect("a unified host boots");
     assert_eq!(app.gpu_shape, HostShape::Unified);
 }
+
+/// A 16 GB discrete card with 1.5 GiB of desktop use (the discrete-GPU laptop
+/// host's shape).
+fn discrete_card() -> Option<mllm_agent::gpu_memory::GpuSample> {
+    use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, GpuSample};
+    Some(GpuSample {
+        devices: vec![GpuDevice {
+            index: 0,
+            uuid: "GPU-00000000-2222-3333-4444-555555555555".into(),
+            pci_bus_id: "00000000:01:00.0".into(),
+            name: "RTX".into(),
+            memory: Some(GpuMemory {
+                total_bytes: 16376 << 20,
+                used_bytes: 1536 << 20,
+                free_bytes: (16376 - 1536) << 20,
+            }),
+        }],
+        // Sampled now: a device reading older than the observation TTL is
+        // unobserved, and the host's policy would not publish.
+        sampled_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+    })
+}
+
+/// A model store holding one checkpoint whose weights are `weights` bytes (a
+/// sparse file: only its size is read).
+fn store_with_checkpoint(weights: u64) -> tempfile::TempDir {
+    let store = safe_state_dir();
+    let checkpoint = store.path().join("m");
+    std::fs::create_dir(&checkpoint).unwrap();
+    std::fs::write(checkpoint.join("config.json"), "{}").unwrap();
+    std::fs::File::create(checkpoint.join("model.safetensors"))
+        .unwrap()
+        .set_len(weights)
+        .unwrap();
+    store
+}
+
+/// Design §3, spec §5 (owner decision 2): on a discrete host the generated
+/// deployment states a device request sized from the checkpoint's weights,
+/// derives its phases on the GPU the picker chooses, and parks to host RAM
+/// when the system domain has parked room for the copy; otherwise it parks
+/// deep. The suite's 32 GiB host parks 8 GiB: a 3 GiB checkpoint's copy plus
+/// the engine's host overhead fits, an 8 GiB one does not.
+// T26 T23
+#[tokio::test]
+async fn a_discrete_standalone_sizes_its_deployment_from_the_checkpoint() {
+    let gpu = discrete_card().unwrap().devices[0].memory.clone().unwrap();
+    let limits = mllm_cli::standalone_config::device_limits(&gpu, 4);
+    for (weights, residency) in [(3_i64 << 30, "host_backed"), (8 << 30, "deep")] {
+        let dir = safe_state_dir();
+        let store = store_with_checkpoint(weights as u64);
+        let app = support::try_boot_discrete(dir.path(), discrete_card, store.path(), true)
+            .await
+            .expect("a discrete host boots");
+        let id = app
+            .deploy("m", ModelSource::Local { path: "m".into() })
+            .expect("a model that fits the card deploys");
+        let effective = app
+            .store
+            .effective_configuration(&id)
+            .unwrap()
+            .expect("the deployment has an effective revision")
+            .effective;
+        assert_eq!(effective["residency"], residency, "{effective}");
+        let (request, _) = mllm_cli::standalone_config::device_request(
+            mllm_config::engine_policy::Engine::Vllm,
+            weights,
+            limits.managed_limit,
+            gpu.total_bytes,
+        );
+        let ready = &effective["resources"]["ready"]["allocations"];
+        assert_eq!(ready[0]["domain"], "gpu0", "{effective}");
+        assert_eq!(ready[0]["bytes"], request, "{effective}");
+        assert_eq!(ready[1]["domain"], "system", "{effective}");
+        // The startup peak on the card is the request: a derived peak of
+        // weights x 1.6 plus a margin would not fit a 16 GB card.
+        let cold = &effective["resources"]["cold"]["allocations"];
+        assert_eq!(cold[0]["bytes"], request, "{effective}");
+        let _ = app.shutdown().await;
+    }
+}
+
+/// Spec §3, §11: a model the card can never hold is refused at deploy with the
+/// numbers, under `insufficient_device_memory` (exit 4), and nothing is stored.
+// T26
+#[tokio::test]
+async fn a_model_larger_than_the_card_is_refused_at_deploy() {
+    let dir = safe_state_dir();
+    let store = store_with_checkpoint(16 << 30);
+    let app = support::try_boot_discrete(dir.path(), discrete_card, store.path(), true)
+        .await
+        .expect("a discrete host boots");
+    let error = app
+        .deploy("m", ModelSource::Local { path: "m".into() })
+        .expect_err("a model larger than the card is refused");
+    assert!(
+        matches!(error, mllm_cli::roles::StartError::Template(_)),
+        "{error:?}"
+    );
+    let structured = mllm_cli::output::StructuredError::from(error);
+    assert_eq!(structured.code, "insufficient_device_memory");
+    assert_eq!(
+        structured.exit_code(),
+        mllm_cli::output::ExitCode::INSUFFICIENT_RESOURCES
+    );
+    assert_eq!(
+        app.store.deployment_count().unwrap(),
+        0,
+        "nothing is stored"
+    );
+}

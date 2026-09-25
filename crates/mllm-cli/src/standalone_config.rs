@@ -255,10 +255,19 @@ pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
 /// Phase footprints are declared because admission compares a transition's peak
 /// against the ceiling, not its steady state.
 ///
-/// ADR 0014 §2, §5: the document carries an `engine_config` whose KV cache is a
-/// tenth of capacity, inside the Ready allocation that is its memory request.
-/// Standalone replaces it with the installation's configured block
-/// ([`EngineInstallation::engine_config`]) when it deploys.
+/// ADR 0014 §2, §5: on a unified host ([`TemplateMemory::Unified`]) the
+/// document carries an `engine_config` whose KV cache is a tenth of capacity,
+/// inside the Ready allocation that is its memory request. Standalone replaces
+/// it with the installation's configured block
+/// ([`EngineInstallation::engine_config`]) when it deploys. That document is
+/// byte-identical to the one before discrete hosts had a template.
+///
+/// Design §3: on a discrete host ([`TemplateMemory::Device`]) the document
+/// states a device memory request sized from the checkpoint's weights
+/// ([`device_request`]) and omits `resources:`, so its phases derive on the GPU
+/// the picker chooses; the residency is [`default_residency`]. A request the
+/// device domain cannot hold is refused
+/// ([`TemplateError::InsufficientDeviceMemory`]).
 ///
 /// `request_deadline` is a parameter rather than a constant because the deadline is
 /// a property of the deployment an operator asks for, and the live suite has to be
@@ -268,9 +277,8 @@ pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
 /// `deep_park` is the host's switch ([`EngineInstallation::deep_park`]). ADR 0012:
 /// deep parking is on by default and a host opts out, so the generated residency
 /// has to follow that switch rather than state a tier the host's profile refuses.
-/// The residency no longer depends on the engine (vLLM sleeps, SGLang uses its
-/// memory saver), so the engine argument does not decide it; it is kept so
-/// callers name the installation the document is generated for.
+/// The residency does not depend on the engine (vLLM sleeps, SGLang uses its
+/// memory saver). The engine decides only a discrete request's floor (vLLM's).
 ///
 /// `profile` is the runtime profile the deployment runs on (ADR 0018 §5: the
 /// host may publish several; [`STANDALONE_PROFILE`] is the environment's).
@@ -280,12 +288,37 @@ pub fn deployment_document(
     name: &str,
     route: &str,
     source: &ModelSource,
-    _engine: Engine,
-    capacity_bytes: i64,
+    engine: Engine,
+    memory: &TemplateMemory,
     request_deadline: &str,
     deep_park: bool,
     profile: &str,
-) -> Value {
+) -> Result<Value, TemplateError> {
+    let capacity_bytes = match *memory {
+        TemplateMemory::Unified { capacity_bytes } => capacity_bytes,
+        TemplateMemory::Device {
+            managed_limit,
+            device_total,
+            weights_bytes,
+            system_parked_limit,
+        } => {
+            return discrete_document(
+                name,
+                route,
+                source,
+                engine,
+                DiscreteTemplate {
+                    managed_limit,
+                    device_total,
+                    weights_bytes,
+                    system_parked_limit,
+                },
+                request_deadline,
+                deep_park,
+                profile,
+            )
+        }
+    };
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
     // ADR 0012: deep parking is on by default and a host opts out, and the
@@ -304,7 +337,7 @@ pub fn deployment_document(
     // (MLLM_DEEP_PARK=off), which declares restart_only here.
     let residency = if deep_park { "deep" } else { "restart_only" };
     let allocation = |percent: i64, kv: i64| json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}]);
-    json!({
+    Ok(json!({
         "schema_version": 1,
         "kind": "deployment",
         "name": name,
@@ -334,7 +367,199 @@ pub fn deployment_document(
             "parked":  {"allocations": allocation(2, 0),  "devices": []},
             "wake":    {"allocations": allocation(20, 2), "devices": devices}
         }
+    }))
+}
+
+/// What the deployment template is sized from.
+///
+/// Design §3: a unified host states fixed shares of its observed capacity; a
+/// discrete host states a memory request sized from the checkpoint's weights,
+/// and its phases derive from it. There is no device id: the picker chooses the
+/// GPU (discrete GPU design §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateMemory {
+    Unified {
+        capacity_bytes: i64,
+    },
+    Device {
+        /// The device domain's managed limit ([`device_limits`]).
+        managed_limit: i64,
+        /// The card's total memory, which vLLM's floor is a fraction of.
+        device_total: i64,
+        /// ADR 0014 §5: the sum of the checkpoint's weight-file sizes.
+        weights_bytes: i64,
+        /// What the system domain holds parked: the smaller of its
+        /// `parked_limit` and `managed_limit`.
+        system_parked_limit: i64,
+    },
+}
+
+/// Why no deployment template could be generated.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TemplateError {
+    /// Spec §3, §11: the device request exceeds the device domain's managed
+    /// limit, so no placement could ever hold it.
+    #[error(
+        "insufficient_device_memory: the deployment needs a device memory request of {request} \
+         bytes (weights x 1.10 plus the KV cache), above the {limit} bytes the device domain \
+         manages; use a smaller or quantized checkpoint"
+    )]
+    InsufficientDeviceMemory { request: i64, limit: i64 },
+}
+
+impl TemplateError {
+    /// The structured error code the refusal is reported under.
+    pub fn code(&self) -> &'static str {
+        match self {
+            TemplateError::InsufficientDeviceMemory { .. } => "insufficient_device_memory",
+        }
+    }
+}
+
+/// Spec §3: the device memory request and KV cache of a discrete deployment.
+///
+/// The KV cache is `min(4 GiB, managed_limit / 4)` and the request is
+/// `weights x 1.10 + kv`. vLLM's request is at least 0.75 of the card.
+pub fn device_request(
+    engine: Engine,
+    weights_bytes: i64,
+    managed_limit: i64,
+    device_total: i64,
+) -> (i64, i64) {
+    const GIB: i64 = 1 << 30;
+    let kv = (4 * GIB).min(managed_limit / 4);
+    let request = (weights_bytes / 100).saturating_mul(110).saturating_add(kv);
+    // Spec §3: vLLM 0.29 with CUDA graphs starts a 4B model on a 16 GB card
+    // only at --gpu-memory-utilization >= 0.75.
+    let floor = if engine == Engine::Vllm {
+        device_total / 100 * 75
+    } else {
+        0
+    };
+    (request.max(floor), kv)
+}
+
+/// The residency the generated template declares.
+///
+/// ADR 0012: `restart_only` when the host opted out of deep parking. Spec §5
+/// (owner decision 2): on a discrete host a wake from host RAM is the default
+/// when the copy fits what the system domain holds parked; otherwise `deep`.
+/// `deep` on a unified host, where a copy in host RAM frees nothing (ADR 0010).
+///
+/// `discrete` is `(weights, system parked limit)`. The parked system
+/// allocation is the engine's host overhead plus the copy (design §3), which is
+/// what resolution holds to the limit (`host_backed_unavailable`), so the
+/// overhead is counted here too: the template never states a tier its own
+/// resolution refuses.
+pub fn default_residency(deep_park: bool, discrete: Option<(i64, i64)>) -> &'static str {
+    const OVERHEAD: i64 = mllm_config::effective::ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
+    match (deep_park, discrete) {
+        (false, _) => "restart_only",
+        (true, Some((weights, parked_limit)))
+            if weights.saturating_add(OVERHEAD) <= parked_limit =>
+        {
+            "host_backed"
+        }
+        (true, _) => "deep",
+    }
+}
+
+/// Design §3: the template memory of a discrete host, sized on its largest GPU
+/// (the one most likely to hold the deployment; the picker still chooses) and
+/// the system domain's parked room. `None` when there is no GPU.
+pub fn discrete_template_memory(
+    gpus: &[mllm_agent::gpu_memory::GpuDevice],
+    capacity_bytes: i64,
+    weights_bytes: i64,
+) -> Option<TemplateMemory> {
+    let largest = gpus
+        .iter()
+        .filter_map(|gpu| gpu.memory.as_ref())
+        .max_by_key(|memory| memory.total_bytes)?;
+    let limits = device_limits(largest, MAX_PARKED);
+    // The same shares `host_policy` publishes for the system domain; the
+    // parked copy is held to the smaller of its parked and managed limits.
+    let system_parked_limit =
+        (capacity_bytes / 100 * PARKED_FRACTION).min(capacity_bytes / 100 * MANAGED_FRACTION);
+    Some(TemplateMemory::Device {
+        managed_limit: limits.managed_limit,
+        device_total: largest.total_bytes,
+        weights_bytes,
+        system_parked_limit,
     })
+}
+
+struct DiscreteTemplate {
+    managed_limit: i64,
+    device_total: i64,
+    weights_bytes: i64,
+    system_parked_limit: i64,
+}
+
+/// Design §3: the discrete template states the device memory request and omits
+/// `resources:`, so every phase derives from the request as `[device, system]`
+/// allocations on the GPU the picker chooses.
+// Each argument is a separate field of the document.
+#[allow(clippy::too_many_arguments)]
+fn discrete_document(
+    name: &str,
+    route: &str,
+    source: &ModelSource,
+    engine: Engine,
+    sizing: DiscreteTemplate,
+    request_deadline: &str,
+    deep_park: bool,
+    profile: &str,
+) -> Result<Value, TemplateError> {
+    let (request, kv) = device_request(
+        engine,
+        sizing.weights_bytes,
+        sizing.managed_limit,
+        sizing.device_total,
+    );
+    // Spec §3: a request the device domain can never hold is refused at
+    // deploy, with the numbers, before anything is stored.
+    if request > sizing.managed_limit {
+        return Err(TemplateError::InsufficientDeviceMemory {
+            request,
+            limit: sizing.managed_limit,
+        });
+    }
+    let residency = default_residency(
+        deep_park,
+        Some((sizing.weights_bytes, sizing.system_parked_limit)),
+    );
+    Ok(json!({
+        "schema_version": 1,
+        "kind": "deployment",
+        "name": name,
+        "routes": [route],
+        "runtime_profile": profile,
+        "runtime_profile_revision": 1,
+        "recipe": "standalone",
+        "residency": residency,
+        "recovery": "reconcile",
+        "request_deadline": request_deadline,
+        "model": {
+            "source": source,
+            "content_fingerprint": format!("sha256:{name}"),
+            "revision": "r1"
+        },
+        // Discrete GPU design §7: no device is pinned; placement picks the GPU.
+        // The key is required by the deployment schema.
+        "devices": [],
+        "engine_config": {"memory": {
+            "request": format!("{request}B"),
+            "kv_cache": format!("{kv}B"),
+            // Design §3: the device holds the startup peak in the cold phase.
+            // The engine's use of the card is bounded by the fraction mllm
+            // renders from this request, so the device peak is the request; the
+            // unified placeholder (weights x 1.6 plus a margin) models load
+            // buffers in the one pool, which on a discrete host sit in host RAM,
+            // and would size a 4B model beyond a 16 GB card.
+            "startup": format!("{request}B")
+        }}
+    }))
 }
 
 #[cfg(test)]

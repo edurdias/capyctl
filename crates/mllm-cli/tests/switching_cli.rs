@@ -87,13 +87,16 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         Engine::Vllm,
         // The capacity the app was booted with (`support::test_memory`), not
         // this machine's: the deployment must be sized against the same host.
-        support::TEST_CAPACITY_BYTES,
+        &mllm_cli::standalone_config::TemplateMemory::Unified {
+            capacity_bytes: support::TEST_CAPACITY_BYTES,
+        },
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
         // ADR 0012: the Fake host opts out of deep parking, so its
         // generated deployment is restart_only.
         false,
         "local",
-    );
+    )
+    .expect("the unified template");
     let path = dir.path().join("deployment.json");
     std::fs::write(&path, config.to_string()).unwrap();
     let deployed = cli(

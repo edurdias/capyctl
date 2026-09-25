@@ -200,11 +200,14 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
             "d",
             &local("/srv/models/d"),
             Engine::Vllm,
-            CAPACITY,
+            &TemplateMemory::Unified {
+                capacity_bytes: CAPACITY,
+            },
             DEFAULT_REQUEST_DEADLINE,
             false,
             "local",
-        );
+        )
+        .expect("the unified template");
         let mut deployment = deployment;
         deployment["engine_config"] = installation.engine_config.clone();
         let effective = mllm_config::effective::resolve_effective(&deployment, &host).unwrap();
@@ -298,11 +301,14 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     let resources = d["resources"].as_object().unwrap();
     for phase in ["cold", "ready", "parking", "parked", "wake"] {
         assert!(resources.contains_key(phase), "{phase} must be declared");
@@ -334,11 +340,14 @@ fn a_parked_deployment_holds_no_device() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(
         d["resources"]["parked"]["devices"]
             .as_array()
@@ -361,11 +370,14 @@ fn the_deployment_names_its_installation() {
         "route-m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
 }
@@ -379,11 +391,14 @@ fn the_deployment_states_its_model_source() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(d["model"]["source"]["type"], "local");
     assert_eq!(d["model"]["source"]["path"], "/models/m");
 
@@ -397,11 +412,14 @@ fn the_deployment_states_its_model_source() {
             token_ref: None,
         },
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(fetched["model"]["source"]["type"], "huggingface");
     assert_eq!(fetched["model"]["source"]["repo"], "org/model");
 }
@@ -449,11 +467,14 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(deployment["residency"], "deep");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("a deep vLLM deployment resolves on a deep-parking host");
@@ -481,11 +502,14 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         false,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(deployment["residency"], "restart_only");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("an opted-out vLLM host's deployment resolves");
@@ -580,11 +604,14 @@ fn host_policy_from_env_is_complete() {
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         installation.deep_park,
         "local",
-    );
+    )
+    .expect("the unified template");
     deployment["engine_config"] = installation.engine_config.clone();
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("the published table resolves");
@@ -872,11 +899,14 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
         installation.engine,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         installation.deep_park,
         "local",
-    );
+    )
+    .expect("the unified template");
     deployment["engine_config"] = installation.engine_config.clone();
     assert_eq!(deployment["residency"], "restart_only");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host);
@@ -909,11 +939,14 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
             "m",
             &local("/models/m"),
             engine,
-            CAPACITY,
+            &TemplateMemory::Unified {
+                capacity_bytes: CAPACITY,
+            },
             DEFAULT_REQUEST_DEADLINE,
             deep_park,
             "local",
-        )["residency"]
+        )
+        .expect("the unified template")["residency"]
             .clone()
     };
     assert_eq!(residency(Engine::Sglang, true), "deep");
@@ -1195,4 +1228,196 @@ fn device_limits_follow_the_spec_table() {
         limits.parked_limit,
         (2 * GIB * 4).min(16376 * MIB / 100 * 25)
     );
+}
+
+fn source() -> ModelSource {
+    ModelSource::Local {
+        path: "/models/a".into(),
+    }
+}
+
+// T26/T23: a 4B bf16 model (~8 GiB) on a 16 GB card: request, no fixed shares.
+#[test]
+fn a_discrete_template_states_a_request_and_derives_phases() {
+    let memory = TemplateMemory::Device {
+        managed_limit: 15 << 30,
+        device_total: 16376 << 20,
+        weights_bytes: 8 << 30,
+        system_parked_limit: 15 << 30,
+    };
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Sglang,
+        &memory,
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert!(doc.get("resources").is_none());
+    // The picker chooses the GPU (discrete GPU design §7); the deployment
+    // parser requires the key, so the template pins nothing with an empty list.
+    assert_eq!(doc["devices"], serde_json::json!([]));
+    let (request, kv) = device_request(Engine::Sglang, 8 << 30, 15 << 30, 16376 << 20);
+    assert_eq!(kv, (15i64 << 30) / 4); // min(4 GiB, 3.75 GiB)
+    assert_eq!(
+        doc["engine_config"]["memory"]["request"],
+        format!("{request}B")
+    );
+    assert_eq!(doc["engine_config"]["memory"]["kv_cache"], format!("{kv}B"));
+    assert_eq!(doc["residency"], "host_backed");
+}
+
+// T26: vLLM's request never falls below 0.75 of the card.
+#[test]
+fn the_vllm_request_has_a_floor() {
+    let (small, _) = device_request(Engine::Vllm, 2 << 30, 15 << 30, 16376 << 20);
+    assert!(small >= (16376i64 << 20) / 100 * 75);
+    // SGLang has no floor: weights x 1.10 plus the KV cache.
+    let (sglang, kv) = device_request(Engine::Sglang, 2 << 30, 15 << 30, 16376 << 20);
+    assert_eq!(sglang, (2i64 << 30) / 100 * 110 + kv);
+}
+
+// Owner decision 2: host_backed is the discrete default when the copy fits.
+#[test]
+fn the_default_tier_follows_the_host() {
+    assert_eq!(
+        default_residency(true, Some((8 << 30, 15 << 30))),
+        "host_backed"
+    );
+    assert_eq!(default_residency(true, Some((20 << 30, 15 << 30))), "deep");
+    assert_eq!(default_residency(true, None), "deep");
+    assert_eq!(
+        default_residency(false, Some((8 << 30, 15 << 30))),
+        "restart_only"
+    );
+    // Task 6's rule: the parked system allocation is the engine's host overhead
+    // plus the copy, so a copy that fits only without the overhead parks deep.
+    assert_eq!(default_residency(true, Some((12 << 30, 15 << 30))), "deep");
+}
+
+// Review focus 1: a model that cannot fit is refused at deploy with numbers.
+#[test]
+fn a_model_larger_than_the_device_is_refused() {
+    let memory = TemplateMemory::Device {
+        managed_limit: 15 << 30,
+        device_total: 16376 << 20,
+        weights_bytes: 16 << 30,
+        system_parked_limit: 15 << 30,
+    };
+    let error = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Vllm,
+        &memory,
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        TemplateError::InsufficientDeviceMemory { .. }
+    ));
+    assert!(error.to_string().starts_with("insufficient_device_memory"));
+    let (request, _) = device_request(Engine::Vllm, 16 << 30, 15 << 30, 16376 << 20);
+    assert!(error.to_string().contains(&request.to_string()), "{error}");
+    assert!(
+        error.to_string().contains(&(15i64 << 30).to_string()),
+        "{error}"
+    );
+}
+
+// T26: the unified template is byte-identical to before.
+#[test]
+fn the_unified_template_is_unchanged() {
+    // Captured from `main` before discrete hosts had a template.
+    let before = include_str!("fixtures/unified_deployment.json");
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Vllm,
+        &TemplateMemory::Unified {
+            capacity_bytes: 128 << 30,
+        },
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string_pretty(&doc).unwrap(),
+        before.trim_end()
+    );
+}
+
+// T26/T23: the generated discrete template resolves on the discrete host this
+// module publishes, for every engine and tier, and every phase fits the card:
+// a template whose startup peak exceeded the device could never be placed.
+#[test]
+fn the_discrete_template_resolves_and_fits_the_card() {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let gpu = rtx(0, 16376, 1536).memory.unwrap();
+    let limits = device_limits(&gpu, MAX_PARKED);
+    let system_parked = 61 * GIB / 100 * PARKED_FRACTION;
+    for (engine, deep_park) in [
+        (Engine::Vllm, true),
+        (Engine::Sglang, true),
+        (Engine::Vllm, false),
+    ] {
+        let mut host = host.clone();
+        host["runtime_profiles"]["local"]["engine"] = engine_name(engine).into();
+        host["runtime_profiles"]["local"]["security"]["deep_park"] =
+            if deep_park { "enabled" } else { "disabled" }.into();
+        let doc = deployment_document(
+            "a",
+            "a",
+            &source(),
+            engine,
+            &TemplateMemory::Device {
+                managed_limit: limits.managed_limit,
+                device_total: gpu.total_bytes,
+                weights_bytes: 8 * GIB,
+                system_parked_limit: system_parked,
+            },
+            DEFAULT_REQUEST_DEADLINE,
+            deep_park,
+            "local",
+        )
+        .unwrap();
+        let expected = if deep_park {
+            "host_backed"
+        } else {
+            "restart_only"
+        };
+        assert_eq!(doc["residency"], expected);
+        let choices = mllm_config::instances::device_choices(&doc, &host).unwrap();
+        let (device, chosen) = choices.first().expect("the picker has a GPU to choose");
+        assert_eq!(device, "gpu0");
+        let effective = mllm_config::effective::resolve_effective_with_checkpoint(
+            chosen,
+            &host,
+            mllm_config::effective::CheckpointFacts {
+                weights_bytes: Some(8 * GIB),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
+        let value = serde_json::to_value(&effective).unwrap();
+        for (phase, footprint) in value["resources"].as_object().unwrap() {
+            for allocation in footprint["allocations"].as_array().unwrap() {
+                if allocation["domain"] == "gpu0" {
+                    assert!(
+                        allocation["bytes"].as_i64().unwrap() <= limits.managed_limit,
+                        "{engine:?} {phase}: {allocation}"
+                    );
+                }
+            }
+        }
+    }
 }

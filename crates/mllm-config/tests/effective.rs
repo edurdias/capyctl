@@ -1675,11 +1675,18 @@ fn derivation_needs_one_system_domain() {
 
 // T26: the host-RAM tier on a discrete host needs the weight size to charge the copy.
 #[test]
-fn host_backed_with_unknown_weights_is_refused() {
+fn host_backed_with_unknown_weights_is_not_materializable() {
     let mut host = discrete_host();
     host["runtime_profiles"]["vllm"] = host["runtime_profiles"]["local"].clone();
     let e = resolve_effective(&deployment_with("host_backed", "vllm", "10GiB"), &host).unwrap_err();
-    assert!(e.detail.starts_with("host_backed_unavailable:"), "{e}");
+    // ADR 0014 §7: not materializable until the digest measures the weights,
+    // which is what lets acceptance freeze the revision provisional.
+    assert_eq!(
+        e.code,
+        mllm_config::ConfigErrorCode::NotMaterializable,
+        "{e}"
+    );
+    assert!(e.path.starts_with("engine_config.memory"), "{e}");
 }
 
 // T26: the host-RAM tier on a discrete host is allowed only when the system domain

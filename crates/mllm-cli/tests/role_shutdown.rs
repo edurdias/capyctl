@@ -402,9 +402,9 @@ fn deploy(installation: &Installation) -> Value {
 }
 
 fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> Value {
-    // Sized from an explicit capacity, not this machine's (see
-    // `support::BINARY_TEST_CAPACITY_BYTES`).
-    let capacity = support::BINARY_TEST_CAPACITY_BYTES;
+    // Sized for the shape the binary publishes on this machine, from an
+    // explicit capacity rather than this machine's (see
+    // `support::binary_template_memory`).
     let document = mllm_cli::standalone_config::deployment_document(
         "w11-model",
         "w11-model",
@@ -417,13 +417,14 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
                 .into_owned(),
         },
         Engine::Vllm,
-        capacity,
+        &support::binary_template_memory(),
         request_deadline,
         // The host runs with MLLM_DEEP_PARK=off (ADR 0012 opt-out), so
         // its generated deployment is restart_only.
         false,
         "local",
-    );
+    )
+    .expect("the template fits the stated card");
     let file = installation.root.path().join("deployment.json");
     std::fs::write(&file, document.to_string()).unwrap();
     let out = installation.cli(&[

@@ -1,0 +1,105 @@
+{
+  "devices": [
+    {
+      "id": "gpu0",
+      "sharing": "shared"
+    }
+  ],
+  "engine_config": {
+    "memory": {
+      "kv_cache": "13743895340B"
+    }
+  },
+  "kind": "deployment",
+  "model": {
+    "content_fingerprint": "sha256:a",
+    "revision": "r1",
+    "source": {
+      "path": "/models/a",
+      "type": "local"
+    }
+  },
+  "name": "a",
+  "recipe": "standalone",
+  "recovery": "reconcile",
+  "request_deadline": "900s",
+  "residency": "deep",
+  "resources": {
+    "cold": {
+      "allocations": [
+        {
+          "bytes": "27487790680B",
+          "domain": "unified",
+          "host_kv_bytes": "2748779068B"
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    },
+    "parked": {
+      "allocations": [
+        {
+          "bytes": "2748779068B",
+          "domain": "unified",
+          "host_kv_bytes": "0B"
+        }
+      ],
+      "devices": []
+    },
+    "parking": {
+      "allocations": [
+        {
+          "bytes": "20615843010B",
+          "domain": "unified",
+          "host_kv_bytes": "2748779068B"
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    },
+    "ready": {
+      "allocations": [
+        {
+          "bytes": "20615843010B",
+          "domain": "unified",
+          "host_kv_bytes": "2748779068B"
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    },
+    "wake": {
+      "allocations": [
+        {
+          "bytes": "27487790680B",
+          "domain": "unified",
+          "host_kv_bytes": "2748779068B"
+        }
+      ],
+      "devices": [
+        {
+          "id": "gpu0",
+          "sharing": "shared"
+        }
+      ]
+    }
+  },
+  "routes": [
+    "a"
+  ],
+  "runtime_profile": "local",
+  "runtime_profile_revision": 1,
+  "schema_version": 1
+}

@@ -77,11 +77,14 @@ async fn deploy(
             path: format!("/models/{name}"),
         },
         mllm_config::engine_policy::Engine::Vllm,
-        support::TEST_CAPACITY_BYTES,
+        &mllm_cli::standalone_config::TemplateMemory::Unified {
+            capacity_bytes: support::TEST_CAPACITY_BYTES,
+        },
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
         false,
         profile,
-    );
+    )
+    .expect("the unified template");
     let response = reqwest::Client::new()
         .post(format!("http://{address}/management/v1/deployments"))
         .bearer_auth(admin)
