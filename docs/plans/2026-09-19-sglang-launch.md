@@ -24,7 +24,7 @@
 - Schema changes follow the migration pattern in `crates/mllm-store/src/migrations.rs` (`MIGRATIONS` array; one entry per version).
 - Prose in documents and commit messages is normal English. Test IDs cited as `// Txx` where an acceptance-matrix entry exists.
 - Core suite command: `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`. Clippy: `cargo clippy --all-targets -- -D warnings` over those crates.
-- Excluded files (do not read/edit/stage): `crates/mllm-cli/tests/live_interactive.rs`, `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`.
+- Excluded files (do not read/edit/stage): `crates/mllm-cli/tests/live_interactive.rs`, a local Task 2 implementation report.
 
 ## File Structure
 

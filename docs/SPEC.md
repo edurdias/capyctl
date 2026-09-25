@@ -11,7 +11,7 @@
 
 ## How to use this specification
 
-Read sections 1–5 for the product boundary, sections 6–13 for behavior and safety, and sections 14–19 for interfaces, configuration, and delivery. Section 20 defines acceptance tests. `AGENTS.md` is the companion entry point for a coding agent; this document is authoritative when summaries differ.
+Read sections 1–5 for the product boundary, sections 6–13 for behavior and safety, and sections 14–19 for interfaces, configuration, and delivery. Section 20 defines acceptance tests. `AGENTS.md` is the companion working agreement for contributors; this document is authoritative when summaries differ.
 
 **MUST / MUST NOT** identify required behavior. **SHOULD** identifies a recommended default that may be changed with a documented architectural decision. Implementation language, internal libraries, numeric default tuning, and the illustrative YAML field names are baseline proposals, not claims of separately approved implementation details. The requirements and ownership boundaries are the established direction.
 

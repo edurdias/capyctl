@@ -15,7 +15,7 @@
 - Tag tests with their acceptance-matrix ID (`// T14`) where one applies.
 - Core suite command: `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`
 - Clippy must pass with `-D warnings` across those crates.
-- `crates/mllm-cli/tests/live_interactive.rs` and `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md` are excluded: do not read, edit, format, test or stage them.
+- `crates/mllm-cli/tests/live_interactive.rs` and a local Task 2 implementation report are excluded: do not read, edit, format, test or stage them.
 - This plan makes the tier declarable and validated. It does **not** implement ordinary park, and does not decide when the park/restore proof runs. Both are out of scope.
 
 ---

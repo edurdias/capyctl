@@ -13,7 +13,7 @@
 - Only host `host-a` is authorized for live work. Never access `host-b`. No task in this plan touches a live host.
 - Do not change engine environments, drivers, or reboot hosts. The Python files under `runtime/` are not edited by this plan.
 - Native entrypoint denials stay closed. Moving the native launch handoff opens nothing; `ProfileBindings` keeps refusing SGLang.
-- Excluded files, never read, edited, formatted, tested or staged: `crates/mllm-cli/tests/live_interactive.rs` and `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`. The second is modified in the worktree; do not stage it in any commit.
+- Excluded files, never read, edited, formatted, tested or staged: `crates/mllm-cli/tests/live_interactive.rs` and a local Task 2 implementation report. The second is modified in the worktree; do not stage it in any commit.
 - `AGENTS.md` is untracked and not this plan's. Leave it alone.
 - One status document: `docs/runbooks/f2-current-status.md`. No progress or continuation files anywhere under `docs/`.
 - Prose in documents and commit messages is normal English.

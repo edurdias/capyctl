@@ -1068,8 +1068,8 @@ from the pre-ADR 0014 launch shape. Standalone still forces SGLang to `deep`, so
 `MLLM_DEEP_PARK=off` with SGLang was expected to be refused; it now falls back to
 `restart_only` (`deployment_document` gained a `deep_park` argument). On
 2026-09-22 the owner confirmed that `crates/mllm-cli/tests/live_interactive.rs` and
-`.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`, which
-AGENTS.md had excluded as the owner's, are leftovers from earlier agents. The
+a local Task 2 implementation report, which
+AGENTS.md had excluded as the owner's, are leftovers from earlier work. The
 exclusion is removed, and they are deleted if no longer needed: validation goes
 through the shipped product, not hardcoded scripts. `live_interactive.rs` was an
 in-process vLLM park/wake lab that never ran the shipped binary; it is deleted,
@@ -1776,7 +1776,7 @@ standalone reaches the wrapper and reports `launch_failed`, with journal evidenc
 `sglang_startup_failed: artifact_mismatch`, using `/usr/bin/python3` and the stub
 checkpoint. This replaces the prior never-armed failure in this local reproduction;
 it does not demonstrate native model readiness. The diagnostic state is retained
-at `$HOME/.tmpuCTuz5` (machine-local). Running it inside the sandbox
+in a machine-local temporary directory. Running it inside a sandboxed environment
 first failed controller ownership checks because sandbox ancestor UIDs appeared as
 `nobody`; the successful run used real host filesystem ownership without weakening
 the checks.
@@ -2353,8 +2353,8 @@ None is native verification evidence.
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier
 workspace-formatter incident. There is no original baseline for that file, so
-the agent cannot certify or restore it. It remains excluded from reading,
-editing, formatting, tests and staging. The separately modified SDD Task 2 report
+this work cannot certify or restore it. It remains excluded from reading,
+editing, formatting, tests and staging. The separately modified local Task 2 report
 also remains excluded and untouched by this continuation.
 
 Host access item: RESOLVED. The 2026-09-15 SSH timeouts no longer reproduce.
