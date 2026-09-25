@@ -45,6 +45,54 @@ fn staged(stage: &'static str) -> ObservationError {
     ObservationError
 }
 
+/// A socket stage's failure with what the wire showed, on one line: why the
+/// wait ended (`deadline`, `eof` or `error` with its errno), the bytes received
+/// of those expected, the time since the observation began against its budget,
+/// and whether the enrolled scheduler was still alive afterwards. Counts and
+/// times only, never a path, key, proof or engine output. Found live
+/// 2026-09-24 (rc.2, M28 s92-14): a park was refused at `receive_header` and
+/// the bare stage could not tell a slow scheduler from a closed connection.
+fn staged_io(stage: &'static str, failure: Failure<'_>) -> ObservationError {
+    let (cause, errno) = match failure.cause {
+        Cause::Deadline => ("deadline", None),
+        Cause::Eof => ("eof", None),
+        Cause::Error(errno) => ("error", Some(errno)),
+    };
+    let owner_alive = crate::exec::process_identity(failure.owner.pid, &failure.owner.role)
+        .as_ref()
+        == Some(failure.owner);
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "event": "native_observation_failed",
+            "stage": stage,
+            "cause": cause,
+            "errno": errno,
+            "received": failure.received,
+            "expected": failure.expected,
+            "elapsed_ms": failure.started.elapsed().as_millis() as u64,
+            "timeout_ms": failure.timeout_ms as u64,
+            "owner_alive": owner_alive,
+        })
+    );
+    ObservationError
+}
+
+/// A successful observation that took a third of its budget or more.
+fn slow(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed.saturating_mul(3) >= timeout
+}
+
+/// The wire facts `staged_io` reports.
+struct Failure<'a> {
+    cause: Cause,
+    received: usize,
+    expected: usize,
+    started: Instant,
+    timeout_ms: u128,
+    owner: &'a ProcessIdentity,
+}
+
 /// Immutable service-provisioned endpoint. Construction does not enroll a worker.
 pub struct NativeObservationClient {
     path: PathBuf,
@@ -197,9 +245,29 @@ fn remaining(deadline: Instant) -> Result<Duration> {
         .filter(|d| !d.is_zero())
         .ok_or(ObservationError)
 }
-fn wait(stream: &UnixStream, events: i16, deadline: Instant) -> Result<()> {
+/// Why a socket wait or read ended without its bytes. Diagnostic only: every
+/// cause fails the observation closed the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    /// The one shared deadline passed first.
+    Deadline,
+    /// The peer closed the connection (EOF, or hang-up without data).
+    Eof,
+    /// A poll or read error, with its errno.
+    Error(i32),
+}
+impl Cause {
+    fn last_os_error() -> Self {
+        Self::Error(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+}
+fn wait_cause(
+    stream: &UnixStream,
+    events: i16,
+    deadline: Instant,
+) -> std::result::Result<(), Cause> {
     loop {
-        let duration = remaining(deadline)?;
+        let duration = remaining(deadline).map_err(|_| Cause::Deadline)?;
         let millis = duration.as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
         let mut fd = libc::pollfd {
             fd: stream.as_raw_fd(),
@@ -208,13 +276,20 @@ fn wait(stream: &UnixStream, events: i16, deadline: Instant) -> Result<()> {
         };
         let count = unsafe { libc::poll(&mut fd, 1, millis) };
         if count > 0 {
-            remaining(deadline)?;
+            remaining(deadline).map_err(|_| Cause::Deadline)?;
             return Ok(());
         }
-        if count == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return Err(ObservationError);
+        if count == 0 {
+            return Err(Cause::Deadline);
+        }
+        let cause = Cause::last_os_error();
+        if cause != Cause::Error(libc::EINTR) {
+            return Err(cause);
         }
     }
+}
+fn wait(stream: &UnixStream, events: i16, deadline: Instant) -> Result<()> {
+    wait_cause(stream, events, deadline).map_err(|_| ObservationError)
 }
 fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
     let raw = unsafe {
@@ -256,19 +331,24 @@ fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
     remaining(deadline)?;
     Ok(stream)
 }
-fn receive(stream: &mut UnixStream, bytes: &mut [u8], deadline: Instant) -> Result<()> {
+/// Fill `bytes` before the deadline; on failure, why and how many bytes came.
+fn receive(
+    stream: &mut UnixStream,
+    bytes: &mut [u8],
+    deadline: Instant,
+) -> std::result::Result<(), (Cause, usize)> {
     let mut offset = 0;
     while offset < bytes.len() {
-        wait(stream, libc::POLLIN, deadline)?;
+        wait_cause(stream, libc::POLLIN, deadline).map_err(|cause| (cause, offset))?;
         match stream.read(&mut bytes[offset..]) {
-            Ok(0) => return Err(ObservationError),
+            Ok(0) => return Err((Cause::Eof, offset)),
             Ok(n) => offset += n,
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                 ) => {}
-            Err(_) => return Err(ObservationError),
+            Err(e) => return Err((Cause::Error(e.raw_os_error().unwrap_or(0)), offset)),
         }
     }
     Ok(())
@@ -363,13 +443,22 @@ impl NativeObservationClient {
         {
             return Err(staged("timeout_shape"));
         }
-        let deadline = Instant::now() + timeout;
+        let begun = Instant::now();
+        let deadline = begun + timeout;
         let started = monotonic_ns()?;
         if protected_socket(&self.path).map_err(|_| staged("socket_before"))?
             != self.socket_identity
         {
             return Err(staged("socket_replaced_before"));
         }
+        let failure = |cause, received, expected| Failure {
+            cause,
+            received,
+            expected,
+            started: begun,
+            timeout_ms,
+            owner: &self.owner,
+        };
         let mut stream = connect(&self.path, deadline).map_err(|_| staged("connect"))?;
         peer(&stream, &self.owner).map_err(|_| staged("peer_before"))?;
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -392,38 +481,50 @@ impl NativeObservationClient {
         frame.extend(request);
         let mut sent = 0;
         while sent < frame.len() {
-            wait(&stream, libc::POLLOUT, deadline)?;
+            wait_cause(&stream, libc::POLLOUT, deadline)
+                .map_err(|cause| staged_io("send", failure(cause, sent, frame.len())))?;
             match stream.write(&frame[sent..]) {
-                Ok(0) => return Err(ObservationError),
+                Ok(0) => return Err(staged_io("send", failure(Cause::Eof, sent, frame.len()))),
                 Ok(n) => sent += n,
                 Err(e)
                     if matches!(
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                     ) => {}
-                Err(_) => return Err(ObservationError),
+                Err(e) => {
+                    let cause = Cause::Error(e.raw_os_error().unwrap_or(0));
+                    return Err(staged_io("send", failure(cause, sent, frame.len())));
+                }
             }
         }
         let mut header = [0; 4];
-        receive(&mut stream, &mut header, deadline).map_err(|_| staged("receive_header"))?;
+        receive(&mut stream, &mut header, deadline).map_err(|(cause, received)| {
+            staged_io("receive_header", failure(cause, received, header.len()))
+        })?;
         let count = u32::from_be_bytes(header) as usize;
         if !(1..=65536).contains(&count) {
             return Err(staged("frame_size"));
         }
         let mut data = vec![0; count];
-        receive(&mut stream, &mut data, deadline).map_err(|_| staged("receive_body"))?;
+        receive(&mut stream, &mut data, deadline).map_err(|(cause, received)| {
+            staged_io("receive_body", failure(cause, received, count))
+        })?;
         // A full frame alone is insufficient: exact EOF rules out trailing frames.
         loop {
-            wait(&stream, libc::POLLIN, deadline)?;
+            wait_cause(&stream, libc::POLLIN, deadline)
+                .map_err(|cause| staged_io("receive_eof", failure(cause, 0, 0)))?;
             match stream.read(&mut [0; 1]) {
                 Ok(0) => break,
-                Ok(_) => return Err(ObservationError),
+                Ok(_) => return Err(staged("trailing_bytes")),
                 Err(e)
                     if matches!(
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                     ) => {}
-                Err(_) => return Err(ObservationError),
+                Err(e) => {
+                    let cause = Cause::Error(e.raw_os_error().unwrap_or(0));
+                    return Err(staged_io("receive_eof", failure(cause, 0, 0)));
+                }
             }
         }
         peer(&stream, &self.owner).map_err(|_| staged("peer_after"))?;
@@ -455,6 +556,21 @@ impl NativeObservationClient {
         let allocations = response.observation.allocations;
         validate_allocations(&allocations).map_err(|_| staged("allocations_shape"))?;
         remaining(deadline).map_err(|_| staged("deadline"))?;
+        let elapsed = begun.elapsed();
+        if slow(elapsed, timeout) {
+            // A success that used a third of its budget or more: the stalls
+            // that end in `receive_header` show up here first (an idle
+            // scheduler answers in tens of milliseconds, measured live
+            // 2026-09-25), and the engine's own log is off by default.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "native_observation_slow",
+                    "elapsed_ms": elapsed.as_millis() as u64,
+                    "timeout_ms": timeout_ms as u64,
+                })
+            );
+        }
         Ok(AllocationFacts {
             binding_id: response.binding_id,
             incarnation_id: response.incarnation_id,
@@ -813,6 +929,34 @@ mod tests {
             .is_err()
         );
         assert!(start.elapsed() < Duration::from_millis(1500));
+    }
+    /// The wire facts a failed socket stage reports: a peer that closes shows
+    /// EOF with the bytes it sent, a silent one the shared deadline.
+    #[test]
+    fn receive_reports_why_and_how_many_bytes_arrived() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        server.write_all(&[0, 0]).unwrap();
+        let mut header = [0; 4];
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(
+            receive(&mut client, &mut header, deadline),
+            Err((Cause::Deadline, 2))
+        );
+        drop(server);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert_eq!(
+            receive(&mut client, &mut header, deadline),
+            Err((Cause::Eof, 0))
+        );
+    }
+    #[test]
+    fn slow_is_a_third_of_the_budget_or_more() {
+        let budget = Duration::from_millis(1500);
+        assert!(!slow(Duration::from_millis(17), budget));
+        assert!(!slow(Duration::from_millis(499), budget));
+        assert!(slow(Duration::from_millis(500), budget));
+        assert!(slow(Duration::from_millis(1499), budget));
     }
     #[test]
     fn denies_unsafe_socket_alias_replacement_and_changed_owner_identity() {

@@ -447,6 +447,72 @@ class ObservationTransportTests(unittest.TestCase):
             else:
                 self.assertEqual((response["version"], response["status"]), (2, expected))
 
+    def served_lines(self, run):
+        import io
+        from contextlib import redirect_stderr
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            run()
+        return [json.loads(line) for line in stream.getvalue().splitlines()
+                if '"mllm_observation_served"' in line]
+
+    def test_each_connection_reports_where_it_stopped_and_what_the_scheduler_did(self):
+        # Found live 2026-09-24 (rc.2, M28 s92-14): a scheduler that never
+        # reached a safe point before the deadline left the host only
+        # `receive_header`. The engine side now says which stage stopped the
+        # connection, whether a frame went out, and what the bridge saw.
+        scheduler = types.SimpleNamespace(server_args=types.SimpleNamespace(
+            tp_size=1, dp_size=1, pp_size=1, ep_size=1, dcp_size=1, attn_cp_size=1, moe_dp_size=1,
+            enable_dp_attention=False, enable_dp_lm_head=False, enable_prefill_cp=False,
+            speculative_algorithm=None, disaggregation_mode="null"))
+        bridge = bridge_module.SchedulerObserverBridge(scheduler, "binding-1", "incarnation-1",
+            self.owner, saver.TrustedSaverBuild("/private/never-loaded.so", "a" * 64, "preload"))
+        transport = self.make_transport(bridge=bridge)
+
+        def no_safe_point():
+            client, thread, _ = self.connect(transport)
+            client.sendall(self.frame(request_id="request-slow", timeout_ms=50))
+            self.assertIsNone(self.read_response(client))
+            thread.join(3)
+        [line] = self.served_lines(no_safe_point)
+        # The bridge expires the slot at the same deadline the transport sends
+        # by, so its uncertain frame never goes out: the stop is at `send`.
+        self.assertEqual((line["outcome"], line["stage"], line["frame"], line["timeout_ms"]),
+                         ("uncertain", "send", False, 50))
+        self.assertEqual((line["ticks"], line["wait_ms"], line["stored"]), (0, None, None))
+        # Asked, and at most the bridge's own expiry came back.
+        self.assertIsInstance(line["request_ms"], int)
+        self.assertTrue(line["result_ms"] is None or line["result_ms"] >= line["request_ms"])
+
+        def observed():
+            with mock.patch.object(bridge_module, "observe_scheduler_saver",
+                                   return_value=self.bridge.observation):
+                client, thread, _ = self.connect(transport)
+                client.sendall(self.frame(request_id="request-fast"))
+                while bridge._slot is None:
+                    time.sleep(0.001)
+                bridge._tick()
+                self.assertEqual(self.read_response(client)["status"], "observed")
+                thread.join(3)
+        [line] = self.served_lines(observed)
+        self.assertEqual((line["outcome"], line["stage"], line["frame"], line["ticks"],
+                          line["stored"]), ("observed", None, True, 1, True))
+        self.assertIsInstance(line["wait_ms"], int)
+        self.assertLessEqual(line["request_ms"], line["result_ms"])
+        self.assertLessEqual(line["result_ms"], line["elapsed_ms"])
+
+        def unauthenticated():
+            client, thread, _ = self.connect(self.make_transport(
+                expected_peer=saver.ProcessIdentity(1, 1, self.owner.boot_id)))
+            thread.join(3)
+            with self.assertRaises(OSError):
+                client.sendall(self.frame())
+                client.sendall(self.frame())
+        [line] = self.served_lines(unauthenticated)
+        self.assertEqual((line["outcome"], line["stage"], line["frame"], line["request_ms"]),
+                         ("denied", "authenticate", False, None))
+        self.assertNotIn("request", json.dumps(line).replace("request_", ""))
+
     def test_import_never_loads_engine_modules(self):
         result = subprocess.run(["python3", "-B", "-c",
             "import sys; import runtime.sglang_observation_transport; "
