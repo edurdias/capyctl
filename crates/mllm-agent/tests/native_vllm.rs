@@ -70,7 +70,9 @@ fn now_ms() -> i64 {
 /// as vLLM does, so only a chat probe proves a restoration. Control calls are
 /// appended to `residency.log`; a `fail` file names one call to fail with 500,
 /// and a `busy` file makes the running gauge read 1. The worker is reaped when
-/// it dies, so a killed worker reads gone.
+/// it dies, so a killed worker reads gone. The stand-in's group ends itself if
+/// the test process or the fixture directory disappears, so a test killed
+/// outright cannot leave an engine running.
 const FAKE_VLLM: &str = r#"
 import json, os, signal, sys, time, http.server, urllib.parse
 args = sys.argv[1:]
@@ -86,9 +88,23 @@ with open(os.path.join(here, "record.json"), "w") as f:
 port = int(args[args.index("--port") + 1])
 served = args[args.index("--served-model-name") + 1]
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+# A test process that is killed outright (SIGKILL, a CI timeout) runs no Drop,
+# and the launch is durable by design, so the stand-in ends itself instead once
+# the test that owns it, or that test's directory, is gone. Mllm's own cleanup
+# always acts first while the test is alive.
+parent = os.getppid()
+def alive():
+    return os.getppid() == parent and os.path.isdir(here)
 if os.fork() == 0:
-    while True:
-        time.sleep(60)
+    while os.path.isdir(here):
+        time.sleep(0.5)
+    os._exit(0)
+def orphaned():
+    while alive():
+        time.sleep(0.5)
+    os.killpg(0, signal.SIGKILL)
+import threading
+threading.Thread(target=orphaned, daemon=True).start()
 state = {"sleeping": False, "weights": True, "loaded": True, "kv": True}
 def logged(call):
     with open(os.path.join(here, "residency.log"), "a") as f:
@@ -398,6 +414,9 @@ fn scope(command: &MemberCommand) -> IngressScope {
 }
 
 struct Host {
+    /// Declared first so it runs first on drop: whatever this host launched is
+    /// reaped before anything else of the host goes away, on every exit path.
+    _reap: Option<Reap>,
     journal: Arc<HostJournal>,
     ingress: Arc<Ingress>,
     identities: Arc<IngressIdentities>,
@@ -426,6 +445,7 @@ fn host(fixture: &Fixture) -> Host {
     let session = journal.connect().unwrap();
     executor.connected(session).unwrap();
     Host {
+        _reap: Some(Reap(journal.clone())),
         journal,
         ingress,
         identities,
@@ -435,7 +455,9 @@ fn host(fixture: &Fixture) -> Host {
 }
 
 /// Kills whatever the journal recorded if an assertion fails mid-test, so a
-/// failing run cannot leave a stand-in engine behind.
+/// failing run cannot leave a stand-in engine behind. `host()` installs it before
+/// anything is launched; a guard installed by each test after its launch left the
+/// engine running whenever a launch helper's own assertion failed first.
 struct Reap(Arc<HostJournal>);
 impl Drop for Reap {
     fn drop(&mut self) {
@@ -474,7 +496,6 @@ fn files_contain(dir: &Path, needle: &[u8]) -> bool {
 async fn initialize_serve_and_stop(deep_park: bool) {
     let fixture = Fixture::new(deep_park, true);
     let host = host(&fixture);
-    let _reap = Reap(host.journal.clone());
     let launch = fixture.launch();
 
     host.executor.provision(launch.clone(), GATE).await.unwrap();
@@ -610,6 +631,46 @@ async fn remote_vllm_with_deep_park_loads_the_guard_middleware() {
     initialize_serve_and_stop(true).await;
 }
 
+/// A test that fails while its engine runs leaves no engine behind. Stand-ins
+/// were found orphaned on control-host: `ready_deep_park` asserted readiness before its
+/// callers installed their reap guard, so a failed readiness dropped the host
+/// with nothing reaping it. The guard now comes with the host. The fixture and
+/// this test process both outlive the failure here, so only mllm's own
+/// termination of the journaled group, not the stand-in's orphan exit, can end it.
+// T12
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_that_fails_while_its_engine_runs_leaves_no_engine() {
+    use mllm_launchers::process_absence::{presence, Presence};
+    let fixture = Arc::new(Fixture::new(true, true));
+    let owned = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (inner, seen) = (fixture.clone(), owned.clone());
+    let failed = tokio::spawn(async move {
+        let host = host(&inner);
+        let launch = inner.launch();
+        host.executor.provision(launch.clone(), GATE).await.unwrap();
+        host.executor.execute(host.session, launch).await.unwrap();
+        *seen.lock().unwrap() = host
+            .journal
+            .inspect_owned("launch")
+            .unwrap()
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect::<Vec<_>>();
+        panic!("an assertion fails while the engine is running");
+    })
+    .await;
+    assert!(failed.unwrap_err().is_panic());
+    let owned = owned.lock().unwrap().clone();
+    assert!(
+        owned.len() >= 2,
+        "the API process and its worker: {owned:?}"
+    );
+    for identity in &owned {
+        assert_eq!(presence(identity), Presence::Gone, "{identity:?}");
+    }
+    assert!(fixture.root.path().is_dir());
+}
+
 /// SPEC §9.1 / §13.3: a development-mode launch whose host runtime directory
 /// does not carry the guard module is refused before any durable effect, so no
 /// engine can serve its control routes unguarded and no claim is left behind.
@@ -618,7 +679,6 @@ async fn remote_vllm_with_deep_park_loads_the_guard_middleware() {
 async fn remote_vllm_without_the_guard_module_is_refused_before_launch() {
     let fixture = Fixture::new(true, false);
     let host = host(&fixture);
-    let _reap = Reap(host.journal.clone());
     let launch = fixture.launch();
     refused_launch(&host.executor, host.session, &launch).await;
     assert!(fixture.record().is_none(), "no engine may start");
@@ -640,7 +700,6 @@ async fn remote_vllm_without_the_protected_entry_is_refused_before_launch() {
             std::os::unix::fs::symlink(&elsewhere, &entry).unwrap();
         }
         let host = host(&fixture);
-        let _reap = Reap(host.journal.clone());
         let launch = fixture.launch();
         refused_launch(&host.executor, host.session, &launch).await;
         assert!(fixture.record().is_none(), "no engine may start");
@@ -669,7 +728,6 @@ async fn a_writable_runtime_module_is_refused_before_launch() {
         )
         .unwrap();
         let host = host(&fixture);
-        let _reap = Reap(host.journal.clone());
         let launch = fixture.launch();
         refused_launch_for(&host.executor, host.session, &launch, "runtime_integrity").await;
         assert!(fixture.record().is_none(), "no engine may start");
@@ -685,7 +743,6 @@ async fn a_writable_runtime_module_is_refused_before_launch() {
 async fn a_launch_refused_after_provisioning_keeps_no_credentials() {
     let fixture = Fixture::new(true, true);
     let host = host(&fixture);
-    let _reap = Reap(host.journal.clone());
     let launch = fixture.launch();
     host.executor.provision(launch.clone(), GATE).await.unwrap();
     assert!(host.identities.load(&scope(&launch), launch.identity.payload_digest).is_ok());
@@ -710,7 +767,6 @@ async fn a_launch_refused_after_provisioning_keeps_no_credentials() {
 async fn default_on_deep_park_without_the_guard_module_is_still_refused() {
     let fixture = Fixture::with_switch(None, false);
     let host = host(&fixture);
-    let _reap = Reap(host.journal.clone());
     let launch = fixture.launch();
     refused_launch(&host.executor, host.session, &launch).await;
     assert!(fixture.record().is_none(), "no engine may start");
@@ -784,7 +840,9 @@ fn restarted(fixture: &Fixture, before: &Host) -> Host {
     let _ = before.journal.disconnect(before.session);
     let session = before.journal.connect().unwrap();
     executor.connected(session).unwrap();
+    // The first host of this journal already reaps it.
     Host {
+        _reap: None,
         journal: before.journal.clone(),
         ingress,
         identities: before.identities.clone(),
@@ -802,7 +860,6 @@ fn restarted(fixture: &Fixture, before: &Host) -> Host {
 async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
     let fixture = Fixture::new(false, true);
     let first = host(&fixture);
-    let _reap = Reap(first.journal.clone());
     let launch = fixture.launch();
     first.executor.provision(launch.clone(), GATE).await.unwrap();
     let ready = first.executor.execute(first.session, launch.clone()).await.unwrap();
@@ -866,7 +923,6 @@ async fn a_probe_of_an_engine_that_died_keeps_the_gate_closed_and_the_claim() {
     use mllm_adapters::traits::OwnedProcessLaunch;
     let fixture = Fixture::new(false, true);
     let first = host(&fixture);
-    let _reap = Reap(first.journal.clone());
     let launch = fixture.launch();
     first.executor.provision(launch.clone(), GATE).await.unwrap();
     assert!(first.executor.execute(first.session, launch.clone()).await.unwrap().model_usable);
@@ -1015,7 +1071,6 @@ async fn refused_launch_for(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deep_park_launch_parks_and_restores_in_place() {
     let (fixture, first, launch) = ready_deep_park().await;
-    let _reap = Reap(first.journal.clone());
     let (address, server) = serve(first.ingress.clone()).await;
     assert_eq!(chat(address).await, reqwest::StatusCode::OK);
     let group = |r: &mllm_protocol::pb::MemberExecutionResult| {
@@ -1111,7 +1166,6 @@ async fn a_deep_park_launch_parks_and_restores_in_place() {
 async fn a_restart_only_launch_is_never_parked() {
     let fixture = Fixture::new(false, true);
     let host = host(&fixture);
-    let _reap = Reap(host.journal.clone());
     let launch = fixture.launch();
     host.executor.provision(launch.clone(), GATE).await.unwrap();
     assert!(host.executor.execute(host.session, launch.clone()).await.unwrap().model_usable);
@@ -1132,7 +1186,6 @@ async fn a_restart_only_launch_is_never_parked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_busy_engine_is_not_parked() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let (address, server) = serve(host.ingress.clone()).await;
     fixture.engine_file("busy", Some("1"));
     let park = fixture.park(&launch, "park-busy");
@@ -1164,7 +1217,6 @@ async fn a_busy_engine_is_not_parked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_restore_is_quarantined_until_terminate() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let (address, server) = serve(host.ingress.clone()).await;
     let parked = host
         .executor
@@ -1211,7 +1263,6 @@ async fn a_failed_restore_is_quarantined_until_terminate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_checkpoint_changed_while_parked_is_not_woken() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let parked = host
         .executor
         .execute(host.session, fixture.park(&launch, "park"))
@@ -1248,7 +1299,6 @@ async fn a_checkpoint_changed_while_parked_is_not_woken() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_changed_group_is_not_parked() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let ready = host.executor.execute(host.session, launch.clone()).await.unwrap();
     let worker = ready.processes.iter().find(|p| p.role == "worker-0").unwrap().pid;
     unsafe { libc::kill(worker as i32, libc::SIGKILL) };
@@ -1280,7 +1330,6 @@ async fn a_changed_group_is_not_parked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn park_and_restore_are_fenced_by_expected_state_and_owner() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let mut wrong_state = fixture.park(&launch, "park-retained");
     wrong_state.identity.expected_state = "retained".into();
     let mut foreign = fixture.park(&launch, "park-foreign");
@@ -1306,7 +1355,6 @@ async fn park_and_restore_are_fenced_by_expected_state_and_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restore_naming_another_digest_is_not_woken() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let parked = host
         .executor
         .execute(host.session, fixture.park(&launch, "park"))
@@ -1358,7 +1406,6 @@ async fn an_engine_that_exits_before_readiness_is_reported_not_a_lost_session() 
     std::fs::write(&entry, "import sys\nsys.exit(3)\n").unwrap();
     std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o644)).unwrap();
     let host = host(&fixture);
-    let _reap = Reap(host.journal.clone());
     let launch = fixture.launch();
     host.executor.provision(launch.clone(), GATE).await.unwrap();
 
@@ -1398,7 +1445,6 @@ async fn an_engine_that_exits_before_readiness_is_reported_not_a_lost_session() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parked_launch_that_loses_a_member_is_reported() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let _reap = Reap(host.journal.clone());
     let parked = host
         .executor
         .execute(host.session, fixture.park(&launch, "park"))

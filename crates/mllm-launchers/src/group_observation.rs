@@ -56,8 +56,10 @@ pub enum GroupObservationError {
 }
 
 /// Observe a launcher group anchored to an independently persisted API identity.
-/// Only fixed `/proc` paths are accepted. Any unreadable process or scan race
-/// fails closed. No signals, role inference, retries, or receipt creation occur.
+/// Only fixed `/proc` paths are accepted. Any unreadable process, or a group that
+/// changes between the two snapshots, fails closed; a process that exits during a
+/// scan is simply not in it. No signals, role inference, retries, or receipt
+/// creation occur.
 pub fn observe_process_group(
     expected_api: &ProcessIdentity,
 ) -> Result<ProcessGroupObservation, GroupObservationError> {
@@ -118,9 +120,8 @@ pub fn observe_process_group_or_empty(
 /// Every live process whose process group is `pgid`, whether or not the leader
 /// still exists. The group id is the leader's pid, so this survives the leader.
 ///
-/// A pid that disappears between the directory listing and its `stat` read is not
-/// a surviving member; every other read failure still fails closed, because an
-/// unreadable process is indistinguishable from a hidden one.
+/// A pid that exits during the scan is skipped (see `read_listed`); every other
+/// read failure still fails closed.
 pub fn scan_group_by_pgid(
     pgid: u32,
     boot: &str,
@@ -136,18 +137,29 @@ pub fn scan_group_by_pgid(
     if read_boot()? != boot {
         return Err(GroupObservationError::Changed);
     }
-    let facts = list_pids()?.into_iter().filter_map(|pid| {
-        match read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES) {
-            Ok(raw) => Some(parse_stat(pid, &raw, boot)),
-            Err(GroupObservationError::Visibility)
-                if !std::path::Path::new(&format!("/proc/{pid}")).exists() =>
-            {
-                None
-            }
-            Err(error) => Some(Err(error)),
-        }
-    });
+    let facts = list_pids()?
+        .into_iter()
+        .filter_map(|pid| read_listed(pid, boot));
     collect_members(pgid, facts)
+}
+
+/// One listed pid's facts, or `None` if it exited after the listing.
+///
+/// A pid that disappears between the directory listing and its `stat` read is
+/// not a live member of any group; every other read failure still fails closed,
+/// because an unreadable process is indistinguishable from a hidden one. Without
+/// this, any unrelated process exiting anywhere on the host during a scan made
+/// the whole observation fail, which on a busy host is nearly every scan.
+fn read_listed(pid: u32, boot: &str) -> Option<Result<GroupProcessFact, GroupObservationError>> {
+    match read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES) {
+        Ok(raw) => Some(parse_stat(pid, &raw, boot)),
+        Err(GroupObservationError::Visibility)
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() =>
+        {
+            None
+        }
+        Err(error) => Some(Err(error)),
+    }
 }
 
 fn read_bounded(path: &str, limit: usize) -> Result<String, GroupObservationError> {
@@ -215,11 +227,12 @@ fn check_mounts(raw: &str) -> Result<(), GroupObservationError> {
 }
 
 fn snapshot(group: u32, boot: &str) -> Result<Vec<GroupProcessFact>, GroupObservationError> {
-    let pids = list_pids()?;
-    let facts = pids.into_iter().map(|pid| {
-        let raw = read_bounded(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES)?;
-        parse_stat(pid, &raw, boot)
-    });
+    // A member that exits mid-scan is absent from this snapshot and the next, and
+    // one that exits between the two makes them differ, which `finish` refuses as
+    // Changed. So skipping exited pids never hides a live member.
+    let facts = list_pids()?
+        .into_iter()
+        .filter_map(|pid| read_listed(pid, boot));
     collect_members(group, facts)
 }
 
@@ -525,15 +538,12 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let identity = crate::exec::process_identity(child.id(), "api").unwrap();
-        // Other launcher tests create and reap unrelated processes concurrently.
-        // Each production observation still fails closed; the fixture may take
+        // Unrelated exits no longer fail a scan, but a mount-table change
+        // elsewhere on the host is a genuine Changed; the fixture may take
         // another fresh observation while its own child remains unchanged.
         let mut observed = observe_process_group(&identity);
         for _ in 0..7 {
-            if !matches!(
-                observed,
-                Err(GroupObservationError::Visibility | GroupObservationError::Changed)
-            ) {
+            if observed.as_ref().err() != Some(&GroupObservationError::Changed) {
                 break;
             }
             observed = observe_process_group(&identity);
@@ -548,6 +558,64 @@ mod tests {
         assert_eq!(observed.members()[0].start_ticks, identity.start_ticks);
         assert_eq!(observed.members()[0].parent_pid, std::process::id());
         assert!(observe_process_group(&identity).is_err());
+    }
+
+    /// An unrelated process that exits between the `/proc` listing and its `stat`
+    /// read is not a member of the observed group and says nothing about it. A
+    /// busy host (or a parallel test run) retires processes constantly, so an
+    /// observation that failed on every such exit could rarely answer at all.
+    /// The group itself is stable here, so every observation must succeed without
+    /// a retry while unrelated processes are created and reaped around it.
+    // T31
+    #[test]
+    fn unrelated_process_exits_during_a_scan_do_not_fail_the_observation() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut command = Command::new("sh");
+        command.args(["-c", "read value"]).stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+                    .map_err(std::io::Error::other)
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let identity = crate::exec::process_identity(child.id(), "api").unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let churn: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = (0..200)
+            .map(|_| observe_process_group(&identity).map(|o| o.members().len()))
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        for thread in churn {
+            thread.join().unwrap();
+        }
+        // EOF lets the owned CPU fixture exit normally, including on failure.
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        // A mount-table change elsewhere on the host is a real Changed and is
+        // left to the caller's retry; an unrelated exit must never surface.
+        let failures: Vec<_> = outcomes
+            .iter()
+            .filter(|o| !matches!(o, Ok(1) | Err(GroupObservationError::Changed)))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of 200 observations failed, first: {:?}",
+            failures.len(),
+            failures[0]
+        );
+        assert!(outcomes.iter().any(|o| o == &Ok(1)), "{outcomes:?}");
     }
 
     /// A leader that has exited is not proof that its group has: the worker it
