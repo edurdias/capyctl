@@ -110,7 +110,12 @@ pub(super) fn factory(
         let engine = bindings.adapter(declared, spec, tools.clone())?;
         Ok(Arc::new(Driver {
             engine,
-            cleanup: terminate_then_prove_gone(tools.clone(), clock.clone(), grace),
+            cleanup: terminate_then_prove_gone(
+                tools.clone(),
+                clock.clone(),
+                grace,
+                bindings.clone(),
+            ),
             tools: Some(tools),
             settle: None,
         }))

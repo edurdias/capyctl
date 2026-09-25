@@ -51,6 +51,40 @@ impl RendezvousRoot {
         (token(incarnation) && owned_dir(&self.dir, true)).then(|| self.dir.join(incarnation))
     }
 
+    /// The private root itself.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// SPEC §8.2 / T21 (owner decision 2026-09-25): at start, remove every
+    /// directory in the root that belongs to no recorded launch (`keep` holds
+    /// the incarnations the store still retains). Only this user's own real
+    /// directories directly in a private root are removed: a symlink or any
+    /// other entry is left alone and never followed, and nothing outside the
+    /// root is touched. Returns how many were removed.
+    pub fn sweep(&self, keep: &std::collections::BTreeSet<String>) -> usize {
+        if !owned_dir(&self.dir, true) {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| keep.contains(name)) {
+                continue;
+            }
+            let path = self.dir.join(&name);
+            // `symlink_metadata` never follows a link, so a symlink is not a
+            // directory here; `remove_dir_all` does not follow links inside.
+            if owned_dir(&path, false) && std::fs::remove_dir_all(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Remove the rendezvous directory of a launch whose group is proved gone.
     /// Only this user's own directory for exactly that incarnation, never a
     /// symlink or anything else in the root. Returns whether it was removed.
@@ -110,6 +144,44 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.dir.join(INCARNATION)).unwrap();
         assert!(!root.retire(INCARNATION));
         assert!(outside.exists());
+    }
+
+    // T21 T37: owner decision 2026-09-25, a start removes the directories no
+    // recorded launch owns, never a recorded one, a symlink's target, a file,
+    // or anything outside the root.
+    #[test]
+    fn a_start_sweeps_only_unrecorded_directories_in_the_root() {
+        let (temp, root) = root();
+        let make = |name: &str| {
+            let dir = root.dir.join(name);
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            std::fs::write(dir.join("store"), b"rendezvous").unwrap();
+            dir
+        };
+        let recorded = make(INCARNATION);
+        let leftover = make("01K00000000000000000000003");
+        let stray = make("not-a-token");
+        let outside = temp.path().join("keep");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("data"), b"kept").unwrap();
+        std::os::unix::fs::symlink(&outside, root.dir.join("01K00000000000000000000004")).unwrap();
+        std::fs::write(root.dir.join("file"), b"kept").unwrap();
+        let keep = [INCARNATION.to_owned()].into_iter().collect();
+
+        assert_eq!(root.sweep(&keep), 2);
+        assert!(recorded.join("store").exists());
+        assert!(!leftover.exists() && !stray.exists());
+        assert!(outside.join("data").exists());
+        assert!(root
+            .dir
+            .join("01K00000000000000000000004")
+            .symlink_metadata()
+            .is_ok());
+        assert!(root.dir.join("file").exists());
+        // A root that is not private is never swept.
+        make("01K00000000000000000000005");
+        std::fs::set_permissions(&root.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(root.sweep(&keep), 0);
     }
 
     #[test]

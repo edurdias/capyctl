@@ -28,17 +28,28 @@ pub fn safe_state_dir() -> tempfile::TempDir {
 /// engine the developer's environment happens to name. Passing this one is not
 /// qualification of a native recipe and must never be reported as one (SPEC §18).
 pub async fn boot(state_dir: &std::path::Path) -> mllm_cli::roles::App {
+    try_boot_on(state_dir, engine_ports())
+        .await
+        .expect("standalone boots")
+}
+
+/// As [`boot`], on the engine port range `ports`, returning the refusal
+/// instead of panicking on it. The range is part of the published host
+/// document, so a test that restarts the role passes the same range again.
+pub async fn try_boot_on(
+    state_dir: &std::path::Path,
+    ports: (u16, u16),
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
     mllm_cli::roles::start_standalone_with_memory(
         state_dir,
         Arc::new(PortedProvider {
-            ports: engine_ports(),
+            ports,
             deep_park: false,
             members: None,
         }),
         test_memory(),
     )
     .await
-    .expect("standalone boots")
 }
 
 /// As [`boot`], on a Fake installation whose host leaves deep parking on
