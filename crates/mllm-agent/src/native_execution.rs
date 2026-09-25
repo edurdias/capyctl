@@ -71,12 +71,15 @@ pub struct NativeHostExecution {
     journal: Arc<HostJournal>,
     ingress: Arc<Ingress>,
     identities: Arc<IngressIdentities>,
-    config: HostConfig,
     host_id: String,
     controller_id: String,
     runtime_dir: PathBuf,
     log_dir: PathBuf,
-    inventory: pb::ReportInventory,
+    /// ADR 0018 §3: the accepted, pending and previous runtime profile sets,
+    /// each with its inventory and the installations registered for it
+    /// (ADR 0008: installation fingerprints, drift, launch-time probes).
+    /// `config` above keeps the role-local settings only.
+    profiles: Arc<crate::profiles::HostProfiles>,
     authority: Arc<Mutex<SessionAuthority>>,
     /// SGLang saver-map observation for residency evidence. Without one the
     /// host cannot prove an SGLang release or restoration and refuses both.
@@ -85,9 +88,6 @@ pub struct NativeHostExecution {
     load: Option<Arc<crate::load::LoadReporter>>,
     /// ADR 0014 §7 (WE3): this host's checkpoint digests and stat cache.
     checkpoints: Arc<CheckpointVerifier>,
-    /// ADR 0008 (owner decision 2026-09-23): the installations this host
-    /// registered, drift its launches found, and launch-time capability probes.
-    installations: Arc<crate::installation::InstallationRegistry>,
     /// ADR 0007: per-process resident memory reported beside availability,
     /// so the server can credit resident engines instead of counting them
     /// twice (found live 2026-09-23, matrix M33). `None` reports none.
@@ -144,8 +144,13 @@ impl NativeHostExecution {
         // ADR 0013 §5 (journal v5): it also fences each instance of a
         // deployment on its own, so instances of one deployment may share it.
         inventory.launch_claims = crate::journal::PER_INSTANCE_CLAIMS.into();
-        let installations = Arc::new(crate::installation::InstallationRegistry::from_inventory(
-            &inventory,
+        // ADR 0018 §3: plans name the document they were approved under by
+        // this fingerprint; the role's startup inventory already carries it.
+        inventory.policy_fingerprint =
+            mllm_config::remote_resources::policy_fingerprint(&config.document);
+        let profiles = crate::profiles::HostProfiles::new(crate::profiles::ProfileSet::new(
+            config.clone(),
+            inventory,
         ));
         // The host document's period, bounded when it was parsed (D9: 250 ms
         // to 5 s), so a reporter is never refused for it here.
@@ -171,16 +176,14 @@ impl NativeHostExecution {
             journal,
             ingress,
             identities,
-            config,
             host_id,
             controller_id,
             runtime_dir,
             log_dir,
-            inventory,
+            profiles,
             authority: Arc::new(Mutex::new(SessionAuthority::default())),
             saver: None,
             checkpoints: Arc::new(CheckpointVerifier::in_memory()),
-            installations,
             residency: None,
             rendezvous: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -243,6 +246,26 @@ impl NativeHostExecution {
         Arc::make_mut(&mut self).residency = Some(sampler);
         self
     }
+    /// ADR 0018 §3: the host's runtime profile sets, shared with the live
+    /// session and the local control handler.
+    pub fn profiles(&self) -> Arc<crate::profiles::HostProfiles> {
+        self.profiles.clone()
+    }
+
+    /// ADR 0008: the installations registered for the document `plan` was
+    /// approved under; the accepted set's for a plan that names none of the
+    /// held documents (a legacy retained launch).
+    fn installations_for(
+        &self,
+        plan: &SingleLaunchPlan,
+    ) -> Arc<crate::installation::InstallationRegistry> {
+        self.profiles
+            .for_fingerprint(&plan.host_policy_fingerprint)
+            .unwrap_or_else(|| self.profiles.accepted())
+            .installations
+            .clone()
+    }
+
     /// ADR 0014 §7, owner decision Q9: keep the per-host checkpoint stat cache
     /// in this private directory, so a restarted agent verifies an unchanged
     /// checkpoint without hashing it in full again.
@@ -329,19 +352,22 @@ impl NativeHostExecution {
         let legacy = retained
             .then(|| mllm_config::effective::legacy_retained_deployment(&config))
             .flatten();
+        // ADR 0018 §3: authorized against the document the plan names:
+        // accepted, being published, or the one before.
+        let set = self.profiles.for_fingerprint(&plan.host_policy_fingerprint);
         if command.identity.controller_id != self.controller_id
             || command.identity.member.host_id != self.host_id
-            || (legacy.is_none()
-                && plan.host_policy_fingerprint
-                    != mllm_config::remote_resources::policy_fingerprint(&self.config.document))
+            || (legacy.is_none() && set.is_none())
         {
             return Err(JournalError::Unauthorized);
         }
+        // A legacy retained launch resolves against today's accepted document.
+        let set = set.unwrap_or_else(|| self.profiles.accepted());
         let config = legacy.unwrap_or(config);
         if config["runtime_profile"].as_str() != Some(&plan.profile_name) {
             return Err(JournalError::Unauthorized);
         }
-        let host = mllm_config::remote_resources::local_host_document(&self.config.document)
+        let host = mllm_config::remote_resources::local_host_document(&set.config.document)
             .map_err(|_| JournalError::Unauthorized)?;
         // ADR 0014 §5, §7: resolve with exactly the checkpoint facts the server
         // resolved this revision with, so both sides derive the same request.
@@ -523,9 +549,12 @@ impl NativeHostExecution {
         }
         use crate::sources::{reason, SourceStatus};
         let status = match (&self.sources, plan.source()) {
+            // ADR 0018 §3: any document this host holds, as for a launch.
             (Some(store), Some(source))
-                if plan.host_policy_fingerprint
-                    == mllm_config::remote_resources::policy_fingerprint(&self.config.document) =>
+                if self
+                    .profiles
+                    .for_fingerprint(&plan.host_policy_fingerprint)
+                    .is_some() =>
             {
                 store.request(&source)
             }
@@ -578,15 +607,14 @@ impl NativeHostExecution {
         &self,
         plan: &DigestCheckpointPlan,
     ) -> Result<mllm_config::effective::CheckpointLocation, &'static str> {
-        if plan.host_policy_fingerprint
-            != mllm_config::remote_resources::policy_fingerprint(&self.config.document)
-        {
+        // ADR 0018 §3: the document the plan names, as for a launch.
+        let Some(set) = self.profiles.for_fingerprint(&plan.host_policy_fingerprint) else {
             return Err("unauthorized");
-        }
+        };
         let deployment =
             mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
                 .map_err(|_| "unauthorized")?;
-        let host = mllm_config::remote_resources::local_host_document(&self.config.document)
+        let host = mllm_config::remote_resources::local_host_document(&set.config.document)
             .map_err(|_| "unauthorized")?;
         mllm_config::effective::checkpoint_location(&deployment, &host).map_err(|error| {
             if error.code == mllm_config::ConfigErrorCode::NotMaterializable {
@@ -1436,9 +1464,11 @@ impl SessionExecution for NativeHostExecution {
         }))
     }
     fn inventory(&self) -> Option<pb::ReportInventory> {
-        let mut inventory = self.inventory.clone();
+        // ADR 0018 §3: the accepted set describes what this host publishes.
+        let set = self.profiles.accepted();
+        let mut inventory = set.inventory.clone();
         // ADR 0008: status carries installation drift and missing capabilities.
-        self.installations.overlay(&mut inventory.profiles);
+        set.installations.overlay(&mut inventory.profiles);
         // Startup only publishes measured domains. Refresh exactly the same
         // single unified pool, preserving its approved name and policy binding.
         if inventory.domains.len() != 1 {
@@ -2348,29 +2378,31 @@ mod tests {
         ] {
             let root = directory();
             let identity_dir = directory();
-            let (mut executor, deployment, _) =
+            let (executor, deployment, _) =
                 sglang_fixture(root.path(), identity_dir.path(), "restart_only");
             sglang_runtime(root.path());
-            let host = Arc::make_mut(&mut executor);
-            let mut document = host.config.document.clone();
+            let accepted = executor.profiles.accepted();
+            let mut document = accepted.config.document.clone();
             if let Some(value) = policy_value {
                 document["runtime_profiles"]["local"]["security"]["installation_drift"] =
                     value.into();
             }
-            host.config = HostConfig::parse(&document.to_string()).unwrap();
-            let policy = mllm_config::remote_resources::policy_fingerprint(&host.config.document);
+            let config = HostConfig::parse(&document.to_string()).unwrap();
+            let policy = mllm_config::remote_resources::policy_fingerprint(&config.document);
             // Registered at agent start with a digest this installation no
             // longer measures to (the fixture's has no package tree at all).
-            host.inventory.profiles = vec![pb::RuntimeProfileStatus {
+            let mut inventory = accepted.inventory.clone();
+            inventory.policy_fingerprint = policy.clone();
+            inventory.profiles = vec![pb::RuntimeProfileStatus {
                 name: "local".into(),
                 installation_version: "0.5.20".into(),
                 installation_digest: format!("sha256:{}", "a".repeat(64)),
                 installation_state: "measured".into(),
                 ..Default::default()
             }];
-            host.installations = Arc::new(
-                crate::installation::InstallationRegistry::from_inventory(&host.inventory),
-            );
+            executor
+                .profiles
+                .replace(crate::profiles::ProfileSet::new(config, inventory));
             let (mut launch, _) = launch_with(&deployment, &policy, "");
             launch.identity.payload_digest = launch.canonical_digest();
             let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
@@ -2381,8 +2413,9 @@ mod tests {
                 Err(LaunchVerdict::Refused(expected)),
                 "{policy_value:?}"
             );
-            let mut profiles = executor.inventory.profiles.clone();
-            executor.installations.overlay(&mut profiles);
+            let accepted = executor.profiles.accepted();
+            let mut profiles = accepted.inventory.profiles.clone();
+            accepted.installations.overlay(&mut profiles);
             assert_eq!(profiles[0].installation_state, "drifted");
             assert_eq!(
                 profiles[0].installation_observed_digest,
@@ -2428,6 +2461,8 @@ mod tests {
         };
         // The fixture's installation has no package tree: unmeasured, keyed "".
         executor
+            .profiles
+            .accepted()
             .installations
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(
@@ -2470,6 +2505,8 @@ mod tests {
             panic!("a launch");
         };
         restart
+            .profiles
+            .accepted()
             .installations
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(

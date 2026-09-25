@@ -42,4 +42,7 @@ pub mod journal;
 
 pub mod session;
 
+// ADR 0018 §3: the accepted, pending and previous runtime profile sets.
+pub mod profiles;
+
 pub mod native_execution;
