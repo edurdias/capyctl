@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::device_inventory::InventoryPublication;
+use mllm_agent::gpu_memory::HostShape;
 
 /// What the embedded host publishes, and how to rebuild it.
 pub struct EmbeddedHost {
@@ -29,6 +30,8 @@ pub struct EmbeddedHost {
     environment_fingerprint: String,
     capacity_bytes: i64,
     inventory: Option<InventoryPublication>,
+    /// The GPU shape sampled at boot (design §1), which decides the domains.
+    shape: HostShape,
 }
 
 impl EmbeddedHost {
@@ -39,12 +42,14 @@ impl EmbeddedHost {
         environment_fingerprint: String,
         capacity_bytes: i64,
         inventory: Option<InventoryPublication>,
+        shape: HostShape,
     ) -> Arc<Self> {
         let document = crate::standalone_config::host_policy(
             &named,
             &environment_fingerprint,
             capacity_bytes,
             inventory.as_ref(),
+            &shape,
         );
         let installations = EmbeddedInstallations::new();
         for n in &named {
@@ -61,6 +66,7 @@ impl EmbeddedHost {
             environment_fingerprint,
             capacity_bytes,
             inventory,
+            shape,
         })
     }
 
@@ -101,6 +107,7 @@ impl EmbeddedHost {
             &self.environment_fingerprint,
             self.capacity_bytes,
             self.inventory.as_ref(),
+            &self.shape,
         )
     }
 

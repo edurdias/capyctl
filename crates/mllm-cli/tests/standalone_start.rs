@@ -344,3 +344,71 @@ async fn an_explicit_document_does_not_recreate_lost_credentials() {
     );
     assert!(!dir.path().join("identity/credentials").exists());
 }
+
+/// Design §1: integrated and discrete GPUs on one host are refused at boot
+/// rather than published as a guess, and the refusal names its code.
+// T26
+#[tokio::test]
+async fn standalone_refuses_mixed_integrated_and_discrete_gpus() {
+    use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, GpuSample};
+    let dir = safe_state_dir();
+    let device = |index: u32, memory: Option<GpuMemory>| GpuDevice {
+        index,
+        uuid: format!("GPU-{index:08}-2222-3333-4444-555555555555"),
+        pci_bus_id: format!("00000000:0{index}:00.0"),
+        name: "GPU".into(),
+        memory,
+    };
+    let mixed = move || {
+        Some(GpuSample {
+            devices: vec![
+                device(0, None),
+                device(
+                    1,
+                    Some(GpuMemory {
+                        total_bytes: 16 << 30,
+                        used_bytes: 0,
+                        free_bytes: 16 << 30,
+                    }),
+                ),
+            ],
+            sampled_at_ms: 1,
+        })
+    };
+    let error = support::try_boot_with_gpu(dir.path(), &mixed)
+        .await
+        .err()
+        .expect("a mixed host must refuse to boot");
+    assert!(
+        matches!(error, mllm_cli::roles::StartError::GpuTopology(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().starts_with("unsupported_gpu_topology"));
+    let structured = mllm_cli::output::StructuredError::from(error);
+    assert_eq!(structured.code, "unsupported_gpu_topology");
+}
+
+/// Design §1: a unified host (every device integrated) boots with today's
+/// single `unified` domain.
+// T26
+#[tokio::test]
+async fn standalone_on_a_unified_host_keeps_the_unified_shape() {
+    use mllm_agent::gpu_memory::{GpuDevice, GpuSample, HostShape};
+    let dir = safe_state_dir();
+    let unified = || {
+        Some(GpuSample {
+            devices: vec![GpuDevice {
+                index: 0,
+                uuid: "GPU-00000000-2222-3333-4444-555555555555".into(),
+                pci_bus_id: "0000000F:01:00.0".into(),
+                name: "GB10".into(),
+                memory: None,
+            }],
+            sampled_at_ms: 1,
+        })
+    };
+    let app = support::try_boot_with_gpu(dir.path(), &unified)
+        .await
+        .expect("a unified host boots");
+    assert_eq!(app.gpu_shape, HostShape::Unified);
+}

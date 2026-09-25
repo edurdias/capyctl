@@ -52,6 +52,25 @@ pub async fn try_boot_on(
     .await
 }
 
+/// As [`try_boot_on`], sampling the host's GPUs through `gpu` (design §1)
+/// instead of the machine's own `nvidia-smi`.
+pub async fn try_boot_with_gpu(
+    state_dir: &std::path::Path,
+    gpu: &mllm_agent::gpu_memory::GpuSampler,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_with_gpu(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+        }),
+        test_memory(),
+        gpu,
+    )
+    .await
+}
+
 /// As [`boot`], on a Fake installation whose host leaves deep parking on
 /// (ADR 0012: the product default, `MLLM_DEEP_PARK` unset), with every Fake
 /// reporting `members` as its launched group. The coordinator checks after a

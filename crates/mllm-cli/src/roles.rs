@@ -32,6 +32,7 @@ use mllm_store::secrets::SecretsKey;
 use mllm_store::Store;
 
 use crate::host_observation::{system_clock, HostMemoryObservation};
+use mllm_agent::gpu_memory::{GpuSampler, HostShape};
 
 use crate::grammar::Command as CliCommand;
 use crate::output::{ExitCode, StructuredError};
@@ -132,6 +133,10 @@ pub struct App {
     host: Arc<crate::standalone_engines::EmbeddedHost>,
     /// Observed host capacity the published limits were derived from.
     capacity_bytes: i64,
+    /// Design §1: the host's GPU shape, sampled once at boot. It decides the
+    /// domains the host publishes and, on a discrete host, the deployment
+    /// template and the memory observation.
+    pub gpu_shape: HostShape,
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     management: axum::Router,
@@ -339,6 +344,10 @@ pub enum StartError {
     /// SPEC §15.3: a run-time setting that is present but malformed is refused.
     #[error("invalid setting: {0}")]
     Setting(String),
+    /// Design §1: integrated and discrete GPUs on one host are refused at
+    /// boot, not guessed at (`unsupported_gpu_topology`).
+    #[error("{0}")]
+    GpuTopology(mllm_agent::gpu_memory::GpuShapeError),
 }
 
 impl From<ProviderError> for StartError {
@@ -363,6 +372,7 @@ impl From<StartError> for StructuredError {
             StartError::NoEngineInstallation(_) => "invalid_config",
             StartError::ProfileExists(_) => "profile_exists",
             StartError::Setting(_) => "invalid_config",
+            StartError::GpuTopology(error) => error.code(),
             _ => "internal",
         };
         StructuredError {
@@ -831,12 +841,23 @@ pub async fn start_standalone_from(
             state_dir.join("runtime"),
         )),
         crate::host_observation::proc_meminfo(),
+        // Design §1: the production boot samples the GPUs with
+        // `mllm_agent::gpu_memory::sample`. It observes no GPU until the
+        // standalone deployment template can allocate in a discrete host's
+        // device domains (Task 8 of the discrete GPU plan switches it on);
+        // until then a discrete host would publish domains its own template
+        // cannot name, and refuse to boot.
+        &no_gpu,
     )
     .await
 }
 
 /// Boot against an explicit provider, which is how a test supplies an installation
 /// it controls instead of one the environment happens to name.
+///
+/// The test entry points observe no GPU, so the published policy is the one a
+/// test states rather than the one the machine running it happens to have;
+/// [`start_standalone_with_gpu`] states a sample.
 pub async fn start_standalone_with(
     state_dir: &Path,
     provider: Arc<dyn EngineProvider>,
@@ -846,6 +867,7 @@ pub async fn start_standalone_with(
         None,
         provider,
         crate::host_observation::proc_meminfo(),
+        &no_gpu,
     )
     .await
 }
@@ -859,7 +881,23 @@ pub async fn start_standalone_with_memory(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, None, provider, memory).await
+    start_standalone_inner(state_dir, None, provider, memory, &no_gpu).await
+}
+
+/// As [`start_standalone_with_memory`], sampling the host's GPUs through `gpu`
+/// instead of `nvidia-smi` (design §1).
+pub async fn start_standalone_with_gpu(
+    state_dir: &Path,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    gpu: &GpuSampler,
+) -> Result<App, StartError> {
+    start_standalone_inner(state_dir, None, provider, memory, gpu).await
+}
+
+/// The sampler of a boot that observes no GPU.
+fn no_gpu() -> Option<mllm_agent::gpu_memory::GpuSample> {
+    None
 }
 
 /// As [`start_standalone_with_memory`], with an explicit role document
@@ -870,7 +908,7 @@ pub async fn start_standalone_configured(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, config, provider, memory).await
+    start_standalone_inner(state_dir, config, provider, memory, &no_gpu).await
 }
 
 async fn start_standalone_inner(
@@ -878,6 +916,7 @@ async fn start_standalone_inner(
     config: Option<&Path>,
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
+    gpu: &GpuSampler,
 ) -> Result<App, StartError> {
     // Fail-closed credentials (SPEC §15.2): the generated api key lives in
     // the protected credentials file. The hardcoded fallback exists ONLY
@@ -976,6 +1015,14 @@ async fn start_standalone_inner(
         .map(|sample| sample.capacity_bytes)
         .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
 
+    // Design §1: the GPUs are sampled once, and the shape they describe decides
+    // the domains this host publishes. Integrated and discrete devices mixed on
+    // one host are refused rather than guessed at. No sample (no `nvidia-smi`,
+    // or a failed run) is a host with no GPU, which publishes as before.
+    let gpu_sample = gpu();
+    let gpu_shape =
+        mllm_agent::gpu_memory::shape(gpu_sample.as_ref()).map_err(StartError::GpuTopology)?;
+
     // SPEC §3: the NVIDIA device inventory is a host fact published at boot
     // like the fingerprints. The collector is bounded and closed-error: a
     // machine with no NVIDIA devices, or one whose collection fails or
@@ -987,6 +1034,7 @@ async fn start_standalone_inner(
             .runtime_dir
             .parent()
             .unwrap_or(&installation.runtime_dir),
+        gpu_sample.as_ref(),
     );
 
     // The host's own accounting units, resolved before anything can observe or be
@@ -998,6 +1046,7 @@ async fn start_standalone_inner(
             &environment_fingerprint,
             capacity_bytes,
             inventory.as_ref(),
+            &gpu_shape,
         );
         let probe = crate::standalone_config::deployment_document(
             "policy-probe",
@@ -1056,10 +1105,11 @@ async fn start_standalone_inner(
     // Initialize measures the one its profile names again for drift. Bounded,
     // reads files only, and a failure is `unmeasured`, never a refusal.
     let embedded = {
-        let (named, fingerprint, inventory) = (
+        let (named, fingerprint, inventory, shape) = (
             named.clone(),
             environment_fingerprint.clone(),
             inventory.clone(),
+            gpu_shape.clone(),
         );
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
@@ -1067,6 +1117,7 @@ async fn start_standalone_inner(
                 fingerprint,
                 capacity_bytes,
                 inventory,
+                shape,
             )
         })
         .await
@@ -1295,6 +1346,7 @@ async fn start_standalone_inner(
         store,
         host: embedded,
         capacity_bytes,
+        gpu_shape,
         router,
         management,
         deps,

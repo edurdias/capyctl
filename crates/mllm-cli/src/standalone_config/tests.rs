@@ -94,6 +94,7 @@ fn the_host_declares_exactly_one_engine_installation() {
         "env-1",
         CAPACITY,
         None,
+        &HostShape::NoGpu,
     );
     let profiles = host["runtime_profiles"]
         .as_object()
@@ -114,7 +115,13 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
     for allowed in [false, true] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.deep_park = allowed;
-        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installation),
+            "env-1",
+            CAPACITY,
+            None,
+            &HostShape::NoGpu,
+        );
         assert_eq!(
             host["runtime_profiles"][STANDALONE_PROFILE]["security"]["deep_park"],
             if allowed { "enabled" } else { "disabled" }
@@ -134,6 +141,7 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
             "env-1",
             CAPACITY,
             None,
+            &HostShape::NoGpu,
         );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         assert_eq!(
@@ -153,7 +161,13 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
 fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.trust_remote_code = true;
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
     assert_eq!(security["trust_remote_code"], true);
     assert_eq!(security["deep_park"], "disabled");
@@ -169,7 +183,13 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
     for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.installation_drift = policy;
-        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installation),
+            "env-1",
+            CAPACITY,
+            None,
+            &HostShape::NoGpu,
+        );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         match policy {
             InstallationDrift::Warn => assert!(security.get("installation_drift").is_none()),
@@ -198,7 +218,13 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
 fn the_published_host_names_the_store_its_weights_live_under() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.models_root = "/data/checkpoints".into();
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     assert_eq!(host["model_store"]["path"], "/data/checkpoints");
 }
 
@@ -207,8 +233,20 @@ fn the_published_host_names_the_store_its_weights_live_under() {
 #[test]
 fn limits_scale_with_observed_capacity() {
     let installation = installed(Engine::Vllm, "/bin/true");
-    let small = host_policy(&named(&installation), "env-1", 16 << 30, None);
-    let large = host_policy(&named(&installation), "env-1", 128 << 30, None);
+    let small = host_policy(
+        &named(&installation),
+        "env-1",
+        16 << 30,
+        None,
+        &HostShape::NoGpu,
+    );
+    let large = host_policy(
+        &named(&installation),
+        "env-1",
+        128 << 30,
+        None,
+        &HostShape::NoGpu,
+    );
     let managed = |h: &Value| {
         h["resource_policy"]["domains"][DOMAIN]["managed_limit"]
             .as_str()
@@ -234,6 +272,7 @@ fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
         "env-1",
         CAPACITY,
         None,
+        &HostShape::NoGpu,
     );
     let bytes = |field: &str| {
         host["resource_policy"]["domains"][DOMAIN][field]
@@ -380,6 +419,7 @@ fn the_published_host_declares_one_memory_pool() {
         "env-1",
         1 << 40,
         None,
+        &HostShape::NoGpu,
     );
     assert_eq!(
         host["resource_policy"]["domains"]["unified"]["memory"],
@@ -397,7 +437,13 @@ fn the_published_host_declares_one_memory_pool() {
 fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm/bin/vllm");
     installation.deep_park = true;
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let deployment = deployment_document(
         "m",
         "m",
@@ -423,7 +469,13 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     // SPEC §6.2: the opted-out host declares restart_only and launches without
     // sleep mode.
     installation.deep_park = false;
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let deployment = deployment_document(
         "m",
         "m",
@@ -512,7 +564,13 @@ fn host_policy_from_env_is_complete() {
     // claiming the same build after an upgrade.
     assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
 
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     // ADR 0014 §1: the published profile carries no engine tuning.
     assert!(host["runtime_profiles"][STANDALONE_PROFILE]
         .get("launch_settings")
@@ -695,7 +753,13 @@ fn the_engine_port_range_can_be_named_for_one_run() {
             .installation()
             .expect("the environment declares an installation");
         assert_eq!(installation.engine_ports, ports, "{value:?}");
-        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installation),
+            "env-1",
+            CAPACITY,
+            None,
+            &HostShape::NoGpu,
+        );
         let range = &host["resource_policy"]["endpoint_port_range"];
         assert_eq!(
             (range["start"].as_u64(), range["end"].as_u64()),
@@ -796,7 +860,13 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
     assert_eq!(installation.engine, Engine::Sglang);
     assert!(!installation.deep_park, "the host opted out");
 
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let mut deployment = deployment_document(
         "m",
         "m",
@@ -1038,4 +1108,91 @@ fn an_isolated_test_leaves_this_process_environment_alone() {
         return;
     }
     assert!(std::env::var_os("MLLM_ISOLATION_PROBE").is_none());
+}
+
+use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, HostShape};
+const GIB: i64 = 1 << 30;
+const MIB: i64 = 1 << 20;
+
+/// The installation the discrete-host tests publish; the unified fixture was
+/// captured from `main` with exactly this one.
+fn installations() -> Vec<mllm_controller::engine_provider::NamedInstallation> {
+    named(&installed(Engine::Vllm, "/opt/venv/bin/vllm"))
+}
+
+fn rtx(index: u32, total_mib: i64, used_mib: i64) -> GpuDevice {
+    GpuDevice {
+        index,
+        uuid: format!("GPU-{index:08}-2222-3333-4444-555555555555"),
+        pci_bus_id: format!("00000000:0{index}:00.0"),
+        name: "RTX".into(),
+        memory: Some(GpuMemory {
+            total_bytes: total_mib * MIB,
+            used_bytes: used_mib * MIB,
+            free_bytes: (total_mib - used_mib) * MIB,
+        }),
+    }
+}
+
+// T26: a 16 GB card with 1.5 GiB of desktop use; 61 GiB of RAM.
+#[test]
+fn a_discrete_standalone_host_has_system_and_device_domains() {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let doc = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let domains = &doc["resource_policy"]["domains"];
+    assert!(domains.get("unified").is_none());
+    assert_eq!(domains["system"]["memory"], "distinct");
+    assert_eq!(domains["gpu0"]["memory"], "device");
+    assert_eq!(domains["gpu0"]["device"], "gpu0");
+    let reserve = (16376 * MIB / 100 * 8).max(GIB);
+    assert_eq!(domains["gpu0"]["free_reserve"], format!("{reserve}B"));
+    assert_eq!(
+        domains["gpu0"]["managed_limit"],
+        format!("{}B", 16376 * MIB - reserve)
+    );
+    assert!(domains["gpu0"].get("host_kv_limit").is_none());
+    assert_eq!(doc["resource_policy"]["devices"]["gpu0"]["domain"], "gpu0");
+    // The published document is one the host policy accepts (ADR 0019).
+    mllm_config::effective::normalize_host_policy(&doc).expect("a valid discrete host policy");
+}
+
+// T26: the unified document is byte-identical to before.
+#[test]
+fn a_unified_standalone_host_is_unchanged() {
+    // Captured from `main` before discrete hosts were published.
+    let before = include_str!("fixtures/unified_host_policy.json");
+    let doc = host_policy(
+        &installations(),
+        "env",
+        128 * GIB,
+        None,
+        &HostShape::Unified,
+    );
+    assert_eq!(
+        serde_json::to_string_pretty(&doc).unwrap(),
+        before.trim_end()
+    );
+    let no_gpu = host_policy(&installations(), "env", 128 * GIB, None, &HostShape::NoGpu);
+    assert_eq!(no_gpu, doc);
+}
+
+// T26 (owner decision 3): two GPUs publish two devices and two device domains.
+#[test]
+fn two_gpus_publish_two_device_domains() {
+    let shape = HostShape::Discrete(vec![rtx(0, 24576, 0), rtx(1, 32768, 0)]);
+    let doc = host_policy(&installations(), "env", 64 * GIB, None, &shape);
+    assert_eq!(doc["resource_policy"]["devices"]["gpu1"]["domain"], "gpu1");
+    assert_eq!(doc["resource_policy"]["domains"]["gpu1"]["device"], "gpu1");
+    mllm_config::effective::normalize_host_policy(&doc).expect("a valid two-GPU host policy");
+}
+
+// T26
+#[test]
+fn device_limits_follow_the_spec_table() {
+    let limits = device_limits(&rtx(0, 16376, 0).memory.unwrap(), 4);
+    assert_eq!(limits.free_reserve, GIB.max(16376 * MIB / 100 * 8));
+    assert_eq!(
+        limits.parked_limit,
+        (2 * GIB * 4).min(16376 * MIB / 100 * 25)
+    );
 }

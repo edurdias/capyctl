@@ -2,17 +2,19 @@
 //!
 //! SPEC §3: the versioned inventory digest (`mllm-nvidia-inventory-v1`,
 //! computed by `runtime/sglang_device.py`) is a host fact, published at boot
-//! exactly like the fingerprints, and the single device's physical UUID is
-//! what the guarded launcher sets the engine child's `CUDA_VISIBLE_DEVICES`
-//! from. Both are published only when the bounded, closed-error collector
+//! exactly like the fingerprints, and each device's physical UUID is what the
+//! guarded launcher sets the engine child's `CUDA_VISIBLE_DEVICES` from. Both
+//! are published only when the bounded, closed-error collector
 //! observes an inventory: a machine with no NVIDIA devices publishes nothing,
 //! and an SGLang deployment then fails placement honestly at the native gate
 //! instead of the host claiming devices it cannot see.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use mllm_agent::gpu_memory::GpuSample;
 use serde_json::Value;
 
 /// How long the collector is given before the publication is abandoned. The
@@ -33,27 +35,38 @@ pub struct InventoryPublication {
     /// The collector's `mllm-nvidia-inventory-v1` digest, as the host policy's
     /// `device_inventory_digest` carries it.
     pub digest: String,
-    /// The inventory's physical UUID, published on the host's device entry
-    /// only when the inventory holds exactly one device — the shape this
-    /// host's single `gpu0` policy can honestly name. More than one device is
-    /// a placement choice no boot should make by itself, so the digest is
-    /// published and the UUID is not, and placement fails closed.
-    pub physical_gpu_uuid: Option<String>,
+    /// Each device's physical UUID, keyed by the driver index `nvidia-smi`
+    /// reports for it — the `N` of the host policy's device `gpuN` (design §7:
+    /// every observed GPU is published with its own UUID).
+    ///
+    /// Design §1: a UUID is published only when the inventory collector and
+    /// `nvidia-smi` observe the same UUID at the same PCI address for every
+    /// device; any disagreement publishes no UUIDs (fail closed) while the
+    /// digest, which is the inventory's own fact, is still published. Without
+    /// an `nvidia-smi` sample only a single-device inventory names its device
+    /// (as `gpu0`, the one entry such a host publishes); more than one device
+    /// cannot be keyed by index, so none is.
+    pub physical_gpu_uuids: BTreeMap<u32, String>,
 }
 
 /// The live publication: `python3 -m runtime.sglang_device` inside
 /// `runtime_root`. Every failure is closed and silent — no output, a non-zero
 /// exit, a malformed document, or the bound expiring all publish nothing.
-pub fn collect(runtime_root: &Path) -> Option<InventoryPublication> {
-    collect_with(runtime_root, &run_collector)
+///
+/// `sample` is the boot's one `nvidia-smi` sample, which the device UUIDs are
+/// corroborated against and keyed by (see
+/// [`InventoryPublication::physical_gpu_uuids`]).
+pub fn collect(runtime_root: &Path, sample: Option<&GpuSample>) -> Option<InventoryPublication> {
+    collect_with(runtime_root, sample, &run_collector)
 }
 
 /// The seam a test stubs instead of running Python.
 pub fn collect_with(
     runtime_root: &Path,
+    sample: Option<&GpuSample>,
     run: &dyn Fn(&Path) -> std::io::Result<String>,
 ) -> Option<InventoryPublication> {
-    publication(&run(runtime_root).ok()?)
+    publication(&run(runtime_root).ok()?, sample)
 }
 
 /// Runs the collector and returns its stdout, bounded.
@@ -101,10 +114,10 @@ fn run_collector(runtime_root: &Path) -> std::io::Result<String> {
 }
 
 /// The closed parse of the collector's JSON document. The digest must be the
-/// exact 64 lowercase hex characters the host policy validates, and the device
-/// UUID the exact shape `runtime/sglang_device.py` validates; anything else is
-/// a document the host does not publish from.
-pub fn publication(raw: &str) -> Option<InventoryPublication> {
+/// exact 64 lowercase hex characters the host policy validates, and every
+/// device UUID the exact shape `runtime/sglang_device.py` validates; anything
+/// else is a document the host does not publish from.
+pub fn publication(raw: &str, sample: Option<&GpuSample>) -> Option<InventoryPublication> {
     let document: Value = serde_json::from_str(raw.trim()).ok()?;
     let host_id = document["host_id"].as_str()?;
     if host_id.is_empty()
@@ -129,25 +142,69 @@ pub fn publication(raw: &str) -> Option<InventoryPublication> {
     if devices.is_empty() {
         return None;
     }
-    let physical_gpu_uuid = match devices.as_slice() {
-        // One device is the shape this host's single `gpu0` policy names. The
-        // collector never publishes a device without its validated UUID, so a
-        // document that claims otherwise is malformed and publishes nothing.
-        [only] => {
-            let uuid = only["physical_gpu_uuid"]
+    // The collector never publishes a device without its validated UUID, so a
+    // document that claims otherwise is malformed and publishes nothing.
+    let observed = devices
+        .iter()
+        .map(|device| {
+            let uuid = device["physical_gpu_uuid"]
                 .as_str()
                 .filter(|uuid| is_physical_uuid(uuid))?;
-            Some(uuid.to_owned())
-        }
-        // More than one device is a placement choice no boot makes by itself:
-        // the digest is real, the UUID selection is not.
-        _ => None,
+            Some((uuid, device["pci_address"].as_str()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let physical_gpu_uuids = match sample {
+        Some(sample) => corroborated(&observed, sample).unwrap_or_default(),
+        // No index to key by: only the single device a `gpu0` host names.
+        None => match observed.as_slice() {
+            [(uuid, _)] => BTreeMap::from([(0, (*uuid).to_owned())]),
+            _ => BTreeMap::new(),
+        },
     };
     Some(InventoryPublication {
         host_id: host_id.to_owned(),
         digest: digest.to_owned(),
-        physical_gpu_uuid,
+        physical_gpu_uuids,
     })
+}
+
+/// Design §1: the inventory's devices keyed by `nvidia-smi`'s index, or `None`
+/// unless both observe exactly the same devices — the same UUID at the same PCI
+/// address, one for one.
+fn corroborated(
+    observed: &[(&str, Option<&str>)],
+    sample: &GpuSample,
+) -> Option<BTreeMap<u32, String>> {
+    if observed.len() != sample.devices.len() {
+        return None;
+    }
+    let mut keyed = BTreeMap::new();
+    for (uuid, pci_address) in observed {
+        let address = pci_bus_id((*pci_address)?)?;
+        let device = sample
+            .devices
+            .iter()
+            .find(|device| pci_bus_id(&device.pci_bus_id) == Some(address.clone()))?;
+        if device.uuid != *uuid || keyed.insert(device.index, (*uuid).to_owned()).is_some() {
+            return None;
+        }
+    }
+    Some(keyed)
+}
+
+/// A PCI address in one comparable form. The collector writes the kernel's
+/// `dddd:bb:dd.f`; `nvidia-smi` writes an eight-digit, upper-case domain
+/// (`0000000F:01:00.0`). Both name the domain as hex, so it is compared as a
+/// number and the rest case-insensitively.
+fn pci_bus_id(address: &str) -> Option<(u32, String)> {
+    let (domain, rest) = address.split_once(':')?;
+    if domain.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((
+        u32::from_str_radix(domain, 16).ok()?,
+        rest.to_ascii_lowercase(),
+    ))
 }
 
 /// The physical UUID shape `runtime/sglang_device.py` validates (`GPU-` +

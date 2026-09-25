@@ -6,6 +6,7 @@
 //! how a host gets overcommitted.
 
 use crate::device_inventory::InventoryPublication;
+use mllm_agent::gpu_memory::{GpuMemory, HostShape};
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
 use mllm_controller::engine_provider::NamedInstallation;
@@ -26,6 +27,31 @@ const PARKED_FRACTION: i64 = 25;
 const HOST_KV_FRACTION: i64 = 10;
 /// ADR 0014 §5: the default KV cache, below the Ready allocation (15%).
 const KV_CACHE_FRACTION: i64 = 10;
+/// The most engines the host keeps parked at once.
+const MAX_PARKED: i64 = 4;
+
+/// A discrete device domain's limits (design §2, "Standalone defaults").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceLimits {
+    pub managed_limit: i64,
+    pub free_reserve: i64,
+    pub parked_limit: i64,
+}
+
+/// ADR 0019: the device reserve absorbs a display server's use — the larger of
+/// 1 GiB and 8 % of the card — and everything above it is managed. Parked
+/// engines leave a CUDA context on the card, bounded at 2 GiB for each engine
+/// that may be parked and at most a quarter of the card.
+pub fn device_limits(memory: &GpuMemory, max_parked: i64) -> DeviceLimits {
+    const GIB: i64 = 1 << 30;
+    let total = memory.total_bytes;
+    let free_reserve = (total / 100 * 8).max(GIB);
+    DeviceLimits {
+        managed_limit: total - free_reserve,
+        free_reserve,
+        parked_limit: (2 * GIB * max_parked).min(total / 100 * 25),
+    }
+}
 
 /// The name the published table uses for an engine family.
 fn engine_name(engine: Engine) -> &'static str {
@@ -80,16 +106,22 @@ fn runtime_profile(installation: &EngineInstallation) -> Value {
 ///
 /// `inventory` is the host's NVIDIA device publication, observed at boot by the
 /// bounded collector (`crate::device_inventory`). The digest rides the host
-/// document as `device_inventory_digest`; when the inventory holds exactly one
-/// device its physical UUID rides the `gpu0` entry, which is what the guarded
-/// launcher sets the engine child's `CUDA_VISIBLE_DEVICES` from. A host with
-/// no inventory publishes neither — placement then fails closed at the native
-/// gate, honestly, rather than here.
+/// document as `device_inventory_digest`; each device's corroborated physical
+/// UUID rides its `gpuN` entry, which is what the guarded launcher sets the
+/// engine child's `CUDA_VISIBLE_DEVICES` from. A host with no inventory
+/// publishes neither — placement then fails closed at the native gate,
+/// honestly, rather than here.
+///
+/// `shape` is the host's GPU shape, sampled once at boot (design §1). A unified
+/// host, and a host with no GPU, publish the single `unified` domain exactly as
+/// before. ADR 0019: a discrete host publishes a `system` domain for host RAM
+/// and one `device` domain per GPU, named after its device `gpuN`.
 pub fn host_policy(
     installations: &[NamedInstallation],
     environment_fingerprint: &str,
     capacity_bytes: i64,
     inventory: Option<&InventoryPublication>,
+    shape: &HostShape,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     // ADR 0018 §5: role-level fields (model store, ports, hardware
@@ -99,10 +131,74 @@ pub fn host_policy(
         .first()
         .expect("a standalone host publishes at least one installation")
         .installation;
-    let mut gpu0 = json!({"domain": DOMAIN, "sharing": "shared"});
-    if let Some(uuid) = inventory.and_then(|published| published.physical_gpu_uuid.as_deref()) {
-        gpu0["physical_gpu_uuid"] = json!(uuid);
-    }
+    let (domains, devices) = match shape {
+        HostShape::Unified | HostShape::NoGpu => {
+            let mut gpu0 = json!({"domain": DOMAIN, "sharing": "shared"});
+            // The single entry names the inventory's one device, whatever
+            // index the driver gave it.
+            if let Some(published) = inventory {
+                if let [uuid] = published.physical_gpu_uuids.values().collect::<Vec<_>>()[..] {
+                    gpu0["physical_gpu_uuid"] = json!(uuid);
+                }
+            }
+            let domains = json!({
+                DOMAIN: {
+                    "managed_limit": share(MANAGED_FRACTION),
+                    "free_reserve": share(FREE_RESERVE_FRACTION),
+                    "parked_limit": share(PARKED_FRACTION),
+                    "host_kv_limit": share(HOST_KV_FRACTION),
+                    // One physical pool: a weight backup "in host RAM" would
+                    // allocate from the memory it is meant to free.
+                    "memory": "unified"
+                }
+            });
+            (domains, json!({"gpu0": gpu0}))
+        }
+        HostShape::Discrete(gpus) => {
+            let mut domains = serde_json::Map::new();
+            domains.insert(
+                "system".into(),
+                json!({
+                    "managed_limit": share(MANAGED_FRACTION),
+                    "free_reserve": share(FREE_RESERVE_FRACTION),
+                    "parked_limit": share(PARKED_FRACTION),
+                    "host_kv_limit": share(HOST_KV_FRACTION),
+                    // ADR 0019: host RAM only; the GPU has its own domain.
+                    "memory": "distinct"
+                }),
+            );
+            let mut devices = serde_json::Map::new();
+            for gpu in gpus {
+                let id = format!("gpu{}", gpu.index);
+                // `HostShape::Discrete` holds only devices with memory of their own.
+                let memory = gpu
+                    .memory
+                    .as_ref()
+                    .expect("a discrete device reports its memory");
+                let limits = device_limits(memory, MAX_PARKED);
+                domains.insert(
+                    id.clone(),
+                    json!({
+                        // ADR 0019: this device's VRAM; host-KV lives in RAM,
+                        // so a device domain states no `host_kv_limit`.
+                        "memory": "device",
+                        "device": id,
+                        "managed_limit": format!("{}B", limits.managed_limit),
+                        "free_reserve": format!("{}B", limits.free_reserve),
+                        "parked_limit": format!("{}B", limits.parked_limit)
+                    }),
+                );
+                let mut entry = json!({"domain": id, "sharing": "shared"});
+                if let Some(uuid) =
+                    inventory.and_then(|published| published.physical_gpu_uuids.get(&gpu.index))
+                {
+                    entry["physical_gpu_uuid"] = json!(uuid);
+                }
+                devices.insert(id, entry);
+            }
+            (Value::Object(domains), Value::Object(devices))
+        }
+    };
     let profiles: serde_json::Map<String, Value> = installations
         .iter()
         .map(|named| (named.profile.clone(), runtime_profile(&named.installation)))
@@ -122,20 +218,10 @@ pub fn host_policy(
         "model_store": {"path": first.models_root.to_string_lossy()},
         "runtime_profiles": profiles,
         "resource_policy": {
-            "domains": {
-                DOMAIN: {
-                    "managed_limit": share(MANAGED_FRACTION),
-                    "free_reserve": share(FREE_RESERVE_FRACTION),
-                    "parked_limit": share(PARKED_FRACTION),
-                    "host_kv_limit": share(HOST_KV_FRACTION),
-                    // One physical pool: a weight backup "in host RAM" would
-                    // allocate from the memory it is meant to free.
-                    "memory": "unified"
-                }
-            },
-            "devices": {"gpu0": gpu0},
+            "domains": domains,
+            "devices": devices,
             "device_sharing": "shared",
-            "max_parked": 4,
+            "max_parked": MAX_PARKED,
             "observation_ttl": "2s",
             "endpoint_port_range": {
                 "start": first.engine_ports.0,
