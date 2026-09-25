@@ -1,48 +1,43 @@
-# mllm handoff package — revision 0.2
+# mllm documentation
 
-**Repository status (2026-09-12):** the original design package below now sits
-alongside the F0/F1 implementation. For current status, read
-[`design/milestones/f1-open-items.md`](design/milestones/f1-open-items.md) and
-[`runbooks/spark-model-size-qualification.md`](runbooks/spark-model-size-qualification.md).
-F2 SGLang is the next milestone; its [consolidated design](design/milestones/f2-sglang-design.md)
-is approved after document review. It includes shared single-host foundations, concurrent
-mixed-engine serving, mandatory warm parking, and API contracts for a future UI.
-The first implementation slice is the [F2A1 resource-contract and admission plan](superpowers/plans/2026-09-12-f2a1-resource-contracts-and-admission.md).
-The next slice is the [F2A2a durable reservation transaction plan](superpowers/plans/2026-09-12-f2a2a-durable-reservation-transactions.md).
-Runtime observation and completion checks are specified in the [F2A2b evidence plan](superpowers/plans/2026-09-12-f2a2b-runtime-evidence.md).
-Request ownership is specified in the [F2A2c dispatch plan](superpowers/plans/2026-09-12-f2a2c-durable-dispatch-ownership.md).
-The [F2A2d coordinator integration plan](superpowers/plans/2026-09-12-f2a2d-coordinator-integration.md) connects lifecycle, runtime ownership, and routing.
-The [F2 planning index](superpowers/plans/2026-09-12-f2-planning-index.md) tracks written slices and remaining integration work.
-All eight F2 plans are written; integrated document review fixes have landed.
-CPU-only implementation has started. Live mixed-engine verification remains pending.
-The design-package revision is not a software release or a hardware verification claim.
+This directory holds the user documentation for mllm 0.1.0 and the design and
+process records its contributors work from. The project overview and
+quickstart are in the repository [`README.md`](../README.md).
 
-Start with `AGENTS.md`, then `SPEC.md`.
+## Using mllm
 
-## Contents
-
-| File | Purpose |
+| Document | Contents |
 |---|---|
-| `SPEC.md` | Consolidated architecture, requirements, interfaces, resource rules, configuration, milestones, and 40 acceptance scenarios. |
-| `examples/server.yaml` | Server role document: loopback management and inference, networked enrollment and control. |
-| `examples/host.yaml` | Host role document: unified-memory resource policy, labels, and vLLM and SGLang installations. |
-| `examples/deployment-single.yaml` | vLLM deployment on one host with `engine_config` and `timeouts`. |
-| `examples/deployment-multinode.yaml` | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
-| `examples/standalone.yaml` | Embedded local server/host shape, as `mllm start standalone` generates it. |
-| `operations/install.md` | Release tarball, systemd units per role, restart versus drain, upgrade and rollback. |
+| [`operations/install.md`](operations/install.md) | Release assets and `install.sh`, systemd units per role, file locations, restart versus drain, exit codes, upgrade and rollback. |
+| [`examples/server.yaml`](examples/server.yaml) | Server role document: loopback management and inference listeners, networked enrollment and control listeners. |
+| [`examples/host.yaml`](examples/host.yaml) | Host role document: private ingress, unified-memory resource policy, placement labels, and vLLM and SGLang installations. |
+| [`examples/standalone.yaml`](examples/standalone.yaml) | Standalone role document (embedded server and host on one machine), in the shape `mllm start standalone` generates. |
+| [`examples/deployment-single.yaml`](examples/deployment-single.yaml) | vLLM deployment on one host, with `engine_config` and `timeouts`. |
+| [`examples/deployment-multinode.yaml`](examples/deployment-multinode.yaml) | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
 
-Every example passes `mllm validate config` (deployments also against `examples/host.yaml`);
-`crates/mllm-cli/tests/validate_config.rs` checks this. They illustrate the schema and are
-not calibrated engine recipes.
+Every example passes `mllm validate config`, and the deployments also resolve
+against `examples/host.yaml`; `crates/mllm-cli/tests/validate_config.rs` checks
+this. Host names, addresses, paths, fingerprints, byte budgets and durations
+are placeholders. The examples show the schema; they are not tested engine
+recipes, and passing validation does not mean an engine will start with them.
 
-Revision 0.2 supersedes `mllm-initial-design.md` revision 0.1 and incorporates the subsequent design decisions. The old file is not repeated in the bundle to avoid conflicting instructions.
+## Contributing to mllm
 
-## Verification boundary
+Start with [`AGENTS.md`](../AGENTS.md), the working agreement for human and
+coding-agent contributors. It defines which documents are authoritative and
+in what order.
 
-The original package's checks covered design documents and illustrative
-configuration only. The repository now also contains implementation and tests;
-their evidence is reported separately in the runbooks. YAML syntax checks do
-not establish live-engine correctness, and installed engines, secrets and model
-weights are not part of this documentation package.
+| Document | Contents |
+|---|---|
+| [`SPEC.md`](SPEC.md) | The authoritative product requirements: architecture, interfaces, resource rules, configuration, delivery gates and the T01–T40 acceptance matrix. Where any other document disagrees, the spec wins. |
+| [`design/0000-full-picture.md`](design/0000-full-picture.md) | The overall design and how the parts fit together, recorded around the spec. |
+| [`design/adr/`](design/adr/) | Architecture decision records (ADR 0001 onwards). An ADR that amends the spec says so. |
+| [`design/milestones/`](design/milestones/) | Milestone designs and plans (F0 foundation, F1 vLLM path, F2 SGLang and the two-host program). |
+| [`runbooks/f2-current-status.md`](runbooks/f2-current-status.md) | The single status record: what is done, what remains and what is queued next. |
+| [`runbooks/`](runbooks/) | Operational records kept by the maintainers: live-run evidence, engine environment notes and the carried [vLLM development-mode warning](runbooks/vllm-development-mode-warning.md). |
+| [`superpowers/plans/`](superpowers/plans/) | Implementation plans, one per slice of work. |
+| [`superpowers/specs/`](superpowers/specs/) | Design notes for individual features written ahead of their plans. |
 
-Names, addresses, paths, byte budgets, and durations are examples. Source-backed upstream behavior is referenced inside the specification and still requires verification against the exact build selected for implementation.
+The milestone, runbook and plan documents are working records. Most describe
+the state of the work when they were written; the spec and the status runbook
+are the current references.

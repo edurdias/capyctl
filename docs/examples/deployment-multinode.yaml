@@ -8,10 +8,10 @@ kind: deployment
 name: coding-large
 instances: 2
 placement:
-  hosts: ["host-a", "host-b"]
+  hosts: ["gpu-box", "workstation"]
   # Only hosts whose labels match are candidates.
   selector:
-    accelerator: gb10
+    accelerator: example-gpu
   strategy: spread
   max_per_host: 1
 routes: ["coding-large"]
