@@ -55,7 +55,7 @@ fn main() -> ExitCode {
         }
         // SPEC §15.2 (R13): `--config` names the role document; without it the
         // implicit `<state_dir>/config/standalone.yaml` is loaded or generated.
-        // ADR 0018 §2 (controller ruling 2026-09-25): `$MLLM_CONFIG` names it
+        // ADR 0018 §2 (review decision 2026-09-25): `$MLLM_CONFIG` names it
         // when `--config` is absent, exactly as for `mllm engine`.
         let config = mllm_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
             std::env::var(key).ok().filter(|value| !value.is_empty())

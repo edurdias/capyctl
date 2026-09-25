@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The one bounded external memory allocation of decision D6 (M21).
 
-Runs on a Spark with the system python3. Allocates at most 40 GiB of anonymous
+Runs on a host with the system python3. Allocates at most 40 GiB of anonymous
 memory, touches every page so MemAvailable really drops, holds it for at most
 --seconds, then exits; the kernel reclaims everything at exit. SIGTERM, SIGINT
 and SIGHUP end it early through the same path. fault.sh also wraps it in

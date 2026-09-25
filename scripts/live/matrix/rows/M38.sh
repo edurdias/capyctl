@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M38 (T20, T30): launch failures close, then the host still serves, per fixture:
-#   run_row.sh M38 --tag v92-4 -- v92-4
-#   run_row.sh M38 --tag s92-4 -- s92-4
+#   run_row.sh M38 --tag va-4 -- va-4
+#   run_row.sh M38 --tag sa-4 -- sa-4
 # Replaces the removed in-process suite live_vllm.rs L6, L7 and L8 (owner
 # decision 2026-09-22), driven through the shipped CLI against the host role.
 #
@@ -54,7 +54,7 @@ failure_shape() { # failure_shape <fixture> <tag> <host>
 }
 
 row_main() {
-  local fix=${1:?fixture, e.g. v92-4} host rc=0
+  local fix=${1:?fixture, e.g. va-4} host rc=0
   host=$(fixture_host "$fix")
   echo "fixture $fix host $host" | tee -a "$EVID/timeline.txt"
   step before host_idle "$host" || return 1

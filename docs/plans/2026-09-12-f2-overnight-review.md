@@ -35,7 +35,7 @@ complete merge scope. No push or PR publication was requested. Partial internal
 foundations do not establish that F2 runtime integration or live qualification is done.
 
 The owner changed review cadence: test and review at the end of each module, not
-with detailed reviews per task. This overrides SDD's per-task reviewer dispatches.
+with detailed reviews per task. This overrides the earlier per-task review cadence.
 Keep focused tests/TDD during implementation; group related tasks into cohesive
 modules and run a consolidated independent review plus verification at each module
 boundary. Do not relabel every small task as a module. Candidate Initialize
@@ -80,7 +80,7 @@ Document review remains a planning gate, not a repeated gate for each small task
   evidence or pass predicates. Coordinator selection is accepted above; exact
   corpus/evaluator integration remains outside the Initialize-only slice.
 - Please check unrelated untracked `crates/mllm-cli/tests/live_interactive.rs` for
-  unwanted formatting. During dispatch Task 3, the implementer ran `cargo fmt -- <paths>`;
+  unwanted formatting. During dispatch Task 3, `cargo fmt -- <paths>` was run;
   Cargo formatted the workspace instead of limiting scope. Tracked spill was
   restored byte-exactly; root confirms no remaining unstaged Rust diff. No original
   baseline exists for the untracked file, so no
@@ -100,8 +100,8 @@ Document review remains a planning gate, not a repeated gate for each small task
   with warnings denied. The reviewed tree is
   `c9bfdbfa2e465658a91b24e8fec1e0fc0a6539a1`. See the
   [observer plan](2026-09-14-f2b-memory-saver-observer.md) and
-  [patch provenance and limitations](../../../runtime/patches/README.md).
-  This module performs no installation or Spark operation. Protected scheduler
+  [patch provenance and limitations](../../runtime/patches/README.md).
+  This module performs no installation or host operation. Protected scheduler
   integration, actual loaded-library identity, reviewed isolated CUDA build,
   native allocation/lifecycle qualification and full F2 remain open. The observer
   cannot acknowledge parking, release reservations, or establish whole-process
@@ -156,10 +156,10 @@ Document review remains a planning gate, not a repeated gate for each small task
 - Qualification progression is the next cohesive module: accounted probes, marker
   cases, security checks, warm cycles, trusted evaluation, immutable Fake catalog,
   and verified-cleanup eligibility. Five local document lenses and three independent
- reviews completed, plus one limited local interface check. One family-label
+  reviews completed, plus one limited local interface check. One family-label
   correction was applied. The new candidate-action version preserves legacy history;
   one accounted ReadyProbe supplies lifecycle and qualification readiness together.
-  Native qualification and full F2 remain open. No Spark access or installs occurred.
+  Native qualification and full F2 remain open. No host access or installs occurred.
 
 - Fit-based planner module merged locally into `main` at `8c355c0`. One consolidated
   module review found no critical, important, or minor issues. Fresh pre-merge and
@@ -220,20 +220,20 @@ Document review remains a planning gate, not a repeated gate for each small task
   with boundary and real host-input tests; all 64 config tests and scoped Clippy
   pass. Root baseline workspace suite also passes. Durable resource-policy store
   implementation now reviewed above; atomic arm, production cutover and live tests remain open.
-- Candidate normalization contract reviewed by five local personas, one focused
+- Candidate normalization contract reviewed by five local review lenses, one focused
   interface check and three independent reviews. Two document corrections:
   permit required parser object-array repair and remove full host-policy retention.
   Candidate normalization itself creates no permission, grant or runtime effect.
 - Qualification importer reviewed through `b7109ca`: atomic session-fenced updates,
   revision tombstones, bounded strict reads, redacted events and retained accounting.
   Root checks: 287 CPU tests pass; scoped Clippy clean. Resource-policy contract
-  reviewed by five local personas and three independent reviews. Local
+  reviewed by five local review lenses and three independent reviews. Local
   resource config bootstraps the database; accepted DB controls subsequently win.
   Domain/device/port changes need separate migration, not resource-limit updates.
 - Qualification-policy input reviewed through `cec820f`: strict optional policy,
   independent permissions, canonical allowlist, shared validation, safe nested
   errors. Root checks: 272 CPU tests pass; scoped Clippy clean. Importer contract
-  reviewed by five local personas, one focused check and three independent
+  reviewed by five local review lenses, one focused check and three independent
   reviews. Removing policy retains a revoked revision tombstone; re-add requires
   the next revision. Existing runs, grants and original cleanup authority remain.
 - Earlier checkpoint: V6 management schema and V7 durable event foundation reviewed
@@ -268,12 +268,12 @@ Document review remains a planning gate, not a repeated gate for each small task
   atomic increasing grants, fencing, rollback, replay, and contention tests.
   Four task reviews and broader review approved. Fresh root checks:
   184 workspace tests excluding CLI plus 2 CLI library tests pass. Scoped Clippy
-  clean. No production database or Spark runtime accessed.
+  clean. No production database or host runtime accessed.
 - F2A2b complete through `0f5a576`: bounded host-memory observer and completion
   validator with full process/token/time/milestone checks. Task and broader reviews
   complete; formatting fix re-reviewed. Full checks at `60fd33a`: 194 CPU tests
   pass, scoped Clippy clean. Post-format memory tests and rustfmt check pass.
-- Coordinator staging amendments reviewed: five local personas, three scoped local
+- Coordinator staging amendments reviewed: five local review lenses, three scoped local
   checks, and three independent reviews complete. Five corrections:
   staged joint cutover, claim handoff, attachment endpoint/credential isolation,
   reusable qualification identity, and verified external-accounting reconciliation.
@@ -355,7 +355,7 @@ Document review remains a planning gate, not a repeated gate for each small task
   exact run binding, lifetime request count, and verified-cleanup status. Cost:
   three added tables and corresponding bounded writer tests; no applied migration
   rewritten. Resource-policy API cannot edit qualification permissions.
-- New contract doc-review completed with five local personas, two focused local
+- New contract doc-review completed with five local review lenses, two focused local
   checks, and three independent reviews. Clarified optional
   completion targets for control/cleanup steps. No owner-only decisions.
   Initial SGLang schema accepts the reviewed Qwen3-4B recipe only; further recipes
@@ -379,7 +379,8 @@ Document review remains a planning gate, not a repeated gate for each small task
   credential references and metadata, with reviewed manifest once. Not heap usage.
   Cost: near-limit inputs passing old raw-length sum now reject; future persisted
   DTO has separate 1 MiB cap. Canonical cap is dominated by encoded input cap here.
-- Snapshot document review complete: six local checks, three independent reviews. Three plan corrections applied; no pending owner decision.
+- Snapshot document review complete: six local checks, three independent
+  reviews. Three plan corrections applied; no pending owner decision.
   Permit narrow unsigned parser repair for full u64 revisions. Cost: shared scalar
   behavior changes above i64::MAX; signed/quoted/float/overflow tests required.
   Tightened-host test uses valid 3s deadline and positive matching-candidate control.

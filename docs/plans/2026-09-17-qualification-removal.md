@@ -6,14 +6,14 @@
 
 **Tech Stack:** Rust workspace (`cargo`, `clippy -D warnings`), SQLite through `rusqlite` with forward-only migrations, `tokio` coordinator worker, `axum` management API, `serde` DTOs.
 
-**Spec:** `docs/superpowers/specs/2026-09-17-qualification-removal-design.md`. Read it first. Where this plan deviates from the spec it says so in the task and the docs task records the amendment.
+**Spec:** `docs/specs/2026-09-17-qualification-removal-design.md`. Read it first. Where this plan deviates from the spec it says so in the task and the docs task records the amendment.
 
 ## Global Constraints
 
 - Only host `host-a` is authorized for live work. Never access `host-b`. No task in this plan touches a live host.
 - Do not change engine environments, drivers, or reboot hosts. The Python files under `runtime/` are not edited by this plan.
 - Native entrypoint denials stay closed. Moving the native launch handoff opens nothing; `ProfileBindings` keeps refusing SGLang.
-- Excluded files, never read, edited, formatted, tested or staged: `crates/mllm-cli/tests/live_interactive.rs` and `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`. The second is modified in the worktree; do not stage it in any commit.
+- Excluded files, never read, edited, formatted, tested or staged: `crates/mllm-cli/tests/live_interactive.rs` and a local Task 2 implementation report. The second is modified in the worktree; do not stage it in any commit.
 - `AGENTS.md` is untracked and not this plan's. Leave it alone.
 - One status document: `docs/runbooks/f2-current-status.md`. No progress or continuation files anywhere under `docs/`.
 - Prose in documents and commit messages is normal English.
@@ -79,8 +79,8 @@ because nobody knows whether the effect landed."
 Docs first, so code moves against an amended SPEC and ADR rather than ahead of them.
 
 **Files:**
-- Modify: `docs/design/adr/0011-the-state-machine-owns-recovery.md` (already partly edited in the worktree), `docs/SPEC.md`, `docs/design/adr/0009-proof-carrying-reconciliation.md`, `docs/design/milestones/f2-sglang-design.md`, `docs/superpowers/plans/2026-09-12-f2-planning-index.md`, `docs/README.md`, `docs/superpowers/specs/2026-09-17-qualification-removal-design.md`
-- Delete: `docs/superpowers/plans/2026-09-12-f2c-mixed-engine-qualification.md`, `docs/superpowers/plans/2026-09-14-f2-native-candidate-handoff.md`, `docs/superpowers/plans/2026-09-16-state-machine-owns-recovery.md`, `docs/runbooks/f2-mixed-engine-qualification.md`, `docs/runbooks/f2-sglang-qualification.md`, `docs/AGENT_HANDOFF.md`
+- Modify: `docs/design/adr/0011-the-state-machine-owns-recovery.md` (already partly edited in the worktree), `docs/SPEC.md`, `docs/design/adr/0009-proof-carrying-reconciliation.md`, `docs/design/milestones/f2-sglang-design.md`, `docs/plans/2026-09-12-f2-planning-index.md`, `docs/README.md`, `docs/specs/2026-09-17-qualification-removal-design.md`
+- Delete: `docs/plans/2026-09-12-f2c-mixed-engine-qualification.md`, `docs/plans/2026-09-14-f2-native-candidate-handoff.md`, `docs/plans/2026-09-16-state-machine-owns-recovery.md`, `docs/runbooks/f2-mixed-engine-qualification.md`, `docs/runbooks/f2-sglang-qualification.md`, `docs/AGENT_HANDOFF.md`
 
 - [ ] **Step 1: ADR 0011**
 
@@ -107,7 +107,7 @@ repository (no allocations, weights or cache; quiesced; no unknown work; activit
 counters unmoved; no outstanding request lease; identities equal to the owned
 association; then milestone verification), the Fake engine's lifecycle simulation,
 and the native launch handoff. The design at
-`docs/superpowers/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
+`docs/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
 ```
 
 In decision 5, replace "Both are host policy fields with these defaults, not constants, because a host with slower storage may need a longer cooldown." with:
@@ -154,7 +154,7 @@ that references in §20 remain stable. Recipe ownership is stated in §8.1.
 - §15.1 (line 523): "reservations and qualification results" becomes "reservations and operational evidence".
 - §17 (line 789): remove ", qualification reasons".
 - §18 F2 row (line 805): "mandatory qualified parking" becomes "declared-tier parking"; "selected-recipe live qualification" becomes "live verification of the selected recipes on authorized hardware". F4 row (line 807): "Distributed and cache qualification" becomes "Distributed and cache verification".
-- §19 (line 832): "production-qualified Spark recipes" becomes "production-verified Spark recipes"; "Qualification and the development-endpoint security issue are release gates" becomes "Live verification on authorized hardware and the development-endpoint security issue are release gates".
+- §19 (line 832): "production-qualified host recipes" becomes "production-verified host recipes"; "Qualification and the development-endpoint security issue are release gates" becomes "Live verification on authorized hardware and the development-endpoint security issue are release gates".
 - §20 T14 (line 853): remove "; old qualification invalidated" and append "; a superseded binding identity is not reused". T36 (line 875): "qualified fallback" becomes "declared fallback". Line 881: "a qualified experimental deep-park path where permitted" becomes "a live-verified deep-park path where permitted".
 - §21 (line 905): "retain qualification evidence" becomes "retain operational evidence".
 
@@ -187,22 +187,22 @@ In §8, row Q11 becomes "| Q11 — Engine verification | Pinned recipe for each 
 - [ ] **Step 5: Deletions and index**
 
 ```bash
-git rm docs/superpowers/plans/2026-09-12-f2c-mixed-engine-qualification.md \
-       docs/superpowers/plans/2026-09-14-f2-native-candidate-handoff.md \
-       docs/superpowers/plans/2026-09-16-state-machine-owns-recovery.md \
+git rm docs/plans/2026-09-12-f2c-mixed-engine-qualification.md \
+       docs/plans/2026-09-14-f2-native-candidate-handoff.md \
+       docs/plans/2026-09-16-state-machine-owns-recovery.md \
        docs/runbooks/f2-mixed-engine-qualification.md \
        docs/runbooks/f2-sglang-qualification.md \
        docs/AGENT_HANDOFF.md
 ```
 
-In `docs/superpowers/plans/2026-09-12-f2-planning-index.md`, delete the F2C row (line 18). In `docs/README.md`, delete the sentence "Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning." and replace with "Start with `AGENTS.md`, then `SPEC.md`."; change "Live mixed-engine qualification remains pending." to "Live mixed-engine verification remains pending." and "hardware qualification claim" to "hardware verification claim".
+In `docs/plans/2026-09-12-f2-planning-index.md`, delete the F2C row (line 18). In `docs/README.md`, delete the sentence "Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning." and replace with "Start with `AGENTS.md`, then `SPEC.md`."; change "Live mixed-engine qualification remains pending." to "Live mixed-engine verification remains pending." and "hardware qualification claim" to "hardware verification claim".
 
 Run: `grep -rn "AGENT_HANDOFF\|f2c-mixed-engine-qualification\|f2-native-candidate-handoff\|state-machine-owns-recovery.md\|f2-sglang-qualification\|f2-mixed-engine-qualification" docs AGENTS.md`
 Expected: no hits outside `docs/runbooks/f2-current-status.md` (fixed in Task 13) and the spec's own §5 list.
 
 - [ ] **Step 6: Amend the design doc**
 
-In `docs/superpowers/specs/2026-09-17-qualification-removal-design.md`, add a section "## 9. Amendments during planning" listing the five deviations from the top of this plan, one sentence each.
+In `docs/specs/2026-09-17-qualification-removal-design.md`, add a section "## 9. Amendments during planning" listing the five deviations from the top of this plan, one sentence each.
 
 - [ ] **Step 7: Commit**
 
@@ -1297,7 +1297,7 @@ Also `crates/mllm-controller/src/coordinator.rs:1` doc comment "Owned, qualified
 Run: `cargo test --offline -p mllm-store -p mllm-controller -p mllm-management --all-targets -- --test-threads=4`
 Expected: pass. Management event tests that pinned a `qualified_*` kind string now pin the new one; update the expected literal, not the assertion shape.
 Run: `grep -rn -i "qualif" crates --include=*.rs | grep -v "mllm-cli/src/roles.rs" | cut -c1-120`
-Expected: nothing. `roles.rs` may keep comments about the F1 Spark live verification runs if they cite the runbook by its filename; leave those.
+Expected: nothing. `roles.rs` may keep comments about the F1 host live verification runs if they cite the runbook by its filename; leave those.
 
 - [ ] **Step 4: Commit**
 

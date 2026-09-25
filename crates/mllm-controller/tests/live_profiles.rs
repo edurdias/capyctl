@@ -831,7 +831,7 @@ async fn a_reload_refuses_a_document_changed_outside_profiles() {
     h.server.abort();
 }
 
-// T16 (controller ruling C1): the role retires a published profile and
+// T16 (review decision C1): the role retires a published profile and
 // answers once the server confirms, writing nothing: its configuration
 // directory may be read-only to it (ProtectSystem=strict under the system
 // units). The CLI then rewrites engines.yaml, and the reload it asks for

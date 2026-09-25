@@ -3,14 +3,14 @@
 **Status:** Accepted (owner decision 2026-09-17, reaffirmed 2026-09-22)
 **Amends:** `SPEC.md` §9.1 (security gate), §16.2 (safe-example paragraph), §18 (F1
 deliverable) and §20 T21; the deep-park bullet in `AGENTS.md` "Hard constraints".
-**Unit:** W1 of `docs/superpowers/plans/2026-09-22-two-host-control-plane-plan.md`
+**Unit:** W1 of `docs/plans/2026-09-22-two-host-control-plane-plan.md`
 (matrix decision D1, gap G16).
 
 ## Context
 
 On 2026-09-17 the owner ruled that parking is required product behavior and that deep
 parking is on by default, with a host opting out ("It is opt out of deep parking. We
-will do it by default"; `docs/superpowers/specs/2026-09-17-native-launch-vllm-design.md`
+will do it by default"; `docs/specs/2026-09-17-native-launch-vllm-design.md`
 §1 and §11). S1 shipped that default, and the S2 ADR was to amend SPEC §9.1, T21 and
 `AGENTS.md` to match.
 

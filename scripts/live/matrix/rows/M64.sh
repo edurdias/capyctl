@@ -1,13 +1,13 @@
 # shellcheck shell=bash
 # M64 (T16; G10) plus `drain host` (SPEC §4.3, W11):
-#   run_row.sh M64 -- s92-4 v17-4
+#   run_row.sh M64 -- sa-4 vb-4
 #
-#   delete  s92-4 Ready: plain `delete deployment` is refused (409
+#   delete  sa-4 Ready: plain `delete deployment` is refused (409
 #           delete_requires_cleanup) with nothing changed; `delete deployment --stop`
 #           stops, proves absence, then removes the route (gone from /v1/models, 404
 #           on inference) and the name can be deployed again; checkpoint files are
 #           untouched.
-#   drain   v17-4 Ready: `drain host host-b --wait` stops it with verified
+#   drain   vb-4 Ready: `drain host host-b --wait` stops it with verified
 #           cleanup and leaves it eligible: the next request reactivates it on
 #           demand; then stop with verified cleanup; delete.
 
@@ -26,7 +26,7 @@ model_dir_digest() { # model_dir_digest <host> <dir>: size+mtime listing digest 
 }
 
 row_main() {
-  local a=${1:-s92-4} b=${2:-v17-4} ha hb rc=0 aid=
+  local a=${1:-sa-4} b=${2:-vb-4} ha hb rc=0 aid=
   ha=$(fixture_host "$a"); hb=$(fixture_host "$b")
   step before-a host_idle "$ha" || return 1
   step before-b host_idle "$hb" || return 1

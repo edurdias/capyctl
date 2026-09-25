@@ -1,11 +1,11 @@
 # shellcheck shell=bash
-# M05 (T08, T37): deploy v92-4 --activate --wait; one completion. Expected: vLLM
+# M05 (T08, T37): deploy va-4 --activate --wait; one completion. Expected: vLLM
 # Ready remotely through runtime/vllm_entry.py; the guard refuses unkeyed control
 # routes. The guard check probes the engine's loopback port on host-a with no
 # key and expects 401 on a control route and on /v1, and only /health unkeyed.
 
 row_main() {
-  local dep=v92-4 host=host-a
+  local dep=va-4 host=$HOST_A
   step deploy deploy "$dep" --activate --wait || return 1
   step status status_dep "$dep"
   step owned owned "$dep"

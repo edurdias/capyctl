@@ -33,7 +33,7 @@ static() {
       echo "snapshot_commit $(cat "$SNAPSHOT/commit" 2>/dev/null || echo none)"
       echo "dirty_files $(cat "$SNAPSHOT/dirty-count" 2>/dev/null || echo unknown)"
       echo "cargo_lock $(cat "$SNAPSHOT/cargo-lock.sha256" 2>/dev/null || echo unknown)"
-      echo "binary_control_host $(sha256sum "$MLLM" | cut -c1-64)"
+      echo "binary_control-host $(sha256sum "$MLLM" | cut -c1-64)"
       echo "run $RUN"
     } >"$dir/static.control-host.txt"
   fi
@@ -96,7 +96,7 @@ for r in sorted(glob.glob(sp+\"/*.dist-info/RECORD\")):
       >"$( dry && echo /dev/null || echo "$dir/vparity.$host.txt")"
   done
   dry && return 0
-  if diff <(grep -E '^(env|R) ' "$dir/vparity.host-a.txt") <(grep -E '^(env|R) ' "$dir/vparity.host-b.txt") >"$dir/vparity.diff"; then
+  if diff <(grep -E '^(env|R) ' "$dir/vparity.$HOST_A.txt") <(grep -E '^(env|R) ' "$dir/vparity.$HOST_B.txt") >"$dir/vparity.diff"; then
     echo "vLLM parity: identical distributions and RECORD digests" | tee "$dir/vparity.verdict"
   else
     echo "vLLM parity: DIFFERS (see vparity.diff)" | tee "$dir/vparity.verdict"; return 1

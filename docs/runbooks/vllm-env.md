@@ -1,23 +1,23 @@
-# DGX Spark — vLLM Environment Contract (operator-executed)
+# unified-memory host — vLLM Environment Contract (operator-executed)
 
 **mllm installs nothing** (SPEC §4.2 / T07): the operator executes the steps below on
-the Spark. mllm observes the result via `mllm doctor host` and freezes the live recipe
+the host. mllm observes the result via `mllm doctor host` and freezes the live recipe
 only from reported reality (F1 design §8). Fill the `<CAPTURED>` values from doctor
 output; never guess them.
 
 ## 1. vLLM install (dedicated venv)
 
 ```bash
-# On the Spark, as the operator:
-python3 -m venv ~/mllm-vllm-venv   # /opt requires root on the lab Spark; user-writable venv (recorded deviation)
+# On the host, as the operator:
+python3 -m venv ~/mllm-vllm-venv   # /opt requires root on the lab host; user-writable venv (recorded deviation)
 ~/mllm-vllm-venv/bin/pip install --upgrade pip
 ~/mllm-vllm-venv/bin/pip install vllm==<PINNED_VERSION>   # pin set at first doctor capture
 ~/mllm-vllm-venv/bin/vllm --version                        # record this output as the fingerprint
 ```
 
 `<PINNED_VERSION>` is chosen at the first live session: install the current stable
-release that builds for aarch64/GB10, run `mllm doctor host`, and record the exact
-version in this file before any deploy test. If sleep mode misbehaves on the GB10
+release that builds for aarch64/unified-memory host, run `mllm doctor host`, and record the exact
+version in this file before any deploy test. If sleep mode misbehaves on the unified-memory host
 platform, revise the pin (F1 design §8 step 4 — park/reload is core functionality).
 
 ## 2. Checkpoint (pre-downloaded, read-only)
@@ -38,7 +38,7 @@ runtime_profiles:
     adapter: vllm
     launch:
       type: exec
-      command: ["$HOME/mllm-vllm-venv/bin/vllm", "serve"]
+      command: ["/home/<user>/mllm-vllm-venv/bin/vllm", "serve"]
       argument_contract: native
 ```
 
@@ -61,13 +61,13 @@ The opt-in deep-park lab profile additionally uses
 `--safetensors-load-strategy eager`, qualified on **host-a only** to reduce
 immediate wake-to-response to 7–9s. It needs about 8 GiB more temporary loading
 headroom than the default loader; stock/denied profiles remain unchanged.
-See [the optimization measurements and limits](spark-deep-wake-optimization.md).
+See [the optimization measurements and limits](deep-wake-optimization.md).
 The sleep profile requires both `--enable-sleep-mode` and
 `VLLM_SERVER_DEV_MODE=1`; stock launches explicitly set the latter to 0.
 Restoration calls `/wake_up`, then `/collective_rpc` with
 `{"method":"reload_weights"}`. Checkpoint reload has a 120s client timeout
 (the earlier default loader took 44–50s); sleep and wake retain 30s bounds. Full live results and
-the superseded 64 GiB memory recipe are in `spark-qualification-f1.md`.
+the superseded 64 GiB memory recipe are in `qualification-f1.md`.
 
 ## 5. Doctor capture (recipe freeze)
 

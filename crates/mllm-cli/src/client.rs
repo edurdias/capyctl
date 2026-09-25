@@ -1072,7 +1072,7 @@ mod tests {
     // T40
     #[test]
     fn the_latency_view_is_read_by_the_deployment_id_even_when_named() {
-        let view = json!({"id": "01M38MBH6X88H5YSYEWH1QSYZ7", "name": "s17-4-bn"});
+        let view = json!({"id": "01M38MBH6X88H5YSYEWH1QSYZ7", "name": "sb-4-bn"});
         assert_eq!(
             latency_path(&view).as_deref(),
             Some("/metrics/latency?deployment=01M38MBH6X88H5YSYEWH1QSYZ7")

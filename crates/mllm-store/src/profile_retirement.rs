@@ -100,7 +100,7 @@ fn candidates(
 /// Not while a retirement of it stands, nor when the host's approved
 /// publication exists and no longer carries the profile. Standalone's
 /// embedded host has no approved publication; its embedded publication
-/// (controller ruling I3) plays that part. A host with neither is judged by
+/// (review decision I3) plays that part. A host with neither is judged by
 /// retirements alone.
 pub(crate) fn profile_placeable(
     tx: &Transaction<'_>,
@@ -168,7 +168,7 @@ impl Store {
     }
 
     /// ADR 0018 §4, phase one, returning the key the retirement stands under.
-    /// Controller ruling I1: a retirement keeps the key it was first written
+    /// review decision I1: a retirement keeps the key it was first written
     /// under until it is cleared, so a retried request (under any key, from a
     /// CLI that lost its answer, a host that reconnected, or a server that
     /// restarted) resumes it rather than conflicting. A standing retirement
@@ -237,7 +237,7 @@ impl Store {
         Ok((key, start))
     }
 
-    /// ADR 0018 §4, §5 (controller rulings I2, I3): record the profiles
+    /// ADR 0018 §4, §5 (review decisions I2, I3): record the profiles
     /// standalone's embedded host publishes, the same rules as a server's
     /// publications. At `startup` the list is taken as it is (a server takes a
     /// host's startup publication the same way). Live, a profile the previous

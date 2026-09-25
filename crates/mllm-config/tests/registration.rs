@@ -286,7 +286,7 @@ fn profile_only_changes_are_recognised() {
     assert!(!only_profiles_differ(&old, &edited));
 }
 
-// T04 T37 (ADR 0018 §2; controller ruling C1): the CLI is the only writer of
+// T04 T37 (ADR 0018 §2; review decision C1): the CLI is the only writer of
 // engines.yaml and may run as root (`sudo mllm engine …`) under the system
 // units. A rewrite keeps the file's owner and mode, so the service user can
 // still read it; a new file is created for the owner the CLI names (the

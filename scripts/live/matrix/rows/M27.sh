@@ -2,9 +2,9 @@
 # M27 / M31 (T15, T16, T19, T22, T23; W10): request-driven switching on one host
 # under the tight budget (only one of the pair fits), A -> B -> A ... by requests
 # alone, with distinct models (I1 at every step):
-#   roles.sh host-doc host-a tight; roles.sh host-down host-a; roles.sh host-up host-a
-#   run_row.sh M27 --tag s14-s30 -- s92-14 s92-30 1 restart_only   (same engine, A restart_only)
-#   run_row.sh M31 --tag v14-s30 -- v92-14 s92-30 3 deep           (cross engine, deep, three cycles)
+#   roles.sh host-doc a tight; roles.sh host-down a; roles.sh host-up a
+#   run_row.sh M27 --tag s14-s30 -- sa-14 sa-30 1 restart_only   (same engine, A restart_only)
+#   run_row.sh M31 --tag v14-s30 -- va-14 sa-30 3 deep           (cross engine, deep, three cycles)
 #
 # Expected per switch: the request for the absent deployment waits in the queue
 # (no refusal), the incumbent's admission closes, it drains, then parks (deep) or
@@ -59,7 +59,7 @@ switch_row() {
   fi
   da=$fa${va:+-$va}
   # The derived wake placeholder (60 s + 5 s/GB) is below a measured SGLang
-  # disk reload on GB10 (q30: 61 GB in about 350 s, M27 2026-09-23), so B
+  # disk reload on unified-memory host (q30: 61 GB in about 350 s, M27 2026-09-23), so B
   # declares its wake timeout (a deployment setting, ADR 0014 A1).
   step variant-b variant "$fb" wk "${mem[@]}" --document-json '{"timeouts": {"wake": "900s"}}' || return 1
   db=$fb-wk
@@ -105,4 +105,4 @@ switch_row() {
   return "$rc"
 }
 
-row_main() { switch_row "${1:-s92-14}" "${2:-s92-30}" "${3:-1}" "${4:-restart_only}"; }
+row_main() { switch_row "${1:-sa-14}" "${2:-sa-30}" "${3:-1}" "${4:-restart_only}"; }

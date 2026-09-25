@@ -9,10 +9,10 @@
 > Retired 2026-09-23: `crates/mllm-cli/tests/live_sglang.rs` and the
 > `scripts/live/run-on-spark.sh` runner are deleted by owner decision (2026-09-22). The
 > SGL1–SGL3 gate is matrix row M73 on an SGLang fixture, driven through the shipped CLI
-> and roles; see `docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8.
+> and roles; see `docs/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8.
 > This plan is a historical record.
 
-**Spec:** `docs/superpowers/specs/2026-09-19-sglang-ordinary-launch-design.md`
+**Spec:** `docs/specs/2026-09-19-sglang-ordinary-launch-design.md`
 
 ## Global Constraints
 
@@ -24,7 +24,7 @@
 - Schema changes follow the migration pattern in `crates/mllm-store/src/migrations.rs` (`MIGRATIONS` array; one entry per version).
 - Prose in documents and commit messages is normal English. Test IDs cited as `// Txx` where an acceptance-matrix entry exists.
 - Core suite command: `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`. Clippy: `cargo clippy --all-targets -- -D warnings` over those crates.
-- Excluded files (do not read/edit/stage): `crates/mllm-cli/tests/live_interactive.rs`, `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`.
+- Excluded files (do not read/edit/stage): `crates/mllm-cli/tests/live_interactive.rs`, a local Task 2 implementation report.
 
 ## File Structure
 
@@ -189,7 +189,7 @@
 **Files:**
 - Create: `crates/mllm-cli/tests/live_sglang.rs` — scenarios: SGL1 launch (Ready), SGL2 one routed inference, SGL3 stop with group proven gone + memory returns. Pattern: `crates/mllm-cli/tests/live_vllm.rs`, env `MLLM_SGLANG_BIN` (venv `~/mllm-sglang-f2-venv/bin/sglang`), `MLLM_MODELS_ROOT=~/models`, engine `qwen3-4b-instruct`, SGLang 0.5.19.
 - Modify: `scripts/live/run-on-spark.sh` — build `live_sglang` too and run it after `live_vllm` (same pre-flight, one thread).
-- Modify: `docs/runbooks/spark-live-f2.md` — append the SGLang evidence entry from the template.
+- Modify: `docs/runbooks/live-f2.md` — append the SGLang evidence entry from the template.
 
 - [ ] **Step 1:** Implement the test file mirroring `live_vllm.rs` shapes (guarded by `MLLM_SGLANG_BIN` so CPU runs skip).
 - [ ] **Step 2:** `cargo test -p mllm-cli --test live_sglang` compiles and skips off-host.

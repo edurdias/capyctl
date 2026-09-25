@@ -8,8 +8,7 @@ Current phase: 0.1.0 release candidates on `main` (two-host, single-rank vLLM an
 SGLang; TP2 is parked). Releases are published as GitHub pre-releases in this
 private repository.
 
-This file is the working agreement for every coding agent. `AGENTS.md` imports it;
-edit this file, not a copy.
+This file is the working agreement for every contributor, human or coding agent.
 
 ## Authoritative documents
 
@@ -22,7 +21,8 @@ Read these in order when orienting. Lower entries never override higher ones.
    placement, engine configuration, per-instance lifecycle, revoked-host recovery,
    version skew).
 3. `docs/design/milestones/f2-sglang-design.md` — approved F2 design.
-4. `docs/superpowers/plans/` — per-slice implementation plans.
+4. `docs/plans/` — per-slice implementation plans. Feature design notes written
+   ahead of their plans live in `docs/specs/`.
 5. `docs/runbooks/f2-current-status.md` — **the single status authority.**
    What is done, what remains, what needs owner attention, what is queued next.
 
@@ -47,8 +47,8 @@ became harder to audit than the code they described.
   move the report to the slice's `archive/` directory.
 - **Prose is normal English**, in documents and commit messages, regardless of
   chat style settings.
-- Everything under `.superpowers/sdd/` is gitignored (`*`), so anything written
-  there is unrecoverable once removed. Archive rather than delete.
+- Local working notes (per-unit reports, review ledgers) are gitignored, so
+  anything written there is unrecoverable once removed. Archive rather than delete.
 
 ## Verification
 
@@ -75,12 +75,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
 
 ## Hard constraints
 
-- Live work is authorized on `host-a` and `host-b`. The local machine
-  `control-host` is the control-plane host. Owner authorized host-b on 2026-09-19.
+- Live work is authorized on the two lab hosts, host A and host B, with the
+  control-plane server on the control host. Their real names and addresses live
+  only in the untracked `scripts/live/matrix/hosts.local.env` (see
+  `hosts.example.env`). Owner authorized host B on 2026-09-19.
 - Do not change engine environments, drivers, or reboot hosts. The only owner
-  exceptions are the existing SGLang 0.5.20 venv on both Sparks and the mirrored
-  vLLM 0.29 venv on host-b; do not create or modify others.
-- Only one agent runs live work on the Sparks at a time.
+  exceptions are the existing SGLang 0.5.20 venv on both hosts and the mirrored
+  vLLM 0.29 venv on host B; do not create or modify others.
+- Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to mllm-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change
   firewalls or interfaces.

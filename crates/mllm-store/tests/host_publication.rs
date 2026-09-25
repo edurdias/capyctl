@@ -236,7 +236,7 @@ fn a_confirmed_retirement_outlives_its_deadline_until_the_profile_is_dropped() {
     assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
 }
 
-// T32 T33 (ADR 0018 §4, controller ruling): any accepted publication clears
+// T32 T33 (ADR 0018 §4, review decision): any accepted publication clears
 // the host's confirmed retirements for profiles it no longer lists, the
 // startup publication as well as a live one. A confirmed retirement survives a
 // host restart only while the startup publication still lists the profile.
@@ -270,7 +270,7 @@ fn a_startup_publication_clears_confirmed_retirements_only_for_dropped_profiles(
     assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
 }
 
-// T32 (ADR 0018 §4, controller ruling I1): a retirement's key is the one it
+// T32 (ADR 0018 §4, review decision I1): a retirement's key is the one it
 // was first written under until the retirement is cleared, so a retried
 // `engine remove` (a new request, a new key) resumes it instead of conflicting.
 #[test]
@@ -302,7 +302,7 @@ fn a_retried_retirement_resumes_under_the_standing_key() {
     assert_eq!((standing.as_str(), state.as_str()), ("first", "confirmed"));
 }
 
-// T32 T33 (ADR 0018 §4, controller ruling I1): a live re-publication clears
+// T32 T33 (ADR 0018 §4, review decision I1): a live re-publication clears
 // the confirmed retirement of every profile it does not list, not only of
 // the profiles it drops, as the startup publication does.
 #[test]
@@ -329,7 +329,7 @@ fn a_live_republication_clears_every_confirmed_retirement_it_does_not_list() {
     assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
 }
 
-// T16 T32 T33 (ADR 0018 §4, §5; controller rulings I2, I3): standalone's
+// T16 T32 T33 (ADR 0018 §4, §5; review decisions I2, I3): standalone's
 // embedded host publishes under the server's rules. Live, a profile leaves
 // the list only with a confirmed retirement, which the update then clears; a
 // startup list is taken as it is and clears unlisted confirmed retirements.

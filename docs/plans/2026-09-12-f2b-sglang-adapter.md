@@ -6,7 +6,7 @@
 
 **Tech Stack:** Existing Rust adapters/reqwest/Axum test servers; a small protected Python entrypoint for the pinned SGLang server; existing launcher supervision. No engine installation in deterministic implementation tasks.
 
-**Spec:** [F2 design](../../design/milestones/f2-sglang-design.md), §§3/6 and Q11; [A2d coordinator](2026-09-12-f2a2d-coordinator-integration.md), [A3 management](2026-09-12-f2a3-management-and-configuration.md), and F2C live qualification.
+**Spec:** [F2 design](../design/milestones/f2-sglang-design.md), §§3/6 and Q11; [A2d coordinator](2026-09-12-f2a2d-coordinator-integration.md), [A3 management](2026-09-12-f2a3-management-and-configuration.md), and F2C live qualification.
 
 ## Global Constraints
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a Spark runtime directory before any engine launch (plan unit W2).
+"""Verify a host runtime directory before any engine launch (plan unit W2).
 
 The protected SGLang and vLLM entries refuse a wrapper that others can write,
 or whose ancestors others can write; Phase B found mllm_vllm_guard.py at 0664.

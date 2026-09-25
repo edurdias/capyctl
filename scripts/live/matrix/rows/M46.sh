@@ -1,9 +1,9 @@
 # shellcheck shell=bash
-# M46 (T15, T27): tight host; operator activates s17-30 and s17-14 at once:
+# M46 (T15, T27): tight host; operator activates sb-30 and sb-14 at once:
 # exactly one arms; the other is denied or queued; no double charge.
-#   run_row.sh M46 -- s17-30 s17-14    (host-b on the tight policy)
+#   run_row.sh M46 -- sb-30 sb-14    (host-b on the tight policy)
 row_main() {
-  local a=${1:-s17-30} b=${2:-s17-14} host rc=0
+  local a=${1:-sb-30} b=${2:-sb-14} host rc=0
   host=$(fixture_host "$a")
   step before host_idle "$host" || return 1
   step deploy-a deploy "$a" || return 1

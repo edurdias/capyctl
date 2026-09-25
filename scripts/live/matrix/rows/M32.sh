@@ -2,18 +2,18 @@
 # M32 (T23, T26): `max_parked` is enforced by stopping the least recently parked
 # instance on that host, never ready work. Tight budget on host-a
 # (`max_parked: 1`):
-#   roles.sh host-doc host-a tight; roles.sh host-down host-a; roles.sh host-up host-a
+#   roles.sh host-doc a tight; roles.sh host-down a; roles.sh host-up a
 #   run_row.sh M32
 #
-# Expected: A (v92-4) Ready then parked; B (s92-4) Ready then parked, which exceeds
+# Expected: A (va-4) Ready then parked; B (sa-4) Ready then parked, which exceeds
 # max_parked 1 on the host, so A (least recently parked) is stopped with verified
 # cleanup (identities gone, charge released) while B stays parked with its processes
 # alive; a request to B wakes it on demand; a request to A starts it cold (a new
 # generation), both then serving; stop both with verified cleanup; delete both.
 
 row_main() {
-  local host=host-a a=v92-4 b=s92-4 rc=0
-  [ "${POLICY_92:-}" = tight ] || dry || { echo "host-a is not on the tight policy (POLICY_92=${POLICY_92:-unset})"; return 1; }
+  local host=$HOST_A a=va-4 b=sa-4 rc=0
+  [ "${POLICY_a:-}" = tight ] || dry || { echo "$HOST_A is not on the tight policy (POLICY_a=${POLICY_a:-unset})"; return 1; }
   step before host_idle "$host" || return 1
 
   step deploy-a deploy "$a" --activate --wait || return 1

@@ -2,7 +2,7 @@
 # ENG3 (ADR 0018 §4): removing a published profile is refused while a
 # deployment uses it, then --drain stops it through the ordinary path and
 # removes the profile only on stop evidence:
-#   run_row.sh ENG3 --tag 92 -- host-a v92-4
+#   run_row.sh ENG3 --tag a -- a va-4
 #
 # Expected:
 #   a  engine remove vllm while the deployment is Ready exits 20 naming it;
@@ -16,7 +16,7 @@
 
 row_main() {
   local host vfix=$2 dep rc=0
-  host=$1; dep=$vfix
+  host=$(resolve_host "$1") || return 1; dep=$vfix
   step before host_idle "$host" || return 1
   step bare-systemd eng_bare_systemd "$host" || return 1
   step add-vllm eng_add "$host" "$(vllm_venv "$host")/bin/vllm" || return 1

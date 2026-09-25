@@ -26,7 +26,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CAPACITY = 130_663_170_048  # reported GB10 capacity, both hosts (matrix section 3)
+CAPACITY = 130_663_170_048  # reported unified-memory host capacity, both hosts (matrix section 3)
 GIB = 1 << 30
 PARKED_LIMIT = 32_665_792_500  # Phase B host documents
 HOST_KV_LIMIT = 13_066_317_000

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M16 (T08, T22; G17): model smoke, one fixture per invocation, e.g.
-#   run_row.sh M16 --tag s92-14 -- s92-14
-#   FIXTURE_VARIANT=v1 run_row.sh M16 --tag s92-27f-v1 -- s92-27f   (variant or rerun: deployment s92-27f-v1)
+#   run_row.sh M16 --tag sa-14 -- sa-14
+#   FIXTURE_VARIANT=v1 run_row.sh M16 --tag sa-27f-v1 -- sa-27f   (variant or rerun: deployment sa-27f-v1)
 # Expected: Ready and correct, or a recorded engine incompatibility (not a pass).
 #
 # Evidence beyond E0: Ready time; the checkpoint digest row (first full hash,
@@ -60,7 +60,7 @@ metrics_probe() {
 # accounting, engine_errors and cleanup_check live in rowlib.sh (shared with M38, M73, M74).
 
 row_main() {
-  local fix=${1:?fixture name, e.g. s92-14} dep host rc=0
+  local fix=${1:?fixture name, e.g. sa-14} dep host rc=0
   dep=$fix${FIXTURE_VARIANT:+-$FIXTURE_VARIANT}
   host=$(fixture_host "$fix")
   cp "$(fixture_file "$fix")" "$EVID/fixture.json"

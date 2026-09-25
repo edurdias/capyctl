@@ -1,9 +1,9 @@
 # shellcheck shell=bash
-# M47 (T30; U5-G1): stop s92-14 during Initialize: cleanup verified, release
+# M47 (T30; U5-G1): stop sa-14 during Initialize: cleanup verified, release
 # only after absence proof.
-#   run_row.sh M47 -- s92-14
+#   run_row.sh M47 -- sa-14
 row_main() {
-  local fix=${1:-s92-14} host rc=0
+  local fix=${1:-sa-14} host rc=0
   host=$(fixture_host "$fix")
   step before host_idle "$host" || return 1
   step deploy deploy "$fix" --activate || return 1

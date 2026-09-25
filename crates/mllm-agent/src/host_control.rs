@@ -1,7 +1,7 @@
 //! ADR 0018 §3, §4: the host's answers to `mllm engine add`, `remove` and
 //! `list` over the control socket. Add re-reads host.yaml merged with its
 //! engines.yaml and publishes it live; remove retires the profile on the
-//! server and answers once the server confirmed it. Controller ruling C1: the
+//! server and answers once the server confirmed it. review decision C1: the
 //! role never writes engines.yaml (under the system units `/etc` is read-only
 //! to it); the CLI writes it after the confirmation, then asks for the reload
 //! that publishes the removal. Nothing here reaches an engine.
@@ -196,7 +196,7 @@ impl HostControl {
                 "agent_unreachable",
                 "the host has no control session; nothing was removed",
             ),
-            // Controller ruling I4: the request may have reached the server.
+            // review decision I4: the request may have reached the server.
             RetireOutcome::SessionEnded => refused(
                 "agent_unreachable",
                 format!("the control session ended, or the server did not answer in time, before the retirement of {profile} was confirmed; the outcome is unknown: run `mllm engine list`, and `mllm engine remove {profile}` again to finish (a retry resumes the same removal)"),

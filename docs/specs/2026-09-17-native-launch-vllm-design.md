@@ -518,7 +518,7 @@ running on the Fake through the testkit. They are a pre-check and never count as
 > are matrix rows driven through the shipped CLI and roles: L1–L5 and L11 are M73, L6–L8
 > are M38, L9 is M74 (the readiness bound is now the deployment's `timeouts.initialize`),
 > L10 is M75 plus `scripts/check-release-clean.sh` in `scripts/live/matrix/sync.sh build`
-> (`docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8). The text
+> (`docs/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8). The text
 > below is kept as the design record.
 
 `crates/mllm-cli/tests/live_vllm.rs`, gated on `MLLM_LIVE=1`, release build,
@@ -549,7 +549,7 @@ host name is fixed to `host-a`; any other is refused, and `host-b` is never
 contacted. A pre-flight refuses to start when another engine process is already on the
 box and prints what it found. Nothing is killed by name.
 
-Evidence goes in one hardware runbook for all slices, `docs/runbooks/spark-live-f2.md`:
+Evidence goes in one hardware runbook for all slices, `docs/runbooks/live-f2.md`:
 commit, vLLM version, model, commands, scenario results, timings, memory samples and
 failures. `docs/runbooks/f2-current-status.md` stays the single status authority and
 links to it. Raw logs stay out of git.

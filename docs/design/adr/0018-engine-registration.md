@@ -6,7 +6,7 @@
 never rewritten).
 **Related:** ADR 0008 (engine installations, fingerprints, capability probes), ADR 0012
 (deep parking default-on), ADR 0017 (capability gating). Design:
-`docs/superpowers/specs/2026-09-25-engine-registration-design.md`.
+`docs/specs/2026-09-25-engine-registration-design.md`.
 
 ## Context
 
@@ -61,7 +61,7 @@ refused before anything is written. `engine remove` removes only registered prof
 declared in the role document stays the operator's to edit.
 
 The `mllm engine` CLI is the only writer of `engines.yaml`; a running role only reads it
-(controller ruling C1, 2026-09-25). A rewrite keeps the file's owner and mode. When the CLI
+(review decision C1, 2026-09-25). A rewrite keeps the file's owner and mode. When the CLI
 runs as root (`sudo mllm engine …` under the system units) and creates the file, it creates it
 and its lock for the owner of the role's state directory (the service user), mode 0600, so the
 role can read it and a read-only `/etc` (`ProtectSystem=strict`) never blocks the role.
@@ -163,7 +163,7 @@ refused (`profile_not_published`) for that deployment.
   `engines.yaml` is visible in that host's `mllm engine list`.
 - The role never needs write access to its configuration directory: under the system units
   `/etc/mllm` stays read-only to it, and the operator runs `sudo mllm engine … --config
-  /etc/mllm/host.yaml` (controller ruling C1). The CLI runs the version check and the
+  /etc/mllm/host.yaml` (review decision C1). The CLI runs the version check and the
   deep-park probe of a named installation as the user that invoked it, root in that case.
 - A crash between a confirmed retirement and the CLI's write leaves the profile in
   `engines.yaml` while the server keeps it out of placement; running `engine remove` again

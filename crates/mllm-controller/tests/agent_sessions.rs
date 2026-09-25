@@ -1375,7 +1375,7 @@ fn launch_command(
     launch
 }
 
-/// M16 live run 2026-09-23 (host-a, s92-27): the SGLang entry refused its
+/// M16 live run 2026-09-23 (host-a, sa-27): the SGLang entry refused its
 /// server arguments and exited within seconds. The host reported the launch
 /// with every process gone, but the controller waited for a usable or released
 /// result until the 15-minute Initialize deadline, holding the single

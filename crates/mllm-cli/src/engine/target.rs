@@ -30,7 +30,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
     }
 }
 
-/// ADR 0018 §2 (controller ruling 2026-09-25): the role document a command
+/// ADR 0018 §2 (review decision 2026-09-25): the role document a command
 /// names: `--config`, else `$MLLM_CONFIG`. `mllm engine` and the roles (`start
 /// host`, `join host`, `start standalone`) share this rule, so they agree on
 /// the document and on the engines file beside it.
@@ -56,7 +56,7 @@ pub fn role_engines(named: Option<&Path>, env: &dyn Fn(&str) -> Option<String>) 
 /// The role document: `--config`; else `$MLLM_CONFIG`; else
 /// `<config home>/mllm/host.yaml` if it exists; else
 /// `<state_dir>/config/standalone.yaml`. Both implicit documents present is
-/// ambiguous and refused. Neither present is the first run (controller ruling
+/// ambiguous and refused. Neither present is the first run (review decision
 /// 2026-09-25): standalone, whose document `mllm start standalone` generates,
 /// and whose engines file is the one that start reads.
 pub fn resolve_target(

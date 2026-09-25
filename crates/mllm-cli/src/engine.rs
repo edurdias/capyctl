@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const ADD_REPLY: Duration = Duration::from_secs(60);
-/// Controller ruling I4: how long `remove` waits for the role. The role
+/// review decision I4: how long `remove` waits for the role. The role
 /// answers a retirement within its own bound (`RETIRE_BOUND`, 960 s, which
 /// covers the server's 900 s drain window); this adds a clear margin for the
 /// role's measuring and the socket, so the CLI does not give up on a role
@@ -190,7 +190,7 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
     let fingerprint = mllm_agent::installation::InstallationMeasurer::new()
         .measure(resolved.engine, &resolved.executable)
         .ok();
-    // Controller ruling 2026-09-25: `engine add` before any role has started
+    // review decision 2026-09-25: `engine add` before any role has started
     // is the first run. The state root the role will use is created
     // owner-only, as the role creates it, so the probe has somewhere private
     // to work; engines.yaml is written and the role picks it up at start.
@@ -439,11 +439,11 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
     )
 }
 
-/// ADR 0018 §4 (controller ruling C1): the CLI is the only writer of
+/// ADR 0018 §4 (review decision C1): the CLI is the only writer of
 /// engines.yaml. Remove asks the running role to retire the profile, waits
 /// for the confirmation, then writes engines.yaml without it and asks the
 /// role to reload, which publishes the removal. A retry after any failure
-/// resumes the same retirement (controller ruling I1), so a crash between the
+/// resumes the same retirement (review decision I1), so a crash between the
 /// confirmation and the write is finished by running remove again.
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
     if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name) {
@@ -489,7 +489,7 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             }
             return Err(error(closed(reply["code"].as_str().unwrap_or("")), message));
         }
-        // Controller ruling I4: the role took the request and may have
+        // review decision I4: the role took the request and may have
         // acted on it; only `engine list` can say what happened.
         Err(ClientError::Unanswered(e)) => return Err(unknown_outcome(&e, name)),
         Err(_) if !registered => return Err(not_registered()),
@@ -548,7 +548,7 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
     }
 }
 
-/// Controller ruling C1: who the role runs as, when this CLI is root and the
+/// review decision C1: who the role runs as, when this CLI is root and the
 /// role's state directory belongs to another user: a new engines.yaml goes to
 /// that user so the role can read it. `None` otherwise (the writer owns it).
 fn service_owner(target: &Target) -> Option<(u32, u32)> {
@@ -569,7 +569,7 @@ fn write_without(target: &Target, name: &str) -> Result<u64, mllm_config::Config
     write_engines(&engines, &lock, None)
 }
 
-/// Controller ruling I4: a remove the role took but never answered.
+/// review decision I4: a remove the role took but never answered.
 fn unknown_outcome(cause: &str, name: &str) -> StructuredError {
     error(
         "agent_unreachable",
@@ -585,7 +585,7 @@ fn unknown_outcome(cause: &str, name: &str) -> StructuredError {
 mod tests {
     use super::*;
 
-    // T37 (controller ruling I4): the CLI's bound on `remove` outlasts the
+    // T37 (review decision I4): the CLI's bound on `remove` outlasts the
     // role's own bound on a retirement by a clear margin, so a drain that runs
     // close to its bound is answered, not reported as lost.
     #[test]

@@ -29,7 +29,7 @@ pub enum ControlRequest {
     /// Retire a published profile on the server (phase one of `engine
     /// remove`). The role writes nothing; the CLI rewrites engines.yaml once
     /// this is confirmed and then sends `Add` to publish the removal
-    /// (controller ruling C1).
+    /// (review decision C1).
     Remove { profile: String, drain: bool },
     /// Report what the role has published and what uses it.
     List,
@@ -130,7 +130,7 @@ fn own_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// ADR 0018 §3 (controller ruling C1): the role serves the user id running
+/// ADR 0018 §3 (review decision C1): the role serves the user id running
 /// it and root. Under the system units the operator runs `sudo mllm engine
 /// …`; root can already read and write everything the role owns, so
 /// admitting it widens nothing.
@@ -138,7 +138,7 @@ fn peer_admitted(peer: u32, expected: u32) -> bool {
     peer == expected || peer == 0
 }
 
-/// ADR 0018 §3 (controller ruling C1): a client speaks to a socket served by
+/// ADR 0018 §3 (review decision C1): a client speaks to a socket served by
 /// its own user id. Root (`sudo mllm engine …`) speaks to the role's service
 /// user instead: the owner of the private (0700) directory holding the socket,
 /// which is the role's state directory; no other user could have bound there.
@@ -315,7 +315,7 @@ async fn serve_one(stream: tokio::net::UnixStream, handler: Arc<dyn ControlHandl
 pub enum ClientError {
     /// The request never reached a role: nothing was asked.
     Unreachable(String),
-    /// Controller ruling I4: the role took the request, then gave no usable
+    /// review decision I4: the role took the request, then gave no usable
     /// answer (it closed the connection, answered something that is not a
     /// reply, or the bound passed). What it did is unknown.
     Unanswered(String),
@@ -399,7 +399,7 @@ pub async fn request(
 mod tests {
     use super::*;
 
-    // T37 (ADR 0018 §3; controller ruling C1): `sudo mllm engine …` reaches
+    // T37 (ADR 0018 §3; review decision C1): `sudo mllm engine …` reaches
     // the role running as its service user; no one else does, and root never
     // trusts a socket in a directory another user could have bound in.
     #[test]

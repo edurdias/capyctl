@@ -1177,7 +1177,7 @@ async fn start_standalone_inner(
             .publish_resource_policy(&declared_host, &observations)
             .map_err(|error| StartError::Deploy(error.to_string()))?;
     }
-    // ADR 0018 §4, §5 (controller rulings I2, I3): standalone keeps a removed
+    // ADR 0018 §4, §5 (review decisions I2, I3): standalone keeps a removed
     // profile out of placement and never lets an abandoned retirement wedge a
     // name, as a server does: expiry at start and while running, and the
     // embedded host's profiles recorded as its publication.

@@ -6,7 +6,7 @@
 
 **Tech Stack:** Existing Rust 2021 workspace, Tokio, rusqlite, async-trait, serde, thiserror, ulid, Axum, reqwest, and Unix process supervision. Reuse workspace dependencies. Use the existing nix dependency with its `fs` feature for the lifetime file lock.
 
-**Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3–7 and Q1–Q8. Read and implement [A1](2026-09-12-f2a1-resource-contracts-and-admission.md), [A2a](2026-09-12-f2a2a-durable-reservation-transactions.md), [A2b](2026-09-12-f2a2b-runtime-evidence.md), and [A2c](2026-09-12-f2a2c-durable-dispatch-ownership.md) first. The amendments below supersede their disconnected primitive interfaces at production cutover.
+**Spec:** [Approved F2 design](../design/milestones/f2-sglang-design.md), §§3–7 and Q1–Q8. Read and implement [A1](2026-09-12-f2a1-resource-contracts-and-admission.md), [A2a](2026-09-12-f2a2a-durable-reservation-transactions.md), [A2b](2026-09-12-f2a2b-runtime-evidence.md), and [A2c](2026-09-12-f2a2c-durable-dispatch-ownership.md) first. The amendments below supersede their disconnected primitive interfaces at production cutover.
 
 ## Global Constraints
 
@@ -936,4 +936,4 @@ This is an implementation plan, not implemented product code. Planning checks
 cover the DDL, selected pure safety helpers, file links, and inline review of
 transaction/identity boundaries. The full coordinator, launcher, adapter, router,
 and failure-injection tests listed above must be written and executed during
-implementation. No live engine, GPU, or Spark access is part of this record.
+implementation. No live engine, GPU, or host access is part of this record.

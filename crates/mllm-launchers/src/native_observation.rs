@@ -50,7 +50,7 @@ fn staged(stage: &'static str) -> ObservationError {
 /// of those expected, the time since the observation began against its budget,
 /// and whether the enrolled scheduler was still alive afterwards. Counts and
 /// times only, never a path, key, proof or engine output. Found live
-/// 2026-09-24 (rc.2, M28 s92-14): a park was refused at `receive_header` and
+/// 2026-09-24 (rc.2, M28 sa-14): a park was refused at `receive_header` and
 /// the bare stage could not tell a slow scheduler from a closed connection.
 fn staged_io(stage: &'static str, failure: Failure<'_>) -> ObservationError {
     let (cause, errno) = match failure.cause {

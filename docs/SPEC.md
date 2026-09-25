@@ -11,7 +11,7 @@
 
 ## How to use this specification
 
-Read sections 1–5 for the product boundary, sections 6–13 for behavior and safety, and sections 14–19 for interfaces, configuration, and delivery. Section 20 defines acceptance tests. `AGENTS.md` is the companion entry point for a coding agent; this document is authoritative when summaries differ.
+Read sections 1–5 for the product boundary, sections 6–13 for behavior and safety, and sections 14–19 for interfaces, configuration, and delivery. Section 20 defines acceptance tests. `AGENTS.md` is the companion working agreement for contributors; this document is authoritative when summaries differ.
 
 **MUST / MUST NOT** identify required behavior. **SHOULD** identifies a recommended default that may be changed with a documented architectural decision. Implementation language, internal libraries, numeric default tuning, and the illustrative YAML field names are baseline proposals, not claims of separately approved implementation details. The requirements and ownership boundaries are the established direction.
 
@@ -931,7 +931,7 @@ Added standalone/remote role boundaries, per-host agents and head-only ingress, 
 
 ### Sources
 
-Original project source: Eduardo's `mllm-initial-design.md` revision 0.1 and the subsequent design decisions in this conversation. Primary documentation below was inspected on September 10, 2026. It is live/unversioned documentation; implementing agents must recheck against pinned builds. No inference was executed on the user's machines during preparation of this handoff.
+Original project source: the owner's `mllm-initial-design.md` revision 0.1 and the design decisions that followed it. Primary documentation below was inspected on September 10, 2026. It is live/unversioned documentation; implementers must recheck against pinned builds. No inference was executed on the owner's machines while this specification was prepared.
 
 - **[S1]** vLLM, Sleep Mode — levels, startup prerequisites, explicit restoration: <https://docs.vllm.ai/en/latest/features/sleep_mode/>.
 - **[S2]** vLLM, Security — development-mode warning and endpoint exposure: <https://docs.vllm.ai/en/latest/usage/security/>.

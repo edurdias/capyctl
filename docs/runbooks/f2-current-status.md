@@ -21,7 +21,7 @@ on the exit code for `profile_not_published` (plan item 20): fail-fast, HTTP
 409, CLI exit 24 — the next free exit number, following the accepted 16–23
 pattern for the other engine-registration codes.
 
-Final review (`.superpowers/sdd/2026-09-25-engine-registration/final-review.md`,
+Final review (local review notes,
 range `612ed0d..dc1a426`): 1 Critical and 5 Important findings, plus 12
 minors; verdict was not ready until fixed, plus live ENG1–ENG4. A fix wave
 (`dc1a426..e7565c1`) addressed the Critical — the role no longer writes
@@ -32,7 +32,7 @@ instead of conflicting, standalone expiry and placement exclusion via store
 v36, and an unanswered remove reported as an unknown outcome instead of
 "nothing was removed", plus formatting drift and flaky environment-variable
 tests. A re-review
-(`.superpowers/sdd/2026-09-25-engine-registration/final-rereview.md`) read the
+(local review notes) read the
 fix diff against every finding and ruling and confirmed C1 and I1–I4 fixed
 with no new Critical or Important breakage; I5 (the live rows) stays open by
 ruling. This session's pass fixed the re-review's Minor 1: a root CLI opening
@@ -42,8 +42,7 @@ refused unless they are a regular file with one link owned by root or the
 state-dir owner, checked before any `fchown`, with a regression test that
 fails against the prior code.
 
-Controller rulings from the plan's decision ledger
-(`.superpowers/sdd/2026-09-25-engine-registration/progress.md`):
+Decisions from the plan's local decision record:
 
 - No pre-flight cross-task conflict scan; the owner removed per-task review for
   speed, and the plan's self-review checked type consistency.
@@ -99,7 +98,7 @@ Controller rulings from the plan's decision ledger
   margin over the role's 960 s plus the drain timeout.
 - (I5) Live rows ENG1–ENG4 ran on 2026-09-25 (below).
 
-Live rows ENG1–ENG4, 2026-09-25. Host A is the first Spark, host B the
+Live rows ENG1–ENG4, 2026-09-25. Host A is the first host, host B the
 second; the server runs on the control-plane host. The branch was built from
 the synced tree on all three machines, and only the existing vLLM 0.29.0 and
 SGLang 0.5.20 environments were used. Evidence (local, not committed):
@@ -108,7 +107,7 @@ SGLang 0.5.20 environments were used. Evidence (local, not committed):
 | Row | Live verdict |
 |---|---|
 | ENG1, host A and host B | pass on both. `engine detect` with no `--path` listed both home-level environments from metadata. The host ran under a transient systemd user unit with a document that declares no profiles. `engine add` of each environment exited 0, `published`, `custom: false`: vLLM in 12.2 s and 12.8 s, SGLang in 7.3 s. These times are the whole command, including the bounded version check and the deep-park probe; the plan's "within 10 s" is not met for vLLM, whose version check alone takes several seconds. `host.yaml` was byte-identical afterwards (`sha256sum -c` OK), and `engines.yaml` reached revision 2. `list engines` on the server showed both profiles. v\*-4 and s\*-4 on the new profiles reached Ready, answered 42, stopped with verified cleanup and were deleted |
-| ENG3, host A | pass. With v92-4 Ready, `engine remove vllm` was refused `profile_in_use`, naming v92-4; the deployment stayed Ready and answered. `engine remove vllm --drain` returned in 1.2 s (`removed: vllm`, revision 2); the deployment was stopped with verified cleanup. `list engines` no longer showed vllm. `start --wait` was refused `host_ineligible` ("no approved configuration carries a runtime profile whose build it reported"). `engine add` published the profile again (revision 3) |
+| ENG3, host A | pass. With va-4 Ready, `engine remove vllm` was refused `profile_in_use`, naming va-4; the deployment stayed Ready and answered. `engine remove vllm --drain` returned in 1.2 s (`removed: vllm`, revision 2); the deployment was stopped with verified cleanup. `list engines` no longer showed vllm. `start --wait` was refused `host_ineligible` ("no approved configuration carries a runtime profile whose build it reported"). `engine add` published the profile again (revision 3) |
 | ENG2, host A (standalone, both variables set) | pass after the fix below. `engine list` shows `local-vllm` and `local-sglang`, `published`, `source: environment`. `engine remove local-vllm` is refused `invalid_config` (environment profile). A deployment on `local-vllm` served: its argv carries the host-fixed `--max-model-len 4096`. A deployment that also states `context_length` is refused `invalid_config` ("the installation's host-fixed args already set `--max-model-len`"). A deployment on `local-sglang` served. `engine add --name vllm-reg` of the same vLLM environment was published beside them. See also the registered-profile check below |
 | ENG4, host B | pass. An rc.3 agent was online (`supported`) with the new server. The new CLI's `engine add` exited `agent_unreachable` and wrote `engines.yaml` (revision 1). After a restart the rc.3 agent still published nothing from that file. After an upgrade to the new binary, the host published `vllm` at start. Against an rc.3 server, a new agent's `engine add` answered `published: restart_required`, and after a host restart the rc.3 server listed `vllm` for the host |
 
@@ -197,7 +196,7 @@ Open items:
 
 ## Release candidate 0.1.0-rc.4 — build and live pass, 2026-09-25 (branch `docs/rc4-live-evidence`)
 
-Host names in this section: host A is the first Spark, host B the second (the
+Host names in this section: host A is the first host, host B the second (the
 tight-policy host); the control-plane host runs the server. Evidence (local,
 not committed): `target/live/rc4/`.
 
@@ -237,13 +236,13 @@ environments.
 
 | Check | Live verdict |
 |---|---|
-| a. M73 v92-4, s92-4 | pass. Both engines launched from the managed runtime, listening on loopback only (refused from off-host). Unkeyed engine and control routes returned 401; the router refused unkeyed callers (401) and has no `/metrics` path (404). The answer was correct and the stream well-formed. Stop cleaned up with verification. The restart made a new binding with no reused PID. MemAvailable came back within 0.31 GiB |
+| a. M73 va-4, sa-4 | pass. Both engines launched from the managed runtime, listening on loopback only (refused from off-host). Unkeyed engine and control routes returned 401; the router refused unkeyed callers (401) and has no `/metrics` path (404). The answer was correct and the stream well-formed. Stop cleaned up with verification. The restart made a new binding with no reused PID. MemAvailable came back within 0.31 GiB |
 | b. Standalone vLLM, generated deployment (#29) | pass on host A, `mllm start standalone` under the packaged standalone unit. The deployment document came from the product's own template (`standalone_config::deployment_document`, deep parking on), which gave `residency: deep` and `--enable-sleep-mode`. Two park/wake cycles: each park settled `parked` in about 2 s and released 20.2–20.5 GiB of the 25.2 GiB Ready drop (80–82%, MemAvailable). The same two processes kept their PIDs and start ticks. A routed request woke the deployment in 8.8 s with the right answer, still at generation 1. A `systemctl --user stop`/`start` of the unit re-attached the running engine. `delete deployment --stop` cleaned up |
 | c. `drain host` with `request_deadline: 600s` (#28) | pass on host B. Status showed `request_deadline_ms` 600000. The drain returned `drained: true` with the instance `stopped` and cleanup `verified`, in 1.1 s with nothing refused. Cleanup was verified with no engine, GPU process or port left. The next request reactivated the deployment on demand (20 s, answer correct). Before #28 this drain was refused `LifecycleConflict` |
 | d. Refusals (#18) | pass. After an operator stop, a routed request got 409 `deployment_stopped`, and the message names `mllm start deployment <id>`. Host B then ran rc.1 under its unit on the rc.4-written state, and the server listed it `upgrade_required` ("reports no version"). `start deployment`, `start --evict` and `start --wait` were each refused `host_ineligible`, CLI exit 15. The message names the host, "host version unreported, server version 0.1.0-rc.4" and the reason. The deployment stayed stopped. Reinstalling rc.4 made host B `supported`, and the start served |
-| e. Two-instance `start --evict --wait` on tight host B (#18) | pass. Incumbent v17-14 (46 GiB) was Ready and v17-4 with 2 instances (2 × 24 GiB) was deployed. `start --evict --wait` exited 0 in 22.6 s with both instances Ready. Its receipt names the one victim (`v17-14/0`), which was parked, not stopped: the tight host allows one parked deployment. Both requests were answered. An earlier run first tried a plain `start --wait`: instance 0 fit next to the incumbent, instance 1 did not, and after the 900 s start deadline it exited 4 (`insufficient_resources` … "the start is partial") with instance 0 left Ready. That matches SPEC §14 |
-| f. `revoke host` under the packaged unit (#17) | pass on host A with v92-4 Ready. The revoke answered `engines: retained`. The agent logged one `error [host_revoked]` line naming both recovery commands. systemd recorded `status=14`, `Result=exit-code`, `NRestarts=0`, and the unit was still failed 20 s later (not restarted). All three engine identities stayed alive, and dispatch returned 503. Then `invite host <id> --recover` and `join host --recover` (same host id, `recovered: true`) and a unit start: online, Ready, the same three PIDs and start ticks (re-proven, not relaunched), and served |
-| g. M28 s92-14 SGLang park/wake ×3 | pass 3 of 3. Each run released 88.7–88.9% of the Ready drop with the same four processes, woke on request in 182–219 s (disk reload), and matched I1 exactly (max logprob delta 0.0). The host journal for the run has 0 `native_observation_*` or `saver_observation_*` lines, including the new `native_observation_slow` |
+| e. Two-instance `start --evict --wait` on tight host B (#18) | pass. Incumbent vb-14 (46 GiB) was Ready and vb-4 with 2 instances (2 × 24 GiB) was deployed. `start --evict --wait` exited 0 in 22.6 s with both instances Ready. Its receipt names the one victim (`vb-14/0`), which was parked, not stopped: the tight host allows one parked deployment. Both requests were answered. An earlier run first tried a plain `start --wait`: instance 0 fit next to the incumbent, instance 1 did not, and after the 900 s start deadline it exited 4 (`insufficient_resources` … "the start is partial") with instance 0 left Ready. That matches SPEC §14 |
+| f. `revoke host` under the packaged unit (#17) | pass on host A with va-4 Ready. The revoke answered `engines: retained`. The agent logged one `error [host_revoked]` line naming both recovery commands. systemd recorded `status=14`, `Result=exit-code`, `NRestarts=0`, and the unit was still failed 20 s later (not restarted). All three engine identities stayed alive, and dispatch returned 503. Then `invite host <id> --recover` and `join host --recover` (same host id, `recovered: true`) and a unit start: online, Ready, the same three PIDs and start ticks (re-proven, not relaunched), and served |
+| g. M28 sa-14 SGLang park/wake ×3 | pass 3 of 3. Each run released 88.7–88.9% of the Ready drop with the same four processes, woke on request in 182–219 s (disk reload), and matched I1 exactly (max logprob delta 0.0). The host journal for the run has 0 `native_observation_*` or `saver_observation_*` lines, including the new `native_observation_slow` |
 
 Scratch rows used for c–f (`DRAIN600`, `EVICT2`, `EVICT2D`, `SKEWD`, `SKEWX`,
 `REVOKE`) are kept with the evidence under `target/live/rc4/rows/`, and run
@@ -307,7 +306,7 @@ CPU-only test fix; nothing here is live-proven or qualifies an engine recipe.
   engine) and 0 of 20 after, with no new leaks.
 
 Owner decisions 2026-09-25, both implemented; CPU and Fake-engine tests only, not
-live-proven on the Sparks.
+live-proven on the hosts.
 
 - A start that places nothing because no allowed host is eligible (drain-only
   after version skew, draining, revoked, offline, reconciling) is refused
@@ -331,7 +330,7 @@ Regression tests (each failed on `main` before the fix): management `evict.rs`
 (every replica evicted for, refusal before eviction, `host_ineligible`), router
 `router_core.rs` and CLI `stop_intent.rs` (409 `deployment_stopped`), CLI
 `start_wait_replicas.rs` (partial start exits 4). Pending: a live run of a
-two-instance `start --evict --wait` on a tight Spark and of a start against a
+two-instance `start --evict --wait` on a tight host and of a start against a
 drain-only host.
 ## A revoked host exits instead of retrying — 2026-09-24 (branch `fix/revoked-host-exit`)
 
@@ -366,12 +365,12 @@ thread count four load-sensitive tests in unchanged code, `mllm-launchers` proce
 visibility and `native_vllm` readiness, failed once and pass on rerun); Clippy clean
 with warnings denied; `scripts/verify-packaging.sh` passed (shellcheck not installed,
 skipped); `scripts/test-install.sh` passed. CPU and mTLS tests are not qualification:
-not live-proven. Pending: a live revoke on a Spark under the packaged unit (exit 14,
+not live-proven. Pending: a live revoke on a host under the packaged unit (exit 14,
 unit not restarted, engines alive), then `join --recover` re-proving them.
 
 ## SGLang saver observation failure at `receive_header` — 2026-09-25 (branch `fix/sglang-observation-failed`)
 
-The rc.2 M28 s92-14 refusal (`park_refused` after `native_observation_failed` at
+The rc.2 M28 sa-14 refusal (`park_refused` after `native_observation_failed` at
 `receive_header`) is still **not root-caused**. This branch adds diagnostics only;
 it changes no park, wake or observation outcome.
 
@@ -413,14 +412,14 @@ Diagnostics added:
   contention, and whether the result reached the slot. This line is visible
   only with `--debug-engine-logs`.
 
-Live (host-a, SGLang 0.5.20, qwen3-14b, fixture s92-14, run
+Live (host-a, SGLang 0.5.20, qwen3-14b, fixture sa-14, run
 `matrix-20260925T021319Z`; evidence `target/live/obsfail/`; the scratch loop row
 is `target/live/obsfail/rows/OBS.sh`):
 
 | Run | Result |
 |---|---|
-| `OBS-s92-14`, 20 park/wake cycles, engine logs off (the rc.2 setting) | 20 of 20 parked and 20 of 20 woke on request. 88.8–88.9% of the Ready drop was released each time. Wake took 185–225 s (disk reload). I1: one capture and 19 passes (max logprob delta 0.0). The same four engine identities stayed alive to the end, and cleanup was clean. **0** `native_observation_*` or `saver_observation_*` lines in the host log |
-| `OBS-s92-14-dbg`, 10 cycles, `--debug-engine-logs` | 10 of 10 parked and 10 of 10 woke, with 88.8% released. All 160 served observations came back `observed`. Engine time from accept to close: p50 18 ms, p99 271 ms, max 288 ms. Wait for a safe point: 0 ms every time (the first tick). Snapshot: 13–15 ms. Contention: 0. The 100–290 ms outliers came from the transport thread's own work, not the scheduler. One cycle was high throughout. That fits GIL hand-offs against the busy-spinning scheduler, but it is not proven |
+| `OBS-sa-14`, 20 park/wake cycles, engine logs off (the rc.2 setting) | 20 of 20 parked and 20 of 20 woke on request. 88.8–88.9% of the Ready drop was released each time. Wake took 185–225 s (disk reload). I1: one capture and 19 passes (max logprob delta 0.0). The same four engine identities stayed alive to the end, and cleanup was clean. **0** `native_observation_*` or `saver_observation_*` lines in the host log |
+| `OBS-sa-14-dbg`, 10 cycles, `--debug-engine-logs` | 10 of 10 parked and 10 of 10 woke, with 88.8% released. All 160 served observations came back `observed`. Engine time from accept to close: p50 18 ms, p99 271 ms, max 288 ms. Wait for a safe point: 0 ms every time (the first tick). Snapshot: 13–15 ms. Contention: 0. The 100–290 ms outliers came from the transport thread's own work, not the scheduler. One cycle was high throughout. That fits GIL hand-offs against the busy-spinning scheduler, but it is not proven |
 
 So the failure did not reproduce in 30 cycles, 0 of 30 (rc.2 1 of 3, rc.3 0 of 3).
 The measured margin is 18 ms typical and 288 ms worst against a 1500 ms budget.
@@ -434,21 +433,21 @@ time it happens.
 The live runs used the build before the last two diagnostic additions: the
 host's `native_observation_slow` line and the engine line's
 `request_ms`/`result_ms`. Those two are CPU-tested only. A third live run
-stopped when Tailscale SSH asked for owner re-authentication on both Sparks.
+stopped when Tailscale SSH asked for owner re-authentication on both hosts.
 It was not retried.
 
 Host state after the stop: both deployments in these runs were deleted. The
 last cleanup check found no engine process, no GPU compute process and no
 rendezvous directory on host-a. Still running or present, and needing a
 reachable host to remove: the host roles in tmux (`mx-host-matrix-20260925T021319Z`
-on both Sparks) and the control-host server (`mx-srv-matrix-20260925T021319Z`). Also
+on both hosts) and the control-host server (`mx-srv-matrix-20260925T021319Z`). Also
 present: `~/mllm-obsfail` (with `target/`) and `~/mllm-runs/matrix-20260925T021319Z`
-on both Sparks. The host-a tree was being overwritten by rsync when the SSH
+on both hosts. The host-a tree was being overwritten by rsync when the SSH
 check started, so its runtime files may be a mix of two snapshots. After
 re-authentication, run `MLLM_MATRIX_LIVE=<repo>/target/live/obsfail
 MLLM_REMOTE_TREE=$HOME/mllm-obsfail scripts/live/matrix/roles.sh down`
 (this stops the hosts, then the server), then remove both trees and the run
-directories on the Sparks.
+directories on the hosts.
 
 Local verification (CPU only, not qualification): the core suite passed 1004.
 Workspace all-targets passed 1769, with 1 ignored. Clippy is clean with warnings
@@ -478,7 +477,7 @@ version and are drain-only against an upgraded server until they are upgraded.
 
 Local verification only: core 1070 reported, workspace 1764 passed (1 ignored), Clippy
 clean with warnings denied across the workspace. CPU and mTLS transport tests are not
-qualification; no mixed-version fleet has run on the Sparks. Pending: a live rolling
+qualification; no mixed-version fleet has run on the hosts. Pending: a live rolling
 upgrade (server first, then host-a, then host-b) once a release carries this change.
 ## Release candidate 0.1.0-rc.3 — build and live pass, 2026-09-24 (branch `docs/rc3-live`)
 
@@ -501,20 +500,20 @@ Evidence: `target/live/rc3/`.
 
 | Check | Live verdict |
 |---|---|
-| User state root (fix 1 of #13) | pass on both Sparks: `~/.config/mllm` created first, no `~/.local/state/mllm`; `install.sh --systemd host` printed `created ~/.local/state/mllm (0700)`; after `init`, `join` and the unit's start it is still a real 0700 directory holding `host/`, `tmp/` and the engine runtime; no new "compatibility symlink" journal line |
-| Refused park on a drain-only host (fix 2 of #13) | pass: host-b on rc.1 against the rc.3 server showed `upgrade_required`; v17-4 kept serving; `park deployment v17-4` was refused `park_refused` (`host_upgrade_required`, before any effect); the deployment was `reconciling` for one sample and `ready`, dispatch open, within about 2 s, serving 42, same engine PIDs and start ticks, no host session loss or agent restart. rc.2 reproduced a permanent 503 here |
+| User state root (fix 1 of #13) | pass on both hosts: `~/.config/mllm` created first, no `~/.local/state/mllm`; `install.sh --systemd host` printed `created ~/.local/state/mllm (0700)`; after `init`, `join` and the unit's start it is still a real 0700 directory holding `host/`, `tmp/` and the engine runtime; no new "compatibility symlink" journal line |
+| Refused park on a drain-only host (fix 2 of #13) | pass: host-b on rc.1 against the rc.3 server showed `upgrade_required`; vb-4 kept serving; `park deployment vb-4` was refused `park_refused` (`host_upgrade_required`, before any effect); the deployment was `reconciling` for one sample and `ready`, dispatch open, within about 2 s, serving 42, same engine PIDs and start ticks, no host session loss or agent restart. rc.2 reproduced a permanent 503 here |
 | Upgrade host-b back to rc.3 | pass: `supported`, state root still a real directory |
-| M73 v92-4, s92-4 | pass: launched from `~/.local/state/mllm/host/runtime`, loopback only, unkeyed 401, stop and restart clean |
-| M31 v17-4 ↔ s17-4, tight host-b, 1 cycle deep | pass: park and wake on the same processes |
-| M28 s92-14, three runs | pass 3 of 3 (89% of the Ready drop released each time); `native_observation_failed` did not recur (0 lines in the host journal). The single rc.2 occurrence stays unexplained |
+| M73 va-4, sa-4 | pass: launched from `~/.local/state/mllm/host/runtime`, loopback only, unkeyed 401, stop and restart clean |
+| M31 vb-4 ↔ sb-4, tight host-b, 1 cycle deep | pass: park and wake on the same processes |
+| M28 sa-14, three runs | pass 3 of 3 (89% of the Ready drop released each time); `native_observation_failed` did not recur (0 lines in the host journal). The single rc.2 occurrence stays unexplained |
 
 Local (CPU only) for #14: core 1004, workspace all-targets 1767, Clippy clean
 with warnings denied, `scripts/test-install.sh` passed including the new
 pre-release case. The CPU tests prove the fixes' logic; only the rows above
-prove them on the Sparks, and none of this qualifies an engine recipe beyond
+prove them on the hosts, and none of this qualifies an engine recipe beyond
 the q4/q14 fixtures exercised.
 
-After the pass every role and unit was stopped and uninstalled. Both Sparks
+After the pass every role and unit was stopped and uninstalled. Both hosts
 have no engine, role or GPU compute process, no rendezvous directory, no
 `~/.local/state/mllm`, `~/.config/mllm` or `~/mllm-rc3-*`; the server state
 stays on control-host under `~/mllm-rc3-server` (invitation files removed).
@@ -531,7 +530,7 @@ their own architecture; `BUILDINFO` commit 45f91af, not dirty, runtime manifest
 `80044870…ddee0`.
 
 Live, with release binaries only: `install.sh` from a `file://` mirror of the
-draft assets on control-host (`--systemd server`) and both Sparks (`--systemd host`),
+draft assets on control-host (`--systemd server`) and both hosts (`--systemd host`),
 fresh state under `~/mllm-rc2-*`, host documents without `runtime_dir` (the
 managed runtime the binary writes to `<state_dir>/runtime`), roles run by the
 installed systemd user units (`~/.config/mllm/<role>.env` naming the document).
@@ -542,16 +541,16 @@ scripts only, through the new `MLLM_LOCAL_BIN`, `MLLM_REMOTE_BIN`,
 
 | Row | Verdict |
 |---|---|
-| M75 (no engine, both Sparks) | pass: `invalid_config` "no engine installation", exit 2, nothing left |
-| M73 v92-4, s92-4 | pass: both engines launched from the managed runtime (`~/mllm-rc2-host/host/runtime/vllm_entry.py`, `sglang_entry.py`), loopback-only, unkeyed engine calls 401, stop with verified cleanup, restart at a new binding |
+| M75 (no engine, both hosts) | pass: `invalid_config` "no engine installation", exit 2, nothing left |
+| M73 va-4, sa-4 | pass: both engines launched from the managed runtime (`~/mllm-rc2-host/host/runtime/vllm_entry.py`, `sglang_entry.py`), loopback-only, unkeyed engine calls 401, stop with verified cleanup, restart at a new binding |
 | M08 | pass: router and host ingress serve no engine or control path (404), engines loopback only and refused from control-host, control routes 401 unkeyed, vLLM marked `exposed`/not production safe, SGLang not exposed |
-| M29 v92-4 (vLLM park/wake) | pass: 77% of the Ready drop released, same processes, wake on request |
-| M28 s92-14 (SGLang park/wake) | pass on 2 of 3 runs (89% released). The first run's park was refused `park_refused` after the host's saver observation failed (`native_observation_failed` at `receive_header`); the engine kept serving (fail closed). Not reproduced; open |
-| M31 v17-4 ↔ s17-4, tight host-b, 2 cycles deep | pass: switches park and wake the same processes, reservations settle |
+| M29 va-4 (vLLM park/wake) | pass: 77% of the Ready drop released, same processes, wake on request |
+| M28 sa-14 (SGLang park/wake) | pass on 2 of 3 runs (89% released). The first run's park was refused `park_refused` after the host's saver observation failed (`native_observation_failed` at `receive_header`); the engine kept serving (fail closed). Not reproduced; open |
+| M31 vb-4 ↔ sb-4, tight host-b, 2 cycles deep | pass: switches park and wake the same processes, reservations settle |
 | M64 (`delete --stop`, drain) | pass |
-| TC s92-4 (`qwen25`), v17-4 (`hermes`) | pass: 4 of 4 each (vLLM named choice finishes `stop` with the tool call) |
+| TC sa-4 (`qwen25`), vb-4 (`hermes`) | pass: 4 of 4 each (vLLM named choice finishes `stop` with the tool call) |
 | `systemctl --user restart mllm-host` | pass: same engine PIDs and start ticks, new agent PID, reconciled, serves |
-| M45 revoke with v92-4 Ready | pass: `engines: retained`, dispatch 503, reconnect refused, engine alive |
+| M45 revoke with va-4 Ready | pass: `engines: retained`, dispatch 503, reconnect refused, engine alive |
 | Recovery (`invite host --recover`, `join host --recover`) | pass: same host id, same engine processes at generation 1 (re-proven, not relaunched), serves |
 | Mixed version (host-b on rc.1, server rc.2) | `upgrade_required` with its reason; start refused; a Ready engine keeps serving; stop and drain work; reinstalling rc.2 gives `supported` and a start succeeds. Found bug 2 below |
 
@@ -559,7 +558,7 @@ Bugs found and fixed on `fix/rc2-live-findings` (CPU-verified with failing-first
 regression tests; the fixes themselves have not run live):
 
 1. **User units and systemd ≥ 254.** `~/.config/mllm` (where the user units read
-   `<role>.env`) existed before the first start, so systemd 255 on the Sparks
+   `<role>.env`) existed before the first start, so systemd 255 on the hosts
    made `~/.local/state/mllm` a compatibility symlink to it; the unit's state
    and `TMPDIR` landed in the configuration directory. `install.sh --systemd`
    (user scope) now creates an empty 0700 `~/.local/state/mllm` and warns about
@@ -568,7 +567,7 @@ regression tests; the fixes themselves have not run live):
 2. **A park refused before sending closed dispatch for good.** On a drain-only
    host the park preflight refuses `host_upgrade_required`, the coordinator
    settles it leaving the remote launch's dispatch closed until a fresh probe
-   reopens it, but the readiness proof was kept, so no probe was sent: v17-4
+   reopens it, but the readiness proof was kept, so no probe was sent: vb-4
    stayed `reconciling` with dispatch closed (503) while its engine ran.
    `RemoteEngine::residency` now forgets the proof on every park refusal
    (host `unchanged`, preflight, gate refusal), so the supervisor re-probes.
@@ -580,7 +579,7 @@ fixture's host.
 Local on `fix/rc2-live-findings`: core 1004, workspace all-targets 1767,
 Clippy clean with warnings denied, `scripts/test-install.sh` passed. CPU and
 Fake-engine tests are not qualification. After the run every role was stopped,
-the units and binaries uninstalled, and both Sparks left with no engine, role
+the units and binaries uninstalled, and both hosts left with no engine, role
 or GPU compute process, no rendezvous directory and no `~/mllm-rc2-*` state;
 the server state stays on control-host under `~/mllm-rc2-server`.
 
@@ -594,8 +593,8 @@ retrying its session (a few refusals a minute) instead of exiting.
 M48 is not passed: the owner stopped the soak after 119 walked steps, short of
 the 200 the matrix asks for, and M50 was not run. Harness: `rows/M48.sh`,
 `soak.py`, `rows/M49.sh` (see `scripts/live/matrix/README.md`). Seed 20260924.
-Deployments: v92-4, s92-14, s17-4, v17-4 and v17-14 (every engine launched with
-its tool parser) and the two-instance replica route `qwen3-4b` (s92-4-rep);
+Deployments: va-4, sa-14, sb-4, vb-4 and vb-14 (every engine launched with
+its tool parser) and the two-instance replica route `qwen3-4b` (sa-4-rep);
 host-b on the tight policy, so two of its three single-instance deployments
 fit and a request for the third switches.
 
@@ -637,7 +636,7 @@ fit and a request for the third switches.
   denied. CPU and Fake-engine tests are not qualification.
 
 Remaining: M48 needs a full ≥200-step walk on the final binary, then M49 and
-M50 (M73 on both engines and M08). Both Sparks were left with no engine, role
+M50 (M73 on both engines and M08). Both hosts were left with no engine, role
 or GPU compute process and no rendezvous directory.
 
 ## Distribution: one binary, GitHub Releases, install.sh — 2026-09-24 (branch `feat/distribution`)
@@ -682,7 +681,7 @@ runtime manifest `80044870…ddee0` and `BUILDINFO` commit 6d7bf36, not dirty.
 The API and `gh` download paths of `install.sh` resolve published releases
 only, so they work once the draft is published.
 
-Not established: no release binary has run a role on a Spark, and the matrix
+Not established: no release binary has run a role on a host, and the matrix
 harness still declares `runtime_dir` (synced tree), so the managed runtime has
 not launched a live engine yet.
 
@@ -696,7 +695,7 @@ before any byte is written, per-file verification, atomic commit, then the WE3
 digest. Activation waits (`model_source_pending`) and status shows per-host state
 and bytes. `mllm prune sources` reclaims unreferenced copies explicitly. Local
 verification only, against a fake hub and origin: core 992 reported, workspace
-1741, Clippy clean (schema v33, `ExecuteMember` field 14). Pending: a live Hugging Face download on a Spark; standalone
+1741, Clippy clean (schema v33, `ExecuteMember` field 14). Pending: a live Hugging Face download on a host; standalone
 support; disk in the server's placement plan. CPU and fake-origin tests are not
 qualification.
 
@@ -747,7 +746,7 @@ denied. The
 lost-journal test was shown to fail (stop never settles) with the recorded
 identities removed from the Terminate. One early run hit a transient
 `revoke host` request-journal refusal that did not recur in five later runs.
-Pending: live rows M45 (revocation) and a live recovery row on the Sparks.
+Pending: live rows M45 (revocation) and a live recovery row on the hosts.
 
 ## Schema downgrade guard and standalone `--config` — 2026-09-24 (branch `fix/schema-guard-standalone-config`)
 
@@ -784,7 +783,7 @@ reproducible tarball of git-tracked files with an owner-only `runtime/`;
 `systemd-analyze verify`, builds the tarball twice and checks its entries,
 modes and digests. Operator guide: `docs/operations/install.md`.
 
-Not established: no unit has run on a Spark. Whether the host unit's
+Not established: no unit has run on a host. Whether the host unit's
 hardening lets vLLM and SGLang start, park and wake, and whether engines
 survive `systemctl restart mllm-host` and are re-attached, needs a live run.
 Found while writing the guide: an older binary did not refuse a state store
@@ -795,7 +794,7 @@ Rollback across a schema change still needs a state backup.
 ## Post-merge live smoke — 2026-09-24 (branch `fix/live-smoke-2026-09-24`)
 
 PR #1 (`edurdias/mllm`) merged into `main` as `eb33deb` after local
-verification (no CI minutes available). A live smoke on both Sparks then passed
+verification (no CI minutes available). A live smoke on both hosts then passed
 M75, M73 on both engines, M08, vLLM and SGLang park and wake (M29, M28), a
 cross-engine switch with warm processes (M31), M47, M53, M65, M66, M54, a sustained
 frozen-agent run (M58: 2400 of 2400 requests, 5.4 s suspension, no replay), M64 and
@@ -833,8 +832,8 @@ rejections), `M58` (sustained frozen agent); `M31` takes `SWITCH_MEMORY_JSON` fo
 the q4 pair; `M08` records tool-call behaviour without a parser (not gating).
 
 Live after the fixes (2026-09-24, run `matrix-20260924T185326Z`): TC on SGLang
-s92-4 with `qwen25` returned `get_weather` tool calls for named and auto, streamed
-and not (4 of 4, finish `tool_calls`, well-formed SSE); TC on vLLM v17-4 with
+sa-4 with `qwen25` returned `get_weather` tool calls for named and auto, streamed
+and not (4 of 4, finish `tool_calls`, well-formed SSE); TC on vLLM vb-4 with
 `hermes` 4 of 4; REJ 40 of 40 rejections relayed 400 `engine_rejected`, the
 streamed rejection an `engine_rejected` error event, no lease held, and the route
 then served; M08 passed. The failure-cleanup trap was exercised with a scratch row.
@@ -900,11 +899,11 @@ roles and the runtime endpoint carries only the inference key, adoption with and
 a recorded admin key, and HTTP key routing against a keyed-guard mock (with and without
 an admin key). The standalone profile names both references. Core, workspace and
 clippy logs are `target/orch-logs/key-*.log`. These are CPU and Fake-engine tests only,
-not native qualification: no Spark run has exercised the two-key embedded guard.
+not native qualification: no host run has exercised the two-key embedded guard.
 
 ## Status reasons, solo-first-start switching and launch-failure reasons — 2026-09-24 (uncommitted)
 
-Three local fixes from the M53/M53D/M66 live findings. They were not run on the Sparks.
+Three local fixes from the M53/M53D/M66 live findings. They were not run on the hosts.
 
 1. SPEC §6.4. Status now shows `latest_operation {id, kind, state, error_code, reason, hint}`
    for each deployment and each instance, and `error_code` on each `operations[]` entry.
@@ -994,7 +993,7 @@ Checklist:
 - [x] Complete final Rust integration check (635 distinct core tests).
 - [ ] Complete consolidated code review.
 - [ ] Implement server/agent enrollment, transport, reconciliation and remote lifecycle.
-- [ ] Implement and validate distributed group launch/accounting on both Sparks.
+- [ ] Implement and validate distributed group launch/accounting on both hosts.
 - [ ] Pass the full multi-node gate; standalone success is only its prerequisite.
 
 Non-secret live evidence is copied to `target/live/sglang-0.5.20-product/`.
@@ -1009,14 +1008,14 @@ fixture is supplied through `TMS_SOURCE_ARCHIVE`; these are CPU checks.
 The native start/inference/stop gate passed. This does not qualify deep park,
 wake, switching, or distributed operation.
 
-Read-only multi-node preparation confirms both Sparks are reachable and use
-aarch64 GB10 / driver 580.173.02. host-b has the required checkpoint but no
+Read-only multi-node preparation confirms both hosts are reachable and use
+aarch64 unified-memory host / driver 580.173.02. host-b has the required checkpoint but no
 SGLang environment was listed. Product `start server`, `start host`, enrollment and authenticated AgentControl
 sessions now pass local binary tests. Remote engine execution and native
-two-Spark validation remain pending.
+two-host validation remain pending.
 
 Implementation follows
-`docs/superpowers/plans/2026-09-21-1831-feat-two-spark-sglang-plan.md`.
+`docs/plans/2026-09-21-1831-feat-two-host-sglang-plan.md`.
 Host-scoped ownership, typed command contracts and the additive namespace
 migration are implemented. U1 focused domain/protocol/store checks pass 177
 tests; the integrated core run passes 639 distinct tests (640 reported,
@@ -1034,8 +1033,8 @@ The integrated core run now passes 651 distinct tests (652 reported, excluding
 the nested owned-state summary); core, agent, config and CLI Clippy pass with
 warnings denied. These are local tests, not native qualification. The owner's
 Tailscale SSH reauthentication completed on 2026-09-22; read-only SSH checks then
-succeeded on both Sparks with no GPU compute process on either. The native remote
-gate on host-a is therefore unblocked but not yet run: no source sync, Spark build,
+succeeded on both hosts with no GPU compute process on either. The native remote
+gate on host-a is therefore unblocked but not yet run: no source sync, host build,
 server/host deployment or remote native launch has happened since. host-b
 had no known matching SGLang 0.5.20 environment; on 2026-09-22 the owner granted
 a scoped exception to create a clean SGLang 0.5.20 virtual environment on host-b
@@ -1043,7 +1042,7 @@ mirroring host-a (same source commit, same wheels), with no driver, system packa
 reboot changes and existing vLLM environments left untouched. The owner also
 directed that the old host-a standalone service, if still alive, be stopped through
 the shipped CLI and that work proceed until blocked or a live milestone is proven.
-Later on 2026-09-22 both Sparks were synchronized to the current worktree and built
+Later on 2026-09-22 both hosts were synchronized to the current worktree and built
 `target/release/mllm` under `~/mllm-f2` (builds over non-interactive SSH need
 `~/.local/bin` on PATH for `protoc`). The host-b environment now matches host-a
 byte-for-byte (206 PyPI wheels, identical RECORD digests, same `uv pip check`
@@ -1055,16 +1054,16 @@ SIGTERM. That missing graceful stop is an open product gap. Its state directory
 still records deployment `qwen3-4b` with desired `ready` and observed `stopped`.
 
 Owner direction on 2026-09-22 changes the sequence. Multi-node work proceeds first
-with single-rank recipes: one control-host control plane managing both Sparks, each host
+with single-rank recipes: one control-host control plane managing both hosts, each host
 running multiple vLLM and SGLang single-rank deployments, serving, switching models
 and parking as needed. The end goal is a two-host control plane supporting both
 engines in all meaningful permutations, mapped by an explicit test matrix. Two-rank
 (TP2) group work, previously U6/U7, is deferred until after that matrix passes; its
 open design questions (residency, peer exposure, NCCL transport, rank readiness,
 compensation, owner granularity, placement shape, rendezvous ports) are parked.
-The test matrix is `docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`
+The test matrix is `docs/plans/2026-09-22-two-host-engine-matrix.md`
 (scenarios M01–M72, gaps G01–G17 plus U5-G1…G4, decisions D1–D11) and the work
-plan is `docs/superpowers/plans/2026-09-22-two-host-control-plane-plan.md` (units
+plan is `docs/plans/2026-09-22-two-host-control-plane-plan.md` (units
 W0–W13 in waves). Decision E1 (below) supersedes the plan's per-model recipe
 approach for G17. Owner decisions so far:
 D1 deep parking is enabled by default and a host opts out (the SPEC §9.1/T21
@@ -1217,7 +1216,7 @@ does not exist in practice yet. The owner decided on 2026-09-22 that the router
 writes a durable lease per dispatch and closes it on completion or cancellation
 acknowledgement, with batched bounded writes, as SPEC §10 accounting requires.
 
-Phase B passed live on 2026-09-22 with one server on control-host controlling both Sparks
+Phase B passed live on 2026-09-22 with one server on control-host controlling both hosts
 (evidence `target/live/phase-b/`, all rows on a pre-WE1 source snapshot, qwen3-4b
 only). SGLang ran natively on host-b for the first time (Ready in 127 s; answer, stream,
 stop and verified cleanup). vLLM 0.29.0 ran remotely on host-a for the first time
@@ -1268,7 +1267,7 @@ arguments with the installed `ServerArgs` parser and, after SGLang's own resolve
 refuses any change to a reserved field. vLLM now launches through
 `runtime/vllm_entry.py`, which refuses `--config` and reserved fields however they
 are spelled using the installed vLLM parser, then serves in-process; typed fields
-render to their native flags. Every Spark runtime directory needs the new
+render to their native flags. Every host runtime directory needs the new
 `vllm_entry.py` before any vLLM launch. Until WE3 lands, SGLang launches verify no
 checkpoint identity at all. Core suite 723 reported (722 distinct), runtime Python
 281 and Clippy pass; CPU and fake engines only.
@@ -1325,8 +1324,8 @@ from the pre-ADR 0014 launch shape. Standalone still forces SGLang to `deep`, so
 `MLLM_DEEP_PARK=off` with SGLang was expected to be refused; it now falls back to
 `restart_only` (`deployment_document` gained a `deep_park` argument). On
 2026-09-22 the owner confirmed that `crates/mllm-cli/tests/live_interactive.rs` and
-`.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md`, which
-AGENTS.md had excluded as the owner's, are leftovers from earlier agents. The
+a local Task 2 implementation report, which
+AGENTS.md had excluded as the owner's, are leftovers from earlier work. The
 exclusion is removed, and they are deleted if no longer needed: validation goes
 through the shipped product, not hardcoded scripts. `live_interactive.rs` was an
 in-process vLLM park/wake lab that never ran the shipped binary; it is deleted,
@@ -1388,7 +1387,7 @@ owner decided that on reconnect the server closes such expired, never-armed stop
 as `expired` and issues fresh stops with new deadlines, keeping accounting until
 gone evidence, so drain intent survives an outage of any length.
 
-Live M16 (per-model smoke) started 2026-09-23 on both Sparks. Its first run found a
+Live M16 (per-model smoke) started 2026-09-23 on both hosts. Its first run found a
 product bug, fixed with a regression test: a host agent ended its control session
 when a launch failed before readiness, so the controller waited the full Initialize
 deadline and tore down the host's other effects; the failure is now a journaled
@@ -1508,7 +1507,7 @@ stays strict. SPEC §8.1, §9.2, §13.3, T22 and T37 and ADRs 0008 and 0014 are 
 Core suite 832; runtime Python 225; CPU and fake engines only. Remaining small
 items: standalone records no installation fingerprint yet; `engine_capabilities.py`
 is not yet a required runtime file; the SGLang descriptor still carries the old
-`source_revision` token; the probe's 120 s limit is unverified on a Spark; and the
+`source_revision` token; the probe's 120 s limit is unverified on a host; and the
 `roles_f1` tests collide on port 8100 when run in parallel.
 
 Control-session heartbeats landed locally (additive protocol, negotiated so older
@@ -1543,7 +1542,7 @@ observation source exists; standalone has no idle configuration. The owner
 decided on 2026-09-23 that idle timers stay off unless configured.
 
 M16 (per-model smoke) passed live on 2026-09-23 for all ten model and engine
-combinations across both Sparks (run `matrix-20260923T034935Z`, snapshot `f5d793ea`,
+combinations across both hosts (run `matrix-20260923T034935Z`, snapshot `f5d793ea`,
 evidence `target/live/matrix/M16-*`), five of them only after a variant or rerun.
 Every row answered 3/3 prompts, forwarded logprobs and left zero request leases.
 Ready times ranged from 29 s (vLLM 4B) to 585 s (SGLang 27B BF16); checkpoint
@@ -1575,7 +1574,7 @@ dispatch closed within 2 s of SIGKILL. The cleanup pass also landed: standalone
 records installation fingerprints and drift (`MLLM_INSTALLATION_DRIFT`),
 `engine_capabilities.py` is a required runtime file where used, the SGLang
 `source_revision` token is removed (binary and runtime directory must now be
-updated together on each Spark), standalone engine ports are configurable
+updated together on each host), standalone engine ports are configurable
 (`MLLM_STANDALONE_ENGINE_PORTS`, which also removed the CLI test port collisions),
 and `docs/examples/*.yaml` are rewritten and validated by a test. Core suite 836.
 
@@ -1601,7 +1600,7 @@ call and uncertain after one. Quiescence needs zero in-flight ingress plus zero
 SGLang running and queued gauges. Embedded standalone uses the same observer. Core
 suite 847; runtime Python 238; CPU and fakes only. The harness now uses M16's
 measured requests and working recipe variants. Live questions remain: whether the
-driver reports paused segments as unmapped on GB10, segment counts for the large
+driver reports paused segments as unmapped on unified-memory host, segment counts for the large
 models, and that CUDA-graph memory is neither observed nor released by SGLang park.
 
 With M16's measured requests (4B 24 GiB, 14B 46, 30B-A3B 82, 27B BF16 78, 27B NVFP4
@@ -1786,7 +1785,7 @@ route) is not expressible by design (Q6). Not run: M35, M44, M45, M46, M51, M52,
 M62, M67, M70–M72.
 
 M80 results (2048-token prompt, one request, through the router): decode rate
-tracks model bytes on the GB10, about 21 tokens/s for 4B, 8 for 14B, 4.4 for 27B
+tracks model bytes on the unified-memory host, about 21 tokens/s for 4B, 8 for 14B, 4.4 for 27B
 BF16, 10 for 27B NVFP4 and 30 for 30B-A3B; time to first token 0.3–2.2 s. vLLM cold
 starts are much faster than SGLang (4B 22 s against 68 s; 30B 85 s against 378 s);
 vLLM wakes from deep park in 8–81 s, while SGLang's disk-reload wake is close to a
@@ -1886,7 +1885,7 @@ stop left no engine process group, no GPU compute process, and zero reservations
 leases and claims. Unauthenticated router calls got 401, direct ingress without
 the gate key 403, inference after explicit stop 429 without autoactivation, and a
 replayed stop request returned the original operation. Non-secret evidence is in
-`target/live/u5-remote-0292/`. The first live run found two product bugs, both
+`target/live/u5-remote-host-a/`. The first live run found two product bugs, both
 fixed with a regression test (T09/T33/T38): controller command redelivery every
 500 ms spawned duplicate host effects until the session was torn down mid-launch,
 and every reconnect republished the stale startup inventory, which publication
@@ -1900,7 +1899,7 @@ gate returns 500; G3 status can report `stopped` while an uncertain engine runs;
 G4 host `eligible` is hard-coded false. Controller restart with a live remote
 deployment, stream interruption and CLI crash recovery were not exercised.
 
-The D5 model set is in place on both Sparks with identical payload SHA-256:
+The D5 model set is in place on both hosts with identical payload SHA-256:
 `~/models/{qwen3-4b-instruct, qwen3-14b, qwen3-30b-a3b, qwen3.8-27b,
 qwen3.8-27b-nvfp4}`. The first four were copied from host-a over the direct link;
 `qwen3.8-27b-nvfp4` was materialized on each host from the complete Hugging Face
@@ -1913,7 +1912,7 @@ this architecture and quantization has not been checked by any engine run.
 
 The U5 recovery fixes passed live on 2026-09-22 on native SGLang 0.5.20 (server
 control-host, host host-a, deployment `01M35ARNS85PT8D1WYHXK7EFDC`; evidence in
-`target/live/recovery-0292/`). A killed host agent made the router answer 503
+`target/live/recovery-host-a/`). A killed host agent made the router answer 503
 within 1 ms, and the restarted agent re-proved the same engine processes and
 resumed serving in under 1 s. When the engine had died meanwhile, dispatch stayed
 closed and stop cleaned up. A server restart adopted the Ready launch and resumed
@@ -1948,17 +1947,17 @@ and Store Clippy remain clean. These checks do not qualify native execution.
 
 U1 preserves local ledger keys and immutable
 receipts; group reservation and remote execution remain separate pending work.
-The requested end-to-end two-Spark inference/recovery/cleanup test is distinct
+The requested end-to-end two-host inference/recovery/cleanup test is distinct
 from the broader F4 residency, switching and cache qualification. Those
 capabilities remain unqualified until their own evidence is complete.
 Plan review covered coherence, feasibility, scope, security and adversarial
 assumptions; it corrected an overbroad completion condition that had made all
 F4 cache and switching work a prerequisite for this task.
 
-Read-only SHA-256 comparison on both Sparks confirms identical checkpoint
+Read-only SHA-256 comparison on both hosts confirms identical checkpoint
 configuration, weight index, all three safetensors shards and tokenizer files
 under `~/models/qwen3-4b-instruct`. No model or engine was launched for that check.
-Both Sparks report 200 Gb/s on their two direct interfaces. Bidirectional ICMP
+Both hosts report 200 Gb/s on their two direct interfaces. Bidirectional ICMP
 on `192.0.2.10`/`192.0.2.11` succeeds; this is connectivity evidence,
 not measured throughput or NCCL qualification.
 Enrollment certificate primitives now reject forged/malformed requests,
@@ -2022,7 +2021,7 @@ no installation or driver and rebooted no host.
 
 The deployment settled stopped with admission and dispatch disabled; no engine
 processes remained in the post-run check. Evidence is under
-`target/live/20260921T213446Z/`, with details in `spark-live-f2.md`. Private state
+`target/live/20260921T213446Z/`, with details in `live-f2.md`. Private state
 is retained on host-a at `$HOME/.tmphQyl3M`. This is not native
 qualification. Final S3 review and S2 remain pending behind the live gate.
 
@@ -2033,7 +2032,7 @@ standalone reaches the wrapper and reports `launch_failed`, with journal evidenc
 `sglang_startup_failed: artifact_mismatch`, using `/usr/bin/python3` and the stub
 checkpoint. This replaces the prior never-armed failure in this local reproduction;
 it does not demonstrate native model readiness. The diagnostic state is retained
-at `$HOME/.tmpuCTuz5` (machine-local). Running it inside the sandbox
+in a machine-local temporary directory. Running it inside a sandboxed environment
 first failed controller ownership checks because sandbox ancestor UIDs appeared as
 `nobody`; the successful run used real host filesystem ownership without weakening
 the checks.
@@ -2269,7 +2268,7 @@ The native half of the gate is still open. The owner confirmed on 2026-09-16 tha
   below).
 - SGLang: the native entrypoint denial was **composed open** on 2026-09-19
   (owner-authorized; S3 plan
-  `docs/superpowers/plans/2026-09-19-sglang-launch.md`, commits `393b197..17b6ffc`).
+  `docs/plans/2026-09-19-sglang-launch.md`, commits `393b197..17b6ffc`).
   `sglang_entry._verified_native_contract` runs the audited gates (source
   revalidation, plugin closure, placement, checkpoint) and the guarded engine
   import follows when the contract holds; the ordinary descriptor carries
@@ -2341,7 +2340,7 @@ gate's warm-switching criterion could only be demonstrated engine-direct.
       are not verification of any native recipe.
 - [x] S1 — native launch (vLLM), live-green on host-a on 2026-09-18 (run 5
       at `000b832`, six of six scenarios, evidence entry in
-      `docs/runbooks/spark-live-f2.md`). The coordinator directs a native
+      `docs/runbooks/live-f2.md`). The coordinator directs a native
       builder to launch a real vLLM 0.29 engine: cold start to Ready in 27 s,
       inference through the router, loopback-only listening with the guard
       middleware refusing unkeyed control routes, a stop that proves the group
@@ -2440,10 +2439,10 @@ and the interface warns that a raw flag overrides a structured setting; T14 requ
 conflicts to fail with provenance instead. The CLI grammar is also resource-first
 (`mllm hosts list`), where R11 requires action-first (`mllm list hosts`).
 
-## Earlier multi-node constraints, updated for the current two-Spark work
+## Earlier multi-node constraints, updated for the current two-host work
 
 These constraints were originally deferred beyond the standalone F2 recipe.
-The owner's current two-Spark instruction and the plan linked above now govern
+The owner's current two-host instruction and the plan linked above now govern
 this work. The standalone recipe remains TP=1, DP=1; distributed qualification
 requires its own recipe and evidence under SPEC §11.
 
@@ -2467,7 +2466,7 @@ requires its own recipe and evidence under SPEC §11.
    device, because summing mapped bytes across devices cannot distinguish a fully
    restored group from one restored rank. Per-rank evidence, and cross-host
    aggregation for a multi-node group, remain unimplemented.
-6. Hardware: host-a has a single GB10, so no parallel topology can be verified
+6. Hardware: host-a has a single unified-memory host, so no parallel topology can be verified
    there. Tensor parallelism needs a multi-device host; multi-node needs two hosts.
 
 ## Open questions
@@ -2598,7 +2597,7 @@ reruns and subsequent bounded full core runs. No timeout or evidence-freshness
 limit was changed.
 Tests used four threads to bound concurrent fixture load; internal race tests
 remain enabled. Separate no-site verification passed 10 renderer, 15 runtime-binding
-and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated Spark
+and 218 Python runtime tests; all16 launch-decoder tests also pass on isolated host
 Python 3.12.3.
 The full root run also passes all 74 harness tests, including five phase-bound/ceiling, six exact-marker,
 seven collected JSON, eight streamed-data, five SSE framing, five timing, seven journal and nine
@@ -2610,8 +2609,8 @@ None is native verification evidence.
 One existing item remains for the owner's inspection: check the untracked
 `crates/mllm-cli/tests/live_interactive.rs` for formatting from the earlier
 workspace-formatter incident. There is no original baseline for that file, so
-the agent cannot certify or restore it. It remains excluded from reading,
-editing, formatting, tests and staging. The separately modified SDD Task 2 report
+this work cannot certify or restore it. It remains excluded from reading,
+editing, formatting, tests and staging. The separately modified local Task 2 report
 also remains excluded and untouched by this continuation.
 
 Host access item: RESOLVED. The 2026-09-15 SSH timeouts no longer reproduce.

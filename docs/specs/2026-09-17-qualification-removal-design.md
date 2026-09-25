@@ -3,7 +3,7 @@
 **Date:** 2026-09-17
 **Status:** Approved by the owner in design review; awaiting the implementation plan.
 **Governs:** the execution of ADR 0011 decision 2 and the remaining ADR 0011 tasks.
-**Supersedes:** `docs/superpowers/plans/2026-09-16-state-machine-owns-recovery.md` tasks 3 to 5,
+**Supersedes:** `docs/plans/2026-09-16-state-machine-owns-recovery.md` tasks 3 to 5,
 which this design re-sequences.
 
 ## 1. Principle
@@ -173,15 +173,15 @@ native recipe, and every status claim says so.
 ## 5. Documents
 
 Deleted, because their subject is the deleted code:
-`docs/superpowers/plans/2026-09-12-f2c-mixed-engine-qualification.md`,
-`docs/superpowers/plans/2026-09-14-f2-native-candidate-handoff.md`,
+`docs/plans/2026-09-12-f2c-mixed-engine-qualification.md`,
+`docs/plans/2026-09-14-f2-native-candidate-handoff.md`,
 `docs/runbooks/f2-mixed-engine-qualification.md`,
 `docs/runbooks/f2-sglang-qualification.md`, `docs/AGENT_HANDOFF.md`, and
-`docs/superpowers/plans/2026-09-16-state-machine-owns-recovery.md` once the new plan
+`docs/plans/2026-09-16-state-machine-owns-recovery.md` once the new plan
 replaces it. `f2-planning-index.md` entries are removed. Git keeps the history.
 
-Kept unchanged: the hardware evidence runbooks `spark-qualification-f1.md`,
-`spark-model-size-qualification.md`, `spark-deep-wake-optimization.md`, which record
+Kept unchanged: the hardware evidence runbooks `qualification-f1.md`,
+`model-size-qualification.md`, `deep-wake-optimization.md`, which record
 what ran on `host-a`; and the executed historical plans f2a1 to f2b.
 
 Amended in one place each:

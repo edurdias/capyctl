@@ -10,7 +10,7 @@ giving an independently reconfirmed reduction of 43.890s (85.40%).
 ## Recipe and change
 
 Qwen/Qwen3-4B-Instruct-2507 BF16, 7.49 GiB across three safetensors shards,
-vLLM 0.29.0, Python 3.12.14, PyTorch 2.13.0+cu130, GB10 unified memory,
+vLLM 0.29.0, Python 3.12.14, PyTorch 2.13.0+cu130, unified-memory host unified memory,
 local EXT4 checkpoint storage. Preserve 16 GiB KV, 4096-token maximum context,
 0.10 GPU utilization gate, and localhost port 8150.
 
@@ -99,7 +99,7 @@ no installed vLLM files or dependencies were changed.
 
 ## Reproduction and evidence
 
-Use the environment in [the environment runbook](spark-vllm-env.md). Run one
+Use the environment in [the environment runbook](vllm-env.md). Run one
 engine per host and confirm the prior process has exited. On host-a:
 
 ```bash

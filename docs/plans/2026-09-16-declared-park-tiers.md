@@ -15,7 +15,7 @@
 - Tag tests with their acceptance-matrix ID (`// T14`) where one applies.
 - Core suite command: `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`
 - Clippy must pass with `-D warnings` across those crates.
-- `crates/mllm-cli/tests/live_interactive.rs` and `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-2-report.md` are excluded: do not read, edit, format, test or stage them.
+- `crates/mllm-cli/tests/live_interactive.rs` and a local Task 2 implementation report are excluded: do not read, edit, format, test or stage them.
 - This plan makes the tier declarable and validated. It does **not** implement ordinary park, and does not decide when the park/restore proof runs. Both are out of scope.
 
 ---
@@ -106,7 +106,7 @@ In `crates/mllm-config/src/effective.rs`, beside `DomainPolicy`:
 ```rust
 /// Whether a domain's device memory and host memory are one physical pool.
 ///
-/// On a unified-memory host such as a GB10, retaining a weight backup "in host RAM"
+/// On a unified-memory host such as a unified-memory host, retaining a weight backup "in host RAM"
 /// allocates from the same pool the device allocates from, so it frees nothing. Only
 /// the operator registering the host knows this; it must not be inferred from a
 /// domain's name or from which limits are set. SPEC §6.2's host-backed park is
@@ -661,7 +661,7 @@ refused at configuration time with the domain named."
 
 ### Task 5: Standalone declares its topology and its tier
 
-Standalone publishes the only host policy the product creates. It must now declare each domain's memory topology, and its deployments must name a tier that the GB10 can actually deliver.
+Standalone publishes the only host policy the product creates. It must now declare each domain's memory topology, and its deployments must name a tier that the unified-memory host can actually deliver.
 
 **Files:**
 - Modify: `crates/mllm-cli/src/standalone_config.rs:57-65` (host policy domains) and `:104-105` (deployment residency)

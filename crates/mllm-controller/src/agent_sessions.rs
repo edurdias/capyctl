@@ -1251,7 +1251,7 @@ impl AgentSessions {
                             After::Retire(request) => {
                                 use crate::profile_retirement::{RetirementStep, RETIREMENT_POLL};
                                 let service = self.retirements.lock().ok().and_then(|s| s.clone());
-                                // ADR 0018 §4 (controller ruling I1): the request's key. A
+                                // ADR 0018 §4 (review decision I1): the request's key. A
                                 // retirement already standing for (host, profile) keeps the
                                 // key it was first written under until it is cleared, so any
                                 // retry (a new request id after a reconnect, a rerun `engine

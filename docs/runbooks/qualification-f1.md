@@ -1,7 +1,7 @@
-# F1 Live Qualification — DGX Spark (host-b / host-a)
+# F1 Live Qualification — unified-memory host (host-b / host-a)
 
-**Evidence class: live-tier (Spark)** — every claim in this file was executed on the
-owner's DGX Spark (GB10, aarch64, 130.6 GB unified memory) via SSH. Simulator-tier
+**Evidence class: live-tier (host)** — every claim in this file was executed on the
+owner's unified-memory host (unified-memory host, aarch64, 130.6 GB unified memory) via SSH. Simulator-tier
 claims never substitute. Filled during execution (F1 design §8 sequence).
 
 ## 1. Environment capture (doctor / recipe freeze)
@@ -10,7 +10,7 @@ claims never substitute. Filled during execution (F1 design §8 sequence).
 |---|---|---|
 | Host | host-b, Linux 6.17.0-1031-nvidia, aarch64 | `uname -a` |
 | Memory | 130,663,165,952 bytes total | `free -b` (2026-09-12) |
-| GPU | NVIDIA GB10, UUID ab51907f-117b-000e-81f7-f288c30bf67e | `nvidia-smi -L` |
+| GPU | NVIDIA unified-memory host, UUID ab51907f-117b-000e-81f7-f288c30bf67e | `nvidia-smi -L` |
 | Python | 3.12.14 (uv-managed, headers included) | venv capture |
 | PyTorch | 2.13.0+cu130 | venv import |
 | vLLM | **0.29.0** (pinned) | `vllm --version` |
@@ -22,7 +22,7 @@ Install deviations (owner-visible, no silent decisions): `/opt` is root-owned an
 requires a password; the venv lives in the user's home. The system Python lacks
 `Python.h`; vLLM's `instanttensor` dependency needs C headers, so the venv uses a
 uv-managed Python (3.12.14, headers included). Both recorded in
-`docs/runbooks/spark-vllm-env.md`.
+`docs/runbooks/vllm-env.md`.
 
 ## 2. Doctor capture + recipe freeze (2026-09-12, live)
 
@@ -31,7 +31,7 @@ uv-managed Python (3.12.14, headers included). Both recorded in
 - Checkpoint: `~/models/qwen3-4b-instruct` — Qwen/Qwen3-4B-Instruct-2507, BF16,
   7.49 GiB (3 safetensors shards), weights load in ~41-44 s.
 - Memory observation: `free -b` MemTotal 130,663,165,952 B; device-visible
-  memory 121.69 GiB (GB10 unified).
+  memory 121.69 GiB (unified-memory host unified).
 - Recipe pins (frozen from reported reality): served id `qwen3-4b-instruct`
   (via `--served-model-name`), `--kv-cache-memory 17179869184` (16 GiB grant),
   `--gpu-memory-utilization 0.10` (the 0.92 default gate fails on unified
@@ -39,7 +39,7 @@ uv-managed Python (3.12.14, headers included). Both recorded in
   `--host 127.0.0.1 --port 8150`.
 
 The original 64 GiB grant was superseded after switch overlap exhausted unified
-memory on both Sparks. The 16 GiB grant is the qualified lab recipe, not dynamic
+memory on both hosts. The 16 GiB grant is the qualified lab recipe, not dynamic
 admission: F1 still uses synthetic capacity observations. Host-capacity-based
 sizing and fail-fast diagnostics remain required F2 work.
 
@@ -47,7 +47,7 @@ sizing and fail-fast diagnostics remain required F2 work.
 
 Executed via `~/mllm-qual/live-run.sh` → `cargo test --release -p mllm-cli --test
 live_spark live_restart_only` (evidence: this file + `~/mllm-qual/live-out.log`
-on the Spark):
+on the host):
 
 - **Cold init to READY: 62.7s** (deploy → spawn → weight load → API server up →
   mllm readiness via `/v1/models` serving the route id — liveness ≠ readiness).
@@ -62,7 +62,7 @@ on the Spark):
   stage (see open items).
 
 Live-loop fixes captured during qualification (all committed):
-`--kv-cache-memory` explicit grant (unified-memory heuristic fails on GB10),
+`--kv-cache-memory` explicit grant (unified-memory heuristic fails on unified-memory host),
 `--served-model-name` (served id must match the route id), CRLF SSE normalization,
 stream-always internal path, utilization-gate lowering, ninja/venv PATH injection,
 pre-listen unreachability = Initializing (not crash), engine log capture.
@@ -72,7 +72,7 @@ pre-listen unreachability = Initializing (not crash), engine log capture.
 The initial correctness results below used the default loader. A subsequent
 **host-a-only eager-loader qualification** reduced median wake-to-response to
 7.5s while preserving deep park, at about 8 GiB extra temporary loading memory.
-See [the matched measurements and limits](spark-deep-wake-optimization.md).
+See [the matched measurements and limits](deep-wake-optimization.md).
 
 **PASSED live (2026-09-12): three level-2 park/reload cycles with authenticated
 routed inference after every reload, stock switching, default denial, and
@@ -143,9 +143,9 @@ automatic production recovery from Failed.
 
 | Claim | Tier | Evidence |
 |---|---|---|
-| deploy → READY cycle (cold + warm) | live (Spark) | this file §3; test `live_restart_only_qualification` PASSED |
-| real inference through mllm | live (Spark) | chat response recorded above |
-| engine stop → process group terminated | live (Spark) | `/proc/<pid>` verified gone |
+| deploy → READY cycle (cold + warm) | live (host) | this file §3; test `live_restart_only_qualification` PASSED |
+| real inference through mllm | live (host) | chat response recorded above |
+| engine stop → process group terminated | live (host) | `/proc/<pid>` verified gone |
 | switching A→B→A live | live (host-b) | §4; `live_switch_restart_only` PASSED |
 | park/reload cycles (core feature) live | live (host-a) | §4; three cycles with authenticated routed inference PASSED |
 | T21 default-denial live | live (host-a) | §4; profile rejected before spawn |

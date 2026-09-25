@@ -12,9 +12,9 @@
 #   roles.sh host-up <host> [--debug-engine-logs] | host-down <host> [SIG]
 #   roles.sh host-up-systemd <host> | host-down-systemd <host>   ADR 0018 (ENG1): host role in a transient user unit
 #   roles.sh wait-online [timeout]     poll list hosts until both are online and reconciled
-#   roles.sh fixtures [gen_deployment args]   all <v|s><92|17>-<model> fixtures for this run
+#   roles.sh fixtures [gen_deployment args]   all <v|s><a|b>-<model> fixtures for this run
 #
-# Hosts: host-a, host-b. DRY_RUN=1 prints the plan only.
+# Hosts: a or b (HOST_A, HOST_B from hosts.local.env). DRY_RUN=1 prints the plan only.
 . "$(dirname "$0")/lib.sh"
 
 usage() { sed -n '2,16p' "$0"; exit 2; }
@@ -200,6 +200,12 @@ fixtures() {
 }
 
 cmd=${1:-}; shift || true
+# Host commands take the code a or b, or a configured host name.
+case $cmd in
+  host-init|host-doc|host-doc-bare|enroll|host-up|host-down|host-up-systemd|host-down-systemd)
+    [ $# -ge 1 ] || usage
+    _h=$(resolve_host "$1"); shift; set -- "$_h" "$@" ;;
+esac
 case $cmd in
   up)
     policy=${1:-normal}

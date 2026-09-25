@@ -2,7 +2,7 @@
 # ENG2 (ADR 0018 §5): standalone with MLLM_VLLM_BIN and MLLM_SGLANG_BIN both
 # set (refused before) publishes local-vllm and local-sglang, and serves a
 # deployment on each in turn:
-#   run_row.sh ENG2 --no-e0 -- host-a
+#   run_row.sh ENG2 --no-e0 -- a
 #
 # Expected:
 #   a  the role starts; engine list shows local-vllm and local-sglang,
@@ -91,32 +91,34 @@ eng2_argv() { # eng2_argv <host>: the running vLLM api process's argv tail (no c
 }
 
 row_main() {
-  local host=$1 rc=0
+  local host
+  host=$(resolve_host "$1") || return 1
+  local rc=0
   step before host_idle "$host" || return 1
   step config-home-free eng2_config_home_free "$host" || return 1
   step matrix-host-down "$MATRIX_DIR/roles.sh" host-down "$host" || return 1
   step start eng2_start "$host" || { rc=1; }
   step list eng2_list "$host" || rc=1
   step env-remove-refused refused_with invalid_config rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine remove local-vllm" || rc=1
-  step serve-local-vllm eng2_serve "$host" v92-4 lv local-vllm --engine-config-json '{"context_length": null}' || rc=1
+  step serve-local-vllm eng2_serve "$host" va-4 lv local-vllm --engine-config-json '{"context_length": null}' || rc=1
   step argv-local-vllm eng2_argv "$host"
-  step infer-local-vllm eng2_infer "$host" v92-4-lv || rc=1
-  step delete-local-vllm eng2_delete "$host" v92-4-lv || rc=1
-  step serve-local-sglang eng2_serve "$host" s92-4 ls local-sglang || rc=1
-  step infer-local-sglang eng2_infer "$host" s92-4-ls || rc=1
-  step delete-local-sglang eng2_delete "$host" s92-4-ls || rc=1
+  step infer-local-vllm eng2_infer "$host" va-4-lv || rc=1
+  step delete-local-vllm eng2_delete "$host" va-4-lv || rc=1
+  step serve-local-sglang eng2_serve "$host" sa-4 ls local-sglang || rc=1
+  step infer-local-sglang eng2_infer "$host" sa-4-ls || rc=1
+  step delete-local-sglang eng2_delete "$host" sa-4-ls || rc=1
   step add-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine add $(vllm_venv "$host")/bin/vllm --name vllm-reg" || rc=1
   step list-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list" || rc=1
-  step serve-registered eng2_serve "$host" v92-4 reg vllm-reg || rc=1
+  step serve-registered eng2_serve "$host" va-4 reg vllm-reg || rc=1
   step argv-registered eng2_argv "$host"
-  step infer-registered eng2_infer "$host" v92-4-reg || rc=1
-  step delete-registered eng2_delete "$host" v92-4-reg || rc=1
+  step infer-registered eng2_infer "$host" va-4-reg || rc=1
+  step delete-registered eng2_delete "$host" va-4-reg || rc=1
   # No context length and no --max-model-len default: the model's own limit.
-  step serve-registered-noctx eng2_serve "$host" v92-4 regnc vllm-reg --engine-config-json '{"context_length": null}'
+  step serve-registered-noctx eng2_serve "$host" va-4 regnc vllm-reg --engine-config-json '{"context_length": null}'
   step argv-registered-noctx eng2_argv "$host"
-  step infer-registered-noctx eng2_infer "$host" v92-4-regnc
+  step infer-registered-noctx eng2_infer "$host" va-4-regnc
   step reason-registered-noctx eng2_engine_reason "$host"
-  step delete-registered-noctx eng2_delete "$host" v92-4-regnc || rc=1
+  step delete-registered-noctx eng2_delete "$host" va-4-regnc || rc=1
   step stop eng2_stop "$host" || rc=1
   step engines-file-removed rsh "$host" "rm -f \$HOME/.config/mllm/engines.yaml \$HOME/.config/mllm/engines.yaml.lock" || rc=1
   step idle host_idle "$host" || rc=1

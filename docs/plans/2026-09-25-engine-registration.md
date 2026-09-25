@@ -6,11 +6,11 @@
 
 **Tech Stack:** Rust 2021 workspace (tokio, tonic/prost, axum, rusqlite, clap, serde_json, saphyr-parser strict YAML), bash live harness under `scripts/live/matrix/`.
 
-**Spec:** `docs/superpowers/specs/2026-09-25-engine-registration-design.md` (owner-approved, merged in d067252; revised in this PR with the owner's 2026-09-25 decisions). Read it with this plan. Governing documents: `docs/SPEC.md` (§4.2, §13, §14, §15), ADR 0008, ADR 0012, ADR 0017, and `AGENTS.md`.
+**Spec:** `docs/specs/2026-09-25-engine-registration-design.md` (owner-approved, merged in d067252; revised in this PR with the owner's 2026-09-25 decisions). Read it with this plan. Governing documents: `docs/SPEC.md` (§4.2, §13, §14, §15), ADR 0008, ADR 0012, ADR 0017, and `AGENTS.md`.
 
 ## Decisions (owner-decided 2026-09-25)
 
-The owner reviewed the first version of this plan on PR #22 and decided the items below on 2026-09-25. Items 1, 2, 4, 8 and 14 changed the design; the spec (`docs/superpowers/specs/2026-09-25-engine-registration-design.md`) is updated in the same PR. One item still needs the owner: **20**, marked **owner check**.
+The owner reviewed the first version of this plan on PR #22 and decided the items below on 2026-09-25. Items 1, 2, 4, 8 and 14 changed the design; the spec (`docs/specs/2026-09-25-engine-registration-design.md`) is updated in the same PR. One item still needs the owner: **20**, marked **owner check**.
 
 1. **`host.yaml` is never rewritten.** Registered engines live in a separate, mllm-owned file, `engines.yaml`, merged with the role's own document at load. A profile name declared in both is refused (at role start, and by `engine add` as `profile_exists`). There is no rewrite of the role document, no `.before-engine-registration` backup and no SPEC §15.1 rewrite exception; ADR 0018 instead adds the engines file to the §15.1 authority table. `engines.yaml` is `schema_version: 1`, `kind: engines`, `runtime_profiles: {…}`, mode 0600, written as JSON-shaped YAML.
 2. **Where `engines.yaml` lives.** It sits beside the role's configuration file, with the same rule for both roles: `--config dir/x.yaml` (or `$MLLM_CONFIG`) means `dir/engines.yaml`; without one it is `~/.config/mllm/engines.yaml` (`$XDG_CONFIG_HOME/mllm/engines.yaml`) for a host and for standalone alike. The generated standalone document stays in the state directory. Consequence: a host and a standalone role that both run with implicit documents on one machine would share one engines file; the CLI refuses that ambiguity and asks for `--config`.
@@ -44,7 +44,7 @@ The owner reviewed the first version of this plan on PR #22 and decided the item
 - The deep-park protections of ADR 0012 are unchanged: loopback-only engine listener, per-launch engine key, key-guard middleware, no engine control path through host ingress or the router.
 - Additive protocol only: no field renumbered, command encoding version stays `"1"`, `PROTOCOL_VERSION` stays `"2"` (ADR 0017).
 - Store schema moves from v34 to v35, forward-only.
-- No new venvs and no environment changes on the Sparks; live rows use only `$HOME/mllm-vllm-venv2` (host-a), `$HOME/mllm-vllm-0.29-venv` (host-b) and `$HOME/mllm-sglang-0.5.20-venv` (both).
+- No new venvs and no environment changes on the hosts; live rows use only `$HOME/mllm-vllm-venv2` (host-a), `$HOME/mllm-vllm-0.29-venv` (host-b) and `$HOME/mllm-sglang-0.5.20-venv` (both).
 - CPU and Fake-engine tests are not qualification; the live rows ENG1–ENG4 are. Say so in every status claim.
 - Verification before every commit: the core suite
   `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`,
@@ -97,7 +97,7 @@ Modified files (main ones; each task lists exact lines):
 | File | Change |
 |---|---|
 | `docs/SPEC.md` | "Amended by ADR 0018" notes in §4.2 and §15.1 (engines file row). |
-| `docs/superpowers/specs/2026-09-25-engine-registration-design.md` | Updated in this PR with the owner's 2026-09-25 decisions. |
+| `docs/specs/2026-09-25-engine-registration-design.md` | Updated in this PR with the owner's 2026-09-25 decisions. |
 | `crates/mllm-config/src/lib.rs`, `effective.rs` | Export `registration`; `check_runtime_profile`. |
 | `crates/mllm-config/src/schema.rs`, `remote_roles.rs` | `ConfigKind::Engines`; `HostConfig::load` merges `engines.yaml`. |
 | `crates/mllm-protocol/proto/mllm/management/v1/management.proto`, `src/capabilities.rs`, `tests/version_skew.rs` | New messages and capability. |
@@ -138,7 +138,7 @@ Task order and dependencies: 1 (ADR) → 2, 3 (config) → 4, 5 (agent engine di
 never rewritten).
 **Related:** ADR 0008 (engine installations, fingerprints, capability probes), ADR 0012
 (deep parking default-on), ADR 0017 (capability gating). Design:
-`docs/superpowers/specs/2026-09-25-engine-registration-design.md`.
+`docs/specs/2026-09-25-engine-registration-design.md`.
 
 ## Context
 
@@ -716,7 +716,7 @@ In `crates/mllm-config/src/remote_roles.rs`, beside `parse`:
 
 In `crates/mllm-cli/src/remote_roles.rs`, `start host` (`:879-881`) becomes `serve_host(HostConfig::load(&path).map_err(|e| error(&format!("Invalid host configuration: {}: {}", e.path, e.detail)))?)` (keep `read_config(&path)?` before it for the existing size and file checks), and `join host` (`:890`) uses `HostConfig::load(&path)` the same way.
 
-Note for the implementer: `std::fs::File::lock` is stable since Rust 1.89 (the toolchain is 1.98). `O_NOFOLLOW` differs between x86_64 and aarch64 (the Sparks), so it comes from `libc`, never a literal.
+Note for the implementer: `std::fs::File::lock` is stable since Rust 1.89 (the toolchain is 1.98). `O_NOFOLLOW` differs between x86_64 and aarch64 (the hosts), so it comes from `libc`, never a literal.
 
 - [ ] **Step 5: Run the tests to verify they pass.**
 
@@ -1552,7 +1552,7 @@ fn detection_finds_the_documented_locations_and_runs_nothing() {
 }
 
 // T07 T37 (owner decision 2026-09-25): environments directly in the home
-// directory (the Sparks' `~/mllm-vllm-venv2` layout) are found without
+// directory (the hosts' `~/mllm-vllm-venv2` layout) are found without
 // `--path`, one level deep and only when they carry `pyvenv.cfg`.
 #[test]
 fn home_level_environments_are_found_without_a_path() {
@@ -6478,7 +6478,7 @@ One deliverable: everything the live qualification needs, plus the operator docu
 }
 
 # ADR 0018 (row ENG4): one host may run another binary than the rest, e.g. an
-# rc.3 agent beside new ones. MLLM_REMOTE_BIN_92 / MLLM_REMOTE_BIN_17 override
+# rc.3 agent beside new ones. MLLM_REMOTE_BIN_a / MLLM_REMOTE_BIN_b override
 # RBIN for that host only.
 rbin() { # rbin <host>
   local var
@@ -6517,8 +6517,8 @@ In `host_doc`, pass `${NO_PROFILES:+--no-profiles}` to `gen_host_doc.py`, and ad
 # ENG1 (ADR 0018 §1, §3): engine add of the existing vLLM and SGLang
 # environments on a host running under systemd, published live, then a
 # deployment on each new profile serves:
-#   run_row.sh ENG1 --tag 92 -- host-a v92-4 s92-4
-#   run_row.sh ENG1 --tag 17 -- host-b v17-4 s17-4
+#   run_row.sh ENG1 --tag a -- a va-4 sa-4
+#   run_row.sh ENG1 --tag b -- b vb-4 sb-4
 #
 # Expected:
 #   a  engine detect (no --path) lists both home-level environments
@@ -6630,7 +6630,7 @@ row_main() {
 # ENG3 (ADR 0018 §4): removing a published profile is refused while a
 # deployment uses it, then --drain stops it through the ordinary path and
 # removes the profile only on stop evidence:
-#   run_row.sh ENG3 --tag 92 -- host-a v92-4
+#   run_row.sh ENG3 --tag a -- a va-4
 #
 # Expected:
 #   a  engine remove vllm while the deployment is Ready exits 20 naming it;
@@ -6673,7 +6673,7 @@ row_main() {
 # ENG2 (ADR 0018 §5): standalone with MLLM_VLLM_BIN and MLLM_SGLANG_BIN both
 # set (refused before) publishes local-vllm and local-sglang, and serves a
 # deployment on each in turn:
-#   run_row.sh ENG2 --no-e0 -- host-a
+#   run_row.sh ENG2 --no-e0 -- a
 #
 # Expected:
 #   a  the role starts; engine list shows local-vllm and local-sglang,
@@ -6737,7 +6737,7 @@ row_main() {
 # shellcheck shell=bash
 # ENG4 (ADR 0018 §3, owner decision 2026-09-25): engine add beside an rc.3 agent, and a
 # new agent against an rc.3 server:
-#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- host-b
+#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- b
 #
 # Preconditions (checked, never installed or downloaded): MLLM_RC3_LOCAL
 # (control-host) and MLLM_RC3_REMOTE (on the host) are existing rc.3 binaries whose
@@ -6814,7 +6814,7 @@ row_main() {
 Run: `for r in ENG1 ENG2 ENG3 ENG4; do bash -n scripts/live/matrix/rows/$r.sh || exit 1; done && shellcheck scripts/live/matrix/rows/ENG*.sh scripts/live/matrix/lib.sh scripts/live/matrix/roles.sh && python3 -m py_compile scripts/live/matrix/gen_host_doc.py`
 Expected: no errors (install `shellcheck` locally if missing; skip it only with a note in the commit message).
 
-Run: `scripts/live/matrix/run_row.sh ENG1 --dry-run --tag 92 -- host-a v92-4 s92-4` (and ENG2–ENG4 likewise, ENG4 with `MLLM_RC3_LOCAL=/bin/true MLLM_RC3_REMOTE=/bin/true`)
+Run: `scripts/live/matrix/run_row.sh ENG1 --dry-run --tag a -- a va-4 sa-4` (and ENG2–ENG4 likewise, ENG4 with `MLLM_RC3_LOCAL=/bin/true MLLM_RC3_REMOTE=/bin/true`)
 Expected: each writes `target/live/matrix/dry-run/ENG*/commands.log` and contacts no host.
 
 - [ ] **Step 7: Operator guide.** Add to `docs/operations/install.md` a section:

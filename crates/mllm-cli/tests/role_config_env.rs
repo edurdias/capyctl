@@ -1,4 +1,4 @@
-//! ADR 0018 §2 (controller ruling 2026-09-25): a role resolves its role
+//! ADR 0018 §2 (review decision 2026-09-25): a role resolves its role
 //! document and its engines file by the same rule as `mllm engine`:
 //! `--config`, else `$MLLM_CONFIG`, names the document and the engines file
 //! sits beside it; with neither, the engines file is

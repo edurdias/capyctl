@@ -190,7 +190,7 @@ async fn add_without_a_running_role_is_agent_unreachable() {
     assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 
-// T02 T07 (controller ruling 2026-09-25): `engine add` before any role has
+// T02 T07 (review decision 2026-09-25): `engine add` before any role has
 // ever started is the first run. On a fresh HOME with no state directory and
 // no role document it creates the state root owner-only, writes engines.yaml
 // where `start standalone` reads it, and reports agent_unreachable.
@@ -564,7 +564,7 @@ fn list_engines_goes_to_the_server() {
     }));
 }
 
-// T37 (ADR 0018 §4; controller ruling I4): a remove the role took but never
+// T37 (ADR 0018 §4; review decision I4): a remove the role took but never
 // answered (it closed the connection, or the bound passed) is reported as an
 // unknown outcome that `mllm engine list` settles, never as "nothing was
 // removed"; engines.yaml is not touched.
@@ -657,7 +657,7 @@ fn remove_vllm() -> Command {
     }
 }
 
-// T16 (ADR 0018 §4; controller ruling C1): the CLI is the only writer of
+// T16 (ADR 0018 §4; review decision C1): the CLI is the only writer of
 // engines.yaml. It asks the role to retire the profile, and only after the
 // confirmation writes the file (keeping its mode) and asks for the reload.
 #[tokio::test]
@@ -701,7 +701,7 @@ async fn remove_retires_then_writes_and_reloads() {
     stop.send(true).unwrap();
 }
 
-// T16 T32 (controller rulings C1, I1): a remove whose confirmation came but
+// T16 T32 (review decisions C1, I1): a remove whose confirmation came but
 // whose publication did not (the file is already written) is finished by
 // running it again: the role still publishes the profile, the retry resumes
 // the retirement, and the reload publishes the removal. A name neither

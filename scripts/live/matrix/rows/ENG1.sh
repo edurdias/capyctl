@@ -2,8 +2,8 @@
 # ENG1 (ADR 0018 §1, §3): engine add of the existing vLLM and SGLang
 # environments on a host running under systemd, published live, then a
 # deployment on each new profile serves:
-#   run_row.sh ENG1 --tag 92 -- host-a v92-4 s92-4
-#   run_row.sh ENG1 --tag 17 -- host-b v17-4 s17-4
+#   run_row.sh ENG1 --tag a -- a va-4 sa-4
+#   run_row.sh ENG1 --tag b -- b vb-4 sb-4
 #
 # Expected:
 #   a  engine detect (no --path) lists both home-level environments
@@ -91,7 +91,9 @@ eng_serves() { # eng_serves <fixture>
 }
 
 row_main() {
-  local host=$1 vfix=$2 sfix=$3 rc=0
+  local host
+  host=$(resolve_host "$1") || return 1
+  local vfix=$2 sfix=$3 rc=0
   step before host_idle "$host" || return 1
   step bare-systemd eng_bare_systemd "$host" || return 1
   step host-yaml-before rsh "$host" "sha256sum $RRD/host.yaml > $RRD/host-yaml.sum" || rc=1

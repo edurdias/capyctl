@@ -1009,7 +1009,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 "host"
             };
-            // ADR 0018 §2 (controller ruling 2026-09-25): a host's document is
+            // ADR 0018 §2 (review decision 2026-09-25): a host's document is
             // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`.
             let named = if *role == Role::Host {
                 crate::engine::named_role_document(invocation.config.as_deref(), &role_env)

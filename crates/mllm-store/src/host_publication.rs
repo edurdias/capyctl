@@ -237,7 +237,7 @@ impl Store {
                 return Err(RepublishRefusal::NotRetired(dropped));
             }
         }
-        // ADR 0018 §4 (controller ruling I1): as at startup, an accepted
+        // ADR 0018 §4 (review decision I1): as at startup, an accepted
         // publication clears the confirmed retirement of every profile it
         // does not list, dropped now or earlier; one it still lists stays.
         clear_unlisted_confirmed(&tx, &publication.host_id, &config.document)?;

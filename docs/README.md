@@ -35,8 +35,8 @@ in what order.
 | [`design/milestones/`](design/milestones/) | Milestone designs and plans (F0 foundation, F1 vLLM path, F2 SGLang and the two-host program). |
 | [`runbooks/f2-current-status.md`](runbooks/f2-current-status.md) | The single status record: what is done, what remains and what is queued next. |
 | [`runbooks/`](runbooks/) | Operational records kept by the maintainers: live-run evidence, engine environment notes and the carried [vLLM development-mode warning](runbooks/vllm-development-mode-warning.md). |
-| [`superpowers/plans/`](superpowers/plans/) | Implementation plans, one per slice of work. |
-| [`superpowers/specs/`](superpowers/specs/) | Design notes for individual features written ahead of their plans. |
+| [`plans/`](plans/) | Implementation plans, one per slice of work. |
+| [`specs/`](specs/) | Design notes for individual features written ahead of their plans. |
 
 The milestone, runbook and plan documents are working records. Most describe
 the state of the work when they were written; the spec and the status runbook

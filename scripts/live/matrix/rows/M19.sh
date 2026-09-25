@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M19 + M22 (T22, T26, T16) with co-residence fixtures (owner decision 2026-09-23):
-# vLLM and SGLang co-resident on one GB10.
-#   run_row.sh M19 --tag 92 -- v92-14 s92-4
+# vLLM and SGLang co-resident on one unified-memory host.
+#   run_row.sh M19 --tag a -- va-14 sa-4
 #
 # Expected: both `-co` variants Ready on the same host at once (two reservations
 # within the managed limit, distinct ports, distinct owned process groups);
@@ -10,7 +10,7 @@
 # reservation is released after absence proof (M22); then the second stops clean.
 
 row_main() {
-  local a=${1:?first fixture, e.g. v92-14} b=${2:?second fixture, e.g. s92-4} host rc=0 da db
+  local a=${1:?first fixture, e.g. va-14} b=${2:?second fixture, e.g. sa-4} host rc=0 da db
   host=$(fixture_host "$a")
   da=$a-co; db=$b-co
   step before host_idle "$host" || return 1

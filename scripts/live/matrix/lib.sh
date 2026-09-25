@@ -17,24 +17,40 @@ RUNSTATE=$LIVE/run
 SNAPSHOT=$LIVE/snapshot
 DRY_RUN=${DRY_RUN:-0}
 
-# Machines. Addresses are the Tailscale 100.64/10 addresses recorded in the
-# Phase B host documents (target/live/phase-b/host-b-*.yaml).
-REMOTE_HOME=${MLLM_REMOTE_HOME:-$HOME}
+die() { echo "matrix: $*" >&2; exit 2; }
+
+# Machines come from an untracked local file so that no lab-specific host name,
+# address or path lives in the tree. hosts.example.env documents every variable;
+# copy it to hosts.local.env and fill it in. MLLM_MATRIX_HOSTS_ENV points at
+# another file.
+HOSTS_ENV=${MLLM_MATRIX_HOSTS_ENV:-$MATRIX_DIR/hosts.local.env}
+[ -f "$HOSTS_ENV" ] || die "missing $HOSTS_ENV: copy $MATRIX_DIR/hosts.example.env to hosts.local.env and set the lab's hosts"
+# shellcheck disable=SC1090
+. "$HOSTS_ENV"
+for _v in HOST_A HOST_B CONTROL_HOST HOST_A_ADDR HOST_B_ADDR CONTROL_HOST_ADDR \
+  REMOTE_HOME SGLANG_VENV_DIR HOST_A_VLLM_VENV_DIR HOST_B_VLLM_VENV_DIR; do
+  [ -n "${!_v:-}" ] || die "$HOSTS_ENV does not set $_v (see hosts.example.env)"
+done
+unset _v
+[ "$HOST_A" != "$HOST_B" ] || die "HOST_A and HOST_B must differ"
+export HOST_A HOST_B
+
+REMOTE_HOME=${MLLM_REMOTE_HOME:-$REMOTE_HOME}
 # MLLM_REMOTE_TREE lets a second worktree keep its own tree and binary on the
-# Sparks (the 2026-09-24 soak ran from ~/mllm-soak beside another agent's tree).
+# hosts (the 2026-09-24 soak ran from ~/mllm-soak beside another tree).
 REMOTE_TREE=${MLLM_REMOTE_TREE:-$REMOTE_HOME/mllm-f2}
-SERVER_IP=${MLLM_SERVER_IP:-100.64.0.20}
-MATRIX_HOSTS=(host-a host-b)
+SERVER_IP=${MLLM_SERVER_IP:-$CONTROL_HOST_ADDR}
+MATRIX_HOSTS=("$HOST_A" "$HOST_B")
 MODELS_ROOT=$REMOTE_HOME/models
-SGLANG_VENV=$REMOTE_HOME/mllm-sglang-0.5.20-venv
+export MODELS_ROOT
+SGLANG_VENV=$REMOTE_HOME/$SGLANG_VENV_DIR
 INGRESS_PORT=9443
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # Pattern bracketed so it cannot match its own argv: the pre-flight arrives on the
-# Spark as `bash -lc '... pgrep -af "..." ...'` (and Tailscale SSH's wrapper carries
+# host as `bash -lc '... pgrep -af "..." ...'` (and Tailscale SSH's wrapper carries
 # the same string), so a plain pattern would match the command asking the question.
 ENGINE_PGREP='sglang[.]launch_server|sglang_entr[y]|vllm_entr[y]|vllm[ ]serve|Engine[C]ore|sglang::schedule[r]'
 
-die() { echo "matrix: $*" >&2; exit 2; }
 dry() { [ "$DRY_RUN" = 1 ]; }
 # control-host's date is uutils, whose %3N is not zero-padded; bash's clock is exact.
 now() { local t=$EPOCHREALTIME; TZ=UTC printf '%(%Y-%m-%dT%H:%M:%S)T.%.3sZ\n' "${t%.*}" "${t#*.}"; }
@@ -42,23 +58,28 @@ now_ms() { local t=$EPOCHREALTIME; echo $(( ${t%.*} * 1000 + 10#${t#*.} / 1000 )
 
 host_ip() {
   case $1 in
-    host-a) echo 100.64.0.10 ;;
-    host-b) echo 100.64.0.11 ;;
+    "$HOST_A") echo "$HOST_A_ADDR" ;;
+    "$HOST_B") echo "$HOST_B_ADDR" ;;
     *) die "unknown host $1" ;;
   esac
 }
+# Fixture and run-state code of a host: a for HOST_A, b for HOST_B.
 host_short() {
-  case $1 in host-a) echo 92 ;; host-b) echo 17 ;; *) die "unknown host $1" ;; esac
+  case $1 in "$HOST_A") echo a ;; "$HOST_B") echo b ;; *) die "unknown host $1" ;; esac
 }
 short_host() {
-  case $1 in 92) echo host-a ;; 17) echo host-b ;; *) die "unknown host code $1" ;; esac
+  case $1 in a) echo "$HOST_A" ;; b) echo "$HOST_B" ;; *) die "unknown host code $1" ;; esac
 }
-# The host-b vLLM environment is the byte-identical copy the owner authorized on
-# 2026-09-22; host-b's older vLLM environments are never used.
+# A row's host argument: the code a or b, or a configured host name.
+resolve_host() {
+  case $1 in a|b) short_host "$1" ;; "$HOST_A"|"$HOST_B") echo "$1" ;; *) die "unknown host $1 (use a, b, $HOST_A or $HOST_B)" ;; esac
+}
+# Each host's vLLM environment. Only the environments the owner authorized are
+# named in hosts.local.env; no other environment on a host is used.
 vllm_venv() {
   case $1 in
-    host-a) echo "$REMOTE_HOME/mllm-vllm-venv2" ;;
-    host-b) echo "$REMOTE_HOME/mllm-vllm-0.29-venv" ;;
+    "$HOST_A") echo "$REMOTE_HOME/$HOST_A_VLLM_VENV_DIR" ;;
+    "$HOST_B") echo "$REMOTE_HOME/$HOST_B_VLLM_VENV_DIR" ;;
     *) die "unknown host $1" ;;
   esac
 }
@@ -79,7 +100,7 @@ x() {
   "$@"
 }
 
-# Run a script on a Spark in a login shell (PATH then includes ~/.local/bin).
+# Run a script on a host in a login shell (PATH then includes ~/.local/bin).
 rsh() {
   local host=$1 script=$2
   log_cmd "$host" "$script"
@@ -120,7 +141,7 @@ load_run() {
     die "no run: start one with roles.sh up (or roles.sh server-init)"
   fi
   LRD=${MLLM_LOCAL_RUN_ROOT:-$HOME/mllm-runs/$RUN}         # control-host run root (server state, private)
-  RRD=${MLLM_REMOTE_RUN_ROOT:-$REMOTE_HOME/mllm-runs/$RUN}  # Spark run root (host state, private)
+  RRD=${MLLM_REMOTE_RUN_ROOT:-$REMOTE_HOME/mllm-runs/$RUN}  # host run root (host state, private)
   SERVER_CFG=$LRD/server.yaml
   SERVER_DB=$LRD/server/srv.sqlite3
   # Release validation (MLLM_LOCAL_BIN / MLLM_REMOTE_BIN, e.g. ~/.local/bin/mllm
@@ -131,7 +152,7 @@ load_run() {
 }
 
 # ADR 0018 (row ENG4): one host may run another binary than the rest, e.g. an
-# rc.3 agent beside new ones. MLLM_REMOTE_BIN_92 / MLLM_REMOTE_BIN_17 override
+# rc.3 agent beside new ones. MLLM_REMOTE_BIN_a / MLLM_REMOTE_BIN_b override
 # RBIN for that host only.
 rbin() { # rbin <host>
   local var
@@ -171,7 +192,7 @@ host_id() {
 }
 
 # Tree digest over a directory: every regular file except build output, VCS,
-# process artifacts, logs and bytecode, by relative path. The same function runs
-# locally over the snapshot and remotely over ~/mllm-f2, so equality proves the
-# Spark builds exactly the snapshot.
-TREE_DIGEST_SH='find . \( -name target -o -name .git -o -name .superpowers -o -name __pycache__ \) -prune -o -type f ! -name "*.log" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64'
+# hidden directories (local working notes), logs and bytecode, by relative path.
+# The same function runs locally over the snapshot and remotely over ~/mllm-f2,
+# so equality proves the host builds exactly the snapshot.
+TREE_DIGEST_SH='find . \( -name target -o -name .git -o \( -type d -name ".?*" \) -o -name __pycache__ \) -prune -o -type f ! -name "*.log" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64'

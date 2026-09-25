@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # M33 (T16): preinitialize starts, verifies and parks each deployment in turn:
-#   run_row.sh M33 [fixtures...]      default: s92-14 v92-4 (normal budget)
+#   run_row.sh M33 [fixtures...]      default: sa-14 va-4 (normal budget)
 #
 # Expected: each deployment deployed stopped, then `preinitialize deployment`
 # reaches `parked` without serving traffic (Ready is verified inside the operation,
@@ -10,7 +10,7 @@
 
 row_main() {
   local rc=0 d host fixtures=("$@")
-  [ ${#fixtures[@]} -gt 0 ] || fixtures=(s92-14 v92-4)
+  [ ${#fixtures[@]} -gt 0 ] || fixtures=(sa-14 va-4)
   host=$(fixture_host "${fixtures[0]}")
   step before host_idle "$host" || return 1
   for d in "${fixtures[@]}"; do

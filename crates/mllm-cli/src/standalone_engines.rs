@@ -1,7 +1,7 @@
 //! ADR 0018 §5: standalone's answers to `mllm engine add`, `remove` and
 //! `list`, in one process. Add re-reads engines.yaml, rebuilds the embedded
 //! host document and swaps it; remove retires through the store (the
-//! ordinary stop path when drained). Controller ruling C1: the role never
+//! ordinary stop path when drained). review decision C1: the role never
 //! writes engines.yaml; the CLI rewrites it once the retirement is confirmed
 //! and then asks for the reload. The standalone document is never written.
 //! Nothing here reaches an engine.
@@ -175,7 +175,7 @@ fn resolve(
 /// How often a running standalone expires abandoned retirements.
 pub const RETIREMENT_EXPIRY_TICK: Duration = Duration::from_secs(30);
 
-/// ADR 0018 §4, §5 (controller rulings I2, I3): at standalone's start, what a
+/// ADR 0018 §4, §5 (review decisions I2, I3): at standalone's start, what a
 /// server does at a host's start. A retirement abandoned past its deadline
 /// (the role stopped mid-drain) ends unconfirmed, and the embedded host's
 /// profiles are recorded as its publication, which keeps a profile it no
@@ -198,7 +198,7 @@ pub fn publish_at_start(
         .map_err(|_| "the embedded host's profiles could not be recorded".to_owned())
 }
 
-/// Controller ruling I2: while standalone runs, expire abandoned retirements
+/// review decision I2: while standalone runs, expire abandoned retirements
 /// as the server does before each placement, until `shutdown`.
 pub async fn expire_retirements(
     commands: CoordinatorCommands,
@@ -236,7 +236,7 @@ fn reload(
     if host.document_for(&named) == host.document() {
         return json!({"ok": true, "published": "unchanged"});
     }
-    // ADR 0018 §4 (controller ruling I3): the server's rule. A published
+    // ADR 0018 §4 (review decision I3): the server's rule. A published
     // profile leaves the embedded host only after its retirement was
     // confirmed; the previous publication stays otherwise.
     let profiles: Vec<String> = named.iter().map(|n| n.profile.clone()).collect();
@@ -343,7 +343,7 @@ impl StandaloneControl {
     /// ADR 0018 §4, phase one for `mllm engine remove`: retire `profile` if
     /// the embedded host publishes it. `{"retired": true}` once the store
     /// confirmed nothing uses it, `{"retired": false}` when it is not
-    /// published. Nothing is written here (controller ruling C1).
+    /// published. Nothing is written here (review decision C1).
     async fn retire_for_removal(&self, profile: &str, drain: bool) -> Value {
         if ENVIRONMENT_PROFILES.contains(&profile) {
             return refused(
@@ -358,7 +358,7 @@ impl StandaloneControl {
         if !self.host.profiles().iter().any(|p| p == profile) {
             return json!({"ok": true, "retired": false});
         }
-        // Controller ruling I1: a retirement already standing for the
+        // review decision I1: a retirement already standing for the
         // profile is resumed under its own key, so a retried remove finishes
         // it instead of conflicting.
         let key = format!("{}:{}", self.host_id, ulid::Ulid::new());

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M36 / M37 (T20, T33; W13): SIGKILL of the owned engine api process, per fixture:
-#   run_row.sh M36 --tag s92-14 -- s92-14
-#   run_row.sh M37 --tag v17-4 -- v17-4      (rows/M37.sh reuses this)
+#   run_row.sh M36 --tag sa-14 -- sa-14
+#   run_row.sh M37 --tag vb-4 -- vb-4      (rows/M37.sh reuses this)
 #
 # Expected: the host reports the exit; dispatch closes within seconds (routed
 # requests refused, never hung); status reads `failed`; the reservation stays until

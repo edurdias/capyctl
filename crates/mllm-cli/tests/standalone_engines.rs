@@ -139,7 +139,7 @@ async fn standalone_add_is_usable_without_restart() {
     let _ = app.shutdown().await;
 }
 
-// T16 T32 (ADR 0018 §4, §5; controller ruling C1): an unused registered
+// T16 T32 (ADR 0018 §4, §5; review decision C1): an unused registered
 // profile is retired without the role writing anything; the CLI's rewrite
 // and reload unpublish it; an environment profile cannot be removed; the
 // name can be registered again afterwards.
@@ -309,7 +309,7 @@ async fn ready_on(
     id
 }
 
-// T16 T32 (ADR 0018 §4, §5; controller ruling I3): after a drained removal
+// T16 T32 (ADR 0018 §4, §5; review decision I3): after a drained removal
 // the deployment that used the profile still exists, stopped; starting it
 // again must not place the removed engine on the embedded host.
 #[tokio::test]
@@ -362,7 +362,7 @@ async fn a_removed_profile_never_starts_again() {
     let _ = app.shutdown().await;
 }
 
-// T03 T16 (ADR 0018 §4, §5; controller ruling I3): engines.yaml losing a
+// T03 T16 (ADR 0018 §4, §5; review decision I3): engines.yaml losing a
 // published profile outside `engine remove` is not published by a reload:
 // the profile stays published until it is retired.
 #[tokio::test]
@@ -390,7 +390,7 @@ async fn a_reload_never_drops_a_published_profile() {
     let _ = app.shutdown().await;
 }
 
-// T32 (ADR 0018 §4; controller ruling I2): a retirement left standing by a
+// T32 (ADR 0018 §4; review decision I2): a retirement left standing by a
 // standalone that stopped mid-drain is expired once past its deadline, so the
 // profile is placeable again and not wedged.
 #[tokio::test]

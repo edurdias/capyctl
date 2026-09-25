@@ -197,7 +197,7 @@ simulator-tier only.
 
 ## 8. Spark environment contract and qualification sequence
 
-New runbook: `docs/runbooks/spark-vllm-env.md`. The operator executes the install; mllm
+New runbook: `docs/runbooks/vllm-env.md`. The operator executes the install; mllm
 installs nothing (T07). The contract pins:
 
 - A dedicated venv path with a pinned vLLM release (pip/uv install performed by the

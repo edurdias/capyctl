@@ -8,7 +8,7 @@
 
 **Implementation status:** All three checkpoints completed in `782a3f4`. One consolidated independent review passed specification and quality with no findings. Fresh root verification passed 27 observer tests and 509 existing Rust tests, plus both canonical Clippy checks. This closes only the CPU-tested observer prerequisite; downstream integration, isolated CUDA build, installed provenance and live qualification remain required.
 
-**Spec:** [F2 design](../../design/milestones/f2-sglang-design.md), §§3/6 and Q11; [F2B adapter plan](2026-09-12-f2b-sglang-adapter.md), selected recipe and allocator evidence requirements. The detailed source investigation is `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-7-memory-saver-observer-options.md`.
+**Spec:** [F2 design](../design/milestones/f2-sglang-design.md), §§3/6 and Q11; [F2B adapter plan](2026-09-12-f2b-sglang-adapter.md), selected recipe and allocator evidence requirements. The detailed source investigation was kept in local implementation notes.
 
 ## Global Constraints
 
@@ -19,7 +19,7 @@
 - Preserve `crates/mllm-cli/tests/live_interactive.rs`: never read, edit, stage, format, compile or run it.
 - Snapshot success is not a Park/Restore acknowledgement, qualification, complete process footprint, reservation release, or permission to dispatch.
 - Read the actual saver instance's `_binary_wrapper.cdll`; never load a second library to obtain a convenient symbol.
-- Count Spark physical capacity once. Saver, Torch and logical tensor observations can overlap and must not be added blindly.
+- Count host physical capacity once. Saver, Torch and logical tensor observations can overlap and must not be added blindly.
 - The selected SGLang recipe disables CPU backup. The generic observer reports backup state honestly; its recipe-level aggregation rejects enabled or present backup.
 
 ## Scope and fixed decisions

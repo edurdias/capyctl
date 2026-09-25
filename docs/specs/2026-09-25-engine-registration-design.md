@@ -302,7 +302,7 @@ CLI exit codes: 16 `engine_not_found` through 23 `not_interactive` in table orde
   (0700) directory — the role's service user under the system units — so
   `sudo mllm engine … --config /etc/mllm/host.yaml` reaches the intended role
   and nothing else.
-- The running role never writes `engines.yaml` (controller ruling C1); the
+- The running role never writes `engines.yaml` (review decision C1); the
   CLI is its only writer. `engines.yaml` and its lock are opened `O_NOFOLLOW`
   and, before any `fchown`, refused unless they are a regular file with
   exactly one link, owned by root or by the state-dir owner the write is for.

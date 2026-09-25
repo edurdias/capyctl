@@ -2,8 +2,8 @@
 # Snapshot, sync and build for the matrix (plan unit W2).
 #
 #   sync.sh snapshot        copy the worktree to target/live/matrix/snapshot/tree, record its digest
-#   sync.sh push [host..]   rsync the snapshot to ~/mllm-f2 on the Sparks and verify the digest there
-#   sync.sh build [host..]  build target/release/mllm from the snapshot on control-host and on the Sparks,
+#   sync.sh push [host..]   rsync the snapshot to ~/mllm-f2 on the hosts and verify the digest there
+#   sync.sh build [host..]  build target/release/mllm from the snapshot on control-host and on the hosts,
 #                           then scripts/check-release-clean.sh on every binary built
 #   sync.sh runtime [host..] resync only runtime/ and verify files and permissions
 #                           (development only: the matrix host documents declare
@@ -15,11 +15,11 @@
 # DRY_RUN=1 prints every command without running it.
 . "$(dirname "$0")/lib.sh"
 
-# Excluded from the snapshot: build output, VCS, process artifacts (owner rule),
-# logs and bytecode.
-SNAP_EXCLUDES=(--exclude target --exclude .git --exclude .superpowers
+# Excluded from the snapshot: build output, VCS, hidden directories (local
+# working notes, an owner rule), logs and bytecode.
+SNAP_EXCLUDES=(--exclude target --exclude .git --exclude '.*/'
   --exclude '*.log' --exclude __pycache__)
-# Files a Spark runtime directory must hold before any launch (WE2: vLLM runs
+# Files a host runtime directory must hold before any launch (WE2: vLLM runs
 # through vllm_entry.py; development mode loads mllm_vllm_guard.py; WE3 checkpoint
 # identity runs through pinned_file_observation.py; SGLang parking enrolls the
 # saver observation through sglang_observation_enrollment.py).
@@ -68,7 +68,7 @@ build() {
   # control-host: the server binary is built from the snapshot, not the live worktree.
   x cargo build --release --locked --bin mllm --manifest-path "$SNAPSHOT/tree/Cargo.toml" --target-dir "$LIVE/build"
   # The shipped binary carries no test engine (M75's other half); checked on the
-  # binary this build produced, as on each Spark below.
+  # binary this build produced, as on each host below.
   # shellcheck disable=SC2016  # $1 expands in the inner shell
   x env CARGO_TARGET_DIR="$LIVE/build" bash -c 'cd "$1" && bash scripts/check-release-clean.sh' _ "$SNAPSHOT/tree"
   if ! dry; then sha256sum "$LIVE/build/release/mllm" | tee "$RUNSTATE/binary-control-host.txt"; fi

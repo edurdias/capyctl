@@ -2,10 +2,10 @@
 # M69 (T33; G06, G15): SIGTERM the host-a host agent under load; restart it:
 # gates close, in-flight drains, exit 0, engines retained; Ready again only
 # after a fresh probe; the same engine processes serve.
-#   run_row.sh M69 -- v92-4
+#   run_row.sh M69 -- va-4
 . "$MATRIX_DIR/rows/M36.sh"
 row_main() {
-  local a=${1:-v92-4} ha rc=0 lpid
+  local a=${1:-va-4} ha rc=0 lpid
   ha=$(fixture_host "$a")
   step before host_idle "$ha" || return 1
   step deploy deploy "$a" --activate --wait || return 1

@@ -681,10 +681,10 @@ def first_hist(delta, names):
 
 def fixture_facts(fixture_path, name):
     facts = {"fixture": name}
-    m = re.match(r"^([vs])(92|17)-(\w+)", name or "")
+    m = re.match(r"^([vs])([ab])-(\w+)", name or "")
     if m:
         facts.update({"engine": {"v": "vllm", "s": "sglang"}[m.group(1)],
-                      "host": {"92": "host-a", "17": "host-b"}[m.group(2)], "model": m.group(3)})
+                      "host": {"a": os.environ.get("HOST_A", "host-a"), "b": os.environ.get("HOST_B", "host-b")}[m.group(2)], "model": m.group(3)})
     if fixture_path and os.path.exists(fixture_path):
         with open(fixture_path) as handle:
             doc = json.load(handle)

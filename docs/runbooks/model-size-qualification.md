@@ -2,7 +2,7 @@
 
 Started 2026-09-12. **4B and 14B passed zero-swap tests; 27B passed a bounded-swap diagnostic, not zero-swap qualification.**
 Do not infer larger-model support from a downloaded checkpoint or a recognized
-architecture. Spark host-b is reserved by its owner and is not used in this run.
+architecture. host-b is reserved by its owner and is not used in this run.
 
 ## Scope and fixed recipe
 
@@ -40,7 +40,7 @@ measurement: no cache-drop operation is performed.
 This workload differs from the earlier 8-token test: it adds an initial
 inference and explicit generation controls. Its 4B baseline is the comparison
 point for larger models; it does not replace the measurements in
-[the eager-loader optimization report](spark-deep-wake-optimization.md).
+[the eager-loader optimization report](deep-wake-optimization.md).
 
 ## Completed measurements
 

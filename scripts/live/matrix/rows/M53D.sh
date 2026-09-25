@@ -2,9 +2,9 @@
 # M53D (T20, W6; 2026-09-24): `delete deployment --stop` on a deployment whose
 # launch failed (bogus engine argument) is accepted and removes it; nothing is
 # left on the host or in the ledger (the deleted id's tombstone excepted).
-#   run_row.sh M53D --tag v17-4 -- v17-4
+#   run_row.sh M53D --tag vb-4 -- vb-4
 row_main() {
-  local b=${1:-v17-4} host rc=0 db depid
+  local b=${1:-vb-4} host rc=0 db depid
   host=$(fixture_host "$b"); db=$b-bad
   step before host_idle "$host" || return 1
   step variant-bad variant "$b" bad --engine-config-json '{"accept_extra_args": true, "extra_args": ["--moe-backend", "bogus-m53"]}' || return 1

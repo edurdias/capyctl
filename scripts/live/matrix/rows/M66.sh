@@ -5,9 +5,9 @@
 # (override with M66_PROMPT). After the delete the deployment has no status, so
 # cleanup is judged by the recorded identities being gone and the ledger
 # snapshot holding nothing for the deleted id (its tombstone excepted).
-#   run_row.sh M66 --tag s17-4 -- s17-4
+#   run_row.sh M66 --tag sb-4 -- sb-4
 row_main() {
-  local fix=${1:-s17-4} host rc=0 spid depid
+  local fix=${1:-sb-4} host rc=0 spid depid
   host=$(fixture_host "$fix")
   step before host_idle "$host" || return 1
   step deploy deploy "$fix" --activate --wait || return 1

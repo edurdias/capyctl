@@ -6,7 +6,7 @@
 
 **Tech Stack:** Existing Rust 2021, Axum 0.8, reqwest 0.12, serde, rusqlite 0.37, clap 4, Tokio, SHA-256. Add no browser/UI implementation.
 
-**Spec:** [F2 design](../../design/milestones/f2-sglang-design.md), §§3/5/7, Q1/Q9/Q10; depends on [A2d](2026-09-12-f2a2d-coordinator-integration.md).
+**Spec:** [F2 design](../design/milestones/f2-sglang-design.md), §§3/5/7, Q1/Q9/Q10; depends on [A2d](2026-09-12-f2a2d-coordinator-integration.md).
 
 ## Global Constraints
 
@@ -684,7 +684,7 @@ mllm update host host-a --resource-policy policy.yaml --expected-revision 1 --wa
   Only metadata/timing is recorded by default.
 - [ ] Exercise CLI against the real local management listener with fake engines:
   create/retry/start/park/prepare/stop/update/undeploy, attach/detach, conflict,
-  reconnect, and failed preparation. No Spark or GPU. Run:
+  reconnect, and failed preparation. No host or GPU. Run:
 
 ```bash
 cargo test -p mllm-cli --test grammar --test errors --test management --lib

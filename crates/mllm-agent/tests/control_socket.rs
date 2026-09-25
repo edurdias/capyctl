@@ -296,7 +296,7 @@ fn accepts_then_vanishes(path: &std::path::Path, delay: Duration) -> std::thread
     })
 }
 
-// T37 (ADR 0018 §3; controller ruling I4): a request the role received but
+// T37 (ADR 0018 §3; review decision I4): a request the role received but
 // never answered, whether it closed the connection or the bound passed, is
 // reported as unanswered, never as unreachable: its outcome is unknown.
 #[tokio::test]

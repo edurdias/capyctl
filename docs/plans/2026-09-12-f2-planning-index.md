@@ -1,6 +1,6 @@
 # F2 implementation planning index
 
-The [F2 spec](../../design/milestones/f2-sglang-design.md) is approved. The owner chose
+The [F2 spec](../design/milestones/f2-sglang-design.md) is approved. The owner chose
 to finish the implementation plans before starting production implementation.
 This index tracks that planning work; it is not an implementation or qualification claim.
 

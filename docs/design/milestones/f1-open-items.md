@@ -12,7 +12,7 @@ controller now retains Starting/Waking through readiness/restoration, and the
 vLLM adapter requires a confirmed post-reload cache reset. The reproduced
 workload passed 32/32 exact routed responses, including three eight-request
 automatic wake bursts, with one reload each and an unchanged engine PID.
-See [full comparison and limits](../../runbooks/spark-model-size-qualification.md#fix-and-routed-concurrency-retest).
+See [full comparison and limits](../../runbooks/model-size-qualification.md#fix-and-routed-concurrency-retest).
 
 This does not qualify arbitrary concurrency, streaming after this fix, or
 14B/27B after this fix. The earlier 14B smoke run passed; 27B passed only under
@@ -41,7 +41,7 @@ three level-2 park/reload cycles with authenticated routed inference after
 every reload, real lost-ack park injection, and T21 denial before engine spawn.
 The recipe remains vLLM 0.29.0 + Qwen3-4B, with 16 GiB KV and 4096 context.
 Commands, results, failed probes, timings, and machine-local evidence pointers
-for those four stages are recorded in `docs/runbooks/spark-qualification-f1.md` §4.
+for those four stages are recorded in `docs/runbooks/qualification-f1.md` §4.
 Later model-size and concurrency evidence is in the separate runbook linked above.
 
 ### 2. Park-based switching needs per-deployment ports (rescheduled to F2)
@@ -113,4 +113,4 @@ Historical merge verification follows.
   ADDRESSED in `334ebf8` with regression tests targeting the exact failure
   interleavings (join lost-wake, per-member park, double generation bump,
   orphan termination on timeout, stream-safe timeouts, router-tier wake join).
-- Live-tier claims live ONLY in `docs/runbooks/spark-qualification-f1.md`.
+- Live-tier claims live ONLY in `docs/runbooks/qualification-f1.md`.

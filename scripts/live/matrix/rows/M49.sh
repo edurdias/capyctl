@@ -74,13 +74,13 @@ row_main() {
   done < <(live_deployments)
   step ledger-empty ledger_empty || rc=1
   sleep 5
-  step final-92 host_final host-a || rc=1
-  step final-17 host_final host-b || rc=1
+  step final-a host_final "$HOST_A" || rc=1
+  step final-b host_final "$HOST_B" || rc=1
   snap final
   step roles-down "$MATRIX_DIR/roles.sh" down || rc=1
   step roles-exit roles_exit || rc=1
-  step after-92 host_idle host-a || rc=1
-  step after-17 host_idle host-b || rc=1
+  step after-a host_idle "$HOST_A" || rc=1
+  step after-b host_idle "$HOST_B" || rc=1
   step ledger-after ledger_empty || rc=1
   return "$rc"
 }

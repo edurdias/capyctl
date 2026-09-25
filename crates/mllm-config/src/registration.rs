@@ -268,7 +268,7 @@ pub fn write_engines(
     // SPEC §15.3: validate before side effects.
     EnginesFile::parse(&file.path, &text)?;
     let dir = file.path.parent().unwrap_or(Path::new("."));
-    // Controller ruling C1: a rewrite keeps the file's owner and mode (the
+    // review decision C1: a rewrite keeps the file's owner and mode (the
     // role reads it as its service user; the CLI may be running as root); a
     // new file goes to the lock's named owner, mode 0600.
     //

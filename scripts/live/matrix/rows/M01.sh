@@ -1,11 +1,11 @@
 # shellcheck shell=bash
-# M01 (T08, T37): server + host-a enrolled; deploy s92-4 --activate --wait;
+# M01 (T08, T37): server + host-a enrolled; deploy sa-4 --activate --wait;
 # one completion. Expected: Ready; routed 200 with the correct answer; one owned
 # process group. Evidence beyond E0: ownership record, ingress scope and
-# generation, I1. Leaves s92-4 stopped with verified cleanup.
+# generation, I1. Leaves sa-4 stopped with verified cleanup.
 
 row_main() {
-  local dep=s92-4
+  local dep=sa-4
   step deploy deploy "$dep" --activate --wait || return 1
   step status status_dep "$dep"
   step inspect inspect_dep "$dep"

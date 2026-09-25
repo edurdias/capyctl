@@ -387,7 +387,7 @@ async fn the_engines_listing_shows_published_profiles() {
     setup.worker.shutdown().await.unwrap();
 }
 
-// T16 T32 (controller ruling I1): a retried remove, under a new request key
+// T16 T32 (review decision I1): a retried remove, under a new request key
 // and without drain, resumes the draining retirement rather than being refused
 // as a conflict or cancelling it; its poll follows the standing retirement to
 // confirmation, and a later retry of the confirmed one confirms at once.

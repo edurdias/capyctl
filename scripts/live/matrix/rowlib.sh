@@ -26,7 +26,7 @@ fixture_file() { echo "$RUNSTATE/fixtures/$1${FIXTURE_VARIANT:+.$FIXTURE_VARIANT
 # Model key (4, 14, 27, 27f, 30), engine and host of a fixture name.
 fixture_model() { echo "${1#*-}"; }
 fixture_engine() { case ${1:0:1} in v) echo vllm ;; s) echo sglang ;; esac; }
-fixture_host() { short_host "$(echo "$1" | cut -c2-3)"; }
+fixture_host() { short_host "$(echo "$1" | cut -c2)"; }
 
 deploy() { # deploy <fixture> [--activate] [--wait] [--request-id ULID]
   local f=$1; shift
@@ -330,8 +330,8 @@ alive_check() {
   dry && return 0
   while read -r pid ticks boot hid; do
     h=$host
-    [ "$hid" = "${HOST_ID_92:-}" ] && h=host-a
-    [ "$hid" = "${HOST_ID_17:-}" ] && h=host-b
+    [ "$hid" = "${HOST_ID_a:-}" ] && h=$HOST_A
+    [ "$hid" = "${HOST_ID_b:-}" ] && h=$HOST_B
     probe=$(rsh "$h" "python3 $REMOTE_TREE/scripts/live/matrix/signal_owned.py --pid $pid --ticks $ticks --boot $boot --signal 0" || true)
     echo "$h $pid $probe"
     case $probe in *'"outcome": "absent"'*|'') rc=1 ;; esac
@@ -410,8 +410,8 @@ cleanup_check_partial() {
   # Each identity is probed on the host that owns it (host_id), else on <host>.
   while read -r pid ticks boot hid; do
     h=$host
-    [ "$hid" = "${HOST_ID_92:-}" ] && h=host-a
-    [ "$hid" = "${HOST_ID_17:-}" ] && h=host-b
+    [ "$hid" = "${HOST_ID_a:-}" ] && h=$HOST_A
+    [ "$hid" = "${HOST_ID_b:-}" ] && h=$HOST_B
     probe=$(rsh "$h" "python3 $REMOTE_TREE/scripts/live/matrix/signal_owned.py --pid $pid --ticks $ticks --boot $boot --signal 0" || true)
     echo "$h $pid $probe"
     case $probe in *'"outcome": "absent"'*) ;; *) rc=1 ;; esac
@@ -460,8 +460,8 @@ cleanup_check_deleted() {
   dry && return 0
   while read -r pid ticks boot hid; do
     h=$host
-    [ "$hid" = "${HOST_ID_92:-}" ] && h=host-a
-    [ "$hid" = "${HOST_ID_17:-}" ] && h=host-b
+    [ "$hid" = "${HOST_ID_a:-}" ] && h=$HOST_A
+    [ "$hid" = "${HOST_ID_b:-}" ] && h=$HOST_B
     probe=$(rsh "$h" "python3 $REMOTE_TREE/scripts/live/matrix/signal_owned.py --pid $pid --ticks $ticks --boot $boot --signal 0" || true)
     echo "$h $pid $probe"
     case $probe in *'"outcome": "absent"'*) ;; *) rc=1 ;; esac

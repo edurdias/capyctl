@@ -5,7 +5,7 @@ Status: superseded on 2026-09-19. The entrypoint denial was composed open —
 (`sglang_native_composition.compose`: pinned-source revalidation, plugin
 closure, placement attestation, checkpoint revalidation) and the guarded import
 follows only when the contract holds (owner-authorized; S3 slice
-`docs/superpowers/plans/2026-09-19-sglang-launch.md`). The obligations below are
+`docs/plans/2026-09-19-sglang-launch.md`). The obligations below are
 historical record of how the gates were built; the live-launch prerequisites
 that remain are the host publishing `device_inventory_digest` and the guarded
 launcher setting the child's `CUDA_VISIBLE_DEVICES`.
@@ -116,7 +116,7 @@ patch on host-a. Existing environments and drivers remain outside that change.
 
 ### Installed read-only preflight — September 15, 2026
 
-On the authorized host host-a, `git archive bf4b209 runtime` was extracted
+On the authorized host-a, `git archive bf4b209 runtime` was extracted
 into a new mode-0700 directory, `$HOME/mllm-sglang-f2-runtime-bf4b209`.
 The install refused an existing destination. No existing engine environment,
 checkpoint, driver, or service was modified.
@@ -178,7 +178,7 @@ The actual multiprocessing-spawn test now uses the same flags and asserts both
 remain enabled when deferred argument imports occur. All 13 startup-guard tests
 are included in the passing 217-test Python runtime suite. All 10 renderer and
 15 runtime-binding tests, plus scoped Clippy, pass. A read-only invocation of the
-isolated Spark Python 3.12.3 confirms both flags and imports the existing protected
+isolated host Python 3.12.3 confirms both flags and imports the existing protected
 `949609b` entry helper without importing native packages. No environment or helper
 file was changed by this check.
 
@@ -194,14 +194,14 @@ torch-memory-saver modules, including their submodules. Checking only SGLang
 missed dependencies that could have executed native effects earlier. Six sentinel
 cases failed before the change and pass afterward without importing any native
 package. All 14 startup-guard tests and the full 218-test local runtime suite pass.
-The isolated Spark helper has not been updated with this change. Package-path
+The isolated host helper has not been updated with this change. Package-path
 attestation and native startup composition remain open.
 
 A disposable local interpreter check found that Python3.12.14 under `-IS` resolves
 `sys.prefix` and `sysconfig` package paths against the base installation, unlike
 Python3.14.7, which retains the venv prefix. Explicit package-root provenance is
 therefore required; deriving it from the no-site child is not sufficient. The
-matching read-only check on Spark Python3.12.3 could not run because one SSH
+matching read-only check on host Python3.12.3 could not run because one SSH
 connection timed out on port22. This is not evidence about that interpreter's
 current paths or a lasting host outage. No existing environment was changed.
 
@@ -215,11 +215,11 @@ files do not attest the complete import graph or compiled package.
 
 The added [detokenizer source](https://github.com/sgl-project/sglang/blob/fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1/python/sglang/srt/managers/detokenizer_manager.py)
 has SHA-256 `b8c8a453f34ef3b9777a763e911e9daab161b528a6fc123f42119cd2765afa1f`,
-matching both the exact upstream revision and the isolated Spark installation.
+matching both the exact upstream revision and the isolated host installation.
 A read-only invocation of the existing protected helper with the explicit
 ten-file inventory verified and revalidated all selected installed files without
 importing SGLang, Torch, Transformers or the saver. No helper/environment file
-was changed on Spark. The new CPU test proves a missing or changed detokenizer
+was changed on host. The new CPU test proves a missing or changed detokenizer
 blocks the production-selected inventory. Process enrollment is still unfinished.
 
 Source commit: `fdebc938f7f4d16fe6b9f55dcd9a767cf0899ea1`. Inspection on September 14,

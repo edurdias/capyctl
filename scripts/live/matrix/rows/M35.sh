@@ -1,14 +1,14 @@
 # shellcheck shell=bash
-# M35 (T27; G05): both hosts tight; host-a switches s92-14 -> s92-30 while host-b
-# switches v17-30 -> s17-14, at the same time: independent per-host plans, no
+# M35 (T27; G05): both hosts tight; host-a switches sa-14 -> sa-30 while host-b
+# switches vb-30 -> sb-14, at the same time: independent per-host plans, no
 # double charge, both targets served.
-#   run_row.sh M35 -- s92-14 s92-30 v17-30 s17-14
+#   run_row.sh M35 -- sa-14 sa-30 vb-30 sb-14
 Q="What is 17+25? Answer with only the number."
 row_main() {
-  local a1=${1:-s92-14} b1=${2:-s92-30} a2=${3:-v17-30} b2=${4:-s17-14} rc=0 d p1 p2
-  [ "${POLICY_92:-}" = tight ] && [ "${POLICY_17:-}" = tight ] || { echo "both hosts must be tight"; return 1; }
-  step before-92 host_idle host-a || return 1
-  step before-17 host_idle host-b || return 1
+  local a1=${1:-sa-14} b1=${2:-sa-30} a2=${3:-vb-30} b2=${4:-sb-14} rc=0 d p1 p2
+  [ "${POLICY_a:-}" = tight ] && [ "${POLICY_b:-}" = tight ] || { echo "both hosts must be tight"; return 1; }
+  step before-a host_idle "$HOST_A" || return 1
+  step before-b host_idle "$HOST_B" || return 1
   step variant-b1 variant "$b1" wk --document-json '{"timeouts": {"wake": "900s"}}' || return 1
   step deploy-a1 deploy "$a1" --activate || return 1
   step deploy-a2 deploy "$a2" --activate || return 1
@@ -34,8 +34,8 @@ row_main() {
   for d in "$a1" "$b1-wk" "$a2" "$b2"; do step "stop-$d" stop_dep "$d"; done
   for d in "$a1" "$b1-wk" "$a2" "$b2"; do step "stopped-$d" wait_state "$d" stopped 900 || rc=1; done
   sleep 3
-  step clean-92 host_idle host-a || rc=1
-  step clean-17 host_idle host-b || rc=1
+  step clean-a host_idle "$HOST_A" || rc=1
+  step clean-b host_idle "$HOST_B" || rc=1
   for d in "$a1" "$b1-wk" "$a2" "$b2"; do step "delete-$d" delete_dep "$d" || rc=1; done
   return "$rc"
 }

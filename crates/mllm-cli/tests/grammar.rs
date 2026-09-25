@@ -96,25 +96,9 @@ fn invite_join_inspect_doctor() {
     // named positionally or with --name, never both.
     let recover = parse(["mllm", "invite", "host", "host-a", "--recover"]).unwrap();
     assert!(matches!(recover, Command::Invite{name, recover: true} if name == "host-a"));
-    let recover = parse([
-        "mllm",
-        "invite",
-        "host",
-        "--name",
-        "host-a",
-        "--recover",
-    ])
-    .unwrap();
+    let recover = parse(["mllm", "invite", "host", "--name", "host-a", "--recover"]).unwrap();
     assert!(matches!(recover, Command::Invite{name, recover: true} if name == "host-a"));
-    assert!(parse([
-        "mllm",
-        "invite",
-        "host",
-        "host-a",
-        "--name",
-        "host-a"
-    ])
-    .is_err());
+    assert!(parse(["mllm", "invite", "host", "host-a", "--name", "host-a"]).is_err());
     assert!(parse(["mllm", "invite", "host", "--recover"]).is_err());
     let join = parse([
         "mllm",

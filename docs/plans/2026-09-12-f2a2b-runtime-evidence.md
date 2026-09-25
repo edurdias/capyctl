@@ -6,7 +6,7 @@
 
 **Tech Stack:** Existing Rust 2021 workspace, standard library, existing thiserror and domain/scheduler dependencies. No engine installation, new GPU dependency, or public service.
 
-**Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3–6 and Q2/Q5/Q6/Q8/Q11. Dependencies: [F2A1](2026-09-12-f2a1-resource-contracts-and-admission.md) and [F2A2a](2026-09-12-f2a2a-durable-reservation-transactions.md).
+**Spec:** [Approved F2 design](../design/milestones/f2-sglang-design.md), §§3–6 and Q2/Q5/Q6/Q8/Q11. Dependencies: [F2A1](2026-09-12-f2a1-resource-contracts-and-admission.md) and [F2A2a](2026-09-12-f2a2a-durable-reservation-transactions.md).
 
 ## Execution status
 

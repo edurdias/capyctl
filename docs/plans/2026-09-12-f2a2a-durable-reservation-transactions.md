@@ -6,7 +6,7 @@
 
 **Tech Stack:** Existing Rust 2021 workspace, rusqlite 0.37, serde/serde_json, thiserror, tempfile, and the F2A1 scheduler. No engine dependency or hardware access.
 
-**Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3–6, Q2/Q6/Q8. Dependency: [F2A1 resource kernel](2026-09-12-f2a1-resource-contracts-and-admission.md).
+**Spec:** [Approved F2 design](../design/milestones/f2-sglang-design.md), §§3–6, Q2/Q6/Q8. Dependency: [F2A1 resource kernel](2026-09-12-f2a1-resource-contracts-and-admission.md).
 
 ## Execution status
 

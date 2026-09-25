@@ -8,9 +8,9 @@
 # start needs an empty host; `--evict` would release the incumbent), and
 # `delete deployment --stop` removes it with nothing left in the ledger for its
 # id; the incumbent stops with verified cleanup.
-#   run_row.sh M53 -- s17-4 v17-30   (the unmeasured q30 first start empties the host)
+#   run_row.sh M53 -- sb-4 vb-30   (the unmeasured q30 first start empties the host)
 row_main() {
-  local a=${1:-s17-4} b=${2:-v17-30} host rc=0 db dbid=
+  local a=${1:-sb-4} b=${2:-vb-30} host rc=0 db dbid=
   host=$(fixture_host "$a"); db=$b-bad
   step before host_idle "$host" || return 1
   step variant-bad variant "$b" bad --engine-config-json '{"accept_extra_args": true, "extra_args": ["--moe-backend", "bogus-m53"]}' || return 1

@@ -24,7 +24,7 @@ pub struct StoreRetirements {
     /// Each retirement's bound as its `begin` read it, so a poll whose store
     /// read fails still ends holding once the bound passes.
     deadlines: std::sync::Mutex<std::collections::HashMap<(String, String, String), i64>>,
-    /// Controller ruling I1: the key each request's retirement stands under,
+    /// review decision I1: the key each request's retirement stands under,
     /// when the request resumed one first written under another key.
     standing: std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>,
 }
@@ -67,7 +67,7 @@ impl ProfileRetirements for StoreRetirements {
         let now = (self.clock)();
         let window = i64::try_from(self.window.as_millis()).unwrap_or(i64::MAX);
         let deadline = now.saturating_add(window);
-        // Controller ruling I1: a retirement already standing for (host,
+        // review decision I1: a retirement already standing for (host,
         // profile) is resumed under the key it was first written with, so a
         // retried remove never conflicts and its stops replay their receipts.
         let (key, started) = match commands.read(|store| {

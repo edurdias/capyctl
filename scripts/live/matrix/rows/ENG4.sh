@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # ENG4 (ADR 0018 §3, owner decision 2026-09-25): engine add beside an rc.3 agent, and a
 # new agent against an rc.3 server:
-#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- host-b
+#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- b
 #
 # Preconditions (checked, never installed or downloaded): MLLM_RC3_LOCAL
 # (control-host) and MLLM_RC3_REMOTE (on the host) are existing rc.3 binaries whose
@@ -81,7 +81,9 @@ eng4_rc3_server() ( # (b) a subshell: every server-side command uses the rc.3 bi
 )
 
 row_main() {
-  local host=$1 rc=0
+  local host
+  host=$(resolve_host "$1") || return 1
+  local rc=0
   step preconditions eng4_preconditions "$host" || return 1
   step rc3-agent eng4_rc3_agent "$host" || rc=1
   step rc3-server eng4_rc3_server "$host" || rc=1

@@ -6,7 +6,7 @@
 
 **Tech Stack:** Existing Rust 2021 workspace, rusqlite 0.37, thiserror, ulid, tempfile. No new dependencies, engine control, public API, or GPU work.
 
-**Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), §§3/5/6, Q7/Q8. Dependencies: [F2A2a store schema](2026-09-12-f2a2a-durable-reservation-transactions.md) and [F2A2b evidence contract](2026-09-12-f2a2b-runtime-evidence.md).
+**Spec:** [Approved F2 design](../design/milestones/f2-sglang-design.md), §§3/5/6, Q7/Q8. Dependencies: [F2A2a store schema](2026-09-12-f2a2a-durable-reservation-transactions.md) and [F2A2b evidence contract](2026-09-12-f2a2b-runtime-evidence.md).
 
 ## Execution status
 

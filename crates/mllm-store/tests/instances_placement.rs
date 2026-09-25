@@ -2001,7 +2001,7 @@ fn a_retirement_names_its_instances_and_waits_for_evidence() {
     );
 }
 
-/// ADR 0018 §4 (controller ruling I1): a retirement still draining is resumed,
+/// ADR 0018 §4 (review decision I1): a retirement still draining is resumed,
 /// not refused and not cancelled, by a retried remove under another key, with
 /// or without drain; the stops keep the first key.
 // T16 T32
