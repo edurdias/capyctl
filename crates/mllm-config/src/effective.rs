@@ -476,6 +476,9 @@ pub struct HostPolicy {
 pub enum DomainMemory {
     Unified,
     Distinct,
+    /// ADR 0019: a discrete GPU's own memory. The domain names its device, and
+    /// host RAM is a separate `distinct` system domain beside it.
+    Device,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -485,6 +488,11 @@ pub struct DomainPolicy {
     pub host_kv_limit: Option<i64>,
     pub parked_limit: Option<i64>,
     pub memory: DomainMemory,
+    /// ADR 0019: the device whose memory this is. `Some` exactly when `memory` is
+    /// `Device`; omitted from the encoding otherwise, so a unified or distinct
+    /// domain encodes exactly as it did before device domains existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -649,6 +657,8 @@ struct RawDomain {
     #[serde(skip_serializing_if = "Option::is_none")]
     parked_limit: Option<String>,
     memory: DomainMemory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -693,6 +703,7 @@ pub fn compose_resource_policy(
                     host_kv_limit: d.host_kv_limit.map(|n| format!("{n}B")),
                     parked_limit: d.parked_limit.map(|n| format!("{n}B")),
                     memory: d.memory,
+                    device: d.device.clone(),
                 },
             )
         })

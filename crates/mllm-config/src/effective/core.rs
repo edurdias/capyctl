@@ -264,6 +264,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             host_kv_limit: raw.host_kv_limit.as_deref().map(parse_bytes).transpose()?,
             parked_limit: raw.parked_limit.as_deref().map(parse_bytes).transpose()?,
             memory: raw.memory,
+            device: raw.device,
         };
         domains.insert(name, value);
     }
@@ -330,6 +331,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             }
         }
     }
+    check_domain_shape(&domains, &h.resource_policy.devices)?;
     let host = HostPolicy {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
@@ -348,6 +350,73 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)
+}
+
+/// ADR 0019, SPEC §7.2: a discrete GPU's memory is its own domain. A `device`
+/// domain names exactly one device, that device maps to it and no other does, and
+/// it carries no `host_kv_limit` (host-KV lives in host RAM). A host declares at
+/// most one `unified` domain and never mixes one with a `device` domain.
+fn check_domain_shape(
+    domains: &BTreeMap<String, DomainPolicy>,
+    devices: &BTreeMap<String, DevicePolicy>,
+) -> Result<(), ConfigError> {
+    let path = "resource_policy.domains";
+    let unified = domains
+        .values()
+        .filter(|d| d.memory == DomainMemory::Unified)
+        .count();
+    let device = domains
+        .values()
+        .filter(|d| d.memory == DomainMemory::Device)
+        .count();
+    if unified > 1 || (unified == 1 && device > 0) {
+        return Err(invalid(
+            path,
+            "unsupported_gpu_topology: a unified domain cannot be combined with another unified or a device domain",
+        ));
+    }
+    for (name, domain) in domains {
+        let here = format!("{path}.{name}");
+        match (domain.memory, domain.device.as_deref()) {
+            (DomainMemory::Device, Some(id)) => {
+                if domain.host_kv_limit.is_some() {
+                    return Err(invalid(
+                        &here,
+                        "device_policy_mismatch: host_kv_limit belongs to the system domain",
+                    ));
+                }
+                if devices.get(id).map(|d| d.domain.as_str()) != Some(name.as_str()) {
+                    return Err(invalid(
+                        &here,
+                        "device_policy_mismatch: the named device must map to this domain",
+                    ));
+                }
+                if devices
+                    .iter()
+                    .any(|(other, d)| other != id && d.domain == *name)
+                {
+                    return Err(invalid(
+                        &here,
+                        "device_policy_mismatch: only its own device may map to a device domain",
+                    ));
+                }
+            }
+            (DomainMemory::Device, None) => {
+                return Err(invalid(
+                    &here,
+                    "device_policy_mismatch: a device domain names its device",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(invalid(
+                    &here,
+                    "device_policy_mismatch: only a device domain names a device",
+                ));
+            }
+            (_, None) => {}
+        }
+    }
+    Ok(())
 }
 
 fn domain_phase(

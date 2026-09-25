@@ -281,6 +281,7 @@ mod tests {
             host_kv_limit: None,
             parked_limit: None,
             memory: DomainMemory::Unified,
+            device: None,
         }
     }
 

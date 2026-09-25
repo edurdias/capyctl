@@ -126,6 +126,10 @@ struct StoredDomain {
     // SPEC §6.2: whether a host-backed park frees anything depends on this; it must
     // persist losslessly like every other required domain field.
     memory: String,
+    // ADR 0019: a device domain's device. Serialized only when present, so every
+    // stored unified or distinct policy keeps its bytes, identity and digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +200,7 @@ fn domain_memory(value: DomainMemory) -> String {
     match value {
         DomainMemory::Unified => "unified",
         DomainMemory::Distinct => "distinct",
+        DomainMemory::Device => "device",
     }
     .into()
 }
@@ -203,6 +208,7 @@ fn parse_domain_memory(value: &str) -> Result<DomainMemory, ResourcePolicyError>
     match value {
         "unified" => Ok(DomainMemory::Unified),
         "distinct" => Ok(DomainMemory::Distinct),
+        "device" => Ok(DomainMemory::Device),
         _ => Err(ResourcePolicyError::CorruptStoredPolicy),
     }
 }
@@ -244,6 +250,7 @@ impl StoredControls {
                             host_kv_limit: d.host_kv_limit,
                             parked_limit: d.parked_limit,
                             memory: domain_memory(d.memory),
+                            device: d.device.clone(),
                         },
                     )
                 })
@@ -281,6 +288,7 @@ impl StoredControls {
                             host_kv_limit: d.host_kv_limit,
                             parked_limit: d.parked_limit,
                             memory: parse_domain_memory(&d.memory)?,
+                            device: d.device.clone(),
                         },
                     ))
                 })
@@ -820,13 +828,12 @@ impl crate::Store {
         // report success while freeing nothing. A domain new to the incoming
         // controls is not a change; a domain's absence is already governed by the
         // membership check in `controls.validate` above.
+        // ADR 0019: which device a device domain holds is the same kind of
+        // hardware fact, so rebinding it is refused the same way.
         for (id, domain) in &controls.domains {
-            if current
-                .controls
-                .domains
-                .get(id)
-                .is_some_and(|previous| previous.memory != domain.memory)
-            {
+            if current.controls.domains.get(id).is_some_and(|previous| {
+                previous.memory != domain.memory || previous.device != domain.device
+            }) {
                 return Err(ResourcePolicyError::RevisionConflict);
             }
         }

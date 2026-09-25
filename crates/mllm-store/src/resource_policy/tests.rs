@@ -21,6 +21,7 @@ fn host() -> HostPolicy {
                 host_kv_limit: Some(40),
                 parked_limit: Some(50),
                 memory: DomainMemory::Distinct,
+                device: None,
             },
         )]),
         devices: BTreeMap::from([(
@@ -1260,4 +1261,100 @@ fn a_republished_remote_policy_with_changed_limits_is_applied() {
         (tight_again.controls.max_parked, tight_again.revision),
         (1, back.revision + 1)
     );
+}
+
+// T26: an existing unified stored policy keeps its bytes (no `device` key), so
+// its identity and digest do not change (ADR 0019).
+#[test]
+fn a_unified_stored_domain_serializes_as_before() {
+    let stored = StoredDomain {
+        managed_limit: 1,
+        free_reserve: 1,
+        host_kv_limit: None,
+        parked_limit: None,
+        memory: "unified".into(),
+        device: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&stored).unwrap(),
+        r#"{"managed_limit":1,"free_reserve":1,"host_kv_limit":null,"parked_limit":null,"memory":"unified"}"#
+    );
+    let device = StoredDomain {
+        memory: "device".into(),
+        device: Some("gpu0".into()),
+        ..stored
+    };
+    assert!(serde_json::to_string(&device)
+        .unwrap()
+        .ends_with(r#""memory":"device","device":"gpu0"}"#));
+}
+
+fn discrete_host() -> HostPolicy {
+    let mut h = host();
+    h.domains.insert(
+        "gpu0".into(),
+        DomainPolicy {
+            managed_limit: 60,
+            free_reserve: 10,
+            host_kv_limit: None,
+            parked_limit: Some(10),
+            memory: DomainMemory::Device,
+            device: Some("gpu0".into()),
+        },
+    );
+    h.devices.get_mut("gpu0").unwrap().domain = "gpu0".into();
+    h
+}
+
+fn discrete_observations() -> Vec<MemoryObservation> {
+    let mut all = observations();
+    all.push(MemoryObservation {
+        domain: "gpu0".into(),
+        capacity_bytes: 80,
+        available_bytes: 70,
+        sampled_at_ms: 10_000,
+    });
+    all
+}
+
+// T26: a device domain and its device survive the stored policy round trip.
+#[test]
+fn a_device_domain_round_trips_through_the_store() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &discrete_host(), &discrete_observations(), 11_000)
+        .unwrap();
+    let snapshot = store.resource_policy("host-a").unwrap().unwrap();
+    let gpu = &snapshot.controls.domains["gpu0"];
+    assert_eq!(gpu.memory, DomainMemory::Device);
+    assert_eq!(gpu.device.as_deref(), Some("gpu0"));
+    assert_eq!(snapshot.controls.domains["system"].device, None);
+}
+
+// T26: which device a device domain holds is a hardware fact like `memory`; an
+// update may not rebind it.
+#[test]
+fn update_rejects_rebinding_a_device_domain_as_a_revision_conflict() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &discrete_host(), &discrete_observations(), 11_000)
+        .unwrap();
+    let mut rebound = ResourceControls::from_host(&discrete_host());
+    rebound.domains.get_mut("gpu0").unwrap().device = Some("gpu1".into());
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "rebind",
+            &rebound,
+            &discrete_observations(),
+            11_000,
+        ),
+        Err(ResourcePolicyError::RevisionConflict)
+    ));
+    assert_eq!(store.resource_snapshot().unwrap().epoch, 1);
 }

@@ -1,6 +1,7 @@
 use mllm_config::effective::{
-    binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, DeepPark, DeepParkSource, DomainMemory, Engine, ModelSource, Residency,
+    binding_fingerprint, derive_default_managed_ceiling, normalize_host_policy, parse_bytes,
+    parse_duration_ms, resolve_effective, DeepPark, DeepParkSource, DomainMemory, Engine,
+    ModelSource, Residency,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
@@ -1324,4 +1325,145 @@ fn strict_schema_accepts_model_sources_and_points_locked_commit_at_revision() {
         parse_strict(ConfigKind::Host, &unknown).unwrap_err().code,
         ConfigErrorCode::UnknownField
     );
+}
+
+/// The example host document on its own, for host-policy rules (ADR 0019).
+fn host() -> serde_json::Value {
+    fixture().1
+}
+
+/// A discrete host: a system domain for host RAM and a device domain for the
+/// GPU's own memory (ADR 0019, discrete GPU design §2).
+fn discrete_host() -> serde_json::Value {
+    let mut h = host();
+    h["resource_policy"]["domains"] = serde_json::json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    h["resource_policy"]["devices"] =
+        serde_json::json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    h
+}
+
+// T26: a discrete host declares a system domain and a device domain.
+#[test]
+fn a_discrete_host_policy_resolves_with_a_device_domain() {
+    let policy = normalize_host_policy(&discrete_host()).expect("valid");
+    let gpu = &policy.domains["gpu0"];
+    assert_eq!(gpu.memory, DomainMemory::Device);
+    assert_eq!(gpu.device.as_deref(), Some("gpu0"));
+    assert_eq!(policy.domains["system"].device, None);
+}
+
+// T26: an existing unified host keeps resolving exactly as before.
+#[test]
+fn a_unified_host_policy_has_no_device_domain() {
+    let policy = normalize_host_policy(&host()).expect("valid");
+    assert_eq!(policy.domains["unified"].memory, DomainMemory::Unified);
+    assert_eq!(policy.domains["unified"].device, None);
+}
+
+// T26: every broken device shape is refused with its path and its code.
+#[test]
+fn broken_device_domains_are_refused() {
+    type Mutation = Box<dyn Fn(&mut serde_json::Value)>;
+    let cases: Vec<(&str, &str, Mutation)> = vec![
+        (
+            "device domain without device",
+            "device_policy_mismatch:",
+            Box::new(|h| {
+                h["resource_policy"]["domains"]["gpu0"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("device");
+            }),
+        ),
+        (
+            "unknown device",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["domains"]["gpu0"]["device"] = "gpu9".into()),
+        ),
+        (
+            "device maps elsewhere",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["devices"]["gpu0"]["domain"] = "system".into()),
+        ),
+        (
+            "another device maps to the device domain",
+            "device_policy_mismatch:",
+            Box::new(|h| {
+                h["resource_policy"]["devices"]["gpu1"] =
+                    serde_json::json!({"domain": "gpu0", "sharing": "shared"})
+            }),
+        ),
+        (
+            "host kv on device",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["domains"]["gpu0"]["host_kv_limit"] = "1GiB".into()),
+        ),
+        (
+            "device on system domain",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["domains"]["system"]["device"] = "gpu0".into()),
+        ),
+        (
+            "unified mixed with device",
+            "unsupported_gpu_topology:",
+            Box::new(|h| h["resource_policy"]["domains"]["system"]["memory"] = "unified".into()),
+        ),
+    ];
+    for (name, prefix, mutate) in cases {
+        let mut h = discrete_host();
+        mutate(&mut h);
+        let error = normalize_host_policy(&h).expect_err(name);
+        assert_eq!(
+            error.code,
+            ConfigErrorCode::UnsupportedCombination,
+            "{name}"
+        );
+        assert!(error.path.starts_with("resource_policy"), "{name}: {error}");
+        assert!(error.detail.starts_with(prefix), "{name}: {error}");
+    }
+}
+
+// T26: at most one unified domain per host.
+#[test]
+fn two_unified_domains_are_refused() {
+    let mut h = host();
+    let unified = h["resource_policy"]["domains"]["unified"].clone();
+    h["resource_policy"]["domains"]["unified1"] = unified;
+    let error = normalize_host_policy(&h).expect_err("two unified domains");
+    assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination);
+    assert!(
+        error.detail.starts_with("unsupported_gpu_topology:"),
+        "{error}"
+    );
+}
+
+// T26: two GPUs, each its own device domain (owner decision 3).
+#[test]
+fn two_device_domains_resolve() {
+    let mut h = discrete_host();
+    h["resource_policy"]["domains"]["gpu1"] = serde_json::json!({"memory": "device", "device": "gpu1",
+        "managed_limit": "22GiB", "free_reserve": "2GiB", "parked_limit": "2GiB"});
+    h["resource_policy"]["devices"]["gpu1"] =
+        serde_json::json!({"domain": "gpu1", "sharing": "shared"});
+    assert_eq!(normalize_host_policy(&h).unwrap().domains.len(), 3);
+}
+
+// T26: a device domain round-trips through the one writer of the host shape.
+#[test]
+fn a_device_domain_round_trips_through_composition() {
+    use mllm_config::effective::compose_resource_policy;
+    use mllm_config::resource_controls::ResourceContext;
+    let policy = normalize_host_policy(&discrete_host()).unwrap();
+    let composed = compose_resource_policy(
+        &ResourceControls::from_host(&policy),
+        &ResourceContext::from_host(&policy),
+    );
+    assert_eq!(composed["domains"]["gpu0"]["device"], "gpu0");
+    assert_eq!(composed["domains"]["gpu0"]["memory"], "device");
+    assert!(composed["domains"]["system"].get("device").is_none());
 }
