@@ -30,6 +30,76 @@ Local verification only: core 1070 reported, workspace 1764 passed (1 ignored), 
 clean with warnings denied across the workspace. CPU and mTLS transport tests are not
 qualification; no mixed-version fleet has run on the Sparks. Pending: a live rolling
 upgrade (server first, then host-a, then host-b) once a release carries this change.
+## Release candidate 0.1.0-rc.2 — live validation, 2026-09-24 (branch `fix/rc2-live-findings`)
+
+PR #10 (soak fixes and harness) and PR #11 (version skew, ADR 0017) merged,
+then PR #12 bumped the version. Draft release `v0.1.0-rc.2` (pre-release,
+unpublished) targets `main` at 45f91af: `mllm-0.1.0-rc.2-linux-x86_64.tar.gz`
+(control-host, sha256 `e99f57d9…d0c`), `mllm-0.1.0-rc.2-linux-aarch64.tar.gz` (built
+natively on host-a, nice 19, sha256 `f7a5d598…bc1`), `install.sh`
+(`ba339733…404a`) and `SHA256SUMS`. Both passed `scripts/verify-packaging.sh` on
+their own architecture; `BUILDINFO` commit 45f91af, not dirty, runtime manifest
+`80044870…ddee0`.
+
+Live, with release binaries only: `install.sh` from a `file://` mirror of the
+draft assets on control-host (`--systemd server`) and both Sparks (`--systemd host`),
+fresh state under `~/mllm-rc2-*`, host documents without `runtime_dir` (the
+managed runtime the binary writes to `<state_dir>/runtime`), roles run by the
+installed systemd user units (`~/.config/mllm/<role>.env` naming the document).
+No repository build or synced tree on the hosts; the harness ran from its
+scripts only, through the new `MLLM_LOCAL_BIN`, `MLLM_REMOTE_BIN`,
+`MLLM_*_RUN_ROOT` overrides and `gen_host_doc.py --managed-runtime`. Evidence:
+`target/live/rc2/`.
+
+| Row | Verdict |
+|---|---|
+| M75 (no engine, both Sparks) | pass: `invalid_config` "no engine installation", exit 2, nothing left |
+| M73 v92-4, s92-4 | pass: both engines launched from the managed runtime (`~/mllm-rc2-host/host/runtime/vllm_entry.py`, `sglang_entry.py`), loopback-only, unkeyed engine calls 401, stop with verified cleanup, restart at a new binding |
+| M08 | pass: router and host ingress serve no engine or control path (404), engines loopback only and refused from control-host, control routes 401 unkeyed, vLLM marked `exposed`/not production safe, SGLang not exposed |
+| M29 v92-4 (vLLM park/wake) | pass: 77% of the Ready drop released, same processes, wake on request |
+| M28 s92-14 (SGLang park/wake) | pass on 2 of 3 runs (89% released). The first run's park was refused `park_refused` after the host's saver observation failed (`native_observation_failed` at `receive_header`); the engine kept serving (fail closed). Not reproduced; open |
+| M31 v17-4 ↔ s17-4, tight host-b, 2 cycles deep | pass: switches park and wake the same processes, reservations settle |
+| M64 (`delete --stop`, drain) | pass |
+| TC s92-4 (`qwen25`), v17-4 (`hermes`) | pass: 4 of 4 each (vLLM named choice finishes `stop` with the tool call) |
+| `systemctl --user restart mllm-host` | pass: same engine PIDs and start ticks, new agent PID, reconciled, serves |
+| M45 revoke with v92-4 Ready | pass: `engines: retained`, dispatch 503, reconnect refused, engine alive |
+| Recovery (`invite host --recover`, `join host --recover`) | pass: same host id, same engine processes at generation 1 (re-proven, not relaunched), serves |
+| Mixed version (host-b on rc.1, server rc.2) | `upgrade_required` with its reason; start refused; a Ready engine keeps serving; stop and drain work; reinstalling rc.2 gives `supported` and a start succeeds. Found bug 2 below |
+
+Bugs found and fixed on `fix/rc2-live-findings` (CPU-verified with failing-first
+regression tests; the fixes themselves have not run live):
+
+1. **User units and systemd ≥ 254.** `~/.config/mllm` (where the user units read
+   `<role>.env`) existed before the first start, so systemd 255 on the Sparks
+   made `~/.local/state/mllm` a compatibility symlink to it; the unit's state
+   and `TMPDIR` landed in the configuration directory. `install.sh --systemd`
+   (user scope) now creates an empty 0700 `~/.local/state/mllm` and warns about
+   an existing link; `install.md` documents it; `scripts/test-install.sh`
+   covers both.
+2. **A park refused before sending closed dispatch for good.** On a drain-only
+   host the park preflight refuses `host_upgrade_required`, the coordinator
+   settles it leaving the remote launch's dispatch closed until a fresh probe
+   reopens it, but the readiness proof was kept, so no probe was sent: v17-4
+   stayed `reconciling` with dispatch closed (503) while its engine ran.
+   `RemoteEngine::residency` now forgets the proof on every park refusal
+   (host `unchanged`, preflight, gate refusal), so the supervisor re-probes.
+   Test: `version_skew.rs` `a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_dispatch` (T16 T34).
+
+Harness fix: `M27.sh` checked the tight policy on host-a regardless of the
+fixture's host.
+
+Local on `fix/rc2-live-findings`: core 1004, workspace all-targets 1767,
+Clippy clean with warnings denied, `scripts/test-install.sh` passed. CPU and
+Fake-engine tests are not qualification. After the run every role was stopped,
+the units and binaries uninstalled, and both Sparks left with no engine, role
+or GPU compute process, no rendezvous directory and no `~/mllm-rc2-*` state;
+the server state stays on control-host under `~/mllm-rc2-server`.
+
+Observations, not changed: a start refused because the only allowed host is
+drain-only reports `capacity_blocked` ("capacity is unavailable") although the
+scheduler's diagnostic is `host_ineligible`; a revoked host agent keeps
+retrying its session (a few refusals a minute) instead of exiting.
+
 ## Soak M48–M50 — 2026-09-24 (branch `test/soak-m48-m50`, stopped by the owner)
 
 M48 is not passed: the owner stopped the soak after 119 walked steps, short of
