@@ -948,3 +948,9 @@ where
 {
     parse_invocation(args).map(|inv| inv.command)
 }
+
+/// Website spec, Docs: the clap definition the CLI reference is generated
+/// from. The same `Cli` the binary parses with, so the reference cannot drift.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}

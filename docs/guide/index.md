@@ -6,6 +6,7 @@ for, and puts one OpenAI-compatible endpoint in front of every machine you
 enroll.
 
 - [Install](../operations/install.md) mllm from a release.
+- [CLI reference](/docs/reference/cli/), generated from the command definitions.
 
 mllm does not install engines, drivers or model weights. Bring your own vLLM or
 SGLang environment and your own checkpoints.

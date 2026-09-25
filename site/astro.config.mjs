@@ -17,6 +17,7 @@ export default defineConfig({
       customCss: ['./src/styles/tokens.css'],
       sidebar: [
         { label: 'Start', items: ['docs', 'docs/install'] },
+        { label: 'Reference', items: ['docs/reference/cli'] },
       ],
       // Website spec, Quality checks: no broken internal links.
       plugins: [starlightLinksValidator()],
