@@ -386,3 +386,63 @@ async fn the_engines_listing_shows_published_profiles() {
     assert_eq!(row["deployments"].as_array().unwrap().len(), 1);
     setup.worker.shutdown().await.unwrap();
 }
+
+// T16 T32 (controller ruling I1): a retried remove, under a new request key
+// and without drain, resumes the draining retirement rather than being refused
+// as a conflict or cancelling it; its poll follows the standing retirement to
+// confirmation, and a later retry of the confirmed one confirms at once.
+#[tokio::test]
+async fn a_retried_retirement_resumes_under_the_standing_key() {
+    let setup = setup().await;
+    let id = setup.id.clone();
+    start(&setup, &id).await;
+    place_on_lab(&setup.dir, &setup.owner, &id);
+    let service = Arc::new(retirements(&setup));
+    let s = service.clone();
+    let draining = tokio::task::spawn_blocking(move || s.begin("lab", "local", "lab:req-1", true))
+        .await
+        .unwrap();
+    assert!(
+        matches!(draining, RetirementStep::Draining(_)),
+        "{draining:?}"
+    );
+    let s = service.clone();
+    let retried = tokio::task::spawn_blocking(move || s.begin("lab", "local", "lab:req-2", false))
+        .await
+        .unwrap();
+    assert!(
+        matches!(retried, RetirementStep::Draining(_)),
+        "{retried:?}"
+    );
+    let confirmed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let s = service.clone();
+            if let Some(step) =
+                tokio::task::spawn_blocking(move || s.poll("lab", "local", "lab:req-2"))
+                    .await
+                    .unwrap()
+            {
+                return step;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(confirmed, RetirementStep::Confirmed);
+    let s = service.clone();
+    let again = tokio::task::spawn_blocking(move || s.begin("lab", "local", "lab:req-3", false))
+        .await
+        .unwrap();
+    assert_eq!(again, RetirementStep::Confirmed);
+    let (key, state, _) = setup
+        .owner
+        .lock()
+        .unwrap()
+        .store()
+        .profile_retirement("lab", "local")
+        .unwrap()
+        .unwrap();
+    assert_eq!((key.as_str(), state.as_str()), ("lab:req-1", "confirmed"));
+    setup.worker.shutdown().await.unwrap();
+}

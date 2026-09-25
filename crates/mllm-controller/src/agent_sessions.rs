@@ -1251,8 +1251,11 @@ impl AgentSessions {
                             After::Retire(request) => {
                                 use crate::profile_retirement::{RetirementStep, RETIREMENT_POLL};
                                 let service = self.retirements.lock().ok().and_then(|s| s.clone());
-                                // ADR 0018 §4: the key is stable per request id, so a host
-                                // that retries after a reconnect resumes the same retirement.
+                                // ADR 0018 §4 (controller ruling I1): the request's key. A
+                                // retirement already standing for (host, profile) keeps the
+                                // key it was first written under until it is cleared, so any
+                                // retry (a new request id after a reconnect, a rerun `engine
+                                // remove`) resumes it; the service maps this key onto it.
                                 let key = format!("{host}:{}", request.request_id);
                                 let step = match service.clone() {
                                     None => RetirementStep::Refused("this server cannot retire runtime profiles".into()),
@@ -1277,7 +1280,7 @@ impl AgentSessions {
                                     // Spec design rule 4: the terminal answer waits for stop
                                     // evidence, off this session's loop. A session that ends
                                     // stops the relay only; the retirement itself stands until
-                                    // it settles, is retried with the same request id, or expires.
+                                    // it settles or expires, and any retried remove resumes it.
                                     let (outgoing, named, profile, request_id) =
                                         (outgoing.clone(), host.clone(), request.profile.clone(), request.request_id.clone());
                                     let changed = self.clone_change_notifier();

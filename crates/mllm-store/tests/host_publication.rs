@@ -269,3 +269,62 @@ fn a_startup_publication_clears_confirmed_retirements_only_for_dropped_profiles(
     store.publish_host_configuration(&dropped).unwrap();
     assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
 }
+
+// T32 (ADR 0018 §4, controller ruling I1): a retirement's key is the one it
+// was first written under until the retirement is cleared, so a retried
+// `engine remove` (a new request, a new key) resumes it instead of conflicting.
+#[test]
+fn a_retried_retirement_resumes_under_the_standing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("s.sqlite3")).unwrap();
+    let host = enrolled(&store);
+    let mut added = base_document();
+    added["runtime_profiles"]["vllm"] = vllm_profile();
+    store
+        .publish_host_configuration(&publication(&host, &added))
+        .unwrap();
+    assert!(matches!(
+        store
+            .begin_profile_retirement(&host, "vllm", "first", 1, 10, false)
+            .unwrap(),
+        mllm_store::profile_retirement::RetirementStart::Clear
+    ));
+    // The confirmation never reached the operator; the retry has a new key.
+    let (key, start) = store
+        .begin_profile_retirement_keyed(&host, "vllm", "second", 2, 20, false)
+        .unwrap();
+    assert_eq!(key, "first", "the standing retirement keeps its key");
+    assert_eq!(
+        start,
+        mllm_store::profile_retirement::RetirementStart::Clear
+    );
+    let (standing, state, _) = store.profile_retirement(&host, "vllm").unwrap().unwrap();
+    assert_eq!((standing.as_str(), state.as_str()), ("first", "confirmed"));
+}
+
+// T32 T33 (ADR 0018 §4, controller ruling I1): a live re-publication clears
+// the confirmed retirement of every profile it does not list, not only of
+// the profiles it drops, as the startup publication does.
+#[test]
+fn a_live_republication_clears_every_confirmed_retirement_it_does_not_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("s.sqlite3")).unwrap();
+    let host = enrolled(&store);
+    let base = base_document();
+    store
+        .publish_host_configuration(&publication(&host, &base))
+        .unwrap();
+    // A retirement confirmed for a profile the approved document no longer
+    // lists (its removal was published by an earlier host whose answer was
+    // lost, for example).
+    store
+        .begin_profile_retirement(&host, "vllm", "k", 1, 10, false)
+        .unwrap();
+    let mut added = base.clone();
+    added["runtime_profiles"]["sglang"] = vllm_profile();
+    let base_fp = mllm_config::remote_resources::policy_fingerprint(&base);
+    store
+        .republish_host_configuration(&publication(&host, &added), &base_fp)
+        .unwrap();
+    assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
+}

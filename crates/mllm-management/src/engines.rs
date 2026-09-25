@@ -24,6 +24,9 @@ pub struct StoreRetirements {
     /// Each retirement's bound as its `begin` read it, so a poll whose store
     /// read fails still ends holding once the bound passes.
     deadlines: std::sync::Mutex<std::collections::HashMap<(String, String, String), i64>>,
+    /// Controller ruling I1: the key each request's retirement stands under,
+    /// when the request resumed one first written under another key.
+    standing: std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>,
 }
 
 fn now_ms() -> i64 {
@@ -44,6 +47,7 @@ impl StoreRetirements {
             window: RETIREMENT_WINDOW,
             clock: Arc::new(now_ms),
             deadlines: Default::default(),
+            standing: Default::default(),
         }
     }
     pub fn with_window(mut self, window: Duration) -> Self {
@@ -58,21 +62,30 @@ impl StoreRetirements {
 }
 
 impl ProfileRetirements for StoreRetirements {
-    fn begin(&self, host: &str, profile: &str, key: &str, drain: bool) -> RetirementStep {
+    fn begin(&self, host: &str, profile: &str, request: &str, drain: bool) -> RetirementStep {
         let commands = self.source.commands();
         let now = (self.clock)();
         let window = i64::try_from(self.window.as_millis()).unwrap_or(i64::MAX);
         let deadline = now.saturating_add(window);
-        let started = match commands
-            .read(|store| store.begin_profile_retirement(host, profile, key, now, deadline, drain))
-        {
+        // Controller ruling I1: a retirement already standing for (host,
+        // profile) is resumed under the key it was first written with, so a
+        // retried remove never conflicts and its stops replay their receipts.
+        let (key, started) = match commands.read(|store| {
+            store.begin_profile_retirement_keyed(host, profile, request, now, deadline, drain)
+        }) {
             Ok(started) => started,
             Err(_) => {
                 return RetirementStep::Refused(
-                    "another removal of this profile is in progress, or the server's store is unavailable".into(),
+                    "the server's store is unavailable; nothing was removed".into(),
                 )
             }
         };
+        if key != request {
+            if let Ok(mut standing) = self.standing.lock() {
+                standing.insert((host.into(), profile.into(), request.into()), key.clone());
+            }
+        }
+        let key = key.as_str();
         let named = match started {
             RetirementStart::Clear => return RetirementStep::Confirmed,
             RetirementStart::InUse(named) => {
@@ -163,7 +176,14 @@ impl ProfileRetirements for StoreRetirements {
         }
     }
 
-    fn poll(&self, host: &str, profile: &str, key: &str) -> Option<RetirementStep> {
+    fn poll(&self, host: &str, profile: &str, request: &str) -> Option<RetirementStep> {
+        let request_entry = (host.to_owned(), profile.to_owned(), request.to_owned());
+        let resumed = self
+            .standing
+            .lock()
+            .ok()
+            .and_then(|standing| standing.get(&request_entry).cloned());
+        let key = resumed.as_deref().unwrap_or(request);
         // ADR 0018 §4: past the retirement's bound an unsettled retirement ends
         // unconfirmed (`Expired`), so this poll answers `Holding` rather than
         // waiting without end.
@@ -198,6 +218,9 @@ impl ProfileRetirements for StoreRetirements {
         if step.is_some() {
             if let Ok(mut known) = self.deadlines.lock() {
                 known.remove(&entry);
+            }
+            if let Ok(mut standing) = self.standing.lock() {
+                standing.remove(&request_entry);
             }
         }
         step

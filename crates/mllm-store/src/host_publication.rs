@@ -62,6 +62,28 @@ impl From<rusqlite::Error> for RepublishRefusal {
     }
 }
 
+/// ADR 0018 §4: delete `host`'s confirmed retirements of profiles `document`
+/// does not list. A retirement still in progress is left to its deadline.
+pub(crate) fn clear_unlisted_confirmed(
+    tx: &rusqlite::Transaction<'_>,
+    host: &str,
+    document: &serde_json::Value,
+) -> Result<(), rusqlite::Error> {
+    let confirmed: Vec<String> = tx
+        .prepare("SELECT profile FROM profile_retirements WHERE host_id=?1 AND state='confirmed'")?
+        .query_map([host], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for profile in confirmed {
+        if document["runtime_profiles"].get(&profile).is_none() {
+            tx.execute(
+                "DELETE FROM profile_retirements WHERE host_id=?1 AND profile=?2",
+                params![host, profile],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     /// Caller authenticates transport; this transaction independently checks the
     /// retained enrolled identity/revocation before replacing its publication.
@@ -125,20 +147,7 @@ impl Store {
         // it no longer lists. A confirmed retirement of a profile still
         // listed stays, so the profile stays out of placement across a host
         // restart. A retirement still in progress is left to its deadline.
-        let confirmed: Vec<String> = tx
-            .prepare(
-                "SELECT profile FROM profile_retirements WHERE host_id=?1 AND state='confirmed'",
-            )?
-            .query_map([&publication.host_id], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        for profile in confirmed {
-            if config.document["runtime_profiles"].get(&profile).is_none() {
-                tx.execute(
-                    "DELETE FROM profile_retirements WHERE host_id=?1 AND profile=?2",
-                    params![publication.host_id, profile],
-                )?;
-            }
-        }
+        clear_unlisted_confirmed(&tx, &publication.host_id, &config.document)?;
         if let Some(claims) = claims {
             let mode = match claims {
                 LaunchClaims::PerLaunch => "per_launch",
@@ -227,11 +236,11 @@ impl Store {
             if !confirmed {
                 return Err(RepublishRefusal::NotRetired(dropped));
             }
-            tx.execute(
-                "DELETE FROM profile_retirements WHERE host_id=?1 AND profile=?2",
-                params![publication.host_id, dropped],
-            )?;
         }
+        // ADR 0018 §4 (controller ruling I1): as at startup, an accepted
+        // publication clears the confirmed retirement of every profile it
+        // does not list, dropped now or earlier; one it still lists stays.
+        clear_unlisted_confirmed(&tx, &publication.host_id, &config.document)?;
         tx.execute(
             "UPDATE approved_host_publications SET config_json=?2, boot_id=?3, fingerprint=?4, received_at_ms=?5 WHERE host_id=?1",
             params![

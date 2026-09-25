@@ -138,9 +138,8 @@ fn valid(host: &str, profile: &str, key: &str) -> bool {
 
 impl Store {
     /// ADR 0018 §4, phase one: write the retirement and name the instances
-    /// that use the profile on the host, in one transaction. A retried
-    /// request under the same key reuses its row; another key while one
-    /// stands is refused (`Conflict`).
+    /// that use the profile on the host, in one transaction. See
+    /// [`Store::begin_profile_retirement_keyed`]; this drops the key.
     pub fn begin_profile_retirement(
         &self,
         host: &str,
@@ -150,36 +149,68 @@ impl Store {
         deadline_ms: i64,
         drain: bool,
     ) -> Result<RetirementStart, StoreError> {
+        self.begin_profile_retirement_keyed(host, profile, key, now_ms, deadline_ms, drain)
+            .map(|(_, start)| start)
+    }
+
+    /// ADR 0018 §4, phase one, returning the key the retirement stands under.
+    /// Controller ruling I1: a retirement keeps the key it was first written
+    /// under until it is cleared, so a retried request (under any key, from a
+    /// CLI that lost its answer, a host that reconnected, or a server that
+    /// restarted) resumes it rather than conflicting. A standing retirement
+    /// that still has instances to stop is resumed as a draining one: it is
+    /// never cancelled by a retry that did not ask to drain. Its recorded
+    /// time and deadline never change, so its stops replay the same receipts.
+    pub fn begin_profile_retirement_keyed(
+        &self,
+        host: &str,
+        profile: &str,
+        key: &str,
+        now_ms: i64,
+        deadline_ms: i64,
+        drain: bool,
+    ) -> Result<(String, RetirementStart), StoreError> {
         if !valid(host, profile, key) || now_ms < 0 || deadline_ms < now_ms {
             return Err(StoreError::Conflict);
         }
         let tx = self.conn.unchecked_transaction()?;
-        let existing: Option<String> = tx
+        let existing: Option<(String, String)> = tx
             .query_row(
-                "SELECT retire_key FROM profile_retirements WHERE host_id=?1 AND profile=?2",
+                "SELECT retire_key, state FROM profile_retirements WHERE host_id=?1 AND profile=?2",
                 params![host, profile],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        match existing {
-            Some(other) if other != key => return Err(StoreError::Conflict),
-            Some(_) => {}
-            None => {
-                tx.execute(
-                    "INSERT INTO profile_retirements(host_id,profile,retire_key,state,recorded_at_ms,deadline_ms)
-                     VALUES(?1,?2,?3,'retiring',?4,?5)",
-                    params![host, profile, key, now_ms, deadline_ms],
-                )?;
-            }
-        }
         let named = candidates(&tx, host, profile)?;
+        let (key, standing) = match existing {
+            // Confirmed, yet something holds a runtime again (placement has
+            // excluded the profile since confirmation, so only a binding the
+            // confirmation could not see): the old confirmation proves
+            // nothing now. Start over under the new key, with fresh stops.
+            Some((_, state)) if state == "confirmed" && !named.is_empty() => {
+                tx.execute(
+                    "DELETE FROM profile_retirements WHERE host_id=?1 AND profile=?2",
+                    params![host, profile],
+                )?;
+                (key.to_owned(), false)
+            }
+            Some((standing, _)) => (standing, true),
+            None => (key.to_owned(), false),
+        };
+        if !standing {
+            tx.execute(
+                "INSERT INTO profile_retirements(host_id,profile,retire_key,state,recorded_at_ms,deadline_ms)
+                 VALUES(?1,?2,?3,'retiring',?4,?5)",
+                params![host, profile, key, now_ms, deadline_ms],
+            )?;
+        }
         let start = if named.is_empty() {
             tx.execute(
                 "UPDATE profile_retirements SET state='confirmed' WHERE host_id=?1 AND profile=?2",
                 params![host, profile],
             )?;
             RetirementStart::Clear
-        } else if drain {
+        } else if drain || standing {
             RetirementStart::Draining(named)
         } else {
             tx.execute(
@@ -189,7 +220,7 @@ impl Store {
             RetirementStart::InUse(named)
         };
         tx.commit()?;
-        Ok(start)
+        Ok((key, start))
     }
 
     /// The instances of `profile` holding a runtime on `host` now.

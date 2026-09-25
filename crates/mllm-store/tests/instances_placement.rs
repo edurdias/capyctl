@@ -2001,6 +2001,46 @@ fn a_retirement_names_its_instances_and_waits_for_evidence() {
     );
 }
 
+/// ADR 0018 §4 (controller ruling I1): a retirement still draining is resumed,
+/// not refused and not cancelled, by a retried remove under another key, with
+/// or without drain; the stops keep the first key.
+// T16 T32
+#[test]
+fn a_retried_remove_resumes_a_draining_retirement() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy(
+            "deploy",
+            json!({"instances": 1, "placement": {"hosts": ["spark-a"]}}),
+        )
+        .deployment_id;
+    all_ready(&t, &id, "start");
+    assert!(matches!(
+        t.store.begin_profile_retirement("host-a", "local", "k1", NOW, DEADLINE, true).unwrap(),
+        RetirementStart::Draining(ref named) if named.len() == 1
+    ));
+    for drain in [true, false] {
+        let (key, start) = t
+            .store
+            .begin_profile_retirement_keyed("host-a", "local", "k2", NOW + 5, DEADLINE + 5, drain)
+            .unwrap();
+        assert_eq!(key, "k1");
+        assert!(
+            matches!(start, RetirementStart::Draining(ref named) if named.len() == 1),
+            "{start:?}"
+        );
+    }
+    let (key, state, deadline) = t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (key.as_str(), state.as_str(), deadline),
+        ("k1", "retiring", DEADLINE)
+    );
+}
+
 /// ADR 0018 §4 (owner decision 2026-09-25): a failed stop ends the retirement
 /// without confirming it, and so does the deadline; placements resume and
 /// nothing is released by the retirement itself.
