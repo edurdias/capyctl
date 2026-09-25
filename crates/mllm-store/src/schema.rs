@@ -865,6 +865,18 @@ CREATE TABLE IF NOT EXISTS profile_retirement_stops(
 );
 "#;
 
+/// v36 (ADR 0018 §4, §5; controller ruling I2/I3): the profiles standalone's
+/// embedded host publishes now. The embedded host is not enrolled, so it has
+/// no approved publication; this row plays that part for placement: a
+/// profile it no longer lists takes no new instance, as on a server.
+pub const SCHEMA_V36: &str = r#"
+CREATE TABLE IF NOT EXISTS embedded_host_publications(
+  host_id TEXT PRIMARY KEY CHECK(length(host_id) BETWEEN 1 AND 128),
+  profiles_json TEXT NOT NULL CHECK(json_valid(profiles_json) AND json_type(profiles_json)='array'),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

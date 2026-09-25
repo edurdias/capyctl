@@ -328,3 +328,60 @@ fn a_live_republication_clears_every_confirmed_retirement_it_does_not_list() {
         .unwrap();
     assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
 }
+
+// T16 T32 T33 (ADR 0018 §4, §5; controller rulings I2, I3): standalone's
+// embedded host publishes under the server's rules. Live, a profile leaves
+// the list only with a confirmed retirement, which the update then clears; a
+// startup list is taken as it is and clears unlisted confirmed retirements.
+#[test]
+fn an_embedded_publication_drops_a_profile_only_after_its_retirement() {
+    use mllm_store::host_publication::RepublishRefusal;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("s.sqlite3")).unwrap();
+    let both = vec!["local".to_string(), "vllm".to_string()];
+    store
+        .publish_embedded_profiles("local", &both, 1, true)
+        .unwrap();
+    assert_eq!(
+        store.publish_embedded_profiles("local", &["local".to_string()], 2, false),
+        Err(RepublishRefusal::NotRetired("vllm".into()))
+    );
+    assert_eq!(
+        store.embedded_profiles("local").unwrap(),
+        Some(both.clone())
+    );
+    store
+        .begin_profile_retirement("local", "vllm", "k", 3, 10, false)
+        .unwrap();
+    store
+        .publish_embedded_profiles("local", &["local".to_string()], 4, false)
+        .unwrap();
+    assert!(store.profile_retirement("local", "vllm").unwrap().is_none());
+    assert_eq!(
+        store.embedded_profiles("local").unwrap(),
+        Some(vec!["local".to_string()])
+    );
+    // A crash after confirmation: the startup list decides.
+    store
+        .publish_embedded_profiles("local", &both, 5, false)
+        .unwrap();
+    store
+        .begin_profile_retirement("local", "vllm", "k2", 6, 10, false)
+        .unwrap();
+    store
+        .publish_embedded_profiles("local", &both, 7, true)
+        .unwrap();
+    assert_eq!(
+        store
+            .profile_retirement("local", "vllm")
+            .unwrap()
+            .unwrap()
+            .1,
+        "confirmed",
+        "still listed at startup: still excluded"
+    );
+    store
+        .publish_embedded_profiles("local", &["local".to_string()], 8, true)
+        .unwrap();
+    assert!(store.profile_retirement("local", "vllm").unwrap().is_none());
+}

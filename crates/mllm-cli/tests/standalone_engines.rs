@@ -42,6 +42,15 @@ fn register(document: &std::path::Path, name: &str) {
     write_engines(&engines, &lock, None).unwrap();
 }
 
+/// `engine remove`'s write: `name` out of engines.yaml beside the document.
+fn unregister(document: &std::path::Path, name: &str) {
+    let path = engines_beside(document);
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.remove(name);
+    write_engines(&engines, &lock, None).unwrap();
+}
+
 /// Deploy `name` on `profile` through the management API, as `mllm deploy`
 /// does: the embedded configuration source composes it against the host
 /// document the role publishes now.
@@ -270,4 +279,149 @@ async fn a_name_in_both_is_refused_at_start() {
     };
     let structured: mllm_cli::output::StructuredError = refused.into();
     assert_eq!(structured.code, "profile_exists", "{}", structured.message);
+}
+
+/// Deploy `name` on `profile` and start it to Ready; its deployment id.
+async fn ready_on(
+    app: &mllm_cli::roles::App,
+    state: &std::path::Path,
+    name: &str,
+    profile: &str,
+) -> String {
+    let (status, body) = deploy(app, state, name, profile).await;
+    assert!(status.is_success(), "{status} {body}");
+    let id = body["deployment_id"].as_str().unwrap().to_owned();
+    let op = app
+        .controller
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.controller.wait_terminal(&op).await.unwrap(),
+        mllm_domain::LifecycleState::Ready
+    );
+    id
+}
+
+// T16 T32 (ADR 0018 §4, §5; controller ruling I3): after a drained removal
+// the deployment that used the profile still exists, stopped; starting it
+// again must not place the removed engine on the embedded host.
+#[tokio::test]
+async fn a_removed_profile_never_starts_again() {
+    let state = support::safe_state_dir();
+    let document = standalone_doc(state.path());
+    register(&document, "vllm-patched");
+    let app = support::boot_configured(state.path(), &document)
+        .await
+        .expect("standalone boots");
+    let id = ready_on(&app, state.path(), "busy-model", "vllm-patched").await;
+    let socket = state.path().join(SOCKET_NAME);
+    let reply = request(
+        &socket,
+        &ControlRequest::Remove {
+            profile: "vllm-patched".into(),
+            drain: true,
+        },
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+    // The operator's CLI writes engines.yaml, then asks for the reload.
+    if EnginesFile::load(&engines_beside(&document))
+        .unwrap()
+        .profiles
+        .contains_key("vllm-patched")
+    {
+        unregister(&document, "vllm-patched");
+    }
+    let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(reload["ok"], true, "{reload}");
+    assert_eq!(app.profiles(), vec!["local".to_string()]);
+    let started = match app
+        .controller
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+    {
+        Ok(op) => app.controller.wait_terminal(&op).await.ok(),
+        Err(_) => None,
+    };
+    assert_ne!(
+        started,
+        Some(mllm_domain::LifecycleState::Ready),
+        "the removed profile was placed again"
+    );
+    let _ = app.shutdown().await;
+}
+
+// T03 T16 (ADR 0018 §4, §5; controller ruling I3): engines.yaml losing a
+// published profile outside `engine remove` is not published by a reload:
+// the profile stays published until it is retired.
+#[tokio::test]
+async fn a_reload_never_drops_a_published_profile() {
+    let state = support::safe_state_dir();
+    let document = standalone_doc(state.path());
+    register(&document, "vllm-patched");
+    let app = support::boot_configured(state.path(), &document)
+        .await
+        .expect("standalone boots");
+    unregister(&document, "vllm-patched");
+    let reply = request(
+        &state.path().join(SOCKET_NAME),
+        &ControlRequest::Add,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["code"], "publish_rejected", "{reply}");
+    assert!(
+        reply["message"].as_str().unwrap().contains("engine remove"),
+        "{reply}"
+    );
+    assert!(app.profiles().contains(&"vllm-patched".to_string()));
+    let _ = app.shutdown().await;
+}
+
+// T32 (ADR 0018 §4; controller ruling I2): a retirement left standing by a
+// standalone that stopped mid-drain is expired once past its deadline, so the
+// profile is placeable again and not wedged.
+#[tokio::test]
+async fn a_stale_retirement_expires_when_standalone_starts() {
+    let state = support::safe_state_dir();
+    let document = standalone_doc(state.path());
+    register(&document, "vllm-patched");
+    let ports = support::engine_ports();
+    let app = support::boot_configured_on(state.path(), &document, ports)
+        .await
+        .expect("standalone boots");
+    let id = ready_on(&app, state.path(), "busy-model", "vllm-patched").await;
+    let host = app.host_document()["name"].as_str().unwrap().to_owned();
+    let _ = app.shutdown().await;
+    {
+        // The role stopped while a drained retirement waited on its stop.
+        let store =
+            mllm_store::Store::open(&state.path().join("server").join("srv.sqlite3")).unwrap();
+        let start = store
+            .begin_profile_retirement(&host, "vllm-patched", "stale", 1, 2, true)
+            .unwrap();
+        assert!(
+            matches!(
+                start,
+                mllm_store::profile_retirement::RetirementStart::Draining(_)
+            ),
+            "{start:?}"
+        );
+    }
+    let app = support::boot_configured_on(state.path(), &document, ports)
+        .await
+        .expect("standalone boots again");
+    assert!(app
+        .store
+        .profile_retirement(&host, "vllm-patched")
+        .unwrap()
+        .is_none());
+    let _ = id;
+    let _ = app.shutdown().await;
 }

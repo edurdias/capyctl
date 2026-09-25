@@ -7,7 +7,7 @@
 //! their evidence (spec design rule 4).
 use crate::host_drain::DrainCandidate;
 use crate::{Store, StoreError};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 /// One instance of the profile holding a runtime on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,8 +98,10 @@ fn candidates(
 
 /// ADR 0018 §4: whether a new instance of `profile` may be placed on `host`.
 /// Not while a retirement of it stands, nor when the host's approved
-/// publication exists and no longer carries the profile. A host with no
-/// publication row (the embedded host) is judged by retirements alone.
+/// publication exists and no longer carries the profile. Standalone's
+/// embedded host has no approved publication; its embedded publication
+/// (controller ruling I3) plays that part. A host with neither is judged by
+/// retirements alone.
 pub(crate) fn profile_placeable(
     tx: &Transaction<'_>,
     host: &str,
@@ -120,10 +122,22 @@ pub(crate) fn profile_placeable(
             |r| r.get(0),
         )
         .optional()?;
-    Ok(published.is_none_or(|json| {
-        serde_json::from_str::<serde_json::Value>(&json)
+    if let Some(json) = published {
+        return Ok(serde_json::from_str::<serde_json::Value>(&json)
             .ok()
-            .is_some_and(|doc| doc["runtime_profiles"].get(profile).is_some())
+            .is_some_and(|doc| doc["runtime_profiles"].get(profile).is_some()));
+    }
+    let embedded: Option<String> = tx
+        .query_row(
+            "SELECT profiles_json FROM embedded_host_publications WHERE host_id=?1",
+            [host],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(embedded.is_none_or(|json| {
+        serde_json::from_str::<Vec<String>>(&json)
+            .ok()
+            .is_some_and(|listed| listed.iter().any(|p| p == profile))
     }))
 }
 
@@ -221,6 +235,80 @@ impl Store {
         };
         tx.commit()?;
         Ok((key, start))
+    }
+
+    /// ADR 0018 §4, §5 (controller rulings I2, I3): record the profiles
+    /// standalone's embedded host publishes, the same rules as a server's
+    /// publications. At `startup` the list is taken as it is (a server takes a
+    /// host's startup publication the same way). Live, a profile the previous
+    /// list carried leaves it only with a confirmed retirement; otherwise the
+    /// whole update is refused and the previous list stays. Either way the
+    /// confirmed retirement of every profile the new list does not carry is
+    /// cleared, so the name can be registered again.
+    pub fn publish_embedded_profiles(
+        &self,
+        host: &str,
+        profiles: &[String],
+        now_ms: i64,
+        startup: bool,
+    ) -> Result<(), crate::host_publication::RepublishRefusal> {
+        use crate::host_publication::RepublishRefusal;
+        if host.is_empty() || host.len() > 128 || now_ms < 0 {
+            return Err(RepublishRefusal::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if !startup {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT profiles_json FROM embedded_host_publications WHERE host_id=?1",
+                    [host],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let previous: Vec<String> = match previous {
+                Some(json) => serde_json::from_str(&json).map_err(|_| RepublishRefusal::Store)?,
+                None => Vec::new(),
+            };
+            for dropped in previous.iter().filter(|p| !profiles.contains(p)) {
+                let confirmed: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM profile_retirements WHERE host_id=?1 AND profile=?2 AND state='confirmed')",
+                    params![host, dropped],
+                    |r| r.get(0),
+                )?;
+                if !confirmed {
+                    return Err(RepublishRefusal::NotRetired(dropped.clone()));
+                }
+            }
+        }
+        let listed = serde_json::to_string(profiles).map_err(|_| RepublishRefusal::Invalid)?;
+        tx.execute(
+            "INSERT INTO embedded_host_publications(host_id,profiles_json,recorded_at_ms) VALUES(?1,?2,?3)
+             ON CONFLICT(host_id) DO UPDATE SET profiles_json=excluded.profiles_json,recorded_at_ms=excluded.recorded_at_ms",
+            params![host, listed, now_ms],
+        )?;
+        let document = serde_json::json!({
+            "runtime_profiles": profiles
+                .iter()
+                .map(|p| (p.clone(), serde_json::Value::Bool(true)))
+                .collect::<serde_json::Map<_, _>>()
+        });
+        crate::host_publication::clear_unlisted_confirmed(&tx, host, &document)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The profiles the embedded host published last, if it ever did.
+    pub fn embedded_profiles(&self, host: &str) -> Result<Option<Vec<String>>, StoreError> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT profiles_json FROM embedded_host_publications WHERE host_id=?1",
+                [host],
+                |r| r.get(0),
+            )
+            .optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(|_| StoreError::Conflict))
+            .transpose()
     }
 
     /// The instances of `profile` holding a runtime on `host` now.

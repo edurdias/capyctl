@@ -11,9 +11,11 @@ use mllm_controller::coordinator::CoordinatorCommands;
 use mllm_controller::engine_provider::{EngineProvider, NamedInstallation, ProviderError};
 use mllm_controller::installation_gate::EmbeddedInstallations;
 use mllm_controller::profile_retirement::{ProfileRetirements, RetirementStep, RETIREMENT_POLL};
+use mllm_store::host_publication::RepublishRefusal;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use crate::device_inventory::InventoryPublication;
 
@@ -170,8 +172,59 @@ fn resolve(
     })
 }
 
+/// How often a running standalone expires abandoned retirements.
+pub const RETIREMENT_EXPIRY_TICK: Duration = Duration::from_secs(30);
+
+/// ADR 0018 §4, §5 (controller rulings I2, I3): at standalone's start, what a
+/// server does at a host's start. A retirement abandoned past its deadline
+/// (the role stopped mid-drain) ends unconfirmed, and the embedded host's
+/// profiles are recorded as its publication, which keeps a profile it no
+/// longer publishes out of placement and clears the confirmed retirement of
+/// every profile it does not list.
+pub fn publish_at_start(
+    commands: &CoordinatorCommands,
+    host_id: &str,
+    profiles: &[String],
+) -> Result<(), String> {
+    let now = mllm_protocol::now_unix_ms();
+    commands
+        .read(|store| {
+            store.expire_profile_retirements(now)?;
+            store
+                .publish_embedded_profiles(host_id, profiles, now, true)
+                .map_err(|_| mllm_store::StoreError::Conflict)
+        })
+        .map(|_| ())
+        .map_err(|_| "the embedded host's profiles could not be recorded".to_owned())
+}
+
+/// Controller ruling I2: while standalone runs, expire abandoned retirements
+/// as the server does before each placement, until `shutdown`.
+pub async fn expire_retirements(
+    commands: CoordinatorCommands,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return }
+            }
+            () = tokio::time::sleep(RETIREMENT_EXPIRY_TICK) => {
+                let now = mllm_protocol::now_unix_ms();
+                let _ = commands.read(|store| store.expire_profile_retirements(now));
+            }
+        }
+    }
+}
+
 /// Re-read engines.yaml and publish it if it changed. Blocking.
-fn reload(engines: &Path, provider: &dyn EngineProvider, host: &EmbeddedHost) -> Value {
+fn reload(
+    engines: &Path,
+    provider: &dyn EngineProvider,
+    host: &EmbeddedHost,
+    commands: &CoordinatorCommands,
+    host_id: &str,
+) -> Value {
     let registered = match EnginesFile::load(engines) {
         Ok(file) => file.profiles,
         Err(e) => return refused("invalid_config", format!("{}: {}", e.path, e.detail)),
@@ -182,6 +235,22 @@ fn reload(engines: &Path, provider: &dyn EngineProvider, host: &EmbeddedHost) ->
     };
     if host.document_for(&named) == host.document() {
         return json!({"ok": true, "published": "unchanged"});
+    }
+    // ADR 0018 §4 (controller ruling I3): the server's rule. A published
+    // profile leaves the embedded host only after its retirement was
+    // confirmed; the previous publication stays otherwise.
+    let profiles: Vec<String> = named.iter().map(|n| n.profile.clone()).collect();
+    let now = mllm_protocol::now_unix_ms();
+    match commands.read(|store| Ok(store.publish_embedded_profiles(host_id, &profiles, now, false)))
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(RepublishRefusal::NotRetired(name))) => {
+            return refused(
+                "publish_rejected",
+                format!("engines.yaml no longer declares {name}, which is published; only `mllm engine remove {name}` drops a published profile"),
+            )
+        }
+        _ => return refused("internal", "the embedded host's profiles could not be recorded"),
     }
     match host.replace(named) {
         Ok(()) => json!({"ok": true, "published": "published"}),
@@ -210,14 +279,18 @@ impl StandaloneControl {
     }
 
     async fn reload(&self) -> Value {
-        let (engines, provider, host) = (
+        let (engines, provider, host, commands, host_id) = (
             self.engines.clone(),
             self.provider.clone(),
             self.host.clone(),
+            self.commands.clone(),
+            self.host_id.clone(),
         );
-        tokio::task::spawn_blocking(move || reload(&engines, provider.as_ref(), &host))
-            .await
-            .unwrap_or_else(|_| refused("internal", "reloading the engines failed"))
+        tokio::task::spawn_blocking(move || {
+            reload(&engines, provider.as_ref(), &host, &commands, &host_id)
+        })
+        .await
+        .unwrap_or_else(|_| refused("internal", "reloading the engines failed"))
     }
 
     /// engines.yaml without `profile`, checked to still publish something.
@@ -315,18 +388,11 @@ impl StandaloneControl {
             // profile; a second `engine remove` finishes it.
             return refused("internal", format!("{}: {}", e.path, e.detail));
         }
+        // The publication without the profile clears its confirmed
+        // retirement, so the name can be registered again.
         let mut reply = self.reload().await;
         if reply["ok"] == true {
             reply["removed"] = profile.into();
-            // The profile is gone from the document now; the confirmed
-            // retirement is cleared so the name can be registered again, as
-            // an accepted publication clears it on a server.
-            if published {
-                let (host, name) = (self.host_id.clone(), profile.to_owned());
-                let _ = self
-                    .commands
-                    .read(|store| store.cancel_profile_retirement(&host, &name, &key));
-            }
         }
         reply
     }

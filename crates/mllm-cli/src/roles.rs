@@ -1177,6 +1177,20 @@ async fn start_standalone_inner(
             .publish_resource_policy(&declared_host, &observations)
             .map_err(|error| StartError::Deploy(error.to_string()))?;
     }
+    // ADR 0018 §4, §5 (controller rulings I2, I3): standalone keeps a removed
+    // profile out of placement and never lets an abandoned retirement wedge a
+    // name, as a server does: expiry at start and while running, and the
+    // embedded host's profiles recorded as its publication.
+    crate::standalone_engines::publish_at_start(
+        &coordinator.commands(),
+        &declared_host.name,
+        &embedded.profiles(),
+    )
+    .map_err(StartError::Deploy)?;
+    supervision.supervise(tokio::spawn(crate::standalone_engines::expire_retirements(
+        coordinator.commands(),
+        supervision.cancel_signal(),
+    )));
     // SPEC §10 step 1, §16.2 (W10 gap b): waiting requests are bounded by the
     // embedded host's published `resource_policy.queue`.
     if let Some(queue) = controller
