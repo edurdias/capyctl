@@ -50,7 +50,7 @@ eng4_rc3_agent() { # (a)
   # rc.3 ignores engines.yaml: not published.
   # Only this host's entry counts: the other host's full document declares vllm.
   if ! dry; then
-    cli list hosts --output json >"$EVID/rc3-agent-hosts.json" || return 1
+    cli list hosts --format json >"$EVID/rc3-agent-hosts.json" || return 1
     if eng4_host_has "$EVID/rc3-agent-hosts.json" "$host" vllm; then
       echo "UNEXPECTED: an rc.3 agent published engines.yaml"; return 1
     fi
@@ -58,7 +58,7 @@ eng4_rc3_agent() { # (a)
   "$MATRIX_DIR/roles.sh" host-down "$host" && "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
   dry && return 0
-  cli list hosts --output json >"$EVID/upgraded-agent-hosts.json" && eng4_host_has "$EVID/upgraded-agent-hosts.json" "$host" vllm
+  cli list hosts --format json >"$EVID/upgraded-agent-hosts.json" && eng4_host_has "$EVID/upgraded-agent-hosts.json" "$host" vllm
 }
 
 eng4_rc3_server() ( # (b) a subshell: every server-side command uses the rc.3 binary
@@ -77,7 +77,7 @@ eng4_rc3_server() ( # (b) a subshell: every server-side command uses the rc.3 bi
   "$MATRIX_DIR/roles.sh" host-down "$host" && "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
   dry && return 0
-  cli list hosts --output json >"$EVID/rc3-server-hosts.json" && eng4_host_has "$EVID/rc3-server-hosts.json" "$host" vllm
+  cli list hosts --format json >"$EVID/rc3-server-hosts.json" && eng4_host_has "$EVID/rc3-server-hosts.json" "$host" vllm
 )
 
 row_main() {

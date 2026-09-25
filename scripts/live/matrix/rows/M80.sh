@@ -23,7 +23,7 @@
 #           vLLM keys /metrics and the harness never reads engine keys, so the scrape
 #           gives vLLM no direct baseline; its periodic throughput log lines are kept.
 #           For both engines the row also saves the server's mllm latency view
-#           (`status deployment --output json`, field `latency`) before and after
+#           (`status deployment --format json`, field `latency`) before and after
 #           each cell: router phases, host ingress times and the engine histograms
 #           the host agent forwards (`source: engine`, vLLM included). `bench.py
 #           report` windows it per cell and splits the path overhead (client ->

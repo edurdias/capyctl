@@ -16,4 +16,6 @@ pub mod shutdown;
 pub mod standalone_config;
 // ADR 0018 §5: standalone's engine add, remove and list.
 pub mod standalone_engines;
+// Owner decision 2026-09-25: table output for record views.
+pub mod table;
 pub mod validate;

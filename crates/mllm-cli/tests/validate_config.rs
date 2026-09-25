@@ -38,7 +38,7 @@ fn validate(args: &[&str]) -> (i32, Value, String) {
         .arg("validate")
         .arg("config")
         .args(args)
-        .args(["--output", "json"])
+        .args(["--format", "json"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();

@@ -267,6 +267,13 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true, value_name = "TARGET")]
     output: Option<String>,
+    /// How a command that reads records prints them: an aligned table (the
+    /// default, terminal or not) or the JSON result, as scripts need it.
+    #[arg(long, global = true, value_name = "FORMAT", value_parser = ["table", "json"])]
+    format: Option<String>,
+    /// Short for `--format json`.
+    #[arg(long, global = true, conflicts_with = "format")]
+    json: bool,
     #[arg(long, global = true, value_name = "ID")]
     request_id: Option<String>,
     #[command(subcommand)]
@@ -802,6 +809,9 @@ pub struct Invocation {
     pub command: Command,
     pub config: Option<PathBuf>,
     pub output: Option<String>,
+    /// Owner decision 2026-09-25: `--format table|json` (`--json` is
+    /// `--format json`). `None` is the default, a table for record views.
+    pub format: Option<String>,
     pub debug_engine_logs: bool,
     pub request_id: Option<String>,
     /// ADR 0014 amendment A1: `--initialize-timeout` on `deploy model
@@ -921,6 +931,11 @@ where
         command,
         config: cli.config,
         output: cli.output,
+        format: if cli.json {
+            Some("json".to_owned())
+        } else {
+            cli.format
+        },
         request_id: cli.request_id,
         initialize_timeout_ms,
         evict,
