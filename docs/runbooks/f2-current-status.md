@@ -195,10 +195,76 @@ Open items:
   test). `final-rereview.md` Minor 1, the `engines.yaml.lock` hard link, is
   fixed as of this session's commit.
 
+## Release candidate 0.1.0-rc.4 — build and live pass, 2026-09-25 (branch `docs/rc4-live-evidence`)
+
+Host names in this section: host A is the first Spark, host B the second (the
+tight-policy host); the control-plane host runs the server. Evidence (local,
+not committed): `target/live/rc4/`.
+
+**Cleanup of the observation debug run.** The roles left from run
+`matrix-20260925T021319Z` (both host agents in tmux and the server) were
+stopped with `roles.sh down` (each role signalled by its recorded identity and
+exited). The debug tree `~/mllm-obsfail` and the run directory were removed
+from both hosts. Afterwards neither host had a tmux session, an mllm, engine or
+GPU compute process, or a rendezvous directory.
+
+**Release.** Draft pre-release `v0.1.0-rc.4` (unpublished; the owner
+publishes) now targets `main` at 612ed0d (PR #28 drain fix and PR #29
+standalone vLLM deep park). Both tarballs were rebuilt from 612ed0d: x86_64 on
+the control-plane host, aarch64 natively on host A (nice 19). Each passed
+`scripts/verify-packaging.sh` on its own architecture (shellcheck is not
+installed there, so that check was skipped). `BUILDINFO` records commit
+612ed0d, not dirty, and runtime manifest `dec9dca0…91561`. The assets were
+replaced and the notes updated to add #29.
+
+| Asset | sha256 |
+|---|---|
+| `mllm-0.1.0-rc.4-linux-x86_64.tar.gz` | `69d3e9ce61a45c72243134257d7319e0ded8634483ce0c7a26b5993257b69a24` |
+| `mllm-0.1.0-rc.4-linux-aarch64.tar.gz` | `df08d2b2da12c99126936ad9d8c917d4d5d869aea2093023b9f69a65a37d8b63` |
+| `install.sh` | `a83b56109bba710a84fa3dfb5919c1caebc5c8c980c12cd81c8a3a0fae2812d0` |
+| `SHA256SUMS` | `bcb272df7eac00b1ad04c1f220d08d8e206196bd1a8f5c1dcde8d00fdb33b823` |
+
+**Live pass, installed binaries only.** Every role ran from binaries installed
+by `install.sh`, fed from a `file://` mirror of the draft's assets (downloaded
+back from the draft and checked against its `SHA256SUMS`). The roles ran under
+the packaged systemd user units with fresh state: the server's state in its
+own directory, the hosts in the default layout (`~/.local/state/mllm/host`,
+document at `~/.config/mllm/host.yaml`, managed runtime). Only the matrix
+harness scripts were copied to the hosts, with no build or runtime tree. Host A
+used the normal budget, host B the tight one (managed limit 84 GiB,
+`max_parked` 1). vLLM 0.29.0 and SGLang 0.5.20 ran from the existing
+environments.
+
+| Check | Live verdict |
+|---|---|
+| a. M73 v92-4, s92-4 | pass. Both engines launched from the managed runtime, listening on loopback only (refused from off-host). Unkeyed engine and control routes returned 401; the router refused unkeyed callers (401) and has no `/metrics` path (404). The answer was correct and the stream well-formed. Stop cleaned up with verification. The restart made a new binding with no reused PID. MemAvailable came back within 0.31 GiB |
+| b. Standalone vLLM, generated deployment (#29) | pass on host A, `mllm start standalone` under the packaged standalone unit. The deployment document came from the product's own template (`standalone_config::deployment_document`, deep parking on), which gave `residency: deep` and `--enable-sleep-mode`. Two park/wake cycles: each park settled `parked` in about 2 s and released 20.2–20.5 GiB of the 25.2 GiB Ready drop (80–82%, MemAvailable). The same two processes kept their PIDs and start ticks. A routed request woke the deployment in 8.8 s with the right answer, still at generation 1. A `systemctl --user stop`/`start` of the unit re-attached the running engine. `delete deployment --stop` cleaned up |
+| c. `drain host` with `request_deadline: 600s` (#28) | pass on host B. Status showed `request_deadline_ms` 600000. The drain returned `drained: true` with the instance `stopped` and cleanup `verified`, in 1.1 s with nothing refused. Cleanup was verified with no engine, GPU process or port left. The next request reactivated the deployment on demand (20 s, answer correct). Before #28 this drain was refused `LifecycleConflict` |
+| d. Refusals (#18) | pass. After an operator stop, a routed request got 409 `deployment_stopped`, and the message names `mllm start deployment <id>`. Host B then ran rc.1 under its unit on the rc.4-written state, and the server listed it `upgrade_required` ("reports no version"). `start deployment`, `start --evict` and `start --wait` were each refused `host_ineligible`, CLI exit 15. The message names the host, "host version unreported, server version 0.1.0-rc.4" and the reason. The deployment stayed stopped. Reinstalling rc.4 made host B `supported`, and the start served |
+| e. Two-instance `start --evict --wait` on tight host B (#18) | pass. Incumbent v17-14 (46 GiB) was Ready and v17-4 with 2 instances (2 × 24 GiB) was deployed. `start --evict --wait` exited 0 in 22.6 s with both instances Ready. Its receipt names the one victim (`v17-14/0`), which was parked, not stopped: the tight host allows one parked deployment. Both requests were answered. An earlier run first tried a plain `start --wait`: instance 0 fit next to the incumbent, instance 1 did not, and after the 900 s start deadline it exited 4 (`insufficient_resources` … "the start is partial") with instance 0 left Ready. That matches SPEC §14 |
+| f. `revoke host` under the packaged unit (#17) | pass on host A with v92-4 Ready. The revoke answered `engines: retained`. The agent logged one `error [host_revoked]` line naming both recovery commands. systemd recorded `status=14`, `Result=exit-code`, `NRestarts=0`, and the unit was still failed 20 s later (not restarted). All three engine identities stayed alive, and dispatch returned 503. Then `invite host <id> --recover` and `join host --recover` (same host id, `recovered: true`) and a unit start: online, Ready, the same three PIDs and start ticks (re-proven, not relaunched), and served |
+| g. M28 s92-14 SGLang park/wake ×3 | pass 3 of 3. Each run released 88.7–88.9% of the Ready drop with the same four processes, woke on request in 182–219 s (disk reload), and matched I1 exactly (max logprob delta 0.0). The host journal for the run has 0 `native_observation_*` or `saver_observation_*` lines, including the new `native_observation_slow` |
+
+Scratch rows used for c–f (`DRAIN600`, `EVICT2`, `EVICT2D`, `SKEWD`, `SKEWX`,
+`REVOKE`) are kept with the evidence under `target/live/rc4/rows/`, and run
+through `SCRATCH_ROWS`. The first `SKEWD` run shows rc=1 because its exit-code
+wrapper checked the wrong status; `SKEWX` repeated the refusals and recorded
+exit 15 from the CLI itself.
+
+No product bug was found. CPU and Fake-engine tests are not qualification. The
+rows above prove the named behaviours only for the q4 and q14 fixtures on
+these two hosts.
+
+Host state after the pass: every deployment was deleted and every unit stopped
+and uninstalled. `~/.local/state/mllm`, `~/.config/mllm` and the copied
+harness and mirrors were removed from both hosts. Neither host has an mllm,
+engine or GPU compute process, a tmux session or a rendezvous directory. The
+server state stays on the control-plane host under `~/mllm-rc4-server`.
+
 ## Standalone vLLM deep parking — 2026-09-25 (branch `fix/standalone-vllm-deep-park`)
 
-CPU and Fake-engine tests only; not live-proven. The live check (a standalone
-vLLM park and wake on a Spark with rc.4) is pending.
+Live-proven with rc.4 (see the rc.4 section above, check b). The original
+evidence was CPU and Fake-engine tests only.
 
 - Defect: the generated standalone deployment declared vLLM `restart_only`
   whatever the deep-park switch said, so a standalone vLLM deployment launched
