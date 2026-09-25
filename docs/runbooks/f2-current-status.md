@@ -88,6 +88,91 @@ skipped); `scripts/test-install.sh` passed. CPU and mTLS tests are not qualifica
 not live-proven. Pending: a live revoke on a Spark under the packaged unit (exit 14,
 unit not restarted, engines alive), then `join --recover` re-proving them.
 
+## SGLang saver observation failure at `receive_header` — 2026-09-25 (branch `fix/sglang-observation-failed`)
+
+The rc.2 M28 s92-14 refusal (`park_refused` after `native_observation_failed` at
+`receive_header`) is still **not root-caused**. This branch adds diagnostics only;
+it changes no park, wake or observation outcome.
+
+What the rc.2 evidence shows. The host journal on host-a has exactly two
+lines at 19:32:56.146 local time (23:32:56.146Z): `native_observation_failed`
+`receive_header`, then `saver_observation_unavailable` `observe`. There is no
+`sglang_park_not_quiescent` line, so the quiescence read and the
+`saver_mapped_before` read passed. The failure was the third saver read in the
+park (the precondition read in `Run::run`), 2.53 s after the server accepted the
+park. A `receive_header` failure means the socket gave no 4-byte header before
+the 1500 ms budget ran out, or the engine closed the connection without a frame.
+The bare stage could not tell these apart. The engine's own stderr goes to
+`/dev/null` without `--debug-engine-logs`, and the rc.2 host directory has since
+been removed.
+
+Code finding (not a behaviour change). When the scheduler does not reach a safe
+point in time, the engine never sends its `uncertain` frame. The bridge's slot
+expires at the same deadline the transport sends by, and the host's budget starts
+before the engine's. So on the host a slow scheduler always looks like
+`receive_header`, never `response_status`. Tightening the budgets so an
+`uncertain` frame always arrives in time is a possible follow-up. It is not in
+this branch.
+
+Diagnostics added:
+- Host (`crates/mllm-launchers/src/native_observation.rs`): each socket-stage
+  failure (`send`, `receive_header`, `receive_body`, `receive_eof`) logs one line
+  with `cause` (`deadline`, `eof`, or `error` plus its errno), the bytes received
+  of those expected, `elapsed_ms` against `timeout_ms`, and whether the enrolled
+  scheduler is still alive (`owner_alive`). The send and trailing-EOF paths used
+  to fail without any stage line. A success that took a third of its budget or
+  more logs `native_observation_slow`, so near misses show up in the host
+  journal without engine logs.
+- Engine (`runtime/sglang_observation_transport.py`,
+  `runtime/sglang_scheduler_observer.py`): each served connection logs one
+  `mllm_observation_served` line. It carries the outcome, the stage where a
+  connection without a frame stopped, and whether a frame went out. It also
+  carries the time from accept to when the bridge was asked and answered, the
+  bridge's wait for a safe point, the snapshot duration, safe points seen, lock
+  contention, and whether the result reached the slot. This line is visible
+  only with `--debug-engine-logs`.
+
+Live (host-a, SGLang 0.5.20, qwen3-14b, fixture s92-14, run
+`matrix-20260925T021319Z`; evidence `target/live/obsfail/`; the scratch loop row
+is `target/live/obsfail/rows/OBS.sh`):
+
+| Run | Result |
+|---|---|
+| `OBS-s92-14`, 20 park/wake cycles, engine logs off (the rc.2 setting) | 20 of 20 parked and 20 of 20 woke on request. 88.8–88.9% of the Ready drop was released each time. Wake took 185–225 s (disk reload). I1: one capture and 19 passes (max logprob delta 0.0). The same four engine identities stayed alive to the end, and cleanup was clean. **0** `native_observation_*` or `saver_observation_*` lines in the host log |
+| `OBS-s92-14-dbg`, 10 cycles, `--debug-engine-logs` | 10 of 10 parked and 10 of 10 woke, with 88.8% released. All 160 served observations came back `observed`. Engine time from accept to close: p50 18 ms, p99 271 ms, max 288 ms. Wait for a safe point: 0 ms every time (the first tick). Snapshot: 13–15 ms. Contention: 0. The 100–290 ms outliers came from the transport thread's own work, not the scheduler. One cycle was high throughout. That fits GIL hand-offs against the busy-spinning scheduler, but it is not proven |
+
+So the failure did not reproduce in 30 cycles, 0 of 30 (rc.2 1 of 3, rc.3 0 of 3).
+The measured margin is 18 ms typical and 288 ms worst against a 1500 ms budget.
+Hitting `receive_header` needs a stall more than five times the worst one seen.
+Candidates the evidence cannot separate: a Python GC pause in the scheduler
+(SGLang freezes GC only with CUDA graphs on, and the recipe has them off), a
+procfs stall in the snapshot's `/proc/self/maps` read, or a GIL stall of the
+transport thread. The new lines will name the stage, cause and timings the next
+time it happens.
+
+The live runs used the build before the last two diagnostic additions: the
+host's `native_observation_slow` line and the engine line's
+`request_ms`/`result_ms`. Those two are CPU-tested only. A third live run
+stopped when Tailscale SSH asked for owner re-authentication on both Sparks.
+It was not retried.
+
+Host state after the stop: both deployments in these runs were deleted. The
+last cleanup check found no engine process, no GPU compute process and no
+rendezvous directory on host-a. Still running or present, and needing a
+reachable host to remove: the host roles in tmux (`mx-host-matrix-20260925T021319Z`
+on both Sparks) and the control-host server (`mx-srv-matrix-20260925T021319Z`). Also
+present: `~/mllm-obsfail` (with `target/`) and `~/mllm-runs/matrix-20260925T021319Z`
+on both Sparks. The host-a tree was being overwritten by rsync when the SSH
+check started, so its runtime files may be a mix of two snapshots. After
+re-authentication, run `MLLM_MATRIX_LIVE=<repo>/target/live/obsfail
+MLLM_REMOTE_TREE=$HOME/mllm-obsfail scripts/live/matrix/roles.sh down`
+(this stops the hosts, then the server), then remove both trees and the run
+directories on the Sparks.
+
+Local verification (CPU only, not qualification): the core suite passed 1004.
+Workspace all-targets passed 1769, with 1 ignored. Clippy is clean with warnings
+denied. The `runtime/tests` `test_sglang_*` suite is OK (181).
+
 ## Version skew policy and capability gating — 2026-09-24 (branch `feat/version-skew`)
 
 Owner decision 2026-09-24: a SemVer skew policy between server and hosts (ADR 0017,

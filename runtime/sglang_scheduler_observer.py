@@ -99,6 +99,31 @@ labels, not durable replay fences; a future transport must enforce its own epoch
         self._thread = threading.get_ident()
         self._lock = threading.Lock()
         self._slot = None
+        # Diagnostic timings of the latest request (monotonic ns and counts),
+        # replaced whole, never read by the scheduler: see `timing`.
+        self._timing = None
+
+    def timing(self, request_id):
+        """What the scheduler did for one request, for the transport's log line.
+
+Milliseconds from the request to the safe point that ran the snapshot (`wait_ms`),
+the snapshot's own duration (`observe_ms`), how many safe points passed while the
+request was pending (`ticks`), how many found the bridge lock held (`contended`),
+and whether the result reached the slot (`stored`). None for another request.
+Found live 2026-09-24 (rc.2, M28): a refused park could not say whether the
+scheduler never reached a safe point or the snapshot itself was slow.
+"""
+        timing = self._timing
+        if timing is None or timing.get("id") != request_id:
+            return None
+        def millis(start, end):
+            if start is None or end is None:
+                return None
+            return (end - start) // 1_000_000
+        return dict(wait_ms=millis(timing["requested"], timing["started"]),
+                    observe_ms=millis(timing["started"], timing["finished"]),
+                    ticks=timing["ticks"], contended=timing["contended"],
+                    stored=timing["stored"])
 
     def request(self, request_id, *, timeout_ms):
         _identifier(request_id)
@@ -107,8 +132,11 @@ labels, not durable replay fences; a future transport must enforce its own epoch
         with self._lock:
             if self._slot is not None:
                 raise BridgeError("busy")
-            self._slot = dict(id=request_id, deadline=time.monotonic_ns() + timeout_ms * 1_000_000,
+            now = time.monotonic_ns()
+            self._slot = dict(id=request_id, deadline=now + timeout_ms * 1_000_000,
                               result=None, running=False, uncertain=False)
+            self._timing = dict(id=request_id, requested=now, started=None, finished=None,
+                                ticks=0, contended=0, stored=None)
 
     def _result(self, slot, started, finished, observation=None):
         return ObservationResult(self._binding_id, self._incarnation_id, slot["id"],
@@ -140,18 +168,26 @@ labels, not durable replay fences; a future transport must enforce its own epoch
             self._matching(request_id)["uncertain"] = True
 
     def _tick(self, *, dispatch_failed=False):
+        timing = self._timing
         if not self._lock.acquire(blocking=False):
+            if timing is not None and timing["started"] is None:
+                timing["contended"] += 1
             return
         try:
             slot = self._slot
             if slot is None or slot["running"] or slot["result"] is not None:
                 return
+            timing = self._timing if (self._timing or {}).get("id") == slot["id"] else None
+            if timing is not None:
+                timing["ticks"] += 1
             started = time.monotonic_ns()
             if (dispatch_failed or threading.get_ident() != self._thread
                     or started >= slot["deadline"] or slot["uncertain"]):
                 slot["uncertain"] = True
                 return
             slot["running"] = True
+            if timing is not None:
+                timing["started"] = started
         finally:
             self._lock.release()
         observation = None
@@ -175,6 +211,7 @@ labels, not durable replay fences; a future transport must enforce its own epoch
             observation = None
         finally:
             finished = time.monotonic_ns()
+            stored = False
             if self._lock.acquire(blocking=False):
                 try:
                     if self._slot is slot:
@@ -183,8 +220,12 @@ labels, not durable replay fences; a future transport must enforce its own epoch
                                 _diagnose("deadline", None)
                             observation = None
                         slot["result"] = self._result(slot, started, finished, observation)
+                        stored = True
                 finally:
                     self._lock.release()
+            if timing is not None:
+                timing["finished"] = finished
+                timing["stored"] = stored
             # If contended, the running slot expires uncertain; never retry a snapshot.
 
 

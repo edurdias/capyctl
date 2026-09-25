@@ -216,6 +216,34 @@ def _encode(value):
     return struct.pack("!I", len(data)) + data
 
 
+def _report(outcome, stage, frame, elapsed_ms, timeout_ms, timing, request_ms, result_ms):
+    """One line per served connection on the engine's own stderr.
+
+Fixed words, counts and milliseconds only, never a request ID, proof, path or
+native text. `stage` is where a connection without a frame stopped; `timing`
+is the bridge's view of the request (see SchedulerObserverBridge.timing);
+`request_ms` and `result_ms` are when, since the connection was accepted, the
+bridge was asked and its result came back, so the rest of `elapsed_ms` is this
+thread's own authentication, reads and send.
+Found live 2026-09-24 (rc.2, M28 s92-14): the host saw only `receive_header`
+and the engine side left no trace of why no frame came.
+"""
+    try:
+        import sys
+        fields = dict(event="mllm_observation_served", outcome=outcome, stage=stage,
+                      frame=frame, elapsed_ms=elapsed_ms, timeout_ms=timeout_ms,
+                      request_ms=request_ms, result_ms=result_ms)
+        if type(timing) is dict:
+            for name in ("wait_ms", "observe_ms", "ticks", "contended", "stored"):
+                value = timing.get(name)
+                if value is None or type(value) in (int, bool):
+                    fields[name] = value
+        sys.stderr.write(json.dumps(fields, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 # SPEC §9.2 / T21: the replay fence remembers this many recent correlation IDs.
 _REPLAY_WINDOW = 4096
 
@@ -316,20 +344,32 @@ Malformed/unauthenticated requests get no response. Valid observer failures may
 receive a correlated uncertain frame. EOF, excess input and expired deadlines
 close without a frame; no partial frame is a successful protocol result.
 """
-        deadline = time.monotonic() + 2
+        begun = time.monotonic()
+        deadline = begun + 2
         acquired = self._lock.acquire(blocking=False)
         request_id = None
         pending = False
+        # Diagnostics only (_report): where this connection stopped.
+        stage, frame, outcome, timeout_ms = "busy", False, "denied", None
+        asked = answered = None
         try:
-            if not acquired or self._poisoned:
+            if not acquired:
                 return "denied"
+            stage = "poisoned"
+            if self._poisoned:
+                return "denied"
+            stage = "authenticate"
             self._authenticate(connection)
             connection.setblocking(False)
+            stage = "receive_header"
             length = struct.unpack("!I", _receive(connection, 4, deadline))[0]
+            stage = "request_shape"
             if not 1 <= length <= 1024:
                 raise _Denied()
+            stage = "receive_body"
             request = json.loads(_receive(connection, length, deadline).decode("utf-8", errors="strict"),
                                  object_pairs_hook=_pairs)
+            stage = "request_shape"
             fields = {"version", "request_id", "timeout_ms"}
             if self._version == 2:
                 fields.add("proof")
@@ -338,6 +378,7 @@ close without a frame; no partial frame is a successful protocol result.
             if type(request["version"]) is not int or request["version"] != self._version:
                 raise _Denied()
             candidate_id = _identifier(request["request_id"])
+            stage = "proof"
             if self._version == 2:
                 proof = request["proof"]
                 expected = request_proof(self._binding.key, self._binding.binding_id,
@@ -346,9 +387,12 @@ close without a frame; no partial frame is a successful protocol result.
                         or not hmac.compare_digest(proof.encode("ascii", "replace"),
                                                    expected.encode("ascii"))):
                     raise _Denied()
+            stage = "request_shape"
             timeout_ms = _integer(request["timeout_ms"], 1, 2000)
+            stage = "replay"
             if candidate_id in self._seen:
                 raise _Denied()
+            stage = "authenticate"
             _quiet(connection)
             self._authenticate(connection)
             request_id = candidate_id
@@ -362,12 +406,16 @@ close without a frame; no partial frame is a successful protocol result.
             try:
                 # Mark before invocation: a failing request may already own a slot.
                 pending = True
+                stage = "bridge_request"
+                asked = time.monotonic()
                 self._bridge.request(request_id, timeout_ms=max(1, int(_remaining(deadline) * 1000)))
+                stage = "bridge_wait"
                 while True:
                     _remaining(deadline)
                     _quiet(connection)
                     result = self._bridge.poll(request_id)
                     if result is not None:
+                        answered = time.monotonic()
                         pending = False
                         response = self._project(result, request_id, requested_ns)
                         break
@@ -382,8 +430,10 @@ close without a frame; no partial frame is a successful protocol result.
             except Exception:
                 response = self._uncertain(request_id)
                 encoded = _encode(response)
+            stage = "authenticate_after"
             self._authenticate(connection)
             _quiet(connection)
+            stage = "send"
             view = memoryview(encoded)
             while view:
                 readable, writable, _ = select.select([connection], [connection], [], _remaining(deadline))
@@ -397,9 +447,11 @@ close without a frame; no partial frame is a successful protocol result.
                     if not sent:
                         raise _Denied()
                     view = view[sent:]
-            return response["status"]
+            stage, frame, outcome = None, True, response["status"]
+            return outcome
         except Exception:
-            return "uncertain" if request_id is not None else "denied"
+            outcome = "uncertain" if request_id is not None else "denied"
+            return outcome
         finally:
             if pending:
                 self._cancel(request_id)
@@ -408,3 +460,14 @@ close without a frame; no partial frame is a successful protocol result.
             finally:
                 if acquired:
                     self._lock.release()
+                timing = None
+                if request_id is not None:
+                    try:
+                        timing = getattr(self._bridge, "timing", None)
+                        timing = timing(request_id) if callable(timing) else None
+                    except Exception:
+                        timing = None
+                def since(moment):
+                    return None if moment is None else int((moment - begun) * 1000)
+                _report(outcome, stage, frame, since(time.monotonic()), timeout_ms, timing,
+                        since(asked), since(answered))
