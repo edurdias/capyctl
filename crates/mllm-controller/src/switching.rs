@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use mllm_store::events::SwitchPhase;
 use mllm_store::ordinary_lifecycle::switching::{
-    StartStep, StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchVictim,
+    StartStep, StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchRelease, SwitchVictim,
 };
 
 use crate::coordinator::CoordinatorCommands;
@@ -814,15 +814,7 @@ impl Switcher {
             victims,
             &operations
                 .iter()
-                .map(|(v, r)| {
-                    format!(
-                        "{}/{} {} ({})",
-                        v.deployment_id,
-                        v.instance,
-                        if r.parked { "parked" } else { "stopped" },
-                        r.operation_id
-                    )
-                })
+                .map(|(v, r)| release_line(v, r))
                 .collect::<Vec<_>>()
                 .join(", "),
             explicit,
@@ -907,6 +899,25 @@ impl Drop for Active {
 /// Owner decision 2026-09-25: an explicit start one of whose instances fits
 /// nowhere even with eviction; the closed code leads, so management keeps
 /// classing it as a capacity block, and each host's shortfall follows.
+/// Discrete GPU design §5: the status line for one released victim says
+/// whether it parked or stopped, and names a victim that parks but stopped
+/// because its parked copy did not fit the host after the switch.
+fn release_line(v: &SwitchVictim, r: &SwitchRelease) -> String {
+    format!(
+        "{}/{} released: {} ({})",
+        v.deployment_id,
+        v.instance,
+        if r.parked {
+            "parked"
+        } else if v.park_does_not_fit {
+            "stopped (host RAM full)"
+        } else {
+            "stopped"
+        },
+        r.operation_id
+    )
+}
+
 fn start_capacity(target: &str, instance: u32, code: &str, detail: &str) -> LifecycleFault {
     LifecycleFault::Blocked(format!(
         "{code}: instance {instance} of deployment {target} cannot be placed even with eviction: {detail}; nothing was released"
@@ -917,4 +928,40 @@ fn capacity(target: &str, code: &str) -> LifecycleFault {
     LifecycleFault::Blocked(format!(
         "deployment {target} fits on no allowed host even after releasing every eligible READY instance ({code})"
     ))
+}
+
+#[cfg(test)]
+mod release_line_tests {
+    use super::*;
+
+    // Discrete GPU design §5: the status line names which release happened.
+    // T27
+    #[test]
+    fn the_status_line_names_park_stop_and_a_copy_that_did_not_fit() {
+        let victim = |park_does_not_fit| SwitchVictim {
+            deployment_id: "d".into(),
+            instance: 0,
+            generation: 1,
+            parks: false,
+            park_does_not_fit,
+            last_ready: false,
+            serves_elsewhere: false,
+        };
+        let release = |parked| SwitchRelease {
+            operation_id: "op".into(),
+            parked,
+        };
+        assert_eq!(
+            release_line(&victim(false), &release(true)),
+            "d/0 released: parked (op)"
+        );
+        assert_eq!(
+            release_line(&victim(true), &release(false)),
+            "d/0 released: stopped (host RAM full) (op)"
+        );
+        assert_eq!(
+            release_line(&victim(false), &release(false)),
+            "d/0 released: stopped (op)"
+        );
+    }
 }

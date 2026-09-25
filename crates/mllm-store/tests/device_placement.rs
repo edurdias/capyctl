@@ -477,3 +477,99 @@ fn eviction_frees_one_gpu_by_least_recent_use() {
         "gpu1's instance was used last longest ago"
     );
 }
+
+/// Explicit per-phase resources pinned to `gpu0`: `device` GiB on the card
+/// when Ready, `system` GiB of host RAM, and, parked, 1 GiB of residue with a
+/// `copy` GiB weights copy in host RAM beside the 4 GiB engine overhead.
+fn host_backed_resources(device: u32, system: u32, copy: u32) -> Value {
+    let parked = 4 + copy;
+    let phase = |gpu: u32, ram: u32, devices: bool| {
+        json!({"allocations": [
+                   {"domain": "gpu0", "bytes": format!("{gpu}GiB"), "host_kv_bytes": "0B"},
+                   {"domain": "system", "bytes": format!("{ram}GiB"), "host_kv_bytes": "0B"}],
+               "devices": if devices { json!([{"id": "gpu0", "sharing": "shared"}]) } else { json!([]) }})
+    };
+    json!({
+        "cold": phase(device, system, true),
+        "ready": phase(device, system, true),
+        "parking": phase(device, parked.max(system), true),
+        "parked": phase(1, parked, false),
+        "wake": phase(device, parked.max(system), true),
+    })
+}
+
+// Discrete GPU design §5 ("When a copy does not fit"): the switch planner
+// parks a host_backed victim whose weights copy fits host RAM after the
+// switch, and stops one whose copy does not, never overcommitting host RAM.
+// T27 T16
+#[test]
+fn a_host_backed_victim_parks_only_where_its_copy_fits() {
+    let t = two_gpus();
+    let deploy = |name: &str, device: &str, resources: Value| {
+        t.deploy_as(
+            name,
+            json!({"instances": 1, "residency": "host_backed",
+                   "devices": [{"id": device, "sharing": "shared"}],
+                   "engine_config": {"memory": {"kv_cache": "4GiB"}},
+                   "resources": resources}),
+        )
+    };
+    let ready = |id: &str, pid: u32| {
+        t.start(id, &format!("start-{id}"), StartScope::All);
+        let planned = t.planned(id);
+        t.ready(&planned[0].0, pid);
+    };
+    let plan = |target: &str| match t
+        .store
+        .plan_switch(
+            &t.session,
+            target,
+            None,
+            false,
+            None,
+            &std::collections::BTreeSet::new(),
+            &|_: &str, _: i64| Some(1),
+        )
+        .unwrap()
+    {
+        mllm_store::ordinary_lifecycle::switching::SwitchPlan::Evict { victims, .. } => victims
+            .into_iter()
+            .map(|v| (v.deployment_id, v.parks, v.park_does_not_fit))
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    // a holds 12 GiB of the 22 GiB card; c needs 12 GiB there too. a's
+    // 8 GiB copy (12 GiB parked with the overhead) fits the 24 GiB of host
+    // RAM and the 12 GiB parked limit beside c: a parks.
+    let a = deploy("a", "gpu0", host_backed_resources(12, 4, 8));
+    ready(&a, 100);
+    let c = deploy("c", "gpu0", host_backed_resources(12, 4, 8));
+    assert_eq!(plan(&c), vec![(a.clone(), true, false)]);
+    // b, on the other card, holds 10 GiB of host RAM. a parked (12) beside
+    // b (10) and c (4) would need 26 GiB of the 24 GiB host RAM: a stops.
+    let b = t.deploy_as(
+        "b",
+        json!({"instances": 1, "residency": "restart_only",
+               "devices": [{"id": "gpu1", "sharing": "shared"}],
+               "engine_config": {"memory": {"kv_cache": "4GiB"}},
+               "resources": host_backed_resources(12, 10, 0)
+                   .as_object()
+                   .unwrap()
+                   .iter()
+                   .map(|(phase, value)| {
+                       let mut value = value.clone();
+                       value["allocations"][0]["domain"] = json!("gpu1");
+                       if phase == "parked" {
+                           value["allocations"] = json!([
+                               {"domain": "gpu1", "bytes": "0B", "host_kv_bytes": "0B"},
+                               {"domain": "system", "bytes": "0B", "host_kv_bytes": "0B"}]);
+                       } else {
+                           value["devices"] = json!([{"id": "gpu1", "sharing": "shared"}]);
+                       }
+                       (phase.clone(), value)
+                   })
+                   .collect::<serde_json::Map<_, _>>()}),
+    );
+    ready(&b, 200);
+    assert_eq!(plan(&c), vec![(a.clone(), false, true)]);
+}

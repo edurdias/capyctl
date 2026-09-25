@@ -26,7 +26,7 @@ use crate::instances::instance_owner_id;
 use mllm_config::instances::Placement;
 use mllm_scheduler::device_choice::choose_device_with_eviction;
 use mllm_scheduler::placement::{candidate_fits, fits};
-use mllm_scheduler::switching::{choose_victims, order_victims, VictimCandidate};
+use mllm_scheduler::switching::{choose_victims, order_victims, Release, Victim, VictimCandidate};
 use std::collections::BTreeSet;
 
 /// The default fairness window when a host publishes no queue policy
@@ -42,6 +42,10 @@ pub struct SwitchVictim {
     /// SPEC §6.2, ADR 0013 §8 rule 8: it parks at its declared tier; otherwise
     /// it is stopped with absence proof.
     pub parks: bool,
+    /// Discrete GPU design §5: it parks at its declared tier, but its parked
+    /// footprint (a `host_backed` weights copy in host RAM) does not fit the
+    /// host after the switch, so it is stopped instead.
+    pub park_does_not_fit: bool,
     /// ADR 0013 §8 rule 5: releasing it leaves its deployment with no READY
     /// instance, so the fairness window of SPEC §10 step 3 applies.
     pub last_ready: bool,
@@ -454,9 +458,11 @@ impl crate::Store {
     /// SPEC §10 step 5, ADR 0013 §8 rule 8: release a drained victim. It
     /// parks at its declared tier when it parks (and its park was not refused
     /// before), otherwise it is stopped ordinarily, leaving it eligible for
-    /// on-demand activation. `may_park` is the plan's decision: false when the
-    /// waiting instance needs an empty host (a solo first start), where a
-    /// parked residual would still occupy it, so the victim stops. Refused
+    /// on-demand activation. `may_park` is the plan's decision: false when its
+    /// parked footprint does not fit the host after the switch (discrete GPU
+    /// design §5), or when the waiting instance needs an empty host (a solo
+    /// first start), where a parked residual would still occupy it, so the
+    /// victim stops. Refused
     /// (`Conflict`) while a lease remains or the instance is not the closed
     /// READY incarnation the switch drained.
     #[allow(clippy::too_many_arguments)]
@@ -550,8 +556,13 @@ impl crate::Store {
                         "a request on it is uncertain, which is not quiescence for a park"
                     } else if may_park {
                         "it does not park"
+                    } else if parks(&e) {
+                        // Discrete GPU design §5: the plan stops a victim
+                        // whose parked footprint does not fit after the
+                        // switch, as it does every victim of a solo start.
+                        "the plan releases it by a stop (its parked copy does not fit the host after the switch, or the waiting instance needs an empty host)"
                     } else {
-                        "the waiting instance needs an empty host"
+                        "it does not park"
                     }
                 ),
             )?;
@@ -951,6 +962,11 @@ fn plan_in(
             .collect::<Result<_, _>>()?;
         let mut offered = Vec::new();
         let mut by_owner = std::collections::BTreeMap::new();
+        // Whether each offered victim may park at all: a victim of a solo
+        // first start stops (a parked residual would still occupy the host it
+        // empties), and SPEC §9.2: a victim with an uncertain request stops;
+        // its release would refuse the park anyway.
+        let mut parkable = std::collections::BTreeMap::new();
         for (deployment, index, generation) in rows {
             // Rule 4: never an instance serving a waiting group.
             if protected.contains(&deployment) {
@@ -966,12 +982,22 @@ fn plan_in(
                 params![deployment, index],
                 |r| r.get(0),
             )?;
+            let (_, e, _) = launch(tx, &deployment, index)?;
+            let may_park = !c.whole_host
+                && parks(&e)
+                && !park_refused(tx, &deployment, index, generation)?
+                && !uncertain_leases(tx, &deployment, index)?;
+            parkable.insert(victim_owner.clone(), may_park);
             offered.push(VictimCandidate {
                 owner: victim_owner.clone(),
                 serves_elsewhere: elsewhere,
                 last_used_ms: activity(&deployment, generation)
                     .or_else(|| activity(&deployment, -1))
                     .unwrap_or(0),
+                // Discrete GPU design §5: what it leaves charged once parked
+                // (for `host_backed`, the weights copy on the system domain),
+                // so the planner parks it only where that copy fits.
+                parked: may_park.then(|| footprints(&e).parked),
             });
             by_owner.insert(victim_owner, (deployment, index, generation, elsewhere));
         }
@@ -1003,6 +1029,21 @@ fn plan_in(
             .cloned()
             .collect();
         let mut device = None;
+        // W10 gap (e): an occupant is released at its tier as before; the
+        // park it is accepted as is admitted against the ledger on its own.
+        let occupant_releases = || {
+            occupants
+                .iter()
+                .map(|o| Victim {
+                    owner: o.clone(),
+                    release: if parkable.get(o).copied().unwrap_or(false) {
+                        Release::Park
+                    } else {
+                        Release::Stop
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
         let decided = if c.whole_host {
             // Owner decision 2026-09-23, SPEC §10: a solo first start needs
             // the host empty, so the plan releases every other charge on it up
@@ -1020,6 +1061,7 @@ fn plan_in(
             if others.iter().all(|other| by_owner.contains_key(other))
                 && fits(&empty, &owner, &c.footprint, &c.limits, c.max_parked).is_ok()
             {
+                // Every victim of a solo first start stops.
                 Ok(occupants
                     .iter()
                     .cloned()
@@ -1028,6 +1070,10 @@ fn plan_in(
                             .filter(|v| others.contains(&v.owner))
                             .map(|v| v.owner.clone()),
                     )
+                    .map(|owner| Victim {
+                        owner,
+                        release: Release::Stop,
+                    })
                     .collect::<Vec<_>>())
             } else {
                 Err(mllm_scheduler::placement::HostRefusal::RequiresEmptyHost)
@@ -1045,11 +1091,20 @@ fn plan_in(
             )
             .map(|(on, more)| {
                 device = Some(on);
-                occupants.iter().cloned().chain(more).collect::<Vec<_>>()
+                occupant_releases()
+                    .into_iter()
+                    .chain(more)
+                    .collect::<Vec<_>>()
             })
         } else {
-            choose_victims(&freed, &owner, &c.footprint, &c.limits, c.max_parked, &rest)
-                .map(|more| occupants.iter().cloned().chain(more).collect::<Vec<_>>())
+            choose_victims(&freed, &owner, &c.footprint, &c.limits, c.max_parked, &rest).map(
+                |more| {
+                    occupant_releases()
+                        .into_iter()
+                        .chain(more)
+                        .collect::<Vec<_>>()
+                },
+            )
         };
         match decided {
             Ok(chosen) if chosen.is_empty() => {
@@ -1058,18 +1113,15 @@ fn plan_in(
             }
             Ok(chosen) => {
                 let mut victims = Vec::new();
-                for victim_owner in &chosen {
-                    let (deployment, index, generation, elsewhere) = by_owner[victim_owner].clone();
-                    let (_, e, _) = launch(tx, &deployment, index)?;
+                for victim in &chosen {
+                    let (deployment, index, generation, elsewhere) =
+                        by_owner[&victim.owner].clone();
+                    let may_park = parkable.get(&victim.owner).copied().unwrap_or(false);
                     victims.push(SwitchVictim {
-                        // A victim of a solo first start stops: a parked
-                        // residual would still occupy the host it empties.
-                        // SPEC §9.2: a victim with an uncertain request
-                        // stops; its release would refuse the park anyway.
-                        parks: !c.whole_host
-                            && parks(&e)
-                            && !park_refused(tx, &deployment, index, generation)?
-                            && !uncertain_leases(tx, &deployment, index)?,
+                        // Discrete GPU design §5: it parks only where its
+                        // parked footprint fits the host after the switch.
+                        parks: may_park && victim.release == Release::Park,
+                        park_does_not_fit: may_park && victim.release == Release::Stop,
                         last_ready: false,
                         serves_elsewhere: elsewhere,
                         deployment_id: deployment,
@@ -1080,7 +1132,7 @@ fn plan_in(
                 let candidate = HostChoice {
                     host: c.host_id.clone(),
                     instances_here: c.instances_here,
-                    victims: chosen,
+                    victims: chosen.into_iter().map(|v| v.owner).collect(),
                     device: device.clone(),
                 };
                 // Rule 3: the host needing the least eviction; ties by fewer

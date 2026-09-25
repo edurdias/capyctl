@@ -16,7 +16,7 @@ use mllm_domain::resources::{
 };
 use mllm_scheduler::{
     placement::{fits, HostRefusal},
-    switching::{choose_victims, VictimCandidate},
+    switching::{choose_victims, Release, Victim, VictimCandidate},
 };
 
 const GIB: i64 = 1 << 30;
@@ -84,6 +84,8 @@ fn victim(owner: &str) -> VictimCandidate {
         owner: owner.into(),
         serves_elsewhere: false,
         last_used_ms: 1,
+        // A deep park leaves the device residue and the host overhead.
+        parked: Some(parked_footprint(GIB, 4 * GIB)),
     }
 }
 
@@ -174,7 +176,14 @@ fn planner_and_launch_check_agree_on_a_small_card() {
         &[victim("deployment:a/instance:0")],
     )
     .unwrap();
-    assert_eq!(victims, vec!["deployment:a/instance:0".to_string()]);
+    // Its parked residue fits beside B, so A parks rather than stops.
+    assert_eq!(
+        victims,
+        vec![Victim {
+            owner: "deployment:a/instance:0".to_string(),
+            release: Release::Park
+        }]
+    );
     let effective_b = discrete_effective(9 * GIB, 4 * GIB);
     let before = gpu(16376, 9 * 1024 + 300); // A holds 9 GiB + context
     let after = gpu(16376, 1024); // A deep-parked: 1 GiB residue

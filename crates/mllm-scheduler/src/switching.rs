@@ -30,6 +30,27 @@ pub struct VictimCandidate {
     /// When the router last sent it a request, or when it last became READY;
     /// the least recently used goes first among equals.
     pub last_used_ms: i64,
+    /// SPEC §6.2, discrete GPU design §5: the footprint it holds once parked
+    /// at its declared tier (for `host_backed`, the weights copy on the
+    /// system domain), or `None` when it never parks (`restart_only`).
+    pub parked: Option<PhaseFootprint>,
+}
+
+/// Discrete GPU design §5 ("When a copy does not fit"): how one victim is
+/// released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// Parked at its declared tier: its parked footprint stays charged.
+    Park,
+    /// Stopped ordinarily: nothing of it stays charged once gone.
+    Stop,
+}
+
+/// One victim the waiting instance needs released, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Victim {
+    pub owner: String,
+    pub release: Release,
 }
 
 /// ADR 0013 §8 rule 4: instances whose deployment keeps serving elsewhere
@@ -46,13 +67,21 @@ pub fn order_victims(candidates: &mut [VictimCandidate]) {
 }
 
 /// ADR 0013 §8 rules 3–4: the victims, in preference order, whose release
-/// lets `footprint` fit for `owner` on this host.
+/// lets `footprint` fit for `owner` on this host, each with how it is released.
 ///
 /// `Ok(vec![])` means it fits already. `Err` carries the host's reason when
 /// even releasing every candidate does not make it fit. The set is minimal:
 /// the shortest prefix of `ordered` that fits is taken, then every victim
 /// whose release turns out unnecessary once the later ones are released is
 /// kept serving, starting from the least preferred.
+///
+/// Discrete GPU design §5: a victim is released by [`Release::Park`] only when,
+/// with every chosen victim applied, the ledger holding its parked footprint
+/// still fits the waiting footprint (every domain's managed and parked limits,
+/// and `max_parked`). Parking is tried in preference order; a victim whose
+/// parked footprint would make the fit fail, or that never parks, is released
+/// by [`Release::Stop`]. A copy that does not fit therefore becomes a stop,
+/// never an overcommit and never a silent change of tier.
 pub fn choose_victims(
     ledger: &LedgerSnapshot,
     owner: &str,
@@ -60,7 +89,7 @@ pub fn choose_victims(
     limits: &[MemoryLimit],
     max_parked: usize,
     ordered: &[VictimCandidate],
-) -> Result<Vec<String>, HostRefusal> {
+) -> Result<Vec<Victim>, HostRefusal> {
     let without = |released: &[String]| {
         let mut state = ledger.clone();
         for victim in released {
@@ -95,7 +124,43 @@ pub fn choose_victims(
             chosen = trial;
         }
     }
-    Ok(chosen)
+    let parked_of = |victim: &str| {
+        ordered
+            .iter()
+            .find(|c| c.owner == victim)
+            .and_then(|c| c.parked.clone())
+    };
+    // Every victim is released fully in the set found above, so the all-stop
+    // outcome fits. Parking only adds charges back, so each park is kept only
+    // when the fit survives it with the later victims still assumed parked;
+    // turning a later one into a stop afterwards only frees memory.
+    let fits_with = |releases: &[Victim]| {
+        let mut state = ledger.clone();
+        for victim in releases {
+            match (victim.release, parked_of(&victim.owner)) {
+                (Release::Park, Some(parked)) => {
+                    state.owners.insert(victim.owner.clone(), parked);
+                }
+                _ => {
+                    state.owners.remove(&victim.owner);
+                }
+            }
+        }
+        fits(&state, owner, footprint, limits, max_parked).is_ok()
+    };
+    let mut releases: Vec<Victim> = chosen
+        .into_iter()
+        .map(|owner| Victim {
+            owner,
+            release: Release::Park,
+        })
+        .collect();
+    for index in 0..releases.len() {
+        if parked_of(&releases[index].owner).is_none() || !fits_with(&releases) {
+            releases[index].release = Release::Stop;
+        }
+    }
+    Ok(releases)
 }
 
 #[cfg(test)]
@@ -142,7 +207,12 @@ mod tests {
             owner: owner.into(),
             serves_elsewhere: elsewhere,
             last_used_ms: used,
+            parked: None,
         }
+    }
+
+    fn owners(victims: Vec<Victim>) -> Vec<String> {
+        victims.into_iter().map(|v| v.owner).collect()
     }
 
     // ADR 0013 §8 rule 4: serving elsewhere first, then least recently used.
@@ -166,7 +236,7 @@ mod tests {
         let want = footprint(10 * GIB, ResourcePhase::Cold);
         let ordered = vec![candidate("a", false, 1), candidate("b", false, 2)];
         assert_eq!(
-            choose_victims(&l, "w", &want, &limits(20 * GIB), 16, &ordered).unwrap(),
+            owners(choose_victims(&l, "w", &want, &limits(20 * GIB), 16, &ordered).unwrap()),
             ["a"]
         );
         assert!(
@@ -179,7 +249,7 @@ mod tests {
         let l = ledger(&[("small", 2), ("big", 8)]);
         let ordered = vec![candidate("small", true, 1), candidate("big", false, 2)];
         assert_eq!(
-            choose_victims(&l, "w", &want, &limits(17 * GIB), 16, &ordered).unwrap(),
+            owners(choose_victims(&l, "w", &want, &limits(17 * GIB), 16, &ordered).unwrap()),
             ["big"]
         );
     }
@@ -232,7 +302,7 @@ mod tests {
         let want = two(ResourcePhase::Cold, 9, 4);
         let ordered = vec![candidate("a", false, 1)];
         assert_eq!(
-            choose_victims(&l, "w", &want, &limits, 16, &ordered).unwrap(),
+            owners(choose_victims(&l, "w", &want, &limits, 16, &ordered).unwrap()),
             ["a"]
         );
         // The same models on a card with room for both evict nothing.
@@ -240,5 +310,176 @@ mod tests {
         assert!(choose_victims(&l, "w", &want, &roomy, 16, &ordered)
             .unwrap()
             .is_empty());
+    }
+
+    fn two_domains(phase: ResourcePhase, device: i64, system: i64) -> PhaseFootprint {
+        let allocation = |domain: &str, bytes| Allocation {
+            domain: domain.into(),
+            bytes,
+            host_kv_bytes: 0,
+        };
+        PhaseFootprint {
+            phase,
+            allocations: vec![allocation("gpu0", device), allocation("system", system)],
+            devices: vec![],
+        }
+    }
+
+    fn ready_footprint(device: i64, system: i64) -> PhaseFootprint {
+        two_domains(ResourcePhase::Ready, device, system)
+    }
+
+    fn cold_footprint(device: i64, system: i64) -> PhaseFootprint {
+        two_domains(ResourcePhase::Cold, device, system)
+    }
+
+    fn parked_footprint(device: i64, system: i64) -> PhaseFootprint {
+        two_domains(ResourcePhase::Parked, device, system)
+    }
+
+    fn ledger_with<const N: usize>(owners: [(&str, PhaseFootprint); N]) -> LedgerSnapshot {
+        LedgerSnapshot {
+            epoch: 1,
+            owners: owners
+                .into_iter()
+                .map(|(owner, f)| (owner.to_string(), f))
+                .collect(),
+        }
+    }
+
+    /// A 16 GiB card and 61 GiB of host RAM whose parked copies are bounded
+    /// by `parked` (the system domain's `parked_limit`).
+    fn discrete_limits_with_system_parked(parked: i64) -> Vec<MemoryLimit> {
+        vec![
+            MemoryLimit {
+                domain: "gpu0".into(),
+                managed_bytes: 16 * GIB,
+                free_reserve_bytes: 0,
+                host_kv_bytes: None,
+                parked_bytes: None,
+            },
+            MemoryLimit {
+                domain: "system".into(),
+                managed_bytes: 61 * GIB,
+                free_reserve_bytes: 0,
+                host_kv_bytes: None,
+                parked_bytes: Some(parked),
+            },
+        ]
+    }
+
+    // Discrete GPU design §5 "When a copy does not fit" (review focus 4): a
+    // host_backed victim whose weights copy would push the parked copies over
+    // the system parked_limit is stopped, never parked over the limit.
+    // T27
+    #[test]
+    fn a_copy_that_does_not_fit_is_stopped_not_parked() {
+        // system parked_limit 12 GiB, one 8 GiB copy already parked.
+        let limits = discrete_limits_with_system_parked(12 * GIB);
+        let ledger = ledger_with([
+            ("p", parked_footprint(GIB, 4 * GIB + 8 * GIB)),
+            ("a", ready_footprint(12 * GIB, 4 * GIB)),
+        ]);
+        let a_parked = parked_footprint(GIB, 4 * GIB + 8 * GIB); // another 8 GiB copy
+        let victims = [VictimCandidate {
+            owner: "a".into(),
+            serves_elsewhere: false,
+            last_used_ms: 1,
+            parked: Some(a_parked),
+        }];
+        let chosen = choose_victims(
+            &ledger,
+            "b",
+            &cold_footprint(12 * GIB, 4 * GIB),
+            &limits,
+            4,
+            &victims,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen,
+            vec![Victim {
+                owner: "a".into(),
+                release: Release::Stop
+            }]
+        );
+    }
+
+    // Discrete GPU design §5: a copy that fits the host after the switch
+    // parks.
+    // T27 T16
+    #[test]
+    fn a_copy_that_fits_is_parked() {
+        let limits = discrete_limits_with_system_parked(24 * GIB);
+        let ledger = ledger_with([("a", ready_footprint(12 * GIB, 4 * GIB))]);
+        let victims = [VictimCandidate {
+            owner: "a".into(),
+            serves_elsewhere: false,
+            last_used_ms: 1,
+            parked: Some(parked_footprint(GIB, 12 * GIB)),
+        }];
+        let chosen = choose_victims(
+            &ledger,
+            "b",
+            &cold_footprint(12 * GIB, 4 * GIB),
+            &limits,
+            4,
+            &victims,
+        )
+        .unwrap();
+        assert_eq!(chosen[0].release, Release::Park);
+    }
+
+    // SPEC §6.2: a victim that does not park (`restart_only`, no parked
+    // footprint) is stopped; of two copies only one fitting, the later in
+    // preference order parks and the earlier stops, and the result still fits.
+    // T27
+    #[test]
+    fn a_victim_without_a_parked_footprint_stops_and_parking_never_overcommits() {
+        let limits = discrete_limits_with_system_parked(12 * GIB);
+        let ledger = ledger_with([
+            ("a", ready_footprint(8 * GIB, 4 * GIB)),
+            ("c", ready_footprint(7 * GIB, 4 * GIB)),
+        ]);
+        let want = cold_footprint(14 * GIB, 4 * GIB);
+        let copy = || Some(parked_footprint(GIB, 4 * GIB + 6 * GIB));
+        let candidate = |owner: &str, parked| VictimCandidate {
+            owner: owner.into(),
+            serves_elsewhere: false,
+            last_used_ms: 1,
+            parked,
+        };
+        let chosen = choose_victims(
+            &ledger,
+            "b",
+            &want,
+            &limits,
+            4,
+            &[candidate("a", copy()), candidate("c", copy())],
+        )
+        .unwrap();
+        assert_eq!(
+            chosen,
+            vec![
+                Victim {
+                    owner: "a".into(),
+                    release: Release::Stop
+                },
+                Victim {
+                    owner: "c".into(),
+                    release: Release::Park
+                },
+            ]
+        );
+        let chosen = choose_victims(
+            &ledger,
+            "b",
+            &want,
+            &limits,
+            4,
+            &[candidate("a", None), candidate("c", None)],
+        )
+        .unwrap();
+        assert!(chosen.iter().all(|v| v.release == Release::Stop));
     }
 }

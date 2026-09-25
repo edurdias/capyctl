@@ -336,7 +336,7 @@ fn peak(base: &PhaseFootprint, next: &PhaseFootprint, at: ResourcePhase) -> Phas
 pub(super) struct Footprints {
     ready: PhaseFootprint,
     parking: PhaseFootprint,
-    parked: PhaseFootprint,
+    pub(super) parked: PhaseFootprint,
     pub(super) wake: PhaseFootprint,
 }
 

@@ -11,7 +11,7 @@
 use mllm_domain::resources::{LedgerSnapshot, MemoryLimit, PhaseFootprint};
 
 use crate::placement::{fits, HostRefusal};
-use crate::switching::{choose_victims, VictimCandidate};
+use crate::switching::{choose_victims, Victim, VictimCandidate};
 
 /// One device of the host the instance may run on, with the footprint it
 /// resolved to there.
@@ -110,7 +110,8 @@ pub fn choose_device(
 /// whose minimal victim set is smallest, then whose victims were least
 /// recently used (the sum of their `last_used_ms`), then the lower index.
 /// Only owners charged on that device's own domain are its candidates.
-/// `victims` arrive in preference order (`order_victims`); the order is kept.
+/// `victims` arrive in preference order (`order_victims`); the order is kept,
+/// and each chosen victim carries its release (park or stop, design §5).
 pub fn choose_device_with_eviction(
     ledger: &LedgerSnapshot,
     owner: &str,
@@ -118,8 +119,8 @@ pub fn choose_device_with_eviction(
     limits: &[MemoryLimit],
     max_parked: usize,
     victims: &[VictimCandidate],
-) -> Result<(String, Vec<String>), HostRefusal> {
-    let mut best: Option<(&DeviceOption, Vec<String>, i64)> = None;
+) -> Result<(String, Vec<Victim>), HostRefusal> {
+    let mut best: Option<(&DeviceOption, Vec<Victim>, i64)> = None;
     let mut last = HostRefusal::Insufficient;
     for option in options {
         // Only owners charged on this GPU can make room on it.
@@ -138,7 +139,7 @@ pub fn choose_device_with_eviction(
             Ok(chosen) => {
                 let recency = here
                     .iter()
-                    .filter(|v| chosen.contains(&v.owner))
+                    .filter(|v| chosen.iter().any(|c| c.owner == v.owner))
                     .fold(0_i64, |sum, v| sum.saturating_add(v.last_used_ms));
                 let better = best.as_ref().is_none_or(|(o, c, r)| {
                     (chosen.len(), recency, index(&option.device)) < (c.len(), *r, index(&o.device))
@@ -191,7 +192,12 @@ mod tests {
             owner: owner.into(),
             serves_elsewhere: false,
             last_used_ms,
+            parked: None,
         }
+    }
+
+    fn owners(victims: Vec<Victim>) -> Vec<String> {
+        victims.into_iter().map(|v| v.owner).collect()
     }
 
     fn limits2() -> Vec<MemoryLimit> {
@@ -318,7 +324,7 @@ mod tests {
             choose_device_with_eviction(&ledger, "n", &options(16 * GIB), &limits2(), 4, &victims)
                 .unwrap();
         assert_eq!(device, "gpu0");
-        assert_eq!(chosen, vec!["a".to_string()]);
+        assert_eq!(owners(chosen), vec!["a".to_string()]);
     }
 
     // T27: equal victim counts; the least recently used set wins.
@@ -332,7 +338,10 @@ mod tests {
         let (device, chosen) =
             choose_device_with_eviction(&ledger, "n", &options(16 * GIB), &limits2(), 4, &victims)
                 .unwrap();
-        assert_eq!((device.as_str(), chosen), ("gpu1", vec!["b".to_string()]));
+        assert_eq!(
+            (device.as_str(), owners(chosen)),
+            ("gpu1", vec!["b".to_string()])
+        );
     }
 
     // No device can ever fit: the host's reason is returned.
