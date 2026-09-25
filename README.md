@@ -17,11 +17,13 @@ See [current gaps](docs/design/milestones/f1-open-items.md) and
 
 A release is one self-contained binary per OS/architecture (Linux x86-64 and
 ARM64); mllm's Python runtime helpers are compiled into it. The repository is
-private, so use a logged-in `gh` (or set `GITHUB_TOKEN`):
+private, so use a logged-in `gh` (`gh auth login`) or set `GITHUB_TOKEN`.
+Release candidates are pre-releases, which GitHub's "latest release" skips, so
+always pass `--version`:
 
 ```bash
 gh release download v0.1.0-rc.3 -R edurdias/mllm -p install.sh
-sh install.sh --version 0.1.0-rc.3          # ~/.local/bin/mllm
+sh install.sh --version v0.1.0-rc.3         # ~/.local/bin/mllm
 # sudo sh install.sh --system ...           # /usr/local/bin/mllm
 # add --systemd <server|host|standalone> to install that role's unit
 ```

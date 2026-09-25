@@ -12,7 +12,9 @@
 #
 # Options:
 #   --version V     release to install, e.g. 0.1.0-rc.3 (a leading "v" is
-#                   accepted). Default: the latest published release.
+#                   accepted). Default: the latest published release, which
+#                   GitHub never resolves to a pre-release or a draft: pass
+#                   --version for a release candidate.
 #   --system        install for every user: /usr/local/bin/mllm, units under
 #                   /etc/systemd/system (needs root). Default: this user only,
 #                   ~/.local/bin/mllm and ~/.config/systemd/user.
@@ -46,7 +48,7 @@ action=install
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case $1 in
@@ -149,15 +151,24 @@ curl_get() { # $1 url, $2 output, [$3 accept header]
   fi
 }
 
+# GitHub's "latest release" is the newest published release that is not a
+# pre-release; drafts and pre-releases (every 0.x release candidate) never
+# qualify, so without --version they cannot be found.
+no_latest="GitHub's latest release skips pre-releases and drafts, so while $repo has only pre-releases (release candidates) name one with --version, for example --version v0.1.0-rc.3"
 if [ -z "$version" ]; then
   if [ -n "${MLLM_INSTALL_BASE_URL:-}" ]; then
     die "--version is required with MLLM_INSTALL_BASE_URL"
   elif have_gh; then
     tag=$(gh release view -R "$repo" --json tagName --jq .tagName) ||
-      die "no published release found in $repo; pass --version"
+      die "no latest release found in $repo: $no_latest"
   else
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      access="or GITHUB_TOKEN cannot read $repo"
+    else
+      access="or $repo is private: run \`gh auth login\` or set GITHUB_TOKEN"
+    fi
     curl_get "https://api.github.com/repos/$repo/releases/latest" "$tmp/latest.json" ||
-      die "cannot read the latest release of $repo (private repository? set GITHUB_TOKEN or log in with gh)"
+      die "cannot read the latest release of $repo: $no_latest; $access"
     tag=$(tr ',' '\n' <"$tmp/latest.json" | sed -n 's/^[{ ]*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
   fi
   [ -n "$tag" ] || die "could not determine the latest release; pass --version"

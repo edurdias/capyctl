@@ -142,14 +142,24 @@ tarball and the installer locally.
 
 ## Installing with install.sh
 
-The repository is private, so the installer needs a GitHub credential: a
-logged-in `gh` (preferred) or `GITHUB_TOKEN` with read access to the
-repository.
+Release candidates are published as pre-releases on the GitHub Releases page
+of the private repository `edurdias/mllm` (owner decision
+2026-09-24; the repository opens later). Two things follow:
+
+- **You need a credential.** Run `gh auth login` first (preferred), or export
+  `GITHUB_TOKEN` with read access to the repository. Without one, neither the
+  download of `install.sh` nor the installer itself can reach the release.
+- **You must pass `--version`.** GitHub's "latest release" never resolves to a
+  pre-release or a draft, so while only release candidates exist the
+  installer cannot find one on its own. Name it, for example
+  `--version v0.1.0-rc.3` (the leading `v` is optional). Without it the
+  installer stops and says so.
 
 ```bash
 # As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
+gh auth login                                   # once, or export GITHUB_TOKEN
 gh release download v0.1.0-rc.3 -R edurdias/mllm -p install.sh
-sh install.sh --version 0.1.0-rc.3
+sh install.sh --version v0.1.0-rc.3
 
 # Also install a user unit for a role (installed, not enabled).
 sh install.sh --version 0.1.0-rc.3 --systemd standalone
@@ -158,8 +168,8 @@ sh install.sh --version 0.1.0-rc.3 --systemd standalone
 sudo sh install.sh --system --version 0.1.0-rc.3 --systemd host
 ```
 
-Without `--version` the latest published release is installed; a draft or a
-pre-release is installed only by naming it. The installer:
+Without `--version` the latest published full release is installed; a draft
+or a pre-release is installed only by naming it. The installer:
 
 1. detects the OS (Linux) and architecture (`x86_64`, `aarch64`);
 2. downloads the tarball and `SHA256SUMS` with `gh release download`, else
