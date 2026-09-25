@@ -30,6 +30,10 @@ pub enum VllmPlanError {
     /// source is refused rather than invented.
     #[error("{0}")]
     Unresolved(String),
+    /// Discrete GPU design §7: the host has several GPUs and the selected one
+    /// has neither a published UUID nor a `gpuN` index to pin it by.
+    #[error("the selected GPU cannot be pinned")]
+    UnpinnableDevice,
 }
 
 /// The startup flags that put vLLM into the development mode its park controls
@@ -155,27 +159,10 @@ pub fn plan_from_effective(
         api_key: None,
         engine_log: Some(engine_log),
         runtime_dir: Some(runtime_dir),
-        cuda_visible_devices: selected_device_uuid(effective),
+        // Discrete GPU design §7 (controller ruling): with a choice of GPU the
+        // selected one is always pinned; one that cannot be is refused.
+        cuda_namespace: effective
+            .cuda_namespace()
+            .map_err(|_| VllmPlanError::UnpinnableDevice)?,
     })
-}
-
-/// Discrete GPU design §§6–7: the physical UUID of the device the launch
-/// selected, from the host's own approved policy, when the engine must be
-/// narrowed to it: the host has several devices (mllm picked one), or the
-/// device is a discrete GPU's own memory domain. A one-device unified host
-/// keeps the agent's pass-through unchanged. `None` also when the host
-/// published no UUID for the device.
-fn selected_device_uuid(effective: &EffectiveDeployment) -> Option<String> {
-    let [claim] = effective.selected_devices.as_slice() else {
-        return None;
-    };
-    let device = effective.host.devices.get(&claim.id)?;
-    let discrete = effective
-        .host
-        .domains
-        .get(&device.domain)
-        .is_some_and(|d| d.memory == mllm_config::effective::DomainMemory::Device);
-    (discrete || effective.host.devices.len() > 1)
-        .then(|| device.physical_gpu_uuid.clone())
-        .flatten()
 }

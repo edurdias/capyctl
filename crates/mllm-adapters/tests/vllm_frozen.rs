@@ -5,7 +5,7 @@
 
 use mllm_adapters::vllm::{park_policy, plan_from_effective, render_command, VllmPlanError};
 use mllm_adapters::ParkPolicy;
-use mllm_config::effective::{resolve_effective, EffectiveDeployment};
+use mllm_config::effective::{resolve_effective, CudaNamespace, EffectiveDeployment};
 use serde_json::{json, Value};
 
 fn fixture() -> (Value, Value) {
@@ -210,9 +210,9 @@ fn deployment_engine_config_reaches_the_plan_or_is_refused_by_name() {
         .any(|a| a == "--kv-cache-dtype" || a == "--block-size"));
 }
 
-/// Discrete GPU design §§6–7: with several GPUs, the selected one's published
-/// UUID narrows the engine's CUDA namespace; a one-device unified host keeps
-/// the agent's own pass-through exactly as before.
+/// Discrete GPU design §§6–7: with several GPUs, the selected one narrows the
+/// engine's CUDA namespace (its published UUID, else its PCI-ordered index);
+/// a one-device unified host keeps the agent's own pass-through as before.
 // T27 T21
 #[test]
 fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
@@ -230,7 +230,7 @@ fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
         let effective = resolve_effective(&deployment, &host).unwrap();
         let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
         (
-            plan.cuda_visible_devices.clone(),
+            plan.cuda_namespace.clone(),
             render_command(&plan)
                 .unwrap()
                 .env
@@ -247,8 +247,15 @@ fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
     });
     assert_eq!(
         render(two.clone(), "gpu1"),
-        (Some(UUID.to_string()), Some(UUID.to_string()))
+        (
+            Some(CudaNamespace::Uuid(UUID.to_string())),
+            Some(UUID.to_string())
+        )
     );
-    // No UUID published for the selected GPU: nothing is invented.
-    assert_eq!(render(two, "gpu0"), (None, None));
+    // No UUID published for the selected GPU: its index pins it, never a
+    // pass-through of every GPU (controller ruling; see device_namespace.rs).
+    assert_eq!(
+        render(two, "gpu0"),
+        (Some(CudaNamespace::PciIndex(0)), Some("0".to_string()))
+    );
 }

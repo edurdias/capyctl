@@ -431,6 +431,10 @@ impl NativeHostExecution {
             || effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != 1
+            // Discrete GPU design §7 (controller ruling): with a choice of
+            // GPU the launch pins the selected one; one it cannot pin (no
+            // published UUID, no `gpuN` index) is refused before any effect.
+            || effective.cuda_namespace().is_err()
             || plan.service_port < effective.host.endpoint_port_range.start
             || plan.service_port > effective.host.endpoint_port_range.end
         {

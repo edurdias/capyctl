@@ -91,11 +91,12 @@ pub struct PlanInputVllm {
     /// cannot be loaded, so dev mode without a runtime dir is refused
     /// rather than served unguarded.
     pub runtime_dir: Option<String>,
-    /// Discrete GPU design §§6–7: the selected device's physical GPU UUID from
-    /// the host's own approved policy, which the child's `CUDA_VISIBLE_DEVICES`
-    /// is set to so the engine sees exactly that device as `cuda:0`. `None`
-    /// keeps the agent's own pass-through (a one-device unified host).
-    pub cuda_visible_devices: Option<String>,
+    /// Discrete GPU design §§6–7: the selected GPU, from the host's own
+    /// approved policy, that the child's CUDA namespace is narrowed to so the
+    /// engine sees exactly that device as `cuda:0` (by its published UUID, or
+    /// by its index in PCI bus order). `None` keeps the agent's own
+    /// pass-through (a one-device unified host).
+    pub cuda_namespace: Option<mllm_config::effective::CudaNamespace>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -128,7 +129,7 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("engine_path_extra", &self.engine_path_extra)
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
-            .field("cuda_visible_devices", &self.cuda_visible_devices)
+            .field("cuda_namespace", &self.cuda_namespace)
             .finish()
     }
 }
@@ -340,9 +341,12 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         argv.extend(input.extra_args.iter().cloned());
     }
     // Discrete GPU design §7: the chosen device, by the UUID the host itself
-    // published, replaces whatever namespace the agent was started with.
-    if let Some(uuid) = &input.cuda_visible_devices {
-        env.insert("CUDA_VISIBLE_DEVICES".into(), uuid.clone());
+    // published or its PCI-ordered index, replaces whatever namespace the
+    // agent was started with.
+    if let Some(namespace) = &input.cuda_namespace {
+        for (name, value) in namespace.environment() {
+            env.insert(name.into(), value);
+        }
     }
     if let Some(approvals) = &input.extra_approvals {
         env.insert(

@@ -160,6 +160,13 @@ pub struct NativeDeviceSelection {
     /// is closed at exactly the four reviewed selectors above.
     #[serde(skip_serializing)]
     pub physical_gpu_uuid: Option<String>,
+    /// Discrete GPU design §7 (controller ruling): on a host with a choice of
+    /// GPU that published no UUID for this one, its driver index; the guarded
+    /// launcher then pins the child with `CUDA_DEVICE_ORDER=PCI_BUS_ID` and
+    /// `CUDA_VISIBLE_DEVICES=<index>` rather than handing it every GPU. A
+    /// launch parameter like the UUID, never descriptor content.
+    #[serde(skip_serializing)]
+    pub cuda_pci_index: Option<u32>,
 }
 
 /// Redacted native launch description. Neither metadata nor its digest is send authority.

@@ -84,6 +84,7 @@ with open(os.path.join(here, "record.json"), "w") as f:
                "has_admin_key": bool(admin) and admin != key,
                "env": sorted(os.environ),
                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+               "cuda_device_order": os.environ.get("CUDA_DEVICE_ORDER"),
                "dev_mode": os.environ.get("VLLM_SERVER_DEV_MODE"),
                "pythonpath": os.environ.get("PYTHONPATH")}, f)
 port = int(args[args.index("--port") + 1])
@@ -1737,11 +1738,19 @@ const GPU1_UUID: &str = "GPU-11111111-1111-1111-1111-111111111111";
 /// deployment document naming `device` (what the server sends for the GPU
 /// placement chose).
 fn two_gpus_launching_on(device: &'static str) -> Fixture {
-    Fixture::build(Some(false), true, move |host, deployment| {
-        host["resource_policy"]["devices"] = json!({
+    two_gpus_named(
+        json!({
             "gpu0": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": GPU0_UUID},
             "gpu1": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": GPU1_UUID}
-        });
+        }),
+        device,
+    )
+}
+
+/// A host with the GPUs `devices` declares, launching on `device`.
+fn two_gpus_named(devices: Value, device: &'static str) -> Fixture {
+    Fixture::build(Some(false), true, move |host, deployment| {
+        host["resource_policy"]["devices"] = devices;
         name_device(deployment, device);
     })
 }
@@ -1794,6 +1803,58 @@ async fn a_gpu_the_host_does_not_publish_refuses_the_launch() {
         plan.deployment_config = deployment.to_string();
     }
     let launch = sign(launch);
+    refused_launch(&host.executor, host.session, &launch).await;
+    assert!(fixture.record().is_none(), "no engine was started");
+}
+
+/// Discrete GPU design §7 (controller ruling): a host with two GPUs that
+/// published no UUIDs still pins the chosen one, by its index in PCI bus
+/// order; the engine never inherits every GPU.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chosen_gpu_without_a_uuid_is_pinned_by_its_pci_index() {
+    let fixture = two_gpus_named(
+        json!({
+            "gpu0": {"domain": "unified", "sharing": "shared"},
+            "gpu1": {"domain": "unified", "sharing": "shared"}
+        }),
+        "gpu1",
+    );
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the chosen GPU");
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let record = fixture.record().expect("the engine recorded its launch");
+    assert_eq!(record["cuda_visible_devices"], "1");
+    assert_eq!(record["cuda_device_order"], "PCI_BUS_ID");
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}
+
+/// Discrete GPU design §7 (controller ruling): with two GPUs, one the host
+/// names neither by a UUID nor by a `gpuN` index cannot be pinned, so the
+/// launch is refused `unauthorized` and nothing runs.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_that_cannot_be_pinned_refuses_the_launch() {
+    let fixture = two_gpus_named(
+        json!({
+            "left": {"domain": "unified", "sharing": "shared"},
+            "right": {"domain": "unified", "sharing": "shared"}
+        }),
+        "right",
+    );
+    let host = host(&fixture);
+    let launch = fixture.launch();
     refused_launch(&host.executor, host.session, &launch).await;
     assert!(fixture.record().is_none(), "no engine was started");
 }

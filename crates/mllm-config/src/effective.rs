@@ -509,6 +509,88 @@ pub struct DevicePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_gpu_uuid: Option<String>,
 }
+/// Discrete GPU design §7 (controller ruling): how an engine child's CUDA
+/// namespace is narrowed to the one GPU its launch selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CudaNamespace {
+    /// `CUDA_VISIBLE_DEVICES` set to the physical UUID the host published.
+    Uuid(String),
+    /// `CUDA_DEVICE_ORDER=PCI_BUS_ID` and `CUDA_VISIBLE_DEVICES` set to the
+    /// driver index the host published the GPU under (`gpuN`). `nvidia-smi`
+    /// numbers GPUs in PCI bus order; CUDA's default order is fastest first,
+    /// so without the order variable the index could name another GPU.
+    PciIndex(u32),
+}
+
+impl CudaNamespace {
+    /// The variables that narrow the engine child to this GPU.
+    pub fn environment(&self) -> Vec<(&'static str, String)> {
+        match self {
+            CudaNamespace::Uuid(uuid) => vec![("CUDA_VISIBLE_DEVICES", uuid.clone())],
+            CudaNamespace::PciIndex(index) => vec![
+                ("CUDA_DEVICE_ORDER", "PCI_BUS_ID".into()),
+                ("CUDA_VISIBLE_DEVICES", index.to_string()),
+            ],
+        }
+    }
+}
+
+/// A launch that must be pinned to one GPU names no GPU it can pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the selected GPU has neither a published UUID nor a gpuN index to pin the engine to")]
+pub struct UnpinnableDevice;
+
+impl EffectiveDeployment {
+    /// Discrete GPU design §7 (controller ruling): the namespace a launch's
+    /// engine child is narrowed to. Where there is a choice of GPU (several
+    /// devices) or the GPU is a discrete device domain, the selected GPU is
+    /// always pinned: by the physical UUID the host published, else by its
+    /// `gpuN` index in PCI bus order. A launch is never handed every GPU, so
+    /// with several devices one it cannot name is [`UnpinnableDevice`].
+    /// `Ok(None)` keeps the agent's own namespace: a one-device unified host
+    /// (a GB10), or a lone discrete GPU with no name to pin.
+    pub fn cuda_namespace(&self) -> Result<Option<CudaNamespace>, UnpinnableDevice> {
+        let several = self.host.devices.len() > 1;
+        let unpinned = || {
+            if several {
+                Err(UnpinnableDevice)
+            } else {
+                Ok(None)
+            }
+        };
+        let [claim] = self.selected_devices.as_slice() else {
+            return unpinned();
+        };
+        let Some(device) = self.host.devices.get(&claim.id) else {
+            return unpinned();
+        };
+        let discrete = self
+            .host
+            .domains
+            .get(&device.domain)
+            .is_some_and(|domain| domain.memory == DomainMemory::Device);
+        if !several && !discrete {
+            return Ok(None);
+        }
+        if let Some(uuid) = &device.physical_gpu_uuid {
+            return Ok(Some(CudaNamespace::Uuid(uuid.clone())));
+        }
+        match gpu_index(&claim.id) {
+            Some(index) => Ok(Some(CudaNamespace::PciIndex(index))),
+            None => unpinned(),
+        }
+    }
+}
+
+/// The driver index a `gpuN` device id names; `None` for any other id.
+fn gpu_index(device_id: &str) -> Option<u32> {
+    device_id
+        .strip_prefix("gpu")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortRange {
