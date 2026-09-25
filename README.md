@@ -176,6 +176,7 @@ Upgrade the server first, then the hosts one at a time.
 - [`docs/examples/`](docs/examples/): example server, host, standalone and
   deployment documents. A test checks that `mllm validate config` accepts
   them; they show the schema and are not tested engine recipes.
+- [`site/`](site/): the project website, built from these documents.
 - [`docs/SPEC.md`](docs/SPEC.md): the authoritative requirements and
   architecture.
 - [`docs/design/adr/`](docs/design/adr/): architecture decision records.

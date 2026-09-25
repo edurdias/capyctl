@@ -12,11 +12,17 @@
     "dev": "npm run sync && npm run gen:cli && npm run gen:hero && astro dev",
     "preview": "astro preview",
     "test": "node --test tests/",
-    "gen:hero": "node scripts/gen-hero.mjs"
+    "gen:hero": "node scripts/gen-hero.mjs",
+    "check": "npm test && npm run build && node scripts/check-size.mjs && node scripts/check-voice.mjs",
+    "lighthouse": "node scripts/lighthouse.mjs"
   },
   "dependencies": {
     "@astrojs/starlight": "0.42.4",
     "astro": "7.3.5",
     "starlight-links-validator": "0.26.0"
+  },
+  "devDependencies": {
+    "chrome-launcher": "1.2.1",
+    "lighthouse": "13.5.0"
   }
 }

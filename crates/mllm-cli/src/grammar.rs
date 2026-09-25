@@ -518,7 +518,8 @@ enum StartTarget {
         #[arg(long)]
         wait: bool,
     },
-    /// Owner decision Q7: start one instance, `<deployment>/<index>`.
+    // Owner decision Q7 (kept out of the help text, which users read).
+    /// Start one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
         instance: (String, u32),
@@ -542,7 +543,8 @@ enum StopTarget {
     Deployment {
         deployment: String,
     },
-    /// Owner decision Q7: stop one instance, `<deployment>/<index>`.
+    // Owner decision Q7 (kept out of the help text, which users read).
+    /// Stop one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
         instance: (String, u32),

@@ -7,6 +7,9 @@ export default defineConfig({
   // Hosting is undecided (website spec, Open decisions 1); `site` only feeds
   // canonical URLs and the sitemap. Override with MLLM_SITE_URL.
   site: process.env.MLLM_SITE_URL ?? 'https://mllm.invalid',
+  // Website spec, Technical approach: the landing page ships no client-side
+  // JavaScript except the theme toggle, so no link prefetching script.
+  prefetch: false,
   integrations: [
     starlight({
       title: 'mllm',
