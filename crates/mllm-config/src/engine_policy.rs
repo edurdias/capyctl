@@ -227,6 +227,48 @@ pub enum Sensitivity {
     /// A JSON configuration value, which can carry paths or endpoints no
     /// check here reads (SPEC §8.2).
     Config,
+    /// vLLM `--speculative-config`: a JSON object whose keys are all in
+    /// [`SPECULATIVE_CONFIG_KEYS`] and whose draft `model`, when named, lies
+    /// inside `approved_paths`. Anything else is refused, so every path it
+    /// can carry is checked (found live 2026-09-25: as a plain path option a
+    /// JSON value could never be approved, so vLLM speculation never deployed).
+    SpeculativeConfig,
+}
+
+/// The `--speculative-config` keys a deployment may set. Only `model` names a
+/// path; every other key is a number or a closed word. A key outside this list
+/// (a tokenizer, a revision, a quantization config) is refused.
+pub const SPECULATIVE_CONFIG_KEYS: &[&str] = &[
+    "method",
+    "model",
+    "num_speculative_tokens",
+    "draft_tensor_parallel_size",
+    "prompt_lookup_max",
+    "prompt_lookup_min",
+    "draft_sample_method",
+];
+
+/// Whether a `--speculative-config` value is admissible under the host's
+/// approved directories (ADR 0014 §8).
+fn speculative_config_admitted(value: &str, approved_paths: &[PathBuf]) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(value)
+    else {
+        return false;
+    };
+    map.iter().all(|(key, field)| {
+        if !SPECULATIVE_CONFIG_KEYS.contains(&key.as_str()) {
+            return false;
+        }
+        match (key.as_str(), field) {
+            ("model", serde_json::Value::String(path)) => approved_paths
+                .iter()
+                .any(|root| path_within(path, root)),
+            ("model", _) => false,
+            (_, serde_json::Value::String(_) | serde_json::Value::Number(_)) => true,
+            (_, serde_json::Value::Bool(_)) => true,
+            _ => false,
+        }
+    })
 }
 
 const VLLM_SENSITIVE: &[(&str, Sensitivity)] = &[
@@ -260,12 +302,7 @@ const VLLM_SENSITIVE: &[(&str, Sensitivity)] = &[
             checkpoint_exempt: false,
         },
     ),
-    (
-        "--speculative-config",
-        Sensitivity::Path {
-            checkpoint_exempt: false,
-        },
-    ),
+    ("--speculative-config", Sensitivity::SpeculativeConfig),
     (
         "--generation-config",
         Sensitivity::Path {
@@ -813,6 +850,15 @@ pub fn validate_extra_args(
                     .iter()
                     .any(|root| path_within(value, root))
                 {
+                    return Err(ProfileArgError::PathNotApproved(name));
+                }
+            }
+            Some(Sensitivity::SpeculativeConfig) => {
+                if !approved(context.approved_options, &name) {
+                    return Err(ProfileArgError::Sensitive(name));
+                }
+                let value = option.value.as_deref().unwrap_or_default();
+                if !speculative_config_admitted(value, context.approved_paths) {
                     return Err(ProfileArgError::PathNotApproved(name));
                 }
             }

@@ -339,6 +339,53 @@ fn sensitive_options_need_named_host_approval() {
     extra_args_error("vllm", json!(["--reasoning-parser-plug", "x"]));
 }
 
+/// ADR 0014 §8: vLLM `--speculative-config` is a JSON object. With named
+/// approval it is admitted when every key is on the closed list and its draft
+/// `model` lies inside an approved directory; anything else is refused (found
+/// live 2026-09-25: as a plain path option no value could ever be approved).
+// T21
+#[test]
+fn speculative_config_is_admitted_key_by_key() {
+    let approve = |host: &mut Value| {
+        let security = &mut host["runtime_profiles"]["local"]["security"];
+        security["approved_options"] = json!(["--speculative-config"]);
+        security["approved_paths"] = json!(["/srv/models"]);
+    };
+    for config in [
+        r#"{"method":"mtp","num_speculative_tokens":3}"#,
+        r#"{"method":"dflash","model":"/srv/models/draft","num_speculative_tokens":7}"#,
+        r#"{"model":"/srv/models/draft","num_speculative_tokens":2}"#,
+    ] {
+        let (deployment, mut host) =
+            with_extra_args("vllm", json!(["--speculative-config", config]));
+        approve(&mut host);
+        resolve_effective(&deployment, &host).unwrap_or_else(|e| panic!("{config}: {e}"));
+    }
+    // Unapproved by name: refused even without a path.
+    let text = extra_args_error(
+        "vllm",
+        json!(["--speculative-config", r#"{"method":"mtp"}"#]),
+    );
+    assert!(text.contains("approved_options"), "{text}");
+    for config in [
+        r#"{"model":"/etc/draft"}"#,
+        r#"{"model":"/srv/models/../etc"}"#,
+        r#"{"model":"org/repo"}"#,
+        r#"{"model":["/srv/models/draft"]}"#,
+        r#"{"method":"mtp","tokenizer":"/srv/models/t"}"#,
+        r#"{"method":"mtp","draft_model_config":{"x":1}}"#,
+        r#"["/srv/models/draft"]"#,
+        "/srv/models/draft",
+    ] {
+        let (deployment, mut host) =
+            with_extra_args("vllm", json!(["--speculative-config", config]));
+        approve(&mut host);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(error.to_string().contains("approved_paths"), "{config}: {error}");
+        assert!(!error.to_string().contains("/etc"), "{error}");
+    }
+}
+
 /// ADR 0014 §8, SPEC §8.2: sensitive shapes are matched on what the option can
 /// resolve to, not only on the spelling given. Listener, bind, endpoint, IP,
 /// folder and JSON configuration options (a `*-config` value can name paths

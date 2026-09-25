@@ -29,6 +29,13 @@ PATH = "path"
 PATH_EXEMPT = "path_checkpoint_exempt"
 EGRESS = "listener_or_egress"
 CONFIG = "config"
+# vLLM `--speculative-config` (engine_policy.rs Sensitivity::SpeculativeConfig):
+# an object with only these keys, whose draft `model` lies in an approved
+# directory. Found live 2026-09-25: as a plain path it could never be approved.
+SPECULATIVE = "speculative_config"
+SPECULATIVE_KEYS = frozenset(("method", "model", "num_speculative_tokens",
+                              "draft_tensor_parallel_size", "prompt_lookup_max",
+                              "prompt_lookup_min", "draft_sample_method"))
 
 # The same shapes the deploy-time check applies to option spellings, here on
 # parsed destinations (ADR 0014 open issue 5).
@@ -47,7 +54,7 @@ _EXPLICIT = {
         "logits_processor_pattern": CODE, "tool_parser_plugin": CODE,
         "reasoning_parser_plugin": CODE,
         "download_dir": PATH, "tokenizer": PATH_EXEMPT, "chat_template": PATH_EXEMPT,
-        "lora_modules": PATH, "speculative_config": PATH, "generation_config": PATH,
+        "lora_modules": PATH, "speculative_config": SPECULATIVE, "generation_config": PATH,
         "allowed_local_media_path": PATH, "hf_config_path": PATH,
         "otlp_traces_endpoint": EGRESS, "kv_transfer_config": EGRESS,
         "kv_events_config": EGRESS, "load_format": EGRESS,
@@ -184,6 +191,24 @@ def _paths_of(value):
     raise Refused()
 
 
+def _check_speculative(value, roots):
+    if type(value) is str:
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise Refused() from None
+    if type(value) is not dict:
+        raise Refused()
+    for key, field in value.items():
+        if key not in SPECULATIVE_KEYS:
+            raise Refused()
+        if key == "model":
+            if not any(_within(field, root) for root in roots):
+                raise Refused()
+        elif field is not None and type(field) not in (str, int, float, bool):
+            raise Refused()
+
+
 def check(engine, supplied, approvals, checkpoint):
     """Refuse any supplied destination the host has not approved.
 
@@ -206,6 +231,9 @@ def check(engine, supplied, approvals, checkpoint):
                 pass
         if dest not in approvals.options:
             raise Refused()
+        if kind == SPECULATIVE:
+            _check_speculative(value, approvals.paths)
+            continue
         if kind in (PATH, PATH_EXEMPT):
             for path in _paths_of(value):
                 if not any(_within(path, root) for root in approvals.paths):
