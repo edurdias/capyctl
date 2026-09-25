@@ -5,8 +5,8 @@
 schema_version: 1
 kind: deployment
 name: coding-small
-# Shorthand for `placement: {hosts: [host-a]}`.
-host: host-a
+# Shorthand for `placement: {hosts: [gpu-box]}`.
+host: gpu-box
 routes: ["coding-small"]
 runtime_profile: vllm
 runtime_profile_revision: 1

@@ -359,7 +359,7 @@ fn every_documented_example_passes_validate_config() {
                 host.to_str().unwrap(),
             ]);
             assert_eq!(code, 0, "{} against host.yaml: {raw}", file.display());
-            assert_eq!(value["resolved_against"], "host-a", "{raw}");
+            assert_eq!(value["resolved_against"], "gpu-box", "{raw}");
         }
         kinds.push(kind);
     }
@@ -380,8 +380,8 @@ fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
         dir.path(),
         "elsewhere.yaml",
         &source.replace(
-            "hosts: [\"host-a\", \"host-b\"]",
-            "hosts: [\"host-b\", \"spark-other\"]",
+            "hosts: [\"gpu-box\", \"workstation\"]",
+            "hosts: [\"workstation\", \"server\"]",
         ),
     );
     let (code, value, raw) = validate(&[
@@ -392,7 +392,7 @@ fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
     ]);
     assert_eq!(code, 2, "{raw}");
     assert!(
-        value["message"].as_str().unwrap().contains("host-a"),
+        value["message"].as_str().unwrap().contains("gpu-box"),
         "{raw}"
     );
 }

@@ -37,8 +37,8 @@ first, then stop the unit:
 
 ```bash
 # Remote host: from the server, as the service user.
-sudo -u mllm mllm drain host host-a --config /etc/mllm/server.yaml
-sudo systemctl stop mllm-host           # on host-a
+sudo -u mllm mllm drain host gpu-box --config /etc/mllm/server.yaml
+sudo systemctl stop mllm-host           # on gpu-box
 
 # Standalone.
 sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone \
@@ -131,7 +131,7 @@ Releases and `install.sh`; Homebrew is deferred) carries these assets:
 | Asset | Holds |
 |---|---|
 | `mllm-<version>-linux-x86_64.tar.gz` | The x86-64 build. |
-| `mllm-<version>-linux-aarch64.tar.gz` | The ARM64 build (DGX Spark). |
+| `mllm-<version>-linux-aarch64.tar.gz` | The ARM64 build. |
 | `install.sh` | The installer (POSIX `sh`). |
 | `SHA256SUMS` | SHA-256 of every tarball and of `install.sh`. |
 
@@ -346,7 +346,7 @@ install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/ho
 mllm validate config --file /etc/mllm/host.yaml
 
 # Enroll with an invitation created on the server (`mllm invite host`).
-sudo -u mllm mllm join host --join-file host-a.join --config /etc/mllm/host.yaml
+sudo -u mllm mllm join host --join-file gpu-box.join --config /etc/mllm/host.yaml
 systemctl enable --now mllm-host
 ```
 
@@ -440,8 +440,8 @@ would then land in the configuration directory, behind a symlink the roles'
 identity rules refuse. `install.sh --systemd <role>` creates the empty
 directory for you and warns if the link already exists; to repair a link,
 stop the unit, `rm ~/.local/state/mllm` (the link only), move anything mllm
-wrote under `~/.config/mllm` back out, and reinstall. Found live on the Sparks
-(systemd 255) on 2026-09-24.
+wrote under `~/.config/mllm` back out, and reinstall. Observed with systemd
+255.
 
 User units carry no file-system sandboxing: `ProtectSystem=` and similar need
 privileges the per-user manager lacks (systemd.exec(5)). Prefer the system
@@ -471,8 +471,8 @@ capabilities, and `UMask=0077`. They deliberately omit:
 
 Writable paths are the state root and `/tmp`, `/var/tmp`. If a recipe must
 write into the model store, add `ReadWritePaths=` for it in a drop-in. These
-restrictions are not qualified on the Sparks; the first live run under the
-units is the check.
+restrictions have not been verified under a live engine run yet; the first
+live run under the units is the check.
 
 ## Upgrade
 
