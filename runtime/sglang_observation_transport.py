@@ -225,7 +225,7 @@ is the bridge's view of the request (see SchedulerObserverBridge.timing);
 `request_ms` and `result_ms` are when, since the connection was accepted, the
 bridge was asked and its result came back, so the rest of `elapsed_ms` is this
 thread's own authentication, reads and send.
-Found live 2026-09-24 (rc.2, M28 s92-14): the host saw only `receive_header`
+Found live 2026-09-24 (rc.2, M28 sa-14): the host saw only `receive_header`
 and the engine side left no trace of why no frame came.
 """
     try:

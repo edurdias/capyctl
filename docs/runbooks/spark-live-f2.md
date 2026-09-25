@@ -23,7 +23,7 @@ Entry template:
 
 ```markdown
 ## 2026-MM-DD — S1 run N — <commit>
-vLLM 0.29.0, qwen3-4b-instruct, host-a (GB10, 121 GiB unified). Command: scripts/live/run-on-spark.sh
+vLLM 0.29.0, qwen3-4b-instruct, host-a (unified-memory host, 121 GiB unified). Command: scripts/live/run-on-spark.sh
 
 | Scenario | Result | Timing / sample |
 | --- | --- | --- |
@@ -44,7 +44,7 @@ vLLM control routes keyed by API key: yes/no (see the auth-scope finding below).
 ```
 
 ## 2026-09-18 — S1 runs 1 to 5 — `87b683c` to `000b832`
-vLLM 0.29.0, qwen3-4b-instruct, host-a (GB10, 121 GiB unified, Linux
+vLLM 0.29.0, qwen3-4b-instruct, host-a (unified-memory host, 121 GiB unified, Linux
 6.17.0-1031-nvidia). Command: `scripts/live/run-on-spark.sh`. Evidence for run 5 is
 under `target/live/20260918T131825Z/` on the machine that ran the script.
 
@@ -102,7 +102,7 @@ restart re-attach (S1r) or any other model or engine build. CPU and Fake-engine
 runs remain no evidence of any of it.
 
 ## 2026-09-19 — S1 run 6 — `74aa941`
-vLLM 0.29.0, qwen3-4b-instruct, host-a (GB10, 121 GiB unified, Linux
+vLLM 0.29.0, qwen3-4b-instruct, host-a (unified-memory host, 121 GiB unified, Linux
 6.17.0-1031-nvidia). Command: `scripts/live/run-on-spark.sh`. Evidence under
 `target/live/20260919T152154Z/`.
 

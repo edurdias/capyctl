@@ -2,7 +2,7 @@
 
 Started 2026-09-12. **4B and 14B passed zero-swap tests; 27B passed a bounded-swap diagnostic, not zero-swap qualification.**
 Do not infer larger-model support from a downloaded checkpoint or a recognized
-architecture. Spark host-b is reserved by its owner and is not used in this run.
+architecture. host-b is reserved by its owner and is not used in this run.
 
 ## Scope and fixed recipe
 

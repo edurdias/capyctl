@@ -44,7 +44,7 @@ The owner reviewed the first version of this plan on PR #22 and decided the item
 - The deep-park protections of ADR 0012 are unchanged: loopback-only engine listener, per-launch engine key, key-guard middleware, no engine control path through host ingress or the router.
 - Additive protocol only: no field renumbered, command encoding version stays `"1"`, `PROTOCOL_VERSION` stays `"2"` (ADR 0017).
 - Store schema moves from v34 to v35, forward-only.
-- No new venvs and no environment changes on the Sparks; live rows use only `$HOME/mllm-vllm-venv2` (host-a), `$HOME/mllm-vllm-0.29-venv` (host-b) and `$HOME/mllm-sglang-0.5.20-venv` (both).
+- No new venvs and no environment changes on the hosts; live rows use only `$HOME/mllm-vllm-venv2` (host-a), `$HOME/mllm-vllm-0.29-venv` (host-b) and `$HOME/mllm-sglang-0.5.20-venv` (both).
 - CPU and Fake-engine tests are not qualification; the live rows ENG1–ENG4 are. Say so in every status claim.
 - Verification before every commit: the core suite
   `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`,
@@ -716,7 +716,7 @@ In `crates/mllm-config/src/remote_roles.rs`, beside `parse`:
 
 In `crates/mllm-cli/src/remote_roles.rs`, `start host` (`:879-881`) becomes `serve_host(HostConfig::load(&path).map_err(|e| error(&format!("Invalid host configuration: {}: {}", e.path, e.detail)))?)` (keep `read_config(&path)?` before it for the existing size and file checks), and `join host` (`:890`) uses `HostConfig::load(&path)` the same way.
 
-Note for the implementer: `std::fs::File::lock` is stable since Rust 1.89 (the toolchain is 1.98). `O_NOFOLLOW` differs between x86_64 and aarch64 (the Sparks), so it comes from `libc`, never a literal.
+Note for the implementer: `std::fs::File::lock` is stable since Rust 1.89 (the toolchain is 1.98). `O_NOFOLLOW` differs between x86_64 and aarch64 (the hosts), so it comes from `libc`, never a literal.
 
 - [ ] **Step 5: Run the tests to verify they pass.**
 
@@ -1552,7 +1552,7 @@ fn detection_finds_the_documented_locations_and_runs_nothing() {
 }
 
 // T07 T37 (owner decision 2026-09-25): environments directly in the home
-// directory (the Sparks' `~/mllm-vllm-venv2` layout) are found without
+// directory (the hosts' `~/mllm-vllm-venv2` layout) are found without
 // `--path`, one level deep and only when they carry `pyvenv.cfg`.
 #[test]
 fn home_level_environments_are_found_without_a_path() {
@@ -6478,7 +6478,7 @@ One deliverable: everything the live qualification needs, plus the operator docu
 }
 
 # ADR 0018 (row ENG4): one host may run another binary than the rest, e.g. an
-# rc.3 agent beside new ones. MLLM_REMOTE_BIN_92 / MLLM_REMOTE_BIN_17 override
+# rc.3 agent beside new ones. MLLM_REMOTE_BIN_a / MLLM_REMOTE_BIN_b override
 # RBIN for that host only.
 rbin() { # rbin <host>
   local var
@@ -6517,8 +6517,8 @@ In `host_doc`, pass `${NO_PROFILES:+--no-profiles}` to `gen_host_doc.py`, and ad
 # ENG1 (ADR 0018 §1, §3): engine add of the existing vLLM and SGLang
 # environments on a host running under systemd, published live, then a
 # deployment on each new profile serves:
-#   run_row.sh ENG1 --tag 92 -- host-a v92-4 s92-4
-#   run_row.sh ENG1 --tag 17 -- host-b v17-4 s17-4
+#   run_row.sh ENG1 --tag a -- host-a va-4 sa-4
+#   run_row.sh ENG1 --tag 17 -- host-b vb-4 sb-4
 #
 # Expected:
 #   a  engine detect (no --path) lists both home-level environments
@@ -6630,7 +6630,7 @@ row_main() {
 # ENG3 (ADR 0018 §4): removing a published profile is refused while a
 # deployment uses it, then --drain stops it through the ordinary path and
 # removes the profile only on stop evidence:
-#   run_row.sh ENG3 --tag 92 -- host-a v92-4
+#   run_row.sh ENG3 --tag a -- host-a va-4
 #
 # Expected:
 #   a  engine remove vllm while the deployment is Ready exits 20 naming it;
@@ -6814,7 +6814,7 @@ row_main() {
 Run: `for r in ENG1 ENG2 ENG3 ENG4; do bash -n scripts/live/matrix/rows/$r.sh || exit 1; done && shellcheck scripts/live/matrix/rows/ENG*.sh scripts/live/matrix/lib.sh scripts/live/matrix/roles.sh && python3 -m py_compile scripts/live/matrix/gen_host_doc.py`
 Expected: no errors (install `shellcheck` locally if missing; skip it only with a note in the commit message).
 
-Run: `scripts/live/matrix/run_row.sh ENG1 --dry-run --tag 92 -- host-a v92-4 s92-4` (and ENG2–ENG4 likewise, ENG4 with `MLLM_RC3_LOCAL=/bin/true MLLM_RC3_REMOTE=/bin/true`)
+Run: `scripts/live/matrix/run_row.sh ENG1 --dry-run --tag a -- host-a va-4 sa-4` (and ENG2–ENG4 likewise, ENG4 with `MLLM_RC3_LOCAL=/bin/true MLLM_RC3_REMOTE=/bin/true`)
 Expected: each writes `target/live/matrix/dry-run/ENG*/commands.log` and contacts no host.
 
 - [ ] **Step 7: Operator guide.** Add to `docs/operations/install.md` a section:

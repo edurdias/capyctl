@@ -1480,7 +1480,7 @@ Expected: eleven scenarios green. On any failure, fix on the branch, re-run; eve
 
 ```markdown
 ## 2026-MM-DD — S1 run N — <commit>
-vLLM 0.29.0, qwen3-4b-instruct, host-a (GB10, 121 GiB unified). Command: scripts/live/run-on-spark.sh
+vLLM 0.29.0, qwen3-4b-instruct, host-a (unified-memory host, 121 GiB unified). Command: scripts/live/run-on-spark.sh
 | Scenario | Result | Timing / sample |
 | L1 | pass | cold start to Ready: NN.N s |
 ...
@@ -1494,7 +1494,7 @@ vLLM control routes keyed by API key: yes/no (see Step 3).
 git add crates/mllm-cli/tests/live_vllm.rs scripts/live/run-on-spark.sh docs/runbooks/spark-live-f2.md
 git commit -m "test: S1 live run on host-a
 
-Eleven scenarios drive the product path against vLLM 0.29 on the Spark: launch,
+Eleven scenarios drive the product path against vLLM 0.29 on the host: launch,
 serve, access control, stop with a proven-empty group, restart, three failure
 shapes, recovery, the clean release binary, and memory returned. The runner refuses
 any host but host-a, refuses to start beside another engine, kills nothing by

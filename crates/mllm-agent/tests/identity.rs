@@ -37,9 +37,7 @@ fn host_cannot_request_ca_or_server_privileges() {
     params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let request = params.serialize_request(&key).unwrap();
-    let issued = authority
-        .issue_host("host-b", request.der(), NOW)
-        .unwrap();
+    let issued = authority.issue_host("host-b", request.der(), NOW).unwrap();
     let (_, pem) = x509_parser::pem::parse_x509_pem(issued.pem.as_bytes()).unwrap();
     let (_, cert) = X509Certificate::from_der(&pem.contents).unwrap();
     assert!(!cert.is_ca());
@@ -71,11 +69,7 @@ fn keys_and_authority_can_reload_without_changing_identity() {
             .unwrap();
     assert_eq!(issuer.certificate_pem(), authority.certificate_pem());
     assert!(issuer
-        .issue_host(
-            "host-a",
-            &restored.enrollment_request().unwrap(),
-            NOW + 60
-        )
+        .issue_host("host-a", &restored.enrollment_request().unwrap(), NOW + 60)
         .is_ok());
     let other = CertificateAuthority::generate(NOW).unwrap();
     assert!(

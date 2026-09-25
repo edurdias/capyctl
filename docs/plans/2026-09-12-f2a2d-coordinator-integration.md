@@ -936,4 +936,4 @@ This is an implementation plan, not implemented product code. Planning checks
 cover the DDL, selected pure safety helpers, file links, and inline review of
 transaction/identity boundaries. The full coordinator, launcher, adapter, router,
 and failure-injection tests listed above must be written and executed during
-implementation. No live engine, GPU, or Spark access is part of this record.
+implementation. No live engine, GPU, or host access is part of this record.

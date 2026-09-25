@@ -408,12 +408,7 @@ mod tests {
     // T26 T27
     #[test]
     fn a_whole_host_start_needs_a_host_without_other_charges() {
-        let mut busy = host(
-            "host-a",
-            100 * GIB,
-            0,
-            &[("other", footprint(GIB, None))],
-        );
+        let mut busy = host("host-a", 100 * GIB, 0, &[("other", footprint(GIB, None))]);
         busy.footprint = footprint(100 * GIB, None);
         busy.whole_host = true;
         assert_eq!(
@@ -534,12 +529,7 @@ mod tests {
                 .code(),
             "insufficient_capacity"
         );
-        let own = host(
-            "host-a",
-            15 * GIB,
-            0,
-            &[("d", footprint(10 * GIB, None))],
-        );
+        let own = host("host-a", 15 * GIB, 0, &[("d", footprint(10 * GIB, None))]);
         assert_eq!(
             place(&[own], "d", Strategy::Spread, None, None)
                 .unwrap()

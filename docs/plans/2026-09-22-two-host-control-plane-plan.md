@@ -12,7 +12,7 @@ designs: docs/design/adr/0013-deployment-instances-and-placement.md, docs/design
 ## 1. Goal and inputs
 
 Build what the two-host matrix (M01–M72) needs, in dependency order: one control-host server
-controlling both Sparks running vLLM and SGLang single-rank deployments of the four D5
+controlling both hosts running vLLM and SGLang single-rank deployments of the four D5
 models, with instances, automatic switching, parking, recovery, deployment deletion and graceful
 shutdown. Owner decisions D1–D11 (matrix §2) and E1, P1–P4 (status runbook, 2026-09-22)
 are authoritative; TP2 stays parked. E1 is designed in ADR 0014 (engine configuration,
@@ -348,7 +348,7 @@ the event `deployment_deleted`, the operation kind `delete`, and the tombstone k
 Units in one wave touch disjoint files and may run as parallel agents in separate
 worktrees. Wave 2 needs no instance or E1 work, so remote vLLM and recovery rows proceed
 on the current configuration shape. Live phases use the release binary built on both
-Sparks from the merged tree, record E0 and I1, and update the runbook; a failing row
+hosts from the merged tree, record E0 and I1, and update the runbook; a failing row
 reopens its unit.
 
 Matrix rows written for separate replica deployments (M54–M63, M65) need recasting to

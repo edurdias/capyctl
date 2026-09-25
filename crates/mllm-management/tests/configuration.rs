@@ -1078,8 +1078,7 @@ async fn registry_resolves_every_allowed_host_the_selector_matches() {
         Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
     );
     config["instances"] = json!(1);
-    config["placement"] =
-        json!({"hosts": ["host-a", "host-b"], "selector": {"gpu": "gb10"}});
+    config["placement"] = json!({"hosts": ["host-a", "host-b"], "selector": {"gpu": "gb10"}});
     config["devices"] = json!([{"sharing": "shared"}]);
     for phase in ["cold", "ready", "parking", "wake"] {
         config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);

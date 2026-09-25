@@ -457,7 +457,7 @@ class ObservationTransportTests(unittest.TestCase):
                 if '"mllm_observation_served"' in line]
 
     def test_each_connection_reports_where_it_stopped_and_what_the_scheduler_did(self):
-        # Found live 2026-09-24 (rc.2, M28 s92-14): a scheduler that never
+        # Found live 2026-09-24 (rc.2, M28 sa-14): a scheduler that never
         # reached a safe point before the deadline left the host only
         # `receive_header`. The engine side now says which stage stopped the
         # connection, whether a frame went out, and what the bridge saw.

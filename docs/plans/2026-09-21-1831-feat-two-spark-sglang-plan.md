@@ -1,5 +1,5 @@
 ---
-title: Two-Spark SGLang Product Operation - Plan
+title: Two-host SGLang Product Operation - Plan
 type: feat
 date: 2026-09-21
 artifact_contract: ce-unified-plan/v1
@@ -8,14 +8,14 @@ execution: code
 deepened: 2026-09-21
 ---
 
-# Two-Spark SGLang Product Operation - Plan
+# Two-host SGLang Product Operation - Plan
 
 ## Goal Capsule
 
 - **Objective:** An operator on control-host can deploy, serve, recover and stop a SGLang model distributed across host-a and host-b through mllm.
 - **Means:** Extend the existing coordinator with authenticated host agents and a separately pinned two-node recipe (KTD1–KTD5).
 - **Authority:** `docs/SPEC.md`, then `docs/design/milestones/f2-sglang-design.md`, then this plan. Execution status belongs only in `docs/runbooks/f2-current-status.md`.
-- **Execution:** Implement in dependency order on the current branch, preserve unrelated changes, and run focused regressions before integration checks. The existing user authorization covers continuing product work and live validation on both Sparks.
+- **Execution:** Implement in dependency order on the current branch, preserve unrelated changes, and run focused regressions before integration checks. The existing user authorization covers continuing product work and live validation on both hosts.
 - **Completion:** The executor owns implementation, product validation and one consolidated code review. No push, merge or publication is implied.
 - **Stop conditions:** A failed prerequisite closes its native path. Report an unavailable host or missing permission without substituting shell-managed inference for product operation.
 
@@ -26,7 +26,7 @@ deepened: 2026-09-21
 ### Summary
 
 Add remote host operation and distributed SGLang operation to the shipped CLI and management API.
-Use control-host as the control plane and both Sparks as supervised inference hosts.
+Use control-host as the control plane and both hosts as supervised inference hosts.
 The distributed baseline proves launch, inference, failure recovery and cleanup; the complete F4 gate additionally requires the switching and cache evidence specified in SPEC §18.
 
 ### Problem Frame
@@ -39,14 +39,14 @@ Independent standalone processes cannot establish distributed ownership, resourc
 
 - **Use the product for validation.** Governs R1, R2. (session-settled: user-directed — chosen over manual launch workarounds: fixes must exercise the shipped product.)
 - **Use SGLang 0.5.20.** Governs R3. (session-settled: user-approved — chosen over retaining the modified older installation: clean installation and reviewed source identity.)
-- **Standalone is a prerequisite.** Governs R2, R10. (session-settled: user-directed — chosen over stopping at standalone success: the requested outcome spans both Sparks.)
+- **Standalone is a prerequisite.** Governs R2, R10. (session-settled: user-directed — chosen over stopping at standalone success: the requested outcome spans both hosts.)
 
 ### Requirements
 
 **Product operation**
 
 - R1. Role startup, enrollment, deployment intent and lifecycle actions use the shipped CLI/API under SPEC §§3–4 and §14.
-- R2. One managed deployment spans both Sparks, with control-host routing authenticated inference and each host agent supervising its owned member under SPEC §11.
+- R2. One managed deployment spans both hosts, with control-host routing authenticated inference and each host agent supervising its owned member under SPEC §11.
 - R3. Both members use the reviewed SGLang 0.5.20 build and matching checkpoint contract; driver changes, rebooting and unrelated environment changes remain excluded.
 
 **Trust and recovery**
@@ -60,7 +60,7 @@ Independent standalone processes cannot establish distributed ownership, resourc
 
 - R8. Group launch reserves all members before effects and requires evidence from every member before routing under SPEC §11.
 - R9. Deep park and collective paths require explicit host-policy opt-in and all-member evidence under SPEC §9.1, §11 and T21.
-- R10. Complete this task with product-controlled two-Spark inference, failure recovery and cleanup; report the broader F4 switching, residency and cache gates separately under SPEC §18.
+- R10. Complete this task with product-controlled two-host inference, failure recovery and cleanup; report the broader F4 switching, residency and cache gates separately under SPEC §18.
 
 ### Actors and Flows
 
@@ -82,7 +82,7 @@ Independent standalone processes cannot establish distributed ownership, resourc
 
 ### Scope Boundaries
 
-The initial distributed recipe is TP=2, PP=1, DP=1 with one GB10 per host.
+The initial distributed recipe is TP=2, PP=1, DP=1 with one unified-memory host per host.
 Other parallel layouts, active-active controllers, arbitrary remote shell execution and automatic engine installation are outside this implementation.
 U8 completes the requested distributed test.
 Unsupported persistent/shared cache combinations remain explicitly unsupported rather than gaining an inferred certification.
@@ -283,7 +283,7 @@ Its `/health_generate` always returns 200, so U7 must consume scheduler evidence
 ### U8. Distributed product baseline and failure recovery
 
 - **Dependencies:** U7.
-- **Goal:** Prove real two-Spark generation and owned cleanup from control-host.
+- **Goal:** Prove real two-host generation and owned cleanup from control-host.
 - **Requirements:** R1–R8; F1–F3; KTD1–KTD6.
 - **Files:** Existing live runbook and product-driven live tests/scripts under `scripts/live/`; non-secret evidence under `target/live/`.
 - **Approach:** Prepare matching approved environments, enroll both hosts, and use only shipped lifecycle commands. Record both rank identities, physical resource use, routed inference and final cleanup. Exercise head failure, worker connection loss and controller/agent restart with retained ownership.
@@ -329,5 +329,5 @@ Update `docs/runbooks/f2-current-status.md` in place after each material gate.
 Units U1–U8 satisfy their stated scenarios, integration remains green, and consolidated review has no unresolved correctness or security findings.
 U8 completes the requested multi-node test; it does not complete the separate F4 qualification recorded in follow-up U9.
 The shipped CLI/API reproduces the result without direct database mutations or manual engine launches.
-Both Sparks have verified ownership and cleanup after each failure scenario, with unresolved resources still charged.
+Both hosts have verified ownership and cleanup after each failure scenario, with unresolved resources still charged.
 Remove abandoned implementation attempts, preserve unrelated owner changes, and leave one accurate status runbook.

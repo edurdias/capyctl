@@ -101,7 +101,7 @@ Document review remains a planning gate, not a repeated gate for each small task
   `c9bfdbfa2e465658a91b24e8fec1e0fc0a6539a1`. See the
   [observer plan](2026-09-14-f2b-memory-saver-observer.md) and
   [patch provenance and limitations](../../runtime/patches/README.md).
-  This module performs no installation or Spark operation. Protected scheduler
+  This module performs no installation or host operation. Protected scheduler
   integration, actual loaded-library identity, reviewed isolated CUDA build,
   native allocation/lifecycle qualification and full F2 remain open. The observer
   cannot acknowledge parking, release reservations, or establish whole-process
@@ -159,7 +159,7 @@ Document review remains a planning gate, not a repeated gate for each small task
   reviews completed, plus one limited local interface check. One family-label
   correction was applied. The new candidate-action version preserves legacy history;
   one accounted ReadyProbe supplies lifecycle and qualification readiness together.
-  Native qualification and full F2 remain open. No Spark access or installs occurred.
+  Native qualification and full F2 remain open. No host access or installs occurred.
 
 - Fit-based planner module merged locally into `main` at `8c355c0`. One consolidated
   module review found no critical, important, or minor issues. Fresh pre-merge and
@@ -268,7 +268,7 @@ Document review remains a planning gate, not a repeated gate for each small task
   atomic increasing grants, fencing, rollback, replay, and contention tests.
   Four task reviews and broader review approved. Fresh root checks:
   184 workspace tests excluding CLI plus 2 CLI library tests pass. Scoped Clippy
-  clean. No production database or Spark runtime accessed.
+  clean. No production database or host runtime accessed.
 - F2A2b complete through `0f5a576`: bounded host-memory observer and completion
   validator with full process/token/time/milestone checks. Task and broader reviews
   complete; formatting fix re-reviewed. Full checks at `60fd33a`: 194 CPU tests

@@ -684,7 +684,7 @@ mllm update host host-a --resource-policy policy.yaml --expected-revision 1 --wa
   Only metadata/timing is recorded by default.
 - [ ] Exercise CLI against the real local management listener with fake engines:
   create/retry/start/park/prepare/stop/update/undeploy, attach/detach, conflict,
-  reconnect, and failed preparation. No Spark or GPU. Run:
+  reconnect, and failed preparation. No host or GPU. Run:
 
 ```bash
 cargo test -p mllm-cli --test grammar --test errors --test management --lib

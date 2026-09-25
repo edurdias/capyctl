@@ -154,7 +154,7 @@ that references in §20 remain stable. Recipe ownership is stated in §8.1.
 - §15.1 (line 523): "reservations and qualification results" becomes "reservations and operational evidence".
 - §17 (line 789): remove ", qualification reasons".
 - §18 F2 row (line 805): "mandatory qualified parking" becomes "declared-tier parking"; "selected-recipe live qualification" becomes "live verification of the selected recipes on authorized hardware". F4 row (line 807): "Distributed and cache qualification" becomes "Distributed and cache verification".
-- §19 (line 832): "production-qualified Spark recipes" becomes "production-verified Spark recipes"; "Qualification and the development-endpoint security issue are release gates" becomes "Live verification on authorized hardware and the development-endpoint security issue are release gates".
+- §19 (line 832): "production-qualified host recipes" becomes "production-verified host recipes"; "Qualification and the development-endpoint security issue are release gates" becomes "Live verification on authorized hardware and the development-endpoint security issue are release gates".
 - §20 T14 (line 853): remove "; old qualification invalidated" and append "; a superseded binding identity is not reused". T36 (line 875): "qualified fallback" becomes "declared fallback". Line 881: "a qualified experimental deep-park path where permitted" becomes "a live-verified deep-park path where permitted".
 - §21 (line 905): "retain qualification evidence" becomes "retain operational evidence".
 
@@ -1297,7 +1297,7 @@ Also `crates/mllm-controller/src/coordinator.rs:1` doc comment "Owned, qualified
 Run: `cargo test --offline -p mllm-store -p mllm-controller -p mllm-management --all-targets -- --test-threads=4`
 Expected: pass. Management event tests that pinned a `qualified_*` kind string now pin the new one; update the expected literal, not the assertion shape.
 Run: `grep -rn -i "qualif" crates --include=*.rs | grep -v "mllm-cli/src/roles.rs" | cut -c1-120`
-Expected: nothing. `roles.rs` may keep comments about the F1 Spark live verification runs if they cite the runbook by its filename; leave those.
+Expected: nothing. `roles.rs` may keep comments about the F1 host live verification runs if they cite the runbook by its filename; leave those.
 
 - [ ] **Step 4: Commit**
 

@@ -19,7 +19,7 @@
 - Preserve `crates/mllm-cli/tests/live_interactive.rs`: never read, edit, stage, format, compile or run it.
 - Snapshot success is not a Park/Restore acknowledgement, qualification, complete process footprint, reservation release, or permission to dispatch.
 - Read the actual saver instance's `_binary_wrapper.cdll`; never load a second library to obtain a convenient symbol.
-- Count Spark physical capacity once. Saver, Torch and logical tensor observations can overlap and must not be added blindly.
+- Count host physical capacity once. Saver, Torch and logical tensor observations can overlap and must not be added blindly.
 - The selected SGLang recipe disables CPU backup. The generic observer reports backup state honestly; its recipe-level aggregation rejects enabled or present backup.
 
 ## Scope and fixed decisions
