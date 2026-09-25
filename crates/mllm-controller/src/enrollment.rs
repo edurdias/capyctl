@@ -65,6 +65,16 @@ impl EnrollmentAuthority {
     ) -> Result<(), EnrollmentError> {
         crate::host_publication::publish(&self.state, host, inventory).map_err(|_| EnrollmentError)
     }
+    /// ADR 0018 §3: a live re-publication from a reconciled session. `Err`
+    /// is the operator-safe reason; the previous approved document stays.
+    pub fn republish_inventory(
+        &self,
+        host: &str,
+        inventory: &mllm_protocol::pb::ReportInventory,
+        previous: &mllm_protocol::pb::ReportInventory,
+    ) -> Result<(), String> {
+        crate::host_publication::republish(&self.state, host, inventory, previous)
+    }
     /// ADR 0008 (owner decision 2026-09-23): journal an installation drift the
     /// host newly reported in its status.
     pub fn record_installation_drift(

@@ -215,6 +215,32 @@ fn newly_drifted(
         })
         .collect()
 }
+/// SPEC §§4.2, 13: the bounds every published inventory meets (startup and
+/// ADR 0018 live re-publication alike).
+fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
+    inventory.domains.len() <= 128
+        && inventory.profiles.len() <= 128
+        && inventory.envelope.as_ref().is_some_and(|e| {
+            e.host_id == host && mllm_protocol::compatible_peer(&e.protocol_version)
+        })
+        && inventory.domains.iter().all(|d| {
+            bounded_name(&d.domain_id)
+                && matches!(
+                    d.kind.as_str(),
+                    "system" | "device_memory" | "filesystem" | "remote_storage"
+                )
+                && d.observed_bytes >= -1
+        })
+        && inventory.profiles.iter().all(|p| {
+            bounded_name(&p.name)
+                && bounded_name(&p.build_fingerprint)
+                && matches!(
+                    p.eligibility.as_str(),
+                    "unknown" | "qualified" | "unsupported" | "disabled"
+                )
+                && installation_fields_valid(p)
+        })
+}
 /// ADR 0008: what a host registered for its installations stays fixed for the
 /// session; drift and probe results may change as its launches find them.
 fn same_registration(new: &[pb::RuntimeProfileStatus], old: &[pb::RuntimeProfileStatus]) -> bool {
@@ -1021,9 +1047,7 @@ impl AgentSessions {
                             if s.view.session_id != id { return Err(denied()); }
                             match message.msg {
                                 Some(agent_to_server::Msg::ReportInventory(inventory)) if !s.view.reconciled && s.inventory.is_none() => {
-                                    if inventory.domains.len() > 128 || inventory.profiles.len() > 128 || inventory.envelope.as_ref().is_none_or(|e| e.host_id != host || !mllm_protocol::compatible_peer(&e.protocol_version)) { return Err(denied()); }
-                                    if inventory.domains.iter().any(|d| !bounded_name(&d.domain_id) || !matches!(d.kind.as_str(), "system"|"device_memory"|"filesystem"|"remote_storage") || d.observed_bytes < -1)
-                                        || inventory.profiles.iter().any(|p| !bounded_name(&p.name) || !bounded_name(&p.build_fingerprint) || !matches!(p.eligibility.as_str(), "unknown"|"qualified"|"unsupported"|"disabled") || !installation_fields_valid(p)) { return Err(denied()); }
+                                    if !inventory_shape_valid(&inventory, &host) { return Err(denied()); }
                                     after = After::Publish(Box::new(inventory));
                                     false
                                 }
@@ -1050,6 +1074,28 @@ impl AgentSessions {
                                     // reports is journaled once; status follows what it reports.
                                     let drifts = newly_drifted(&inventory.profiles, &old.profiles);
                                     after = After::Refresh(Box::new(inventory), drifts);
+                                    false
+                                }
+                                // ADR 0018 §3: a live re-publication, only from a host that
+                                // declared `live_profile_update` (ADR 0017). Answered below;
+                                // the session carries on whatever the verdict.
+                                Some(agent_to_server::Msg::PublishProfiles(request))
+                                    if s.view.reconciled && s.capabilities.contains(capabilities::LIVE_PROFILE_UPDATE) =>
+                                {
+                                    let inventory = request.inventory.ok_or_else(denied)?;
+                                    let previous = s.inventory.clone().ok_or_else(denied)?;
+                                    if request.request_id.is_empty()
+                                        || request.request_id.len() > capabilities::MAX_REQUEST_ID
+                                        || !inventory_shape_valid(&inventory, &host)
+                                        || inventory.host_boot_id != previous.host_boot_id
+                                        // Only runtime profiles change live: the domains later
+                                        // refreshes are checked against stay the published ones.
+                                        || inventory.domains.len() != previous.domains.len()
+                                        || !inventory.domains.iter().all(|d| previous.domains.iter().any(|o| o.domain_id == d.domain_id && o.kind == d.kind))
+                                    {
+                                        return Err(denied());
+                                    }
+                                    after = After::Republish(request.request_id, Box::new(inventory), Box::new(previous));
                                     false
                                 }
                                 Some(agent_to_server::Msg::ReconcileHistory(page)) if !s.view.reconciled && s.inventory.is_some() => {
@@ -1148,6 +1194,30 @@ impl AgentSessions {
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 s.inventory = Some(*inventory);
                             }
+                            After::Republish(request_id, inventory, previous) => {
+                                // Store work outside the session table (SPEC §13).
+                                let verdict = self.authority.republish_inventory(&host, &inventory, &previous);
+                                if verdict.is_ok() {
+                                    let mut sessions = self.sessions.lock().map_err(|_| denied())?;
+                                    let s = sessions.get_mut(&host).ok_or_else(denied)?;
+                                    if s.view.session_id != id { return Err(denied()); }
+                                    s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
+                                    s.prepared = crate::host_publication::eligible(&inventory);
+                                    s.view.eligible = s.prepared && s.placeable;
+                                    s.inventory = Some(*inventory);
+                                }
+                                let (accepted, reason) = match verdict {
+                                    Ok(()) => (true, String::new()),
+                                    // ADR 0018: the reason is bounded; `chars` never
+                                    // cuts a character in two.
+                                    Err(reason) => (false, reason.chars().take(capabilities::MAX_REASON).collect()),
+                                };
+                                if accepted {
+                                    // Placement reads the new snapshot from here on.
+                                    self.changed();
+                                }
+                                send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::ProfilesPublished(pb::ProfilesPublished { request_id, accepted, reason })) }).await.map_err(|status| *status)?;
+                            }
                             After::Result(result) => {
                                 self.receive_result(&host, &id, *result, received_at).map_err(|status| *status)?;
                             }
@@ -1192,7 +1262,7 @@ impl AgentSessions {
                                 eprintln!("host {host} control session {id}: the host sends no heartbeats; a frozen host is detected only when its session is lost");
                                 (0, 0)
                             };
-                            send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::SessionReady(pb::SessionReady { controller_id: self.authority.controller_id(), session_id: id.clone(), heartbeat_interval_ms, heartbeat_lost_after_ms, capabilities: Vec::new() })) }).await.map_err(|status| *status)?;
+                            send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::SessionReady(pb::SessionReady { controller_id: self.authority.controller_id(), session_id: id.clone(), heartbeat_interval_ms, heartbeat_lost_after_ms, capabilities: capabilities::server_capabilities() })) }).await.map_err(|status| *status)?;
                         }
                     }
                 }
@@ -1229,6 +1299,8 @@ enum After {
     Nothing,
     Publish(Box<pb::ReportInventory>),
     Refresh(Box<pb::ReportInventory>, Vec<(String, String, String)>),
+    /// ADR 0018 §3: request id, the re-published inventory, the one it replaces.
+    Republish(String, Box<pb::ReportInventory>, Box<pb::ReportInventory>),
     Result(Box<pb::MemberExecutionResult>),
     Provision(Box<pb::IngressProvisioned>),
 }
