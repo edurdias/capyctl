@@ -175,7 +175,9 @@ pre-release is installed only by naming it. The installer:
 5. with `--systemd <server|host|standalone>`, writes that role's unit to
    `~/.config/systemd/user/` (or `/etc/systemd/system/` with `--system`),
    pointed at the installed binary, and runs `systemctl daemon-reload`. It
-   never enables or starts a unit, creates users or touches state.
+   never enables or starts a unit, creates users or touches state, except
+   that a user unit gets an empty `~/.local/state/mllm` (0700) if there is
+   none (see "User services").
 
 `sh install.sh --uninstall [--system]` removes the binary, `<prefix>/share/mllm`
 and the units the installer wrote. State directories are kept.
@@ -385,6 +387,18 @@ sh install.sh --version 0.1.0-rc.2 --systemd host
 systemctl --user enable --now mllm-host
 loginctl enable-linger "$USER"   # keep it running after logout
 ```
+
+The state root must exist as a real directory before the unit first starts.
+systemd 254 and later, finding `~/.local/state/mllm` missing while
+`~/.config/mllm` (where the units read `<role>.yaml` and `<role>.env`)
+exists, assumes its pre-254 layout and makes `~/.local/state/mllm` a symlink
+to `~/.config/mllm` ("creating compatibility symlink" in the journal). State
+would then land in the configuration directory, behind a symlink the roles'
+identity rules refuse. `install.sh --systemd <role>` creates the empty
+directory for you and warns if the link already exists; to repair a link,
+stop the unit, `rm ~/.local/state/mllm` (the link only), move anything mllm
+wrote under `~/.config/mllm` back out, and reinstall. Found live on the Sparks
+(systemd 255) on 2026-09-24.
 
 User units carry no file-system sandboxing: `ProtectSystem=` and similar need
 privileges the per-user manager lacks (systemd.exec(5)). Prefer the system

@@ -61,6 +61,31 @@ pub fn binding(
         binding: binding.clone(),
         readiness,
     });
+    remote_binding(engine, sessions, binding)
+}
+
+/// The engine half of [`binding`] alone: the adapter the coordinator drives
+/// for this launch's Initialize, Park and Restore steps. Tests drive it
+/// directly; production reaches it only through [`binding`].
+pub fn engine(
+    sessions: Arc<AgentSessions>,
+    owner: SharedCoordinatorState,
+    binding: RemoteLaunchBinding,
+    readiness: ReadinessLedger,
+) -> Arc<dyn EngineAdapter> {
+    Arc::new(RemoteEngine {
+        sessions,
+        owner,
+        binding: Arc::new(binding),
+        readiness,
+    })
+}
+
+fn remote_binding(
+    engine: Arc<RemoteEngine>,
+    sessions: Arc<AgentSessions>,
+    binding: Arc<RemoteLaunchBinding>,
+) -> ExecutionBinding {
     let (settle_sessions, settle_binding) = (sessions.clone(), binding.clone());
     ExecutionBinding::remote(
         engine,
@@ -201,6 +226,35 @@ impl RemoteEngine {
     /// retained. A host refusal without effect (`unchanged`) is `Unsupported`;
     /// anything else unproven is `Uncertain`, with the claim retained.
     async fn residency(&self, runtime: &RuntimeCommand) -> Result<EffectObservation, RuntimeError> {
+        let outcome = self.residency_effect(runtime).await;
+        if runtime.action == RuntimeAction::Park {
+            if let Err(
+                RuntimeError::Unsupported
+                | RuntimeError::Refused(_)
+                | RuntimeError::StaleRevision
+                | RuntimeError::Missing,
+            ) = &outcome
+            {
+                // W4 hand-off (W5): the coordinator settles a refused park at
+                // once and leaves a remote launch's dispatch closed until a
+                // fresh probe reopens it. Forget this binding's readiness proof
+                // so the supervisor sends that probe, whether the host refused
+                // (`unchanged`) or the park was refused before anything was sent
+                // (ADR 0017: a drain-only host, a missing capability). Keeping
+                // the proof left a Ready engine closed to dispatch for good
+                // (rc.2 live validation, 2026-09-24).
+                if let Ok(mut readiness) = self.readiness.lock() {
+                    readiness.remove(&runtime.context.binding_id);
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn residency_effect(
+        &self,
+        runtime: &RuntimeCommand,
+    ) -> Result<EffectObservation, RuntimeError> {
         let c = &runtime.context;
         let b = &self.binding;
         let mllm_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities else {
@@ -264,18 +318,9 @@ impl RemoteEngine {
             .execute_on_session(command, None)
             .await
             .map_err(|status| unresolved(&status, "remote residency change remains unresolved"))?;
-        let (alive, facts) = match residency_evidence(park, recorded, &result) {
-            Ok(evidence) => evidence,
-            // W4 hand-off (W5): a refused park leaves the host's gate closed;
-            // readiness is re-proven by a fresh probe before dispatch reopens.
-            Err(RuntimeError::Unsupported) if park => {
-                if let Ok(mut readiness) = self.readiness.lock() {
-                    readiness.remove(&c.binding_id);
-                }
-                return Err(RuntimeError::Unsupported);
-            }
-            Err(error) => return Err(error),
-        };
+        // A refused park leaves the host's gate closed; `residency` forgets
+        // the readiness proof so a fresh probe reopens dispatch.
+        let (alive, facts) = residency_evidence(park, recorded, &result)?;
         if !park {
             // SPEC §13.2 (G2): this readiness belongs to the host session whose
             // fresh probe proved it.
