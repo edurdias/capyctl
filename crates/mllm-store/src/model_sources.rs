@@ -106,6 +106,14 @@ pub struct PendingSource {
 
 /// Record a newly accepted revision's remote source as pending on the host
 /// it resolved on. A local source has no row.
+///
+/// A copy already verified on that host for a deployment that still exists is
+/// the same bytes (the store key pins repository, commit and file patterns),
+/// and `mllm prune sources` never removes a copy an existing deployment
+/// references, so the new revision starts `verified` with that copy's sizes.
+/// Found live 2026-09-25: a second deployment of a downloaded model started
+/// `pending`, and `deploy --activate` was refused `model_source_pending` while
+/// the copy sat verified on the host.
 pub(crate) fn insert_accepted(
     tx: &Transaction<'_>,
     deployment: &str,
@@ -116,9 +124,20 @@ pub(crate) fn insert_accepted(
     let Some(key) = effective.model.source.store_key() else {
         return Ok(());
     };
+    let verified: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT s.bytes_done,s.bytes_total FROM model_sources s JOIN deployments d ON d.id=s.deployment_id WHERE s.host_id=?1 AND s.source_key=?2 AND s.state='verified' ORDER BY s.updated_at_ms DESC LIMIT 1",
+            params![effective.host.name, key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (state, done, total) = match verified {
+        Some((done, total)) => ("verified", done, total),
+        None => ("pending", 0, 0),
+    };
     tx.execute(
-        "INSERT OR IGNORE INTO model_sources(deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms) VALUES(?1,?2,?3,?4,'pending',0,0,NULL,0,?5)",
-        params![deployment, revision, effective.host.name, key, now_ms],
+        "INSERT OR IGNORE INTO model_sources(deployment_id,revision,host_id,source_key,state,bytes_done,bytes_total,reason,terminal,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,0,?8)",
+        params![deployment, revision, effective.host.name, key, state, done, total, now_ms],
     )?;
     Ok(())
 }
