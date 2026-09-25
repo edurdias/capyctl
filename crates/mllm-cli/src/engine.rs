@@ -6,7 +6,7 @@ pub use target::{named_role_document, resolve_target, role_engines, RoleKind, Ta
 
 use crate::grammar::{Command, DeepParkChoice, DriftChoice};
 use crate::output::StructuredError;
-use mllm_agent::control_socket::{request, ControlRequest};
+use mllm_agent::control_socket::{request, ClientError, ControlRequest};
 use mllm_agent::engines::{
     check_version, detect, resolve, Resolved, ScanBounds, ScanRoots, VERSION_CHECK_TIMEOUT,
 };
@@ -21,7 +21,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const ADD_REPLY: Duration = Duration::from_secs(60);
-const REMOVE_REPLY: Duration = Duration::from_secs(990);
+/// Controller ruling I4: how long `remove` waits for the role. The role
+/// answers a retirement within its own bound (`RETIRE_BOUND`, 960 s, which
+/// covers the server's 900 s drain window); this adds a clear margin for the
+/// role's measuring and the socket, so the CLI does not give up on a role
+/// that is still about to answer.
+pub const REMOVE_REPLY: Duration =
+    Duration::from_secs(mllm_agent::host_control::RETIRE_BOUND.as_secs() + 240);
 const LIST_REPLY: Duration = Duration::from_secs(5);
 
 fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
@@ -455,10 +461,46 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             }
             Err(error(closed(reply["code"].as_str().unwrap_or("")), message))
         }
+        // Controller ruling I4: the role took the request and may have
+        // acted on it; only `engine list` can say what happened.
+        Err(ClientError::Unanswered(e)) => Err(unknown_outcome(&e, name)),
         // Owner decision 2026-09-25: a published profile is never removed unconfirmed.
         Err(e) => Err(error(
             "agent_unreachable",
             format!("{e}; nothing was removed; start the role and retry"),
         )),
+    }
+}
+
+/// Controller ruling I4: a remove the role took but never answered.
+fn unknown_outcome(cause: &str, name: &str) -> StructuredError {
+    error(
+        "agent_unreachable",
+        format!(
+            "{cause}; the outcome is unknown: the role may still be retiring {name}. \
+             Run `mllm engine list` to see whether it is still published, and run \
+             `mllm engine remove {name}` again to finish; a retry resumes the same removal"
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T37 (controller ruling I4): the CLI's bound on `remove` outlasts the
+    // role's own bound on a retirement by a clear margin, so a drain that runs
+    // close to its bound is answered, not reported as lost.
+    #[test]
+    fn remove_waits_longer_than_the_role_retires() {
+        let role = mllm_agent::host_control::RETIRE_BOUND;
+        assert!(
+            role >= Duration::from_secs(900 + 60),
+            "covers the drain window"
+        );
+        assert!(
+            REMOVE_REPLY >= role + Duration::from_secs(120),
+            "{REMOVE_REPLY:?}"
+        );
     }
 }

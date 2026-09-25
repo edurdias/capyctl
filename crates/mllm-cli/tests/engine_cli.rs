@@ -522,3 +522,51 @@ fn list_engines_goes_to_the_server() {
         resource: mllm_cli::grammar::ListResource::Engines
     }));
 }
+
+// T37 (ADR 0018 §4; controller ruling I4): a remove the role took but never
+// answered (it closed the connection, or the bound passed) is reported as an
+// unknown outcome that `mllm engine list` settles, never as "nothing was
+// removed"; engines.yaml is not touched.
+#[tokio::test]
+async fn remove_without_an_answer_reports_an_unknown_outcome() {
+    use std::io::BufRead;
+    let dir = private_dir();
+    let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
+    let document = host_doc(dir.path());
+    let _ = execute(&add(&env), Some(&document), dir.path()).await;
+    let before = std::fs::read(engines_beside(&document)).unwrap();
+    let socket = resolve_target(Some(&document), Path::new("/nonexistent"), &|k| {
+        (k == "HOME").then(|| "/home/u".into())
+    })
+    .unwrap()
+    .socket;
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let role = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .unwrap();
+        drop(stream);
+    });
+    let error = execute(
+        &Command::EngineRemove {
+            name: "vllm".into(),
+            drain: true,
+        },
+        Some(&document),
+        dir.path(),
+    )
+    .await
+    .unwrap_err();
+    role.join().unwrap();
+    assert_eq!(error.code, "agent_unreachable");
+    assert!(
+        error.message.contains("outcome is unknown")
+            && error.message.contains("mllm engine list")
+            && !error.message.contains("nothing was removed"),
+        "{}",
+        error.message
+    );
+    assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
+}

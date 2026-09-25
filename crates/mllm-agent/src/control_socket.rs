@@ -288,16 +288,21 @@ async fn serve_one(stream: tokio::net::UnixStream, handler: Arc<dyn ControlHandl
 
 #[derive(Debug)]
 pub enum ClientError {
+    /// The request never reached a role: nothing was asked.
     Unreachable(String),
-    Protocol(String),
+    /// Controller ruling I4: the role took the request, then gave no usable
+    /// answer (it closed the connection, answered something that is not a
+    /// reply, or the bound passed). What it did is unknown.
+    Unanswered(String),
+    /// The bound passed before the request was sent: nothing was asked.
     TimedOut,
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreachable(m) | Self::Protocol(m) => f.write_str(m),
-            Self::TimedOut => f.write_str("the role did not answer in time"),
+            Self::Unreachable(m) | Self::Unanswered(m) => f.write_str(m),
+            Self::TimedOut => f.write_str("the role's socket did not take the request in time"),
         }
     }
 }
@@ -319,6 +324,9 @@ pub async fn request(
     }
     let unreachable =
         |e: std::io::Error| ClientError::Unreachable(format!("{}: {e}", path.display()));
+    // Set once the whole request line is written: from then on the role may
+    // be acting on it, so a failure is `Unanswered`, never `Unreachable`.
+    let sent = std::cell::Cell::new(false);
     let exchange = async {
         let mut stream = tokio::net::UnixStream::connect(path)
             .await
@@ -329,24 +337,31 @@ pub async fn request(
                 path.display()
             )));
         }
+        // A partial write may already have delivered the line; only a
+        // failure before any of it left is certainly unasked.
         stream
             .write_all(format!("{}\n", request.to_line()).as_bytes())
             .await
-            .map_err(unreachable)?;
+            .map_err(|e| ClientError::Unanswered(format!("{}: {e}", path.display())))?;
+        sent.set(true);
         let mut line = String::new();
         BufReader::new(stream.take(MAX_LINE as u64))
             .read_line(&mut line)
             .await
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+            .map_err(|e| ClientError::Unanswered(e.to_string()))?;
         if line.is_empty() {
-            return Err(ClientError::Protocol(
+            return Err(ClientError::Unanswered(
                 "the role closed the connection without answering".into(),
             ));
         }
         serde_json::from_str(line.trim_end())
-            .map_err(|_| ClientError::Protocol("the role's answer is not JSON".into()))
+            .map_err(|_| ClientError::Unanswered("the role's answer is not JSON".into()))
     };
-    tokio::time::timeout(timeout, exchange)
-        .await
-        .map_err(|_| ClientError::TimedOut)?
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result,
+        Err(_) if sent.get() => Err(ClientError::Unanswered(
+            "the role did not answer in time".into(),
+        )),
+        Err(_) => Err(ClientError::TimedOut),
+    }
 }

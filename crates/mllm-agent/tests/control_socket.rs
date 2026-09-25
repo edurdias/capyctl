@@ -279,3 +279,47 @@ async fn a_socket_outside_a_private_directory_is_refused() {
     // 0700 binds.
     ControlServer::bind(&target.join(SOCKET_NAME)).unwrap();
 }
+
+/// A role that takes the request line and then goes away without a reply
+/// (it crashed, or was stopped mid-request); `delay` before it does.
+fn accepts_then_vanishes(path: &std::path::Path, delay: Duration) -> std::thread::JoinHandle<()> {
+    use std::io::BufRead;
+    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .unwrap();
+        std::thread::sleep(delay);
+        drop(stream);
+    })
+}
+
+// T37 (ADR 0018 §3; controller ruling I4): a request the role received but
+// never answered, whether it closed the connection or the bound passed, is
+// reported as unanswered, never as unreachable: its outcome is unknown.
+#[tokio::test]
+async fn a_request_the_role_took_but_never_answered_is_unanswered() {
+    let dir = private_dir();
+    let path = dir.path().join(SOCKET_NAME);
+    let role = accepts_then_vanishes(&path, Duration::ZERO);
+    let closed = request(&path, &ControlRequest::List, Duration::from_secs(5)).await;
+    assert!(
+        matches!(closed, Err(ClientError::Unanswered(_))),
+        "{closed:?}"
+    );
+    role.join().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let role = accepts_then_vanishes(&path, Duration::from_millis(600));
+    let late = request(&path, &ControlRequest::List, Duration::from_millis(200)).await;
+    assert!(matches!(late, Err(ClientError::Unanswered(_))), "{late:?}");
+    role.join().unwrap();
+    // Nothing listening at all: unreachable, the request never left.
+    std::fs::remove_file(&path).unwrap();
+    let absent = request(&path, &ControlRequest::List, Duration::from_secs(5)).await;
+    assert!(
+        matches!(absent, Err(ClientError::Unreachable(_))),
+        "{absent:?}"
+    );
+}
