@@ -9,10 +9,10 @@
 > Retired 2026-09-23: `crates/mllm-cli/tests/live_sglang.rs` and the
 > `scripts/live/run-on-spark.sh` runner are deleted by owner decision (2026-09-22). The
 > SGL1–SGL3 gate is matrix row M73 on an SGLang fixture, driven through the shipped CLI
-> and roles; see `docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8.
+> and roles; see `docs/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8.
 > This plan is a historical record.
 
-**Spec:** `docs/superpowers/specs/2026-09-19-sglang-ordinary-launch-design.md`
+**Spec:** `docs/specs/2026-09-19-sglang-ordinary-launch-design.md`
 
 ## Global Constraints
 

@@ -100,7 +100,7 @@ Document review remains a planning gate, not a repeated gate for each small task
   with warnings denied. The reviewed tree is
   `c9bfdbfa2e465658a91b24e8fec1e0fc0a6539a1`. See the
   [observer plan](2026-09-14-f2b-memory-saver-observer.md) and
-  [patch provenance and limitations](../../../runtime/patches/README.md).
+  [patch provenance and limitations](../../runtime/patches/README.md).
   This module performs no installation or Spark operation. Protected scheduler
   integration, actual loaded-library identity, reviewed isolated CUDA build,
   native allocation/lifecycle qualification and full F2 remain open. The observer

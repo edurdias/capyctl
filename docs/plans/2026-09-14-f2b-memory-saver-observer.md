@@ -8,7 +8,7 @@
 
 **Implementation status:** All three checkpoints completed in `782a3f4`. One consolidated independent review passed specification and quality with no findings. Fresh root verification passed 27 observer tests and 509 existing Rust tests, plus both canonical Clippy checks. This closes only the CPU-tested observer prerequisite; downstream integration, isolated CUDA build, installed provenance and live qualification remain required.
 
-**Spec:** [F2 design](../../design/milestones/f2-sglang-design.md), §§3/6 and Q11; [F2B adapter plan](2026-09-12-f2b-sglang-adapter.md), selected recipe and allocator evidence requirements. The detailed source investigation is `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-7-memory-saver-observer-options.md`.
+**Spec:** [F2 design](../design/milestones/f2-sglang-design.md), §§3/6 and Q11; [F2B adapter plan](2026-09-12-f2b-sglang-adapter.md), selected recipe and allocator evidence requirements. The detailed source investigation is `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-7-memory-saver-observer-options.md`.
 
 ## Global Constraints
 

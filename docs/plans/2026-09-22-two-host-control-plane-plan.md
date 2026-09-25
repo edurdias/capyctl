@@ -3,7 +3,7 @@ title: Two-Host Control Plane - Implementation Plan
 type: implementation-plan
 date: 2026-09-22
 status: W0, W1 and W3 done locally (not live); W0 live verification in progress; rest proposed
-matrix: docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md
+matrix: docs/plans/2026-09-22-two-host-engine-matrix.md
 designs: docs/design/adr/0013-deployment-instances-and-placement.md, docs/design/adr/0014-deployment-engine-configuration.md
 ---
 

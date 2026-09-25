@@ -17,7 +17,7 @@ switching automatically on demand, parking and waking, recovering from failures,
 deleting deployments and shutting down cleanly. This document maps those scenarios into a
 numbered matrix (M01–M80), records what the code supports on the remote path, and lists
 the owner decisions that govern it. The build order is in
-`docs/superpowers/plans/2026-09-22-two-host-control-plane-plan.md`.
+`docs/plans/2026-09-22-two-host-control-plane-plan.md`.
 
 Authority order is unchanged: `docs/SPEC.md`, then
 `docs/design/milestones/f2-sglang-design.md`, then the plans. Execution status belongs

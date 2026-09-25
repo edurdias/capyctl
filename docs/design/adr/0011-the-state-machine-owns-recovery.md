@@ -108,7 +108,7 @@ repository (no allocations, weights or cache; quiesced; no unknown work; activit
 counters unmoved; no outstanding request lease; identities equal to the owned
 association; then milestone verification), the Fake engine's lifecycle simulation,
 and the native launch handoff. The design at
-`docs/superpowers/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
+`docs/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
 
 **3. Park is an ordinary transition.** It gets no gate the other transitions do not
 have. A deployment declares its tier under ADR 0010; the engine either performs it or

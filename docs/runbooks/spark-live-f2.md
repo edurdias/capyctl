@@ -14,7 +14,7 @@ That runner and the suites it ran (`crates/mllm-cli/tests/live_vllm.rs`,
 `live_sglang.rs`) drove standalone in process rather than the shipped binary. By owner
 decision (2026-09-22) they were replaced by matrix rows driven through the shipped CLI
 and roles (M38, M73, M74, M75 in
-`docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, harness
+`docs/plans/2026-09-22-two-host-engine-matrix.md`, harness
 `scripts/live/matrix/`) and deleted on 2026-09-23. The entries below are historical and
 their commands no longer exist; matrix results are recorded only in
 `docs/runbooks/f2-current-status.md`.

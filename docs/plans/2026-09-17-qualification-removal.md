@@ -6,7 +6,7 @@
 
 **Tech Stack:** Rust workspace (`cargo`, `clippy -D warnings`), SQLite through `rusqlite` with forward-only migrations, `tokio` coordinator worker, `axum` management API, `serde` DTOs.
 
-**Spec:** `docs/superpowers/specs/2026-09-17-qualification-removal-design.md`. Read it first. Where this plan deviates from the spec it says so in the task and the docs task records the amendment.
+**Spec:** `docs/specs/2026-09-17-qualification-removal-design.md`. Read it first. Where this plan deviates from the spec it says so in the task and the docs task records the amendment.
 
 ## Global Constraints
 
@@ -79,8 +79,8 @@ because nobody knows whether the effect landed."
 Docs first, so code moves against an amended SPEC and ADR rather than ahead of them.
 
 **Files:**
-- Modify: `docs/design/adr/0011-the-state-machine-owns-recovery.md` (already partly edited in the worktree), `docs/SPEC.md`, `docs/design/adr/0009-proof-carrying-reconciliation.md`, `docs/design/milestones/f2-sglang-design.md`, `docs/superpowers/plans/2026-09-12-f2-planning-index.md`, `docs/README.md`, `docs/superpowers/specs/2026-09-17-qualification-removal-design.md`
-- Delete: `docs/superpowers/plans/2026-09-12-f2c-mixed-engine-qualification.md`, `docs/superpowers/plans/2026-09-14-f2-native-candidate-handoff.md`, `docs/superpowers/plans/2026-09-16-state-machine-owns-recovery.md`, `docs/runbooks/f2-mixed-engine-qualification.md`, `docs/runbooks/f2-sglang-qualification.md`, `docs/AGENT_HANDOFF.md`
+- Modify: `docs/design/adr/0011-the-state-machine-owns-recovery.md` (already partly edited in the worktree), `docs/SPEC.md`, `docs/design/adr/0009-proof-carrying-reconciliation.md`, `docs/design/milestones/f2-sglang-design.md`, `docs/plans/2026-09-12-f2-planning-index.md`, `docs/README.md`, `docs/specs/2026-09-17-qualification-removal-design.md`
+- Delete: `docs/plans/2026-09-12-f2c-mixed-engine-qualification.md`, `docs/plans/2026-09-14-f2-native-candidate-handoff.md`, `docs/plans/2026-09-16-state-machine-owns-recovery.md`, `docs/runbooks/f2-mixed-engine-qualification.md`, `docs/runbooks/f2-sglang-qualification.md`, `docs/AGENT_HANDOFF.md`
 
 - [ ] **Step 1: ADR 0011**
 
@@ -107,7 +107,7 @@ repository (no allocations, weights or cache; quiesced; no unknown work; activit
 counters unmoved; no outstanding request lease; identities equal to the owned
 association; then milestone verification), the Fake engine's lifecycle simulation,
 and the native launch handoff. The design at
-`docs/superpowers/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
+`docs/specs/2026-09-17-qualification-removal-design.md` sorts every piece.
 ```
 
 In decision 5, replace "Both are host policy fields with these defaults, not constants, because a host with slower storage may need a longer cooldown." with:
@@ -187,22 +187,22 @@ In §8, row Q11 becomes "| Q11 — Engine verification | Pinned recipe for each 
 - [ ] **Step 5: Deletions and index**
 
 ```bash
-git rm docs/superpowers/plans/2026-09-12-f2c-mixed-engine-qualification.md \
-       docs/superpowers/plans/2026-09-14-f2-native-candidate-handoff.md \
-       docs/superpowers/plans/2026-09-16-state-machine-owns-recovery.md \
+git rm docs/plans/2026-09-12-f2c-mixed-engine-qualification.md \
+       docs/plans/2026-09-14-f2-native-candidate-handoff.md \
+       docs/plans/2026-09-16-state-machine-owns-recovery.md \
        docs/runbooks/f2-mixed-engine-qualification.md \
        docs/runbooks/f2-sglang-qualification.md \
        docs/AGENT_HANDOFF.md
 ```
 
-In `docs/superpowers/plans/2026-09-12-f2-planning-index.md`, delete the F2C row (line 18). In `docs/README.md`, delete the sentence "Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning." and replace with "Start with `AGENTS.md`, then `SPEC.md`."; change "Live mixed-engine qualification remains pending." to "Live mixed-engine verification remains pending." and "hardware qualification claim" to "hardware verification claim".
+In `docs/plans/2026-09-12-f2-planning-index.md`, delete the F2C row (line 18). In `docs/README.md`, delete the sentence "Start with **`AGENT_HANDOFF.md`**, then read **`SPEC.md`** before implementation planning." and replace with "Start with `AGENTS.md`, then `SPEC.md`."; change "Live mixed-engine qualification remains pending." to "Live mixed-engine verification remains pending." and "hardware qualification claim" to "hardware verification claim".
 
 Run: `grep -rn "AGENT_HANDOFF\|f2c-mixed-engine-qualification\|f2-native-candidate-handoff\|state-machine-owns-recovery.md\|f2-sglang-qualification\|f2-mixed-engine-qualification" docs AGENTS.md`
 Expected: no hits outside `docs/runbooks/f2-current-status.md` (fixed in Task 13) and the spec's own §5 list.
 
 - [ ] **Step 6: Amend the design doc**
 
-In `docs/superpowers/specs/2026-09-17-qualification-removal-design.md`, add a section "## 9. Amendments during planning" listing the five deviations from the top of this plan, one sentence each.
+In `docs/specs/2026-09-17-qualification-removal-design.md`, add a section "## 9. Amendments during planning" listing the five deviations from the top of this plan, one sentence each.
 
 - [ ] **Step 7: Commit**
 

@@ -5,7 +5,7 @@ Status: superseded on 2026-09-19. The entrypoint denial was composed open —
 (`sglang_native_composition.compose`: pinned-source revalidation, plugin
 closure, placement attestation, checkpoint revalidation) and the guarded import
 follows only when the contract holds (owner-authorized; S3 slice
-`docs/superpowers/plans/2026-09-19-sglang-launch.md`). The obligations below are
+`docs/plans/2026-09-19-sglang-launch.md`). The obligations below are
 historical record of how the gates were built; the live-launch prerequisites
 that remain are the host publishing `device_inventory_digest` and the guarded
 launcher setting the child's `CUDA_VISIBLE_DEVICES`.

@@ -759,7 +759,7 @@ sessions now pass local binary tests. Remote engine execution and native
 two-Spark validation remain pending.
 
 Implementation follows
-`docs/superpowers/plans/2026-09-21-1831-feat-two-spark-sglang-plan.md`.
+`docs/plans/2026-09-21-1831-feat-two-spark-sglang-plan.md`.
 Host-scoped ownership, typed command contracts and the additive namespace
 migration are implemented. U1 focused domain/protocol/store checks pass 177
 tests; the integrated core run passes 639 distinct tests (640 reported,
@@ -805,9 +805,9 @@ engines in all meaningful permutations, mapped by an explicit test matrix. Two-r
 (TP2) group work, previously U6/U7, is deferred until after that matrix passes; its
 open design questions (residency, peer exposure, NCCL transport, rank readiness,
 compensation, owner granularity, placement shape, rendezvous ports) are parked.
-The test matrix is `docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`
+The test matrix is `docs/plans/2026-09-22-two-host-engine-matrix.md`
 (scenarios M01–M72, gaps G01–G17 plus U5-G1…G4, decisions D1–D11) and the work
-plan is `docs/superpowers/plans/2026-09-22-two-host-control-plane-plan.md` (units
+plan is `docs/plans/2026-09-22-two-host-control-plane-plan.md` (units
 W0–W13 in waves). Decision E1 (below) supersedes the plan's per-model recipe
 approach for G17. Owner decisions so far:
 D1 deep parking is enabled by default and a host opts out (the SPEC §9.1/T21
@@ -2012,7 +2012,7 @@ The native half of the gate is still open. The owner confirmed on 2026-09-16 tha
   below).
 - SGLang: the native entrypoint denial was **composed open** on 2026-09-19
   (owner-authorized; S3 plan
-  `docs/superpowers/plans/2026-09-19-sglang-launch.md`, commits `393b197..17b6ffc`).
+  `docs/plans/2026-09-19-sglang-launch.md`, commits `393b197..17b6ffc`).
   `sglang_entry._verified_native_contract` runs the audited gates (source
   revalidation, plugin closure, placement, checkpoint) and the guarded engine
   import follows when the contract holds; the ordinary descriptor carries

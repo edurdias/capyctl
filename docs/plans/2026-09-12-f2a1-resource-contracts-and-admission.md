@@ -11,7 +11,7 @@ close F2. Task instructions below remain the implementation contract.
 
 **Tech Stack:** Existing Rust 2021 workspace, standard collections, existing `thiserror` and `proptest` dependencies. No new runtime dependency, engine package, service, or GPU library.
 
-**Spec:** [Approved F2 design](../../design/milestones/f2-sglang-design.md), especially §§3–5 and Q2/Q6. Read it and this plan before execution.
+**Spec:** [Approved F2 design](../design/milestones/f2-sglang-design.md), especially §§3–5 and Q2/Q6. Read it and this plan before execution.
 
 ## Global Constraints
 

@@ -6,11 +6,11 @@
 
 **Tech Stack:** Rust 2021 workspace (tokio, tonic/prost, axum, rusqlite, clap, serde_json, saphyr-parser strict YAML), bash live harness under `scripts/live/matrix/`.
 
-**Spec:** `docs/superpowers/specs/2026-09-25-engine-registration-design.md` (owner-approved, merged in d067252; revised in this PR with the owner's 2026-09-25 decisions). Read it with this plan. Governing documents: `docs/SPEC.md` (§4.2, §13, §14, §15), ADR 0008, ADR 0012, ADR 0017, and `AGENTS.md`.
+**Spec:** `docs/specs/2026-09-25-engine-registration-design.md` (owner-approved, merged in d067252; revised in this PR with the owner's 2026-09-25 decisions). Read it with this plan. Governing documents: `docs/SPEC.md` (§4.2, §13, §14, §15), ADR 0008, ADR 0012, ADR 0017, and `AGENTS.md`.
 
 ## Decisions (owner-decided 2026-09-25)
 
-The owner reviewed the first version of this plan on PR #22 and decided the items below on 2026-09-25. Items 1, 2, 4, 8 and 14 changed the design; the spec (`docs/superpowers/specs/2026-09-25-engine-registration-design.md`) is updated in the same PR. One item still needs the owner: **20**, marked **owner check**.
+The owner reviewed the first version of this plan on PR #22 and decided the items below on 2026-09-25. Items 1, 2, 4, 8 and 14 changed the design; the spec (`docs/specs/2026-09-25-engine-registration-design.md`) is updated in the same PR. One item still needs the owner: **20**, marked **owner check**.
 
 1. **`host.yaml` is never rewritten.** Registered engines live in a separate, mllm-owned file, `engines.yaml`, merged with the role's own document at load. A profile name declared in both is refused (at role start, and by `engine add` as `profile_exists`). There is no rewrite of the role document, no `.before-engine-registration` backup and no SPEC §15.1 rewrite exception; ADR 0018 instead adds the engines file to the §15.1 authority table. `engines.yaml` is `schema_version: 1`, `kind: engines`, `runtime_profiles: {…}`, mode 0600, written as JSON-shaped YAML.
 2. **Where `engines.yaml` lives.** It sits beside the role's configuration file, with the same rule for both roles: `--config dir/x.yaml` (or `$MLLM_CONFIG`) means `dir/engines.yaml`; without one it is `~/.config/mllm/engines.yaml` (`$XDG_CONFIG_HOME/mllm/engines.yaml`) for a host and for standalone alike. The generated standalone document stays in the state directory. Consequence: a host and a standalone role that both run with implicit documents on one machine would share one engines file; the CLI refuses that ambiguity and asks for `--config`.
@@ -97,7 +97,7 @@ Modified files (main ones; each task lists exact lines):
 | File | Change |
 |---|---|
 | `docs/SPEC.md` | "Amended by ADR 0018" notes in §4.2 and §15.1 (engines file row). |
-| `docs/superpowers/specs/2026-09-25-engine-registration-design.md` | Updated in this PR with the owner's 2026-09-25 decisions. |
+| `docs/specs/2026-09-25-engine-registration-design.md` | Updated in this PR with the owner's 2026-09-25 decisions. |
 | `crates/mllm-config/src/lib.rs`, `effective.rs` | Export `registration`; `check_runtime_profile`. |
 | `crates/mllm-config/src/schema.rs`, `remote_roles.rs` | `ConfigKind::Engines`; `HostConfig::load` merges `engines.yaml`. |
 | `crates/mllm-protocol/proto/mllm/management/v1/management.proto`, `src/capabilities.rs`, `tests/version_skew.rs` | New messages and capability. |
@@ -138,7 +138,7 @@ Task order and dependencies: 1 (ADR) → 2, 3 (config) → 4, 5 (agent engine di
 never rewritten).
 **Related:** ADR 0008 (engine installations, fingerprints, capability probes), ADR 0012
 (deep parking default-on), ADR 0017 (capability gating). Design:
-`docs/superpowers/specs/2026-09-25-engine-registration-design.md`.
+`docs/specs/2026-09-25-engine-registration-design.md`.
 
 ## Context
 

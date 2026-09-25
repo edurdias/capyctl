@@ -8,7 +8,7 @@ The SPEC amendments below are applied to `SPEC.md` §8.2 and §16.3.
 **Amends:** `SPEC.md` §8.2 (parameter ownership) and §16.3 (single-host example). It
 implements ADR 0008's "a deployment owns its `engine_config`" and applies ADR 0011's rule
 that mllm validates a recipe's shape and capacity while the user owns whether it works.
-**Unit:** WE of `docs/superpowers/plans/2026-09-22-two-host-control-plane-plan.md`.
+**Unit:** WE of `docs/plans/2026-09-22-two-host-control-plane-plan.md`.
 
 ## Context
 

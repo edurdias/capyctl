@@ -518,7 +518,7 @@ running on the Fake through the testkit. They are a pre-check and never count as
 > are matrix rows driven through the shipped CLI and roles: L1–L5 and L11 are M73, L6–L8
 > are M38, L9 is M74 (the readiness bound is now the deployment's `timeouts.initialize`),
 > L10 is M75 plus `scripts/check-release-clean.sh` in `scripts/live/matrix/sync.sh build`
-> (`docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8). The text
+> (`docs/plans/2026-09-22-two-host-engine-matrix.md`, Tier 8). The text
 > below is kept as the design record.
 
 `crates/mllm-cli/tests/live_vllm.rs`, gated on `MLLM_LIVE=1`, release build,

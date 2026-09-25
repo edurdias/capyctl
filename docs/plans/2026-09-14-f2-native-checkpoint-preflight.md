@@ -10,7 +10,7 @@ product_contract_source: legacy-requirements
 
 **Tech Stack:** Python 3.12+, standard library, Linux descriptor-relative filesystem operations, SHA-256, unittest. No Torch, safetensors, engine or tokenizer imports.
 
-**Spec:** [F2 design](../../design/milestones/f2-sglang-design.md), sections 3, 4, 6 and Q11; [native adapter plan](2026-09-12-f2b-sglang-adapter.md), selected checkpoint/recipe. Exact previously verified source facts are in `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-7-native-local-inputs.md`.
+**Spec:** [F2 design](../design/milestones/f2-sglang-design.md), sections 3, 4, 6 and Q11; [native adapter plan](2026-09-12-f2b-sglang-adapter.md), selected checkpoint/recipe. Exact previously verified source facts are in `.superpowers/sdd/2026-09-12-f2a2d-coordinator-integration/task-7-native-local-inputs.md`.
 
 ## Global Constraints
 

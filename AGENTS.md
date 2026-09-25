@@ -21,7 +21,8 @@ Read these in order when orienting. Lower entries never override higher ones.
    placement, engine configuration, per-instance lifecycle, revoked-host recovery,
    version skew).
 3. `docs/design/milestones/f2-sglang-design.md` — approved F2 design.
-4. `docs/superpowers/plans/` — per-slice implementation plans.
+4. `docs/plans/` — per-slice implementation plans. Feature design notes written
+   ahead of their plans live in `docs/specs/`.
 5. `docs/runbooks/f2-current-status.md` — **the single status authority.**
    What is done, what remains, what needs owner attention, what is queued next.
 

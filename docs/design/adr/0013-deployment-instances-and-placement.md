@@ -6,7 +6,7 @@ Owner answers Q5 and Q8 confirm decisions 9 and 7 as written.
 **Amends:** `SPEC.md` §1.1 (R06), §2 (vocabulary), §10 (routing and switching) and §16.4
 (two-host example). §6, §7, §11 and §13 are unchanged and govern everything this
 document relies on; ADR 0007 governs every capacity check named here.
-**Replaces:** units W7 and W9 of `docs/superpowers/plans/2026-09-22-two-host-control-plane-plan.md`
+**Replaces:** units W7 and W9 of `docs/plans/2026-09-22-two-host-control-plane-plan.md`
 (separate replica deployments bound to one route).
 **Related:** ADR 0014 (deployment engine configuration, owner decision E1) supplies the
 per-instance memory request (owner decision P2) and the checkpoint digest every instance

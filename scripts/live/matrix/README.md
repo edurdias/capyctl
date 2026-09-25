@@ -1,6 +1,6 @@
 # Two-host matrix harness (plan unit W2)
 
-This harness runs the rows of `docs/superpowers/plans/2026-09-22-two-host-engine-matrix.md`.
+This harness runs the rows of `docs/plans/2026-09-22-two-host-engine-matrix.md`.
 It uses one server on control-host and host roles on host-a and host-b. Results go in
 `docs/runbooks/f2-current-status.md` only. The harness records evidence and does not decide
 whether a row passed. A dry run, the local rehearsal, CPU tests and Fake-engine tests are not

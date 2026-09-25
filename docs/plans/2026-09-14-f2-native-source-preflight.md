@@ -6,7 +6,7 @@
 
 **Tech Stack:** Python standard library and unittest; existing checkpoint preflight primitives.
 
-**Spec:** [F2B](2026-09-12-f2b-sglang-adapter.md), Task 1; [native prerequisites](../../runbooks/f2-native-startup-prerequisites.md).
+**Spec:** [F2B](2026-09-12-f2b-sglang-adapter.md), Task 1; [native prerequisites](../runbooks/f2-native-startup-prerequisites.md).
 
 ## Global Constraints
 
