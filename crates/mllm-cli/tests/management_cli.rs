@@ -49,7 +49,9 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
         // this machine's: the deployment must be sized against the same host.
         support::TEST_CAPACITY_BYTES,
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
-        true,
+        // ADR 0012: the Fake host opts out of deep parking, so its
+        // generated deployment is restart_only.
+        false,
     );
     let path = dir.path().join("deployment.json");
     std::fs::write(&path, config.to_string()).unwrap();

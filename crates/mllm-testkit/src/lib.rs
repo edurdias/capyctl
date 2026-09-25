@@ -28,7 +28,8 @@ pub use fake_engine::{FakeEngine, BUFFER_RESIDUE, FULL_RESIDENT_BYTES, LEVEL1_RE
 pub use fake_launcher::FakeLauncher;
 pub use lifecycle::FakeFault;
 pub use provider::{
-    fake_bindings, fake_installation, fake_provider, fake_tools_factory, spawn_fake_coordinator,
+    fake_bindings, fake_bindings_with_members, fake_installation, fake_provider,
+    fake_tools_factory, live_identity, spawn_fake_coordinator,
 };
 pub use scripted_tool::ScriptedTool;
 
