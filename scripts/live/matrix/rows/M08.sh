@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # M08 (T37, T21): development controls and engine surfaces stay off every
-# non-loopback path, with s92-4 and v92-4 Ready together on host-a.
+# non-loopback path, with sa-4 and va-4 Ready together on host-a.
 #   run_row.sh M08
 #
 # Expected:
@@ -14,8 +14,8 @@
 #   engines  each engine port listens on loopback only and is refused from control-host;
 #            unkeyed loopback calls are refused 401, except /health and SGLang's
 #            /metrics (read-only, loopback, marked in status).
-#   status   v92-4 reports development_controls.state `exposed` with its surface,
-#            mitigations and production_safe false; s92-4 is not exposed and
+#   status   va-4 reports development_controls.state `exposed` with its surface,
+#            mitigations and production_safe false; sa-4 is not exposed and
 #            carries unauthenticated_local_surfaces [/metrics] on loopback.
 # Leaves both stopped with verified cleanup and deletes them.
 
@@ -115,9 +115,9 @@ engine_sockets() { # engine_sockets <host>
 
 status_marks() {
   dry && return 0
-  status_dep v92-4 >"$EVID/status-v92-4.json"; status_dep s92-4 >"$EVID/status-s92-4.json"
+  status_dep va-4 >"$EVID/status-va-4.json"; status_dep sa-4 >"$EVID/status-sa-4.json"
   cli list hosts --output json >"$EVID/hosts-marks.json"
-  python3 - "$EVID/status-v92-4.json" "$EVID/status-s92-4.json" <<'PY'
+  python3 - "$EVID/status-va-4.json" "$EVID/status-sa-4.json" <<'PY'
 import json, sys
 v = json.load(open(sys.argv[1])); s = json.load(open(sys.argv[2]))
 v = v.get("deployment", v); s = s.get("deployment", s)
@@ -138,44 +138,44 @@ PY
 }
 
 row_main() {
-  local host=host-a rc=0 dep
+  local host=$HOST_A rc=0 dep
   step before host_idle "$host" || return 1
-  step deploy-v deploy v92-4 --activate || return 1
-  step deploy-s deploy s92-4 --activate || return 1
-  step ready-v wait_state v92-4 ready 900 || rc=1
-  step ready-s wait_state s92-4 ready 900 || rc=1
+  step deploy-v deploy va-4 --activate || return 1
+  step deploy-s deploy sa-4 --activate || return 1
+  step ready-v wait_state va-4 ready 900 || rc=1
+  step ready-s wait_state sa-4 ready 900 || rc=1
   if [ "$rc" != 0 ]; then
     step errors engine_errors "$host"
   else
-    step owned-v owned v92-4
-    step owned-s owned s92-4
-    for dep in v92-4 s92-4; do accounting "$dep" >"$EVID/accounting-ready-$dep.json"; done
+    step owned-v owned va-4
+    step owned-s owned sa-4
+    for dep in va-4 sa-4; do accounting "$dep" >"$EVID/accounting-ready-$dep.json"; done
     snap ready
-    step infer-v infer v92-4 "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
-    step infer-s infer s92-4 "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
+    step infer-v infer va-4 "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
+    step infer-s infer sa-4 "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
     step status-marks status_marks || rc=1
     step router router_paths || rc=1
     step ingress ingress_paths "$host" || rc=1
-    step engine-v engine_surface "$host" v92-4 vllm || rc=1
-    step engine-s engine_surface "$host" s92-4 sglang || rc=1
+    step engine-v engine_surface "$host" va-4 vllm || rc=1
+    step engine-s engine_surface "$host" sa-4 sglang || rc=1
     step engine-sockets engine_sockets "$host" || rc=1
     # SPEC §10 tool calls on engines launched without a tool parser (evidence,
     # not gating; rows/TC.sh gates tool calls with a parser). Observed
     # 2026-09-24: vLLM answered a named tool_choice 400; SGLang answered it as
     # plain JSON text, not tool_calls.
-    step toolcall-v python3 "$MATRIX_DIR/toolcall.py" --route v92-4 --out "$EVID/toolcall.jsonl"
-    step toolcall-s python3 "$MATRIX_DIR/toolcall.py" --route s92-4 --out "$EVID/toolcall.jsonl"
+    step toolcall-v python3 "$MATRIX_DIR/toolcall.py" --route va-4 --out "$EVID/toolcall.jsonl"
+    step toolcall-s python3 "$MATRIX_DIR/toolcall.py" --route sa-4 --out "$EVID/toolcall.jsonl"
   fi
-  for dep in v92-4 s92-4; do
+  for dep in va-4 sa-4; do
     step "stop-$dep" stop_dep "$dep" || rc=1
   done
-  for dep in v92-4 s92-4; do
+  for dep in va-4 sa-4; do
     step "stopped-$dep" wait_state "$dep" stopped 600 || rc=1
   done
   sleep 3
-  step cleanup-v cleanup_check v92-4 "$host" "$EVID/owned-v92-4.json" "$EVID/accounting-ready-v92-4.json" v || rc=1
-  step cleanup-s cleanup_check s92-4 "$host" "$EVID/owned-s92-4.json" "$EVID/accounting-ready-s92-4.json" s || rc=1
-  step delete-v delete_dep v92-4 || rc=1
-  step delete-s delete_dep s92-4 || rc=1
+  step cleanup-v cleanup_check va-4 "$host" "$EVID/owned-va-4.json" "$EVID/accounting-ready-va-4.json" v || rc=1
+  step cleanup-s cleanup_check sa-4 "$host" "$EVID/owned-sa-4.json" "$EVID/accounting-ready-sa-4.json" s || rc=1
+  step delete-v delete_dep va-4 || rc=1
+  step delete-s delete_dep sa-4 || rc=1
   return "$rc"
 }

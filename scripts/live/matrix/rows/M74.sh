@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # M74 (T14, T20): the Initialize deadline is the deployment's `timeouts.initialize`
 # (ADR 0014 amendment A1), per fixture:
-#   run_row.sh M74 --tag v92-14 -- v92-14
-#   run_row.sh M74 --tag s92-14 -- s92-14
+#   run_row.sh M74 --tag va-14 -- va-14
+#   run_row.sh M74 --tag sa-14 -- sa-14
 # Replaces the removed in-process scenario live_vllm.rs L9 (owner decision
 # 2026-09-22). L9 could only assert an admission refusal, because the readiness
 # bound was not reachable from a deployment document; `timeouts.initialize` and
@@ -72,7 +72,7 @@ expire_start() { # expire_start <deployment>
 }
 
 row_main() {
-  local fix=${1:?fixture, e.g. v92-14} host dep rc=0
+  local fix=${1:?fixture, e.g. va-14} host dep rc=0
   host=$(fixture_host "$fix")
   dep=$fix-it30
   echo "fixture $fix deployment $dep host $host" | tee -a "$EVID/timeline.txt"

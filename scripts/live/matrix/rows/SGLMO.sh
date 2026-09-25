@@ -2,9 +2,9 @@
 # SGLMO (T21; 2026-09-24 fix): an SGLang deployment of the NVFP4 (modelopt)
 # anchor with `residency: deep` is refused capability_missing:deep_park with a
 # restart_only hint; the restart_only variant deploys, serves and stops clean.
-#   run_row.sh SGLMO --tag s17-27f -- s17-27f
+#   run_row.sh SGLMO --tag sb-27f -- sb-27f
 row_main() {
-  local fix=${1:-s17-27f} host rc=0 dep
+  local fix=${1:-sb-27f} host rc=0 dep
   host=$(fixture_host "$fix"); dep=$fix-ro
   step before host_idle "$host" || return 1
   step fixture-residency grep -nE 'residency|quantization|kv_cache_dtype' "$(fixture_file "$fix")"

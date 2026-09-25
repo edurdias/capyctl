@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Tier 5 (D9, P1): one deployment with two instances spread across both hosts,
 # served on the replica route `qwen3-14b`, covering M54, M56, M57, M58, M59, M60:
-#   run_row.sh M54 --tag rep -- v92-14
+#   run_row.sh M54 --tag rep -- va-14
 #
 #   M54  20 sequential requests: both instances serve; every answer correct; I1
 #        probes (several, balanced) all match the model's golden.
@@ -125,11 +125,11 @@ m59_block() { # m59_block <dep>: stall the host-b engine under load, count selec
   sleep 6
   l1=$(wc -l <"$LRD/server.log")
   echo "engine_stop $(now_ms) server.log $l1" >>"$EVID/marks.txt"
-  step m59-sigstop fault engine host-b "$dep" STOP || rc=1
+  step m59-sigstop fault engine "$HOST_B" "$dep" STOP || rc=1
   sleep "${M59_STALL_S:-20}"
   l2=$(wc -l <"$LRD/server.log")
   echo "engine_cont $(now_ms) server.log $l2" >>"$EVID/marks.txt"
-  step m59-sigcont fault engine host-b "$dep" CONT || rc=1
+  step m59-sigcont fault engine "$HOST_B" "$dep" CONT || rc=1
   wait "$BG_LOAD" || rc=1
   l3=$(wc -l <"$LRD/server.log")
   step m59-load-summary cat "$EVID/load-m59.summary.json"
@@ -143,15 +143,15 @@ m59_block() { # m59_block <dep>: stall the host-b engine under load, count selec
 }
 
 row_main() {
-  local fix=${1:-v92-14} dep rc=0 i
+  local fix=${1:-va-14} dep rc=0 i
   dep=$fix-rep
-  step before-92 host_idle host-a || return 1
-  step before-17 host_idle host-b || return 1
+  step before-a host_idle "$HOST_A" || return 1
+  step before-b host_idle "$HOST_B" || return 1
   step variant variant "$fix" rep --route "$REP_ROUTE" \
     --document-json '{"host": null, "instances": 2, "placement": {"strategy": "spread", "max_per_host": 1}}' || return 1
   dry || cp "$(FIXTURE_VARIANT=rep fixture_file "$fix")" "$EVID/fixture-rep.json"
   FIXTURE_VARIANT=rep step deploy deploy "$fix" --activate || return 1
-  step ready both_ready "$dep" 1200 || { rc=1; step errors-92 engine_errors host-a; step errors-17 engine_errors host-b; return 1; }
+  step ready both_ready "$dep" 1200 || { rc=1; step errors-a engine_errors "$HOST_A"; step errors-b engine_errors "$HOST_B"; return 1; }
   step status status_dep "$dep"
   step owned keep_owned "$dep" ready
   snap ready
@@ -179,12 +179,12 @@ row_main() {
   bg_load m58 --stream 16 --nonstream 112 --concurrency 16 --max-tokens 512
   sleep 6
   echo "agent_stop $(now_ms)" >>"$EVID/marks.txt"
-  step m58-sigstop fault agent host-b STOP || rc=1
+  step m58-sigstop fault agent "$HOST_B" STOP || rc=1
   sleep 20
   step m58-accounting keep_owned "$dep" agent-stopped
   step m58-selections-frozen sel_count m58-frozen
   echo "agent_cont $(now_ms)" >>"$EVID/marks.txt"
-  step m60-sigcont fault agent host-b CONT || rc=1
+  step m60-sigcont fault agent "$HOST_B" CONT || rc=1
   wait "$BG_LOAD" || rc=1
   sleep 10
   host_poll_stop
@@ -201,9 +201,9 @@ row_main() {
   step stop stop_dep "$dep" || rc=1
   step stopped wait_state "$dep" stopped 900 || rc=1
   sleep 3
-  step cleanup-ids cleanup_check_partial "$dep" host-a "$EVID/owned-$dep-ready.json" || rc=1
-  step clean-92 host_idle host-a || rc=1
-  step clean-17 host_idle host-b || rc=1
+  step cleanup-ids cleanup_check_partial "$dep" "$HOST_A" "$EVID/owned-$dep-ready.json" || rc=1
+  step clean-a host_idle "$HOST_A" || rc=1
+  step clean-b host_idle "$HOST_B" || rc=1
   step delete delete_dep "$dep" || rc=1
   return "$rc"
 }

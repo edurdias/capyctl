@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # M40 (T33; G06): kill (SIGKILL) and restart a host agent with a Ready engine:
-#   run_row.sh M40 --tag s92-4 -- s92-4
+#   run_row.sh M40 --tag sa-4 -- sa-4
 #
 # Expected: while the agent is down the route answers a retryable refusal quickly
 # (503), never a hang or a 500 with Ready; after `host-up` the journal reconciles,
@@ -10,7 +10,7 @@
 . "$MATRIX_DIR/rows/M36.sh"
 
 row_main() {
-  local fix=${1:-s92-4} dep host rc=0
+  local fix=${1:-sa-4} dep host rc=0
   dep=$fix; host=$(fixture_host "$fix")
   step before host_idle "$host" || return 1
   step deploy deploy "$fix" --activate --wait || return 1

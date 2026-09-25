@@ -75,12 +75,14 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
 
 ## Hard constraints
 
-- Live work is authorized on `host-a` and `host-b`. The local machine
-  `control-host` is the control-plane host. Owner authorized host-b on 2026-09-19.
+- Live work is authorized on the two lab hosts, host A and host B, with the
+  control-plane server on the control host. Their real names and addresses live
+  only in the untracked `scripts/live/matrix/hosts.local.env` (see
+  `hosts.example.env`). Owner authorized host B on 2026-09-19.
 - Do not change engine environments, drivers, or reboot hosts. The only owner
-  exceptions are the existing SGLang 0.5.20 venv on both Sparks and the mirrored
-  vLLM 0.29 venv on host-b; do not create or modify others.
-- Only one agent runs live work on the Sparks at a time.
+  exceptions are the existing SGLang 0.5.20 venv on both hosts and the mirrored
+  vLLM 0.29 venv on host B; do not create or modify others.
+- Only one live session runs on the hosts at a time.
 - Fault injection is limited to signals sent to mllm-owned processes (PIDs taken
   from ownership evidence) and one bounded external memory allocation. Never change
   firewalls or interfaces.

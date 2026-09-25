@@ -1,13 +1,13 @@
 # shellcheck shell=bash
 # M65 (T17; G10, G13): remove one replica of `qwen3-14b` under load by a
 # count-only revision (2 -> 1): the route keeps serving, no failed request.
-#   run_row.sh M65 -- v92-14
+#   run_row.sh M65 -- va-14
 . "$MATRIX_DIR/rows/M54.sh"
 row_main() {
-  local fix=${1:-v92-14} dep rc=0
+  local fix=${1:-va-14} dep rc=0
   dep=$fix-r65
-  step before-92 host_idle host-a || return 1
-  step before-17 host_idle host-b || return 1
+  step before-a host_idle "$HOST_A" || return 1
+  step before-b host_idle "$HOST_B" || return 1
   step variant variant "$fix" r65 --route "$REP_ROUTE" \
     --document-json '{"host": null, "instances": 2, "placement": {"strategy": "spread", "max_per_host": 1}}' || return 1
   FIXTURE_VARIANT=r65 step deploy deploy "$fix" --activate || return 1
@@ -32,8 +32,8 @@ PY
   step stop stop_dep "$dep" || rc=1
   step stopped wait_state "$dep" stopped 600 || rc=1
   sleep 3
-  step clean-92 host_idle host-a || rc=1
-  step clean-17 host_idle host-b || rc=1
+  step clean-a host_idle "$HOST_A" || rc=1
+  step clean-b host_idle "$HOST_B" || rc=1
   step delete delete_dep "$dep" || rc=1
   return "$rc"
 }

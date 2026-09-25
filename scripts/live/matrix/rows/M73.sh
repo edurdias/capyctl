@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M73 (T08, T10, T37): one engine lifecycle through the shipped CLI, per fixture:
-#   run_row.sh M73 --tag v92-4 -- v92-4
-#   run_row.sh M73 --tag s92-4 -- s92-4
+#   run_row.sh M73 --tag va-4 -- va-4
+#   run_row.sh M73 --tag sa-4 -- sa-4
 # Replaces the removed in-process suites (owner decision 2026-09-22):
 # live_vllm.rs L1-L5 and L11, and live_sglang.rs SGL1-SGL3.
 #
@@ -172,7 +172,7 @@ PY
 }
 
 row_main() {
-  local fix=${1:?fixture, e.g. v92-4} dep host engine rc=0
+  local fix=${1:?fixture, e.g. va-4} dep host engine rc=0
   dep=$fix-$M73_TAG
   host=$(fixture_host "$fix")
   engine=$(fixture_engine "$fix")

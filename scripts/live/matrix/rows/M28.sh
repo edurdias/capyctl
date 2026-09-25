@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # M28 (T16, T20, T22): deep park then wake on request, per fixture:
-#   run_row.sh M28 --tag s92-14 -- s92-14      (SGLang: memory-saver release, observed unmapped)
-#   run_row.sh M29 --tag v92-14 -- v92-14      (vLLM: rows/M29.sh reuses this with sleep level 2)
+#   run_row.sh M28 --tag sa-14 -- sa-14      (SGLang: memory-saver release, observed unmapped)
+#   run_row.sh M29 --tag va-14 -- va-14      (vLLM: rows/M29.sh reuses this with sleep level 2)
 #
 # Setup: server and the fixture's host online (normal budget); no other deployment
 # active on that host. Only after M08 passed live (owner decision P4).
@@ -74,4 +74,4 @@ park_wake_row() {
   return "$rc"
 }
 
-row_main() { park_wake_row "${1:?fixture, e.g. s92-14}"; }
+row_main() { park_wake_row "${1:?fixture, e.g. sa-14}"; }

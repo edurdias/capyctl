@@ -5,7 +5,7 @@
 
 rows/M48.sh writes the plan (deployments, fixture files, host policies) and runs
 this with the run's settings in the environment (RUN, LRD, SERVER_CFG, SERVER_DB,
-MLLM, EVID, RUNSTATE, RRD, REMOTE_TREE, HOST_ID_92, HOST_ID_17, MLLM_API_KEY).
+MLLM, EVID, RUNSTATE, RRD, REMOTE_TREE, HOST_ID_a, HOST_ID_b, MLLM_API_KEY).
 
 Each step picks one operation with a random generator derived from (seed, step),
 so a step's choice is reproducible given the observed state, and a walk that
@@ -18,7 +18,7 @@ process, and a short SIGSTOP/SIGCONT of a host agent.
 
 After every step the walk waits for the deployments to settle and then checks
 the invariants, each read-only (CLI status, SELECTs on the server database,
-/proc and nvidia-smi on each Spark):
+/proc and nvidia-smi on each host):
 
   I-LEDGER   per host, the charged bytes are within the host's managed_limit and
              the parked count within max_parked
@@ -68,7 +68,8 @@ EVID = ENV.get("EVID", "")
 RRD = ENV.get("RRD", "")
 REMOTE_TREE = ENV.get("REMOTE_TREE", "")
 RUNSTATE = ENV.get("RUNSTATE", "")
-HOSTS = ("host-a", "host-b")
+HOST_A, HOST_B = ENV["HOST_A"], ENV["HOST_B"]
+HOSTS = (HOST_A, HOST_B)
 ENGINE_RE = r"sglang[.]launch_server|sglang_entr[y]|vllm_entr[y]|vllm[ ]serve|Engine[C]ore|sglang::schedule[r]|sglang::detokenize[r]"
 STABLE = {"ready", "parked", "stopped", "failed"}
 # `queued`: a start that waits for room until its own deadline (an instance the
@@ -87,7 +88,7 @@ CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
 class SshLost(Exception):
-    """SSH to a Spark failed twice in a row: stop the walk cleanly."""
+    """SSH to a host failed twice in a row: stop the walk cleanly."""
 
 
 def now_ms():
@@ -102,11 +103,11 @@ def ulid_ms(ulid):
 
 
 def host_id(host):
-    return ENV["HOST_ID_92"] if host == "host-a" else ENV["HOST_ID_17"]
+    return ENV["HOST_ID_a"] if host == HOST_A else ENV["HOST_ID_b"]
 
 
 def host_name(hid):
-    return {ENV["HOST_ID_92"]: "host-a", ENV["HOST_ID_17"]: "host-b"}.get(hid, hid)
+    return {ENV["HOST_ID_a"]: HOST_A, ENV["HOST_ID_b"]: HOST_B}.get(hid, hid)
 
 
 # --- local tools ---------------------------------------------------------------
@@ -411,7 +412,7 @@ class Soak:
         name = self.pick(rng, cands)
         if not name:
             return "skipped", {"why": "every deployment has a ready instance"}
-        evict = "host-b" in self.deps[name]["hosts"] and rng.random() < 0.5
+        evict = HOST_B in self.deps[name]["hosts"] and rng.random() < 0.5
         args = ["start", "deployment", name, "--wait", "--output", "json"] + (["--evict"] if evict else [])
         rc, data, err = cli(*args)
         return ("ok" if rc == 0 else "refused"), {"target": name, "evict": evict, "rc": rc, "out": data, "err": err}
@@ -468,10 +469,10 @@ class Soak:
         must park or stop one of them (M27/M31). Incumbents are started first when
         needed; when every candidate target is operator-stopped the switch is the
         operator's `start --evict` instead."""
-        hid = host_id("host-b")
-        trio = sorted(n for n, d in self.deps.items() if d["hosts"] == ["host-b"] and sts.get(n))
+        hid = host_id(HOST_B)
+        trio = sorted(n for n, d in self.deps.items() if d["hosts"] == [HOST_B] and sts.get(n))
         if len(trio) < 3:
-            return "skipped", {"why": "fewer than three single-instance deployments on host-b"}
+            return "skipped", {"why": f"fewer than three single-instance deployments on {HOST_B}"}
 
         def op_stopped(n):
             s = sts[n] or {}
@@ -489,7 +490,7 @@ class Soak:
                 prepared.append({"start": n, "rc": rc, "err": err[-300:]})
         led = ledger()
         charged, _ = self.charged_on(led, hid)
-        limit = self.limits["host-b"]["managed_limit"]
+        limit = self.limits[HOST_B]["managed_limit"]
         target_st = self.status(target) or {}
         needs = not self.ready(target_st) and charged + self.deps[target]["request_bytes"] > limit
         before = {n: self.inst_states(self.status(n)) for n in self.deps}
@@ -543,7 +544,7 @@ class Soak:
                 self.expect_dead += dead
             return ("ok" if rc == 0 and done else "refused" if rc else "failed"), {
                 "target": target, "action": "stop", "rc": rc, "out": data, "err": err}
-        evict = host_name(hid) == "host-b" and rng.random() < 0.5
+        evict = host_name(hid) == HOST_B and rng.random() < 0.5
         rc, data, err = cli("start", "instance", target, "--wait", "--output", "json", *(["--evict"] if evict else []))
         return ("ok" if rc == 0 else "refused"), {"target": target, "action": "start", "evict": evict, "from": state,
                                                   "rc": rc, "out": data, "err": err}

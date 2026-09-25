@@ -2,7 +2,7 @@
 """Generate an approved host document from templates/host.json (plan unit W2).
 
 Inputs are measured on the host, never typed by hand: the device observation
-(`python3 -m runtime.sglang_device` on the Spark, which prints host_id, digest
+(`python3 -m runtime.sglang_device` on the host, which prints host_id, digest
 and the physical GPU UUID) and each engine's reported version. The budget comes
 from budgets/<policy>.yaml (D10). Profiles carry only host-fixed fields; engine
 tuning lives in each deployment's engine_config (ADR 0014 section 1).
@@ -53,9 +53,9 @@ def main():
     parser.add_argument("--sglang-version", required=True)
     parser.add_argument("--vllm-version", required=True)
     parser.add_argument("--vllm-venv", required=True)
-    parser.add_argument("--sglang-venv", default="$HOME/mllm-sglang-0.5.20-venv")
-    parser.add_argument("--remote-tree", default="$HOME/mllm-f2")
-    parser.add_argument("--models-root", default="$HOME/models")
+    parser.add_argument("--sglang-venv", required=True)
+    parser.add_argument("--remote-tree", required=True)
+    parser.add_argument("--models-root", required=True)
     parser.add_argument("--ingress-port", type=int, default=9443)
     # Release validation: leave runtime_dir out, so the host uses the managed
     # runtime its binary writes to <state_dir>/runtime (docs/operations/install.md).

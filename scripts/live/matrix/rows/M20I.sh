@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Instances (ADR 0013, Q7; P1), with co-residence fixtures:
-#   run_row.sh M20I --tag same -- same v92-4     two instances of one deployment on one host
-#   run_row.sh M20I --tag spread -- spread v92-4 two instances spread across both hosts,
+#   run_row.sh M20I --tag same -- same va-4     two instances of one deployment on one host
+#   run_row.sh M20I --tag spread -- spread va-4 two instances spread across both hosts,
 #                                                 then a count change 2 -> 1 -> 2
 #
 # Expected (same): both instances Ready on the fixture's host with distinct ports and
@@ -95,8 +95,8 @@ row_same() {
 row_spread() {
   local fix=$1 dep rc=0
   dep=$fix-sp2
-  step before-92 host_idle host-a || return 1
-  step before-17 host_idle host-b || return 1
+  step before-a host_idle "$HOST_A" || return 1
+  step before-b host_idle "$HOST_B" || return 1
   step variant variant "$fix" sp2 --document-json '{"host": null, "instances": 2, "placement": {"strategy": "spread", "max_per_host": 1}}' || return 1
   FIXTURE_VARIANT=sp2 step deploy deploy "$fix" --activate || return 1
   step ready ready_count "$dep" 2 1200 || rc=1
@@ -131,17 +131,17 @@ PY
   step stop stop_dep "$dep" || rc=1
   step stopped wait_state "$dep" stopped 900 || rc=1
   sleep 3
-  step cleanup cleanup_check_partial "$dep" host-a "$EVID/owned-$dep-count2.json" || rc=1
-  step clean-92 host_idle host-a || rc=1
-  step clean-17 host_idle host-b || rc=1
+  step cleanup cleanup_check_partial "$dep" "$HOST_A" "$EVID/owned-$dep-count2.json" || rc=1
+  step clean-a host_idle "$HOST_A" || rc=1
+  step clean-b host_idle "$HOST_B" || rc=1
   step delete delete_dep "$dep" || rc=1
   return "$rc"
 }
 
 row_main() {
   case ${1:-same} in
-    same) row_same "${2:-v92-4}" ;;
-    spread) row_spread "${2:-v92-4}" ;;
+    same) row_same "${2:-va-4}" ;;
+    spread) row_spread "${2:-va-4}" ;;
     *) echo "usage: same|spread <fixture>"; return 2 ;;
   esac
 }

@@ -10,7 +10,7 @@
 #   roles.sh enroll <host>             invite on control-host, copy the invitation, `join host`
 #   roles.sh host-up <host> [--debug-engine-logs] | host-down <host> [SIG]
 #   roles.sh wait-online [timeout]     poll list hosts until both are online and reconciled
-#   roles.sh fixtures [gen_deployment args]   all <v|s><92|17>-<model> fixtures for this run
+#   roles.sh fixtures [gen_deployment args]   all <v|s><a|b>-<model> fixtures for this run
 #
 # Hosts: host-a, host-b. DRY_RUN=1 prints the plan only.
 . "$(dirname "$0")/lib.sh"

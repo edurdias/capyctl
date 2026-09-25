@@ -5,8 +5,8 @@
 # non-streaming and streaming. Tool calls need the engine's own parser; without
 # one vLLM rejects `auto` (relayed `engine_rejected`, rows/REJ.sh) and SGLang
 # answers the call as plain text.
-#   run_row.sh TC --tag v17-4 -- v17-4 '["--enable-auto-tool-choice","--tool-call-parser","hermes"]'
-#   run_row.sh TC --tag s92-4 -- s92-4 '["--tool-call-parser","qwen25"]'
+#   run_row.sh TC --tag vb-4 -- vb-4 '["--enable-auto-tool-choice","--tool-call-parser","hermes"]'
+#   run_row.sh TC --tag sa-4 -- sa-4 '["--tool-call-parser","qwen25"]'
 row_main() {
   local fix=$1 extra=$2 host rc=0 dep choice
   host=$(fixture_host "$fix"); dep=$fix-tc

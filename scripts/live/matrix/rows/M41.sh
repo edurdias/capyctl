@@ -2,9 +2,9 @@
 # M41 (T09, T34; G06, U5-G1): SIGKILL the host agent after the engine is
 # spawned and before its Initialize result: one engine; uncertainty settles on
 # evidence (adopted after a fresh probe, or settled) and stop works.
-#   run_row.sh M41 -- s17-4
+#   run_row.sh M41 -- sb-4
 row_main() {
-  local a=${1:-s17-4} ha rc=0 i
+  local a=${1:-sb-4} ha rc=0 i
   ha=$(fixture_host "$a")
   step before host_idle "$ha" || return 1
   step deploy deploy "$a" --activate || return 1

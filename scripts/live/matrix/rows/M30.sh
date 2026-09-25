@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # M30 (T17): park during a long stream waits for the request lease:
-#   run_row.sh M30 --tag s92-14 -- s92-14
+#   run_row.sh M30 --tag sa-14 -- sa-14
 # M30_MAX_TOKENS (default 3000): the router's fixed 300 s stream cap is gone
 # (streams end only on the request deadline before the first event or on the
 # stream idle timeout), so the vLLM rerun streams 3000 tokens.

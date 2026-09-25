@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 # M68 (T33, T38; G07, G15): engines Ready on both hosts; SIGTERM the server:
 # it drains and exits 0 with engines retained; restart re-attaches (as M42).
-#   run_row.sh M68 -- v92-4 s17-4
+#   run_row.sh M68 -- va-4 sb-4
 . "$MATRIX_DIR/rows/M36.sh"
 row_main() {
-  local a=${1:-v92-4} b=${2:-s17-4} ha hb rc=0
+  local a=${1:-va-4} b=${2:-sb-4} ha hb rc=0
   ha=$(fixture_host "$a"); hb=$(fixture_host "$b")
   step before-a host_idle "$ha" || return 1
   step before-b host_idle "$hb" || return 1

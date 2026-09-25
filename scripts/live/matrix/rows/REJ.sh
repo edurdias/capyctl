@@ -4,9 +4,9 @@
 # `engine_rejected` with the engine's status and message, and its lease closes.
 # More rejections than the deployment's outstanding bound (32) leave the route
 # serving and no request lease held.
-#   run_row.sh REJ --tag v17-4 -- v17-4
+#   run_row.sh REJ --tag vb-4 -- vb-4
 row_main() {
-  local fix=${1:-v17-4} host rc=0
+  local fix=${1:-vb-4} host rc=0
   host=$(fixture_host "$fix")
   step before host_idle "$host" || return 1
   step deploy deploy "$fix" --activate --wait || return 1

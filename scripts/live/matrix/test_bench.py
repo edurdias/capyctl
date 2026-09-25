@@ -142,7 +142,7 @@ class BenchTests(unittest.TestCase):
             bench.write_json(os.path.join(evid, "latency", "L128-C1.before.json"), view(0.01, 0.01, 0.01, 1))
             bench.write_json(os.path.join(evid, "latency", "L128-C1.after.json"), view(0.01, 0.01, 0.005, 3))
             out = subprocess.run([sys.executable, os.path.join(HERE, "bench.py"), "report", "--evid", evid,
-                                  "--fixture", "v92-4"], capture_output=True, text=True, check=True).stdout
+                                  "--fixture", "va-4"], capture_output=True, text=True, check=True).stdout
             self.assertIn("Path overhead from the mllm latency view", out)
             report = bench.read_json(os.path.join(evid, "bench.json"))
             side = report["cells"][0]["mllm_side"]

@@ -1,14 +1,14 @@
 # shellcheck shell=bash
 # Solo first start (owner decision 2026-09-23, store schema v28) and `start
 # --evict`, on one host under the normal budget:
-#   run_row.sh SOLO --tag s17-30 -- s17-30 v17-4
+#   run_row.sh SOLO --tag sb-30 -- sb-30 vb-4
 #
 # Expected:
-#   a  the small fixture (v17-4) is Ready on the host.
+#   a  the small fixture (vb-4) is Ready on the host.
 #   b  a new, unmeasured q30 deployment (its placeholder startup estimate is above
 #      the managed limit) is refused a plain start with `startup_requires_empty_host`
-#      while v17-4 holds a charge; nothing is spawned for it.
-#   c  `start deployment <q30> --evict` reports v17-4 as its victim, v17-4 is
+#      while vb-4 holds a charge; nothing is spawned for it.
+#   c  `start deployment <q30> --evict` reports vb-4 as its victim, vb-4 is
 #      released with verified cleanup, q30 starts alone reserving the whole managed
 #      limit (status startup provenance `whole_host`), reaches Ready and answers.
 #   d  after Ready its startup peak is recorded (status startup.measured); stop,
@@ -20,7 +20,7 @@ d=json.load(sys.stdin); d=d.get("deployment",d)
 print(json.dumps({"deployment": d.get("startup"), "instances": [i.get("startup") for i in d.get("instances", [])], "state": d.get("observed_state")}))'; }
 
 row_main() {
-  local big=${1:-s17-30} small=${2:-v17-4} host dep rc=0
+  local big=${1:-sb-30} small=${2:-vb-4} host dep rc=0
   host=$(fixture_host "$big")
   dep=$big-solo
   step before host_idle "$host" || return 1

@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # M43 (T38): SIGKILL the server during a stream: the client sees an honest
 # failure; after restart nothing is replayed and the same engine serves again.
-#   run_row.sh M43 -- v92-4
+#   run_row.sh M43 -- va-4
 row_main() {
-  local a=${1:-v92-4} ha rc=0 spid
+  local a=${1:-va-4} ha rc=0 spid
   ha=$(fixture_host "$a")
   step before host_idle "$ha" || return 1
   step deploy deploy "$a" --activate --wait || return 1

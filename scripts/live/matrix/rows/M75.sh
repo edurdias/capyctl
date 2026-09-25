@@ -1,10 +1,10 @@
 # shellcheck shell=bash
-# M75 (T02): a host that declares no engine does not boot, on each Spark:
+# M75 (T02): a host that declares no engine does not boot, on each host:
 #   run_row.sh M75 --no-e0
 # Replaces the removed in-process scenario live_vllm.rs L10 (owner decision
 # 2026-09-22). The other half of L10, that the shipped release binary carries
 # no test engine, is scripts/check-release-clean.sh, which `sync.sh build` runs
-# against the control-host build and on each Spark after every build.
+# against the control-host build and on each host after every build.
 #
 # The snapshot-built release binary starts standalone in a fresh private state
 # directory under the run root, with every engine variable removed from its

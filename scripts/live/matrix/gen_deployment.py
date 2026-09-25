@@ -2,7 +2,7 @@
 """Deployment fixtures for the matrix, one per model x engine x host (plan unit W2).
 
 Names follow matrix section 3: <engine><host>-<model>, engine v (vLLM) or s
-(SGLang), host 92 (host-a) or 17 (host-b), model 4, 14, 27, 27f (the
+(SGLang), host a (HOST_A) or b (HOST_B), model 4, 14, 27, 27f (the
 NVFP4 anchor with an FP8 KV cache) or 30. A fixture's route is its name unless
 --route gives a shared replica route.
 
@@ -48,10 +48,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from gen_budgets import load_models  # noqa: E402
 
-NAME = re.compile(r"^(?P<engine>[vs])(?P<host>92|17)-(?P<model>4|14|27f|27|30)$")
-HOSTS = {"92": "host-a", "17": "host-b"}
+NAME = re.compile(r"^(?P<engine>[vs])(?P<host>a|b)-(?P<model>4|14|27f|27|30)$")
+# Host names and the models root come from the harness environment (lib.sh,
+# from hosts.local.env), so no lab-specific name or path lives here.
+def _env(name):
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"{name} is not set: run through the matrix scripts, which source hosts.local.env")
+    return value
+
+
+HOSTS = {"a": _env("HOST_A"), "b": _env("HOST_B")}
 ENGINES = {"v": "vllm", "s": "sglang"}
-MODELS_ROOT = "$HOME/models"
+MODELS_ROOT = _env("MODELS_ROOT")
 ULID = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 
 
@@ -71,7 +80,7 @@ def host_ids(path):
 def fixture(name, args, models, ids, checkpoints):
     match = NAME.match(name)
     if not match:
-        sys.exit(f"{name!r} is not <v|s><92|17>-<4|14|27|27f|30>")
+        sys.exit(f"{name!r} is not <v|s><a|b>-<4|14|27|27f|30>")
     engine = ENGINES[match["engine"]]
     host = HOSTS[match["host"]]
     key = match["model"]
@@ -179,7 +188,7 @@ def main():
         parser.error("--variant must be lowercase letters and digits")
     names = list(args.names)
     if args.all:
-        names += [f"{e}{h}-{m}" for e in "vs" for h in ("92", "17") for m in ("4", "14", "27", "27f", "30")]
+        names += [f"{e}{h}-{m}" for e in "vs" for h in ("a", "b") for m in ("4", "14", "27", "27f", "30")]
     if not names:
         parser.error("name fixtures or pass --all")
     models = load_models(args.measured)

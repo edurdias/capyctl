@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # M80 (T40; SPEC section 17): performance benchmark through the shipped router, per fixture:
-#   run_row.sh M80 --tag s92-14 -- s92-14                 (cold, bench, park phases)
-#   run_row.sh M80 --tag s92-14 -- s92-14 s92-30          (adds switch s92-30 -> s92-14; needs a
+#   run_row.sh M80 --tag sa-14 -- sa-14                 (cold, bench, park phases)
+#   run_row.sh M80 --tag sa-14 -- sa-14 sa-30          (adds switch sa-30 -> sa-14; needs a
 #                                                          host policy under which the two do not co-fit)
-#   M80_PHASES="bench" M80_REPEATS=5 run_row.sh M80 --tag v17-4 -- v17-4
+#   M80_PHASES="bench" M80_REPEATS=5 run_row.sh M80 --tag vb-4 -- vb-4
 #
 # Setup: server and the fixture's host online; no other deployment active on that
 # host (the phases scan the whole host). Run after the current live phase (owner,
@@ -186,7 +186,7 @@ m80_switch() {
   da=$afix-sa; db=$fix-sw
   step variant-sa variant "$afix" sa --document-json "$M80_WAKE_DOC" || return 1
   step variant-sw variant "$fix" sw --document-json "$M80_WAKE_DOC" || return 1
-  echo "policy host-a=${POLICY_92:-unknown} host-b=${POLICY_17:-unknown}" | tee -a "$EVID/timeline.txt"
+  echo "policy $HOST_A=${POLICY_a:-unknown} $HOST_B=${POLICY_b:-unknown}" | tee -a "$EVID/timeline.txt"
   step idle-switch host_idle "$host" || return 1
   FIXTURE_VARIANT=sa step deploy-sa deploy "$afix" --activate --wait || return 1
   step owned-sa keep_owned "$da" ready
@@ -216,7 +216,7 @@ m80_switch() {
 }
 
 row_main() {
-  local fix=${1:?fixture, e.g. s92-14} afix=${2:-} host dep residency rc=0
+  local fix=${1:?fixture, e.g. sa-14} afix=${2:-} host dep residency rc=0
   host=$(fixture_host "$fix")
   dep=$fix-bn
   mkdir -p "$EVID/cells" "$EVID/metrics" "$EVID/latency"

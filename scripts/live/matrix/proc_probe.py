@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What one owned engine process was actually given (rows M73; SPEC section 13.2).
 
-Runs on the Spark. The identity is (pid, start ticks, boot id) from the server's
+Runs on the host. The identity is (pid, start ticks, boot id) from the server's
 recorded launch identities (ledger.py owned), checked exactly as signal_owned.py
 checks it, so a reused pid is never read. It prints one JSON line:
 
@@ -34,7 +34,7 @@ SECRET = re.compile(r"(key|token|secret|password|credential)", re.IGNORECASE)
 def redact(argv):
     # A credential passed by descriptor (`--inference-credential-fd 20`) carries
     # only a descriptor number on argv, which is the SPEC section 3 shape, not a
-    # credential; it is kept visible and not counted (found live, M73 s17-4).
+    # credential; it is kept visible and not counted (found live, M73 sb-4).
     out, hidden, i = [], False, 0
     while i < len(argv):
         arg = argv[i]
