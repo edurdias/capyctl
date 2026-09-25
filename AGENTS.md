@@ -8,8 +8,7 @@ Current phase: 0.1.0 release candidates on `main` (two-host, single-rank vLLM an
 SGLang; TP2 is parked). Releases are published as GitHub pre-releases in this
 private repository.
 
-This file is the working agreement for every coding agent. `AGENTS.md` imports it;
-edit this file, not a copy.
+This file is the working agreement for every contributor, human or coding agent.
 
 ## Authoritative documents
 
@@ -47,8 +46,8 @@ became harder to audit than the code they described.
   move the report to the slice's `archive/` directory.
 - **Prose is normal English**, in documents and commit messages, regardless of
   chat style settings.
-- Everything under `.superpowers/sdd/` is gitignored (`*`), so anything written
-  there is unrecoverable once removed. Archive rather than delete.
+- Local working notes (per-unit reports, review ledgers) are gitignored, so
+  anything written there is unrecoverable once removed. Archive rather than delete.
 
 ## Verification
 

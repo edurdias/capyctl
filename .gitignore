@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 /dist
+
+# Local tool files, never tracked
+.superpowers/
