@@ -129,6 +129,42 @@ pub struct DeploymentSnapshot {
     /// Additive; absent when the deployment has no operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_operation: Option<LatestOperation>,
+    /// ADR 0014 §5 (owner decision 2026-09-25): the current revision's
+    /// effective context, its source (`declared`, `host_fixed`, `fitted`,
+    /// `fallback`, or `on_host` when a remote host fits it at launch) and why.
+    /// Additive; absent when the revision does not decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<mllm_config::context_fit::ContextFit>,
+}
+
+/// ADR 0014 §5 (owner decision 2026-09-25): the effective context of the
+/// current revision. An embedded (standalone) checkpoint is read here, where
+/// the launch reads it; a revision placed on enrolled remote hosts is fitted by
+/// the host, so a host's path is never read on this machine.
+fn context_status(
+    conn: &rusqlite::Connection,
+    deployment_id: &str,
+) -> rusqlite::Result<Option<mllm_config::context_fit::ContextFit>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT e.effective_json,EXISTS(SELECT 1 FROM host_effective_revisions h JOIN enrolled_hosts x ON x.host_id=h.host_id WHERE h.deployment_id=d.id AND h.revision=d.revision)
+               FROM deployments d JOIN effective_revisions e ON e.deployment_id=d.id AND e.revision=d.revision WHERE d.id=?1",
+            [deployment_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((raw, remote)) = row else {
+        return Ok(None);
+    };
+    let Ok(effective) = mllm_config::effective::decode_effective_snapshot(&raw) else {
+        return Ok(None);
+    };
+    Ok(Some(if remote {
+        mllm_config::context_fit::fit_on_remote_host(&effective)
+    } else {
+        mllm_config::context_fit::fit_for_effective(&effective)
+    }))
 }
 
 /// SPEC §6.4: an operation and its error as status shows them. The reason is
@@ -528,6 +564,7 @@ impl Store {
                 switch: None,
                 warm: false,
                 latest_operation: None,
+                context: None,
             })
         })?;
         let mut deployments = deployments;
@@ -551,6 +588,7 @@ impl Store {
         for entry in &mut deployments {
             entry.timeouts = crate::lifecycle_windows::read(&tx, &entry.id)?;
             entry.startup = crate::ordinary_lifecycle::startup::status(&tx, &entry.id)?;
+            entry.context = context_status(&tx, &entry.id)?;
             entry.switch = crate::switch_state::status(&tx, &entry.id)?;
             entry.warm = crate::switch_state::is_warm(&tx, &entry.id)?;
             entry.latest_operation = latest_operation(

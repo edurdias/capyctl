@@ -81,6 +81,10 @@ pub enum AdapterSpec {
         /// ADR 0014 §8, SPEC §8.2: the host's approvals for sensitive extra
         /// arguments; `None` approves nothing.
         extra_approvals: Option<String>,
+        /// SPEC §8.2 / T21: the per-launch rendezvous directory inside the
+        /// host's private root, removed on gone evidence. `None`: the entry
+        /// makes its own temporary one.
+        rendezvous: Option<std::path::PathBuf>,
     },
 }
 
@@ -148,6 +152,7 @@ pub fn resolve(
             log,
             session,
             extra_approvals,
+            rendezvous,
         } => {
             let mut adapter = SglangAdapter::from_frozen(&frozen, observer)
                 .map_err(|error| match error {
@@ -173,6 +178,9 @@ pub fn resolve(
             }
             if let Some(approvals) = extra_approvals {
                 adapter = adapter.with_extra_approvals(approvals);
+            }
+            if let Some(dir) = rendezvous {
+                adapter = adapter.with_rendezvous_dir(dir);
             }
             if let Some(tools) = tools {
                 adapter = adapter.with_tools(tools);

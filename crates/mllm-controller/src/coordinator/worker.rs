@@ -1125,6 +1125,11 @@ pub trait EngineBindings: Send + Sync {
         None
     }
 
+    /// SPEC §8.2 / T21: called once the launch `incarnation`'s recorded
+    /// processes are proved gone, so per-launch host state (its rendezvous
+    /// directory) can be removed on verified evidence only.
+    fn launch_gone(&self, _incarnation: &str) {}
+
     /// ADR 0008 (owner decision 2026-09-23): the engine installation the
     /// embedded host registered for `work`'s profile, measured again before
     /// each Initialize for drift. Bindings that keep no registration have none.
@@ -1198,17 +1203,23 @@ fn terminate_then_prove_gone(
     tools: Arc<dyn OwnedProcessLaunch>,
     clock: ServiceClock,
     grace: Duration,
+    bindings: Arc<dyn EngineBindings>,
 ) -> Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync> {
     Arc::new(move |context| {
         let tools = tools.clone();
         let clock = clock.clone();
+        let bindings = bindings.clone();
         Box::pin(async move {
             let identities = context.identities.clone();
             tokio::task::spawn_blocking(move || tools.terminate_owned(&identities, grace))
                 .await
                 .map_err(|_| CoordinatorError::Service("terminate task failed".into()))?
                 .map_err(|error| CoordinatorError::Service(error.to_string()))?;
-            observed_gone(&context, &clock)
+            let evidence = observed_gone(&context, &clock)?;
+            // SPEC §8.2 / T21: only after every recorded process is proved
+            // gone is the launch's per-launch host state removed.
+            bindings.launch_gone(&context.incarnation);
+            Ok(evidence)
         })
     })
 }
@@ -1429,7 +1440,12 @@ impl OwnedCoordinator {
                 };
                 Ok(Arc::new(Driver {
                     engine,
-                    cleanup: terminate_then_prove_gone(tools.clone(), cleanup_clock.clone(), grace),
+                    cleanup: terminate_then_prove_gone(
+                        tools.clone(),
+                        cleanup_clock.clone(),
+                        grace,
+                        bindings.clone(),
+                    ),
                     tools: Some(tools),
                     settle: None,
                 }))

@@ -116,7 +116,11 @@ pub fn plan_from_effective(
         quantization: common.quantization.clone(),
         kv_cache_dtype: common.kv_cache_dtype.clone(),
         block_size_tokens: settings.block_size_tokens,
-        context_length: common.context_length,
+        // ADR 0014 §5 (owner decision 2026-09-25): an undeclared context is
+        // fitted to the KV cache grant from the checkpoint's configuration,
+        // read here where the checkpoint is; a host-fixed `--max-model-len`
+        // wins and nothing is passed.
+        context_length: mllm_config::context_fit::fit_for_effective(effective).tokens,
         max_concurrent_requests: common.max_concurrent_requests,
         max_num_batched_tokens: settings.max_num_batched_tokens,
         enforce_eager: common.cuda_graphs == Some(false),

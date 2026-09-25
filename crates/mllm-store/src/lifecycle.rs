@@ -1043,6 +1043,20 @@ impl crate::Store {
         )
     }
 
+    /// SPEC §8.2 / T21 (owner decision 2026-09-25): the incarnation of every
+    /// retained (not released) binding. A launch whose binding is released
+    /// was proved gone; any other may still run, so its per-launch host state
+    /// (its rendezvous directory) is kept.
+    pub fn retained_incarnations(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, LifecycleError> {
+        Ok(self
+            .conn
+            .prepare("SELECT incarnation FROM runtime_bindings WHERE state!='released'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// One retained (not released) binding, by its id.
     pub fn retained_binding(
         &self,

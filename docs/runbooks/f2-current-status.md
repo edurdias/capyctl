@@ -4,6 +4,39 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Context fitted to the KV grant; standalone rendezvous root — 2026-09-25 (branch `fix/context-fit-standalone-rdzv`)
+
+Two owner decisions of 2026-09-25. CPU tests only; live proof on real engines
+is pending (no live run was made: the hosts were busy with a benchmark).
+
+- **Context fitted to the KV grant** (ADR 0014 §5). With no
+  `engine_config.context_length`, the shared launch builders compute the
+  largest context the KV cache grant holds from the checkpoint's `config.json`
+  (layers, KV heads, head dim; KV element width from `kv_cache_dtype`, then
+  `dtype`, then the checkpoint's, fp8 at one byte), cap it at
+  `max_position_embeddings`, round it down to a 16-token block (or
+  `vllm.block_size_tokens`) and pass it as vLLM `--max-model-len` or SGLang
+  `--context-length`, for every profile on both engines. Sliding-window and
+  hybrid layers count as full attention; MLA, missing fields, an unknown KV
+  dtype or a missing `config.json` fall back to 4096 with the reason. An
+  explicit value wins (with a warning when the grant provably cannot hold
+  it); a host-fixed `--max-model-len` in `MLLM_ENGINE_ARGS` is kept. The
+  standalone `--max-model-len 4096` environment default is removed. The fit
+  runs where the checkpoint is (embedded host or host agent) and is not part
+  of the effective configuration. `validate config` shows `effective.context`;
+  `status` shows each deployment's `context` (`declared`, `host_fixed`,
+  `fitted`, `fallback`, or `on_host` for a remote host's revision).
+- **Standalone rendezvous root** (SPEC §8.2 / T21). Standalone creates
+  `<state>/rendezvous` (0700, refused if not owned/0700, as a host) at start,
+  names each SGLang launch's rendezvous directory in it, removes it once the
+  launch's processes are proved gone, and at start sweeps directories no
+  retained binding owns (never through a symlink, never outside the root).
+  The directory name matches the host's (`rendezvous`), not `rdzv`.
+
+Live checks still owed: a vLLM and an SGLang standalone deployment with no
+`context_length` start and report the fitted value; an SGLang stop leaves no
+directory in `<state>/rendezvous` and none in `/tmp`.
+
 ## Table output for record views — 2026-09-25 (branch `feat/cli-table-output`)
 
 Owner decision 2026-09-25 (recorded in SPEC §14): like the docker CLI, commands

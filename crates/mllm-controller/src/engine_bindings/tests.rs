@@ -442,3 +442,40 @@ fn a_memory_saver_sglang_spec_carries_the_saver_observer() {
     };
     assert!(observer.is_none(), "a restart_only launch never parks");
 }
+
+/// SPEC §8.2 / T21 (owner decision 2026-09-25): a standalone SGLang launch
+/// keeps its file rendezvous in `<root>/<incarnation>` inside the private
+/// root, as on a host, and the entry's `/tmp` fallback is never selected; the
+/// directory goes once the launch is proved gone.
+// T21 T37
+#[test]
+fn a_standalone_sglang_launch_keeps_its_rendezvous_in_the_private_root() {
+    use std::os::unix::fs::DirBuilderExt;
+    let work = sglang_work();
+    // Without a root the entry falls back to its own directory.
+    let AdapterSpec::Sglang { rendezvous, .. } = bindings().spec(&work).unwrap() else {
+        panic!("the fixture profile declares sglang");
+    };
+    assert_eq!(rendezvous, None);
+
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path().join("rendezvous");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let bindings = bindings().with_rendezvous_root(root.clone());
+    let AdapterSpec::Sglang { rendezvous, .. } = bindings.spec(&work).unwrap() else {
+        panic!("the fixture profile declares sglang");
+    };
+    let dir = rendezvous.expect("a private root names the launch's directory");
+    assert_eq!(dir, root.join(work.incarnation()));
+    assert!(!dir.starts_with(std::env::temp_dir().join("mllm-rdzv")));
+
+    // The entry creates it and leaves its store; stop evidence removes both.
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    std::fs::write(dir.join("store"), b"rendezvous").unwrap();
+    bindings.launch_gone(work.incarnation());
+    assert!(!dir.exists());
+    assert!(root.is_dir(), "the root itself stays");
+}
