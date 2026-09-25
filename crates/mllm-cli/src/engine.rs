@@ -388,6 +388,24 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             .into_iter()
             .map(|(n, p)| (n, p, "role document")),
     );
+    // ADR 0018 §5: a standalone role's environment profiles (`local`,
+    // `local-vllm`, `local-sglang`) live in neither file; the role publishes
+    // them, so they are listed from what it accepted.
+    if let Some(accepted) = role.as_ref().and_then(|r| r["accepted"].as_object()) {
+        let known: std::collections::BTreeSet<String> =
+            all.iter().map(|(n, _, _)| n.clone()).collect();
+        for (name, entry) in accepted {
+            if known.contains(name) {
+                continue;
+            }
+            let profile = json!({
+                "engine": entry["engine"], "executable": entry["executable"],
+                "build_fingerprint": entry["build_fingerprint"],
+                "security": {"deep_park": entry["deep_park"]},
+            });
+            all.push((name.clone(), profile, "environment"));
+        }
+    }
     let rows: Vec<Value> = all
         .into_iter()
         .map(|(name, profile, source)| {

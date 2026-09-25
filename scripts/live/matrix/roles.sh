@@ -39,7 +39,10 @@ server_init() {
   fi
   load_run
   x install -d -m 700 "$LRD"
-  x install -m 755 "$LIVE/build/release/mllm" "$MLLM"
+  # A named binary (MLLM_LOCAL_BIN: an installed release, or ENG4's rc.3 server)
+  # is run as it is; only the run's own copy is replaced by the snapshot build
+  # (found live 2026-09-25: ENG4's rc.3 server binary was overwritten).
+  if [ -z "${MLLM_LOCAL_BIN:-}" ]; then x install -m 755 "$LIVE/build/release/mllm" "$MLLM"; fi
   x env "MLLM_STATE_DIR=$LRD/server" "$MLLM" init server --output "$SERVER_CFG"
   # Bootstrap and control listen on control-host's Tailscale address; management and
   # inference stay on loopback (ServerConfig::parse refuses anything else).

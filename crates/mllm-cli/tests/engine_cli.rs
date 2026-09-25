@@ -515,6 +515,47 @@ async fn list_merges_the_files_and_the_role() {
     assert_eq!(listed["engines"][0]["published"], "not published");
 }
 
+// T16 (ADR 0018 §5): a standalone role's environment profiles (`local`,
+// `local-vllm`, `local-sglang`) are in neither engines.yaml nor the role
+// document, but the role publishes them, so `engine list` shows them as
+// published (found live 2026-09-25: the list came back empty).
+#[tokio::test]
+async fn list_shows_the_roles_environment_profiles() {
+    let dir = private_dir();
+    let document = host_doc(dir.path());
+    let accepted = |engine: &str, exe: &str, version: &str| {
+        json!({"engine": engine, "executable": exe, "build_fingerprint": version,
+        "installation": {"version": version, "digest": "sha256:00", "state": "recorded"},
+        "deep_park": "enabled", "deep_park_probe": "unknown"})
+    };
+    let (_r, _stop) = role(
+        &document,
+        json!({"ok": true, "connected": true, "live_profile_update": true,
+        "accepted": {"local-vllm": accepted("vllm", "/v/bin/vllm", "0.29.0"),
+                     "local-sglang": accepted("sglang", "/s/bin/python3", "0.5.20")},
+        "users": {"local-vllm": ["m"]}}),
+    )
+    .await;
+    let listed = execute(&Command::EngineList, Some(&document), dir.path())
+        .await
+        .unwrap();
+    let rows = listed["engines"].as_array().unwrap();
+    let row = |name: &str| rows.iter().find(|r| r["profile"] == name).cloned();
+    let v = row("local-vllm").unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(v["source"], "environment");
+    assert_eq!(v["published"], "published");
+    assert_eq!(v["engine"], "vllm");
+    assert_eq!(v["version"], "0.29.0");
+    assert_eq!(v["custom"], false);
+    assert_eq!(v["executable"], "/v/bin/vllm");
+    assert_eq!(v["deep_park"], "enabled");
+    assert_eq!(v["deployments"], json!(["m"]));
+    let s = row("local-sglang").unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(s["source"], "environment");
+    assert_eq!(s["engine"], "sglang");
+    assert_eq!(s["published"], "published");
+}
+
 // T01: `list engines` is a server command.
 #[test]
 fn list_engines_goes_to_the_server() {

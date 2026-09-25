@@ -13,10 +13,8 @@ removal, standalone `local-vllm`/`local-sglang`. Commits: `deed9ae..HEAD`.
 Evidence: CPU and Fake-engine tests only (`crates/*/tests/{registration,engines,
 control_socket,live_profiles,engine_cli,standalone_engines}.rs`, plus a
 hard-link hardening regression pair added in `registration.rs` this pass).
-These are not qualification. Live rows ENG1–ENG4
-(`scripts/live/matrix/rows/ENG*.sh`) are written and dry-run only, not yet
-run: Tailscale SSH to host-a/host-b needs owner re-auth before any
-host is reachable.
+These are not qualification. Live rows ENG1–ENG4 ran on 2026-09-25; see
+"Live rows ENG1–ENG4" below.
 
 Owner decisions of 2026-09-25 are recorded in the plan and ADR 0018; the answer
 on the exit code for `profile_not_published` (plan item 20): fail-fast, HTTP
@@ -99,14 +97,90 @@ Controller rulings from the plan's decision ledger
   reports the outcome as unknown, not "nothing was removed", and tells the
   operator to run `mllm engine list`; the client's wait bound carries a
   margin over the role's 960 s plus the drain timeout.
-- (I5) Live rows ENG1–ENG4 stay pending until Tailscale SSH is
-  re-authenticated; the PR says so and the owner decides whether to merge
-  before or after the live run.
+- (I5) Live rows ENG1–ENG4 ran on 2026-09-25 (below).
+
+Live rows ENG1–ENG4, 2026-09-25. Host A is the first Spark, host B the
+second; the server runs on the control-plane host. The branch was built from
+the synced tree on all three machines, and only the existing vLLM 0.29.0 and
+SGLang 0.5.20 environments were used. Evidence (local, not committed):
+`target/live/engreg/`.
+
+| Row | Live verdict |
+|---|---|
+| ENG1, host A and host B | pass on both. `engine detect` with no `--path` listed both home-level environments from metadata. The host ran under a transient systemd user unit with a document that declares no profiles. `engine add` of each environment exited 0, `published`, `custom: false`: vLLM in 12.2 s and 12.8 s, SGLang in 7.3 s. These times are the whole command, including the bounded version check and the deep-park probe; the plan's "within 10 s" is not met for vLLM, whose version check alone takes several seconds. `host.yaml` was byte-identical afterwards (`sha256sum -c` OK), and `engines.yaml` reached revision 2. `list engines` on the server showed both profiles. v\*-4 and s\*-4 on the new profiles reached Ready, answered 42, stopped with verified cleanup and were deleted |
+| ENG3, host A | pass. With v92-4 Ready, `engine remove vllm` was refused `profile_in_use`, naming v92-4; the deployment stayed Ready and answered. `engine remove vllm --drain` returned in 1.2 s (`removed: vllm`, revision 2); the deployment was stopped with verified cleanup. `list engines` no longer showed vllm. `start --wait` was refused `host_ineligible` ("no approved configuration carries a runtime profile whose build it reported"). `engine add` published the profile again (revision 3) |
+| ENG2, host A (standalone, both variables set) | pass after the fix below. `engine list` shows `local-vllm` and `local-sglang`, `published`, `source: environment`. `engine remove local-vllm` is refused `invalid_config` (environment profile). A deployment on `local-vllm` served: its argv carries the host-fixed `--max-model-len 4096`. A deployment that also states `context_length` is refused `invalid_config` ("the installation's host-fixed args already set `--max-model-len`"). A deployment on `local-sglang` served. `engine add --name vllm-reg` of the same vLLM environment was published beside them. See also the registered-profile check below |
+| ENG4, host B | pass. An rc.3 agent was online (`supported`) with the new server. The new CLI's `engine add` exited `agent_unreachable` and wrote `engines.yaml` (revision 1). After a restart the rc.3 agent still published nothing from that file. After an upgrade to the new binary, the host published `vllm` at start. Against an rc.3 server, a new agent's `engine add` answered `published: restart_required`, and after a host restart the rc.3 server listed `vllm` for the host |
+
+Registered vLLM profile without a `--max-model-len` default (ENG2). A profile
+added with `engine add` carries no arguments, so the environment profile's
+`--max-model-len 4096` default does not apply. A deployment on it that states
+`context_length: 16384` passes `--max-model-len 16384` and serves. A deployment
+that states no context length launches with the model's own maximum.
+qwen3-4b-instruct has a 262144-token context, so vLLM refused at start:
+"To serve at least one request with the model's max seq len (262144), 36.0 GiB
+KV cache is needed, which is larger than the available KV cache memory
+(4.0 GiB)". The operation failed as `launch failed: the engine exited before
+readiness`, with the engine_config hint, and cleanup was clean. This is
+vLLM's own limit, not an mllm defect. An operator who registers a vLLM
+environment must state `context_length` in each deployment, or add the
+profile with `--arg --max-model-len --arg N`. Whether the documentation
+should say so, or a registered vLLM profile should carry the same default
+as the environment profile, is an owner decision.
+
+Found and fixed during the live rows:
+
+1. **Product: `engine list` did not show standalone environment profiles.**
+   The first ENG2 run returned an empty list. `list` read only `engines.yaml`
+   and the role document, and dropped the profiles the role reported as
+   accepted from `MLLM_VLLM_BIN`/`MLLM_SGLANG_BIN`. It now appends every
+   profile the role accepted that neither file names, with
+   `source: environment`. Regression test (T16):
+   `engine_cli.rs::list_shows_the_roles_environment_profiles`, which fails
+   without the fix. The rerun of ENG2 shows both profiles (live proof).
+2. Harness: `roles.sh` `server_init` copied the snapshot build over
+   `MLLM_LOCAL_BIN`, so ENG4's "rc.3 server" binary was replaced by the new
+   one. A named binary is now run as given. ENG4 also read `hosts.json` for
+   `"vllm"` anywhere, which the other host's full document matched; it now
+   checks the named host's entry only. Its rc.3-server phase now reloads the
+   new run's variables and runs in a subshell.
+3. Harness: `host_clean` hid leftover rendezvous directories. `ls -d A B &&
+   echo LEFTOVER_RDZV` exits non-zero when one pattern matches nothing, so
+   the directories were listed but never flagged. It now pipes through
+   `grep .`.
+
+Found, not fixed (product, open): **a standalone SGLang launch leaves
+`/tmp/mllm-rdzv-*` behind.** Both ENG2 runs left one owner-only
+`/tmp/mllm-rdzv-*` directory, holding its `store` file, per `local-sglang`
+launch after `delete --stop`. The directories were created at the SGLang
+launch times, and they were removed by hand after the run. The host role
+names each launch's rendezvous directory inside
+`<state_dir>/rendezvous/<incarnation>` and removes it on gone evidence (fixed
+2026-09-23). Standalone never sets a rendezvous root (`ProfileBindings` has
+none), so the entry falls back to its own temporary directory, and a
+signalled stop never runs the entry's exit handler. This predates engine
+registration (same path on `main`) and breaks the rule that standalone must
+not differ from server mode. A fix needs standalone to own a rendezvous root
+and to retire each launch's directory where its local cleanup proves the
+group gone (standalone does not retire saver enrollments there either). That
+is a design choice in the coordinator's local cleanup, so it is left for the
+owner. With the `host_clean` fix, ENG2's idle check now fails on this until
+it is fixed.
+
+Local verification of the fix (CPU only, not qualification): `mllm-cli`
+all-targets 208 passed; Clippy on `mllm-cli` clean with warnings denied;
+`cargo fmt --check` clean.
+
+Host state after the rows: every role was stopped (`roles.sh down`, each
+role signalled by its recorded identity). The branch's trees, run directories
+and the rc.3 binary copy were removed from both hosts. Neither host has an
+mllm, engine or GPU compute process, a tmux session or a rendezvous directory.
+`~/.config/mllm` is absent.
 
 Open items:
 
-- Live rows ENG1–ENG4 (`scripts/live/matrix/rows/ENG*.sh`) have not run; they
-  need Tailscale SSH re-auth to host-a and host-b.
+- Standalone SGLang rendezvous directories (above).
+- Registered vLLM profile and context length (above): owner decision.
 - Version skew on removal: an older CLI's `remove` can still reach a newer
   role and get back a confirmed retirement, but does not know to write
   `engines.yaml` on this path. The retirement keeps the profile out of
