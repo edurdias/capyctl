@@ -459,6 +459,66 @@ User units carry no file-system sandboxing: `ProtectSystem=` and similar need
 privileges the per-user manager lacks (systemd.exec(5)). Prefer the system
 units on shared machines.
 
+## Registering engines
+
+mllm uses engines you install yourself. Register them on the machine that runs them:
+
+    mllm engine detect [--path DIR]        # lists vLLM/SGLang environments; runs nothing
+    mllm engine add ~/venvs/vllm           # or its bin/vllm, or bin/python3 for SGLang
+    mllm engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
+    mllm engine list
+    mllm engine remove vllm [--drain]
+    mllm list engines --config server.yaml # on the server: every host's engines
+
+`detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,
+`~/.virtualenvs`, uv and pipx tool environments, `/opt`, and any venv directly
+in your home directory (for example `~/mllm-vllm-venv2`).
+
+`engine add` runs the installation only after you name or pick it (a bounded
+version check, the installation fingerprint and the deep-park probe), writes
+the profile into `engines.yaml`, and asks the running role to publish it
+without a restart. mllm never rewrites `host.yaml` or `standalone.yaml`.
+`engines.yaml` sits beside the role's configuration file (`--config
+dir/host.yaml` means `dir/engines.yaml`); without `--config` it is
+`~/.config/mllm/engines.yaml`, for a host and for standalone alike. The role
+merges it with its own document at start; a profile name declared in both is
+refused. Its first line records its revision (`# mllm-document-revision: N`).
+The running role listens on `<state_dir>/control.sock` (mode 0600, your user
+only) for these commands.
+
+`engine remove` removes only profiles `engine add` registered; one you wrote
+into `host.yaml` stays yours to edit. It is refused while a deployment on this
+machine uses the profile (`profile_in_use`); `--drain` stops those deployments
+through the ordinary stop path first, and the profile is removed only after the
+server confirms their stop evidence. A role that is not running cannot remove a
+published profile (`agent_unreachable`); start it and retry.
+
+A deployment naming a runtime profile that no allowed host publishes is refused
+at `deploy` (`profile_not_published`), naming the profile and each host; run
+`mllm engine add <path> --name <profile>` on a host, then deploy again.
+
+In standalone, `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone gives the profile
+`local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
+with them.
+
+**With the system units, an ad hoc `mllm engine` shell command needs its
+`--config` (or `$MLLM_CONFIG`).** The unit reads `/etc/mllm/<role>.yaml`; a
+bare `sudo -u mllm mllm engine add …` with no `--config` and no `MLLM_CONFIG`
+in the shell instead resolves `~/.config/mllm/engines.yaml` under the service
+user's home (`/var/lib/mllm`), a different file than the one beside
+`/etc/mllm/host.yaml` the running role reads. `mllm engine`, `mllm list
+engines`, and the role itself all resolve `engines.yaml` by the same rule
+(`--config`, then `$MLLM_CONFIG`, then `~/.config/mllm/engines.yaml`), so
+matching the unit's `--config` is what keeps them looking at the same file:
+`sudo -u mllm mllm engine add ~/venvs/vllm --config /etc/mllm/host.yaml`.
+
+`engine add` also works before any role has ever started — the first-run path
+of adding an engine, then starting the role for the first time. It creates the
+state directory the role will use (owner-only, mode 0700) if it does not exist
+yet, writes `engines.yaml`, and reports `agent_unreachable`, since nothing is
+listening to publish it live; the profile takes effect at the role's first
+start.
+
 ## Hardening in the units
 
 The server unit takes the strict profile: read-only system, no home, private

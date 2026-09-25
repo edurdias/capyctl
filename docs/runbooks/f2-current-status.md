@@ -4,6 +4,54 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Engine registration — 2026-09-25 (branch `feat/engine-registration`)
+
+ADR 0018 (amends SPEC §4.2, §15.1): `mllm engine detect|add|list|remove` and
+`mllm list engines`, live publication (`live_profile_update`), two-phase removal,
+standalone `local-vllm`/`local-sglang`. Commits: `8ec4fe1..43aa457`, plus this
+change (live harness, operator guide, status).
+
+Evidence: CPU and Fake-engine tests only (`crates/*/tests/{registration,engines,
+control_socket,live_profiles,engine_cli,standalone_engines}.rs`). These are not
+qualification. Live rows ENG1–ENG4 (`scripts/live/matrix/rows/ENG*.sh`) are
+written and dry-run only, not yet run: Tailscale SSH to host-a/host-b
+needs owner re-auth before any host is reachable.
+
+Owner decisions of 2026-09-25 are recorded in the plan and ADR 0018; the answer
+on the exit code for `profile_not_published` (plan item 20): fail-fast, HTTP
+409, CLI exit 24 — the next free exit number, following the accepted 16–23
+pattern for the other engine-registration codes.
+
+Controller rulings from the plan's decision ledger
+(`.superpowers/sdd/2026-09-25-engine-registration/progress.md`):
+
+- No pre-flight cross-task conflict scan; the owner removed per-task review for
+  speed, and the plan's self-review checked type consistency.
+- Implementers run the task's own tests plus a build of touched crates; the
+  core suite, workspace tests, clippy and fmt run before the final review.
+- `profile_not_published` is HTTP 409, CLI exit 24 (fail-fast; see above).
+- `expire_profile_retirements` expires only rows in state `retiring`; a
+  confirmed retirement stays until the host's re-publication drops the
+  profile, so a stale confirmed row cannot block re-adding the same name
+  forever.
+- An uncertain or unfinished stop keeps a retirement open until it expires
+  unconfirmed — the spec never confirms on a guess.
+- Any accepted host publication, startup or live, clears that host's
+  confirmed retirement rows for profiles the publication no longer lists, so a
+  host restart cannot strand a confirmed row.
+- The drain poll in the session relay has no bound of its own; the retirement
+  service returns Holding (unconfirmed) once the 900 s bound passes, so a
+  drained removal cannot poll forever.
+- The role binding the control socket must first check its parent state
+  directory is owned by the running user, mode 0700, and refuse to bind
+  otherwise, closing the bind-to-chmod umask window.
+- `engine add` works before any role has ever started (the first-run path):
+  the state root is created owner-only (0700) if missing, `engines.yaml` is
+  written, and the command reports `agent_unreachable`.
+- Roles resolve `engines.yaml` with the same rule as the CLI, including
+  `$MLLM_CONFIG` when `--config` is absent, so a role and `mllm engine` always
+  agree on the file.
+
 ## Flaky parallel tests and leaked stand-in engines — 2026-09-25 (branch `fix/flaky-parallel-tests`)
 
 CPU-only test fix; nothing here is live-proven or qualifies an engine recipe.

@@ -130,6 +130,15 @@ load_run() {
   RBIN=${MLLM_REMOTE_BIN:-$REMOTE_TREE/target/release/mllm}  # the host binary
 }
 
+# ADR 0018 (row ENG4): one host may run another binary than the rest, e.g. an
+# rc.3 agent beside new ones. MLLM_REMOTE_BIN_92 / MLLM_REMOTE_BIN_17 override
+# RBIN for that host only.
+rbin() { # rbin <host>
+  local var
+  var="MLLM_REMOTE_BIN_$(host_short "$1")"
+  printf '%s\n' "${!var:-$RBIN}"
+}
+
 save_run_var() { # save_run_var NAME VALUE
   dry && { log_cmd control-host "record $1=$2 in $RUNSTATE/run.env"; return 0; }
   mkdir -p "$RUNSTATE"
