@@ -468,3 +468,79 @@ fn deploy_wait_without_activate_is_refused_with_its_reason() {
     ])
     .is_err());
 }
+
+use mllm_cli::grammar::{DeepParkChoice, DriftChoice};
+
+// T01 (ADR 0018 §1): the engine commands and `list engines` parse strictly.
+#[test]
+fn engine_commands_parse() {
+    assert_eq!(
+        parse([
+            "mllm",
+            "engine",
+            "add",
+            "/v",
+            "--name",
+            "vllm-patched",
+            "--deep-park",
+            "disabled",
+            "--drift",
+            "refuse",
+            "--arg",
+            "--max-num-seqs",
+            "--arg",
+            "8"
+        ])
+        .unwrap(),
+        Command::EngineAdd {
+            path: Some("/v".into()),
+            name: Some("vllm-patched".into()),
+            deep_park: Some(DeepParkChoice::Disabled),
+            drift: DriftChoice::Refuse,
+            args: vec!["--max-num-seqs".into(), "8".into()],
+        }
+    );
+    assert_eq!(
+        parse(["mllm", "engine", "add"]).unwrap(),
+        Command::EngineAdd {
+            path: None,
+            name: None,
+            deep_park: None,
+            drift: DriftChoice::Warn,
+            args: vec![]
+        }
+    );
+    assert_eq!(
+        parse(["mllm", "engine", "detect", "--path", "/a", "--path", "/b"]).unwrap(),
+        Command::EngineDetect {
+            paths: vec!["/a".into(), "/b".into()]
+        }
+    );
+    assert_eq!(
+        parse(["mllm", "engine", "list"]).unwrap(),
+        Command::EngineList
+    );
+    assert_eq!(
+        parse(["mllm", "engine", "remove", "vllm", "--drain"]).unwrap(),
+        Command::EngineRemove {
+            name: "vllm".into(),
+            drain: true
+        }
+    );
+    assert_eq!(
+        parse(["mllm", "list", "engines"]).unwrap(),
+        Command::List {
+            resource: ListResource::Engines
+        }
+    );
+    assert!(parse(["mllm", "engine", "add", "--deep-park", "maybe"]).is_err());
+    assert!(parse(["mllm", "engine", "remove"]).is_err());
+    assert_eq!(
+        parse(["mllm", "engine", "remove", "vllm"]).unwrap().label(),
+        "engine remove vllm"
+    );
+    assert_eq!(
+        parse(["mllm", "list", "engines"]).unwrap().label(),
+        "list engines"
+    );
+}

@@ -57,6 +57,27 @@ fn main() -> ExitCode {
         // implicit `<state_dir>/config/standalone.yaml` is loaded or generated.
         return run_standalone(invocation.config.as_deref(), format);
     }
+    // ADR 0018: engine registration, on this machine, through its role's socket.
+    if mllm_cli::engine::is_engine_command(&invocation.command) {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
+        };
+        return match runtime.block_on(mllm_cli::engine::execute(
+            &invocation.command,
+            invocation.config.as_deref(),
+            &default_state_dir(),
+        )) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
     // SPEC §4.3: explicit drain, through the server's or the standalone role's
     // management API. Stopping a role itself is a signal (SPEC §14 has no verb).
     if let Command::Drain { host, wait } = &invocation.command {

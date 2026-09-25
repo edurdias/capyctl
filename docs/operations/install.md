@@ -106,6 +106,14 @@ are defined in `crates/mllm-cli/src/output.rs`.
 | 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`) | all | The newer binary or a restored backup (see "State and migrations"). |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
+| 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `mllm engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `mllm engine detect --path DIR`. |
+| 17 | The package is not a supported engine (`engine_unsupported`) | none | Register a vLLM or SGLang installation. |
+| 18 | The version check failed or timed out; nothing is written (`engine_version_failed`) | none | Repair the installation until its version check succeeds and matches its package metadata, then add it again. |
+| 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
+| 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
+| 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
+| 22 | The role's control socket did not answer (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role starts. On `remove`, nothing is written: start the role and retry. |
+| 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 
 **A revoked host (14).** After `mllm revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its

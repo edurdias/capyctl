@@ -958,6 +958,9 @@ pub fn supports(command: &Command) -> bool {
             | Command::List {
                 resource: ListResource::Hosts
             }
+            | Command::List {
+                resource: ListResource::Engines
+            }
             | Command::Inspect {
                 resource: Resource::Host,
                 ..
@@ -1146,6 +1149,13 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 Ok(result)
             }
+        }
+        Command::List {
+            resource: ListResource::Engines,
+        } => {
+            // ADR 0018: every host's published profiles, from the server.
+            let config = server_context(invocation.config.as_deref(), root)?;
+            management_request(&config, reqwest::Method::GET, "/engines", None).await
         }
         _ => Err(error("Unsupported remote role command")),
     }

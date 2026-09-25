@@ -41,6 +41,23 @@ pub enum LifecycleAction {
 pub enum ListResource {
     Hosts,
     Deployments,
+    /// ADR 0018: every host's published runtime profiles, from the server.
+    Engines,
+}
+
+/// ADR 0018 §1: `--deep-park` on `engine add`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeepParkChoice {
+    Enabled,
+    Disabled,
+}
+
+/// ADR 0018 §1: `--drift` on `engine add` (ADR 0008 `installation_drift`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DriftChoice {
+    #[default]
+    Warn,
+    Refuse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +154,25 @@ pub enum Command {
         apply: bool,
         referenced_file: Option<PathBuf>,
     },
+    /// ADR 0018 §1: installations found on this machine; executes nothing.
+    EngineDetect {
+        paths: Vec<PathBuf>,
+    },
+    /// ADR 0018 §1: register an installation as a runtime profile.
+    EngineAdd {
+        path: Option<PathBuf>,
+        name: Option<String>,
+        deep_park: Option<DeepParkChoice>,
+        drift: DriftChoice,
+        args: Vec<String>,
+    },
+    /// ADR 0018 §1: this machine's runtime profiles.
+    EngineList,
+    /// ADR 0018 §4: remove a runtime profile, stopping its deployments with `drain`.
+    EngineRemove {
+        name: String,
+        drain: bool,
+    },
 }
 
 impl Command {
@@ -211,6 +247,10 @@ impl Command {
             Command::PruneSources { apply, .. } => {
                 format!("prune sources{}", if *apply { " --apply" } else { "" })
             }
+            Command::EngineDetect { .. } => "engine detect".into(),
+            Command::EngineAdd { .. } => "engine add".into(),
+            Command::EngineList => "engine list".into(),
+            Command::EngineRemove { name, .. } => format!("engine remove {name}"),
         }
     }
 }
@@ -331,6 +371,49 @@ enum CliCommand {
     Prune {
         #[command(subcommand)]
         resource: PruneArgs,
+    },
+    /// Register vLLM and SGLang installations on this machine as runtime
+    /// profiles, list them, or remove one. Acts on this machine's role.
+    Engine {
+        #[command(subcommand)]
+        action: EngineArgs,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum EngineArgs {
+    /// List vLLM and SGLang installations on this machine (reads metadata only).
+    Detect {
+        /// Also scan this directory (repeatable).
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+    },
+    /// Register an installation as a runtime profile and publish it.
+    Add {
+        /// A venv directory, its bin/vllm, or its bin/python3. Omit to pick interactively.
+        path: Option<PathBuf>,
+        /// The profile name (default: the engine's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Record deep parking enabled or disabled (default: enabled unless
+        /// the capability probe reports it missing).
+        #[arg(long, value_enum)]
+        deep_park: Option<DeepParkChoice>,
+        /// What a launch does when the installation changed since registration.
+        #[arg(long, value_enum, default_value_t = DriftChoice::Warn)]
+        drift: DriftChoice,
+        /// A host-fixed engine argument (repeatable).
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// This machine's runtime profiles and whether the server accepted them.
+    List,
+    /// Remove a runtime profile.
+    Remove {
+        name: String,
+        /// Stop the deployments on this machine that use it first.
+        #[arg(long)]
+        drain: bool,
     },
 }
 
@@ -481,6 +564,7 @@ fn parse_instance(value: &str) -> Result<(String, u32), String> {
 enum ListArgs {
     Hosts,
     Deployments,
+    Engines,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -595,6 +679,9 @@ impl From<CliCommand> for Command {
                 ListArgs::Deployments => Command::List {
                     resource: ListResource::Deployments,
                 },
+                ListArgs::Engines => Command::List {
+                    resource: ListResource::Engines,
+                },
             },
             CliCommand::Inspect { resource } => match resource {
                 InspectArgs::Host { host } => Command::Inspect {
@@ -687,6 +774,24 @@ impl From<CliCommand> for Command {
                 host_config,
                 apply,
                 referenced_file,
+            },
+            CliCommand::Engine { action } => match action {
+                EngineArgs::Detect { paths } => Command::EngineDetect { paths },
+                EngineArgs::Add {
+                    path,
+                    name,
+                    deep_park,
+                    drift,
+                    args,
+                } => Command::EngineAdd {
+                    path,
+                    name,
+                    deep_park,
+                    drift,
+                    args,
+                },
+                EngineArgs::List => Command::EngineList,
+                EngineArgs::Remove { name, drain } => Command::EngineRemove { name, drain },
             },
         }
     }

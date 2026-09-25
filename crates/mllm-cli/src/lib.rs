@@ -2,6 +2,7 @@ pub mod client;
 mod client_journal;
 pub mod device_inventory;
 pub mod drain;
+pub mod engine;
 pub mod grammar;
 pub mod host_observation;
 pub mod managed_runtime;

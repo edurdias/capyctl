@@ -30,6 +30,7 @@ libc = "0.2"
 sha2 = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 mllm-testkit = { workspace = true }
 tempfile = { workspace = true }
 

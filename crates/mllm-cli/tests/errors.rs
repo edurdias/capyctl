@@ -184,7 +184,37 @@ fn a_start_with_no_eligible_host_exits_15() {
         ExitCode::NO_SAFE_ESTIMATE,
         ExitCode::INTERNAL,
         ExitCode::HOST_REVOKED,
+        ExitCode::ENGINE_NOT_FOUND,
+        ExitCode::ENGINE_UNSUPPORTED,
+        ExitCode::ENGINE_VERSION_FAILED,
+        ExitCode::PROFILE_EXISTS,
+        ExitCode::PROFILE_IN_USE,
+        ExitCode::PUBLISH_REJECTED,
+        ExitCode::AGENT_UNREACHABLE,
+        ExitCode::NOT_INTERACTIVE,
     ] {
         assert_ne!(other, ExitCode::HOST_INELIGIBLE);
+    }
+}
+
+// T01 (ADR 0018 §6): the engine codes exit 16 to 23; 9 stays unused.
+#[test]
+fn engine_codes_have_their_exit_codes() {
+    for (code, exit) in [
+        ("engine_not_found", 16),
+        ("engine_unsupported", 17),
+        ("engine_version_failed", 18),
+        ("profile_exists", 19),
+        ("profile_in_use", 20),
+        ("publish_rejected", 21),
+        ("agent_unreachable", 22),
+        ("not_interactive", 23),
+    ] {
+        let error = StructuredError {
+            code,
+            message: String::new(),
+        };
+        assert_eq!(error.exit_code(), ExitCode(exit), "{code}");
+        assert_ne!(error.exit_code(), ExitCode(9));
     }
 }
