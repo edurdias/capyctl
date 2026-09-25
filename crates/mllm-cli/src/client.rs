@@ -354,8 +354,10 @@ impl Management {
     /// The wait is bounded by the start's own Initialize window (the
     /// conservative pending value, or `--initialize-timeout`); nothing is
     /// started if it expires. A digest that is recorded, mismatched or absent
-    /// ends the wait at once, and the start that follows decides.
-    async fn await_checkpoint_digest(&self, id: &str) -> Result<(), StructuredError> {
+    /// ends the wait at once, and the start that follows decides. ADR 0008:
+    /// a declared remote source that is still downloading is waited for the
+    /// same way, within the same bound (owner decision 2026-09-25).
+    async fn await_activation_inputs(&self, id: &str) -> Result<(), StructuredError> {
         let mut until: Option<(tokio::time::Instant, i64)> = None;
         let mut backoff = FIRST_BACKOFF;
         loop {
@@ -377,18 +379,25 @@ impl Management {
             backoff = FIRST_BACKOFF;
             let current = deployment(&snapshot, id)?;
             let digest = &current["checkpoint_digest"];
-            if !(digest["state"] == "pending" && digest["provisional"] == true) {
+            let digest_pending = digest["state"] == "pending" && digest["provisional"] == true;
+            // ADR 0008 (owner decision 2026-09-25): a declared remote source is
+            // waited for the same way; found live, `--activate --wait` was
+            // refused `model_source_pending` while the download ran.
+            let source_pending = model_source_pending(current);
+            if !digest_pending && !source_pending {
                 return Ok(());
             }
             let (deadline, window_ms) = match until {
                 Some(bound) => bound,
                 None => {
                     let window_ms = window(current, "start", self.initialize_timeout_ms)?;
-                    eprintln!(
-                        "Waiting for the checkpoint digest of {} to be measured (at most {}s)",
-                        current["name"].as_str().unwrap_or(id),
-                        window_ms / 1000
-                    );
+                    let name = current["name"].as_str().unwrap_or(id);
+                    let what = if source_pending {
+                        format!("the model source of {name} to be downloaded and verified")
+                    } else {
+                        format!("the checkpoint digest of {name} to be measured")
+                    };
+                    eprintln!("Waiting for {what} (at most {}s)", window_ms / 1000);
                     let bound = (
                         tokio::time::Instant::now()
                             + Duration::from_millis(u64::try_from(window_ms).unwrap_or(0)),
@@ -400,13 +409,18 @@ impl Management {
             };
             if tokio::time::Instant::now() >= deadline {
                 let name = current["name"].as_str().unwrap_or(id);
-                return Err(error(
-                    "activation_timeout",
+                let message = if source_pending {
+                    format!(
+                        "model_source_pending: the model source of {name} was still being downloaded after {}s; nothing was started. `mllm status deployment {name}` shows its progress; run `mllm start deployment {name} --wait` again once it is verified",
+                        window_ms / 1000
+                    )
+                } else {
                     format!(
                         "checkpoint_digest_pending: the checkpoint digest of {name} was still being measured after {}s; nothing was started. `mllm status deployment {name}` shows it; run `mllm start deployment {name} --wait` again once it is recorded",
                         window_ms / 1000
-                    ),
-                ));
+                    )
+                };
+                return Err(error("activation_timeout", message));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -698,7 +712,7 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
         .unwrap_or("Management command rejected");
     // ADR 0014 §7: a start without `--wait` stays asynchronous; the refusal
     // says which command waits for the measurement.
-    let message = if server == "checkpoint_digest_pending" {
+    let message = if server == "checkpoint_digest_pending" || server == "model_source_pending" {
         format!("{message}; run the start again with --wait (`mllm start deployment <name> --wait`), which waits for the measurement and then starts")
     } else {
         message.to_owned()
@@ -708,6 +722,18 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
     } else {
         error(code, format!("{server}: {message}"))
     }
+}
+
+/// ADR 0008: whether activation still waits for a declared remote source: no
+/// host holds a verified copy and some attempt is not failed. A failed source
+/// ends the wait, and the start that follows reports it (`model_source_failed`).
+fn model_source_pending(deployment: &Value) -> bool {
+    let Some(sources) = deployment["model_sources"].as_array() else {
+        return false;
+    };
+    !sources.is_empty()
+        && !sources.iter().any(|source| source["state"] == "verified")
+        && sources.iter().any(|source| source["state"] != "failed")
 }
 
 fn deployment<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value, StructuredError> {
@@ -962,7 +988,7 @@ pub async fn execute_with_start_options(
                 .as_str()
                 .ok_or_else(|| error("internal", "Missing deployment identity"))?;
             // ADR 0014 §7: `--activate` waits for a new checkpoint's digest.
-            api.await_checkpoint_digest(id).await?;
+            api.await_activation_inputs(id).await?;
             let (action, deadline) = api.action(id, "start").await?;
             if *wait {
                 api.wait_all(action, deadline).await
@@ -999,7 +1025,7 @@ pub async fn execute_with_start_options(
             )?;
             // ADR 0014 §7: `start --wait` waits for a new checkpoint's digest.
             if api.wait_start && action == "start" {
-                api.await_checkpoint_digest(id).await?;
+                api.await_activation_inputs(id).await?;
             }
             let (receipt, deadline) = api.action(id, action).await?;
             if api.wait_start && action == "start" {
@@ -1055,7 +1081,7 @@ pub async fn execute_with_start_options(
             )?;
             // ADR 0014 §7: `start --wait` waits for a new checkpoint's digest.
             if api.wait_start && action == "start" {
-                api.await_checkpoint_digest(id).await?;
+                api.await_activation_inputs(id).await?;
             }
             let (receipt, deadline) = api.action_on(id, action, Some(*instance)).await?;
             if api.wait_start && action == "start" {

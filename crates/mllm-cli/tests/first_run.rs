@@ -245,6 +245,9 @@ struct Management {
     refused_starts: AtomicUsize,
     starts: AtomicUsize,
     measured_after: Option<usize>,
+    /// ADR 0008: the deployment declares a remote source, downloading until
+    /// the digest would be recorded (the digest itself is then non-provisional).
+    source: bool,
 }
 
 impl Management {
@@ -275,12 +278,20 @@ async fn management(state: Arc<Management>, initialize_ms: i64) -> std::net::Soc
             "/management/v1/snapshot",
             routing::get(move |State(m): State<Arc<Management>>| async move {
                 m.reads.fetch_add(1, Ordering::SeqCst);
-                let state = if m.pending() { "pending" } else { "recorded" };
-                Json(json!({"operations": [], "deployments": [{
+                let pending = m.pending();
+                let mut item = json!({
                     "id": DEPLOYMENT_ID, "name": "first-model", "revision": "1",
                     "timeouts": {"initialize_ms": initialize_ms, "request_deadline_ms": 600_000},
-                    "checkpoint_digest": {"state": state, "host_id": "h", "provisional": true},
-                }]}))
+                    "checkpoint_digest": {"state": if pending { "pending" } else { "recorded" },
+                        "host_id": "h", "provisional": !m.source},
+                });
+                if m.source {
+                    item["model_sources"] = json!([{"host_id": "h",
+                        "source_key": "sources/huggingface/o--m@0123456789abcdef0123456789abcdef01234567",
+                        "state": if pending { "downloading" } else { "verified" },
+                        "bytes_done": 10, "bytes_total": 100}]);
+                }
+                Json(json!({"operations": [], "deployments": [item]}))
             }),
         )
         .route(
@@ -288,10 +299,11 @@ async fn management(state: Arc<Management>, initialize_ms: i64) -> std::net::Soc
             routing::post(|State(m): State<Arc<Management>>| async move {
                 if m.pending() {
                     m.refused_starts.fetch_add(1, Ordering::SeqCst);
+                    let code = if m.source { "model_source_pending" } else { "checkpoint_digest_pending" };
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"api_version": "1", "error": {"code": "checkpoint_digest_pending",
-                            "message": "The checkpoint digest is still being measured; retry shortly",
+                        Json(json!({"api_version": "1", "error": {"code": code,
+                            "message": "Still pending; retry shortly",
                             "retryable": true, "operation_id": null, "details": {}}})),
                     );
                 }
@@ -364,6 +376,7 @@ async fn deploy_activate_waits_for_the_checkpoint_digest() {
         refused_starts: AtomicUsize::new(0),
         starts: AtomicUsize::new(0),
         measured_after: Some(3),
+        source: false,
     });
     let address = management(state.clone(), 60_000).await;
     let output = deploy(root.path(), address, &["--activate"]).await;
@@ -389,6 +402,7 @@ async fn deploy_activate_gives_up_after_the_initialize_window() {
         refused_starts: AtomicUsize::new(0),
         starts: AtomicUsize::new(0),
         measured_after: None,
+        source: false,
     });
     let address = management(state.clone(), 1_000).await;
     let output = deploy(root.path(), address, &["--activate"]).await;
@@ -414,6 +428,7 @@ async fn deploy_without_activate_says_what_to_run() {
         refused_starts: AtomicUsize::new(0),
         starts: AtomicUsize::new(0),
         measured_after: None,
+        source: false,
     });
     let address = management(state.clone(), 60_000).await;
     let output = deploy(root.path(), address, &[]).await;
@@ -425,4 +440,56 @@ async fn deploy_without_activate_says_what_to_run() {
         text(&output)
     );
     assert_eq!(state.starts.load(Ordering::SeqCst), 0);
+}
+
+// T08 T14 (ADR 0008, owner decision 2026-09-25): `deploy model --activate`
+// of a declared remote source waits while the host downloads it, then starts
+// it; the start is never sent while the source is pending (found live: it was
+// refused `model_source_pending` at once).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deploy_activate_waits_for_the_model_source() {
+    let root = private_dir();
+    let state = Arc::new(Management {
+        reads: AtomicUsize::new(0),
+        refused_starts: AtomicUsize::new(0),
+        starts: AtomicUsize::new(0),
+        measured_after: Some(3),
+        source: true,
+    });
+    let address = management(state.clone(), 60_000).await;
+    let output = deploy(root.path(), address, &["--activate"]).await;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.refused_starts.load(Ordering::SeqCst), 0);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("model source of first-model"),
+        "{}",
+        text(&output)
+    );
+}
+
+// T08 T14: the source wait is bounded by the same Initialize window; when it
+// expires nothing is started and the error says what to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deploy_activate_gives_up_on_a_source_after_the_initialize_window() {
+    let root = private_dir();
+    let state = Arc::new(Management {
+        reads: AtomicUsize::new(0),
+        refused_starts: AtomicUsize::new(0),
+        starts: AtomicUsize::new(0),
+        measured_after: None,
+        source: true,
+    });
+    let address = management(state.clone(), 1_000).await;
+    let output = deploy(root.path(), address, &["--activate"]).await;
+    assert_ne!(output.status.code(), Some(0), "{}", text(&output));
+    let all = text(&output);
+    assert!(all.contains("activation_timeout"), "{all}");
+    assert!(all.contains("model_source_pending"), "{all}");
+    assert!(
+        all.contains("mllm start deployment first-model --wait"),
+        "{all}"
+    );
+    assert_eq!(state.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(state.refused_starts.load(Ordering::SeqCst), 0);
 }
