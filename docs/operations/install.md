@@ -112,7 +112,7 @@ are defined in `crates/mllm-cli/src/output.rs`.
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
 | 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
-| 22 | The role's control socket did not answer (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role starts. On `remove`, nothing is written: start the role and retry. |
+| 22 | The role's control socket did not answer (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role starts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 | 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
 
@@ -483,15 +483,22 @@ dir/host.yaml` means `dir/engines.yaml`); without `--config` it is
 `~/.config/mllm/engines.yaml`, for a host and for standalone alike. The role
 merges it with its own document at start; a profile name declared in both is
 refused. Its first line records its revision (`# mllm-document-revision: N`).
-The running role listens on `<state_dir>/control.sock` (mode 0600, your user
-only) for these commands.
+The running role listens on `<state_dir>/control.sock` (mode 0600; only the
+role's own user and root are served) for these commands. Only the `mllm engine`
+command writes `engines.yaml`; the running role only reads it.
 
 `engine remove` removes only profiles `engine add` registered; one you wrote
 into `host.yaml` stays yours to edit. It is refused while a deployment on this
 machine uses the profile (`profile_in_use`); `--drain` stops those deployments
-through the ordinary stop path first, and the profile is removed only after the
-server confirms their stop evidence. A role that is not running cannot remove a
-published profile (`agent_unreachable`); start it and retry.
+through the ordinary stop path first. The command asks the running role to
+retire the profile, waits until the server confirms their stop evidence, then
+rewrites `engines.yaml` without it and asks the role to publish the removal. A
+role that is not running cannot remove a published profile
+(`agent_unreachable`); start it and retry. If a removal is interrupted after
+the confirmation (the command was killed, the connection dropped, or the
+publication failed), the profile stays out of placement on that machine; run
+`mllm engine remove <name>` again, which resumes the same removal and finishes
+it.
 
 A deployment naming a runtime profile that no allowed host publishes is refused
 at `deploy` (`profile_not_published`), naming the profile and each host; run
@@ -501,16 +508,29 @@ In standalone, `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
 with them.
 
-**With the system units, an ad hoc `mllm engine` shell command needs its
-`--config` (or `$MLLM_CONFIG`).** The unit reads `/etc/mllm/<role>.yaml`; a
-bare `sudo -u mllm mllm engine add …` with no `--config` and no `MLLM_CONFIG`
-in the shell instead resolves `~/.config/mllm/engines.yaml` under the service
-user's home (`/var/lib/mllm`), a different file than the one beside
-`/etc/mllm/host.yaml` the running role reads. `mllm engine`, `mllm list
-engines`, and the role itself all resolve `engines.yaml` by the same rule
-(`--config`, then `$MLLM_CONFIG`, then `~/.config/mllm/engines.yaml`), so
-matching the unit's `--config` is what keeps them looking at the same file:
-`sudo -u mllm mllm engine add ~/venvs/vllm --config /etc/mllm/host.yaml`.
+**With the system units, run `mllm engine` as root with the unit's
+`--config`.** The host unit reads `/etc/mllm/host.yaml`, so its `engines.yaml`
+is `/etc/mllm/engines.yaml`. `/etc/mllm` is root's (mode 0750, group `mllm`),
+and the unit makes `/etc` read-only to the role (`ProtectSystem=strict`), so
+the role never writes there; `mllm engine` does, and only root can:
+
+    sudo mllm engine add /opt/venvs/vllm --config /etc/mllm/host.yaml
+    sudo mllm engine list --config /etc/mllm/host.yaml
+    sudo mllm engine remove vllm --drain --config /etc/mllm/host.yaml
+
+Run as root, the command keeps an existing `engines.yaml`'s owner and mode, and
+creates a new one (and its lock) owned by the role's service user (the owner of
+the host's `state_dir`, `mllm`), mode 0600, so the role can read it. It talks to
+the role over `<state_dir>/control.sock`, which serves root as well as the
+service user. Root also runs the named installation's version check and
+deep-park probe, so name only an installation you trust. Keep the `--config`:
+`mllm engine`, `mllm list engines`, and the role itself all resolve
+`engines.yaml` by the same rule (`--config`, then `$MLLM_CONFIG`, then
+`~/.config/mllm/engines.yaml`), and without it root's `~/.config` is a
+different file than the one the role reads. The packaged standalone unit
+starts without `--config`, so its `engines.yaml` is the service user's
+`/var/lib/mllm/.config/mllm/engines.yaml`, which the service user can write:
+`sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm engine add …`.
 
 `engine add` also works before any role has ever started — the first-run path
 of adding an engine, then starting the role for the first time. It creates the

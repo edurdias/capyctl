@@ -1,15 +1,15 @@
 //! ADR 0018 §3, §4: the host's answers to `mllm engine add`, `remove` and
 //! `list` over the control socket. Add re-reads host.yaml merged with its
-//! engines.yaml and publishes it live; remove retires on the server first and
-//! rewrites engines.yaml (never host.yaml) only after confirmation. Nothing
-//! here reaches an engine.
+//! engines.yaml and publishes it live; remove retires the profile on the
+//! server and answers once the server confirmed it. Controller ruling C1: the
+//! role never writes engines.yaml (under the system units `/etc` is read-only
+//! to it); the CLI writes it after the confirmation, then asks for the reload
+//! that publishes the removal. Nothing here reaches an engine.
 use crate::control_socket::{ControlHandler, ControlRequest};
 use crate::journal::HostJournal;
 use crate::profiles::ProfileSet;
 use crate::session::{ProfileUpdates, PublishOutcome, RetireOutcome};
-use mllm_config::registration::{
-    lock_engines, only_profiles_differ, removed_profiles, write_engines, EnginesFile,
-};
+use mllm_config::registration::{only_profiles_differ, removed_profiles};
 use mllm_config::remote_roles::HostConfig;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -144,14 +144,6 @@ impl HostControl {
         json!({"ok": true, "published": "pending_session"})
     }
 
-    fn write_without(&self, profile: &str) -> Result<u64, Value> {
-        let path = &self.engines;
-        let lock = lock_engines(path).map_err(|e| refused("internal", e.detail))?;
-        let mut engines = EnginesFile::load(path).map_err(invalid)?;
-        engines.profiles.remove(profile);
-        write_engines(&engines, &lock, None).map_err(|e| refused("internal", e.detail))
-    }
-
     /// Whether host.yaml itself (not engines.yaml) declares `profile`.
     fn declared_by_operator(&self, profile: &str) -> bool {
         std::fs::read_to_string(&self.document)
@@ -160,27 +152,22 @@ impl HostControl {
             .is_some_and(|document| document["runtime_profiles"].get(profile).is_some())
     }
 
-    async fn remove(&self, profile: &str, drain: bool) -> Value {
-        // ADR 0018 §2: only what `engine add` registered is removed here; a
-        // profile the operator declared in host.yaml stays theirs to edit.
-        match EnginesFile::load(&self.engines) {
-            Ok(engines) if engines.profiles.contains_key(profile) => {}
-            Ok(_) if self.declared_by_operator(profile) => {
-                return refused(
-                    "invalid_config",
-                    format!(
-                        "{profile} is declared in {}; edit that file and restart the role",
-                        self.document.display()
-                    ),
-                )
-            }
-            Ok(_) => {
-                return refused(
-                    "invalid_config",
-                    format!("no registered profile named {profile}"),
-                )
-            }
-            Err(e) => return invalid(e),
+    /// ADR 0018 §4, phase one for `mllm engine remove`: retire `profile` on
+    /// the server if this host publishes it. `{"retired": true}` once the
+    /// server confirmed nothing on this host uses it; `{"retired": false}`
+    /// when the host never published it. Nothing is written here (controller
+    /// ruling C1): the CLI rewrites engines.yaml, then asks for a reload.
+    async fn retire(&self, profile: &str, drain: bool) -> Value {
+        // ADR 0018 §2: a profile the operator declared in host.yaml stays
+        // theirs to edit; mllm never removes it.
+        if self.declared_by_operator(profile) {
+            return refused(
+                "invalid_config",
+                format!(
+                    "{profile} is declared in {}; edit that file and restart the role",
+                    self.document.display()
+                ),
+            );
         }
         let published = self
             .updates
@@ -189,38 +176,32 @@ impl HostControl {
             .config
             .profiles
             .contains_key(profile);
-        if published {
-            // Owner decision 2026-09-25 (design rule 3): never without the
-            // server's confirmation that nothing on this host uses it.
-            match self.updates.retire(profile, drain, RETIRE_BOUND).await {
-                RetireOutcome::Confirmed => {}
-                RetireOutcome::InUse(deployments) | RetireOutcome::Holding(deployments) => {
-                    return json!({"ok": false, "code": "profile_in_use", "deployments": deployments,
-                        "message": "deployments on this host use the profile; stop them, or use --drain"});
-                }
-                RetireOutcome::Refused(reason) => return refused("publish_rejected", reason),
-                RetireOutcome::RestartRequired => {
-                    return refused(
-                        "publish_rejected",
-                        "the server does not support live profile updates; stop the deployments that use it and the role, remove the profile, then restart the role",
-                    )
-                }
-                RetireOutcome::NotConnected | RetireOutcome::SessionEnded => {
-                    return refused(
-                        "agent_unreachable",
-                        "the host has no control session; nothing was removed",
-                    )
-                }
+        if !published {
+            return json!({"ok": true, "retired": false});
+        }
+        // Owner decision 2026-09-25 (design rule 3): never without the
+        // server's confirmation that nothing on this host uses it.
+        match self.updates.retire(profile, drain, RETIRE_BOUND).await {
+            RetireOutcome::Confirmed => json!({"ok": true, "retired": true}),
+            RetireOutcome::InUse(deployments) | RetireOutcome::Holding(deployments) => {
+                json!({"ok": false, "code": "profile_in_use", "deployments": deployments,
+                    "message": "deployments on this host use the profile; stop them, or use --drain"})
             }
+            RetireOutcome::Refused(reason) => refused("publish_rejected", reason),
+            RetireOutcome::RestartRequired => refused(
+                "publish_rejected",
+                "the server does not support live profile updates; stop the deployments that use it and the role, remove the profile, then restart the role",
+            ),
+            RetireOutcome::NotConnected => refused(
+                "agent_unreachable",
+                "the host has no control session; nothing was removed",
+            ),
+            // Controller ruling I4: the request may have reached the server.
+            RetireOutcome::SessionEnded => refused(
+                "agent_unreachable",
+                format!("the control session ended, or the server did not answer in time, before the retirement of {profile} was confirmed; the outcome is unknown: run `mllm engine list`, and `mllm engine remove {profile}` again to finish (a retry resumes the same removal)"),
+            ),
         }
-        if let Err(reply) = self.write_without(profile) {
-            return reply;
-        }
-        let mut reply = self.reload().await;
-        if reply["ok"] == true {
-            reply["removed"] = profile.into();
-        }
-        reply
     }
 
     fn list(&self) -> Value {
@@ -285,7 +266,7 @@ impl ControlHandler for HostControl {
             }
             ControlRequest::Remove { profile, drain } => {
                 let _one = self.mutation.lock().await;
-                self.remove(&profile, drain).await
+                self.retire(&profile, drain).await
             }
             ControlRequest::List => self.list(),
         }

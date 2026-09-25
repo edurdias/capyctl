@@ -26,7 +26,10 @@ const MAX_PROFILE: usize = 64;
 pub enum ControlRequest {
     /// Re-read the role document merged with engines.yaml and publish it.
     Add,
-    /// Retire a published profile, then rewrite the document and publish.
+    /// Retire a published profile on the server (phase one of `engine
+    /// remove`). The role writes nothing; the CLI rewrites engines.yaml once
+    /// this is confirmed and then sends `Add` to publish the removal
+    /// (controller ruling C1).
     Remove { profile: String, drain: bool },
     /// Report what the role has published and what uses it.
     List,
@@ -127,6 +130,28 @@ fn own_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// ADR 0018 §3 (controller ruling C1): the role serves the user id running
+/// it and root. Under the system units the operator runs `sudo mllm engine
+/// …`; root can already read and write everything the role owns, so
+/// admitting it widens nothing.
+fn peer_admitted(peer: u32, expected: u32) -> bool {
+    peer == expected || peer == 0
+}
+
+/// ADR 0018 §3 (controller ruling C1): a client speaks to a socket served by
+/// its own user id. Root (`sudo mllm engine …`) speaks to the role's service
+/// user instead: the owner of the private (0700) directory holding the socket,
+/// which is the role's state directory; no other user could have bound there.
+fn server_trusted(own: u32, peer: u32, directory_owner: Option<u32>) -> bool {
+    peer == own || (own == 0 && directory_owner == Some(peer))
+}
+
+/// The owner of `socket`'s directory, if it is a private (0700) directory.
+fn private_directory_owner(socket: &Path) -> Option<u32> {
+    let meta = std::fs::symlink_metadata(socket.parent()?).ok()?;
+    (meta.file_type().is_dir() && meta.mode() & 0o7777 == 0o700).then(|| meta.uid())
+}
+
 pub struct ControlServer {
     path: PathBuf,
     /// `(st_dev, st_ino)` of the socket this server created, so shutdown
@@ -217,9 +242,9 @@ impl ControlServer {
                 accepted = self.listener.accept() => accepted,
             };
             let Ok((stream, _)) = accepted else { continue };
-            // ADR 0018 §3: only the user id running mllm; anyone else is
-            // closed unanswered, before anything is read.
-            if !matches!(stream.peer_cred(), Ok(cred) if cred.uid() == expected_uid) {
+            // ADR 0018 §3: only the user id running mllm (and root); anyone
+            // else is closed unanswered, before anything is read.
+            if !matches!(stream.peer_cred(), Ok(cred) if peer_admitted(cred.uid(), expected_uid)) {
                 drop(stream);
                 continue;
             }
@@ -310,7 +335,8 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 /// Send one request and read its reply within `timeout`. The socket must be
-/// served by this same user id; a socket of anyone else is not spoken to.
+/// served by this same user id (or, for root, by the owner of the socket's
+/// private directory); a socket of anyone else is not spoken to.
 pub async fn request(
     path: &Path,
     request: &ControlRequest,
@@ -331,7 +357,10 @@ pub async fn request(
         let mut stream = tokio::net::UnixStream::connect(path)
             .await
             .map_err(unreachable)?;
-        if !matches!(stream.peer_cred(), Ok(cred) if cred.uid() == own_uid()) {
+        let directory_owner = private_directory_owner(path);
+        if !matches!(stream.peer_cred(),
+            Ok(cred) if server_trusted(own_uid(), cred.uid(), directory_owner))
+        {
             return Err(ClientError::Unreachable(format!(
                 "{} is not served by this user",
                 path.display()
@@ -363,5 +392,39 @@ pub async fn request(
             "the role did not answer in time".into(),
         )),
         Err(_) => Err(ClientError::TimedOut),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T37 (ADR 0018 §3; controller ruling C1): `sudo mllm engine …` reaches
+    // the role running as its service user; no one else does, and root never
+    // trusts a socket in a directory another user could have bound in.
+    #[test]
+    fn root_and_the_service_user_reach_each_other_and_no_one_else() {
+        let (service, operator, root) = (990, 1000, 0);
+        // The role, running as the service user, admits itself and root.
+        assert!(peer_admitted(service, service));
+        assert!(peer_admitted(root, service));
+        assert!(!peer_admitted(operator, service));
+        // The client trusts its own user id.
+        assert!(server_trusted(operator, operator, None));
+        assert!(!server_trusted(operator, service, Some(service)));
+        // Root trusts the owner of the socket's private directory only.
+        assert!(server_trusted(root, service, Some(service)));
+        assert!(!server_trusted(root, service, Some(operator)));
+        assert!(!server_trusted(root, service, None));
+    }
+
+    #[test]
+    fn the_directory_owner_is_read_only_from_a_private_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(private_directory_owner(&socket), Some(own_uid()));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert_eq!(private_directory_owner(&socket), None);
     }
 }

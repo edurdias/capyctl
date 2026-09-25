@@ -1,12 +1,12 @@
 //! ADR 0018 §5: standalone's answers to `mllm engine add`, `remove` and
 //! `list`, in one process. Add re-reads engines.yaml, rebuilds the embedded
 //! host document and swaps it; remove retires through the store (the
-//! ordinary stop path when drained) before rewriting engines.yaml. The
-//! standalone document is never written. Nothing here reaches an engine.
+//! ordinary stop path when drained). Controller ruling C1: the role never
+//! writes engines.yaml; the CLI rewrites it once the retirement is confirmed
+//! and then asks for the reload. The standalone document is never written.
+//! Nothing here reaches an engine.
 use mllm_agent::control_socket::{ControlHandler, ControlRequest};
-use mllm_config::registration::{
-    check_profile, lock_engines, write_engines, EnginesFile, ENVIRONMENT_PROFILES,
-};
+use mllm_config::registration::{check_profile, EnginesFile, ENVIRONMENT_PROFILES};
 use mllm_controller::coordinator::CoordinatorCommands;
 use mllm_controller::engine_provider::{EngineProvider, NamedInstallation, ProviderError};
 use mllm_controller::installation_gate::EmbeddedInstallations;
@@ -340,61 +340,39 @@ impl StandaloneControl {
         step
     }
 
-    async fn remove(&self, profile: &str, drain: bool) -> Value {
+    /// ADR 0018 §4, phase one for `mllm engine remove`: retire `profile` if
+    /// the embedded host publishes it. `{"retired": true}` once the store
+    /// confirmed nothing uses it, `{"retired": false}` when it is not
+    /// published. Nothing is written here (controller ruling C1).
+    async fn retire_for_removal(&self, profile: &str, drain: bool) -> Value {
         if ENVIRONMENT_PROFILES.contains(&profile) {
             return refused(
                 "invalid_config",
                 format!("{profile} comes from MLLM_VLLM_BIN / MLLM_SGLANG_BIN; unset it and restart the role"),
             );
         }
-        match EnginesFile::load(&self.engines) {
-            Ok(file) if file.profiles.contains_key(profile) => {}
-            Ok(_) => {
-                return refused(
-                    "invalid_config",
-                    format!("no registered profile named {profile}"),
-                )
-            }
-            Err(e) => return refused("invalid_config", format!("{}: {}", e.path, e.detail)),
-        }
         // The role keeps at least one engine: refused before anything is retired.
         if let Err(reply) = self.without(profile).await {
             return reply;
         }
+        if !self.host.profiles().iter().any(|p| p == profile) {
+            return json!({"ok": true, "retired": false});
+        }
+        // Controller ruling I1: a retirement already standing for the
+        // profile is resumed under its own key, so a retried remove finishes
+        // it instead of conflicting.
         let key = format!("{}:{}", self.host_id, ulid::Ulid::new());
         // Owner decision 2026-09-25 (design rule 3): a published profile is
         // removed only once the store confirms nothing on this host uses it.
-        let published = self.host.profiles().iter().any(|p| p == profile);
-        if published {
-            match self.retire(profile, &key, drain).await {
-                RetirementStep::Confirmed => {}
-                RetirementStep::InUse(deployments) | RetirementStep::Holding(deployments) => {
-                    return json!({"ok": false, "code": "profile_in_use", "deployments": deployments,
-                        "message": "deployments on this host use the profile; stop them, or use --drain"})
-                }
-                RetirementStep::Refused(reason) => return refused("publish_rejected", reason),
-                RetirementStep::Draining(_) => {
-                    return refused("internal", "the retirement did not finish")
-                }
+        match self.retire(profile, &key, drain).await {
+            RetirementStep::Confirmed => json!({"ok": true, "retired": true}),
+            RetirementStep::InUse(deployments) | RetirementStep::Holding(deployments) => {
+                json!({"ok": false, "code": "profile_in_use", "deployments": deployments,
+                    "message": "deployments on this host use the profile; stop them, or use --drain"})
             }
+            RetirementStep::Refused(reason) => refused("publish_rejected", reason),
+            RetirementStep::Draining(_) => refused("internal", "the retirement did not finish"),
         }
-        let written = lock_engines(&self.engines).and_then(|lock| {
-            let mut file = EnginesFile::load(&self.engines)?;
-            file.profiles.remove(profile);
-            write_engines(&file, &lock, None)
-        });
-        if let Err(e) = written {
-            // The confirmed retirement stands, so nothing is placed on the
-            // profile; a second `engine remove` finishes it.
-            return refused("internal", format!("{}: {}", e.path, e.detail));
-        }
-        // The publication without the profile clears its confirmed
-        // retirement, so the name can be registered again.
-        let mut reply = self.reload().await;
-        if reply["ok"] == true {
-            reply["removed"] = profile.into();
-        }
-        reply
     }
 
     fn list(&self) -> Value {
@@ -448,7 +426,7 @@ impl ControlHandler for StandaloneControl {
             }
             ControlRequest::Remove { profile, drain } => {
                 let _one = self.mutation.lock().await;
-                self.remove(&profile, drain).await
+                self.retire_for_removal(&profile, drain).await
             }
             ControlRequest::List => self.list(),
         }

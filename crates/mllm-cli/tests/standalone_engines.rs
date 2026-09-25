@@ -139,11 +139,12 @@ async fn standalone_add_is_usable_without_restart() {
     let _ = app.shutdown().await;
 }
 
-// T16 T32 (ADR 0018 §4, §5): an unused registered profile is removed and
-// unpublished; an environment profile cannot be removed; the name can be
-// registered again afterwards.
+// T16 T32 (ADR 0018 §4, §5; controller ruling C1): an unused registered
+// profile is retired without the role writing anything; the CLI's rewrite
+// and reload unpublish it; an environment profile cannot be removed; the
+// name can be registered again afterwards.
 #[tokio::test]
-async fn standalone_remove_rewrites_and_unpublishes() {
+async fn standalone_remove_retires_and_the_reload_unpublishes() {
     let state = support::safe_state_dir();
     let document = standalone_doc(state.path());
     register(&document, "vllm-patched");
@@ -165,11 +166,16 @@ async fn standalone_remove_rewrites_and_unpublishes() {
     )
     .await
     .unwrap();
-    assert_eq!(reply["removed"], "vllm-patched", "{reply}");
-    assert!(!EnginesFile::load(&engines_beside(&document))
+    assert_eq!(reply, serde_json::json!({"ok": true, "retired": true}));
+    assert!(EnginesFile::load(&engines_beside(&document))
         .unwrap()
         .profiles
         .contains_key("vllm-patched"));
+    unregister(&document, "vllm-patched");
+    let reload = request(&socket, &ControlRequest::Add, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(reload["published"], "published", "{reload}");
     assert_eq!(app.profiles(), vec!["local".to_string()]);
     let refused = request(
         &socket,

@@ -13,8 +13,8 @@ use mllm_agent::engines::{
 use mllm_config::effective::InstallationDrift;
 use mllm_config::engine_policy::Engine;
 use mllm_config::registration::{
-    check_profile, lock_engines, profile_document, valid_profile_name, write_engines, EnginesFile,
-    ProfileSpec, ENVIRONMENT_PROFILES,
+    check_profile, lock_engines_for, profile_document, valid_profile_name, write_engines,
+    EnginesFile, ProfileSpec, ENVIRONMENT_PROFILES,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -260,7 +260,8 @@ fn declared_by_operator(
 /// ADR 0018 §2: lock engines.yaml, re-check the name against both files,
 /// validate, write. The role document is never written. The revision written.
 fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64, StructuredError> {
-    let lock = lock_engines(&target.engines).map_err(|e| error("internal", e.detail))?;
+    let lock = lock_engines_for(&target.engines, service_owner(target))
+        .map_err(|e| error("internal", format!("{}: {}", e.path, e.detail)))?;
     let mut engines =
         EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
     if engines.profiles.contains_key(name) || declared_by_operator(target)?.contains_key(name) {
@@ -420,6 +421,12 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
     )
 }
 
+/// ADR 0018 §4 (controller ruling C1): the CLI is the only writer of
+/// engines.yaml. Remove asks the running role to retire the profile, waits
+/// for the confirmation, then writes engines.yaml without it and asks the
+/// role to reload, which publishes the removal. A retry after any failure
+/// resumes the same retirement (controller ruling I1), so a crash between the
+/// confirmation and the write is finished by running remove again.
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
     if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name) {
         return Err(error("invalid_config", format!(
@@ -428,21 +435,24 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
     }
     let engines =
         EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
-    if !engines.profiles.contains_key(name) {
-        // ADR 0018 §2: a profile declared in the role document is the operator's.
+    let registered = engines.profiles.contains_key(name);
+    // ADR 0018 §2: a profile declared in the role document is the operator's.
+    if !registered && declared_by_operator(target)?.contains_key(name) {
         return Err(error(
             "invalid_config",
-            if declared_by_operator(target)?.contains_key(name) {
-                format!(
-                    "{name} is declared in {}; edit that file and restart the role",
-                    target.role_document.display()
-                )
-            } else {
-                format!("{} has no profile named {name}", target.engines.display())
-            },
+            format!(
+                "{name} is declared in {}; edit that file and restart the role",
+                target.role_document.display()
+            ),
         ));
     }
-    match request(
+    let not_registered = || {
+        error(
+            "invalid_config",
+            format!("{} has no profile named {name}", target.engines.display()),
+        )
+    };
+    let retired = match request(
         &target.socket,
         &ControlRequest::Remove {
             profile: name.into(),
@@ -452,24 +462,93 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
     )
     .await
     {
-        Ok(reply) if reply["ok"] == true => Ok(reply),
+        Ok(reply) if reply["ok"] == true => reply["retired"] == true,
         Ok(reply) => {
             let mut message = reply["message"].as_str().unwrap_or("refused").to_owned();
             if let Some(names) = reply["deployments"].as_array().filter(|n| !n.is_empty()) {
                 let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
                 message = format!("{message}: {}", names.join(", "));
             }
-            Err(error(closed(reply["code"].as_str().unwrap_or("")), message))
+            return Err(error(closed(reply["code"].as_str().unwrap_or("")), message));
         }
         // Controller ruling I4: the role took the request and may have
         // acted on it; only `engine list` can say what happened.
-        Err(ClientError::Unanswered(e)) => Err(unknown_outcome(&e, name)),
+        Err(ClientError::Unanswered(e)) => return Err(unknown_outcome(&e, name)),
+        Err(_) if !registered => return Err(not_registered()),
         // Owner decision 2026-09-25: a published profile is never removed unconfirmed.
+        Err(e) => {
+            return Err(error(
+                "agent_unreachable",
+                format!("{e}; nothing was removed; start the role and retry"),
+            ))
+        }
+    };
+    // Neither registered nor published by the role: there is nothing to remove.
+    if !registered && !retired {
+        return Err(not_registered());
+    }
+    let revision = if registered {
+        write_without(target, name).map_err(|e| {
+            error(
+                "internal",
+                format!(
+                    "{}: {}; {}. Run `mllm engine remove {name}` again to finish",
+                    e.path,
+                    e.detail,
+                    if retired {
+                        format!("{name} is retired, so nothing new is placed on it")
+                    } else {
+                        "nothing was removed".into()
+                    }
+                ),
+            )
+        })?
+    } else {
+        engines.revision
+    };
+    let mut out = json!({"removed": name, "engines_file": target.engines, "revision": revision});
+    match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
+        Ok(reply) if reply["ok"] == true => {
+            out["published"] = reply["published"].clone();
+            Ok(out)
+        }
+        Ok(reply) => Err(error(
+            closed(reply["code"].as_str().unwrap_or("")),
+            format!(
+                "{}; {name} is out of {} (revision {revision}) but the role has not published its removal; run `mllm engine remove {name}` again to finish",
+                reply["message"].as_str().unwrap_or("refused"),
+                target.engines.display()
+            ),
+        )),
         Err(e) => Err(error(
             "agent_unreachable",
-            format!("{e}; nothing was removed; start the role and retry"),
+            format!(
+                "{e}; {name} is out of {} (revision {revision}) but its removal may not be published; run `mllm engine list`, and `mllm engine remove {name}` again to finish",
+                target.engines.display()
+            ),
         )),
     }
+}
+
+/// Controller ruling C1: who the role runs as, when this CLI is root and the
+/// role's state directory belongs to another user: a new engines.yaml goes to
+/// that user so the role can read it. `None` otherwise (the writer owns it).
+fn service_owner(target: &Target) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(&target.state_dir).ok()?;
+    (meta.file_type().is_dir() && meta.uid() != 0).then(|| (meta.uid(), meta.gid()))
+}
+
+/// engines.yaml without `name`, under the lock, keeping its owner and mode.
+fn write_without(target: &Target, name: &str) -> Result<u64, mllm_config::ConfigError> {
+    let lock = lock_engines_for(&target.engines, service_owner(target))?;
+    let mut engines = EnginesFile::load(&target.engines)?;
+    engines.profiles.remove(name);
+    write_engines(&engines, &lock, None)
 }
 
 /// Controller ruling I4: a remove the role took but never answered.

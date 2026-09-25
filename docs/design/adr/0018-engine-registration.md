@@ -60,10 +60,18 @@ ignores comments. A host whose merged document would exceed the 32 KiB publicati
 refused before anything is written. `engine remove` removes only registered profiles; one
 declared in the role document stays the operator's to edit.
 
+The `mllm engine` CLI is the only writer of `engines.yaml`; a running role only reads it
+(controller ruling C1, 2026-09-25). A rewrite keeps the file's owner and mode. When the CLI
+runs as root (`sudo mllm engine …` under the system units) and creates the file, it creates it
+and its lock for the owner of the role's state directory (the service user), mode 0600, so the
+role can read it and a read-only `/etc` (`ProtectSystem=strict`) never blocks the role.
+
 ### 3. Live reload
 
 The role listens on `<state_dir>/control.sock`, a Unix socket with mode 0600 whose
-connections are accepted only from the user id running mllm (`SO_PEERCRED`). It carries one
+connections are accepted only from the user id running mllm and from root (`SO_PEERCRED`). A
+client speaks only to a socket served by its own user id; root speaks to the owner of the
+socket's private (0700) directory, the role's service user. It carries one
 JSON request and one JSON response per connection, `add` (reload the engines file), `remove` and
 `list`, and nothing else. It never reaches an engine.
 
@@ -97,15 +105,29 @@ ordinary stop path (drain up to `switching.drain_timeout`, then terminate, gone 
 required), and the retirement is confirmed only when every stop succeeded and a fresh
 enumeration is empty. An unsettled or failed stop keeps its accounting; at the drain window
 (900 s) the retirement ends and the CLI reports `profile_in_use` with what is unsettled.
-After confirmation the host rewrites `engines.yaml` without the profile and re-publishes; the
-publication transaction deletes the retirement. A profile the role never published is
-removed locally. A published profile is never removed while the role is unreachable
-(`agent_unreachable`, nothing written).
+The role answers `remove` once the retirement is confirmed and writes nothing. The CLI then
+rewrites `engines.yaml` without the profile and sends `add`; the role re-publishes, and the
+publication transaction deletes the retirement. Any accepted publication, at startup or live,
+clears the confirmed retirement of every profile it does not list. A retirement keeps the key
+it was first written under until it is cleared, so a retried `remove` (after a lost answer, a
+dropped session, a crash between the confirmation and the CLI's write, or a failed reload)
+resumes it and finishes the removal; a retirement still draining is resumed as draining. A
+profile the role never published is removed from `engines.yaml` without a retirement. A
+published profile is never removed while the role is unreachable (`agent_unreachable`,
+nothing written). A `remove` the role took but did not answer (the connection closed or the
+CLI's bound, the role's 960 s plus a margin, passed) is reported as an unknown outcome, with
+`mllm engine list` to settle it.
 
 ### 5. Standalone
 
-Standalone runs the same steps in one process: the same socket, the same `engines.yaml` write,
-the same retirement over the embedded host. `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone still
+Standalone runs the same steps in one process: the same socket, the same CLI-written
+`engines.yaml`, the same retirement over the embedded host. The embedded host is not enrolled,
+so its published profiles are recorded as an embedded publication (store v36) that placement
+reads as it reads a server's approved document: a profile it no longer publishes takes no new
+instance, explicit or on demand. A reload that would drop a published profile without a
+confirmed retirement is refused (`publish_rejected`). Standalone expires abandoned
+retirements at start and every 30 s, and its startup publication clears confirmed
+retirements of profiles it no longer lists, so a role stopped mid-drain never wedges a name. `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone still
 gives profile `local`; both give `local-vllm` and `local-sglang`. They coexist with added
 profiles; a name collision is refused at start with `profile_exists`. Environment profiles are
 not removable with `engine remove`.
@@ -139,6 +161,13 @@ refused (`profile_not_published`) for that deployment.
 - Older hosts list `live_profile_update` among `capabilities_missing` in `mllm list hosts`.
 - `mllm list engines` shows what the server accepted; a profile only in a host's
   `engines.yaml` is visible in that host's `mllm engine list`.
+- The role never needs write access to its configuration directory: under the system units
+  `/etc/mllm` stays read-only to it, and the operator runs `sudo mllm engine … --config
+  /etc/mllm/host.yaml` (controller ruling C1). The CLI runs the version check and the
+  deep-park probe of a named installation as the user that invoked it, root in that case.
+- A crash between a confirmed retirement and the CLI's write leaves the profile in
+  `engines.yaml` while the server keeps it out of placement; running `engine remove` again
+  finishes it.
 
 ## Verification
 

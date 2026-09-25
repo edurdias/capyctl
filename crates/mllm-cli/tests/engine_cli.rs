@@ -570,3 +570,128 @@ async fn remove_without_an_answer_reports_an_unknown_outcome() {
     );
     assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
 }
+
+/// A role that answers `remove` and `add` each its own way.
+struct ByOp {
+    seen: Mutex<Vec<ControlRequest>>,
+    remove: Value,
+    add: Value,
+}
+#[async_trait::async_trait]
+impl ControlHandler for ByOp {
+    async fn handle(&self, request: ControlRequest) -> Value {
+        self.seen.lock().unwrap().push(request.clone());
+        match request {
+            ControlRequest::Remove { .. } => self.remove.clone(),
+            ControlRequest::Add => self.add.clone(),
+            ControlRequest::List => json!({"ok": false, "code": "internal"}),
+        }
+    }
+}
+
+async fn role_by_op(
+    document: &Path,
+    remove: Value,
+    add: Value,
+) -> (Arc<ByOp>, tokio::sync::watch::Sender<bool>) {
+    let target = resolve_target(Some(document), Path::new("/nonexistent"), &|k| {
+        (k == "HOME").then(|| "/home/u".into())
+    })
+    .unwrap();
+    let server = ControlServer::bind(&target.socket).unwrap();
+    let handler = Arc::new(ByOp {
+        seen: Mutex::new(vec![]),
+        remove,
+        add,
+    });
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(server.serve(handler.clone(), unsafe { libc::geteuid() }, shutdown));
+    (handler, stop)
+}
+
+fn remove_vllm() -> Command {
+    Command::EngineRemove {
+        name: "vllm".into(),
+        drain: false,
+    }
+}
+
+// T16 (ADR 0018 §4; controller ruling C1): the CLI is the only writer of
+// engines.yaml. It asks the role to retire the profile, and only after the
+// confirmation writes the file (keeping its mode) and asks for the reload.
+#[tokio::test]
+async fn remove_retires_then_writes_and_reloads() {
+    let dir = private_dir();
+    let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
+    let document = host_doc(dir.path());
+    let _ = execute(&add(&env), Some(&document), dir.path()).await;
+    let (role, stop) = role_by_op(
+        &document,
+        json!({"ok": true, "retired": true}),
+        json!({"ok": true, "published": "published"}),
+    )
+    .await;
+    let out = execute(&remove_vllm(), Some(&document), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out["removed"], "vllm", "{out}");
+    assert_eq!(out["published"], "published", "{out}");
+    assert_eq!(out["revision"], 2, "{out}");
+    let engines = engines_of(&document);
+    assert!(!engines.profiles.contains_key("vllm"));
+    assert_eq!(
+        std::fs::metadata(engines_beside(&document))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        *role.seen.lock().unwrap(),
+        vec![
+            ControlRequest::Remove {
+                profile: "vllm".into(),
+                drain: false
+            },
+            ControlRequest::Add
+        ]
+    );
+    stop.send(true).unwrap();
+}
+
+// T16 T32 (controller rulings C1, I1): a remove whose confirmation came but
+// whose publication did not (the file is already written) is finished by
+// running it again: the role still publishes the profile, the retry resumes
+// the retirement, and the reload publishes the removal. A name neither
+// registered nor published is refused.
+#[tokio::test]
+async fn a_rerun_remove_finishes_a_removal_the_file_already_shows() {
+    let dir = private_dir();
+    let document = host_doc(dir.path());
+    let (role, stop) = role_by_op(
+        &document,
+        json!({"ok": true, "retired": true}),
+        json!({"ok": true, "published": "published"}),
+    )
+    .await;
+    let out = execute(&remove_vllm(), Some(&document), dir.path())
+        .await
+        .unwrap();
+    assert_eq!(out["removed"], "vllm", "{out}");
+    assert_eq!(out["published"], "published", "{out}");
+    assert_eq!(role.seen.lock().unwrap().len(), 2);
+    stop.send(true).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (_role, stop) = role_by_op(
+        &document,
+        json!({"ok": true, "retired": false}),
+        json!({"ok": true, "published": "unchanged"}),
+    )
+    .await;
+    let error = execute(&remove_vllm(), Some(&document), dir.path())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "invalid_config", "{}", error.message);
+    stop.send(true).unwrap();
+}

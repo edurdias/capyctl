@@ -153,9 +153,24 @@ pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<()
 pub struct EnginesLock {
     _file: File,
     path: PathBuf,
+    /// Who owns an engines file this write creates (`None`: the writer).
+    owner: Option<(u32, u32)>,
 }
 
 pub fn lock_engines(path: &Path) -> Result<EnginesLock, ConfigError> {
+    lock_engines_for(path, None)
+}
+
+/// As [`lock_engines`], naming who owns what this write creates. Controller
+/// ruling C1: the CLI is the only writer of engines.yaml, and under the
+/// system units it runs as root (`sudo mllm engine …`); the file and its
+/// lock are then created for the role's service user (`owner`, uid and gid),
+/// mode 0600, so the service can read the file. An existing file keeps its
+/// owner and mode (see [`write_engines`]).
+pub fn lock_engines_for(
+    path: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<EnginesLock, ConfigError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
     }
@@ -168,11 +183,26 @@ pub fn lock_engines(path: &Path) -> Result<EnginesLock, ConfigError> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&lock)
         .map_err(|e| io(&lock, e))?;
+    if let Some(owner) = owner {
+        give(&file, owner).map_err(|e| io(&lock, e))?;
+    }
     file.lock().map_err(|e| io(&lock, e))?;
     Ok(EnginesLock {
         _file: file,
         path: path.to_path_buf(),
+        owner,
     })
+}
+
+/// `fchown` `file` to `(uid, gid)` unless it already has them (only root may
+/// give a file away; a writer that already owns it changes nothing).
+fn give(file: &File, (uid, gid): (u32, u32)) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    if (meta.uid(), meta.gid()) == (uid, gid) {
+        return Ok(());
+    }
+    std::os::unix::fs::fchown(file, Some(uid), Some(gid))
 }
 
 /// ADR 0018 §2: write `file` under `lock` at the next revision and return it.
@@ -209,10 +239,23 @@ pub fn write_engines(
     // SPEC §15.3: validate before side effects.
     EnginesFile::parse(&file.path, &text)?;
     let dir = file.path.parent().unwrap_or(Path::new("."));
+    // Controller ruling C1: a rewrite keeps the file's owner and mode (the
+    // role reads it as its service user; the CLI may be running as root); a
+    // new file goes to the lock's named owner, mode 0600.
+    let (owner, mode) = match fs::symlink_metadata(&file.path) {
+        Ok(meta) if meta.file_type().is_file() => {
+            use std::os::unix::fs::MetadataExt;
+            (Some((meta.uid(), meta.gid())), meta.mode() & 0o777)
+        }
+        _ => (lock.owner, 0o600),
+    };
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| io(dir, e))?;
     tmp.write_all(text.as_bytes())
         .map_err(|e| io(tmp.path(), e))?;
-    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o600))
+    if let Some(owner) = owner {
+        give(tmp.as_file(), owner).map_err(|e| io(tmp.path(), e))?;
+    }
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))
         .map_err(|e| io(tmp.path(), e))?;
     tmp.as_file().sync_all().map_err(|e| io(tmp.path(), e))?;
     tmp.persist(&file.path)

@@ -688,7 +688,12 @@ impl Agent {
 
 async fn agent(h: &Harness) -> Agent {
     let dir = directory();
-    let document = dir.path().join("host.yaml");
+    // The role's configuration directory, apart from its state (as
+    // `/etc/mllm` is under the system units), so a test can make it
+    // read-only to the role.
+    let etc = dir.path().join("etc");
+    std::fs::create_dir(&etc).unwrap();
+    let document = etc.join("host.yaml");
     std::fs::write(&document, prepared_document().to_string()).unwrap();
     let config =
         mllm_config::remote_roles::HostConfig::parse(&prepared_document().to_string()).unwrap();
@@ -826,10 +831,13 @@ async fn a_reload_refuses_a_document_changed_outside_profiles() {
     h.server.abort();
 }
 
-// T16: a published profile is removed only after the server confirms; the
-// engines file is rewritten (host.yaml never) and the removal published.
+// T16 (controller ruling C1): the role retires a published profile and
+// answers once the server confirms, writing nothing: its configuration
+// directory may be read-only to it (ProtectSystem=strict under the system
+// units). The CLI then rewrites engines.yaml, and the reload it asks for
+// publishes the removal; host.yaml is never rewritten.
 #[tokio::test]
-async fn a_confirmed_removal_rewrites_and_publishes() {
+async fn a_confirmed_retirement_writes_nothing_and_the_reload_publishes_the_removal() {
     let h = enrolled().await;
     h.sessions.with_profile_retirements(Arc::new(Scripted {
         first: RetirementStep::Confirmed,
@@ -843,7 +851,9 @@ async fn a_confirmed_removal_rewrites_and_publishes() {
         a.control.handle(ControlRequest::Add).await["published"],
         "published"
     );
+    let engines_path = mllm_config::registration::engines_beside(&a.document);
     let host_before = std::fs::read(&a.document).unwrap();
+    let engines_before = std::fs::read(&engines_path).unwrap();
     // The scripted service confirms without the store row the publication
     // transaction needs; write it as StoreRetirements would.
     h.state
@@ -852,6 +862,8 @@ async fn a_confirmed_removal_rewrites_and_publishes() {
         .store()
         .begin_profile_retirement(&h.host, "vllm", "k", 1, i64::MAX / 2, false)
         .unwrap();
+    let etc = a.document.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o555)).unwrap();
     let reply = a
         .control
         .handle(ControlRequest::Remove {
@@ -859,12 +871,19 @@ async fn a_confirmed_removal_rewrites_and_publishes() {
             drain: false,
         })
         .await;
-    assert_eq!(reply["removed"], "vllm", "{reply}");
+    std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(reply, json!({"ok": true, "retired": true}));
+    assert_eq!(std::fs::read(&engines_path).unwrap(), engines_before);
+    // The CLI's write, then its reload.
+    {
+        use mllm_config::registration::{lock_engines, write_engines};
+        let lock = lock_engines(&engines_path).unwrap();
+        let mut engines = EnginesFile::load(&engines_path).unwrap();
+        engines.profiles.remove("vllm");
+        write_engines(&engines, &lock, None).unwrap();
+    }
+    let reply = a.control.handle(ControlRequest::Add).await;
     assert_eq!(reply["published"], "published", "{reply}");
-    let engines =
-        EnginesFile::load(&mllm_config::registration::engines_beside(&a.document)).unwrap();
-    assert!(!engines.profiles.contains_key("vllm"));
-    assert_eq!(engines.revision, 2);
     assert_eq!(std::fs::read(&a.document).unwrap(), host_before);
     assert!(!a
         .updates
@@ -873,6 +892,23 @@ async fn a_confirmed_removal_rewrites_and_publishes() {
         .config
         .profiles
         .contains_key("vllm"));
+    assert!(h
+        .state
+        .lock()
+        .unwrap()
+        .store()
+        .profile_retirement(&h.host, "vllm")
+        .unwrap()
+        .is_none());
+    // A profile the host does not publish: nothing to retire.
+    let reply = a
+        .control
+        .handle(ControlRequest::Remove {
+            profile: "vllm".into(),
+            drain: false,
+        })
+        .await;
+    assert_eq!(reply, json!({"ok": true, "retired": false}));
     a.stop().await;
     h.server.abort();
 }

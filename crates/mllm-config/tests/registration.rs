@@ -285,3 +285,38 @@ fn profile_only_changes_are_recognised() {
     edited["load_report_interval"] = "9s".into();
     assert!(!only_profiles_differ(&old, &edited));
 }
+
+// T04 T37 (ADR 0018 §2; controller ruling C1): the CLI is the only writer of
+// engines.yaml and may run as root (`sudo mllm engine …`) under the system
+// units. A rewrite keeps the file's owner and mode, so the service user can
+// still read it; a new file is created for the owner the CLI names (the
+// role's service user), mode 0600, and so is its lock.
+#[test]
+fn a_rewrite_keeps_the_owner_and_mode_and_a_new_file_takes_the_named_owner() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_doc(dir.path());
+    let path = engines_beside(&host);
+    let me = std::fs::metadata(dir.path()).unwrap();
+    let owner = Some((me.uid(), me.gid()));
+    let lock = lock_engines_for(&path, owner).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert("vllm".into(), profile());
+    write_engines(&engines, &lock, None).unwrap();
+    drop(lock);
+    for file in [path.clone(), dir.path().join("engines.yaml.lock")] {
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (me.uid(), me.gid()), "{file:?}");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{file:?}");
+    }
+    // The operator made it group-readable for the service's group: kept.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.remove("vllm");
+    write_engines(&engines, &lock, None).unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
