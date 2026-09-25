@@ -140,11 +140,11 @@ snap() {
   x mkdir -p "$dir"
   local p=$dir/$label
   if dry; then
-    cli list deployments --output json >/dev/null; cli list hosts --output json >/dev/null
+    cli list deployments --format json >/dev/null; cli list hosts --format json >/dev/null
     x python3 "$MATRIX_DIR/ledger.py" snapshot --db "$SERVER_DB"
   else
-    cli list deployments --output json >"$p.deployments.json" 2>&1 || true
-    cli list hosts --output json >"$p.hosts.json" 2>&1 || true
+    cli list deployments --format json >"$p.deployments.json" 2>&1 || true
+    cli list hosts --format json >"$p.hosts.json" 2>&1 || true
     python3 "$MATRIX_DIR/ledger.py" snapshot --db "$SERVER_DB" >"$p.ledger.json" 2>&1 || true
   fi
   for host in "${MATRIX_HOSTS[@]}"; do

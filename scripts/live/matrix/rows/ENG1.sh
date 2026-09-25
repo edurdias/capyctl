@@ -63,7 +63,7 @@ eng_add() { # eng_add <host> <path>
 eng_listed() { # eng_listed <host> <profile...>: list engines shows them
   local host=$1
   shift
-  cli list engines --output json >"$EVID/engines.json" || return 1
+  cli list engines --format json >"$EVID/engines.json" || return 1
   dry && return 0
   python3 - "$EVID/engines.json" "$host" "$@" <<'PY'
 import json, sys

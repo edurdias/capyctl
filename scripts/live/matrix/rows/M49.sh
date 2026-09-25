@@ -14,7 +14,7 @@
 M49_MEM_SLACK_KB=${M49_MEM_SLACK_KB:-$((4 * 1024 * 1024))}
 
 live_deployments() {
-  cli list deployments --output json | python3 -c 'import json,sys
+  cli list deployments --format json | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for x in (d if isinstance(d, list) else d["deployments"]):
     n=x.get("name","")
@@ -69,7 +69,7 @@ row_main() {
   while read -r name id; do
     [ -n "$name" ] || continue
     echo "$name $id" >>"$EVID/deleted.txt"
-    step "delete-$name" timed "delete-$name" cli delete deployment "$name" --stop --output json || rc=1
+    step "delete-$name" timed "delete-$name" cli delete deployment "$name" --stop --format json || rc=1
     step "residue-$name" residue_check "$id" || rc=1
   done < <(live_deployments)
   step ledger-empty ledger_empty || rc=1

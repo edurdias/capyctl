@@ -34,7 +34,7 @@ deploy() { # deploy <fixture> [--activate] [--wait] [--request-id ULID]
   # Recorded before the call: a deploy that fails after the server accepted it
   # still leaves a deployment behind (cleanup_failed_row).
   dry || echo "$f${FIXTURE_VARIANT:+-$FIXTURE_VARIANT}" >>"$EVID/deployed.txt"
-  cli deploy model --file "$(fixture_file "$f")" "$@" --output json
+  cli deploy model --file "$(fixture_file "$f")" "$@" --format json
 }
 
 # cleanup_failed_row: run_row.sh calls this when a row fails or exits early
@@ -49,15 +49,15 @@ cleanup_failed_row() {
   [ -f "$EVID/deployed.txt" ] || return 0
   while read -r d; do
     status_dep "$d" >/dev/null 2>&1 </dev/null || continue
-    step "trap-delete-$d" cli delete deployment "$d" --stop --output json </dev/null || true
+    step "trap-delete-$d" cli delete deployment "$d" --stop --format json </dev/null || true
   done < <(sort -u "$EVID/deployed.txt")
 }
-start_dep() { cli start deployment "$1" --output json "${@:2}"; }
-stop_dep() { cli stop deployment "$1" --output json "${@:2}"; }
-park_dep() { cli park deployment "$1" --output json; }
-delete_dep() { cli delete deployment "$1" --output json; }
-status_dep() { cli status deployment "$1" --output json; }
-inspect_dep() { cli inspect deployment "$1" --output json; }
+start_dep() { cli start deployment "$1" --format json "${@:2}"; }
+stop_dep() { cli stop deployment "$1" --format json "${@:2}"; }
+park_dep() { cli park deployment "$1" --format json; }
+delete_dep() { cli delete deployment "$1" --format json; }
+status_dep() { cli status deployment "$1" --format json; }
+inspect_dep() { cli inspect deployment "$1" --format json; }
 
 # variant <fixture> <tag> [gen_deployment.py args...]: write <fixture>.<tag>.yaml
 # from the run's fixture inputs; it deploys as a new deployment <fixture>-<tag>

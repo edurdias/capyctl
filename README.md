@@ -85,6 +85,22 @@ mllm list deployments
 mllm status deployment <name>
 ```
 
+Commands that read records (`list`, `status`, `engine list`, `engine detect`)
+print an aligned table, whether or not the output is a terminal:
+
+```text
+$ mllm list deployments
+NAME       KIND    DESIRED   STATE   READY   REVISION   HOSTS
+qwen3-8b   model   ready     ready   1/1     1          workstation
+```
+
+For scripts, `--format json` (or `--json`) prints the full JSON result
+instead, including the detail a table leaves out, and makes errors JSON too:
+
+```bash
+mllm list deployments --format json | jq -r '.[].name'
+```
+
 Send a request to the route the deployment names. The inference API key is in
 the credentials file the first start wrote:
 
@@ -134,6 +150,17 @@ mllm list hosts --config server.yaml
 mllm deploy model --file deployment.yaml --activate --wait --config server.yaml
 mllm list deployments --config server.yaml
 mllm park deployment <name> --config server.yaml
+```
+
+```text
+$ mllm list hosts --config server.yaml
+NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
+gpu-box   online   yes        0.1.0-rc.4   supported       88.3 GiB / 119.7 GiB    vllm,sglang
+
+$ mllm list deployments --config server.yaml
+NAME           KIND    DESIRED   STATE    READY   REVISION   HOSTS
+qwen3-8b       model   ready     ready    1/1     1          gpu-box
+llama-3.1-8b   model   parked    parked   0/1     2          gpu-box
 ```
 
 A parked deployment releases GPU memory (its weights and KV cache with
