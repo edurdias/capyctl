@@ -62,6 +62,13 @@ pub enum ConfigurationFailure {
     /// host is eligible now; the message names each host and why (for a
     /// drain-only host, both versions). Not a capacity block.
     HostIneligible(String),
+    /// ADR 0018 §7 (owner decision 2026-09-25): no allowed host publishes the
+    /// deployment's runtime profile. Refused before anything is stored; each
+    /// allowed host is listed with the profiles it publishes.
+    ProfileNotPublished {
+        profile: String,
+        hosts: Vec<(String, Vec<String>)>,
+    },
     /// Owner decision 2026-09-23: an unmeasured model too large to measure
     /// beside anything else starts only on an empty host (`--evict`).
     StartupRequiresEmptyHost,
@@ -114,10 +121,44 @@ impl ConfigurationFailure {
                 };
                 return detailed(StatusCode::SERVICE_UNAVAILABLE, "host_ineligible", message);
             }
+            ProfileNotPublished { profile, hosts } => {
+                // ADR 0018 §7: name the profile, each allowed host with what it
+                // publishes, and the fix. Deployments are never re-resolved
+                // after `engine add`, so the operator deploys again.
+                let each: Vec<String> = hosts
+                    .iter()
+                    .map(|(host, names)| {
+                        let names = if names.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            names.join(", ")
+                        };
+                        format!("{host}: {names}")
+                    })
+                    .collect();
+                let message = format!(
+                    "runtime profile `{profile}` is not published by any allowed host ({}); register it on a host with `mllm engine add <path> --name {profile}`, then deploy again",
+                    each.join("; ")
+                );
+                let details: serde_json::Map<String, Value> = hosts
+                    .iter()
+                    .map(|(host, names)| (host.clone(), serde_json::json!(names)))
+                    .collect();
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"api_version":"1","error":{
+                        "code":"profile_not_published","message":message,"retryable":false,
+                        "operation_id":null,"details":{"profile":profile,"hosts":details}}})),
+                )
+                    .into_response();
+            }
             _ => {}
         }
         let (status, code, message, retryable) = match self {
-            InvalidConfigReason { .. } | CapacityBlockedBecause(_) | HostIneligible(_) => {
+            InvalidConfigReason { .. }
+            | CapacityBlockedBecause(_)
+            | HostIneligible(_)
+            | ProfileNotPublished { .. } => {
                 unreachable!("answered above")
             }
             LifecycleConflict => (
@@ -492,6 +533,21 @@ impl ConfigurationSource for SharedConfigurationSource {
                 .as_millis(),
         )
         .map_err(|_| ConfigurationFailure::Internal)?;
+        // ADR 0018 §7: a retry of an accepted command is answered from its
+        // receipt by the store, never re-checked against what hosts publish
+        // now; only a new command fails fast on an unpublished profile.
+        let retry = store
+            .has_configuration_receipt(
+                &self.principal,
+                key,
+                match &command {
+                    ConfigurationCommand::Create { .. } => None,
+                    ConfigurationCommand::Replace { deployment_id, .. } => {
+                        Some(deployment_id.as_str())
+                    }
+                },
+            )
+            .map_err(|_| ConfigurationFailure::Internal)?;
         let (targets, refusals) = match &self.host {
             HostSource::Embedded { document, id } => {
                 let policy = store
@@ -504,6 +560,13 @@ impl ConfigurationSource for SharedConfigurationSource {
                     .read()
                     .map_err(|_| ConfigurationFailure::Internal)?
                     .clone();
+                // ADR 0018 §7 (owner decision 2026-09-25): fail fast, storing
+                // nothing, when the embedded host does not publish the profile.
+                let (ConfigurationCommand::Create { config_json }
+                | ConfigurationCommand::Replace { config_json, .. }) = &command;
+                if !retry {
+                    require_published(config_json, vec![(id.clone(), profile_names(&document))])?;
+                }
                 let host = mllm_config::effective::compose_current_resource_controls(
                     &document,
                     &policy.context,
@@ -523,7 +586,7 @@ impl ConfigurationSource for SharedConfigurationSource {
             HostSource::Registry => {
                 let (ConfigurationCommand::Create { config_json }
                 | ConfigurationCommand::Replace { config_json, .. }) = &command;
-                registry_targets(store, config_json)?
+                registry_targets(store, config_json, !retry)?
             }
         };
         match command {
@@ -592,6 +655,7 @@ impl ConfigurationSource for SharedConfigurationSource {
 fn registry_targets(
     store: &mllm_store::Store,
     config_json: &str,
+    fail_fast: bool,
 ) -> Result<(Vec<HostTarget>, Vec<HostRefusal>), ConfigurationFailure> {
     let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, config_json)?;
     let spec = mllm_config::instances::parse_instance_spec(&config)?;
@@ -608,6 +672,28 @@ fn registry_targets(
     if allowed.iter().any(|host| !identifier(host)) {
         return Err(ConfigurationFailure::InvalidConfig);
     }
+    // ADR 0018 §7 (owner decision 2026-09-25): a profile no allowed host
+    // publishes is refused as a whole before anything is stored. A host set
+    // none of which has published at all keeps its per-host answer
+    // (`host_unpublished`): registering an engine would not fix that.
+    let mut published = Vec::new();
+    let mut any_published = false;
+    for selector in &allowed {
+        let publication = store
+            .host_publication(selector)
+            .map_err(|_| ConfigurationFailure::Internal)?;
+        any_published |= publication.is_some();
+        let names = publication
+            .and_then(|publication| serde_json::from_str::<Value>(&publication.config_json).ok())
+            .map(|document| profile_names(&document))
+            .unwrap_or_default();
+        published.push((selector.clone(), names));
+    }
+    let profile = if fail_fast && any_published {
+        Some(require_published(config_json, published)?)
+    } else {
+        None
+    };
     let mut targets = Vec::new();
     let mut refusals = Vec::new();
     let mut single = None;
@@ -649,6 +735,19 @@ fn registry_targets(
             single = Some(refuse(
                 ConfigurationFailure::HostPolicyDenied,
                 "no_runtime_profiles",
+                &mut refusals,
+            ));
+            continue;
+        }
+        // ADR 0018 §7: another allowed host publishes the profile; this one
+        // does not, so it is recorded refused with its reason.
+        if profile
+            .as_ref()
+            .is_some_and(|profile| original["runtime_profiles"].get(profile).is_none())
+        {
+            single = Some(refuse(
+                ConfigurationFailure::HostPolicyDenied,
+                "profile_not_published",
                 &mut refusals,
             ));
             continue;
@@ -708,6 +807,36 @@ fn registry_targets(
         });
     }
     Ok((targets, refusals))
+}
+
+/// ADR 0018 §7: the runtime profile the deployment names, when some host in
+/// `published` (host, profiles it publishes) carries it; otherwise the whole
+/// deploy is refused `profile_not_published`.
+fn require_published(
+    config_json: &str,
+    published: Vec<(String, Vec<String>)>,
+) -> Result<String, ConfigurationFailure> {
+    let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, config_json)?;
+    let profile = config["runtime_profile"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if published.iter().any(|(_, names)| names.contains(&profile)) {
+        Ok(profile)
+    } else {
+        Err(ConfigurationFailure::ProfileNotPublished {
+            profile,
+            hosts: published,
+        })
+    }
+}
+
+/// The runtime profile names a host document publishes, in document order.
+fn profile_names(document: &Value) -> Vec<String> {
+    document["runtime_profiles"]
+        .as_object()
+        .map(|profiles| profiles.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn identifier(value: &str) -> bool {

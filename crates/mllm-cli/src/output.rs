@@ -40,6 +40,9 @@ impl ExitCode {
     pub const PUBLISH_REJECTED: Self = Self(21);
     pub const AGENT_UNREACHABLE: Self = Self(22);
     pub const NOT_INTERACTIVE: Self = Self(23);
+    /// ADR 0018 §7: a deploy named a runtime profile no allowed host
+    /// publishes; nothing was stored.
+    pub const PROFILE_NOT_PUBLISHED: Self = Self(24);
 }
 
 impl From<ExitCode> for u8 {
@@ -153,6 +156,7 @@ impl StructuredError {
             "publish_rejected" => ExitCode::PUBLISH_REJECTED,
             "agent_unreachable" => ExitCode::AGENT_UNREACHABLE,
             "not_interactive" => ExitCode::NOT_INTERACTIVE,
+            "profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,
             _ => ExitCode::UNSUPPORTED,
         }
     }

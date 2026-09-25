@@ -192,6 +192,7 @@ fn a_start_with_no_eligible_host_exits_15() {
         ExitCode::PUBLISH_REJECTED,
         ExitCode::AGENT_UNREACHABLE,
         ExitCode::NOT_INTERACTIVE,
+        ExitCode::PROFILE_NOT_PUBLISHED,
     ] {
         assert_ne!(other, ExitCode::HOST_INELIGIBLE);
     }
@@ -217,4 +218,15 @@ fn engine_codes_have_their_exit_codes() {
         assert_eq!(error.exit_code(), ExitCode(exit), "{code}");
         assert_ne!(error.exit_code(), ExitCode(9));
     }
+}
+
+// T01 (ADR 0018 §7): a deploy refused for an unpublished profile exits 24.
+#[test]
+fn profile_not_published_exits_24() {
+    let error = StructuredError {
+        code: "profile_not_published",
+        message: String::new(),
+    };
+    assert_eq!(error.exit_code(), ExitCode(24));
+    assert_eq!(ExitCode::PROFILE_NOT_PUBLISHED, ExitCode(24));
 }

@@ -114,6 +114,7 @@ are defined in `crates/mllm-cli/src/output.rs`.
 | 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
 | 22 | The role's control socket did not answer (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role starts. On `remove`, nothing is written: start the role and retry. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
+| 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
 
 **A revoked host (14).** After `mllm revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its
