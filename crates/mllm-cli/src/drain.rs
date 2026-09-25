@@ -31,9 +31,11 @@ use std::time::Duration;
 /// retried drain with the same `--request-id` sends the same deadline and
 /// replays the same Stops rather than conflicting with them, and a request
 /// identity minted earlier never starts a drain whose deadline already passed.
-/// The store bounds a Stop's deadline by the deployment's request deadline, so
-/// an offline host's Stops complete on reconnect only within this window
-/// (owner decision 4).
+/// This is the drain's bound, not each Stop's deadline: the server lowers every
+/// Stop to its deployment's request-deadline window (SPEC §6: no operation's
+/// deadline lies beyond it), so a deployment whose request deadline is shorter
+/// than this window is still drained. An offline host's Stops complete on
+/// reconnect only within those deadlines (owner decision 4).
 const DRAIN_WINDOW_MS: i64 = 900_000;
 const POLL: Duration = Duration::from_millis(250);
 /// SPEC §6.4: a transient management failure while waiting is retried with

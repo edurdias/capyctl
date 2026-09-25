@@ -142,13 +142,19 @@ async fn start(setup: &Setup, id: &str) {
 }
 
 async fn drain(setup: &Setup, key: &str) -> (u16, Value) {
+    drain_until(setup, key, 10000).await
+}
+
+async fn drain_until(setup: &Setup, key: &str, deadline_ms: i64) -> (u16, Value) {
     let request = Request::builder()
         .method("POST")
         .uri("/management/v1/hosts/lab/drain")
         .header("authorization", format!("Bearer {MANAGEMENT}"))
         .header("content-type", "application/json")
         .header("idempotency-key", key)
-        .body(Body::from(json!({"deadline_ms": 10000}).to_string()))
+        .body(Body::from(
+            json!({ "deadline_ms": deadline_ms }).to_string(),
+        ))
         .unwrap();
     body(setup.drain.clone().oneshot(request).await.unwrap()).await
 }
@@ -373,5 +379,40 @@ async fn a_drain_of_an_idle_host_leaves_no_hold() {
         .store()
         .host_drain_pending("lab")
         .unwrap());
+    setup.worker.shutdown().await.unwrap();
+}
+
+/// SPEC §4.3, §6: the operator CLI bounds a drain at 900 s, but a Stop's
+/// deadline may not lie beyond its launch's request deadline (here the golden
+/// fixture's, shorter than 900 s). The drain still stops the deployment: each
+/// Stop takes the earlier of the drain's bound and its own request-deadline
+/// window, and a retried drain under the same key replays that Stop's receipt
+/// rather than conflicting with it.
+// T10 T13 T32
+#[tokio::test]
+async fn a_drain_bound_beyond_the_request_deadline_still_stops() {
+    let setup = setup().await;
+    let id = setup.id.clone();
+    start(&setup, &id).await;
+    place_on_lab(&setup.dir, &setup.owner, &id);
+    // The worker's clock reads 1900; the CLI's drain window is 900 s.
+    let bound = 1900 + 900_000;
+    let (status, accepted) = drain_until(&setup, "drain-long", bound).await;
+    assert_eq!(status, 202, "{accepted}");
+    assert_eq!(accepted["refused"], json!([]), "{accepted}");
+    let operations = accepted["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{accepted}");
+    assert_eq!(operations[0]["deployment_id"], id.as_str());
+    let operation = operations[0]["operation_id"].as_str().unwrap().to_owned();
+    // An exact retry replays the same Stop.
+    let (status, retried) = drain_until(&setup, "drain-long", bound).await;
+    assert_eq!(status, 202, "{retried}");
+    assert_eq!(retried["refused"], json!([]), "{retried}");
+    assert_eq!(retried["operations"], accepted["operations"]);
+    settled(&setup.owner, &operation).await;
+    let snapshot = setup.owner.lock().unwrap().store().snapshot().unwrap();
+    let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    // SPEC §6.3: a drain is not an operator stop.
+    assert!(!deployment.suspended);
     setup.worker.shutdown().await.unwrap();
 }

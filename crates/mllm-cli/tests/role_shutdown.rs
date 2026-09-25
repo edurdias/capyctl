@@ -395,6 +395,13 @@ async fn served_within(installation: &Installation, within: Duration) -> Duratio
 }
 
 fn deploy(installation: &Installation) -> Value {
+    deploy_with_deadline(
+        installation,
+        mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
+    )
+}
+
+fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> Value {
     // Sized from an explicit capacity, not this machine's (see
     // `support::BINARY_TEST_CAPACITY_BYTES`).
     let capacity = support::BINARY_TEST_CAPACITY_BYTES;
@@ -411,7 +418,7 @@ fn deploy(installation: &Installation) -> Value {
         },
         Engine::Vllm,
         capacity,
-        mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
+        request_deadline,
         true,
     );
     let file = installation.root.path().join("deployment.json");
@@ -604,6 +611,61 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     assert!(status.success(), "{status:?}");
     assert_eq!(report["engines"], "retained", "{report}");
     assert!(alive(launches[1]));
+}
+
+/// SPEC §4.3, §6: `mllm drain standalone` bounds its drain at 900 s, and a
+/// Stop's deadline may not lie beyond its launch's request deadline. A
+/// deployment whose request deadline is shorter than the drain window is still
+/// drained with verified cleanup, and a retry under the same `--request-id`
+/// is not refused (an in-flight Stop's exact replay is covered in
+/// `mllm-management/tests/drain.rs`).
+// T10 T13 T32
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_stops_a_deployment_whose_request_deadline_is_shorter_than_the_drain() {
+    let installation = Installation::new();
+    let role = installation.start(Some(20));
+    let deployed = deploy_with_deadline(&installation, "600s");
+    assert_eq!(deployed["deployment"]["observed_state"], "ready");
+    let deployment = deployed["deployment"]["id"].as_str().unwrap().to_owned();
+    served_within(&installation, Duration::from_secs(10)).await;
+    let engine = installation.launches()[0];
+
+    let request_id = ulid::Ulid::new().to_string();
+    let request_id = request_id.as_str();
+    let drain = || {
+        let out = installation.cli(&["drain", "standalone", "--request-id", request_id]);
+        assert!(
+            out.status.success(),
+            "drain: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    let drained = drain();
+    assert_eq!(drained["drained"], true, "{drained}");
+    assert_eq!(drained["refused"], json!([]), "{drained}");
+    let stopped = &drained["deployments"][0];
+    assert_eq!(stopped["deployment_id"], deployment.as_str(), "{drained}");
+    assert_eq!(stopped["state"], "succeeded", "{drained}");
+    assert_eq!(stopped["cleanup"], "verified", "{drained}");
+    // T10: a drain is not an operator stop.
+    assert_eq!(stopped["suspended"], false, "{drained}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(engine) {
+        assert!(Instant::now() < deadline, "the drained engine is gone");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // T13: the same request identity is sent again with the same journaled
+    // deadline and is not refused. The Stop already settled and released the
+    // runtime, so nothing is left on the host to stop and nothing relaunches.
+    let replayed = drain();
+    assert_eq!(replayed["drained"], true, "{replayed}");
+    assert_eq!(replayed["refused"], json!([]), "{replayed}");
+    assert_eq!(installation.launches(), vec![engine]);
+
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(40));
+    assert!(status.success(), "{status:?}");
 }
 
 /// How long a role start that must refuse is given to exit. A refusal that

@@ -695,6 +695,67 @@ impl crate::Store {
         )
     }
 
+    /// SPEC §4.3, §6: the deadline an explicit drain's Stop of one instance
+    /// carries. The operator's drain names one bound for the whole host, but an
+    /// operation's deadline may not lie beyond its request deadline, which the
+    /// instance's launch froze (a Stop past it is refused as a conflict). So the
+    /// Stop takes the earlier of the drain's `bound` and `now` plus that request
+    /// deadline.
+    ///
+    /// SPEC §13: a Stop already accepted under `key` for this instance answers
+    /// with the deadline it was accepted with, so a retried drain sends the
+    /// exact request again and replays its receipt instead of conflicting with
+    /// it. An instance holding no launch keeps the drain's own bound; its stop
+    /// has nothing to stop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drain_stop_deadline(
+        &self,
+        s: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        instance: u32,
+        key: &str,
+        now: i64,
+        bound: i64,
+    ) -> Result<i64, LifecycleError> {
+        if now < 0 || bound <= 0 {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",
+                params![principal, instance_scope(deployment, instance), key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = prior {
+            if raw.len() > 1 << 20 {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            // Both instance Stop receipts (unarmed and cleanup) record it.
+            return serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|receipt| receipt["deadline_ms"].as_i64())
+                .ok_or(LifecycleError::CorruptStoredData);
+        }
+        let launch: Option<String> = tx
+            .query_row(
+                "SELECT s.step_json FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released'",
+                params![deployment, instance],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(raw) = launch else {
+            return Ok(bound);
+        };
+        let plan: Plan = decode(&raw)?;
+        let e = decode_effective_snapshot(&plan.effective_json)
+            .map_err(|_| LifecycleError::CorruptStoredData)?;
+        Ok(bound.min(now.saturating_add(e.request_deadline_ms)))
+    }
+
     /// Stop for idleness: the deployment stays eligible for on-demand activation.
     ///
     /// SPEC §6.3 separates this from an administrative stop, and the difference is
