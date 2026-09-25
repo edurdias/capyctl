@@ -196,6 +196,99 @@ impl ActionSource for OwnedActionSource {
         key: &str,
         command: ActionCommand,
     ) -> Result<ActionReceipt, ConfigurationFailure> {
+        self.deployment_action(deployment, key, command)
+            .map_err(|failure| self.explain(deployment, failure))
+    }
+
+    fn check_evicting_start(
+        &self,
+        deployment: &str,
+        instance: Option<u32>,
+        key: &str,
+        command: &ActionCommand,
+    ) -> Result<bool, ConfigurationFailure> {
+        let replay = self.evicting_start_checked(deployment, instance, key, command)?;
+        // Owner decision 2026-09-25: a start no allowed host is eligible for
+        // is refused as such before any victim is released.
+        if !replay {
+            if let Some(reason) = self.ineligible_detail(deployment) {
+                return Err(ConfigurationFailure::HostIneligible(reason));
+            }
+        }
+        Ok(replay)
+    }
+
+    fn accept_instance_action(
+        &self,
+        deployment: &str,
+        instance: u32,
+        key: &str,
+        command: ActionCommand,
+    ) -> Result<InstanceActionReceipt, ConfigurationFailure> {
+        self.instance_action(deployment, instance, key, command)
+            .map_err(|failure| self.explain(deployment, failure))
+    }
+}
+
+impl OwnedActionSource {
+    /// Owner decision 2026-09-25: a start refused because no allowed host is
+    /// eligible names each host and why, instead of reporting capacity.
+    fn explain(&self, deployment: &str, failure: ConfigurationFailure) -> ConfigurationFailure {
+        match failure {
+            ConfigurationFailure::HostIneligible(reason) if reason.is_empty() => {
+                ConfigurationFailure::HostIneligible(
+                    self.ineligible_detail(deployment).unwrap_or_default(),
+                )
+            }
+            other => other,
+        }
+    }
+
+    /// Owner decision 2026-09-25: when none of the allowed hosts that resolved
+    /// the deployment's revision is eligible for placement now, one line per
+    /// host saying why: the session's own reason (drain-only with both
+    /// versions, draining, unresponsive, reconciling, a missing placement
+    /// capability), else revoked, else no live control session. `None` when
+    /// some allowed host is eligible, or this source has no notion of
+    /// eligibility (the embedded host).
+    fn ineligible_detail(&self, deployment: &str) -> Option<String> {
+        // Read without the owner lock: the session source takes it itself.
+        let (eligible, reasons) = self.commands.eligibility();
+        let eligible = eligible?;
+        let (hosts, enrolled) = {
+            let owner = self.commands.owner_for_read().ok()?;
+            (
+                owner.store().resolved_hosts(deployment).ok()?,
+                owner.store().enrolled_hosts().ok()?,
+            )
+        };
+        if hosts.is_empty() || hosts.iter().any(|host| eligible.contains(host)) {
+            return None;
+        }
+        let lines: Vec<String> = hosts
+            .iter()
+            .map(|host| {
+                reasons.get(host).cloned().unwrap_or_else(|| {
+                    if enrolled.iter().any(|e| e.host_id == *host && e.revoked) {
+                        format!("host {host} is revoked")
+                    } else {
+                        format!("host {host} has no live control session (offline or not joined)")
+                    }
+                })
+            })
+            .collect();
+        Some(format!(
+            "no allowed host is eligible for placement: {}",
+            lines.join("; ")
+        ))
+    }
+
+    fn deployment_action(
+        &self,
+        deployment: &str,
+        key: &str,
+        command: ActionCommand,
+    ) -> Result<ActionReceipt, ConfigurationFailure> {
         let principal = self.configuration.principal();
         match command.action {
             Action::Start => {
@@ -371,7 +464,7 @@ impl ActionSource for OwnedActionSource {
         }
     }
 
-    fn check_evicting_start(
+    fn evicting_start_checked(
         &self,
         deployment: &str,
         instance: Option<u32>,
@@ -410,7 +503,7 @@ impl ActionSource for OwnedActionSource {
         Ok(false)
     }
 
-    fn accept_instance_action(
+    fn instance_action(
         &self,
         deployment: &str,
         instance: u32,
@@ -723,6 +816,8 @@ fn command_failure(error: CoordinatorCommandError) -> ConfigurationFailure {
             LifecycleError::Disabled | LifecycleError::HostPolicyDenied => F::HostPolicyDenied,
             LifecycleError::CapacityBlocked => F::CapacityBlocked,
             LifecycleError::StartupRequiresEmptyHost => F::StartupRequiresEmptyHost,
+            // Explained with each host's reason by `OwnedActionSource::explain`.
+            LifecycleError::HostIneligible => F::HostIneligible(String::new()),
             LifecycleError::QueueFull => F::QueueFull,
             LifecycleError::Stale | LifecycleError::ReconciliationRequired => {
                 F::ReconciliationRequired
@@ -788,8 +883,10 @@ fn switch_failure(fault: mllm_controller::LifecycleFault) -> ConfigurationFailur
     match fault {
         L::NotFound(_) => ConfigurationFailure::NotFound,
         L::Conflict(_) => ConfigurationFailure::LifecycleConflict,
-        // Nothing fits even after releasing every eligible READY instance.
-        L::Blocked(_) => ConfigurationFailure::CapacityBlocked,
+        // Nothing fits even after releasing every eligible READY instance;
+        // the reason names the instance and each host's shortfall (owner
+        // decision 2026-09-25).
+        L::Blocked(reason) => ConfigurationFailure::CapacityBlockedBecause(reason),
         _ => ConfigurationFailure::SwitchFailed,
     }
 }
@@ -823,13 +920,24 @@ async fn accept_evicting(
             .map_err(|_| ConfigurationFailure::Internal)??
         };
         let _turn = switcher.target_turn(&id).await;
-        let room = if replay {
-            None
+        // Owner decision 2026-09-25: `start deployment --evict` makes room for
+        // every instance the start activates (planned whole before anyone is
+        // released); `start instance --evict` for that instance.
+        let rooms: Vec<mllm_controller::switching::Room> = if replay {
+            Vec::new()
         } else {
-            switcher
-                .make_room_explicit(&id, instance)
-                .await
-                .map_err(switch_failure)?
+            match instance {
+                None => switcher
+                    .make_room_for_start(&id)
+                    .await
+                    .map_err(switch_failure)?,
+                Some(k) => switcher
+                    .make_room_explicit(&id, Some(k))
+                    .await
+                    .map_err(switch_failure)?
+                    .into_iter()
+                    .collect(),
+            }
         };
         let accept = {
             let (source, id, key) = (source.clone(), id.clone(), key.clone());
@@ -850,37 +958,46 @@ async fn accept_evicting(
         };
         let accepted = accept.await.map_err(|_| ConfigurationFailure::Internal)?;
         let evicted = Evicted {
-            switch_id: room
-                .as_ref()
+            switch_id: rooms
+                .iter()
                 .map(|r| r.switch_id.clone())
-                .filter(|id| !id.is_empty()),
-            victims: room
-                .as_ref()
-                .map(|r| {
+                .find(|id| !id.is_empty()),
+            victims: rooms
+                .iter()
+                .flat_map(|r| {
                     r.victims
                         .iter()
                         .map(|v| format!("{}/{}", v.deployment_id, v.instance))
-                        .collect()
                 })
-                .unwrap_or_default(),
+                .collect(),
         };
-        match (accepted, room) {
-            (Ok((receipt, index)), Some(room)) => {
+        match accepted {
+            Ok((receipt, index)) => {
                 if !receipt.operation_id.is_empty() {
-                    switcher.finish_in_background(room, id, receipt.operation_id.clone());
+                    for room in rooms {
+                        switcher.finish_in_background(
+                            room,
+                            id.clone(),
+                            receipt.operation_id.clone(),
+                        );
+                    }
                 }
                 Ok((receipt, index, evicted))
             }
-            (Ok((receipt, index)), None) => Ok((receipt, index, evicted)),
-            (Err(failure), Some(room)) => {
+            Err(failure) => {
                 // The victims stay released and on-demand eligible (ADR 0013
                 // §8 rule 6); the refusal is the start's own.
-                if !room.switch_id.is_empty() {
-                    switcher.activation_failed(&room, &id, &format!("start refused: {failure:?}"));
+                for room in &rooms {
+                    if !room.switch_id.is_empty() {
+                        switcher.activation_failed(
+                            room,
+                            &id,
+                            &format!("start refused: {failure:?}"),
+                        );
+                    }
                 }
                 Err(failure)
             }
-            (Err(failure), None) => Err(failure),
         }
     })
     .await

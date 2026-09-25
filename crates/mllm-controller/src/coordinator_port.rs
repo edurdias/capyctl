@@ -504,9 +504,7 @@ impl CoordinatorLifecycle {
                 .commands
                 .read(|store| store.is_admin_stopped(deployment))?
         {
-            return Err(LifecycleFault::Blocked(format!(
-                "deployment {deployment} was explicitly stopped"
-            )));
+            return Err(crate::fault::operator_stopped(deployment, false));
         }
         // Owner decisions Q5, Q7 (ADR 0013 as amended): on-demand activation never
         // lifts an operator's `stop instance`; it brings up the lowest-index
@@ -517,9 +515,7 @@ impl CoordinatorLifecycle {
                 .on_demand_instance_stopped(deployment)
                 .map_err(Into::into)
         })? {
-            return Err(LifecycleFault::Blocked(format!(
-                "every instance of deployment {deployment} was explicitly stopped"
-            )));
+            return Err(crate::fault::operator_stopped(deployment, true));
         }
         Ok(row)
     }

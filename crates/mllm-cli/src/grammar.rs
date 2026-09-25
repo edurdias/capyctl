@@ -405,14 +405,23 @@ enum StartTarget {
         /// `timeouts.initialize` (for example `20m`); at most its request deadline.
         #[arg(long, value_name = "DURATION")]
         initialize_timeout: Option<String>,
-        /// Make room by releasing other engines on one host with the same
-        /// switch plan a waiting request uses (drain within the switch drain
-        /// timeout, then park or stop), and report them. Without it a start
-        /// never evicts anything.
+        /// Make room for every instance of the deployment by releasing other
+        /// engines with the same switch plan a waiting request uses (drain
+        /// within the switch drain timeout, then park or stop), and report
+        /// them. The whole start is planned first and only what placement
+        /// needs is released; if any instance cannot be placed even with
+        /// eviction, nothing is released and the start is refused
+        /// (capacity_blocked, exit code 4). Without it a start never evicts
+        /// anything.
         #[arg(long)]
         evict: bool,
-        /// SPEC §6.4: wait for the start's operation to finish; a failure
-        /// prints the reason and hint status shows for it.
+        /// SPEC §6.4: wait until every instance of the deployment is ready.
+        /// Exits 0 only then; a partial start is never a success. An instance
+        /// not placed before the start's deadline exits 4
+        /// (insufficient_resources), a failed launch 13 (operation_failed),
+        /// any other wait expiry 10 (activation_timeout); no allowed host
+        /// eligible for placement exits 15 (host_ineligible). The failure
+        /// prints the reason status shows.
         #[arg(long)]
         wait: bool,
     },

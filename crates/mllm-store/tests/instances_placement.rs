@@ -736,6 +736,46 @@ fn ineligible_hosts_and_max_per_host_bound_placement() {
     assert_eq!(t.status(&id).instances[1].observed_state, "stopped");
 }
 
+/// Owner decision 2026-09-25 (ADR 0017): a start that places nothing because
+/// no allowed host is eligible now (drain-only after version skew, draining,
+/// revoked, offline) is refused `HostIneligible`, not `CapacityBlocked`;
+/// releasing capacity would not help.
+// T05 T23
+#[test]
+fn a_start_with_no_eligible_host_is_host_ineligible_not_capacity() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy(
+            "deploy",
+            json!({"instances": 1, "placement": {"hosts": ["spark-a", "spark-b"]}}),
+        )
+        .deployment_id;
+    let none: BTreeSet<String> = BTreeSet::new();
+    let refused = t.store.accept_scoped_start_command(
+        &t.session,
+        "owner",
+        &id,
+        StartScope::All,
+        t.revision(&id),
+        "start",
+        NOW,
+        DEADLINE,
+        Some(&none),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(mllm_store::lifecycle::LifecycleError::HostIneligible)
+        ),
+        "{:?}",
+        refused.map(|r| r.operation_id().to_owned())
+    );
+    assert_eq!(
+        t.store.resolved_hosts(&id).unwrap(),
+        vec!["host-a".to_string(), "host-b".to_string()]
+    );
+}
+
 /// SPEC §7.3, ADR 0013 §4 step 2: two instances co-reside on one host only
 /// when both device claims are shared and the host's managed limit holds
 /// both; otherwise the second is refused with its reason, never over budget.

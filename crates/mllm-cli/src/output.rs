@@ -27,6 +27,10 @@ impl ExitCode {
     /// its engines keep running for `join host --recover` to re-prove. The
     /// packaged units do not restart on it (`RestartPreventExitStatus`).
     pub const HOST_REVOKED: Self = Self(14);
+    /// Owner decision 2026-09-25: no allowed host is eligible for placement
+    /// (drain-only after version skew, draining, revoked, offline). A CLI
+    /// command's exit, never a role's, so no unit lists it.
+    pub const HOST_INELIGIBLE: Self = Self(15);
 }
 
 impl From<ExitCode> for u8 {
@@ -131,6 +135,7 @@ impl StructuredError {
             "topology_unknown" => ExitCode::TOPOLOGY_UNKNOWN,
             "no_safe_estimate" => ExitCode::NO_SAFE_ESTIMATE,
             HOST_REVOKED => ExitCode::HOST_REVOKED,
+            "host_ineligible" => ExitCode::HOST_INELIGIBLE,
             _ => ExitCode::UNSUPPORTED,
         }
     }

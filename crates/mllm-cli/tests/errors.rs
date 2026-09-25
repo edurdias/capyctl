@@ -120,6 +120,7 @@ fn a_revoked_host_exits_with_its_own_code_and_the_recovery_commands() {
         ExitCode::TOPOLOGY_UNKNOWN,
         ExitCode::NO_SAFE_ESTIMATE,
         ExitCode::INTERNAL,
+        ExitCode::HOST_INELIGIBLE,
     ] {
         assert_ne!(other, ExitCode::HOST_REVOKED);
     }
@@ -141,4 +142,34 @@ fn a_revoked_host_exits_with_its_own_code_and_the_recovery_commands() {
     // The commands named in the message parse with the real grammar.
     parse(["mllm", "invite", "host", "01HOSTID", "--recover", "--output", "FILE"]).unwrap();
     parse(["mllm", "join", "host", "--join-file", "FILE", "--recover"]).unwrap();
+}
+
+// T23 (owner decision 2026-09-25): a start refused because no allowed host is
+// eligible exits with its own code, 15, distinct from every other one and in
+// particular from the revoked host's 14 (9 stays a reserved gap).
+#[test]
+fn a_start_with_no_eligible_host_exits_15() {
+    assert_eq!(ExitCode::HOST_INELIGIBLE, ExitCode(15));
+    let e = StructuredError {
+        code: "host_ineligible",
+        message: "host_ineligible: no allowed host is eligible for placement".into(),
+    };
+    assert_eq!(e.exit_code(), ExitCode(15));
+    for other in [
+        ExitCode::SUCCESS,
+        ExitCode::INVALID_CONFIG,
+        ExitCode::UNAUTHORIZED,
+        ExitCode::INSUFFICIENT_RESOURCES,
+        ExitCode::UNSUPPORTED,
+        ExitCode::UNRECONCILED,
+        ExitCode::DEVICE_CONFLICT,
+        ExitCode::CATEGORY_LIMIT,
+        ExitCode::ACTIVATION_TIMEOUT,
+        ExitCode::TOPOLOGY_UNKNOWN,
+        ExitCode::NO_SAFE_ESTIMATE,
+        ExitCode::INTERNAL,
+        ExitCode::HOST_REVOKED,
+    ] {
+        assert_ne!(other, ExitCode::HOST_INELIGIBLE);
+    }
 }

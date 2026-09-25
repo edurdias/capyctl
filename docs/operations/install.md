@@ -103,6 +103,7 @@ defined in `crates/mllm-cli/src/output.rs`.
 | 3 | Unauthorized | all | Fix the identity or credentials. |
 | 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`) | all | The newer binary or a restored backup (see "State and migrations"). |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
+| 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
 
 **A revoked host (14).** After `mllm revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its

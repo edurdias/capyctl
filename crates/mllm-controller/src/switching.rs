@@ -41,7 +41,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mllm_store::events::SwitchPhase;
-use mllm_store::ordinary_lifecycle::switching::{SwitchPlan, SwitchRecord, SwitchVictim};
+use mllm_store::ordinary_lifecycle::switching::{
+    StartStep, StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchVictim,
+};
 
 use crate::coordinator::CoordinatorCommands;
 use crate::fault::LifecycleFault;
@@ -345,6 +347,163 @@ impl Switcher {
         }
     }
 
+    /// Owner decision 2026-09-25: `start deployment --evict` makes room for
+    /// every instance the start activates, not only the first, so that no
+    /// instance of an explicit start is left queued behind capacity the
+    /// operator asked to reclaim. The whole start is planned before anyone is
+    /// released (each instance against the ledger as the earlier ones leave
+    /// it, each victim set minimal); when any instance cannot be placed even
+    /// with eviction, nothing is released and the refusal names the instance
+    /// and each host's shortfall. Victims are released per host with the same
+    /// switch sequence as a waiting request (fairness window, drain bound,
+    /// park or verified stop). One room per host that releases anything;
+    /// empty when everything fits as the ledger stands.
+    pub async fn make_room_for_start(
+        self: &Arc<Self>,
+        target: &str,
+    ) -> Result<Vec<Room>, LifecycleFault> {
+        let rounds = self.options.max_rounds.max(1);
+        let mut round = 0;
+        loop {
+            match self.start_rooms(target).await {
+                Ok(rooms) => return Ok(rooms),
+                Err(NoRoom::Moved) if round < rounds => round += 1,
+                Err(NoRoom::Fault(LifecycleFault::Failed(_))) if round + 1 < rounds => round += 1,
+                Err(NoRoom::Moved) => {
+                    return Err(LifecycleFault::Blocked(format!(
+                        "no room could be made for deployment {target} after {rounds} switch round(s)"
+                    )))
+                }
+                Err(NoRoom::Fault(fault)) => return Err(fault),
+            }
+        }
+    }
+
+    async fn start_rooms(self: &Arc<Self>, target: &str) -> Result<Vec<Room>, NoRoom> {
+        let steps = match self
+            .commands
+            .plan_start_switch(target, &self.protected())
+            .map_err(fault)?
+        {
+            StartSwitchPlan::Steps(steps) => steps,
+            // Another switch may hold its victims closed right now: wait for
+            // it to end and plan again rather than refuse.
+            StartSwitchPlan::Impossible { .. }
+                if self.active.load(std::sync::atomic::Ordering::SeqCst) > 0 =>
+            {
+                let ended = self.ended.notified();
+                if self.active.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    let _ = tokio::time::timeout(self.options.drain_timeout, ended).await;
+                }
+                return Err(NoRoom::Moved);
+            }
+            StartSwitchPlan::Impossible {
+                instance,
+                code,
+                detail,
+            } => {
+                return Err(NoRoom::Fault(start_capacity(
+                    target, instance, &code, &detail,
+                )))
+            }
+        };
+        let hosts: BTreeSet<String> = steps.iter().map(|s| s.host.clone()).collect();
+        if hosts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SPEC §10: the oldest waiting group first on each host. Turns are
+        // taken in host order, so two starts spanning hosts never wait on each
+        // other crosswise.
+        let mut turns = BTreeMap::new();
+        for host in &hosts {
+            turns.insert(host.clone(), self.turn(host).lock_owned().await);
+        }
+        // The plan again under the turns: an earlier group may have changed
+        // a host meanwhile.
+        let steps = match self
+            .commands
+            .plan_start_switch(target, &self.protected())
+            .map_err(fault)?
+        {
+            StartSwitchPlan::Steps(steps) => steps,
+            StartSwitchPlan::Impossible {
+                instance,
+                code,
+                detail,
+            } => {
+                return Err(NoRoom::Fault(start_capacity(
+                    target, instance, &code, &detail,
+                )))
+            }
+        };
+        let again: BTreeSet<String> = steps.iter().map(|s| s.host.clone()).collect();
+        if again.is_empty() {
+            return Ok(Vec::new());
+        }
+        if again != hosts {
+            return Err(NoRoom::Moved);
+        }
+        let mut rooms: Vec<Room> = Vec::new();
+        for host in hosts {
+            let here: Vec<&StartStep> = steps.iter().filter(|s| s.host == host).collect();
+            let victims: Vec<SwitchVictim> = here.iter().flat_map(|s| s.victims.clone()).collect();
+            let window = here
+                .iter()
+                .map(|s| s.admission_window_ms)
+                .max()
+                .unwrap_or(0);
+            let switch_id = ulid::Ulid::new().to_string();
+            self.record(
+                SwitchPhase::Planned,
+                &switch_id,
+                target,
+                Some(&host),
+                &victims,
+                &format!(
+                    "instance(s) {} of an explicit start activate on {host} after releasing {} instance(s); admission window {window} ms",
+                    here.iter()
+                        .map(|s| format!("{}{}", s.instance, if s.wake { " (wakes)" } else { "" }))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    victims.len()
+                ),
+                true,
+            );
+            let active = Active::enter(self);
+            let released = self
+                .release(&switch_id, target, &host, &victims, window, true)
+                .await;
+            if let Err(error) = released {
+                // A failure path records its own end; this covers one that
+                // returned without it.
+                let _ = self.commands.end_switch(&switch_id);
+                // Hosts already released stay released and on-demand eligible
+                // (ADR 0013 §8 rule 6); their switches end as failed, since
+                // nothing is started.
+                for room in &rooms {
+                    self.activation_failed(
+                        room,
+                        target,
+                        &format!(
+                            "the release on host {host} did not complete; nothing was started"
+                        ),
+                    );
+                }
+                return Err(NoRoom::Fault(error));
+            }
+            rooms.push(Room {
+                _turn: turns.remove(&host).expect("a turn per planned host"),
+                _active: Some(active),
+                switch_id,
+                host,
+                victims,
+                commands: Some(self.commands.clone()),
+                explicit: true,
+            });
+        }
+        Ok(rooms)
+    }
+
     /// Owner decision 2026-09-23: after an explicit `--evict` start was
     /// accepted, keep the host's turn until that start's operation ends, then
     /// record the switch's end, off the caller's request.
@@ -610,25 +769,35 @@ impl Switcher {
                 }
             }
         }
+        // Every accepted release is waited for on its own evidence, even after
+        // one fails, so the next round plans against settled victims (a park
+        // refused on its own evidence is stopped then) rather than one still
+        // in flight (owner decision 2026-09-25: a start may release several).
+        let mut first_failure: Option<(String, LifecycleFault)> = None;
         for (v, release) in &operations {
             if let Err(error) = self.settled(&release.operation_id).await {
-                let reason = format!(
-                    "{} of {}/{} did not complete: {error}",
-                    if release.parked { "park" } else { "stop" },
-                    v.deployment_id,
-                    v.instance
-                );
-                self.record(
-                    SwitchPhase::Failed,
-                    switch_id,
-                    target,
-                    Some(host),
-                    victims,
-                    &reason,
-                    explicit,
-                );
-                return Err(error);
+                if first_failure.is_none() {
+                    let reason = format!(
+                        "{} of {}/{} did not complete: {error}",
+                        if release.parked { "park" } else { "stop" },
+                        v.deployment_id,
+                        v.instance
+                    );
+                    first_failure = Some((reason, error));
+                }
             }
+        }
+        if let Some((reason, error)) = first_failure {
+            self.record(
+                SwitchPhase::Failed,
+                switch_id,
+                target,
+                Some(host),
+                victims,
+                &reason,
+                explicit,
+            );
+            return Err(error);
         }
         self.record(
             SwitchPhase::Released,
@@ -726,6 +895,15 @@ impl Drop for Active {
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.0.ended.notify_waiters();
     }
+}
+
+/// Owner decision 2026-09-25: an explicit start one of whose instances fits
+/// nowhere even with eviction; the closed code leads, so management keeps
+/// classing it as a capacity block, and each host's shortfall follows.
+fn start_capacity(target: &str, instance: u32, code: &str, detail: &str) -> LifecycleFault {
+    LifecycleFault::Blocked(format!(
+        "{code}: instance {instance} of deployment {target} cannot be placed even with eviction: {detail}; nothing was released"
+    ))
 }
 
 fn capacity(target: &str, code: &str) -> LifecycleFault {

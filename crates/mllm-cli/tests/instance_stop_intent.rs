@@ -58,8 +58,11 @@ async fn a_stopped_instance_survives_inference_and_start_deployment_lifts_it() {
         .set_instance_operator_stopped(&id, 0, true)
         .expect("instance 0 exists");
     match app.controller.auto_activate(&id).await {
-        Err(mllm_controller::LifecycleFault::Blocked(reason)) => {
-            assert!(reason.contains("explicitly stopped"), "{reason}")
+        // SPEC §10 (owner decision 2026-09-25): the operator's stop, with
+        // how to start it again; not a capacity refusal.
+        Err(mllm_controller::LifecycleFault::Stopped(reason)) => {
+            assert!(reason.contains("stopped by an operator"), "{reason}");
+            assert!(reason.contains("mllm start deployment"), "{reason}");
         }
         other => panic!("a request must not undo an operator's instance stop: {other:?}"),
     }

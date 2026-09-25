@@ -383,6 +383,12 @@ pub enum LifecycleError {
     /// switching rules) empties the host first.
     #[error("startup requires an empty host")]
     StartupRequiresEmptyHost,
+    /// Owner decision 2026-09-25: nothing could be placed because every
+    /// allowed host that resolved the revision is ineligible for placement now
+    /// (drain-only after version skew, draining, revoked, offline or not yet
+    /// reconciled). Not a capacity refusal: releasing memory would not help.
+    #[error("every allowed host is ineligible for placement")]
+    HostIneligible,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

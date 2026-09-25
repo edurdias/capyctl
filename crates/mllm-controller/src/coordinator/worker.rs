@@ -115,6 +115,15 @@ pub trait ServiceObservation: Send + Sync + 'static {
         None
     }
 
+    /// Owner decision 2026-09-25: why each host this source knows is not
+    /// eligible now, one line each for the operator (drain-only after version
+    /// skew with both versions, draining, unresponsive, not reconciled, a
+    /// placement requirement missing). A host absent here has no live control
+    /// session. Diagnostics only: `eligible_hosts` alone decides placement.
+    fn ineligible_hosts(&self) -> std::collections::BTreeMap<String, String> {
+        Default::default()
+    }
+
     /// Owner decision 4 (2026-09-22): the remote hosts reachable now (a live,
     /// reconciled session). A planned cleanup of a remote binding whose host is
     /// not among them is deferred, unarmed, until it is, instead of timing out

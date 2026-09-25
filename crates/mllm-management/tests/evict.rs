@@ -34,11 +34,23 @@ use mllm_testkit::fixture;
 const MANAGEMENT: &str = "management-credential-012345678901234567890";
 const INFERENCE: &str = "inference-credential-0123456789012345678901";
 
-struct Observations(Vec<MemoryObservation>);
+struct Observations(Vec<MemoryObservation>, Option<Ineligible>);
+
+/// Owner decision 2026-09-25: a session source under which no host is
+/// eligible for placement, with the reason it gives for each.
+#[derive(Clone)]
+struct Ineligible(std::collections::BTreeMap<String, String>);
+
 impl ServiceObservation for Observations {
     fn observe(&self, _: String) -> ObservationFuture {
         let values = self.0.clone();
         Box::pin(async move { Ok(values) })
+    }
+    fn eligible_hosts(&self) -> Option<std::collections::BTreeSet<String>> {
+        self.1.as_ref().map(|_| Default::default())
+    }
+    fn ineligible_hosts(&self) -> std::collections::BTreeMap<String, String> {
+        self.1.as_ref().map(|i| i.0.clone()).unwrap_or_default()
     }
 }
 
@@ -51,11 +63,18 @@ struct Lab {
     /// The fixture's two deployments: 10 GiB cold and 8 GiB Ready each.
     a: String,
     b: String,
+    managed_gib: i64,
 }
 
 /// A host whose 15 GiB managed limit holds one READY deployment beside a
 /// cold start of another, never two cold starts.
 async fn lab() -> Lab {
+    lab_with(15, None).await
+}
+
+/// As [`lab`], with the host's managed limit in GiB and, when given, a
+/// session source under which no host is eligible.
+async fn lab_with(managed_gib: i64, ineligible: Option<Ineligible>) -> Lab {
     let source = fixture::owned_source().await;
     let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -66,7 +85,7 @@ async fn lab() -> Lab {
     {
         let o = owner.lock().unwrap();
         let mut controls = o.store().resource_policy("lab").unwrap().unwrap().controls;
-        controls.domains.get_mut("unified").unwrap().managed_limit = 15 << 30;
+        controls.domains.get_mut("unified").unwrap().managed_limit = managed_gib << 30;
         controls.queue.admission_window_ms = 50;
         o.store()
             .update_resource_policy(
@@ -83,7 +102,7 @@ async fn lab() -> Lab {
     }
     let worker = mllm_testkit::spawn_fake_coordinator(
         owner.clone(),
-        Arc::new(Observations(source.observations.clone())),
+        Arc::new(Observations(source.observations.clone(), ineligible)),
         Arc::new(|| Ok::<_, CoordinatorError>(1900)),
         CoordinatorOptions::default(),
     )
@@ -115,6 +134,7 @@ async fn lab() -> Lab {
     Lab {
         a: source.fence.deployment_id.clone(),
         b: source.other.deployment_id.clone(),
+        managed_gib,
         dir,
         owner,
         worker,
@@ -171,6 +191,40 @@ impl Lab {
         })
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// Create one more managed deployment on the lab host from the vLLM
+    /// golden fixture, with `instances` instances (10 GiB cold, 8 GiB Ready
+    /// each), and return its id.
+    fn deploy(&self, name: &str, instances: u32) -> String {
+        let source: Value = serde_json::from_str(include_str!(
+            "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
+        ))
+        .unwrap();
+        let mut host = source["input"]["host"].clone();
+        host["runtime_profiles"]["local"]["build_fingerprint"] = json!("qualification-fake-v1");
+        host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
+            json!("secret://another-admin");
+        // The trusted host document matches the policy the budget published.
+        host["resource_policy"]["domains"]["unified"]["managed_limit"] =
+            json!(format!("{}GiB", self.managed_gib));
+        host["resource_policy"]["queue"]["admission_window"] = json!("50ms");
+        let mut deployment = source["input"]["deployment"].clone();
+        deployment["name"] = json!(name);
+        deployment["routes"] = json!([name]);
+        deployment["instances"] = json!(instances);
+        let o = self.owner.lock().unwrap();
+        o.store()
+            .create_stopped_managed_configuration(
+                o.session(),
+                "owner",
+                name,
+                &json!({ "config": deployment }).to_string(),
+                &host,
+                1700,
+            )
+            .unwrap()
+            .deployment_id
     }
 
     fn switch_events(&self) -> Vec<String> {
@@ -354,5 +408,112 @@ async fn evicting_starts_in_flight_are_bounded() {
             .unwrap();
         assert_ne!(status, 429);
     }
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T10 T15 T16 (owner decision 2026-09-25): `start deployment --evict` makes
+// room for every instance of the deployment, not only the first. On a 20 GiB
+// host holding A and C Ready (8 GiB each), a two-instance B needs both
+// released: B/0 starts beside one of them, B/1 only once the other is gone
+// too. Before the fix the switch released one victim, the start returned
+// success and B/1 stayed queued until its deadline. The receipt names both
+// victims and both instances become ready.
+#[tokio::test]
+async fn start_evict_makes_room_for_every_instance() {
+    let lab = lab_with(20, None).await;
+    for (id, key) in [(&lab.a, "start-a"), (&lab.b, "start-c")] {
+        let (status, body) = send(&lab, action(id, key, start(false))).await;
+        assert_eq!(status, 202, "{body}");
+    }
+    lab.until("A and C ready", |l| {
+        l.instance(&l.a, 0).0 == "ready" && l.instance(&l.b, 0).0 == "ready"
+    })
+    .await;
+    let pair = lab.deploy("pair", 2);
+    let (status, evicted) = send(&lab, action(&pair, "start-pair-evict", start(true))).await;
+    assert_eq!(status, 202, "{evicted}");
+    let mut victims: Vec<String> = evicted["victims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    victims.sort();
+    let mut expected = vec![format!("{}/0", lab.a), format!("{}/0", lab.b)];
+    expected.sort();
+    assert_eq!(victims, expected, "{evicted}");
+    lab.until("both instances of the pair ready", |l| {
+        l.instance(&pair, 0).0 == "ready" && l.instance(&pair, 1).0 == "ready"
+    })
+    .await;
+    assert_ne!(lab.instance(&lab.a, 0).0, "ready");
+    assert_ne!(lab.instance(&lab.b, 0).0, "ready");
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T10 T23 (owner decision 2026-09-25): an evicting start one of whose
+// instances cannot be placed even with eviction is refused before anyone is
+// released, and the refusal names the instance and the host's shortfall. A
+// three-instance deployment on the 20 GiB host fits two (8 GiB Ready beside a
+// 10 GiB start), never three.
+#[tokio::test]
+async fn start_evict_refuses_before_evicting_when_an_instance_cannot_fit() {
+    let lab = lab_with(20, None).await;
+    for (id, key) in [(&lab.a, "start-a"), (&lab.b, "start-c")] {
+        let (status, body) = send(&lab, action(id, key, start(false))).await;
+        assert_eq!(status, 202, "{body}");
+    }
+    lab.until("A and C ready", |l| {
+        l.instance(&l.a, 0).0 == "ready" && l.instance(&l.b, 0).0 == "ready"
+    })
+    .await;
+    let triple = lab.deploy("triple", 3);
+    let (status, refused) = send(&lab, action(&triple, "start-triple-evict", start(true))).await;
+    assert_eq!(status, 503, "{refused}");
+    assert_eq!(refused["error"]["code"], "capacity_blocked");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("instance 2"), "{message}");
+    assert!(message.contains("host lab needs 10.0 GiB"), "{message}");
+    assert!(message.contains("evictable"), "{message}");
+    assert_eq!(
+        lab.instance(&lab.a, 0),
+        ("ready".into(), true),
+        "A was evicted"
+    );
+    assert_eq!(
+        lab.instance(&lab.b, 0),
+        ("ready".into(), true),
+        "C was evicted"
+    );
+    assert!(lab.switch_events().is_empty(), "{:?}", lab.switch_events());
+    lab.worker.shutdown().await.unwrap();
+}
+
+// T13 T23 (owner decision 2026-09-25, ADR 0017): a start whose only allowed
+// host is not eligible for placement (here drain-only after version skew) is
+// refused `host_ineligible`, naming the host and why with both versions, not
+// `capacity_blocked`. With `--evict` it is refused the same way before
+// anything is released.
+#[tokio::test]
+async fn a_start_with_no_eligible_host_reports_host_ineligible() {
+    let reason = "host lab is drain-only (upgrade_required): host version unreported, server version 0.1.0; upgrade the host";
+    let lab = lab_with(
+        15,
+        Some(Ineligible(
+            [("lab".to_owned(), reason.to_owned())]
+                .into_iter()
+                .collect(),
+        )),
+    )
+    .await;
+    for (key, body) in [("plain", start(false)), ("evicting", start(true))] {
+        let (status, refused) = send(&lab, action(&lab.b, key, body)).await;
+        assert_eq!(status, 503, "{refused}");
+        assert_eq!(refused["error"]["code"], "host_ineligible", "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains(reason), "{message}");
+        assert!(message.contains("no allowed host is eligible"), "{message}");
+    }
+    assert!(lab.switch_events().is_empty(), "{:?}", lab.switch_events());
     lab.worker.shutdown().await.unwrap();
 }
