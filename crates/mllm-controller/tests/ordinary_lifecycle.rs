@@ -3203,3 +3203,130 @@ async fn an_unobserved_device_blocks_a_start_and_keeps_existing_charges() {
     );
     worker.shutdown().await.unwrap();
 }
+
+/// ADR 0019: a discrete host with two GPUs of 22 and 30 GiB managed, each its
+/// own device-memory domain, beside host RAM in `system`.
+fn two_gpu_host(host: &mut Value) {
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "22GiB",
+                 "free_reserve": "1GiB", "parked_limit": "2GiB"},
+        "gpu1": {"memory": "device", "device": "gpu1", "managed_limit": "30GiB",
+                 "free_reserve": "1GiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({
+        "gpu0": {"domain": "gpu0", "sharing": "shared"},
+        "gpu1": {"domain": "gpu1", "sharing": "shared"}
+    });
+}
+
+/// A 12 GiB request whose budget is derived, on the GPU `devices` names (an
+/// empty list lets mllm pick the GPU).
+fn derived_on(deployment: &mut Value, devices: Value) {
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["devices"] = devices;
+    deployment["residency"] = json!("restart_only");
+    deployment["engine_config"] = json!({"memory": {"request": "12GiB", "kv_cache": "4GiB"}});
+}
+
+/// Discrete GPU design §7 (owner decision 3), with Fake devices: two 12 GiB
+/// instances of a deployment that pins no GPU start through the coordinator;
+/// the first lands on the card with more room (gpu1), the second on gpu0, and
+/// each reaches Ready charged on its own GPU's domain.
+// T27 T16
+#[tokio::test]
+async fn instances_start_on_the_gpu_with_room() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture::fixture_with(|deployment, host| {
+        two_gpu_host(host);
+        derived_on(deployment, json!([{"id": "gpu0", "sharing": "shared"}]));
+    });
+    let fence = fixture::managed_edit(&f, "picked", |deployment, host| {
+        two_gpu_host(host);
+        derived_on(deployment, json!([]));
+        deployment["instances"] = json!(2);
+    });
+    let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("srv.sqlite3");
+    f.sql
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = Arc::new(Mutex::new(OwnedCoordinatorState::open(dir.path()).unwrap()));
+    let observations = Arc::new(Switchable(Mutex::new(f.observations.clone())));
+    let worker = mllm_testkit::spawn_fake_coordinator(
+        owner.clone(),
+        observations,
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    worker
+        .commands()
+        .start(
+            "owner",
+            &fence.deployment_id,
+            fence.revision,
+            "start",
+            10000,
+        )
+        .unwrap();
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    let live = || -> i64 {
+        sql.query_row(
+            "SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?1 AND state='live'",
+            [&fence.deployment_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while live() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both instances reach Ready");
+    let devices: Vec<(u32, String, String)> = sql
+        .prepare(
+            "SELECT i.instance_index,i.device,json_extract(h.effective_json,'$.selected_devices[0].id')
+               FROM deployment_instances i
+               JOIN host_device_effective_revisions h ON h.deployment_id=i.deployment_id
+                AND h.revision=i.revision AND h.host_id=i.host_id AND h.device=i.device
+              WHERE i.deployment_id=?1 ORDER BY i.instance_index",
+        )
+        .unwrap()
+        .query_map([&fence.deployment_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        devices,
+        vec![
+            (0, "gpu1".into(), "gpu1".into()),
+            (1, "gpu0".into(), "gpu0".into())
+        ]
+    );
+    let charged = owner.lock().unwrap().store().resource_snapshot().unwrap();
+    let on = |owner: &str, domain: &str| -> i64 {
+        charged.owners[owner]
+            .allocations
+            .iter()
+            .filter(|a| a.domain == domain)
+            .map(|a| a.bytes)
+            .sum()
+    };
+    let second = format!("deployment:{}/instance:1", fence.deployment_id);
+    assert_eq!(on(&fence.deployment_id, "gpu1"), 12 << 30);
+    assert_eq!(on(&fence.deployment_id, "gpu0"), 0);
+    assert_eq!(on(&second, "gpu0"), 12 << 30);
+    assert_eq!(on(&second, "gpu1"), 0);
+    worker.shutdown().await.unwrap();
+}

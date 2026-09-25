@@ -236,6 +236,31 @@ pub(crate) fn frozen_on_host(
     }
 }
 
+/// ADR 0019 (discrete GPU design §7): the revision as resolved on `host` with
+/// `device` selected, when the host offered a GPU choice for it; otherwise
+/// the host's own resolution ([`frozen_on_host`]).
+pub(crate) fn frozen_on_device(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    host: Option<&str>,
+    device: Option<&str>,
+) -> Result<(String, String), LifecycleError> {
+    if let (Some(host), Some(device)) = (host, device) {
+        let chosen: Option<(String, String)> = tx
+            .query_row(
+                "SELECT effective_json,fingerprint FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                params![deployment_id, revision, host, device],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some(chosen) = chosen {
+            return Ok(chosen);
+        }
+    }
+    frozen_on_host(tx, deployment_id, revision, host)
+}
+
 /// ADR 0013 §3: validate a frozen revision a plan names. The acceptance
 /// receipt binds the canonical revision; a revision resolved on another host
 /// must be that host's row of the same accepted revision.
@@ -266,8 +291,10 @@ pub(crate) fn validate_frozen(
         _ => LifecycleError::CorruptStoredData,
     })?;
     if raw != canonical {
+        // ADR 0019: or one GPU's resolution of it on a multi-GPU host.
         let resolved: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved' AND effective_json=?3)",
+            "SELECT EXISTS(SELECT 1 FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved' AND effective_json=?3)
+                 OR EXISTS(SELECT 1 FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND effective_json=?3)",
             params![deployment_id, revision, raw],
             |r| r.get(0),
         )?;
@@ -282,17 +309,23 @@ fn effective(
     tx: &Transaction<'_>,
     fence: &DeploymentFence,
 ) -> Result<(String, EffectiveDeployment), LifecycleError> {
-    // ADR 0013 §4: an instance runs the revision as resolved on its placed host.
-    let host: Option<String> = tx
+    // ADR 0013 §4: an instance runs the revision as resolved on its placed
+    // host, and (ADR 0019) on the GPU it was placed on there.
+    let (host, device): (Option<String>, Option<String>) = tx
         .query_row(
-            "SELECT host_id FROM deployment_instances WHERE deployment_id=?1 AND generation=?2",
+            "SELECT host_id,device FROM deployment_instances WHERE deployment_id=?1 AND generation=?2",
             params![fence.deployment_id, fence.generation],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
-        .flatten();
-    let (raw, fingerprint) =
-        frozen_on_host(tx, &fence.deployment_id, fence.revision, host.as_deref())?;
+        .unwrap_or_default();
+    let (raw, fingerprint) = frozen_on_device(
+        tx,
+        &fence.deployment_id,
+        fence.revision,
+        host.as_deref(),
+        device.as_deref(),
+    )?;
     validate_frozen(tx, &fence.deployment_id, fence.revision, &raw).map_err(
         |error| match error {
             LifecycleError::Sql(error) => LifecycleError::Sql(error),

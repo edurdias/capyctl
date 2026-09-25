@@ -113,6 +113,10 @@ struct Resolved {
     source: Value,
     effective: mllm_config::effective::EffectiveDeployment,
     provisional: bool,
+    /// ADR 0019 (discrete GPU design §7): on a multi-GPU host, the revision
+    /// resolved once per GPU (device, source, resolution) when the deployment
+    /// pins no device; `source` and `effective` are the first of them.
+    devices: Vec<(String, Value, mllm_config::effective::EffectiveDeployment)>,
 }
 
 fn scoped_source(target: &HostTarget, config: &Value) -> Result<Value> {
@@ -343,19 +347,45 @@ impl crate::Store {
         for host in &ordered {
             let attempt = (|| {
                 let command = scoped_source(host, &config)?;
-                // ADR 0013 §2: unnamed device claims take this host's devices,
-                // and the per-host recipe carries no deployment-level field.
-                let mut source =
-                    mllm_config::instances::assign_devices(&command, &host.trusted_host)
-                        .map_err(ManagedConfigurationError::Rejected)?;
-                if let Some(object) = source.as_object_mut() {
-                    for field in ["instances", "placement", "host"] {
-                        object.remove(field);
+                // ADR 0019 (discrete GPU design §7): a deployment that pins
+                // no device is resolved once per GPU of a discrete host, and
+                // placement picks the GPU. The host's own resolution is the
+                // lowest-index GPU's.
+                let choices = mllm_config::instances::device_choices(&command, &host.trusted_host)
+                    .map_err(ManagedConfigurationError::Rejected)?;
+                let recipe = |document: &Value| -> Result<Value> {
+                    // ADR 0013 §2: unnamed device claims take this host's
+                    // devices, and the per-host recipe carries no
+                    // deployment-level field.
+                    let mut source =
+                        mllm_config::instances::assign_devices(document, &host.trusted_host)
+                            .map_err(ManagedConfigurationError::Rejected)?;
+                    if let Some(object) = source.as_object_mut() {
+                        for field in ["instances", "placement", "host"] {
+                            object.remove(field);
+                        }
                     }
-                }
+                    Ok(source)
+                };
+                let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
                 let (mut effective, provisional) =
                     resolve_for_acceptance(&source, &host.trusted_host)?;
                 effective.routes.sort();
+                let mut devices = Vec::new();
+                if choices.len() > 1 {
+                    for (device, choice) in &choices {
+                        let source = recipe(choice)?;
+                        let (mut on_device, device_provisional) =
+                            resolve_for_acceptance(&source, &host.trusted_host)?;
+                        // One checkpoint, one set of facts: every GPU's
+                        // resolution is provisional exactly when the host's is.
+                        if device_provisional != provisional {
+                            return Err(ManagedConfigurationError::Invalid);
+                        }
+                        on_device.routes.sort();
+                        devices.push((device.clone(), source, on_device));
+                    }
+                }
                 let policy = read_selected_policy(&tx, &effective.host.name)
                     .map_err(|_| ManagedConfigurationError::PolicyConflict)?
                     .ok_or(ManagedConfigurationError::PolicyConflict)?;
@@ -364,16 +394,17 @@ impl crate::Store {
                 {
                     return Err(ManagedConfigurationError::PolicyConflict);
                 }
-                Ok((command, source, effective, provisional))
+                Ok((command, source, effective, provisional, devices))
             })();
             match attempt {
-                Ok((command, source, effective, provisional)) => resolved.push(Resolved {
+                Ok((command, source, effective, provisional, devices)) => resolved.push(Resolved {
                     host_id: host.host_id.clone(),
                     host_name: host.host_name.clone(),
                     command,
                     source,
                     effective,
                     provisional,
+                    devices,
                 }),
                 Err(ManagedConfigurationError::Sql(error)) => {
                     return Err(ManagedConfigurationError::Sql(error))
@@ -469,12 +500,27 @@ impl crate::Store {
             if json.len() > MAX_BYTES {
                 return Err(ManagedConfigurationError::Invalid);
             }
+            let mut devices = Vec::with_capacity(host.devices.len());
+            for (device, source, on_device) in &host.devices {
+                let json = serde_json::to_string(on_device)
+                    .map_err(|_| ManagedConfigurationError::Invalid)?;
+                if json.len() > MAX_BYTES {
+                    return Err(ManagedConfigurationError::Invalid);
+                }
+                devices.push(crate::instances::DeviceResolution {
+                    device: device.clone(),
+                    effective_json: json,
+                    fingerprint: on_device.recipe_fingerprint.clone(),
+                    source_json: source.to_string(),
+                });
+            }
             hosts.push(crate::instances::ResolvedHost {
                 host_id: host.host_id.clone(),
                 host_name: host.host_name.clone(),
                 effective_json: json,
                 fingerprint: host.effective.recipe_fingerprint.clone(),
                 source_json: host.source.to_string(),
+                devices,
             });
         }
         crate::instances::record_accepted_revision(

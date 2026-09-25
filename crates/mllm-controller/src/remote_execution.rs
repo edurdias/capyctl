@@ -827,10 +827,20 @@ impl crate::coordinator::ExecutionBindings for RemoteProfileBindings {
             .map_err(|_| denied())?;
         let ingress = host_config.ingress.as_ref().ok_or_else(denied)?;
         // ADR 0013 §3: the document as scoped to the host this instance was
-        // placed on.
+        // placed on and (ADR 0019) to the GPU placement chose there, which the
+        // frozen launch names as its one selected device.
+        let device = match work.effective().selected_devices.as_slice() {
+            [claim] => Some(claim.id.as_str()),
+            _ => None,
+        };
         let source = owner
             .store()
-            .host_configuration_source(&work.fence().deployment_id, work.fence().revision, host)
+            .launch_configuration_source(
+                &work.fence().deployment_id,
+                work.fence().revision,
+                host,
+                device,
+            )
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
         let scoped = source;

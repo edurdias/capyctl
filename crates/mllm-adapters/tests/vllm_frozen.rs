@@ -209,3 +209,46 @@ fn deployment_engine_config_reaches_the_plan_or_is_refused_by_name() {
         .iter()
         .any(|a| a == "--kv-cache-dtype" || a == "--block-size"));
 }
+
+/// Discrete GPU design §§6–7: with several GPUs, the selected one's published
+/// UUID narrows the engine's CUDA namespace; a one-device unified host keeps
+/// the agent's own pass-through exactly as before.
+// T27 T21
+#[test]
+fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
+    const UUID: &str = "GPU-11111111-1111-1111-1111-111111111111";
+    let render = |devices: Value, selected: &str| {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = json!("restart_only");
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = json!("disabled");
+        host["resource_policy"]["devices"] = devices;
+        let claim = json!([{"id": selected, "sharing": "shared"}]);
+        deployment["devices"] = claim.clone();
+        for phase in ["cold", "ready", "parking", "wake"] {
+            deployment["resources"][phase]["devices"] = claim.clone();
+        }
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+        (
+            plan.cuda_visible_devices.clone(),
+            render_command(&plan)
+                .unwrap()
+                .env
+                .get("CUDA_VISIBLE_DEVICES")
+                .cloned(),
+        )
+    };
+    let one =
+        json!({"gpu0": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": UUID}});
+    assert_eq!(render(one, "gpu0"), (None, None));
+    let two = json!({
+        "gpu0": {"domain": "unified", "sharing": "shared"},
+        "gpu1": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": UUID}
+    });
+    assert_eq!(
+        render(two.clone(), "gpu1"),
+        (Some(UUID.to_string()), Some(UUID.to_string()))
+    );
+    // No UUID published for the selected GPU: nothing is invented.
+    assert_eq!(render(two, "gpu0"), (None, None));
+}

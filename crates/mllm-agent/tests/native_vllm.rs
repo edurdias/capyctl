@@ -83,6 +83,7 @@ with open(os.path.join(here, "record.json"), "w") as f:
     json.dump({"argv": args, "has_key": bool(key),
                "has_admin_key": bool(admin) and admin != key,
                "env": sorted(os.environ),
+               "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                "dev_mode": os.environ.get("VLLM_SERVER_DEV_MODE"),
                "pythonpath": os.environ.get("PYTHONPATH")}, f)
 port = int(args[args.index("--port") + 1])
@@ -224,6 +225,12 @@ impl Fixture {
     /// `None` leaves `deep_park` out of the host document, so the ADR 0012
     /// default (enabled) applies; the deployment then asks for `deep`.
     fn with_switch(switch: Option<bool>, guard: bool) -> Self {
+        Self::build(switch, guard, |_, _| {})
+    }
+
+    /// As [`Fixture::with_switch`], with the host document and the deployment
+    /// edited before the host document is parsed.
+    fn build(switch: Option<bool>, guard: bool, edit: impl FnOnce(&mut Value, &mut Value)) -> Self {
         let deep_park = switch.unwrap_or(true);
         let root = directory();
         let path = root.path();
@@ -321,6 +328,7 @@ impl Fixture {
             deployment["resources"][phase]["allocations"][0]["bytes"] = json!(bytes);
             deployment["resources"][phase]["allocations"][0]["host_kv_bytes"] = json!("0B");
         }
+        edit(&mut host, &mut deployment);
         let config = HostConfig::parse(&host.to_string()).unwrap();
         Self {
             root,
@@ -1720,4 +1728,72 @@ async fn a_parked_launch_that_loses_a_member_is_reported() {
         host.journal.residency_of("launch").unwrap().as_deref(),
         Some("parked")
     );
+}
+
+const GPU0_UUID: &str = "GPU-00000000-0000-0000-0000-000000000000";
+const GPU1_UUID: &str = "GPU-11111111-1111-1111-1111-111111111111";
+
+/// A host with two GPUs, each published with its physical UUID, and a
+/// deployment document naming `device` (what the server sends for the GPU
+/// placement chose).
+fn two_gpus_launching_on(device: &'static str) -> Fixture {
+    Fixture::build(Some(false), true, move |host, deployment| {
+        host["resource_policy"]["devices"] = json!({
+            "gpu0": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": GPU0_UUID},
+            "gpu1": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": GPU1_UUID}
+        });
+        name_device(deployment, device);
+    })
+}
+
+fn name_device(deployment: &mut Value, device: &str) {
+    let claim = json!([{"id": device, "sharing": "shared"}]);
+    deployment["devices"] = claim.clone();
+    for phase in ["cold", "ready", "parking", "wake"] {
+        deployment["resources"][phase]["devices"] = claim.clone();
+    }
+}
+
+/// Discrete GPU design §7: the launch names the GPU placement chose, and the
+/// agent sets the engine child's `CUDA_VISIBLE_DEVICES` to that GPU's
+/// physical UUID from its own approved policy, so the engine sees only it.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chosen_gpu_reaches_the_engine_by_its_published_uuid() {
+    let fixture = two_gpus_launching_on("gpu1");
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the chosen GPU");
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let record = fixture.record().expect("the engine recorded its launch");
+    assert_eq!(record["cuda_visible_devices"], GPU1_UUID);
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}
+
+/// Discrete GPU design §7: a GPU the host's own policy does not publish is
+/// never launched on: the launch is refused `unauthorized` and nothing runs.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_the_host_does_not_publish_refuses_the_launch() {
+    let fixture = two_gpus_launching_on("gpu1");
+    let host = host(&fixture);
+    let mut launch = fixture.launch();
+    if let MemberAction::LaunchSingle(plan) = &mut launch.action {
+        let mut deployment: Value = serde_json::from_str(&plan.deployment_config).unwrap();
+        name_device(&mut deployment, "gpu7");
+        plan.deployment_config = deployment.to_string();
+    }
+    let launch = sign(launch);
+    refused_launch(&host.executor, host.session, &launch).await;
+    assert!(fixture.record().is_none(), "no engine was started");
 }

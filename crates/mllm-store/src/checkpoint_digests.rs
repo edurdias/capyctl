@@ -495,6 +495,26 @@ impl crate::Store {
                             params![deployment, revision, host, host_json, on_host.recipe_fingerprint],
                         )?;
                     }
+                    // ADR 0019: so was every GPU's resolution on a multi-GPU
+                    // host (discrete GPU design §7).
+                    let devices: Vec<(String, String, String)> = tx
+                        .prepare("SELECT host_id,device,effective_json FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2")?
+                        .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    for (host, device, frozen_json) in devices {
+                        let Ok(mut on_device) =
+                            resolve_snapshot_with_checkpoint(&frozen_json, facts)
+                        else {
+                            return Err(CheckpointDigestError::CorruptStoredData);
+                        };
+                        on_device.routes.sort();
+                        let device_json = serde_json::to_string(&on_device)
+                            .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
+                        tx.execute(
+                            "UPDATE host_device_effective_revisions SET effective_json=?5,fingerprint=?6 WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                            params![deployment, revision, host, device, device_json, on_device.recipe_fingerprint],
+                        )?;
+                    }
                     crate::managed_configuration::reseal_migrated_receipt(
                         &tx, deployment, revision, &json, None, None,
                     )

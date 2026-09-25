@@ -24,7 +24,8 @@ use super::*;
 use crate::events::{append_event, EventMetadata, SwitchPhase};
 use crate::instances::instance_owner_id;
 use mllm_config::instances::Placement;
-use mllm_scheduler::placement::fits;
+use mllm_scheduler::device_choice::choose_device_with_eviction;
+use mllm_scheduler::placement::{candidate_fits, fits};
 use mllm_scheduler::switching::{choose_victims, order_victims, VictimCandidate};
 use std::collections::BTreeSet;
 
@@ -112,10 +113,14 @@ struct Assumed {
 enum Planned {
     /// It serves, its activation is in flight, or nothing is startable.
     Settled,
-    /// It fits as the ledger stands, on the host placement would choose.
-    Fits { host: Option<String> },
-    /// Release victims first.
-    Evict(SwitchPlan),
+    /// It fits as the ledger stands, on the host (and, ADR 0019, the GPU)
+    /// placement would choose.
+    Fits {
+        host: Option<String>,
+        device: Option<String>,
+    },
+    /// Release victims first; on a multi-GPU host, the GPU they free.
+    Evict(SwitchPlan, Option<String>),
     /// It fits nowhere even with eviction.
     Impossible { code: String, detail: String },
 }
@@ -288,7 +293,7 @@ impl crate::Store {
             &Assumed::default(),
         )? {
             Planned::Settled | Planned::Fits { .. } => SwitchPlan::FitsNow,
-            Planned::Evict(plan) => plan,
+            Planned::Evict(plan, _) => plan,
             Planned::Impossible { code, .. } => SwitchPlan::Impossible(code),
         };
         tx.commit()?;
@@ -843,6 +848,8 @@ fn plan_in(
         let peak = footprints(&e).wake;
         for c in &mut hosts {
             c.footprint = peak.clone();
+            // ADR 0019: it wakes on the GPU it parked on, no other.
+            c.device_options.clear();
         }
     }
     // Owner decision 2026-09-25: earlier instances of the same evicting start
@@ -868,6 +875,7 @@ fn plan_in(
         host: String,
         instances_here: u32,
         victims: Vec<String>,
+        device: Option<String>,
     }
     let mut best: Option<(HostChoice, Vec<SwitchVictim>)> = None;
     let mut refusals: Vec<&'static str> = Vec::new();
@@ -890,10 +898,8 @@ fn plan_in(
         // Owner decision 2026-09-23 (solo first start): a whole-host start
         // fits only where no other owner holds a charge.
         let alone = !c.whole_host || c.ledger.owners.keys().all(|other| *other == owner);
-        if fits(&c.ledger, &owner, &c.footprint, &c.limits, c.max_parked).is_ok()
-            && !c.occupied
-            && alone
-        {
+        // ADR 0019: on a multi-GPU host, on any of its GPUs.
+        if candidate_fits(c, &owner).is_ok() && !c.occupied && alone {
             // Rule 2: it fits without eviction; placement takes it, on the
             // host placement's own order chooses.
             let last_host: Option<String> = tx
@@ -904,16 +910,26 @@ fn plan_in(
                 )
                 .optional()?
                 .flatten();
-            let chosen = mllm_scheduler::placement::place(
+            let (chosen, device) = mllm_scheduler::placement::place(
                 &hosts,
                 &owner,
                 placement::strategy(&spec),
                 if wake { None } else { spec.max_per_host },
                 last_host.as_deref(),
             )
-            .map(|p| p.host_id)
-            .unwrap_or_else(|_| c.host_id.clone());
-            return Ok(Planned::Fits { host: Some(chosen) });
+            .map(|p| (p.host_id, p.device))
+            .unwrap_or_else(|_| {
+                (
+                    c.host_id.clone(),
+                    candidate_fits(c, &owner)
+                        .ok()
+                        .and_then(|(_, device)| device),
+                )
+            });
+            return Ok(Planned::Fits {
+                host: Some(chosen),
+                device,
+            });
         }
         let rows: Vec<(String, u32, i64)> = tx
             .prepare(&format!(
@@ -986,6 +1002,7 @@ fn plan_in(
             .filter(|v| !occupants.contains(&v.owner))
             .cloned()
             .collect();
+        let mut device = None;
         let decided = if c.whole_host {
             // Owner decision 2026-09-23, SPEC §10: a solo first start needs
             // the host empty, so the plan releases every other charge on it up
@@ -1015,6 +1032,21 @@ fn plan_in(
             } else {
                 Err(mllm_scheduler::placement::HostRefusal::RequiresEmptyHost)
             }
+        } else if !c.device_options.is_empty() {
+            // ADR 0019 (discrete GPU design §7): eviction is per GPU; only
+            // instances charged on a GPU's own domain can make room there.
+            choose_device_with_eviction(
+                &freed,
+                &owner,
+                &c.device_options,
+                &c.limits,
+                c.max_parked,
+                &rest,
+            )
+            .map(|(on, more)| {
+                device = Some(on);
+                occupants.iter().cloned().chain(more).collect::<Vec<_>>()
+            })
         } else {
             choose_victims(&freed, &owner, &c.footprint, &c.limits, c.max_parked, &rest)
                 .map(|more| occupants.iter().cloned().chain(more).collect::<Vec<_>>())
@@ -1049,6 +1081,7 @@ fn plan_in(
                     host: c.host_id.clone(),
                     instances_here: c.instances_here,
                     victims: chosen,
+                    device: device.clone(),
                 };
                 // Rule 3: the host needing the least eviction; ties by fewer
                 // last-READY victims, then the placement order (spread), then
@@ -1103,13 +1136,16 @@ fn plan_in(
         .map_or(DEFAULT_ADMISSION_WINDOW_MS, |p| {
             p.controls.queue.admission_window_ms
         });
-    Ok(Planned::Evict(SwitchPlan::Evict {
-        host: choice.host,
-        instance,
-        wake,
-        victims,
-        admission_window_ms,
-    }))
+    Ok(Planned::Evict(
+        SwitchPlan::Evict {
+            host: choice.host,
+            instance,
+            wake,
+            victims,
+            admission_window_ms,
+        },
+        choice.device,
+    ))
 }
 
 /// Rule 5: a victim is its deployment's last READY instance when no READY,
@@ -1238,14 +1274,17 @@ fn plan_start_in(
             &assumed,
         )? {
             Planned::Settled => continue,
-            Planned::Fits { host } => host,
-            Planned::Evict(SwitchPlan::Evict {
-                host,
-                instance,
-                wake,
-                victims,
-                admission_window_ms,
-            }) => {
+            Planned::Fits { host, device } => host.map(|host| (host, device)),
+            Planned::Evict(
+                SwitchPlan::Evict {
+                    host,
+                    instance,
+                    wake,
+                    victims,
+                    admission_window_ms,
+                },
+                device,
+            ) => {
                 for v in &victims {
                     assumed
                         .released
@@ -1258,9 +1297,9 @@ fn plan_start_in(
                     victims,
                     admission_window_ms,
                 });
-                Some(host)
+                Some((host, device))
             }
-            Planned::Evict(_) => continue,
+            Planned::Evict(..) => continue,
             Planned::Impossible { code, detail } => {
                 return Ok(StartSwitchPlan::Impossible {
                     instance: k,
@@ -1270,8 +1309,9 @@ fn plan_start_in(
             }
         };
         // Charged as placement charges a start accepted but not yet armed.
-        if let Some(host) = host {
-            let (raw, _) = frozen_on_host(tx, target, revision, Some(&host))?;
+        // ADR 0019: on the GPU it goes to, on a multi-GPU host.
+        if let Some((host, device)) = host {
+            let (raw, _) = frozen_on_device(tx, target, revision, Some(&host), device.as_deref())?;
             let e =
                 decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
             assumed.charges.push((
