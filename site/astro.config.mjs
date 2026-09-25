@@ -16,8 +16,8 @@ export default defineConfig({
       expressiveCode: { themes: ['github-dark'] },
       customCss: ['./src/styles/tokens.css'],
       sidebar: [
-        { label: 'Start', items: ['docs', 'docs/install'] },
-        { label: 'Reference', items: ['docs/reference/cli'] },
+        { label: 'Start', items: ['docs', 'docs/install', 'docs/quickstart', 'docs/concepts', 'docs/multiple-machines'] },
+        { label: 'Reference', items: ['docs/reference/configuration', 'docs/reference/cli', 'docs/reference/errors'] },
       ],
       // Website spec, Quality checks: no broken internal links.
       plugins: [starlightLinksValidator()],

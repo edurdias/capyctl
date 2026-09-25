@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, readdirSync } from 'node:fs';
 import { rewriteLink, expandIncludes, toStarlight } from '../scripts/lib/sync.mjs';
 
 const REPO = 'https://github.com/example/mllm';
@@ -47,4 +48,14 @@ test('toStarlight takes the H1 as title, drops it, and leaves links inside code 
 test('an explicit page title wins over the H1', () => {
   const out = toStarlight('# Something else\n\nBody\n', PAGES[0], PAGES, REPO, () => '');
   assert.match(out, /^---\ntitle: "Overview"\n---\n\nBody\n$/);
+});
+
+test('every docs/examples file is embedded verbatim on the configuration page', () => {
+  const root = new URL('../../', import.meta.url);
+  const read = (p) => readFileSync(new URL(p, root), 'utf8');
+  const page = { source: 'docs/guide/configuration.md', slug: 'docs/reference/configuration', title: 'Configuration' };
+  const out = toStarlight(read(page.source), page, [page], REPO, read);
+  const files = readdirSync(new URL('docs/examples/', root)).filter((f) => f.endsWith('.yaml'));
+  assert.equal(files.length, 5);
+  for (const f of files) assert.ok(out.includes(read(`docs/examples/${f}`)), f);
 });

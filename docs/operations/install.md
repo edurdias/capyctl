@@ -1,16 +1,8 @@
 # Installing and operating mllm as a service
 
 This guide covers installing a release with `install.sh`, running each role
-under systemd, upgrading, and rolling back. It follows SPEC §3.3 (one
-executable per OS/architecture, ADR 0001), §4.3 (foreground roles, OS service
-definitions, restart distinct from drain) and §13.3 (owner-only runtime
-files).
-
-What this guide does not establish: the unit files, the tarball and the
-installer are checked locally (`scripts/verify-packaging.sh`), not on a GPU
-host. Running a unit is
-not evidence that an engine recipe works; engine qualification stays with the
-live runbooks.
+under systemd, upgrading, and rolling back. mllm is one executable per OS and
+architecture; each role runs in the foreground under a service manager.
 
 ## Restart is not drain
 
@@ -29,7 +21,7 @@ Read this before anything else.
 A signal (SIGTERM, SIGINT) to any role closes admission, lets admitted
 requests finish within the role document's `shutdown.drain_timeout` (30 s by
 default, 0 s to 600 s), cancels what is still streaming, and exits without
-touching an engine (`crates/mllm-cli/src/shutdown.rs`). A second signal cuts
+touching an engine. A second signal cuts
 the wait short; engines are still retained.
 
 The units therefore have no draining `ExecStop=`. To take engines down, drain
@@ -96,8 +88,7 @@ as with any other restart.
 The units restart a role that fails (`Restart=on-failure`) except on exit
 codes that restarting cannot heal (`RestartPreventExitStatus=`). The table
 lists those codes, plus CLI exit codes an operator is likely to meet; the
-"Units" column says which units, if any, refuse to restart on each. The codes
-are defined in `crates/mllm-cli/src/output.rs`.
+"Units" column says which units, if any, refuse to restart on each.
 
 | Exit | Meaning | Units | What heals it |
 |---|---|---|---|
@@ -126,7 +117,7 @@ error [host_revoked]: Host <host id> is revoked; its engines keep running. To re
 ```
 
 Its engines are neither stopped nor signalled, and its state directory and
-journal are untouched. After `join host --recover` (ADR 0016) and
+journal are untouched. After `join host --recover` and
 `systemctl start mllm-host`, the host reconnects under the same host id and
 each engine is re-proven by a fresh probe, not relaunched. Only that exact,
 authenticated answer from the controller stops the host: an unreachable or
@@ -136,8 +127,8 @@ revoke and never exits with 14; the server unit does not either.
 
 ## Release contents
 
-A release (owner decision 2026-09-24: one self-contained binary, GitHub
-Releases and `install.sh`; Homebrew is deferred) carries these assets:
+A release is one self-contained binary per architecture, published on GitHub
+Releases with `install.sh`. It carries these assets:
 
 | Asset | Holds |
 |---|---|
@@ -163,12 +154,11 @@ mllm-<version>-linux-<arch>/
 
 There is no `runtime/` directory in the release. mllm's Python helpers (the
 vLLM guard and entry, the SGLang entry and its modules, the capability
-probes) are compiled into `bin/mllm` with a manifest of their SHA-256 digests
-(`crates/mllm-agent/build.rs`), and each role that launches engines writes
+probes) are compiled into `bin/mllm` with a manifest of their SHA-256 digests, and each role that launches engines writes
 them to its own state directory; see "The managed runtime directory".
 
 Engines, engine Python environments, model weights and GPU drivers are not in
-the release and are never installed by it (SPEC §4.2, §15.2).
+the release and are never installed by it.
 
 ### Building a release
 
@@ -186,9 +176,8 @@ tarball and the installer locally.
 
 ## Installing with install.sh
 
-Release candidates are published as pre-releases on the GitHub Releases page
-of the private repository `edurdias/mllm` (owner decision
-2026-09-24; the repository opens later). Two things follow:
+Release candidates are published as pre-releases on the project's GitHub
+Releases page. While the repository is private, two things follow:
 
 - **You need a credential.** Run `gh auth login` first (preferred), or export
   `GITHUB_TOKEN` with read access to the repository. Without one, neither the
@@ -202,7 +191,7 @@ of the private repository `edurdias/mllm` (owner decision
 ```bash
 # As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
 gh auth login                                   # once, or export GITHUB_TOKEN
-gh release download v0.1.0-rc.4 -R edurdias/mllm -p install.sh
+gh release download v0.1.0-rc.4 -R <owner>/mllm -p install.sh   # the repository publishing the releases
 sh install.sh --version v0.1.0-rc.4
 
 # Also install a user unit for a role (installed, not enabled).
@@ -262,7 +251,7 @@ sudo install -m 0755 mllm-$V-linux-$A/bin/mllm /usr/local/bin/mllm
 
 The engine imports mllm's own Python from the runtime directory, so a module
 another account can rewrite runs as the engine behind the controls it is meant
-to guard (SPEC §9.1, §13.3). The binary therefore writes that directory
+to guard. The binary therefore writes that directory
 itself:
 
 - **Where.** A host whose document does not name `runtime_dir` uses
@@ -285,9 +274,7 @@ itself:
   overwritten: remove it, or name it as `runtime_dir`. A directory named by
   `runtime_dir` or `MLLM_RUNTIME_DIR` is never written; mllm only checks it.
 
-Every launch still passes the integrity check
-(`crates/mllm-agent/src/runtime_integrity.rs`,
-`crates/mllm-adapters/src/owner_only.rs`): the directory, every subdirectory
+Every launch still passes the integrity check: the directory, every subdirectory
 and every `.py` module owned by the service user, nothing writable by other,
 group write only through the owner's private group, no symlinks, nothing
 importable besides `.py` source, and every ancestor of the SGLang entry owned
@@ -301,8 +288,7 @@ State directories are stricter still: `state_dir`, its `identity`,
 `observation` and `rendezvous` directories must be canonical paths, owned by
 the service user, mode 0700, and every ancestor of the identity directory must
 be owned by root or the service user with no group or other write at all
-(`crates/mllm-agent/src/identity_storage.rs`; `init` otherwise fails with
-"Role identity is unsafe or already in use"). mllm creates the directories
+(`init` otherwise fails with "Role identity is unsafe or already in use"). mllm creates the directories
 itself; do not place `/var/lib/mllm` behind a symlink or under a
 group-writable directory.
 
@@ -392,7 +378,7 @@ instead of the managed one.
 #### Explicit standalone document
 
 `mllm start standalone --config <file>` uses `<file>` as the role document
-instead (SPEC §15.2, R13). A missing or invalid explicit file refuses the
+instead. A missing or invalid explicit file refuses the
 start with exit code 2; it is never replaced by the generated default, and
 nothing is written under `<MLLM_STATE_DIR>/config`. On a state root that has
 never served, the first start creates the protected credentials there, as a
@@ -563,14 +549,14 @@ capabilities, and `UMask=0077`. They deliberately omit:
 
 Writable paths are the state root and `/tmp`, `/var/tmp`. If a recipe must
 write into the model store, add `ReadWritePaths=` for it in a drop-in. These
-restrictions have not been verified under a live engine run yet; the first
-live run under the units is the check.
+restrictions may need loosening for some engine builds; if an engine fails to
+start under the unit but starts by hand, check these first.
 
 ## Upgrade
 
 A restart re-attaches running engines, so an upgrade does not need a drain.
 
-**Order: the server first, then the hosts one at a time** (ADR 0017). The
+**Order: the server first, then the hosts one at a time**. The
 server judges each host's release against its own when the host connects:
 
 | Host release, relative to the server | `compatibility` | What the server does |
@@ -638,10 +624,9 @@ newer release did not migrate the state store (see below).
 
 ## State and migrations
 
-The server store is SQLite with forward-only migrations
-(`crates/mllm-store/src/migrations.rs`): a new release upgrades the store on
+The server store is SQLite with forward-only migrations: a new release upgrades the store on
 first start and no release migrates it back. An older binary refuses a store
-a newer one migrated (SPEC §13.2, T33): the role exits with code 5 and error
+a newer one migrated: the role exits with code 5 and error
 `store_from_newer_version`, naming the store's schema version and the newest
 one the binary supports, and writes nothing. The host journal is refused the
 same way. The packaged units do not restart on exit code 5; the fix is the
@@ -657,9 +642,9 @@ know. So:
   after the backup was taken; drain the affected hosts first (`mllm drain
   host`), then stop the role, restore, and start it.
 - Never copy state between hosts or reuse a host's state under a different
-  name: identities are bound to it (SPEC §4.1). Losing a host's identity
+  name: identities are bound to it. Losing a host's identity
   requires re-enrollment, not a copied directory.
 
 Role documents under `/etc/mllm` are operator configuration; mllm never
-rewrites them (SPEC §15.1). Validate them with the new binary
+rewrites them. Validate them with the new binary
 (`mllm validate config`) before restarting.
