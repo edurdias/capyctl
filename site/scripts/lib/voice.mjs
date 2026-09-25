@@ -29,3 +29,14 @@ export function findInternalTerms(text) {
   const edge = (c) => (/[a-z0-9]/.test(c) ? '(?:$|[^a-z0-9])' : '');
   return INTERNAL_TERMS.filter((t) => new RegExp(`(?:^|[^a-z0-9])${escape(t)}${edge(t.at(-1))}`).test(lower));
 }
+
+// Owner feedback 2026-09-25: the landing page names no port. Its text,
+// terminal blocks included, carries no `:<port>` and none of mllm's default
+// port numbers.
+export function findPorts(html) {
+  const text = html
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ');
+  return [...new Set([...text.matchAll(/:\d{2,5}\b|\b(?:7443|7444|7445|8443|8444)\b/g)].map((m) => m[0]))];
+}

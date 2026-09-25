@@ -1,4 +1,4 @@
-# A deployment for `mllm start standalone`, used by the quickstart.
+# A deployment for `mllm start standalone` with the engine in MLLM_VLLM_BIN.
 # Deploy it with `mllm deploy model --file deployment-standalone.yaml --activate`.
 schema_version: 1
 kind: deployment

@@ -6,7 +6,8 @@ import { INSTALL_COMMAND, href } from '../../../site.config.mjs';
 <section>
   <h2>Install</h2>
   <pre class="terminal" tabindex="0"><code><span class="prompt">$ </span>{INSTALL_COMMAND}
-<span class="prompt">$ </span>mllm start standalone
-<span class="prompt">$ </span>mllm deploy model --file deployment.yaml --activate</code></pre>
-  <p>One static binary. Bring your own engine and weights. <a href={href('/docs/quickstart/')}>Quickstart</a></p>
+<span class="prompt">$ </span>mllm engine add ~/venvs/vllm
+<span class="prompt">$ </span>MLLM_MODELS_ROOT=~/models mllm start standalone
+<span class="prompt">$ </span>mllm deploy model --file my-model.yaml</code></pre>
+  <p>One static binary. Bring your own engine and weights. <a href={href('/docs/one-machine/')}>Run on one machine</a></p>
 </section>

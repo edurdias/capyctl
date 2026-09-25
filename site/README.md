@@ -27,6 +27,14 @@ Astro's telemetry is turned off in every script.
   own table code from `src/data/hero-deployments.json` and
   `src/data/hero-hosts.json` (`cargo run -p mllm-cli --example hero_table`).
 - The version shown is the workspace version in `Cargo.toml`.
+- Command output in the guide is pasted from a real run:
+  `node scripts/transcript/capture.mjs ../target/debug/mllm` runs every
+  command the guide shows against a built binary, in private sandbox homes
+  under `~/.cache/mllm-site-docs`, with a stand-in engine
+  (`scripts/transcript/fake-vllm.py`) that answers mllm's calls and loads
+  nothing. It prints the transcript to copy from; it is not a test of any
+  engine. `npm run check` also checks that every `mllm` command the guide and
+  the landing page show exists in the built CLI's `--help`.
 
 ## Settings
 
@@ -50,7 +58,7 @@ value (`scripts/lib/settings.mjs`):
 
 - Recompute the GPU table (`src/data/gpu.mjs`) against actual weight sizes of
   current models and update `tests/gpu.test.mjs` on purpose.
-- Run every command on the landing page and in the quickstart against the
+- Run every command on the landing page and in the guide against the
   release the site documents.
 - Settle the remaining open decisions in the website spec: a community link
   and a logo.

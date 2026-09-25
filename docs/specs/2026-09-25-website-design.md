@@ -63,7 +63,7 @@ Sections in order (approved in the phone-width mockup, v2):
 2. **Why.** Heading "More models than memory". One paragraph: most home GPUs hold
    one or two models at a time; mllm parks the idle ones, releases their GPU
    memory and wakes the one a request asks for, behind the same endpoint.
-3. **How it works.** A diagram: your apps → `:8443/v1` (OpenAI API) → mllm server
+3. **How it works.** A diagram: your apps → one OpenAI-compatible endpoint → mllm server
    (router, scheduler, memory ledger) → gRPC over mutual TLS → hosts, each showing
    models with their engine and state. One line under it: engines listen on
    loopback only; the server decides where each model runs and tracks the GPU
@@ -106,6 +106,12 @@ Built with Starlight. Content at launch:
   example with `clap-markdown`), never hand-written.
 - **Exit codes and errors** — from the tables in `install.md` and the SPEC error
   vocabulary.
+
+Owner feedback 2026-09-25 replaces the list above with task pages: Install,
+Run on one machine, Run on several machines, Add an engine, Deploy a model,
+Make a request, Parking and switching, then the reference pages. Every
+command and output block shown is from a real run of the documented CLI, and
+the landing page shows no port numbers.
 
 Single source rule: pages that already exist in `docs/` are pulled into the site at
 build time by a sync step, not copied by hand. New user-facing pages live under

@@ -14,7 +14,7 @@ release's checksums. Make sure `~/.local/bin` is on your `PATH`, then check:
 mllm --version
 ```
 
-Next: the [Quickstart](quickstart.md).
+Next: [Run on one machine](one-machine.md).
 
 ## Upgrade
 

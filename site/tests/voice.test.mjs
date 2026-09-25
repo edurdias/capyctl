@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { visibleText, findViolations, findInternalTerms } from '../scripts/lib/voice.mjs';
+import { visibleText, findViolations, findInternalTerms, findPorts } from '../scripts/lib/voice.mjs';
 
 test('visible text excludes code, scripts and attributes', () => {
   const html = '<p title="powered by x">Hello <code>tested on box</code></p><script>powered by</script><pre>x</pre>';
@@ -21,4 +21,11 @@ test('flags internal terms as whole words only', () => {
   assert.deepEqual(findInternalTerms('See SPEC §6.4 and the ledger.'), ['spec §', 'ledger']);
   assert.deepEqual(findInternalTerms('Each release is released; a readr.'), []);
   assert.deepEqual(findInternalTerms('The ADR 0013 lease.'), ['adr', 'lease']);
+});
+
+test('the landing page port check finds ports in text and code, not in styles', () => {
+  assert.deepEqual(findPorts('<p>One OpenAI-compatible endpoint</p><style>.a{max-width:720px}</style>'), []);
+  assert.deepEqual(findPorts('<div><code>:8443/v1</code></div>'), [':8443']);
+  assert.deepEqual(findPorts('<pre>listening on 127.0.0.1:7443</pre>'), [':7443']);
+  assert.deepEqual(findPorts('<p>port 8443</p>'), ['8443']);
 });

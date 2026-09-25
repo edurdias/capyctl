@@ -12,7 +12,9 @@ they are not tuned settings for any model.
 
 ## Deployment for standalone
 
-The [Quickstart](quickstart.md) uses this one.
+This one names `local`, the engine standalone takes from `MLLM_VLLM_BIN`.
+With an engine added by [`mllm engine add`](engines.md), name that profile
+instead, as in [Deploy a model](deploy.md).
 
 <!-- include: ../examples/deployment-standalone.yaml -->
 

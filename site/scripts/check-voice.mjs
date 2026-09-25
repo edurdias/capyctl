@@ -3,7 +3,7 @@
 // built file (code blocks and attributes included).
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { visibleText, findViolations, findInternalTerms } from './lib/voice.mjs';
+import { visibleText, findViolations, findInternalTerms, findPorts } from './lib/voice.mjs';
 import { INSTALL_URL, REPO_URL, SITE_ORIGIN } from '../site.config.mjs';
 
 // Owner decision 2026-09-25: the configured URLs (the repository and the
@@ -27,6 +27,7 @@ for (const entry of readdirSync(dist, { recursive: true })) {
     ...(entry.endsWith('.html') ? findViolations(visibleText(raw), []) : []),
     ...(entry.startsWith('docs/') && entry.endsWith('.html') ? findInternalTerms(visibleText(raw)).map((t) => `internal term "${t}"`) : []),
     ...findViolations(withoutUrls(raw), denylist),
+    ...(entry === 'index.html' ? findPorts(raw).map((p) => `port "${p}" on the landing page`) : []),
   ];
   if (hits.length) failures.push(`${entry}: ${[...new Set(hits)].join(', ')}`);
 }
