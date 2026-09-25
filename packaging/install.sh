@@ -1,43 +1,42 @@
 #!/bin/sh
 # Install mllm from a GitHub release.
 #
-#   install.sh [--version VERSION] [--system] [--systemd ROLE] [--repo OWNER/NAME]
-#   install.sh --uninstall [--system]
+#   curl -fsSL <install URL> | sh                      # latest release
+#   curl -fsSL <install URL> | sh -s -- [OPTIONS]      # with options
+#   sh install.sh [OPTIONS]                            # a downloaded copy
 #
-# Downloads mllm-<version>-linux-<arch>.tar.gz and the release's SHA256SUMS,
-# refuses on any checksum mismatch, and installs the one self-contained
-# binary (SPEC §3.3, ADR 0001; mllm's Python runtime helpers are compiled into
-# it and written to <state_dir>/runtime when a role starts). Engines, engine
-# Python environments, model weights and GPU drivers are never installed.
+# Downloads mllm-<version>-linux-<arch>.tar.gz and the release's SHA256SUMS
+# with curl, refuses on any checksum mismatch, and installs the one
+# self-contained binary. Engines, engine Python environments, model weights
+# and GPU drivers are never installed.
 #
 # Options:
-#   --version V     release to install, e.g. 0.1.0-rc.4 (a leading "v" is
-#                   accepted). Default: the latest published release, which
-#                   GitHub never resolves to a pre-release or a draft: pass
-#                   --version for a release candidate.
+#   --version V     release to install, e.g. 0.1.0 (a leading "v" is
+#                   accepted). Default: the latest release; a release
+#                   candidate is installed only when named.
 #   --system        install for every user: /usr/local/bin/mllm, units under
 #                   /etc/systemd/system (needs root). Default: this user only,
 #                   ~/.local/bin/mllm and ~/.config/systemd/user.
 #   --systemd ROLE  also install the unit for ROLE (server, host or
-#                   standalone) and reload systemd. The unit is not enabled or
-#                   started; docs/operations/install.md says how.
-#   --repo R        GitHub repository (default edurdias/mllm).
+#                   standalone) and reload systemd. The unit is not enabled
+#                   or started.
+#   --repo R        GitHub repository, OWNER/NAME (default below).
 #   --uninstall     remove the binary, the shared files and the units this
 #                   script installed. State directories are never touched.
 #   -h, --help      this text.
 #
-# Download, in order of preference:
+# Fallbacks, for a private repository or a mirror:
+#   gh                     used when the GitHub CLI is installed and logged in.
+#   GITHUB_TOKEN           used with the GitHub API when set.
 #   MLLM_INSTALL_BASE_URL  a directory holding the release assets (https://
-#                          or file://); used as is, for mirrors and tests.
-#   gh                     `gh release download` when the GitHub CLI is
-#                          installed and logged in (works for private repos).
-#   curl + GITHUB_TOKEN    the GitHub API with the token (private repos).
-#   curl                   the public release download URL.
+#                          or file://), used as is; needs --version.
 #
 # Environment: PREFIX overrides the install prefix (default ~/.local, or
 # /usr/local with --system), UNIT_DIR the unit directory. SYSTEMCTL names the
 # systemctl to run (tests).
 # POSIX sh; shellcheck-clean.
+
+# Packaging design: ADR 0001 (one self-contained binary per architecture).
 set -eu
 
 repo=edurdias/mllm
@@ -48,7 +47,14 @@ action=install
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() {
+  # Piped into sh, $0 is the shell, not this file.
+  if [ -r "$0" ] && head -n 2 "$0" | grep -q 'Install mllm'; then
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+  else
+    say "usage: install.sh [--version V] [--system] [--systemd ROLE] [--repo OWNER/NAME] | --uninstall [--system]"
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case $1 in

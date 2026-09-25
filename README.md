@@ -42,22 +42,18 @@ or SGLang environment and your own checkpoints.
 ## Install
 
 A release is one self-contained binary per architecture (Linux x86-64 and
-ARM64); mllm's Python runtime helpers are compiled into it. The repository is
-private for now, so use a logged-in `gh` (`gh auth login`) or set
-`GITHUB_TOKEN`. Release candidates are pre-releases, which GitHub's "latest
-release" skips, so always pass `--version`:
+ARM64). Install it with the installer published with each release:
 
 ```bash
-gh release download v0.1.0-rc.4 -R edurdias/mllm -p install.sh
-sh install.sh --version v0.1.0-rc.4         # installs ~/.local/bin/mllm
-# sudo sh install.sh --system ...           # /usr/local/bin/mllm
-# add --systemd <server|host|standalone> to install that role's unit
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh                              # ~/.local/bin/mllm
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version v0.1.0-rc.4  # a release candidate
 ```
 
 The installer checks every download against the release's `SHA256SUMS` and
-refuses on a mismatch. See
-[`docs/operations/install.md`](docs/operations/install.md) for services,
-upgrades and rollback.
+refuses on a mismatch. While the repository is private, it falls back to a
+logged-in `gh` or to `GITHUB_TOKEN`. See [`docs/guide/install.md`](docs/guide/install.md)
+to get started, and [`docs/operations/install.md`](docs/operations/install.md)
+for services, upgrades and rollback.
 
 ## Quickstart: one machine
 

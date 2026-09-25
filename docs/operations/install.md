@@ -176,38 +176,40 @@ tarball and the installer locally.
 
 ## Installing with install.sh
 
-Release candidates are published as pre-releases on the project's GitHub
-Releases page. While the repository is private, two things follow:
-
-- **You need a credential.** Run `gh auth login` first (preferred), or export
-  `GITHUB_TOKEN` with read access to the repository. Without one, neither the
-  download of `install.sh` nor the installer itself can reach the release.
-- **You must pass `--version`.** GitHub's "latest release" never resolves to a
-  pre-release or a draft, so while only release candidates exist the
-  installer cannot find one on its own. Name it, for example
-  `--version v0.1.0-rc.4` (the leading `v` is optional). Without it the
-  installer stops and says so.
+The project site serves the installer; each release also publishes a copy
+beside its tarballs. It downloads the release from GitHub with `curl`:
 
 ```bash
 # As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
-gh auth login                                   # once, or export GITHUB_TOKEN
-gh release download v0.1.0-rc.4 -R <owner>/mllm -p install.sh   # the repository publishing the releases
-sh install.sh --version v0.1.0-rc.4
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh
 
-# Also install a user unit for a role (installed, not enabled).
-sh install.sh --version 0.1.0-rc.4 --systemd standalone
+# A named release, and a user unit for a role (installed, not enabled).
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sh -s -- --version <version> --systemd standalone
 
 # For every user: /usr/local/bin/mllm and system units.
-sudo sh install.sh --system --version 0.1.0-rc.4 --systemd host
+curl -fsSL https://edurdias.github.io/mllm/install.sh | sudo sh -s -- --system --version <version> --systemd host
 ```
+
+A downloaded copy takes the same options: `sh install.sh --version <version>`.
+
+**Release candidates.** GitHub's "latest release" never resolves to a
+pre-release or a draft, so while only release candidates exist, pass
+`--version` (for example `--version v0.1.0-rc.4`; the leading `v` is optional).
+Without it the installer stops and says so.
+
+**Private repository.** The public download needs no credential. For a
+private repository, log in with `gh auth login` first, or export
+`GITHUB_TOKEN` with read access, and fetch the installer itself the same way
+(`gh release download <tag> -R <owner>/mllm -p install.sh`).
 
 Without `--version` the latest published full release is installed; a draft
 or a pre-release is installed only by naming it. The installer:
 
 1. detects the OS (Linux) and architecture (`x86_64`, `aarch64`);
-2. downloads the tarball and `SHA256SUMS` with `gh release download`, else
-   through the GitHub API with `GITHUB_TOKEN`, else from the public download
-   URL (`MLLM_INSTALL_BASE_URL` names a mirror directory, `https://` or
+2. downloads the tarball and `SHA256SUMS` from the public download URL with
+   `curl`; when `gh` is logged in it uses `gh release download`, and when
+   `GITHUB_TOKEN` is set the GitHub API, which also work for a private
+   repository (`MLLM_INSTALL_BASE_URL` names a mirror directory, `https://` or
    `file://`, instead);
 3. refuses to install unless the tarball's SHA-256 matches `SHA256SUMS`, every
    file in it matches the archive's own `SHA256SUMS`, and the binary reports
@@ -228,7 +230,7 @@ and the units the installer wrote. State directories are kept.
 To install from a downloaded tarball by hand instead:
 
 ```bash
-V=0.1.0-rc.4; A=$(uname -m)
+V=x.y.z; A=$(uname -m)   # the version you downloaded
 sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf mllm-$V-linux-$A.tar.gz
 (cd mllm-$V-linux-$A && sha256sum -c --quiet SHA256SUMS)
@@ -303,7 +305,7 @@ useradd --system --user-group --home-dir /var/lib/mllm --shell /usr/sbin/nologin
 install -d -o mllm -g mllm -m 0700 /var/lib/mllm
 
 # The binary and the role's unit (host shown; server and standalone alike).
-sh install.sh --system --version 0.1.0-rc.4 --systemd host
+sh install.sh --system --version <version> --systemd host
 install -d -m 0750 -g mllm /etc/mllm
 ```
 
@@ -424,7 +426,7 @@ leaves `MLLM_STATE_DIR` unset, so it and your shell both use
 `~/.local/state/mllm`.
 
 ```bash
-sh install.sh --version 0.1.0-rc.4 --systemd host
+sh install.sh --version <version> --systemd host
 systemctl --user enable --now mllm-host
 loginctl enable-linger "$USER"   # keep it running after logout
 ```
