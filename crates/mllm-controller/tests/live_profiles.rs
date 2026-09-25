@@ -630,3 +630,30 @@ async fn a_malformed_or_unserved_retirement_is_refused() {
     assert!(h.sessions.current_session(&h.host).is_some());
     h.server.abort();
 }
+
+// T37: with a retirement service installed, an invalid profile name is
+// refused before the service is asked, and the session stays up.
+#[tokio::test]
+async fn an_invalid_profile_name_is_refused_with_a_service_installed() {
+    let h = enrolled().await;
+    let service = Arc::new(Scripted {
+        first: RetirementStep::Confirmed,
+        waits: 0.into(),
+        last: RetirementStep::Confirmed,
+        seen: Mutex::new(vec![]),
+    });
+    h.sessions.with_profile_retirements(service.clone());
+    let (send, mut stream) = h.reconciled(BINARY_VERSION, all()).await;
+    send.send(retire("req-6", "Not A Name", true))
+        .await
+        .unwrap();
+    let answer = retirement(&mut stream).await;
+    assert_eq!(
+        (answer.request_id.as_str(), answer.outcome.as_str()),
+        ("req-6", "refused")
+    );
+    assert!(!answer.reason.is_empty());
+    assert!(service.seen.lock().unwrap().is_empty());
+    assert!(h.sessions.current_session(&h.host).is_some());
+    h.server.abort();
+}
