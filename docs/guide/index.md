@@ -1,17 +1,15 @@
 # mllm documentation
 
-mllm runs vLLM and SGLang engines on GPU machines you own. It parks the models
-nobody is using so their GPU memory is released, wakes the one a request asks
-for, and puts one OpenAI-compatible endpoint in front of every machine you
-enroll.
+mllm runs vLLM and SGLang models on GPU machines you own. It parks the models
+nobody is using, which frees their GPU memory, and wakes the one a request
+asks for. Clients use one OpenAI-compatible endpoint.
 
-- [Install](../operations/install.md) mllm from a release.
-- [CLI reference](/docs/reference/cli/), generated from the command definitions.
-- [Quickstart](quickstart.md): one machine, one model, a park and a wake.
-- [Concepts](concepts.md): deployments, instances, hosts, parking and the memory ledger.
-- [Multiple machines](multiple-machines.md): a server and several GPU hosts.
-- [Configuration reference](configuration.md) and
-  [exit codes and errors](errors.md).
+1. [Install](install.md) mllm with one command.
+2. [Quickstart](quickstart.md): one machine, one model, a park and a wake.
+3. [Several machines](several-machines.md): one server, several GPU machines.
+
+Reference: [CLI](/docs/reference/cli/), [configuration files](configuration.md),
+[installer options](installer.md), [exit codes and errors](errors.md).
 
 mllm does not install engines, drivers or model weights. Bring your own vLLM or
-SGLang environment and your own checkpoints.
+SGLang installation and your own checkpoints.

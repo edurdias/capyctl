@@ -153,12 +153,12 @@ same text.
 
 ## Open decisions (before launch, not before building)
 
-1. **Domain and hosting.** A standalone mllm domain versus a path on an existing
-   domain; GitHub Pages versus Cloudflare Pages. Depends on the public repository's
-   organisation.
-2. **Installer one-liner.** `curl … | sh` works only once releases are public. Until
-   then the Install button links to the docs page that explains `gh` and
-   `--version`.
+1. **Domain and hosting.** Decided 2026-09-25: GitHub Pages at the
+   repository's `github.io` path, no custom domain, published by
+   `.github/workflows/site.yml`.
+2. **Installer one-liner.** Decided 2026-09-25: `curl -fsSL <site>/install.sh | sh`,
+   served by the site, downloading public release assets. `gh` and a token are
+   only a fallback for a private repository.
 3. **Community link.** GitHub Discussions, Discord, or neither at launch.
 4. **Logo.** A wordmark in the sans-serif is enough for launch.
 
