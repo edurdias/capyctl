@@ -85,6 +85,15 @@ mllm list deployments
 mllm status deployment <name>
 ```
 
+The first `--activate` of a new checkpoint waits while the host measures its
+digest (bounded by the deployment's Initialize timeout), then starts it; a
+plain `deploy model` returns at once and names the `start deployment <name>
+--wait` that starts it. `validate config` checks a document offline; given
+`--host host.yaml` it also runs the per-host checks `deploy` runs (runtime
+profile, including one `mllm engine add` registered beside that document,
+placement, devices, resources and timeouts), and its `requires_server` field
+lists the checks only a running server can make.
+
 Commands that read records (`list`, `status`, `engine list`, `engine detect`)
 print an aligned table, whether or not the output is a terminal:
 

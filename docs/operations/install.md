@@ -112,7 +112,7 @@ are defined in `crates/mllm-cli/src/output.rs`.
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
 | 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
-| 22 | The role's control socket did not answer (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role starts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
+| 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 | 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
 
@@ -555,11 +555,19 @@ starts without `--config`, so its `engines.yaml` is the service user's
 `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm engine add …`.
 
 `engine add` also works before any role has ever started — the first-run path
-of adding an engine, then starting the role for the first time. It creates the
-state directory the role will use (owner-only, mode 0700) if it does not exist
-yet, writes `engines.yaml`, and reports `agent_unreachable`, since nothing is
-listening to publish it live; the profile takes effect at the role's first
-start.
+of adding an engine, then starting the role for the first time (standalone
+refuses to start with no engine). It creates the state directory the role will
+use (owner-only, mode 0700) if it does not exist yet, writes `engines.yaml`, and
+exits 0 with `published: role_not_running` and the line `saved to
+<engines.yaml> (revision N); start mllm (…) to use it`: no role is running (no
+control socket, or a stale one nobody listens on), so the profile takes effect
+at the role's first start. Only a role that is running but does not take or
+answer the request exits 22 (`agent_unreachable`).
+
+`--config` and `$MLLM_CONFIG` may be relative: every command and role resolves
+them against its working directory first, so `mllm engine add … --config
+host.yaml` run beside `host.yaml` writes the `engines.yaml` next to it and asks
+the running role to publish it.
 
 ## Hardening in the units
 

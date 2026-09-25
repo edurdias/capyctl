@@ -315,11 +315,19 @@ async fn a_request_the_role_took_but_never_answered_is_unanswered() {
     let late = request(&path, &ControlRequest::List, Duration::from_millis(200)).await;
     assert!(matches!(late, Err(ClientError::Unanswered(_))), "{late:?}");
     role.join().unwrap();
-    // Nothing listening at all: unreachable, the request never left.
+    // Nothing listening at all: no role is running, the request never left.
     std::fs::remove_file(&path).unwrap();
     let absent = request(&path, &ControlRequest::List, Duration::from_secs(5)).await;
     assert!(
-        matches!(absent, Err(ClientError::Unreachable(_))),
+        matches!(absent, Err(ClientError::NotRunning(_))),
         "{absent:?}"
+    );
+    // A stale socket left by a role that exited refuses the connection:
+    // likewise not running.
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    let stale = request(&path, &ControlRequest::List, Duration::from_secs(5)).await;
+    assert!(
+        matches!(stale, Err(ClientError::NotRunning(_))),
+        "{stale:?}"
     );
 }

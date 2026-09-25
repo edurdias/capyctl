@@ -2,7 +2,7 @@
 //! standalone. Detection reads metadata only; an installation runs only
 //! after the operator named or picked it.
 mod target;
-pub use target::{named_role_document, resolve_target, role_engines, RoleKind, Target};
+pub use target::{absolute, named_role_document, resolve_target, role_engines, RoleKind, Target};
 
 use crate::grammar::{Command, DeepParkChoice, DriftChoice};
 use crate::output::StructuredError;
@@ -359,6 +359,25 @@ async fn add(
                 reply["message"].as_str().unwrap_or("refused")
             ),
         )),
+        // Owner decision 2026-09-25 (first-run walk): no role is running,
+        // which is the normal first run (standalone refuses to start with no
+        // engine). The profile is saved and the role publishes it when it
+        // starts, so this is a success with a notice, not an error. SPEC §8,
+        // ADR 0018 §3.
+        Err(ClientError::NotRunning(_)) => {
+            out["published"] = json!("role_not_running");
+            out["notice"] = json!(format!(
+                "saved to {} (revision {revision}); start mllm (`{}`) to use it",
+                target.engines.display(),
+                match target.kind {
+                    RoleKind::Standalone => "mllm start standalone",
+                    RoleKind::Host => "mllm start host",
+                }
+            ));
+            Ok(out)
+        }
+        // A role is there but did not take or answer the request: that is a
+        // fault the operator must look at.
         Err(e) => Err(error(
             "agent_unreachable",
             format!(
