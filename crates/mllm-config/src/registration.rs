@@ -183,6 +183,7 @@ pub fn lock_engines_for(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&lock)
         .map_err(|e| io(&lock, e))?;
+    refuse_hardlink(&lock, &file, owner)?;
     if let Some(owner) = owner {
         give(&file, owner).map_err(|e| io(&lock, e))?;
     }
@@ -192,6 +193,34 @@ pub fn lock_engines_for(
         path: path.to_path_buf(),
         owner,
     })
+}
+
+/// ADR 0018 §2 hardening (2026-09-25): before any `fchown`, refuse a path
+/// that opened to anything but a regular file with exactly one link, owned
+/// by root or by the state-dir owner this write is for. Without this check,
+/// a hard link planted at `engines.yaml` or `engines.yaml.lock` before the
+/// CLI runs as root would make root's `fchown` change that other file's
+/// ownership too (they share one inode) — the check runs on the already
+/// opened, `O_NOFOLLOW`-opened file descriptor, so there is no gap between
+/// checking and using it.
+fn refuse_hardlink(path: &Path, file: &File, owner: Option<(u32, u32)>) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().map_err(|e| io(path, e))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let allowed_uid = owner.map_or_else(|| unsafe { libc::geteuid() }, |(uid, _)| uid);
+    if !meta.is_file() || meta.nlink() != 1 || (meta.uid() != 0 && meta.uid() != allowed_uid) {
+        return Err(ConfigError::new(
+            ConfigErrorCode::Io,
+            path.display().to_string(),
+            format!(
+                "refusing to use {}: expected a regular file with one link, owned by root or uid {allowed_uid}; found {} link(s) owned by uid {} (ADR 0018)",
+                path.display(),
+                meta.nlink(),
+                meta.uid()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `fchown` `file` to `(uid, gid)` unless it already has them (only root may
@@ -242,12 +271,26 @@ pub fn write_engines(
     // Controller ruling C1: a rewrite keeps the file's owner and mode (the
     // role reads it as its service user; the CLI may be running as root); a
     // new file goes to the lock's named owner, mode 0600.
-    let (owner, mode) = match fs::symlink_metadata(&file.path) {
-        Ok(meta) if meta.file_type().is_file() => {
+    //
+    // ADR 0018 §2 hardening: opened with `O_NOFOLLOW` (a symlink here makes
+    // the open fail with ELOOP; the rename below replaces the link itself
+    // rather than following it, so that case still just writes a fresh
+    // file) and refused if it is a hard link to something else — otherwise
+    // that file's owner would be copied onto the new engines.yaml.
+    let (owner, mode) = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&file.path)
+    {
+        Ok(existing) => {
+            refuse_hardlink(&file.path, &existing, lock.owner)?;
             use std::os::unix::fs::MetadataExt;
+            let meta = existing.metadata().map_err(|e| io(&file.path, e))?;
             (Some((meta.uid(), meta.gid())), meta.mode() & 0o777)
         }
-        _ => (lock.owner, 0o600),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (lock.owner, 0o600),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => (lock.owner, 0o600),
+        Err(e) => return Err(io(&file.path, e)),
     };
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| io(dir, e))?;
     tmp.write_all(text.as_bytes())

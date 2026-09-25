@@ -320,3 +320,65 @@ fn a_rewrite_keeps_the_owner_and_mode_and_a_new_file_takes_the_named_owner() {
         0o640
     );
 }
+
+// ADR 0018 §2 hardening (2026-09-25): a hard link planted at `engines.yaml.lock`
+// before the CLI runs as root must not let its `fchown` reach the file the
+// link really points at (they share one inode). `lock_engines_for` refuses
+// it instead of chowning the victim.
+#[test]
+fn lock_refuses_a_hard_linked_lock_file() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let before = std::fs::metadata(&victim).unwrap();
+    let path = dir.path().join("engines.yaml");
+    let lock_path = dir.path().join("engines.yaml.lock");
+    std::fs::hard_link(&victim, &lock_path).unwrap();
+    let me = std::fs::metadata(dir.path()).unwrap();
+    let err = match lock_engines_for(&path, Some((me.uid(), me.gid()))) {
+        Ok(_) => panic!("expected the hard-linked lock file to be refused"),
+        Err(e) => e,
+    };
+    assert!(err.detail.contains("one link"), "{}", err.detail);
+    let after = std::fs::metadata(&victim).unwrap();
+    assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+    assert_eq!(
+        before.permissions().mode() & 0o777,
+        after.permissions().mode() & 0o777
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch");
+}
+
+// As above, for `engines.yaml` itself: a hard link there must not have its
+// owner/mode copied onto the freshly written file, nor its inode touched.
+#[test]
+fn write_refuses_a_hard_linked_engines_file() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    let seed = EnginesFile {
+        path: victim.clone(),
+        revision: 0,
+        profiles: Default::default(),
+    };
+    std::fs::write(&victim, seed.render(0)).unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let before = std::fs::metadata(&victim).unwrap();
+    let before_text = std::fs::read_to_string(&victim).unwrap();
+    let path = dir.path().join("engines.yaml");
+    std::fs::hard_link(&victim, &path).unwrap();
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert("vllm".into(), profile());
+    let err = write_engines(&engines, &lock, None).unwrap_err();
+    assert!(err.detail.contains("one link"), "{}", err.detail);
+    let after = std::fs::metadata(&victim).unwrap();
+    assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+    assert_eq!(
+        before.permissions().mode() & 0o777,
+        after.permissions().mode() & 0o777
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), before_text);
+}
