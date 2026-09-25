@@ -555,7 +555,10 @@ mod tests {
         assert!(store
             .replan_unproven_cleanup(&session, &receipt.step_id, now + 3)
             .unwrap());
-        assert!(owns(&store, &fence.deployment_id), "the re-plan releases nothing");
+        assert!(
+            owns(&store, &fence.deployment_id),
+            "the re-plan releases nothing"
+        );
         assert_eq!(
             store
                 .ordinary_cleanup_status(&session, &receipt.step_id, now + 4)

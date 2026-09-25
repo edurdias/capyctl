@@ -174,8 +174,15 @@ async fn standalone_starts_from_a_document_an_older_generator_wrote() {
 
     let notices = app.config_notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(notices[0].contains("server.tls") && notices[0].contains("ignored"), "{notices:?}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy, "the file is not rewritten");
+    assert!(
+        notices[0].contains("server.tls") && notices[0].contains("ignored"),
+        "{notices:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        legacy,
+        "the file is not rewritten"
+    );
 }
 
 /// T03 (SPEC §15.3): the current generated document reports nothing ignored.
@@ -183,13 +190,21 @@ async fn standalone_starts_from_a_document_an_older_generator_wrote() {
 async fn standalone_reports_nothing_ignored_for_the_current_generated_document() {
     let dir = safe_state_dir();
     let app = boot(dir.path()).await;
-    assert!(app.config_notices().is_empty(), "{:?}", app.config_notices());
+    assert!(
+        app.config_notices().is_empty(),
+        "{:?}",
+        app.config_notices()
+    );
 }
 
 /// Nothing a refused explicit document could have produced exists under the
 /// state root: no generated document, no credentials, no store.
 fn assert_untouched(state: &std::path::Path) {
-    for leaf in ["config/standalone.yaml", "identity/credentials", "server/srv.sqlite3"] {
+    for leaf in [
+        "config/standalone.yaml",
+        "identity/credentials",
+        "server/srv.sqlite3",
+    ] {
         assert!(!state.join(leaf).exists(), "{leaf} was created");
     }
 }
@@ -205,9 +220,15 @@ async fn an_explicit_standalone_document_that_is_missing_refuses_without_fallbac
         .await
         .err()
         .expect("a missing explicit document refuses the boot");
-    assert!(matches!(error, mllm_cli::roles::StartError::Config(_)), "{error:?}");
+    assert!(
+        matches!(error, mllm_cli::roles::StartError::Config(_)),
+        "{error:?}"
+    );
     assert!(error.to_string().contains("does not exist"), "{error}");
-    assert_eq!(mllm_cli::output::StructuredError::from(error).code, "invalid_config");
+    assert_eq!(
+        mllm_cli::output::StructuredError::from(error).code,
+        "invalid_config"
+    );
     assert_untouched(dir.path());
 }
 
@@ -227,7 +248,10 @@ async fn an_explicit_standalone_document_that_is_invalid_is_not_replaced_by_the_
         .await
         .err()
         .expect("an invalid explicit document refuses the boot");
-    assert!(matches!(error, mllm_cli::roles::StartError::Config(_)), "{error:?}");
+    assert!(
+        matches!(error, mllm_cli::roles::StartError::Config(_)),
+        "{error:?}"
+    );
     assert_eq!(std::fs::read_to_string(&explicit).unwrap(), invalid);
     assert_eq!(std::fs::read_to_string(&implicit).unwrap(), implicit_before);
     assert!(!dir.path().join("server/srv.sqlite3").exists());
@@ -271,7 +295,11 @@ async fn standalone_honours_a_valid_explicit_document() {
     let notices = app.config_notices();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("server.tls"), "{notices:?}");
-    assert_eq!(std::fs::read_to_string(&explicit).unwrap(), text, "not rewritten");
+    assert_eq!(
+        std::fs::read_to_string(&explicit).unwrap(),
+        text,
+        "not rewritten"
+    );
     assert!(
         !dir.path().join("config/standalone.yaml").exists(),
         "no implicit document is generated beside an explicit one"
@@ -279,7 +307,11 @@ async fn standalone_honours_a_valid_explicit_document() {
     let credentials = dir.path().join("identity/credentials");
     use std::os::unix::fs::PermissionsExt as _;
     assert_eq!(
-        std::fs::metadata(&credentials).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(&credentials)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o600
     );
     assert!(!app.api_key().is_empty() && app.api_key() != "mllm-local");
@@ -292,8 +324,14 @@ async fn standalone_honours_a_valid_explicit_document() {
 async fn an_explicit_document_does_not_recreate_lost_credentials() {
     let dir = safe_state_dir();
     let explicit = dir.path().join("explicit.yaml");
-    std::fs::write(&explicit, "schema_version: 1\nkind: standalone\nname: local\n").unwrap();
-    let app = boot_configured(dir.path(), &explicit).await.expect("first boot");
+    std::fs::write(
+        &explicit,
+        "schema_version: 1\nkind: standalone\nname: local\n",
+    )
+    .unwrap();
+    let app = boot_configured(dir.path(), &explicit)
+        .await
+        .expect("first boot");
     let _ = app.shutdown().await;
     std::fs::remove_file(dir.path().join("identity/credentials")).unwrap();
     let error = boot_configured(dir.path(), &explicit)

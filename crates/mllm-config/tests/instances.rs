@@ -153,10 +153,15 @@ fn lifecycle_warm_parses_and_leaves_the_recipe_unchanged() {
     assert!(parse_strict(ConfigKind::Deployment, &warm.to_string()).is_ok());
     assert_eq!(
         resolve_effective(&warm, &host).unwrap().recipe_fingerprint,
-        resolve_effective(&deployment, &host).unwrap().recipe_fingerprint
+        resolve_effective(&deployment, &host)
+            .unwrap()
+            .recipe_fingerprint
     );
     warm["lifecycle"] = json!({"warm": "yes"});
-    assert_eq!(parse_instance_spec(&warm).unwrap_err().path, "lifecycle.warm");
+    assert_eq!(
+        parse_instance_spec(&warm).unwrap_err().path,
+        "lifecycle.warm"
+    );
     warm["lifecycle"] = json!({"pinned": true});
     assert_eq!(
         parse_instance_spec(&warm).unwrap_err().code,

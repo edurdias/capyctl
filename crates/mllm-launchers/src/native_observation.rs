@@ -471,7 +471,9 @@ impl NativeObservationClient {
                 "proof": mllm_adapters::sglang::observation::request_proof(
                     key, &self.binding_id, &self.incarnation_id, &request_id),
             }),
-            None => serde_json::json!({"version":1,"request_id":request_id,"timeout_ms":timeout_ms}),
+            None => {
+                serde_json::json!({"version":1,"request_id":request_id,"timeout_ms":timeout_ms})
+            }
         };
         let request = serde_json::to_vec(&body).map_err(|_| ObservationError)?;
         if request.len() > 1024 {
@@ -859,30 +861,26 @@ mod tests {
                 "{pointer}"
             );
         }
-        assert!(
-            fixture(
-                |v| {
-                    v["extra"] = serde_json::json!(0);
-                },
-                false
-            )
-            .is_err()
-        );
+        assert!(fixture(
+            |v| {
+                v["extra"] = serde_json::json!(0);
+            },
+            false
+        )
+        .is_err());
         assert!(fixture(|_| {}, true).is_err());
     }
     #[test]
     fn denies_unprotected_or_missing_socket() {
         let identity = crate::exec::process_identity(std::process::id(), "scheduler").unwrap();
-        assert!(
-            NativeObservationClient::new(
-                "/tmp/missing.sock".into(),
-                "binding".into(),
-                "incarnation".into(),
-                identity,
-                "a".repeat(64)
-            )
-            .is_err()
-        );
+        assert!(NativeObservationClient::new(
+            "/tmp/missing.sock".into(),
+            "binding".into(),
+            "incarnation".into(),
+            identity,
+            "a".repeat(64)
+        )
+        .is_err());
     }
     #[test]
     fn denies_duplicate_nested_fields_partial_oversized_and_invalid_frames() {
@@ -896,38 +894,34 @@ mod tests {
             assert!(fixture_wire(|_| {}, move |_| bytes, Duration::ZERO).is_err());
         }
         for field in ["version", "pid", "mapped_bytes"] {
-            assert!(
-                fixture_wire(
-                    |_| {},
-                    move |bytes| {
-                        let text = String::from_utf8(bytes).unwrap();
-                        let needle = format!("\"{field}\":");
-                        let text = text.replacen(&needle, &format!("\"{field}\":0,{needle}"), 1);
-                        let mut frame = (text.len() as u32).to_be_bytes().to_vec();
-                        frame.extend(text.bytes());
-                        frame
-                    },
-                    Duration::ZERO
-                )
-                .is_err()
-            );
+            assert!(fixture_wire(
+                |_| {},
+                move |bytes| {
+                    let text = String::from_utf8(bytes).unwrap();
+                    let needle = format!("\"{field}\":");
+                    let text = text.replacen(&needle, &format!("\"{field}\":0,{needle}"), 1);
+                    let mut frame = (text.len() as u32).to_be_bytes().to_vec();
+                    frame.extend(text.bytes());
+                    frame
+                },
+                Duration::ZERO
+            )
+            .is_err());
         }
     }
     #[test]
     fn full_frame_without_eof_is_not_success_and_has_one_total_deadline() {
         let start = Instant::now();
-        assert!(
-            fixture_wire(
-                |_| {},
-                |bytes| {
-                    let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
-                    frame.extend(bytes);
-                    frame
-                },
-                Duration::from_millis(650)
-            )
-            .is_err()
-        );
+        assert!(fixture_wire(
+            |_| {},
+            |bytes| {
+                let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+                frame.extend(bytes);
+                frame
+            },
+            Duration::from_millis(650)
+        )
+        .is_err());
         assert!(start.elapsed() < Duration::from_millis(1500));
     }
     /// The wire facts a failed socket stage reports: a peer that closes shows
@@ -988,20 +982,16 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut stale_owner = owner.clone();
         stale_owner.start_ticks += 1;
-        assert!(
-            make(path.clone(), stale_owner)
-                .unwrap()
-                .observe(Duration::from_millis(50))
-                .is_err()
-        );
+        assert!(make(path.clone(), stale_owner)
+            .unwrap()
+            .observe(Duration::from_millis(50))
+            .is_err());
         let mut wrong_pid = owner.clone();
         wrong_pid.pid = 1;
-        assert!(
-            make(path.clone(), wrong_pid)
-                .unwrap()
-                .observe(Duration::from_millis(50))
-                .is_err()
-        );
+        assert!(make(path.clone(), wrong_pid)
+            .unwrap()
+            .observe(Duration::from_millis(50))
+            .is_err());
         fs::rename(&path, dir.path().join("old.sock")).unwrap();
         let _replacement = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();

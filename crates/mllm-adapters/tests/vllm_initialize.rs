@@ -406,17 +406,36 @@ async fn the_engine_environment_is_a_closed_allowlist() {
     let spawned = tool.spawned.lock().unwrap();
     let env = &spawned[0].env;
     let allowed = [
-        "PATH", "HOME", "CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
-        "VLLM_API_KEY", "MLLM_VLLM_ADMIN_KEY", "VLLM_SERVER_DEV_MODE", "PYTHONPATH",
-        "VLLM_PLUGINS", "PYTHONDONTWRITEBYTECODE", "MLLM_ENGINE_LOG", "MLLM_EXTRA_APPROVALS",
+        "PATH",
+        "HOME",
+        "CUDA_VISIBLE_DEVICES",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "VLLM_API_KEY",
+        "MLLM_VLLM_ADMIN_KEY",
+        "VLLM_SERVER_DEV_MODE",
+        "PYTHONPATH",
+        "VLLM_PLUGINS",
+        "PYTHONDONTWRITEBYTECODE",
+        "MLLM_ENGINE_LOG",
+        "MLLM_EXTRA_APPROVALS",
     ];
     for name in env.keys() {
-        assert!(allowed.contains(&name.as_str()), "{name} is not on the allowlist");
+        assert!(
+            allowed.contains(&name.as_str()),
+            "{name} is not on the allowlist"
+        );
     }
     assert_eq!(env.get("VLLM_PLUGINS").map(String::as_str), Some(""));
-    assert_eq!(env.get("PYTHONDONTWRITEBYTECODE").map(String::as_str), Some("1"));
+    assert_eq!(
+        env.get("PYTHONDONTWRITEBYTECODE").map(String::as_str),
+        Some("1")
+    );
     assert_eq!(env.get("VLLM_API_KEY").map(String::as_str), Some("k3y"));
-    assert_eq!(env.get("MLLM_VLLM_ADMIN_KEY").map(String::as_str), Some("adm1n"));
+    assert_eq!(
+        env.get("MLLM_VLLM_ADMIN_KEY").map(String::as_str),
+        Some("adm1n")
+    );
     assert!(env.contains_key("MLLM_EXTRA_APPROVALS"));
     // PATH is the engine's own bin and fixed system directories only.
     assert_eq!(

@@ -198,7 +198,10 @@ impl<'de> Deserialize<'de> for ModelSource {
                     archive: f.archive,
                 })
                 .map_err(D::Error::custom),
-            _ => Err(D::Error::unknown_variant(kind, &["local", "huggingface", "http"])),
+            _ => Err(D::Error::unknown_variant(
+                kind,
+                &["local", "huggingface", "http"],
+            )),
         }
     }
 }
@@ -332,12 +335,18 @@ impl ModelSource {
 
 /// A full git commit SHA: 40 lowercase hexadecimal characters.
 pub fn is_commit_sha(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// 64 lowercase hexadecimal characters.
 pub fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn valid_segment(segment: &str) -> bool {
@@ -367,7 +376,9 @@ fn valid_pattern(pattern: &str) -> bool {
         && !pattern.starts_with('/')
         && !pattern.contains('\\')
         && !pattern.chars().any(char::is_control)
-        && pattern.split('/').all(|segment| segment != ".." && segment != ".")
+        && pattern
+            .split('/')
+            .all(|segment| segment != ".." && segment != ".")
 }
 
 /// The name of a `secret://<name>` reference, or `None` for anything else.
@@ -389,7 +400,9 @@ pub fn https_host(url: &str) -> Option<String> {
     let authority = rest.split(['/', '?', '#']).next()?;
     if authority.is_empty()
         || authority.contains('@')
-        || authority.chars().any(|c| c.is_whitespace() || c.is_control())
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
         || url.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return None;
@@ -693,14 +706,20 @@ mod tests {
             "url": "https://example.test/w.tar", "sha256": "a".repeat(64), "archive": "tar"
         }}))
         .unwrap();
-        assert_eq!(http.store_key().unwrap(), format!("sources/http/{}-tar", "a".repeat(64)));
+        assert_eq!(
+            http.store_key().unwrap(),
+            format!("sources/http/{}-tar", "a".repeat(64))
+        );
         for bad in [
             json!({"local": {"path": "x"}, "http": {"url": "u", "sha256": "s"}}),
             json!({"s3": {"path": "x"}}),
             json!({"huggingface": {"repo": "r", "revision": SHA, "locked_commit": SHA}}),
             json!({"type": "huggingface", "repo": "r", "revision": SHA, "locked_commit": SHA}),
         ] {
-            assert!(serde_json::from_value::<ModelSource>(bad.clone()).is_err(), "{bad}");
+            assert!(
+                serde_json::from_value::<ModelSource>(bad.clone()).is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -735,9 +754,12 @@ mod tests {
             files: files.into_iter().map(Into::into).collect(),
             token_ref: token.map(Into::into),
         };
-        with(vec!["*.safetensors", "config.json"], Some("secret://hf-token"))
-            .validate()
-            .unwrap();
+        with(
+            vec!["*.safetensors", "config.json"],
+            Some("secret://hf-token"),
+        )
+        .validate()
+        .unwrap();
         for (files, token) in [
             (vec!["../x"], None),
             (vec!["/abs"], None),
@@ -746,14 +768,19 @@ mod tests {
             (vec![], Some("secret://")),
             (vec![], Some("secret://../x")),
         ] {
-            assert!(with(files.clone(), token).validate().is_err(), "{files:?} {token:?}");
+            assert!(
+                with(files.clone(), token).validate().is_err(),
+                "{files:?} {token:?}"
+            );
         }
         let http = |url: &str, sha: &str| ModelSource::Http {
             url: url.into(),
             sha256: sha.into(),
             archive: Archive::None,
         };
-        http("https://example.test/w.gguf", &"a".repeat(64)).validate().unwrap();
+        http("https://example.test/w.gguf", &"a".repeat(64))
+            .validate()
+            .unwrap();
         for (url, sha) in [
             ("http://example.test/w", "a".repeat(64)),
             ("https://", "a".repeat(64)),
@@ -785,8 +812,12 @@ mod tests {
             files: files.into_iter().map(Into::into).collect(),
             token_ref: Some("secret://t".into()),
         };
-        let a = narrowed(vec!["*.json", "*.safetensors"]).store_key().unwrap();
-        let b = narrowed(vec!["*.safetensors", "*.json"]).store_key().unwrap();
+        let a = narrowed(vec!["*.json", "*.safetensors"])
+            .store_key()
+            .unwrap();
+        let b = narrowed(vec!["*.safetensors", "*.json"])
+            .store_key()
+            .unwrap();
         let c = narrowed(vec!["*.json"]).store_key().unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -822,8 +853,8 @@ mod tests {
         };
         let error = raw(json!({"huggingface": "allowed"})).unwrap_err();
         assert_eq!(error.code, ConfigErrorCode::MissingRequired, "max_bytes");
-        let policy = raw(json!({"huggingface": "allowed", "http": "allowed", "max_bytes": "1GiB"}))
-            .unwrap();
+        let policy =
+            raw(json!({"huggingface": "allowed", "http": "allowed", "max_bytes": "1GiB"})).unwrap();
         policy.permits(&hf).unwrap();
         policy.permits(&http).unwrap();
         let listed = raw(json!({
@@ -848,7 +879,10 @@ mod tests {
         assert!(pattern_matches("*.safetensors", "model-00001.safetensors"));
         assert!(pattern_matches("*.json", "sub/dir/config.json"));
         assert!(pattern_matches("config.json", "config.json"));
-        assert!(pattern_matches("model-?????-of-*.safetensors", "model-00001-of-00002.safetensors"));
+        assert!(pattern_matches(
+            "model-?????-of-*.safetensors",
+            "model-00001-of-00002.safetensors"
+        ));
         assert!(!pattern_matches("*.json", "model.safetensors"));
         assert!(!pattern_matches("config.json", "sub/config.json"));
     }

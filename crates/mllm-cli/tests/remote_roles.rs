@@ -97,22 +97,41 @@ fn the_host_runtime_is_managed_unless_the_document_declares_one() {
     let temp = root();
     let state = temp.path().join("host-state");
     let config = temp.path().join("host.yaml");
-    let out = cli(&state, &["init", "host", "--output", config.to_str().unwrap()]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = cli(
+        &state,
+        &["init", "host", "--output", config.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let runtime = state.join("runtime");
     let reported: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(reported["runtime_dir"], serde_json::json!(runtime));
-    assert_eq!(fs::metadata(&runtime).unwrap().permissions().mode() & 0o7777, 0o700);
+    assert_eq!(
+        fs::metadata(&runtime).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
     let guard = runtime.join("mllm_vllm_guard.py");
-    assert_eq!(fs::metadata(&guard).unwrap().permissions().mode() & 0o7777, 0o600);
+    assert_eq!(
+        fs::metadata(&guard).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
     assert!(runtime.join(".mllm-managed-runtime").is_file());
     assert!(runtime.join("sglang_entry.py").is_file());
-    assert!(!runtime.join("tests").exists(), "runtime tests are never shipped");
+    assert!(
+        !runtime.join("tests").exists(),
+        "runtime tests are never shipped"
+    );
     let pristine = tree(&runtime);
 
     // Tampering is repaired at the next start, even one that then refuses.
     fs::write(&guard, b"# rewritten by someone else\n").unwrap();
-    let offline = refused_start(&state, &["start", "host", "--config", config.to_str().unwrap()]);
+    let offline = refused_start(
+        &state,
+        &["start", "host", "--config", config.to_str().unwrap()],
+    );
     assert!(!offline.status.success());
     let stderr = String::from_utf8_lossy(&offline.stderr);
     assert!(stderr.contains("restored"), "{stderr}");
@@ -129,19 +148,31 @@ fn the_host_runtime_is_managed_unless_the_document_declares_one() {
     let declared = temp.path().join("declared.yaml");
     fs::write(&declared, document.to_string()).unwrap();
     fs::set_permissions(&declared, fs::Permissions::from_mode(0o600)).unwrap();
-    let offline = refused_start(&state, &["start", "host", "--config", declared.to_str().unwrap()]);
+    let offline = refused_start(
+        &state,
+        &["start", "host", "--config", declared.to_str().unwrap()],
+    );
     assert!(!offline.status.success());
-    assert_eq!(tree(&operator), vec![("vllm_entry.py".to_owned(), b"# operator copy\n".to_vec())]);
+    assert_eq!(
+        tree(&operator),
+        vec![("vllm_entry.py".to_owned(), b"# operator copy\n".to_vec())]
+    );
 
     // An unmarked directory at the managed path is refused, not overwritten.
     fs::remove_dir_all(&runtime).unwrap();
     fs::create_dir(&runtime).unwrap();
     fs::write(runtime.join("vllm_entry.py"), b"# copied by hand\n").unwrap();
-    let refused = refused_start(&state, &["start", "host", "--config", config.to_str().unwrap()]);
+    let refused = refused_start(
+        &state,
+        &["start", "host", "--config", config.to_str().unwrap()],
+    );
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("managed runtime directory"), "{stderr}");
-    assert_eq!(tree(&runtime), vec![("vllm_entry.py".to_owned(), b"# copied by hand\n".to_vec())]);
+    assert_eq!(
+        tree(&runtime),
+        vec![("vllm_entry.py".to_owned(), b"# copied by hand\n".to_vec())]
+    );
 }
 // T04 (W12, U5 live): `join host --join-file NAME` with a bare relative name
 // reads the invitation from the working directory. It used to fail before
@@ -151,9 +182,12 @@ fn join_reads_a_relative_invitation_from_the_working_directory() {
     let temp = root();
     let state = temp.path().join("host-state");
     let config = temp.path().join("host.yaml");
-    assert!(cli(&state, &["init", "host", "--output", config.to_str().unwrap()])
-        .status
-        .success());
+    assert!(cli(
+        &state,
+        &["init", "host", "--output", config.to_str().unwrap()]
+    )
+    .status
+    .success());
     let invitation = temp.path().join("host.join");
     fs::write(&invitation, b"not an invitation").unwrap();
     fs::set_permissions(&invitation, fs::Permissions::from_mode(0o600)).unwrap();
@@ -206,16 +240,33 @@ fn concurrent_initialization_has_one_winner_and_preserves_identity() {
     let temp = root();
     let state = temp.path().join("state");
     let output = temp.path().join("server.yaml");
-    let start = || Command::new(env!("CARGO_BIN_EXE_mllm"))
-        .args(["init","server","--output",output.to_str().unwrap()])
-        .env("MLLM_STATE_DIR",&state).stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null()).spawn().unwrap();
+    let start = || {
+        Command::new(env!("CARGO_BIN_EXE_mllm"))
+            .args(["init", "server", "--output", output.to_str().unwrap()])
+            .env("MLLM_STATE_DIR", &state)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
     let mut first = start();
     let mut second = start();
-    assert_eq!(usize::from(first.wait().unwrap().success()) + usize::from(second.wait().unwrap().success()),1);
+    assert_eq!(
+        usize::from(first.wait().unwrap().success())
+            + usize::from(second.wait().unwrap().success()),
+        1
+    );
     let ca = fs::read(state.join("identity/controller-ca.json")).unwrap();
-    assert!(!cli(&state,&["init","server","--output",output.to_str().unwrap()]).status.success());
-    assert_eq!(fs::read(state.join("identity/controller-ca.json")).unwrap(),ca);
+    assert!(!cli(
+        &state,
+        &["init", "server", "--output", output.to_str().unwrap()]
+    )
+    .status
+    .success());
+    assert_eq!(
+        fs::read(state.join("identity/controller-ca.json")).unwrap(),
+        ca
+    );
 }
 // T01, T37: host log retention is an explicit local option.
 #[test]
@@ -399,7 +450,16 @@ fn product_enrolls_unprepared_host_and_reconnects_without_identity_change() {
 
 /// Initialize a server and a host, enroll the host through the product and
 /// start the server. Returns the server and the paths the host role needs.
-fn enrolled_server(temp: &Path, host_name: &str) -> (Service, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+fn enrolled_server(
+    temp: &Path,
+    host_name: &str,
+) -> (
+    Service,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let server_root = temp.join("server");
     let host_root = temp.join("host");
     let server_config = temp.join("server.yaml");
@@ -409,12 +469,19 @@ fn enrolled_server(temp: &Path, host_name: &str) -> (Service, std::path::PathBuf
         (&host_root, "host", &host_config),
     ] {
         let result = cli(state, &["init", role, "--output", config.to_str().unwrap()]);
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(&server_config).unwrap()).unwrap();
     let ports = free_ports(4, false);
-    for (i, name) in ["management", "inference", "bootstrap", "control"].iter().enumerate() {
+    for (i, name) in ["management", "inference", "bootstrap", "control"]
+        .iter()
+        .enumerate()
+    {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ports[i]));
         document["listeners"][name]["bind"] = addr.to_string().into();
         if matches!(*name, "bootstrap" | "control") {
@@ -427,20 +494,56 @@ fn enrolled_server(temp: &Path, host_name: &str) -> (Service, std::path::PathBuf
     let invitation = temp.join(format!("{host_name}.join"));
     let invited = cli(
         &server_root,
-        &["invite", "host", "--name", host_name, "--config", server_config.to_str().unwrap(),
-          "--output", invitation.to_str().unwrap()],
+        &[
+            "invite",
+            "host",
+            "--name",
+            host_name,
+            "--config",
+            server_config.to_str().unwrap(),
+            "--output",
+            invitation.to_str().unwrap(),
+        ],
     );
-    assert!(invited.status.success(), "{}", String::from_utf8_lossy(&invited.stderr));
+    assert!(
+        invited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invited.stderr)
+    );
     let joined = cli(
         &host_root,
-        &["join", "host", "--join-file", invitation.to_str().unwrap(), "--config", host_config.to_str().unwrap()],
+        &[
+            "join",
+            "host",
+            "--join-file",
+            invitation.to_str().unwrap(),
+            "--config",
+            host_config.to_str().unwrap(),
+        ],
     );
-    assert!(joined.status.success(), "{}", String::from_utf8_lossy(&joined.stderr));
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
     (server, server_root, server_config, host_root, host_config)
 }
 
-fn revoke(root: &Path, config: &Path, host: &str, request_id: Option<&str>) -> std::process::Output {
-    let mut args = vec!["revoke", "host", host, "--config", config.to_str().unwrap(), "--output", "json"];
+fn revoke(
+    root: &Path,
+    config: &Path,
+    host: &str,
+    request_id: Option<&str>,
+) -> std::process::Output {
+    let mut args = vec![
+        "revoke",
+        "host",
+        host,
+        "--config",
+        config.to_str().unwrap(),
+        "--output",
+        "json",
+    ];
     if let Some(id) = request_id {
         args.extend(["--request-id", id]);
     }
@@ -464,8 +567,17 @@ fn revoke_host_closes_the_session_and_keeps_the_host_out() {
     assert_eq!(snapshot["hosts"][0]["revoked"], false);
 
     let request = ulid::Ulid::new().to_string();
-    let out = revoke(&server_root, &server_config, "revoked-spark", Some(&request));
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = revoke(
+        &server_root,
+        &server_config,
+        "revoked-spark",
+        Some(&request),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let revoked: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(revoked["host_id"], id.as_str());
     assert_eq!(revoked["name"], "revoked-spark");
@@ -490,13 +602,29 @@ fn revoke_host_closes_the_session_and_keeps_the_host_out() {
     // SPEC §6.4: the same request identity replays; the host was already
     // revoked, so nothing changes.
     let out = revoke(&server_root, &server_config, &id, Some(&request));
-    assert!(!out.status.success(), "one request identity named two spellings of the host");
-    let out = revoke(&server_root, &server_config, "revoked-spark", Some(&request));
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !out.status.success(),
+        "one request identity named two spellings of the host"
+    );
+    let out = revoke(
+        &server_root,
+        &server_config,
+        "revoked-spark",
+        Some(&request),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let replay: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(replay["newly_revoked"], false);
     let out = revoke(&server_root, &server_config, &id, None);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let by_id: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(by_id["host_id"], id.as_str());
     assert_eq!(by_id["newly_revoked"], false);
@@ -539,7 +667,10 @@ fn a_guarded_role_takes_its_process_group_with_it() {
     while std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
         .is_ok_and(|stat| !stat.contains(") Z "))
     {
-        assert!(std::time::Instant::now() < deadline, "the group outlived its guard");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the group outlived its guard"
+        );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }

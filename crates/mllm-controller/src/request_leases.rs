@@ -249,7 +249,10 @@ impl RequestLeaseWriter {
 }
 
 fn is_grant(write: &LeaseWrite) -> bool {
-    matches!(write, LeaseWrite::Grant { .. } | LeaseWrite::GrantInstance { .. })
+    matches!(
+        write,
+        LeaseWrite::Grant { .. } | LeaseWrite::GrantInstance { .. }
+    )
 }
 
 fn refusal(error: DispatchError) -> LeaseRefused {
@@ -285,10 +288,7 @@ fn run(receiver: mpsc::Receiver<Job>, backend: LeaseBackend, queued_grants: Arc<
                 Err(_) => break,
             }
         }
-        let grants = batch
-            .iter()
-            .filter(|job| is_grant(&job.write))
-            .count();
+        let grants = batch.iter().filter(|job| is_grant(&job.write)).count();
         let writes: Vec<LeaseWrite> = batch.iter().map(|job| job.write.clone()).collect();
         let outcomes = backend(&writes);
         queued_grants.fetch_sub(grants, Ordering::SeqCst);

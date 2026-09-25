@@ -36,7 +36,10 @@ pub struct ServerConfig {
 /// SPEC §17 (M80): `observability.timing_header` of a server (or a standalone
 /// document's `server:` block). Omitted, off; anything but a boolean is refused.
 pub fn timing_header(document: &Value) -> Result<bool, ConfigError> {
-    match document.get("observability").and_then(|o| o.get("timing_header")) {
+    match document
+        .get("observability")
+        .and_then(|o| o.get("timing_header"))
+    {
         None => Ok(false),
         Some(value) => value.as_bool().ok_or_else(|| {
             ConfigError::new(
@@ -59,7 +62,10 @@ pub const MAX_SWITCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 /// refused, never read as the default. A drain that does not finish in time
 /// fails the switch; nothing is killed.
 pub fn switch_drain_timeout(document: &Value) -> Result<Duration, ConfigError> {
-    match document.get("switching").and_then(|s| s.get("drain_timeout")) {
+    match document
+        .get("switching")
+        .and_then(|s| s.get("drain_timeout"))
+    {
         None => Ok(DEFAULT_SWITCH_DRAIN_TIMEOUT),
         Some(value) => value
             .as_str()
@@ -108,8 +114,11 @@ impl Default for HeartbeatTimeouts {
 /// Omitted, 5 s and 30 s. A value outside its bounds, or a lost bound not
 /// beyond the suspend bound, is refused, never read as the default.
 pub fn heartbeat_timeouts(document: &Value) -> Result<HeartbeatTimeouts, ConfigError> {
-    let read = |field: &str, default: Duration, min: Duration, max: Duration, bounds: &str| {
-        match document.get("control").and_then(|c| c.get(field)) {
+    let read =
+        |field: &str, default: Duration, min: Duration, max: Duration, bounds: &str| match document
+            .get("control")
+            .and_then(|c| c.get(field))
+        {
             None => Ok(default),
             Some(value) => value
                 .as_str()
@@ -124,8 +133,7 @@ pub fn heartbeat_timeouts(document: &Value) -> Result<HeartbeatTimeouts, ConfigE
                         format!("must be a duration from {bounds}"),
                     )
                 }),
-        }
-    };
+        };
     let timeouts = HeartbeatTimeouts {
         suspend_after: read(
             "heartbeat_suspend_after",
@@ -167,7 +175,10 @@ pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// outside 1 s to 7 days is refused, never read as off.
 pub fn idle_timeouts(document: &Value) -> Result<IdleTimeouts, ConfigError> {
     let read = |field: &str| -> Result<Option<Duration>, ConfigError> {
-        match document.get("lifecycle_defaults").and_then(|d| d.get(field)) {
+        match document
+            .get("lifecycle_defaults")
+            .and_then(|d| d.get(field))
+        {
             None => Ok(None),
             Some(value) => value
                 .as_str()
@@ -216,7 +227,10 @@ pub const MAX_DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
 /// standalone document, `shutdown.drain_timeout`. Omitted, it is 30 s; a value
 /// outside 0 s to 600 s is refused, never read as the default.
 pub fn drain_timeout(document: &Value) -> Result<Duration, ConfigError> {
-    match document.get("shutdown").and_then(|s| s.get("drain_timeout")) {
+    match document
+        .get("shutdown")
+        .and_then(|s| s.get("drain_timeout"))
+    {
         None => Ok(DEFAULT_DRAIN_TIMEOUT),
         Some(value) => value
             .as_str()

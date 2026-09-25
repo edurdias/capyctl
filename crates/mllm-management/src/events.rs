@@ -1,9 +1,9 @@
 //! Bounded durable replay; event notifications are not required for continuity.
-use crate::{AppState, StoreSnapshotSource, error};
+use crate::{error, AppState, StoreSnapshotSource};
 use axum::{
     extract::{Request, State},
     http::StatusCode,
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{sse::Event, IntoResponse, Response, Sse},
 };
 use mllm_store::events::{EventPage, EventReadError, ManagementEvent};
 use serde_json::{Map, Value};

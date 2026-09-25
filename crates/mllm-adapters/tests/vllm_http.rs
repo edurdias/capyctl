@@ -272,18 +272,14 @@ async fn engine_reads_are_bounded() {
                 Body::from_stream(stream)
             }),
         )
-        .route(
-            "/metrics",
-            get(|| async { vec![b'#'; 5 << 20] }),
-        )
+        .route("/metrics", get(|| async { vec![b'#'; 5 << 20] }))
         .route(
             "/v1/chat/completions",
             post(|| async {
                 // An SSE frame that never ends.
                 let chunk = axum::body::Bytes::from(vec![b'x'; 1 << 20]);
-                let stream = futures::stream::iter(
-                    (0..6).map(move |_| Ok::<_, Infallible>(chunk.clone())),
-                );
+                let stream =
+                    futures::stream::iter((0..6).map(move |_| Ok::<_, Infallible>(chunk.clone())));
                 Body::from_stream(stream)
             }),
         );
@@ -331,13 +327,19 @@ async fn spawn_keyed_guard(
         },
     );
     let app = axum::Router::new()
-        .route("/v1/models", get(|| async {
-            Json(serde_json::json!({"object": "list", "data": [{"id": "toy-model"}]}))
-        }))
+        .route(
+            "/v1/models",
+            get(|| async {
+                Json(serde_json::json!({"object": "list", "data": [{"id": "toy-model"}]}))
+            }),
+        )
         .route("/v1/chat/completions", post(sse))
         .route("/sleep", post(|| async { Json(serde_json::json!({})) }))
         .route("/wake_up", post(|| async { Json(serde_json::json!({})) }))
-        .route("/is_sleeping", get(|| async { Json(serde_json::json!({"is_sleeping": false})) }))
+        .route(
+            "/is_sleeping",
+            get(|| async { Json(serde_json::json!({"is_sleeping": false})) }),
+        )
         .route("/collective_rpc", post(reload))
         .route(
             "/reset_prefix_cache",
@@ -351,13 +353,18 @@ async fn spawn_keyed_guard(
 }
 
 async fn drive_every_route(http: &EngineHttp) {
-    assert_eq!(http.list_models().await.unwrap(), vec!["toy-model".to_string()]);
+    assert_eq!(
+        http.list_models().await.unwrap(),
+        vec!["toy-model".to_string()]
+    );
     http.chat_completion_stream(&serde_json::json!({"model": "toy-model"}), |_| {})
         .await
         .unwrap();
     http.sleep(1).await.unwrap();
     http.wake().await.unwrap();
-    http.wake_tag(mllm_adapters::vllm::WakeTag::Weights).await.unwrap();
+    http.wake_tag(mllm_adapters::vllm::WakeTag::Weights)
+        .await
+        .unwrap();
     assert!(!http.is_sleeping().await.unwrap());
     http.collective_rpc().await.unwrap();
     http.reset_prefix_cache().await.unwrap();
@@ -377,9 +384,21 @@ async fn control_routes_take_the_admin_key_and_inference_takes_the_inference_key
         .with_admin_key("admin-key".into());
     drive_every_route(&keyed).await;
     let recorded = seen.lock().unwrap().clone();
-    assert!(recorded.iter().all(|(_, admitted)| *admitted), "{recorded:?}");
-    for path in ["/sleep", "/wake_up", "/is_sleeping", "/collective_rpc", "/reset_prefix_cache"] {
-        assert!(recorded.iter().any(|(seen, _)| seen == path), "{path} not driven");
+    assert!(
+        recorded.iter().all(|(_, admitted)| *admitted),
+        "{recorded:?}"
+    );
+    for path in [
+        "/sleep",
+        "/wake_up",
+        "/is_sleeping",
+        "/collective_rpc",
+        "/reset_prefix_cache",
+    ] {
+        assert!(
+            recorded.iter().any(|(seen, _)| seen == path),
+            "{path} not driven"
+        );
     }
 
     // The inference key alone opens nothing on the control surface.
@@ -399,7 +418,10 @@ async fn control_routes_take_the_admin_key_and_inference_takes_the_inference_key
 #[tokio::test]
 async fn without_an_admin_key_every_route_takes_the_engine_key() {
     let (addr, seen) = spawn_keyed_guard("engine-key", "engine-key").await;
-    let http = EngineHttp::new(format!("http://{addr}").parse().unwrap(), Some("engine-key".into()));
+    let http = EngineHttp::new(
+        format!("http://{addr}").parse().unwrap(),
+        Some("engine-key".into()),
+    );
     drive_every_route(&http).await;
     assert!(seen.lock().unwrap().iter().all(|(_, admitted)| *admitted));
 }

@@ -111,12 +111,16 @@ fn issue(
 #[test]
 fn recovery_replaces_only_the_same_hosts_identity_with_a_new_key() {
     let ca_dir = dir();
-    let ca = initialize_controller_ca(&IdentityDirectory::open(ca_dir.path()).unwrap(), now()).unwrap();
+    let ca =
+        initialize_controller_ca(&IdentityDirectory::open(ca_dir.path()).unwrap(), now()).unwrap();
     let path = dir();
     let storage = IdentityDirectory::open(path.path()).unwrap();
     let ordinary = invitation_for(&ca, 'a', None);
     let mut pending = PendingEnrollment::prepare(&storage, &ordinary).unwrap();
-    assert_eq!(issue(&ca, &storage, &mut pending, &ordinary, "host-a").unwrap(), "host-a");
+    assert_eq!(
+        issue(&ca, &storage, &mut pending, &ordinary, "host-a").unwrap(),
+        "host-a"
+    );
     let old_csr = pending.request(&ordinary).unwrap().csr_der;
 
     // Recovery is explicit on both sides.
@@ -124,21 +128,39 @@ fn recovery_replaces_only_the_same_hosts_identity_with_a_new_key() {
     assert!(PendingEnrollment::prepare(&storage, &recovery).is_err());
     assert!(PendingEnrollment::prepare_recovery(&storage, &ordinary).is_err());
     // Another host's recovery never takes over this identity.
-    assert!(PendingEnrollment::prepare_recovery(&storage, &invitation_for(&ca, 'c', Some("host-b"))).is_err());
+    assert!(PendingEnrollment::prepare_recovery(
+        &storage,
+        &invitation_for(&ca, 'c', Some("host-b"))
+    )
+    .is_err());
     // Nor does another controller's.
     let other_ca_dir = dir();
-    let other_ca =
-        initialize_controller_ca(&IdentityDirectory::open(other_ca_dir.path()).unwrap(), now()).unwrap();
-    assert!(PendingEnrollment::prepare_recovery(&storage, &invitation_for(&other_ca, 'd', Some("host-a"))).is_err());
+    let other_ca = initialize_controller_ca(
+        &IdentityDirectory::open(other_ca_dir.path()).unwrap(),
+        now(),
+    )
+    .unwrap();
+    assert!(PendingEnrollment::prepare_recovery(
+        &storage,
+        &invitation_for(&other_ca, 'd', Some("host-a"))
+    )
+    .is_err());
     assert_eq!(
-        PendingEnrollment::load(&storage).unwrap().request(&ordinary).unwrap().csr_der,
+        PendingEnrollment::load(&storage)
+            .unwrap()
+            .request(&ordinary)
+            .unwrap()
+            .csr_der,
         old_csr,
         "a refused recovery left the identity untouched"
     );
 
     let recovering = PendingEnrollment::prepare_recovery(&storage, &recovery).unwrap();
     let request = recovering.request(&recovery).unwrap();
-    assert_ne!(request.csr_der, old_csr, "recovery never reuses the revoked key");
+    assert_ne!(
+        request.csr_der, old_csr,
+        "recovery never reuses the revoked key"
+    );
     // A restart before the reply resumes the same transaction and key.
     drop(recovering);
     drop(storage);
@@ -147,7 +169,10 @@ fn recovery_replaces_only_the_same_hosts_identity_with_a_new_key() {
     assert_eq!(recovering.request(&recovery).unwrap(), request);
     // A certificate for another host id is refused.
     assert!(issue(&ca, &storage, &mut recovering, &recovery, "host-b").is_err());
-    assert_eq!(issue(&ca, &storage, &mut recovering, &recovery, "host-a").unwrap(), "host-a");
+    assert_eq!(
+        issue(&ca, &storage, &mut recovering, &recovery, "host-a").unwrap(),
+        "host-a"
+    );
     let loaded = PendingEnrollment::load(&storage).unwrap();
     assert_eq!(loaded.host_id(), Some("host-a"));
     assert!(loaded.control_endpoint(now()).is_ok());
@@ -157,5 +182,8 @@ fn recovery_replaces_only_the_same_hosts_identity_with_a_new_key() {
     let storage = IdentityDirectory::open(lost.path()).unwrap();
     let again = invitation_for(&ca, 'e', Some("host-a"));
     let mut fresh = PendingEnrollment::prepare_recovery(&storage, &again).unwrap();
-    assert_eq!(issue(&ca, &storage, &mut fresh, &again, "host-a").unwrap(), "host-a");
+    assert_eq!(
+        issue(&ca, &storage, &mut fresh, &again, "host-a").unwrap(),
+        "host-a"
+    );
 }

@@ -556,8 +556,16 @@ fn extras_follow_their_own_marker_with_the_host_approvals() {
     p.extra_approvals = Some(r#"{"options":[],"paths":[],"trust_remote_code":false}"#.into());
     let cmd = render_command(&p).unwrap();
     let user = cmd.argv.iter().position(|a| a == USER_ARGS_MARKER).unwrap();
-    let extra = cmd.argv.iter().position(|a| a == EXTRA_ARGS_MARKER).unwrap();
-    let fixed = cmd.argv.iter().position(|a| a == "--max-model-len").unwrap();
+    let extra = cmd
+        .argv
+        .iter()
+        .position(|a| a == EXTRA_ARGS_MARKER)
+        .unwrap();
+    let fixed = cmd
+        .argv
+        .iter()
+        .position(|a| a == "--max-model-len")
+        .unwrap();
     assert!(user < fixed && fixed < extra);
     assert_eq!(&cmd.argv[extra + 1..], ["--reasoning-parser", "qwen3"]);
     assert_eq!(
@@ -569,7 +577,10 @@ fn extras_follow_their_own_marker_with_the_host_approvals() {
     dup.extra_args = vec!["--max-model-len".into(), "1".into()];
     assert!(render_command(&dup).is_err());
     // Without extras there is no second marker.
-    assert!(!render_command(&plan()).unwrap().argv.contains(&EXTRA_ARGS_MARKER.to_string()));
+    assert!(!render_command(&plan())
+        .unwrap()
+        .argv
+        .contains(&EXTRA_ARGS_MARKER.to_string()));
 }
 
 /// SPEC §7.5 / T14: vLLM 0.29 has no `--swap-space`; a swap budget is never

@@ -175,7 +175,12 @@ impl Cluster {
         let server_config = path.join("server.yaml");
         stdout_json(&cli(
             &server_state,
-            &["init", "server", "--output", server_config.to_str().unwrap()],
+            &[
+                "init",
+                "server",
+                "--output",
+                server_config.to_str().unwrap(),
+            ],
         ));
         let mut server: Value =
             serde_json::from_slice(&std::fs::read(&server_config).unwrap()).unwrap();
@@ -231,7 +236,8 @@ impl Cluster {
                 engine.join("vllm").display().to_string()
             ),
         );
-        let template: Value = serde_json::from_slice(&std::fs::read(&host_config).unwrap()).unwrap();
+        let template: Value =
+            serde_json::from_slice(&std::fs::read(&host_config).unwrap()).unwrap();
         let mut host = golden["input"]["host"].clone();
         host["name"] = HOST.into();
         host["state_dir"] = template["state_dir"].clone();
@@ -327,7 +333,11 @@ impl Cluster {
     fn start_server(&self) -> Role {
         let server = self.start("server", &self.server_state, &self.server_config);
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !self.manage(&["list", "hosts", "--output", "json"]).status.success() {
+        while !self
+            .manage(&["list", "hosts", "--output", "json"])
+            .status
+            .success()
+        {
             assert!(Instant::now() < deadline, "the server never answered");
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -350,7 +360,10 @@ impl Cluster {
             if listed["hosts"][0]["online"] == true && listed["hosts"][0]["eligible"] == true {
                 return listed["hosts"][0].clone();
             }
-            assert!(Instant::now() < deadline, "the host never became eligible: {listed}");
+            assert!(
+                Instant::now() < deadline,
+                "the host never became eligible: {listed}"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -441,7 +454,10 @@ impl Cluster {
             }) {
                 return;
             }
-            assert!(Instant::now() < deadline, "operation {operation} never succeeded");
+            assert!(
+                Instant::now() < deadline,
+                "operation {operation} never succeeded"
+            );
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -561,7 +577,10 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
 
     // SPEC §4.1: recovery is for a revoked host only.
     let (_, out) = cluster.invite(HOST, true, "not-revoked.join");
-    assert!(!out.status.success(), "an active host took a recovery invitation");
+    assert!(
+        !out.status.success(),
+        "an active host took a recovery invitation"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("host_not_revoked"),
         "{}",
@@ -576,7 +595,12 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     // and stays charged.
     cluster.not_served(Duration::from_secs(3)).await;
     assert!(engine.iter().all(|pid| alive(*pid)));
-    assert!(!cluster.store().resource_snapshot().unwrap().owners.is_empty());
+    assert!(!cluster
+        .store()
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .is_empty());
     // A restarted host role with its old identity is refused.
     host.stop();
     let host = cluster.start_host();
@@ -594,9 +618,15 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     assert_eq!(invited["recover_host_id"], host_id.as_str());
     assert_eq!(invited["host_name"], HOST);
     let (_, out) = cluster.invite(HOST, false, "collision.join");
-    assert!(!out.status.success(), "a revoked name was reused for a new host");
+    assert!(
+        !out.status.success(),
+        "a revoked name was reused for a new host"
+    );
     let out = cluster.join(&recovery, false);
-    assert!(!out.status.success(), "an ordinary join redeemed a recovery invitation");
+    assert!(
+        !out.status.success(),
+        "an ordinary join redeemed a recovery invitation"
+    );
     let joined = stdout_json(&cluster.join(&recovery, true));
     assert_eq!(joined["host_id"], host_id.as_str(), "the same host id");
     assert_eq!(joined["recovered"], true);
@@ -614,10 +644,20 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     ));
     let out = cli(
         &other_state,
-        &["join", "host", "--join-file", recovery.to_str().unwrap(), "--config",
-          other_config.to_str().unwrap(), "--recover"],
+        &[
+            "join",
+            "host",
+            "--join-file",
+            recovery.to_str().unwrap(),
+            "--config",
+            other_config.to_str().unwrap(),
+            "--recover",
+        ],
     );
-    assert!(!out.status.success(), "a recovery invitation was redeemed twice");
+    assert!(
+        !out.status.success(),
+        "a recovery invitation was redeemed twice"
+    );
 
     // The recovered host reconnects under its same id; its still-owned engine
     // is re-proven by a fresh probe and serves again, without a relaunch.
@@ -625,7 +665,11 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     let listed = cluster.eligible();
     assert_eq!(listed["host_id"], host_id.as_str());
     assert_eq!(listed["revoked"], false);
-    assert_eq!(cluster.hosts()["hosts"].as_array().unwrap().len(), 1, "no second host");
+    assert_eq!(
+        cluster.hosts()["hosts"].as_array().unwrap().len(),
+        1,
+        "no second host"
+    );
     cluster.served(Duration::from_secs(60)).await;
     assert_eq!(cluster.launches(), engine, "re-proven, not relaunched");
     assert!(engine.iter().all(|pid| alive(*pid)));
@@ -633,7 +677,13 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     // The old certificate stays revoked for ever; the new one authorizes.
     let store = cluster.store();
     assert!(store.certificate_host(&old_fingerprint, now()).is_err());
-    assert_eq!(store.certificate_host(&new_fingerprint, now()).unwrap().host_id, host_id);
+    assert_eq!(
+        store
+            .certificate_host(&new_fingerprint, now())
+            .unwrap()
+            .host_id,
+        host_id
+    );
     drop(store);
     assert_eq!(cluster.events("host_revoked"), 1);
     assert_eq!(cluster.events("host_recovery_invited"), 1);
@@ -689,7 +739,10 @@ async fn a_recovered_host_that_lost_its_journal_settles_engines_only_on_gone_evi
 
     // T05: an expired recovery invitation is refused.
     let response = reqwest::Client::new()
-        .post(format!("http://{}/management/v1/host-invitations", cluster.management))
+        .post(format!(
+            "http://{}/management/v1/host-invitations",
+            cluster.management
+        ))
         .bearer_auth(cluster.admin_token())
         .json(&json!({"host_name": host_id, "lifetime_seconds": 1, "recover": true}))
         .send()
@@ -701,12 +754,19 @@ async fn a_recovered_host_that_lost_its_journal_settles_engines_only_on_gone_evi
     private_file(&expired_file, &expired.to_string());
     tokio::time::sleep(Duration::from_millis(2100)).await;
     let out = cluster.join(&expired_file, true);
-    assert!(!out.status.success(), "an expired recovery invitation was redeemed");
+    assert!(
+        !out.status.success(),
+        "an expired recovery invitation was redeemed"
+    );
 
     let (recovery, out) = cluster.invite(&host_id, true, "recover.join");
     stdout_json(&out);
     let joined = stdout_json(&cluster.join(&recovery, true));
-    assert_eq!(joined["host_id"], host_id.as_str(), "the same host id from fresh files");
+    assert_eq!(
+        joined["host_id"],
+        host_id.as_str(),
+        "the same host id from fresh files"
+    );
     let host = cluster.start_host();
     let listed = cluster.eligible();
     assert_eq!(listed["host_id"], host_id.as_str());
@@ -715,7 +775,12 @@ async fn a_recovered_host_that_lost_its_journal_settles_engines_only_on_gone_evi
     // stays closed and the engine stays charged; nothing was signalled.
     cluster.not_served(Duration::from_secs(8)).await;
     assert!(engine.iter().all(|pid| alive(*pid)));
-    assert!(!cluster.store().resource_snapshot().unwrap().owners.is_empty());
+    assert!(!cluster
+        .store()
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .is_empty());
     assert_eq!(cluster.launches(), engine, "nothing relaunched");
 
     // The host role restarts (ordinary restart); while it is away an
@@ -725,7 +790,12 @@ async fn a_recovered_host_that_lost_its_journal_settles_engines_only_on_gone_evi
     host.stop();
     let stopped = cluster.manage_json(&["stop", "deployment", &id, "--output", "json"]);
     let operation = stopped["operation_id"].as_str().unwrap().to_owned();
-    assert!(!cluster.store().resource_snapshot().unwrap().owners.is_empty());
+    assert!(!cluster
+        .store()
+        .resource_snapshot()
+        .unwrap()
+        .owners
+        .is_empty());
     for pid in &engine {
         unsafe {
             libc::killpg(*pid, libc::SIGKILL);

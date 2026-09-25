@@ -394,8 +394,20 @@ fn a_size_only_request_is_answered_with_weights_and_no_digest() {
     let open = digest_command("");
     for (command, evidence) in [
         (&sizing, evidence("computed", DIGEST)),
-        (&sizing, pb::CheckpointDigestEvidence { digest: DIGEST.into(), ..sized.clone() }),
-        (&sizing, pb::CheckpointDigestEvidence { weights_bytes: 13, ..sized.clone() }),
+        (
+            &sizing,
+            pb::CheckpointDigestEvidence {
+                digest: DIGEST.into(),
+                ..sized.clone()
+            },
+        ),
+        (
+            &sizing,
+            pb::CheckpointDigestEvidence {
+                weights_bytes: 13,
+                ..sized.clone()
+            },
+        ),
         (&open, sized.clone()),
     ] {
         assert!(

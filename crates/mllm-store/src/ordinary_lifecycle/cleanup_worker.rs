@@ -78,7 +78,8 @@ impl crate::Store {
         online: Option<&std::collections::BTreeSet<String>>,
         now_ms: i64,
         busy: &super::lanes::BusyLanes,
-    ) -> Result<Option<(OrdinaryCleanupReceipt, Option<super::lanes::InstanceLane>)>, LifecycleError> {
+    ) -> Result<Option<(OrdinaryCleanupReceipt, Option<super::lanes::InstanceLane>)>, LifecycleError>
+    {
         let online = online
             .map(|hosts| serde_json::to_string(hosts).map_err(|_| LifecycleError::Invalid))
             .transpose()?;

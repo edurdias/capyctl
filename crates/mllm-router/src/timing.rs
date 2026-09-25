@@ -101,7 +101,10 @@ impl LatencyRecorder {
     }
     /// SPEC §17 (M80): the host latency table the timing header reads the
     /// engine family from. Set once; later calls are ignored.
-    pub fn set_host_latency(&self, hosts: std::sync::Arc<mllm_controller::latency_table::LatencyTable>) {
+    pub fn set_host_latency(
+        &self,
+        hosts: std::sync::Arc<mllm_controller::latency_table::LatencyTable>,
+    ) {
         let _ = self.hosts.set(hosts);
     }
     /// The engine family the host running `deployment`'s incarnation
@@ -516,7 +519,10 @@ mod tests {
             histogram,
         };
         let report = latency_report(&recorder, &[host], Some("d"));
-        assert_eq!(report["deployments"][0]["instances"][0]["engine"], "sglang", "{report}");
+        assert_eq!(
+            report["deployments"][0]["instances"][0]["engine"], "sglang",
+            "{report}"
+        );
     }
 
     /// A host latency table holding one report for `d`, generation 1, from a
@@ -548,7 +554,10 @@ mod tests {
         table
     }
 
-    fn header_engine(recorder: std::sync::Arc<LatencyRecorder>, generation: i64) -> serde_json::Value {
+    fn header_engine(
+        recorder: std::sync::Arc<LatencyRecorder>,
+        generation: i64,
+    ) -> serde_json::Value {
         let mut timing = RequestTiming::start(recorder);
         // The router resolves the deployment's kind, which live is `model`.
         timing.resolved("d", "model");

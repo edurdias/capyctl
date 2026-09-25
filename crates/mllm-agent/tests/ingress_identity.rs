@@ -16,21 +16,23 @@ fn private_credentials_survive_reopen_and_refuse_scope_or_gate_replacement() {
         instance_index: 0,
     };
     let store = IdentityDirectory::open(directory.path()).unwrap();
-    let first = ingress_identity::provision(&store, &scope, [9;32], [1; 32]).unwrap();
+    let first = ingress_identity::provision(&store, &scope, [9; 32], [1; 32]).unwrap();
     assert_ne!(first.inference, first.admin);
     assert_ne!(first.inference, first.gate);
     drop(store);
     let store = IdentityDirectory::open(directory.path()).unwrap();
-    let replay = ingress_identity::provision(&store, &scope, [9;32], [1; 32]).unwrap();
+    let replay = ingress_identity::provision(&store, &scope, [9; 32], [1; 32]).unwrap();
     assert_eq!(first.inference, replay.inference);
     assert_eq!(first.admin, replay.admin);
-    assert!(ingress_identity::provision(&store, &scope, [9;32], [2; 32]).is_err());
+    assert!(ingress_identity::provision(&store, &scope, [9; 32], [2; 32]).is_err());
     let mut changed = scope.clone();
     changed.generation = 2;
-    assert!(ingress_identity::load(&store, &changed, [9;32]).is_err());
-    assert!(ingress_identity::load(&store, &scope, [8;32]).is_err());
+    assert!(ingress_identity::load(&store, &changed, [9; 32]).is_err());
+    assert!(ingress_identity::load(&store, &scope, [8; 32]).is_err());
     assert_eq!(
-        ingress_identity::load(&store, &scope, [9;32]).unwrap().gate,
+        ingress_identity::load(&store, &scope, [9; 32])
+            .unwrap()
+            .gate,
         [1; 32]
     );
 }
@@ -60,11 +62,20 @@ fn a_bundle_written_before_instances_were_keyed_still_loads_for_its_binding() {
     let file = std::fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("ingress-"))
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ingress-")
+        })
         .unwrap();
-    let mut bundle: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     assert_eq!(bundle["scope"]["instance_index"], 1);
-    bundle["scope"].as_object_mut().unwrap().remove("instance_index");
+    bundle["scope"]
+        .as_object_mut()
+        .unwrap()
+        .remove("instance_index");
     std::fs::write(&file, serde_json::to_vec(&bundle).unwrap()).unwrap();
     let loaded = ingress_identity::load(&store, &scope, [9; 32]).unwrap();
     assert_eq!(loaded.inference, provisioned.inference);

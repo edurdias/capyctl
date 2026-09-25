@@ -92,7 +92,10 @@ impl std::fmt::Debug for EngineHttp {
                     "none"
                 },
             )
-            .field("admin_key", &crate::traits::redacted(self.admin_key.is_some()))
+            .field(
+                "admin_key",
+                &crate::traits::redacted(self.admin_key.is_some()),
+            )
             .finish()
     }
 }
@@ -224,13 +227,15 @@ impl EngineHttp {
     /// gauge is unknown work, never zero (SPEC §9.2, §10 step 4).
     pub async fn work_counts(&self) -> Result<Option<(f64, f64)>, HttpError> {
         let body = self.get_body("/metrics").await?;
-        Ok(match (
-            gauge_sum(&body, "vllm:num_requests_running"),
-            gauge_sum(&body, "vllm:num_requests_waiting"),
-        ) {
-            (Some(running), Some(waiting)) => Some((running, waiting)),
-            _ => None,
-        })
+        Ok(
+            match (
+                gauge_sum(&body, "vllm:num_requests_running"),
+                gauge_sum(&body, "vllm:num_requests_waiting"),
+            ) {
+                (Some(running), Some(waiting)) => Some((running, waiting)),
+                _ => None,
+            },
+        )
     }
 
     /// Invalidate prefix-cache metadata after destructive restoration.
@@ -243,9 +248,9 @@ impl EngineHttp {
         if !response.status().is_success() {
             return Err(HttpError::UnexpectedStatus(response.status().as_u16()));
         }
-        let body = read_bounded(response)
-            .await
-            .map_err(|e| HttpError::Uncertain(format!("reset_prefix_cache acknowledgement: {e}")))?;
+        let body = read_bounded(response).await.map_err(|e| {
+            HttpError::Uncertain(format!("reset_prefix_cache acknowledgement: {e}"))
+        })?;
         let body: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             HttpError::Uncertain(format!("reset_prefix_cache acknowledgement: {e}"))
         })?;

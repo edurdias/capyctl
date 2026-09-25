@@ -304,7 +304,9 @@ impl OwnedActionSource {
                     let previous = self.instance_rows(deployment)?;
                     self.commands
                         .read(|store| {
-                            store.clear_instance_operator_stops(deployment).map_err(Into::into)
+                            store
+                                .clear_instance_operator_stops(deployment)
+                                .map_err(Into::into)
                         })
                         .map_err(|_| ConfigurationFailure::Internal)?;
                     previous
@@ -473,7 +475,10 @@ impl OwnedActionSource {
     ) -> Result<bool, ConfigurationFailure> {
         // An exact retry is answered from its receipt, even for a deployment
         // deleted since (SPEC §6.3, W6).
-        if self.start_key_used(deployment, instance, key, command)?.is_some() {
+        if self
+            .start_key_used(deployment, instance, key, command)?
+            .is_some()
+        {
             return Ok(true);
         }
         let (deleted, revision, rows) = self
@@ -522,7 +527,10 @@ impl OwnedActionSource {
         // setting the mark first let a replayed stop re-set a mark a later start
         // lifted (or a replayed start lift a later stop).
         let (replay, start_replay) = if stop {
-            (self.stop_key_used(deployment, instance, key, &command)?, None)
+            (
+                self.stop_key_used(deployment, instance, key, &command)?,
+                None,
+            )
         } else {
             let found = self.start_key_used(deployment, Some(instance), key, &command)?;
             (found.is_some(), found)
@@ -543,9 +551,10 @@ impl OwnedActionSource {
             // mark. A separate lookup first raced compaction or retirement: an
             // instance moved or removed in between made this write fail, which
             // answered 500 for what is a 404.
-            match self.commands.read(|store| {
-                Ok(store.set_instance_operator_stopped(deployment, instance, stop))
-            }) {
+            match self
+                .commands
+                .read(|store| Ok(store.set_instance_operator_stopped(deployment, instance, stop)))
+            {
                 Ok(Ok(previous)) => Some(previous),
                 Ok(Err(mllm_store::instances::InstanceError::NotFound)) => {
                     return Err(ConfigurationFailure::NotFound)
@@ -563,13 +572,14 @@ impl OwnedActionSource {
                 });
             }
         };
-        let receipt = |operation_id: Option<String>, revision: i64, joined: bool| InstanceActionReceipt {
-            deployment_id: deployment.into(),
-            instance,
-            operation_id,
-            revision,
-            joined,
-        };
+        let receipt =
+            |operation_id: Option<String>, revision: i64, joined: bool| InstanceActionReceipt {
+                deployment_id: deployment.into(),
+                instance,
+                operation_id,
+                revision,
+                joined,
+            };
         if stop {
             // An ordinary stop with verified cleanup: the deployment stays
             // eligible for on-demand activation of the instances the operator
@@ -742,10 +752,7 @@ impl OwnedActionSource {
         if failure == ConfigurationFailure::IdempotencyConflict {
             return failure;
         }
-        match self
-            .commands
-            .read(|store| store.is_deleted(deployment))
-        {
+        match self.commands.read(|store| store.is_deleted(deployment)) {
             Ok(true) => ConfigurationFailure::NotFound,
             _ => failure,
         }
@@ -853,7 +860,8 @@ impl ConfigurationSource for OwnedActionSource {
         self.configuration.accept(key, command)
     }
     fn checkpoint_digest_state(&self, deployment_id: &str, revision: i64) -> Option<String> {
-        self.configuration.checkpoint_digest_state(deployment_id, revision)
+        self.configuration
+            .checkpoint_digest_state(deployment_id, revision)
     }
     fn effective_configuration(
         &self,
@@ -943,17 +951,19 @@ async fn accept_evicting(
             let (source, id, key) = (source.clone(), id.clone(), key.clone());
             tokio::task::spawn_blocking(move || match instance {
                 None => source.accept_action(&id, &key, command).map(|r| (r, None)),
-                Some(k) => source.accept_instance_action(&id, k, &key, command).map(|r| {
-                    (
-                        ActionReceipt {
-                            operation_id: r.operation_id.unwrap_or_default(),
-                            deployment_id: r.deployment_id,
-                            revision: r.revision,
-                            joined: r.joined,
-                        },
-                        Some(r.instance),
-                    )
-                }),
+                Some(k) => source
+                    .accept_instance_action(&id, k, &key, command)
+                    .map(|r| {
+                        (
+                            ActionReceipt {
+                                operation_id: r.operation_id.unwrap_or_default(),
+                                deployment_id: r.deployment_id,
+                                revision: r.revision,
+                                joined: r.joined,
+                            },
+                            Some(r.instance),
+                        )
+                    }),
             })
         };
         let accepted = accept.await.map_err(|_| ConfigurationFailure::Internal)?;
@@ -1047,7 +1057,11 @@ async fn accept_inner(
         // The switch may drain for its whole bound: it does not hold one of
         // the bounded command slots meanwhile.
         drop(permit);
-        let slot = state.evictions.clone().try_acquire_owned().map_err(|_| QueueFull)?;
+        let slot = state
+            .evictions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| QueueFull)?;
         let (receipt, _, evicted) = accept_evicting(source, id, None, key, command, slot).await?;
         (receipt, Some(evicted))
     } else {
@@ -1122,7 +1136,11 @@ async fn accept_instance_inner(
     let source = state.actions.clone().ok_or(Unsupported)?;
     let (result, evicted) = if command.evict {
         drop(permit);
-        let slot = state.evictions.clone().try_acquire_owned().map_err(|_| QueueFull)?;
+        let slot = state
+            .evictions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| QueueFull)?;
         let (receipt, _, evicted) =
             accept_evicting(source, id, Some(index), key, command, slot).await?;
         (
@@ -1181,10 +1199,12 @@ mod tests {
             LifecycleError::Disabled,
             LifecycleError::Conflict,
         ] {
-            assert!(!nothing_left_to_start(&CoordinatorCommandError::Lifecycle(error)));
+            assert!(!nothing_left_to_start(&CoordinatorCommandError::Lifecycle(
+                error
+            )));
         }
-        assert!(!nothing_left_to_start(&CoordinatorCommandError::Coordinator(
-            CoordinatorError::Busy
-        )));
+        assert!(!nothing_left_to_start(
+            &CoordinatorCommandError::Coordinator(CoordinatorError::Busy)
+        ));
     }
 }

@@ -83,7 +83,10 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
 
 /// What this build's agent declares: it implements every feature it knows.
 pub fn agent_capabilities() -> Vec<String> {
-    CATALOGUE.iter().map(|(name, _)| (*name).to_owned()).collect()
+    CATALOGUE
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect()
 }
 
 /// The server-to-host features a host must have for this server to place new
@@ -107,7 +110,9 @@ pub fn declared(connect: &pb::Connect) -> Option<BTreeSet<String>> {
         || !connect.capabilities.iter().all(|name| {
             !name.is_empty()
                 && name.len() <= 64
-                && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         })
     {
         return None;
@@ -145,7 +150,11 @@ pub fn required(command: &pb::ExecuteMember) -> Vec<&'static str> {
         Some(Action::MaterializeSource(_)) => needs.push(MODEL_SOURCES),
         _ => {}
     }
-    if command.identity.as_ref().is_some_and(|id| id.instance_index != 0) {
+    if command
+        .identity
+        .as_ref()
+        .is_some_and(|id| id.instance_index != 0)
+    {
         needs.push(INSTANCE_INDEX);
     }
     if !command.restore_checkpoint_digest.is_empty() {

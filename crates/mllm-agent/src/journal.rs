@@ -5,22 +5,22 @@ use crate::identity_storage::IdentityDirectory;
 use mllm_adapters::traits::{OwnedProcessLaunch, RenderedCommand};
 use mllm_domain::completion::{Presence, ProcessIdentity};
 use mllm_launchers::{
-    AssociationError, LaunchAssociation, ProtectedLaunchDescriptors,
-    owned_launch::DurableProcessLaunch,
+    owned_launch::DurableProcessLaunch, AssociationError, LaunchAssociation,
+    ProtectedLaunchDescriptors,
 };
 use mllm_protocol::{
     execution::{MemberAction, MemberCommand},
     pb,
 };
 use prost::Message;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
@@ -363,7 +363,8 @@ impl HostJournal {
         }
         if !marked && !fresh {
             let untouched = version == JOURNAL_SCHEMA_VERSION
-                && db.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))
+                && db
+                    .query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))
                     .ok()
                     == Some(0)
                 && db
@@ -398,14 +399,24 @@ impl HostJournal {
         }
         if version < 2 {
             tx.execute_batch("CREATE TABLE native_results(command_id TEXT PRIMARY KEY REFERENCES commands(command_id), result BLOB NOT NULL); PRAGMA user_version=2;")?;
-        } else if tx.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='native_results'", [], |r| r.get::<_, i64>(0))? != 1 {
+        } else if tx.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='native_results'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? != 1
+        {
             return Err(JournalError::Storage);
         }
         // SPEC §§9.1, 13.1 (W4): one durable residency row per parked, parking,
         // restoring or quarantined launch; a resident launch has none.
         if version < 3 {
             tx.execute_batch("CREATE TABLE residency(owner TEXT PRIMARY KEY REFERENCES commands(command_id), state TEXT NOT NULL CHECK(state IN ('parking','parked','restoring','uncertain')), command_id TEXT NOT NULL); PRAGMA user_version=3;")?;
-        } else if tx.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='residency'", [], |r| r.get::<_, i64>(0))? != 1 {
+        } else if tx.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='residency'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? != 1
+        {
             return Err(JournalError::Storage);
         }
         // SPEC §§3.1, 7.3, 13.1 (per-launch claims): the host-wide single
@@ -456,7 +467,9 @@ impl HostJournal {
         // measured when it parked a launch journaled before WE3 (whose plan
         // records none), so its wake verifies against the host's own
         // measurement. Evidence only, same schema version like member_exits.
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS park_digests(owner TEXT PRIMARY KEY,digest TEXT NOT NULL);")?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS park_digests(owner TEXT PRIMARY KEY,digest TEXT NOT NULL);",
+        )?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS member_exits(command_id TEXT NOT NULL REFERENCES commands(command_id),role TEXT NOT NULL,pid INTEGER NOT NULL,boot TEXT NOT NULL,ticks INTEGER NOT NULL,code INTEGER,signal INTEGER,observed_at INTEGER NOT NULL,PRIMARY KEY(command_id,pid,boot,ticks));")?;
         let bound: (String, String) = tx.query_row(
             "SELECT controller,host FROM authority WHERE singleton=1",
@@ -587,7 +600,10 @@ impl HostJournal {
         ) {
             return Err(JournalError::Unauthorized);
         }
-        if matches!(command.action, MemberAction::Park { .. } | MemberAction::Restore { .. }) {
+        if matches!(
+            command.action,
+            MemberAction::Park { .. } | MemberAction::Restore { .. }
+        ) {
             // SPEC §§9.1, 10: a residency change names a launch this host owns,
             // at its declared tier, in the state the action changes. Anything
             // else is refused before it is journaled.
@@ -614,7 +630,10 @@ impl HostJournal {
         if assignment.is_some_and(|(g, r)| id.generation < g || id.revision < r) {
             return Err(JournalError::Fenced);
         }
-        let claim = matches!(command.action, MemberAction::Launch(_) | MemberAction::LaunchSingle(_));
+        let claim = matches!(
+            command.action,
+            MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+        );
         if claim {
             // SPEC §§3.1, 7.3: one claim per instance incarnation; a second
             // launch of the same (deployment, generation) stays uncertain.
@@ -662,7 +681,11 @@ impl HostJournal {
         self.validate()?;
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         Ok(db
-            .query_row("SELECT digest FROM park_digests WHERE owner=?1", [owner], |r| r.get(0))
+            .query_row(
+                "SELECT digest FROM park_digests WHERE owner=?1",
+                [owner],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -963,43 +986,45 @@ impl HostJournal {
         clock: &dyn ExecutionClock,
         policy: &dyn LocalExecutionPolicy,
     ) -> Result<MemberCommand, JournalError> {
-
-            let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
-            let tx = db.transaction()?;
-            let (body, state, instance): (Vec<u8>, i64, i64) = tx.query_row(
-                "SELECT body,state,instance FROM commands WHERE command_id=?1",
-                [&ticket.command_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            if state != 0 {
-                return Err(JournalError::Uncertain);
-            }
-            let command = decode(&body)?;
-            let id = &command.identity;
-            // ADR 0013 §5: the instance this command was fenced as at accept.
-            let assignment: (i64, i64) = tx.query_row(
-                "SELECT generation,revision FROM assignments WHERE deployment=?1 AND instance=?2",
-                params![id.deployment_id, instance],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            before_deadline(clock, id.deadline_ms)?;
-            if assignment != (id.generation, id.revision) {
-                return Err(JournalError::Fenced);
-            }
-            policy.authorize(&command)?;
-            if matches!(command.action, MemberAction::Launch(_) | MemberAction::LaunchSingle(_)) {
-                // Defense in depth: the launch still fits beside every other
-                // claim this host retains, just before its durable attempt.
-                policy.admit_beside(&command, &claimed_launches(&tx, &ticket.command_id)?)?;
-            }
-            before_deadline(clock, id.deadline_ms)?;
-            // SPEC §13.1: this commit precedes any process or ingress effect.
-            tx.execute(
-                "UPDATE commands SET state=1 WHERE command_id=?1",
-                [&ticket.command_id],
-            )?;
-            tx.commit()?;
-            Ok(command)
+        let mut db = self.db.lock().map_err(|_| JournalError::Storage)?;
+        let tx = db.transaction()?;
+        let (body, state, instance): (Vec<u8>, i64, i64) = tx.query_row(
+            "SELECT body,state,instance FROM commands WHERE command_id=?1",
+            [&ticket.command_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if state != 0 {
+            return Err(JournalError::Uncertain);
+        }
+        let command = decode(&body)?;
+        let id = &command.identity;
+        // ADR 0013 §5: the instance this command was fenced as at accept.
+        let assignment: (i64, i64) = tx.query_row(
+            "SELECT generation,revision FROM assignments WHERE deployment=?1 AND instance=?2",
+            params![id.deployment_id, instance],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        before_deadline(clock, id.deadline_ms)?;
+        if assignment != (id.generation, id.revision) {
+            return Err(JournalError::Fenced);
+        }
+        policy.authorize(&command)?;
+        if matches!(
+            command.action,
+            MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+        ) {
+            // Defense in depth: the launch still fits beside every other
+            // claim this host retains, just before its durable attempt.
+            policy.admit_beside(&command, &claimed_launches(&tx, &ticket.command_id)?)?;
+        }
+        before_deadline(clock, id.deadline_ms)?;
+        // SPEC §13.1: this commit precedes any process or ingress effect.
+        tx.execute(
+            "UPDATE commands SET state=1 WHERE command_id=?1",
+            [&ticket.command_id],
+        )?;
+        tx.commit()?;
+        Ok(command)
     }
 
     /// SPEC §13: a fresh durable ticket supplies one local native adapter with
@@ -1018,10 +1043,14 @@ impl HostJournal {
             return Err(JournalError::Fenced);
         }
         let clock: Arc<dyn ExecutionClock> = Arc::new(AnchoredClock {
-            epoch_ms: now_ms, started: Instant::now(),
+            epoch_ms: now_ms,
+            started: Instant::now(),
         });
         let command = self.begin_attempt(&ticket, clock.as_ref(), policy.as_ref())?;
-        if !matches!(command.action, MemberAction::Launch(_) | MemberAction::LaunchSingle(_)) {
+        if !matches!(
+            command.action,
+            MemberAction::Launch(_) | MemberAction::LaunchSingle(_)
+        ) {
             return Err(JournalError::Unauthorized);
         }
         let incarnation = match &command.action {
@@ -1029,12 +1058,19 @@ impl HostJournal {
             _ => ticket.command_id.clone(),
         };
         let tools = DurableProcessLaunch::new(Arc::new(JournalAssociation {
-            journal: Arc::downgrade(self), command_id: ticket.command_id.clone(),
+            journal: Arc::downgrade(self),
+            command_id: ticket.command_id.clone(),
             effect: Some((clock.clone(), command.identity.deadline_ms, ticket.session)),
         }));
         Ok(Arc::new(JournalLaunchTools {
-            journal: self.clone(), command, session: ticket.session,
-            clock, tools, incarnation, policy, spent: AtomicBool::new(false),
+            journal: self.clone(),
+            command,
+            session: ticket.session,
+            clock,
+            tools,
+            incarnation,
+            policy,
+            spent: AtomicBool::new(false),
         }))
     }
 
@@ -1096,7 +1132,9 @@ impl HostJournal {
     /// connected, so a concurrent Terminate or a newer session is never
     /// overtaken by a late readiness write.
     pub fn record_launch_ready(
-        self: &Arc<Self>, session: u64, command_id: &str,
+        self: &Arc<Self>,
+        session: u64,
+        command_id: &str,
         observation: &mllm_domain::completion::EffectObservation,
     ) -> Result<(), JournalError> {
         use mllm_domain::completion::Milestone;
@@ -1107,25 +1145,52 @@ impl HostJournal {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             load_command(&db, command_id)?
         };
-        let MemberAction::LaunchSingle(plan) = &command.action else { return Err(JournalError::Unauthorized); };
+        let MemberAction::LaunchSingle(plan) = &command.action else {
+            return Err(JournalError::Unauthorized);
+        };
         let identity = &command.identity;
         let token = &observation.token;
-        if observation.binding_id != plan.binding_id || observation.incarnation != plan.incarnation
-            || token.deployment_id != identity.deployment_id || token.operation_id != identity.operation_id
-            || token.step_id != identity.step_id || token.revision != identity.revision || token.generation != identity.generation
-            || observation.observed_at_ms < plan.issued_at_ms || observation.observed_at_ms >= identity.deadline_ms
-            || observation.receipt.is_empty() || observation.facts != [Milestone::AllocationsRestored, Milestone::WeightsUsable, Milestone::CacheValid, Milestone::ModelUsable]
-        { return Err(JournalError::Conflict); }
-        mllm_domain::group::validate_local_processes(&observation.identities).map_err(|_| JournalError::Conflict)?;
+        if observation.binding_id != plan.binding_id
+            || observation.incarnation != plan.incarnation
+            || token.deployment_id != identity.deployment_id
+            || token.operation_id != identity.operation_id
+            || token.step_id != identity.step_id
+            || token.revision != identity.revision
+            || token.generation != identity.generation
+            || observation.observed_at_ms < plan.issued_at_ms
+            || observation.observed_at_ms >= identity.deadline_ms
+            || observation.receipt.is_empty()
+            || observation.facts
+                != [
+                    Milestone::AllocationsRestored,
+                    Milestone::WeightsUsable,
+                    Milestone::CacheValid,
+                    Milestone::ModelUsable,
+                ]
+        {
+            return Err(JournalError::Conflict);
+        }
+        mllm_domain::group::validate_local_processes(&observation.identities)
+            .map_err(|_| JournalError::Conflict)?;
         let mut result = self.execution_result(command_id, observation.observed_at_ms)?;
-        let alive: std::collections::BTreeSet<_> = result.processes.iter().filter(|p| p.presence == "alive")
-            .map(|p| ProcessIdentity { role: p.role.clone(), pid: p.pid, boot_id: p.boot_id.clone(), start_ticks: p.start_ticks }).collect();
+        let alive: std::collections::BTreeSet<_> = result
+            .processes
+            .iter()
+            .filter(|p| p.presence == "alive")
+            .map(|p| ProcessIdentity {
+                role: p.role.clone(),
+                pid: p.pid,
+                boot_id: p.boot_id.clone(),
+                start_ticks: p.start_ticks,
+            })
+            .collect();
         if alive != observation.identities.iter().cloned().collect() {
             return Err(JournalError::Uncertain);
         }
         result.model_usable = true;
         result.observed_at_unix_ms = observation.observed_at_ms;
-        mllm_protocol::execution::validate_result(&command, &result).map_err(|_| JournalError::Conflict)?;
+        mllm_protocol::execution::validate_result(&command, &result)
+            .map_err(|_| JournalError::Conflict)?;
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         db.execute("INSERT INTO native_results(command_id,result) VALUES(?1,?2) ON CONFLICT(command_id) DO UPDATE SET result=excluded.result", params![command_id, result.encode_to_vec()])?;
         Ok(())
@@ -1161,7 +1226,11 @@ impl HostJournal {
             if residency_row(&db, owned_handle)?.is_some() {
                 return Err(JournalError::Uncertain);
             }
-            (load_command(&db, owned_handle)?, record(&db, owned_handle)?, saved)
+            (
+                load_command(&db, owned_handle)?,
+                record(&db, owned_handle)?,
+                saved,
+            )
         };
         if !same_owner(&owner, probe)
             || !matches!(owner.action, MemberAction::LaunchSingle(_))
@@ -1170,8 +1239,8 @@ impl HostJournal {
         {
             return Err(JournalError::Uncertain);
         }
-        let saved =
-            pb::MemberExecutionResult::decode(saved.as_slice()).map_err(|_| JournalError::Storage)?;
+        let saved = pb::MemberExecutionResult::decode(saved.as_slice())
+            .map_err(|_| JournalError::Storage)?;
         mllm_protocol::execution::validate_result(&owner, &saved)
             .map_err(|_| JournalError::Storage)?;
         if !saved.model_usable {
@@ -1246,7 +1315,10 @@ impl HostJournal {
         if !Weak::ptr_eq(&ticket.journal, &Arc::downgrade(self)) {
             return Err(JournalError::Fenced);
         }
-        let clock = AnchoredClock { epoch_ms: now_ms, started: Instant::now() };
+        let clock = AnchoredClock {
+            epoch_ms: now_ms,
+            started: Instant::now(),
+        };
         let command = self.begin_attempt(&ticket, &clock, policy)?;
         let owner = {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
@@ -1262,7 +1334,10 @@ impl HostJournal {
             }
             Ok(())
         };
-        let expected = match policy.authorize_residency(&command, &owner).and_then(|()| wake_fits()) {
+        let expected = match policy
+            .authorize_residency(&command, &owner)
+            .and_then(|()| wake_fits())
+        {
             Ok(()) => self.ready_group(&owner)?,
             Err(_) => None,
         };
@@ -1317,14 +1392,19 @@ impl HostJournal {
         let (record, saved) = {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             let saved: Option<Vec<u8>> = db
-                .query_row("SELECT result FROM native_results WHERE command_id=?1", [id], |r| r.get(0))
+                .query_row(
+                    "SELECT result FROM native_results WHERE command_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
                 .optional()?;
             (record(&db, id)?, saved)
         };
         let Some(saved) = saved else { return Ok(None) };
-        let saved =
-            pb::MemberExecutionResult::decode(saved.as_slice()).map_err(|_| JournalError::Storage)?;
-        mllm_protocol::execution::validate_result(owner, &saved).map_err(|_| JournalError::Storage)?;
+        let saved = pb::MemberExecutionResult::decode(saved.as_slice())
+            .map_err(|_| JournalError::Storage)?;
+        mllm_protocol::execution::validate_result(owner, &saved)
+            .map_err(|_| JournalError::Storage)?;
         if !record.claim_retained || record.state != CommandState::Launched || !saved.model_usable {
             return Ok(None);
         }
@@ -1387,7 +1467,10 @@ impl HostJournal {
         let mut outcome = outcome;
         let mut result = self.execution_result(command_id, observed_at_ms)?;
         result.state = "completed".into();
-        let claimed = matches!(outcome, ResidencyOutcome::Parked | ResidencyOutcome::Restored);
+        let claimed = matches!(
+            outcome,
+            ResidencyOutcome::Parked | ResidencyOutcome::Restored
+        );
         let intent_held = {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
             residency_row(&db, &owned)?.is_some_and(|(_, by)| by == command_id)
@@ -1435,24 +1518,36 @@ impl HostJournal {
                 tx.execute("DELETE FROM residency WHERE owner=?1", [&owned])?;
             }
             ResidencyOutcome::Unchanged if mine => {
-                tx.execute("UPDATE residency SET state='parked' WHERE owner=?1", [&owned])?;
+                tx.execute(
+                    "UPDATE residency SET state='parked' WHERE owner=?1",
+                    [&owned],
+                )?;
             }
             ResidencyOutcome::Unchanged => {}
             ResidencyOutcome::Parked if mine && parking => {
-                tx.execute("UPDATE residency SET state='parked' WHERE owner=?1", [&owned])?;
+                tx.execute(
+                    "UPDATE residency SET state='parked' WHERE owner=?1",
+                    [&owned],
+                )?;
             }
             ResidencyOutcome::Restored if mine && !parking => {
                 tx.execute("DELETE FROM residency WHERE owner=?1", [&owned])?;
             }
             ResidencyOutcome::Uncertain if mine => {
-                tx.execute("UPDATE residency SET state='uncertain' WHERE owner=?1", [&owned])?;
+                tx.execute(
+                    "UPDATE residency SET state='uncertain' WHERE owner=?1",
+                    [&owned],
+                )?;
             }
             // The intent is gone (a Terminate settled the launch): the result
             // is recorded, and there is no residency left to quarantine.
             ResidencyOutcome::Uncertain => {}
             _ => return Err(JournalError::Conflict),
         }
-        tx.execute("UPDATE commands SET state=3 WHERE command_id=?1 AND claim=0", [command_id])?;
+        tx.execute(
+            "UPDATE commands SET state=3 WHERE command_id=?1 AND claim=0",
+            [command_id],
+        )?;
         tx.execute("INSERT INTO native_results(command_id,result) VALUES(?1,?2) ON CONFLICT(command_id) DO UPDATE SET result=excluded.result", params![command_id, result.encode_to_vec()])?;
         tx.commit()?;
         Ok(outcome)
@@ -1469,7 +1564,9 @@ impl HostJournal {
     /// Current physical observations accompany retained command identity. A
     /// journal state alone never claims readiness or releases controller ownership.
     pub fn execution_result(
-        self: &Arc<Self>, command_id: &str, observed_at_ms: i64,
+        self: &Arc<Self>,
+        command_id: &str,
+        observed_at_ms: i64,
     ) -> Result<pb::MemberExecutionResult, JournalError> {
         self.validate()?;
         let (command, record) = {
@@ -1486,7 +1583,11 @@ impl HostJournal {
         };
         let unknown_probe_target = matches!(command.action, MemberAction::Probe { .. }) && {
             let db = self.db.lock().map_err(|_| JournalError::Storage)?;
-            !db.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE command_id=?1)", [&handle], |r| r.get::<_, bool>(0))?
+            !db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE command_id=?1)",
+                [&handle],
+                |r| r.get::<_, bool>(0),
+            )?
         };
         // ADR 0016: a Terminate of a handle this host has no launch record of
         // (it was fenced when first named, typically because the journal was
@@ -1533,29 +1634,51 @@ impl HostJournal {
             | MemberAction::Park { owned_handle }
             | MemberAction::Restore { owned_handle, .. } => {
                 let db = self.db.lock().map_err(|_| JournalError::Storage)?;
-                load_command(&db, owned_handle).map(|owner| bound(&owner.action)).unwrap_or_default()
+                load_command(&db, owned_handle)
+                    .map(|owner| bound(&owner.action))
+                    .unwrap_or_default()
             }
             action => bound(action),
         };
         let mut result = pb::MemberExecutionResult {
             identity: command.to_wire().identity,
             state: match record.state {
-                CommandState::Accepted => "accepted", CommandState::Attempted => "attempted",
-                CommandState::Launched => "launched", CommandState::Completed => "completed",
+                CommandState::Accepted => "accepted",
+                CommandState::Attempted => "attempted",
+                CommandState::Launched => "launched",
+                CommandState::Completed => "completed",
                 CommandState::Tombstone => "tombstone",
-            }.into(),
+            }
+            .into(),
             owned_handle: handle.clone(),
-            processes: processes.into_iter().map(|(p, presence)| pb::OwnedProcessObservation {
-                role: p.role, pid: p.pid, boot_id: p.boot_id, start_ticks: p.start_ticks,
-                presence: match presence { Presence::Alive => "alive", Presence::Gone => "gone", Presence::Unknown => "unknown" }.into(),
-            }).collect(),
-            observed_at_unix_ms: observed_at_ms, claim_retained, model_usable: false,
-            binding_id, incarnation,
+            processes: processes
+                .into_iter()
+                .map(|(p, presence)| pb::OwnedProcessObservation {
+                    role: p.role,
+                    pid: p.pid,
+                    boot_id: p.boot_id,
+                    start_ticks: p.start_ticks,
+                    presence: match presence {
+                        Presence::Alive => "alive",
+                        Presence::Gone => "gone",
+                        Presence::Unknown => "unknown",
+                    }
+                    .into(),
+                })
+                .collect(),
+            observed_at_unix_ms: observed_at_ms,
+            claim_retained,
+            model_usable: false,
+            binding_id,
+            incarnation,
             // SPEC §§9.1, 10: Park and Restore always report residency; with no
             // persisted outcome (an attempt still running, or one a host crash
             // interrupted) it is unknown and claims nothing.
-            residency: matches!(command.action, MemberAction::Park { .. } | MemberAction::Restore { .. })
-                .then(unknown_residency),
+            residency: matches!(
+                command.action,
+                MemberAction::Park { .. } | MemberAction::Restore { .. }
+            )
+            .then(unknown_residency),
             // ADR 0014 §7: DigestCheckpoint is never journaled.
             checkpoint: None,
             // SPEC §13: a policy refusal is never journaled either.
@@ -1569,34 +1692,51 @@ impl HostJournal {
         // A launch that is not resident (parking, parked, restoring or
         // quarantined) is never reported usable by an earlier readiness proof.
         let resident = handle.is_empty() || residency_row(&db, &handle)?.is_none();
-        let saved: Option<Vec<u8>> = db.query_row("SELECT result FROM native_results WHERE command_id=?1", [command_id], |r| r.get(0)).optional()?;
+        let saved: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT result FROM native_results WHERE command_id=?1",
+                [command_id],
+                |r| r.get(0),
+            )
+            .optional()?;
         if let Some(bytes) = saved {
-            let previous = pb::MemberExecutionResult::decode(bytes.as_slice()).map_err(|_| JournalError::Storage)?;
-            mllm_protocol::execution::validate_result(&command, &previous).map_err(|_| JournalError::Storage)?;
-            let alive = |report: &pb::MemberExecutionResult| report.processes.iter().filter(|p| p.presence == "alive")
-                .map(|p| (p.role.clone(), p.pid, p.boot_id.clone(), p.start_ticks)).collect::<std::collections::BTreeSet<_>>();
+            let previous = pb::MemberExecutionResult::decode(bytes.as_slice())
+                .map_err(|_| JournalError::Storage)?;
+            mllm_protocol::execution::validate_result(&command, &previous)
+                .map_err(|_| JournalError::Storage)?;
+            let alive = |report: &pb::MemberExecutionResult| {
+                report
+                    .processes
+                    .iter()
+                    .filter(|p| p.presence == "alive")
+                    .map(|p| (p.role.clone(), p.pid, p.boot_id.clone(), p.start_ticks))
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
             let reportable = match &command.action {
-                MemberAction::Probe { .. } | MemberAction::Park { .. } | MemberAction::Restore { .. } => {
-                    result.state == "completed"
-                }
+                MemberAction::Probe { .. }
+                | MemberAction::Park { .. }
+                | MemberAction::Restore { .. } => result.state == "completed",
                 _ => result.state == "launched",
             };
-            let unchanged = reportable && result.claim_retained && alive(&result) == alive(&previous);
+            let unchanged =
+                reportable && result.claim_retained && alive(&result) == alive(&previous);
             if let MemberAction::Park { .. } | MemberAction::Restore { .. } = &command.action {
                 // SPEC §§9.1, 13.2: a persisted park or restore claim is
                 // repeated only while the launch is still in that state with
                 // the same live group; otherwise the replay claims nothing.
                 let mut evidence = previous.residency.clone().unwrap_or_else(unknown_residency);
                 let current = residency_row(&db, &handle)?.map(|(state, _)| state);
-                let holds = unchanged && match evidence.state.as_str() {
-                    "parked" => current.as_deref() == Some("parked"),
-                    "restored" => current.is_none(),
-                    _ => true,
-                };
+                let holds = unchanged
+                    && match evidence.state.as_str() {
+                        "parked" => current.as_deref() == Some("parked"),
+                        "restored" => current.is_none(),
+                        _ => true,
+                    };
                 if !holds && matches!(evidence.state.as_str(), "parked" | "restored") {
                     evidence.state = "unknown".into();
                 }
-                result.model_usable = holds && evidence.state == "restored" && previous.model_usable;
+                result.model_usable =
+                    holds && evidence.state == "restored" && previous.model_usable;
                 result.residency = Some(evidence);
                 if result.model_usable {
                     result.observed_at_unix_ms = previous.observed_at_unix_ms;
@@ -1635,7 +1775,9 @@ impl HostJournal {
     /// now (its native readiness recorded, not changing residency), with the
     /// exact group that readiness named. The processes to watch for an exit;
     /// for a parked launch the report is evidence only.
-    pub fn ready_launches(&self) -> Result<Vec<(MemberCommand, Vec<ProcessIdentity>)>, JournalError> {
+    pub fn ready_launches(
+        &self,
+    ) -> Result<Vec<(MemberCommand, Vec<ProcessIdentity>)>, JournalError> {
         self.validate()?;
         let db = self.db.lock().map_err(|_| JournalError::Storage)?;
         let mut ready = Vec::new();
@@ -1729,7 +1871,12 @@ fn fenced_handle(db: &Connection, handle: &str) -> Result<bool, JournalError> {
 
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
     identities.sort_by(|a, b| {
-        (&a.role, a.pid, &a.boot_id, a.start_ticks).cmp(&(&b.role, b.pid, &b.boot_id, b.start_ticks))
+        (&a.role, a.pid, &a.boot_id, a.start_ticks).cmp(&(
+            &b.role,
+            b.pid,
+            &b.boot_id,
+            b.start_ticks,
+        ))
     });
     identities
 }
@@ -1808,7 +1955,10 @@ fn residency_row(db: &Connection, owner: &str) -> Result<Option<(String, String)
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    if row.as_ref().is_some_and(|(state, _)| !RESIDENCY_STATES.contains(&state.as_str())) {
+    if row
+        .as_ref()
+        .is_some_and(|(state, _)| !RESIDENCY_STATES.contains(&state.as_str()))
+    {
         return Err(JournalError::Storage);
     }
     Ok(row)
@@ -1816,10 +1966,17 @@ fn residency_row(db: &Connection, owner: &str) -> Result<Option<(String, String)
 
 /// The retained single launch a Park or Restore names: same member,
 /// deployment and approved profile, never a compacted or foreign command.
-fn residency_owner(db: &Connection, command: &MemberCommand) -> Result<MemberCommand, JournalError> {
+fn residency_owner(
+    db: &Connection,
+    command: &MemberCommand,
+) -> Result<MemberCommand, JournalError> {
     let owned = owned_handle(command)?;
     let body: Option<Option<Vec<u8>>> = db
-        .query_row("SELECT body FROM commands WHERE command_id=?1", [owned], |r| r.get(0))
+        .query_row(
+            "SELECT body FROM commands WHERE command_id=?1",
+            [owned],
+            |r| r.get(0),
+        )
         .optional()?;
     let Some(Some(body)) = body else {
         return Err(JournalError::Unauthorized);
@@ -1837,7 +1994,9 @@ fn residency_owner(db: &Connection, command: &MemberCommand) -> Result<MemberCom
 fn residency_precondition(db: &Connection, command: &MemberCommand) -> Result<(), JournalError> {
     let state = residency_row(db, owned_handle(command)?)?.map(|(state, _)| state);
     match (&command.action, state.as_deref()) {
-        (MemberAction::Park { .. }, None) | (MemberAction::Restore { .. }, Some("parked")) => Ok(()),
+        (MemberAction::Park { .. }, None) | (MemberAction::Restore { .. }, Some("parked")) => {
+            Ok(())
+        }
         _ => Err(JournalError::Unauthorized),
     }
 }
@@ -1856,7 +2015,9 @@ struct JournalLaunchTools {
 }
 impl JournalLaunchTools {
     fn launch(
-        &self, incarnation: &str, command: &RenderedCommand,
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
         descriptors: Option<&ProtectedLaunchDescriptors>,
     ) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
         use mllm_adapters::traits::RuntimeError;
@@ -1866,74 +2027,125 @@ impl JournalLaunchTools {
             return Err(failure());
         }
         self.journal.validate().map_err(|_| failure())?;
-        self.journal.check_session(self.session).map_err(|_| failure())?;
-        self.policy.authorize(&self.command).map_err(|_| failure())?;
-        before_deadline(self.clock.as_ref(), self.command.identity.deadline_ms).map_err(|_| failure())?;
+        self.journal
+            .check_session(self.session)
+            .map_err(|_| failure())?;
+        self.policy
+            .authorize(&self.command)
+            .map_err(|_| failure())?;
+        before_deadline(self.clock.as_ref(), self.command.identity.deadline_ms)
+            .map_err(|_| failure())?;
         {
             let db = self.journal.db.lock().map_err(|_| failure())?;
             let assignment: (i64, i64) = db.query_row(
                 "SELECT a.generation,a.revision FROM assignments a JOIN commands c ON c.deployment=a.deployment AND c.instance=a.instance WHERE c.command_id=?1",
                 [&self.command.identity.command_id], |row| Ok((row.get(0)?, row.get(1)?)),
             ).map_err(|_| failure())?;
-            if assignment != (self.command.identity.generation, self.command.identity.revision) {
+            if assignment
+                != (
+                    self.command.identity.generation,
+                    self.command.identity.revision,
+                )
+            {
                 return Err(failure());
             }
             // SPEC §13.2: a Terminate that settled this launch while nothing had
             // spawned released its claim under this same lock. Starting an engine
             // now would create a process nobody retains.
-            let owned: (i64, bool) = db.query_row(
-                "SELECT state,claim FROM commands WHERE command_id=?1",
-                [&self.command.identity.command_id], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).map_err(|_| failure())?;
+            let owned: (i64, bool) = db
+                .query_row(
+                    "SELECT state,claim FROM commands WHERE command_id=?1",
+                    [&self.command.identity.command_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| failure())?;
             if owned != (1, true) {
                 return Err(failure());
             }
             // SPEC §§3.1, 7.3: the last local check before the engine starts
             // is that it still fits beside every other retained claim.
-            let claimed = claimed_launches(&db, &self.command.identity.command_id)
+            let claimed =
+                claimed_launches(&db, &self.command.identity.command_id).map_err(|_| failure())?;
+            self.policy
+                .admit_beside(&self.command, &claimed)
                 .map_err(|_| failure())?;
-            self.policy.admit_beside(&self.command, &claimed).map_err(|_| failure())?;
         }
         let identity = match descriptors {
-            Some(descriptors) => self.tools.spawn_durable_protected(incarnation, command, descriptors),
+            Some(descriptors) => {
+                self.tools
+                    .spawn_durable_protected(incarnation, command, descriptors)
+            }
             None => self.tools.spawn_durable(incarnation, command),
         }?;
         let db = self.journal.db.lock().map_err(|_| failure())?;
-        db.execute("UPDATE commands SET state=2 WHERE command_id=?1 AND state=1",
-            [&self.command.identity.command_id]).map_err(|_| failure())?;
+        db.execute(
+            "UPDATE commands SET state=2 WHERE command_id=?1 AND state=1",
+            [&self.command.identity.command_id],
+        )
+        .map_err(|_| failure())?;
         Ok(identity)
     }
     fn owns(&self, identity: &ProcessIdentity) -> bool {
-        self.journal.db.lock().ok().and_then(|db| record(&db, &self.command.identity.command_id).ok())
+        self.journal
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| record(&db, &self.command.identity.command_id).ok())
             .is_some_and(|record| record.processes.contains(identity))
     }
 }
 impl OwnedProcessLaunch for JournalLaunchTools {
-    fn spawn_durable(&self, incarnation: &str, command: &RenderedCommand) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
+    fn spawn_durable(
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
+    ) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
         self.launch(incarnation, command, None)
     }
-    fn spawn_durable_protected(&self, incarnation: &str, command: &RenderedCommand, descriptors: &ProtectedLaunchDescriptors) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
+    fn spawn_durable_protected(
+        &self,
+        incarnation: &str,
+        command: &RenderedCommand,
+        descriptors: &ProtectedLaunchDescriptors,
+    ) -> Result<ProcessIdentity, mllm_adapters::traits::RuntimeError> {
         self.launch(incarnation, command, Some(descriptors))
     }
     fn present(&self, identity: &ProcessIdentity) -> Presence {
-        if self.owns(identity) { self.tools.present(identity) } else { Presence::Unknown }
+        if self.owns(identity) {
+            self.tools.present(identity)
+        } else {
+            Presence::Unknown
+        }
     }
-    fn observe_group(&self, api: &ProcessIdentity) -> Result<Vec<ProcessIdentity>, mllm_adapters::traits::RuntimeError> {
+    fn observe_group(
+        &self,
+        api: &ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, mllm_adapters::traits::RuntimeError> {
         use mllm_adapters::traits::RuntimeError;
-        if !self.owns(api) { return Err(RuntimeError::Uncertain("unowned process".into())); }
+        if !self.owns(api) {
+            return Err(RuntimeError::Uncertain("unowned process".into()));
+        }
         let observed = self.tools.observe_group(api)?;
         let persist = || -> Result<(), JournalError> {
             self.journal.validate()?;
             let mut db = self.journal.db.lock().map_err(|_| JournalError::Storage)?;
             let tx = db.transaction()?;
-            for identity in &observed { persist_process(&tx, &self.command.identity.command_id, identity)?; }
+            for identity in &observed {
+                persist_process(&tx, &self.command.identity.command_id, identity)?;
+            }
             tx.commit()?;
             Ok(())
         };
-        persist().map_err(|_| RuntimeError::Uncertain("process observation could not be retained".into()))?;
+        persist().map_err(|_| {
+            RuntimeError::Uncertain("process observation could not be retained".into())
+        })?;
         Ok(observed)
     }
-    fn terminate_owned(&self, _: &[ProcessIdentity], _: Duration) -> Result<(), mllm_adapters::traits::RuntimeError> {
+    fn terminate_owned(
+        &self,
+        _: &[ProcessIdentity],
+        _: Duration,
+    ) -> Result<(), mllm_adapters::traits::RuntimeError> {
         // Cleanup requires its own accepted, fenced command.
         Err(mllm_adapters::traits::RuntimeError::Unsupported)
     }
@@ -2061,7 +2273,11 @@ fn claimed_launches(db: &Connection, except: &str) -> Result<Vec<ClaimedLaunch>,
             Some(_) => ClaimPhase::Changing,
             None => {
                 let saved: Option<Vec<u8>> = db
-                    .query_row("SELECT result FROM native_results WHERE command_id=?1", [&id], |r| r.get(0))
+                    .query_row(
+                        "SELECT result FROM native_results WHERE command_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 let ready = CommandState::decode(state)? == CommandState::Launched
                     && saved
@@ -2069,7 +2285,11 @@ fn claimed_launches(db: &Connection, except: &str) -> Result<Vec<ClaimedLaunch>,
                         .transpose()
                         .map_err(|_| JournalError::Storage)?
                         .is_some_and(|result| result.model_usable);
-                if ready { ClaimPhase::Ready } else { ClaimPhase::Starting }
+                if ready {
+                    ClaimPhase::Ready
+                } else {
+                    ClaimPhase::Starting
+                }
             }
         };
         claimed.push(ClaimedLaunch { command, phase });

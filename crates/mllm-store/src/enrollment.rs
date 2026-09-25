@@ -78,10 +78,21 @@ pub fn valid_name(s: &str) -> bool {
 impl Store {
     /// SPEC §4.2: enrollment persists independently of current connectivity.
     pub fn enrolled_hosts(&self) -> Result<Vec<EnrolledHost>, StoreError> {
-        let mut query = self.conn.prepare("SELECT host_id,host_name,revoked FROM enrolled_hosts ORDER BY host_name LIMIT 4097")?;
-        let hosts = query.query_map([], |r| Ok(EnrolledHost { host_id: r.get(0)?, host_name: r.get(1)?, revoked: r.get(2)? }))?
+        let mut query = self.conn.prepare(
+            "SELECT host_id,host_name,revoked FROM enrolled_hosts ORDER BY host_name LIMIT 4097",
+        )?;
+        let hosts = query
+            .query_map([], |r| {
+                Ok(EnrolledHost {
+                    host_id: r.get(0)?,
+                    host_name: r.get(1)?,
+                    revoked: r.get(2)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        if hosts.len() > 4096 { return Err(StoreError::Conflict); }
+        if hosts.len() > 4096 {
+            return Err(StoreError::Conflict);
+        }
         Ok(hosts)
     }
     pub fn create_host_invitation(
@@ -414,7 +425,10 @@ fn resolve_host(
     }
 }
 /// ADR 0016: revoke, by fingerprint, every certificate `host_id` holds.
-fn revoke_certificates(tx: &rusqlite::Transaction<'_>, host_id: &str) -> Result<(), rusqlite::Error> {
+fn revoke_certificates(
+    tx: &rusqlite::Transaction<'_>,
+    host_id: &str,
+) -> Result<(), rusqlite::Error> {
     tx.execute(
         "INSERT OR IGNORE INTO revoked_host_certificates(fingerprint,revoked_at_unix)
            SELECT fingerprint,MAX(CAST(strftime('%s','now') AS INTEGER),0) FROM host_certificates WHERE host_id=?1",

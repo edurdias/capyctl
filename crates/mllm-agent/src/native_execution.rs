@@ -14,16 +14,14 @@ use crate::{
     session::{ExecutionFuture, Provisioned, SessionError, SessionExecution},
 };
 use mllm_adapters::{
-    sglang::{SglangAdapter, frozen_from_effective},
+    sglang::{frozen_from_effective, SglangAdapter},
     traits::{
         ChatForward, EngineAdapter, MemberRef, OwnedProcessLaunch, Readiness, RuntimeAction,
         RuntimeCommand,
     },
 };
 use mllm_config::{
-    effective::EffectiveDeployment,
-    engine_policy::Engine,
-    remote_roles::HostConfig,
+    effective::EffectiveDeployment, engine_policy::Engine, remote_roles::HostConfig,
 };
 use mllm_domain::completion::{ExecutionIdentities, StepExecutionContext, TransitionToken};
 use mllm_protocol::{
@@ -254,7 +252,10 @@ impl NativeHostExecution {
     }
     /// ADR 0008: materialize model sources through this store instead of the
     /// one built from the host document (tests serve a loopback origin).
-    pub fn with_model_sources(mut self: Arc<Self>, store: Arc<crate::sources::SourceStore>) -> Arc<Self> {
+    pub fn with_model_sources(
+        mut self: Arc<Self>,
+        store: Arc<crate::sources::SourceStore>,
+    ) -> Arc<Self> {
         Arc::make_mut(&mut self).sources = Some(store);
         self
     }
@@ -348,8 +349,9 @@ impl NativeHostExecution {
             weights_bytes: plan.checkpoint_weights_bytes,
             ..Default::default()
         };
-        let mut effective = mllm_config::effective::resolve_effective_with_checkpoint(&config, &host, facts)
-            .map_err(|_| JournalError::Unauthorized)?;
+        let mut effective =
+            mllm_config::effective::resolve_effective_with_checkpoint(&config, &host, facts)
+                .map_err(|_| JournalError::Unauthorized)?;
         // Owner decision 2026-09-23: the launch's starting phase is charged the
         // startup peak the server reserved (declared, measured or placeholder),
         // never below the steady request this host resolved itself.
@@ -544,7 +546,11 @@ impl NativeHostExecution {
             } => {
                 evidence.state = "downloading".into();
                 evidence.bytes_total = bytes_total;
-                evidence.bytes_done = if bytes_total == 0 { 0 } else { bytes_done.min(bytes_total) };
+                evidence.bytes_done = if bytes_total == 0 {
+                    0
+                } else {
+                    bytes_done.min(bytes_total)
+                };
             }
             SourceStatus::Verified { bytes } => {
                 evidence.state = "verified".into();
@@ -659,8 +665,8 @@ impl NativeHostExecution {
     ) -> Result<Box<dyn EngineAdapter>, SessionError> {
         Ok(match prepared {
             PreparedLaunch::Sglang(frozen) => {
-                let mut adapter = SglangAdapter::from_frozen(&frozen, None)
-                    .map_err(|_| SessionError)?;
+                let mut adapter =
+                    SglangAdapter::from_frozen(&frozen, None).map_err(|_| SessionError)?;
                 // SPEC §9.2: a memory-saver launch enrolls its saver
                 // observation in this host's private directory.
                 if let Some(dir) = self.saver.as_ref().and_then(|s| s.observation_dir()) {
@@ -685,17 +691,19 @@ impl NativeHostExecution {
                         security.trust_remote_code,
                     ),
                 );
-                Box::new(adapter
-                    .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin))
-                    .with_launch(*frozen)
-                    .with_tools(tools)
-                    .with_session(plan.coordinator_session_id.clone())
-                    .with_wrapper(self.runtime_dir.join("sglang_entry.py"))
-                    .with_log(
-                        self.log_dir
-                            .join(format!("{}.log", plan.incarnation))
-                            .to_string_lossy(),
-                    ))
+                Box::new(
+                    adapter
+                        .with_credentials(hex::encode(keys.inference), hex::encode(keys.admin))
+                        .with_launch(*frozen)
+                        .with_tools(tools)
+                        .with_session(plan.coordinator_session_id.clone())
+                        .with_wrapper(self.runtime_dir.join("sglang_entry.py"))
+                        .with_log(
+                            self.log_dir
+                                .join(format!("{}.log", plan.incarnation))
+                                .to_string_lossy(),
+                        ),
+                )
             }
             PreparedLaunch::Vllm(launch) => Box::new(
                 self.vllm_adapter(effective, plan, keys, served)?
@@ -906,7 +914,9 @@ impl NativeHostExecution {
             .map_err(|_| SessionError)?;
         if matches!(
             command.action,
-            MemberAction::LaunchSingle(_) | MemberAction::Park { .. } | MemberAction::Restore { .. }
+            MemberAction::LaunchSingle(_)
+                | MemberAction::Park { .. }
+                | MemberAction::Restore { .. }
         ) && matches!(fresh, Ok(true))
         {
             let host = self.clone();
@@ -1089,7 +1099,8 @@ impl NativeHostExecution {
             // Exact, still-fresh replay may recover a lost acknowledgement. An
             // in-memory gate lost on host restart is rebuilt only for this scope.
             let owned = match &command.action {
-                MemberAction::Probe { owned_handle } | MemberAction::Restore { owned_handle, .. } => self
+                MemberAction::Probe { owned_handle }
+                | MemberAction::Restore { owned_handle, .. } => self
                     .journal
                     .retained_command(owned_handle)
                     .map_err(|_| SessionError)?,
@@ -1130,7 +1141,9 @@ fn launch_failure(result: &pb::MemberExecutionResult, engine: Option<&str>) -> S
         };
         match mllm_launchers::reaped::status_of(&identity)? {
             mllm_launchers::reaped::ReapedStatus::Code(code) => Some(EngineExit::Code(code)),
-            mllm_launchers::reaped::ReapedStatus::Signal(signal) => Some(EngineExit::Signal(signal)),
+            mllm_launchers::reaped::ReapedStatus::Signal(signal) => {
+                Some(EngineExit::Signal(signal))
+            }
         }
     });
     summary(engine.unwrap_or(""), exit)
@@ -1147,9 +1160,7 @@ async fn fresh_probe(
     stop_at_ms: i64,
 ) -> Result<(), SessionError> {
     let remaining = || {
-        Duration::from_millis(
-            u64::try_from(stop_at_ms - mllm_protocol::now_unix_ms()).unwrap_or(0),
-        )
+        Duration::from_millis(u64::try_from(stop_at_ms - mllm_protocol::now_unix_ms()).unwrap_or(0))
     };
     let listed = tokio::time::timeout(
         remaining().min(PROBE_MODELS_TIMEOUT),
@@ -1268,7 +1279,9 @@ impl LocalExecutionPolicy for NativeHostExecution {
         // SPEC §13.2: that measurement ran outside the lock when the command
         // was pre-admitted; only a command that was not runs it here.
         if !self.pre_admitted(command)
-            && self.park_capability(&effective, &plan.profile_name).is_some()
+            && self
+                .park_capability(&effective, &plan.profile_name)
+                .is_some()
         {
             return Err(JournalError::Unauthorized);
         }
@@ -1327,8 +1340,9 @@ impl SessionExecution for NativeHostExecution {
         &self,
         command: MemberCommand,
         gate_key: [u8; 32],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Provisioned, SessionError>> + Send>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Provisioned, SessionError>> + Send>,
+    > {
         let host = self.clone();
         Box::pin(async move {
             command.verify_digest().map_err(|_| SessionError)?;
@@ -1347,9 +1361,11 @@ impl SessionExecution for NativeHostExecution {
             let authorizer = host.clone();
             let authorized = command.clone();
             // SPEC §§3.1, 7.3: alone, then beside every launch still claimed.
-            match tokio::task::spawn_blocking(move || authorizer.admit_launch_here(&authorized, &plan))
-                .await
-                .map_err(|_| SessionError)?
+            match tokio::task::spawn_blocking(move || {
+                authorizer.admit_launch_here(&authorized, &plan)
+            })
+            .await
+            .map_err(|_| SessionError)?
             {
                 Ok(()) => {}
                 // SPEC §13: a policy refusal is the answer, not a lost session;
@@ -1398,11 +1414,8 @@ impl SessionExecution for NativeHostExecution {
         Some(Box::pin(async move {
             // `/proc` reads and journal writes are blocking work.
             tokio::task::spawn_blocking(move || {
-                let exited = crate::exits::scan(
-                    &host.journal,
-                    &host.host_id,
-                    mllm_protocol::now_unix_ms(),
-                );
+                let exited =
+                    crate::exits::scan(&host.journal, &host.host_id, mllm_protocol::now_unix_ms());
                 for launch in &exited {
                     // SPEC §§6.1, 13.2 (W13): an engine with an exited member
                     // is not the group readiness proved. Its readiness authority
@@ -1413,7 +1426,10 @@ impl SessionExecution for NativeHostExecution {
                         let _ = host.ingress.close(&scope);
                     }
                 }
-                exited.into_iter().map(|launch| launch.exit.to_wire()).collect()
+                exited
+                    .into_iter()
+                    .map(|launch| launch.exit.to_wire())
+                    .collect()
             })
             .await
             .unwrap_or_default()
@@ -1555,9 +1571,13 @@ mod tests {
             barrier.wait();
         });
         assert!(executor.authority.lock().unwrap().session.is_none());
-        assert!(executor.publish_ready(1, "first", "late-first", &scope).is_err());
+        assert!(executor
+            .publish_ready(1, "first", "late-first", &scope)
+            .is_err());
         executor.connected(2).unwrap();
-        assert!(executor.publish_ready(1, "first", "late-first", &scope).is_err());
+        assert!(executor
+            .publish_ready(1, "first", "late-first", &scope)
+            .is_err());
         // A stale disconnect cannot revoke a newer session, but the new session
         // still has no model probe and therefore no forwarding authority.
         executor.disconnected(1);
@@ -1576,9 +1596,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
         // The same mutex guards both orders of completion versus disconnect.
-        executor.publish_ready(2, "first", "second", &scope).unwrap();
+        executor
+            .publish_ready(2, "first", "second", &scope)
+            .unwrap();
         executor.disconnected(2);
-        assert!(executor.publish_ready(2, "first", "late-second", &scope).is_err());
+        assert!(executor
+            .publish_ready(2, "first", "late-second", &scope)
+            .is_err());
         server.abort();
     }
 
@@ -1597,7 +1621,9 @@ mod tests {
         std::fs::create_dir_all(root.path().join("runtime")).unwrap();
         std::fs::write(root.path().join("runtime/mllm_vllm_guard.py"), "").unwrap();
         std::fs::write(
-            root.path().join("runtime").join(mllm_adapters::vllm::VLLM_ENTRY),
+            root.path()
+                .join("runtime")
+                .join(mllm_adapters::vllm::VLLM_ENTRY),
             "",
         )
         .unwrap();
@@ -1805,9 +1831,17 @@ mod tests {
         executor.verify_checkpoint(&effective, &plan).unwrap();
         assert!(executor.checkpoint_unchanged(&launch, &plan, "").await);
         // Owner decision 5: a wake may name the same digest, never another.
-        assert!(executor.checkpoint_unchanged(&launch, &plan, &recorded).await);
+        assert!(
+            executor
+                .checkpoint_unchanged(&launch, &plan, &recorded)
+                .await
+        );
         let other_digest = format!("sha256:{}", "0".repeat(64));
-        assert!(!executor.checkpoint_unchanged(&launch, &plan, &other_digest).await);
+        assert!(
+            !executor
+                .checkpoint_unchanged(&launch, &plan, &other_digest)
+                .await
+        );
         // Weights the server did not resolve with are refused as well.
         let weighed = SingleLaunchPlan {
             checkpoint_weights_bytes: Some(1),
@@ -1821,16 +1855,30 @@ mod tests {
         };
         let effective = executor.resolve(&other).unwrap();
         assert_eq!(
-            executor.verify_checkpoint(&effective, &weighed).unwrap_err(),
+            executor
+                .verify_checkpoint(&effective, &weighed)
+                .unwrap_err(),
             CheckpointError::Mismatch
         );
         // Pre-WE3 plan: adoptable, never launched, and woken only against the
         // digest the server measured and recorded for it (owner decision 5).
         let (legacy, legacy_plan) = launch_with(&deployment, &policy, "");
         assert!(executor.authorize(&legacy).is_err());
-        assert!(!executor.checkpoint_unchanged(&legacy, &legacy_plan, "").await);
-        assert!(executor.checkpoint_unchanged(&legacy, &legacy_plan, &recorded).await);
-        assert!(!executor.checkpoint_unchanged(&legacy, &legacy_plan, &other_digest).await);
+        assert!(
+            !executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, "")
+                .await
+        );
+        assert!(
+            executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, &recorded)
+                .await
+        );
+        assert!(
+            !executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, &other_digest)
+                .await
+        );
         // The checkpoint changes under the recorded digest.
         std::fs::write(root.path().join("models/toy/model.safetensors"), "swapped").unwrap();
         let effective = executor.resolve(&launch).unwrap();
@@ -1840,7 +1888,11 @@ mod tests {
         );
         assert!(executor.authorize(&launch).is_err());
         assert!(!executor.checkpoint_unchanged(&launch, &plan, "").await);
-        assert!(!executor.checkpoint_unchanged(&legacy, &legacy_plan, &recorded).await);
+        assert!(
+            !executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, &recorded)
+                .await
+        );
     }
 
     /// ADR 0014 §7 (WE3), owner decision 5: a pre-WE3 launch has no recorded
@@ -1868,12 +1920,28 @@ mod tests {
             executor.journal.park_digest("launch").unwrap().as_deref(),
             Some(parked_digest.as_str())
         );
-        assert!(executor.checkpoint_unchanged(&legacy, &legacy_plan, "").await);
-        assert!(executor.checkpoint_unchanged(&legacy, &legacy_plan, &parked_digest).await);
+        assert!(
+            executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, "")
+                .await
+        );
+        assert!(
+            executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, &parked_digest)
+                .await
+        );
         std::fs::write(root.path().join("models/toy/model.safetensors"), "swapped").unwrap();
         let swapped = measure();
-        assert!(!executor.checkpoint_unchanged(&legacy, &legacy_plan, &swapped).await);
-        assert!(!executor.checkpoint_unchanged(&legacy, &legacy_plan, "").await);
+        assert!(
+            !executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, &swapped)
+                .await
+        );
+        assert!(
+            !executor
+                .checkpoint_unchanged(&legacy, &legacy_plan, "")
+                .await
+        );
     }
 
     /// SPEC §13.2: the slow half of admission (checkpoint hashing, the
@@ -1958,15 +2026,27 @@ mod tests {
         assert_eq!((sized.weights_bytes, sized.file_count), (7, 2));
         assert!(sized.digest.is_empty() && !sized.full_rehash);
         let again = run(digest(&deployment, &policy, Some(&computed.digest))).await;
-        assert_eq!((again.state.as_str(), again.full_rehash), ("computed", false));
+        assert_eq!(
+            (again.state.as_str(), again.full_rehash),
+            ("computed", false)
+        );
         let other = format!("sha256:{}", "0".repeat(64));
-        assert_eq!(run(digest(&deployment, &policy, Some(&other))).await.state, "mismatch");
+        assert_eq!(
+            run(digest(&deployment, &policy, Some(&other))).await.state,
+            "mismatch"
+        );
         let refused = run(digest(&deployment, &"c".repeat(64), None)).await;
-        assert_eq!((refused.state.as_str(), refused.reason.as_str()), ("refused", "unauthorized"));
+        assert_eq!(
+            (refused.state.as_str(), refused.reason.as_str()),
+            ("refused", "unauthorized")
+        );
         let mut escaping = deployment.clone();
         escaping["model"]["path"] = serde_json::json!("/etc");
         let refused = run(digest(&escaping, &policy, None)).await;
-        assert_eq!((refused.state.as_str(), refused.reason.as_str()), ("refused", "invalid_root"));
+        assert_eq!(
+            (refused.state.as_str(), refused.reason.as_str()),
+            ("refused", "invalid_root")
+        );
         // Another controller's command is not evidence at all.
         let mut foreign = digest(&deployment, &policy, None);
         foreign.identity.controller_id = "other".into();
@@ -1984,7 +2064,8 @@ mod tests {
         use sha2::Digest as _;
         let root = directory();
         let identity_dir = directory();
-        let (executor, mut deployment, policy) = checkpoint_fixture(root.path(), identity_dir.path());
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture(root.path(), identity_dir.path());
         let weights = vec![3_u8; 5000];
         let sha = hex::encode(sha2::Sha256::digest(&weights));
         let served = weights.clone();
@@ -2005,8 +2086,11 @@ mod tests {
             serde_json::json!({"http": {"url": "https://weights.example.test/model.bin", "sha256": sha}}),
         );
         let command = |id: &str, policy: &str| {
-            let plan = mllm_protocol::execution::MaterializeSourcePlan::new(&deployment.to_string(), policy)
-                .expect("a remote source");
+            let plan = mllm_protocol::execution::MaterializeSourcePlan::new(
+                &deployment.to_string(),
+                policy,
+            )
+            .expect("a remote source");
             let mut command = MemberCommand {
                 identity: checkpoint_identity(id, "source"),
                 action: MemberAction::MaterializeSource(plan),
@@ -2021,7 +2105,10 @@ mod tests {
         };
         // The fixture host states no model_sources: denied, nothing fetched.
         let denied = run(executor.clone(), command("s1", &policy)).await;
-        assert_eq!((denied.state.as_str(), denied.reason.as_str()), ("failed", "denied"));
+        assert_eq!(
+            (denied.state.as_str(), denied.reason.as_str()),
+            ("failed", "denied")
+        );
         // A command resolved against another host document is denied too.
         let foreign = run(executor.clone(), command("s2", &"c".repeat(64))).await;
         assert_eq!(foreign.reason, "denied");
@@ -2060,7 +2147,12 @@ mod tests {
             }),
         };
         digest.identity.payload_digest = digest.canonical_digest();
-        let measured = executor.execute(1, digest).await.unwrap().checkpoint.unwrap();
+        let measured = executor
+            .execute(1, digest)
+            .await
+            .unwrap()
+            .checkpoint
+            .unwrap();
         assert_eq!(measured.state, "computed", "{measured:?}");
         assert_eq!(measured.total_bytes, 5000);
     }
@@ -2090,7 +2182,10 @@ mod tests {
         );
         let scope = executor.scope(&launch).unwrap();
         assert!(
-            executor.identities.load(&scope, launch.identity.payload_digest).is_err(),
+            executor
+                .identities
+                .load(&scope, launch.identity.payload_digest)
+                .is_err(),
             "a refused provision stores no key"
         );
         let session = executor.journal.connect().unwrap();
@@ -2181,8 +2276,7 @@ mod tests {
         launch.identity.payload_digest = launch.canonical_digest();
         let effective = executor.resolve(&launch).unwrap();
         assert_eq!(effective.profile.engine, Engine::Sglang);
-        let mllm_domain::launch::LaunchSettings::Sglang(settings) = &effective.engine_config
-        else {
+        let mllm_domain::launch::LaunchSettings::Sglang(settings) = &effective.engine_config else {
             panic!("an SGLang profile resolves SGLang settings");
         };
         assert!(!settings.memory_saver && !settings.cpu_weight_backup);
@@ -2207,7 +2301,11 @@ mod tests {
         assert_eq!(refused.refused, "residency_tier");
         assert_eq!(refused.residency.as_ref().unwrap().state, "unchanged");
         assert!(!refused.model_usable);
-        assert_eq!(executor.journal.history(0, 100).unwrap().len(), 1, "the park is not journaled");
+        assert_eq!(
+            executor.journal.history(0, 100).unwrap().len(),
+            1,
+            "the park is not journaled"
+        );
         assert_eq!(executor.journal.residency_of("launch").unwrap(), None);
 
         // The same launch declared `deep` passes the tier gate: the tier, not
@@ -2270,9 +2368,9 @@ mod tests {
                 installation_state: "measured".into(),
                 ..Default::default()
             }];
-            host.installations = Arc::new(crate::installation::InstallationRegistry::from_inventory(
-                &host.inventory,
-            ));
+            host.installations = Arc::new(
+                crate::installation::InstallationRegistry::from_inventory(&host.inventory),
+            );
             let (mut launch, _) = launch_with(&deployment, &policy, "");
             launch.identity.payload_digest = launch.canonical_digest();
             let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
@@ -2320,7 +2418,8 @@ mod tests {
     async fn a_build_without_saver_hooks_refuses_deep_and_park_but_not_restart_only() {
         let root = directory();
         let identity_dir = directory();
-        let (executor, deployment, policy) = sglang_fixture(root.path(), identity_dir.path(), "deep");
+        let (executor, deployment, policy) =
+            sglang_fixture(root.path(), identity_dir.path(), "deep");
         sglang_runtime(root.path());
         let (mut owner, _) = launch_with(&deployment, &policy, "");
         owner.identity.payload_digest = owner.canonical_digest();
@@ -2354,7 +2453,11 @@ mod tests {
         assert_eq!(refused.state, "completed");
         assert_eq!(refused.refused, "capability_missing:deep_park");
         assert_eq!(refused.residency.as_ref().unwrap().state, "unchanged");
-        assert_eq!(executor.journal.history(0, 100).unwrap().len(), 1, "the park is not journaled");
+        assert_eq!(
+            executor.journal.history(0, 100).unwrap().len(),
+            1,
+            "the park is not journaled"
+        );
 
         let root = directory();
         let identity_dir = directory();
@@ -2419,7 +2522,10 @@ mod tests {
             park.identity.payload_digest = park.canonical_digest();
             let refused = executor.execute(session, park.clone()).await.unwrap();
             mllm_protocol::execution::validate_result(&park, &refused).unwrap();
-            assert_eq!(refused.refused, "capability_missing:deep_park", "{quantization}");
+            assert_eq!(
+                refused.refused, "capability_missing:deep_park",
+                "{quantization}"
+            );
             assert_eq!(refused.residency.as_ref().unwrap().state, "unchanged");
         }
 

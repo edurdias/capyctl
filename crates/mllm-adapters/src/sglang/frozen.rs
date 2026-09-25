@@ -1,12 +1,11 @@
 //! Shared frozen native recipe construction for embedded and remote host execution.
 //! Both callers supply already-resolved local policy; this grants no launch authority.
-use crate::traits::RuntimeError;
 use crate::sglang::pinned::NATIVE_SGLANG_CONTRACT;
+use crate::traits::RuntimeError;
 use mllm_config::effective::EffectiveDeployment;
 use mllm_config::engine_policy::Engine;
 use mllm_domain::launch::{
-    LaunchSettings, NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata,
-    SglangLaunchSettings,
+    LaunchSettings, NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings,
 };
 use sha2::{Digest, Sha256};
 

@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::Json;
 
+use crate::admission::StaticStreamGuard;
 use crate::forwarders::ForwarderError;
+use crate::timing::RequestTiming;
 use crate::RouterDeps;
 use mllm_adapters::traits::AdapterError;
 use mllm_controller::{LeaseEnd, LeaseRefused, RequestLease};
-use crate::admission::StaticStreamGuard;
-use crate::timing::RequestTiming;
 
 /// Resolve the alias to an explicit deployment (no model-name guessing —
 /// SPEC §10) and ensure READY, joining the single activation operation.
@@ -90,13 +90,20 @@ async fn resolve_held(
     let deadline = received + deps.inflight.waiting.limits().deadline;
     let controller = deps.controller.clone();
     let id = deployment_id.clone();
-    let joined = deps.activation_join.join_detached(&deployment_id, move || async move {
-        controller
-            .activate_for_request(&id)
-            .await
-            .map(|()| 0)
-            .map_err(map_controller)
-    }, err("activation_uncertain", "the activation task ended without an outcome; retry shortly"));
+    let joined = deps.activation_join.join_detached(
+        &deployment_id,
+        move || async move {
+            controller
+                .activate_for_request(&id)
+                .await
+                .map(|()| 0)
+                .map_err(map_controller)
+        },
+        err(
+            "activation_uncertain",
+            "the activation task ended without an outcome; retry shortly",
+        ),
+    );
     let joined_at = std::time::Instant::now();
     match tokio::time::timeout_at(deadline, joined).await {
         Ok(Ok(_)) => {
@@ -159,7 +166,11 @@ pub async fn admit_timed(
         None => enter_queue(deps, &deployment_id, body_bytes)?,
     };
     let deadline = received + deps.inflight.waiting.limits().deadline;
-    match deps.inflight.acquire_arc(&deployment_id, max, deadline).await {
+    match deps
+        .inflight
+        .acquire_arc(&deployment_id, max, deadline)
+        .await
+    {
         Some(guard) => Ok((deployment_id, guard)),
         None => Err(err(
             "queue_full",
@@ -193,9 +204,9 @@ fn serves_now(
     // PARKING, a switch) queues; any other state dispatches or is refused
     // by the planner.
     Ok(!instances.is_empty()
-        && instances.iter().any(|i| {
-            i.dispatch_open || i.host_unresponsive || i.engine_exited || !i.host_live
-        }))
+        && instances
+            .iter()
+            .any(|i| i.dispatch_open || i.host_unresponsive || i.engine_exited || !i.host_live))
 }
 
 /// Non-streaming dispatch: resolve + forward through the deployment's
@@ -251,7 +262,8 @@ pub async fn dispatch_timed(
     // SPEC §10: the collected response is bounded like a relayed stream (the
     // request deadline for its first backend event, then the idle bound), not
     // by a fixed wall-clock cap.
-    let bounds = crate::stream::StreamBounds::for_request(received, &deps.inflight.waiting.limits());
+    let bounds =
+        crate::stream::StreamBounds::for_request(received, &deps.inflight.waiting.limits());
     // From the first poll onward the engine may have accepted work. Dropping
     // this request or receiving an uncertain transport error cannot free it.
     let guard = guard.abandon();
@@ -349,9 +361,15 @@ enum Refused {
 
 /// SPEC §10: the client answer for an engine's invalid-request rejection: the
 /// engine's status (400, 413 or 422) and its bounded message, never a 500.
-pub(crate) fn engine_rejection(status: u16, message: &str) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn engine_rejection(
+    status: u16,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
     let (_, body) = err("engine_rejected", message);
-    (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), body)
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+        body,
+    )
 }
 
 /// The router's error answer, for the instance planner.
@@ -387,14 +405,19 @@ pub(crate) fn refused_before_sending(error: &AdapterError) -> bool {
 /// The client answer for a refusal decided before sending.
 pub(crate) fn adapter_refusal(error: &AdapterError) -> (StatusCode, Json<serde_json::Value>) {
     match error {
-        AdapterError::PolicyDenied => err("invalid_request", "the request carries a field that is not accepted"),
+        AdapterError::PolicyDenied => err(
+            "invalid_request",
+            "the request carries a field that is not accepted",
+        ),
         _ => err("unsupported", &format!("{error}")),
     }
 }
 
 /// SPEC §10, T19 T21: refuse a request whose fields cannot be forwarded, before
 /// any admission accounting, activation or engine is touched.
-pub fn validate_request(body: &serde_json::Value) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+pub fn validate_request(
+    body: &serde_json::Value,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     use mllm_adapters::forward::ChatRequestRefusal as R;
     mllm_adapters::forward::validate_chat_request(body).map_err(|refusal| match refusal {
         R::Malformed(_) | R::Field(_) => err("invalid_request", &refusal.to_string()),
@@ -474,7 +497,9 @@ fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
 /// outcome as an activation failure, which told a client that nothing happened even
 /// when the activation was still running. A new fault variant must be a compile
 /// error here, not silently absorbed into that claim.
-pub(crate) fn map_controller(e: mllm_controller::LifecycleFault) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn map_controller(
+    e: mllm_controller::LifecycleFault,
+) -> (StatusCode, Json<serde_json::Value>) {
     use mllm_controller::LifecycleFault as F;
     match e {
         F::NotFound(d) => err("unknown_model", &format!("deployment {d} vanished")),

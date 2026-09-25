@@ -248,7 +248,11 @@ fn collect_notices(view: &serde_json::Value, notices: &mut Vec<String>) {
                     let mark = &instance["development_controls"];
                     if !mark.is_null() && mark != controls {
                         let index = instance["index"].as_u64().unwrap_or(0);
-                        push_notice(&format!("deployment {label} instance {index}"), mark, notices);
+                        push_notice(
+                            &format!("deployment {label} instance {index}"),
+                            mark,
+                            notices,
+                        );
                     }
                 }
             }

@@ -234,7 +234,9 @@ fn accepted_revisions_record_count_and_instance_rows() {
     );
     // Instance 0 is fenced by the receipt's generation; the others draw one
     // when they first start. None is placed at deploy time (ADR 0013 §3).
-    assert!(rows.iter().all(|r| r.host_id.is_none() && !r.operator_stopped));
+    assert!(rows
+        .iter()
+        .all(|r| r.host_id.is_none() && !r.operator_stopped));
     assert_eq!(
         rows.iter().map(|r| r.generation).collect::<Vec<_>>(),
         vec![Some(first.generation), None, None]
@@ -383,7 +385,11 @@ fn v23_moves_runtime_state_onto_instance_zero_unchanged() {
     )
     .unwrap();
     let dispatch: i64 = conn
-        .query_row("SELECT dispatch_enabled FROM deployments WHERE id='a'", [], |r| r.get(0))
+        .query_row(
+            "SELECT dispatch_enabled FROM deployments WHERE id='a'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(dispatch, 0);
 }

@@ -39,7 +39,12 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 /// SPEC §13.3 / T21: variables an engine may take from the agent's own
 /// environment. Everything else it sees is named here by mllm.
-const PASS_THROUGH: &[&str] = &["HOME", "CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"];
+const PASS_THROUGH: &[&str] = &[
+    "HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+];
 
 /// Fixed system tool directories after the engine's own bin.
 const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -47,9 +52,19 @@ const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// Every variable a vLLM engine may be started with (SPEC §13.3 / T21). The
 /// launcher clears the agent's environment, so this is all the engine sees.
 pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
-    "PATH", "HOME", "CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
-    "VLLM_API_KEY", "MLLM_VLLM_ADMIN_KEY", "VLLM_SERVER_DEV_MODE", "PYTHONPATH",
-    "VLLM_PLUGINS", "PYTHONDONTWRITEBYTECODE", "MLLM_ENGINE_LOG", "MLLM_EXTRA_APPROVALS",
+    "PATH",
+    "HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "VLLM_API_KEY",
+    "MLLM_VLLM_ADMIN_KEY",
+    "VLLM_SERVER_DEV_MODE",
+    "PYTHONPATH",
+    "VLLM_PLUGINS",
+    "PYTHONDONTWRITEBYTECODE",
+    "MLLM_ENGINE_LOG",
+    "MLLM_EXTRA_APPROVALS",
 ];
 
 /// The closed environment one vLLM launch starts with: the rendered variables,
@@ -115,13 +130,9 @@ pub(super) async fn initialize(
     plan.api_key = None;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    cmd.env = engine_environment(
-        &cmd.env,
-        &plan,
-        &key,
-        adapter.admin_key(),
-        &|name| std::env::var(name).ok(),
-    );
+    cmd.env = engine_environment(&cmd.env, &plan, &key, adapter.admin_key(), &|name| {
+        std::env::var(name).ok()
+    });
 
     // The tool is synchronous on purpose (mllm-launchers has no runtime), so every
     // call into it leaves the async threads free.

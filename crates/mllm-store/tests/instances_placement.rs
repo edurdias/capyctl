@@ -1204,19 +1204,35 @@ fn the_switch_planner_frees_a_single_claim_host_by_releasing_its_occupant() {
     t.start(&first, "start-first", StartScope::All, None);
     let second = only_a(&t, "second", json!({}));
     // The occupant is still starting: nothing to release, no plan.
-    assert_eq!(plan(&t, &second), SwitchPlan::Impossible("host_occupied".into()));
+    assert_eq!(
+        plan(&t, &second),
+        SwitchPlan::Impossible("host_occupied".into())
+    );
     let (step, _, host) = t.planned(&first).remove(0);
     t.ready(&step, &host, 100);
     // Memory fits both, yet placement refuses: the host is occupied.
     assert!(matches!(
         t.store.accept_scoped_start_command(
-            &t.session, "owner", &second, StartScope::All, t.revision(&second),
-            "start-second", NOW, DEADLINE, None,
+            &t.session,
+            "owner",
+            &second,
+            StartScope::All,
+            t.revision(&second),
+            "start-second",
+            NOW,
+            DEADLINE,
+            None,
         ),
         Err(mllm_store::lifecycle::LifecycleError::CapacityBlocked)
     ));
     match plan(&t, &second) {
-        SwitchPlan::Evict { host, instance, wake, victims, .. } => {
+        SwitchPlan::Evict {
+            host,
+            instance,
+            wake,
+            victims,
+            ..
+        } => {
             assert_eq!((host.as_str(), instance, wake), ("host-a", 0, false));
             assert_eq!(victims.len(), 1);
             assert_eq!(victims[0].deployment_id, first);
@@ -1300,12 +1316,21 @@ fn a_failed_switch_reopens_only_its_own_closure() {
     t.ready(&step, &host, 100);
     let generation = generation(&t, &id);
     // Closed and reopened by the switch alone.
-    assert!(t.store.close_for_switch(&t.session, &id, 0, generation).unwrap());
+    assert!(t
+        .store
+        .close_for_switch(&t.session, &id, 0, generation)
+        .unwrap());
     assert!(!dispatch_open(&t, &id));
-    assert!(t.store.reopen_after_switch(&t.session, &id, 0, generation).unwrap());
+    assert!(t
+        .store
+        .reopen_after_switch(&t.session, &id, 0, generation)
+        .unwrap());
     assert!(dispatch_open(&t, &id));
     // Closed by the switch, then the engine exits during the drain.
-    assert!(t.store.close_for_switch(&t.session, &id, 0, generation).unwrap());
+    assert!(t
+        .store
+        .close_for_switch(&t.session, &id, 0, generation)
+        .unwrap());
     let exited = t
         .store
         .record_engine_exit(
@@ -1322,10 +1347,19 @@ fn a_failed_switch_reopens_only_its_own_closure() {
         )
         .unwrap();
     assert!(exited.is_some());
-    assert!(!t.store.reopen_after_switch(&t.session, &id, 0, generation).unwrap());
-    assert!(!dispatch_open(&t, &id), "a failed switch reopened an exited engine");
+    assert!(!t
+        .store
+        .reopen_after_switch(&t.session, &id, 0, generation)
+        .unwrap());
+    assert!(
+        !dispatch_open(&t, &id),
+        "a failed switch reopened an exited engine"
+    );
     // A later switch failure for a gate it no longer holds changes nothing.
-    assert!(!t.store.reopen_after_switch(&t.session, &id, 0, generation).unwrap());
+    assert!(!t
+        .store
+        .reopen_after_switch(&t.session, &id, 0, generation)
+        .unwrap());
     assert!(!dispatch_open(&t, &id));
 }
 
@@ -1465,7 +1499,14 @@ fn an_inflight_lease_still_refuses_a_switch_release() {
         .unwrap());
     assert!(matches!(
         t.store.accept_switch_release(
-            &t.session, "switch", &victim, 0, generation, "switch-release", NOW, true,
+            &t.session,
+            "switch",
+            &victim,
+            0,
+            generation,
+            "switch-release",
+            NOW,
+            true,
         ),
         Err(mllm_store::lifecycle::LifecycleError::Conflict)
     ));
@@ -1504,7 +1545,10 @@ fn a_slow_revision_stop_does_not_expire_the_restart() {
         .store
         .reconcile_instances(&t.session, late, None, true)
         .unwrap();
-    assert!(done.is_empty(), "nothing expires while the stop runs: {done:?}");
+    assert!(
+        done.is_empty(),
+        "nothing expires while the stop runs: {done:?}"
+    );
     t.cleaned(&t.cleanup_step(operation_id));
     let done = t
         .store
@@ -1681,7 +1725,10 @@ fn a_switch_that_ends_without_reopening_clears_its_closures() {
     t.store
         .record_switch(&t.session, &record(SwitchPhase::AdmissionClosed))
         .unwrap();
-    assert!(t.store.close_for_switch(&t.session, &id, 0, generation).unwrap());
+    assert!(t
+        .store
+        .close_for_switch(&t.session, &id, 0, generation)
+        .unwrap());
     t.store
         .record_switch(&t.session, &record(SwitchPhase::Failed))
         .unwrap();
@@ -1692,7 +1739,10 @@ fn a_switch_that_ends_without_reopening_clears_its_closures() {
     t.store
         .record_switch(&t.session, &record(SwitchPhase::AdmissionClosed))
         .unwrap();
-    assert!(t.store.close_for_switch(&t.session, &id, 0, generation).unwrap());
+    assert!(t
+        .store
+        .close_for_switch(&t.session, &id, 0, generation)
+        .unwrap());
     // A retired session cannot end it.
     let stale = t.session.clone();
     let session = t.store.begin_coordinator_session().unwrap();
@@ -1796,7 +1846,11 @@ fn closure_reasons_are_pruned_on_fence_move_and_cleanup() {
         .accept_instance_stop_command(&t.session, "owner", &id, 0, 1, "stop", NOW, DEADLINE)
         .unwrap()
         .unwrap();
-    assert_eq!(closures(), 0, "the fence move retires the old incarnation's reasons");
+    assert_eq!(
+        closures(),
+        0,
+        "the fence move retires the old incarnation's reasons"
+    );
     // A reason recorded against the stop's own generation (the one a restart
     // on this host keeps) is retired by the verified cleanup.
     let stopped = generation(&t, &id);

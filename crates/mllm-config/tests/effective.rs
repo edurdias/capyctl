@@ -638,12 +638,18 @@ fn sglang_settings_show_defaults_and_derivations_with_provenance() {
     assert_eq!(settings.weight_restore, "disk_reload");
     let provenance = &settings.provenance;
     assert_eq!(provenance["cuda_graphs"], SettingSource::MllmDefault);
-    assert_eq!(provenance["sglang.tokenizer_workers"], SettingSource::MllmDefault);
+    assert_eq!(
+        provenance["sglang.tokenizer_workers"],
+        SettingSource::MllmDefault
+    );
     assert_eq!(provenance["memory_saver"], SettingSource::Derived);
     assert_eq!(provenance["memory.request"], SettingSource::Derived);
     assert!(!provenance.contains_key("memory.kv_cache"));
     let shown = serde_json::to_value(&effective).unwrap();
-    assert_eq!(shown["engine_config"]["provenance"]["cuda_graphs"], "mllm default");
+    assert_eq!(
+        shown["engine_config"]["provenance"]["cuda_graphs"],
+        "mllm default"
+    );
     assert_eq!(shown["engine_config"]["engine"], "sglang");
 
     // A deployment may override a safe default; the provenance entry goes away.
@@ -1003,7 +1009,10 @@ fn typed_remote_code_needs_the_host_switch() {
         assert_eq!(error.path, "engine_config.trust_remote_code", "{engine}");
         host["runtime_profiles"]["local"]["security"]["trust_remote_code"] = true.into();
         let effective = resolve_effective(&deployment, &host).unwrap();
-        assert!(effective.engine_config.common().trust_remote_code, "{engine}");
+        assert!(
+            effective.engine_config.common().trust_remote_code,
+            "{engine}"
+        );
     }
 }
 
@@ -1130,11 +1139,18 @@ fn remote_sources_need_host_opt_in_and_pins_and_resolve_into_the_store() {
         let (deployment, host) = with_source(source.clone(), Some(allowed.clone()));
         let effective = resolve_effective(&deployment, &host)
             .unwrap_or_else(|error| panic!("{source} must resolve: {error}"));
-        assert_eq!(effective.model.resolved_path.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(expected.as_str())
+        );
         assert!(effective.model.source.is_remote());
         // The frozen revision round-trips with the host's policy.
         let text = serde_json::to_string(&effective).unwrap();
-        assert_eq!(mllm_config::effective::decode_effective_snapshot(&text).unwrap(), effective, "{source}");
+        assert_eq!(
+            mllm_config::effective::decode_effective_snapshot(&text).unwrap(),
+            effective,
+            "{source}"
+        );
     }
 
     // Unpinned or unsafe declarations are refused even where allowed.
@@ -1295,7 +1311,9 @@ fn strict_schema_accepts_model_sources_and_points_locked_commit_at_revision() {
     }
     let error = parse_strict(
         ConfigKind::Deployment,
-        &deployment(&format!("    huggingface:\n      repo: r\n      revision: {sha}\n      locked_commit: {sha}")),
+        &deployment(&format!(
+            "    huggingface:\n      repo: r\n      revision: {sha}\n      locked_commit: {sha}"
+        )),
     )
     .unwrap_err();
     assert!(error.detail.contains("revision"), "{error:?}");

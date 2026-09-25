@@ -168,7 +168,10 @@ fn valid_invitation(invitation: &JoinInvitation) -> Result<(), EnrollmentError> 
             .bytes()
             .all(|b| b.is_ascii_hexdigit())
         || invitation.invitation_id != digest(invitation.invitation_secret.as_bytes())
-        || invitation.recover_host_id.as_deref().is_some_and(|id| !name(id))
+        || invitation
+            .recover_host_id
+            .as_deref()
+            .is_some_and(|id| !name(id))
     {
         return Err(EnrollmentError);
     }
@@ -215,7 +218,9 @@ impl PendingEnrollment {
     ) -> Result<Self, EnrollmentError> {
         valid_invitation(invitation)?;
         let host = invitation.recover_host_id.clone().ok_or(EnrollmentError)?;
-        let existing = storage.read_bundle(HOST_FILE).map_err(|_| EnrollmentError)?;
+        let existing = storage
+            .read_bundle(HOST_FILE)
+            .map_err(|_| EnrollmentError)?;
         let bytes = match existing {
             None => {
                 let bytes = serde_json::to_vec(&fresh_bundle(invitation, Some(host))?)

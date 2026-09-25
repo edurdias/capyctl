@@ -75,7 +75,6 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-
 pub fn doctor_host(profiles: &[ProfileInput]) -> Result<DoctorReport, DoctorError> {
     let mut report = DoctorReport::default();
 
@@ -86,20 +85,25 @@ pub fn doctor_host(profiles: &[ProfileInput]) -> Result<DoctorReport, DoctorErro
         } else {
             // Approved non-destructive check: `--version` capture only. The
             // program is never launched as an engine here.
-            match std::process::Command::new(&p.command[0]).arg("--version").output() {
+            match std::process::Command::new(&p.command[0])
+                .arg("--version")
+                .output()
+            {
                 Ok(o) if o.status.success() => {
                     let stdout = String::from_utf8_lossy(&o.stdout).to_string();
                     let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    let combined = if stdout.trim().is_empty() { stderr } else { stdout };
+                    let combined = if stdout.trim().is_empty() {
+                        stderr
+                    } else {
+                        stdout
+                    };
                     (
                         String::new(),
                         Some(format!(
                             "{}:{}",
                             {
                                 use sha2::{Digest, Sha256};
-                                hex::encode(Sha256::digest(
-                                    redact_api_keys(&combined).as_bytes(),
-                                ))
+                                hex::encode(Sha256::digest(redact_api_keys(&combined).as_bytes()))
                             },
                             redact_api_keys(&combined)
                                 .lines()

@@ -135,7 +135,10 @@ impl VllmAdapter {
             .residency
             .lock()
             .map_err(|_| RuntimeError::Unsupported)?;
-        if fence.active || fence.uncertain || fence.steps.len() >= 64 || fence.steps.contains(step_id)
+        if fence.active
+            || fence.uncertain
+            || fence.steps.len() >= 64
+            || fence.steps.contains(step_id)
         {
             return Err(RuntimeError::Unsupported);
         }
@@ -300,9 +303,7 @@ impl EngineAdapter for VllmAdapter {
             | RuntimeAction::Restore
             | RuntimeAction::ReloadWeights
             | RuntimeAction::InvalidateCache
-            | RuntimeAction::Probe => {
-                crate::vllm::residency::execute(self, command).await
-            }
+            | RuntimeAction::Probe => crate::vllm::residency::execute(self, command).await,
             _ => Err(RuntimeError::Unsupported),
         }
     }

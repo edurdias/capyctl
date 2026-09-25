@@ -2,7 +2,7 @@ use super::permits_send;
 use crate::ownership::SharedCoordinatorState;
 use futures::FutureExt;
 use mllm_adapters::traits::{
-    EngineAdapter, OwnedProcessLaunch, RuntimeError, RuntimeAction, RuntimeCommand,
+    EngineAdapter, OwnedProcessLaunch, RuntimeAction, RuntimeCommand, RuntimeError,
 };
 use mllm_adapters::vllm::args::redact_text;
 use mllm_config::engine_policy::Engine;
@@ -84,7 +84,10 @@ pub type ResidentObservationFuture = Pin<
     Box<
         dyn Future<
                 Output = Result<
-                    (Vec<MemoryObservation>, Vec<mllm_domain::resources::ProcessResident>),
+                    (
+                        Vec<MemoryObservation>,
+                        Vec<mllm_domain::resources::ProcessResident>,
+                    ),
                     CoordinatorError,
                 >,
             > + Send,
@@ -889,7 +892,9 @@ impl CoordinatorCommands {
         if !self.shared.accepting.load(Ordering::Acquire)
             || (increases && !self.shared.initializing.load(Ordering::Acquire))
         {
-            return Err(CoordinatorError::Stopped("worker is not admitting this command".into()).into());
+            return Err(
+                CoordinatorError::Stopped("worker is not admitting this command".into()).into(),
+            );
         }
         let now = (self.shared.clock)()?;
         let receipt = accept(&owner, now).map_err(|error| {
@@ -911,8 +916,7 @@ pub type CleanupFuture =
     Pin<Box<dyn Future<Output = Result<CleanupEvidence, CoordinatorError>> + Send>>;
 /// Host-specific cleanup must return authenticated physical evidence. An adapter
 /// shutdown acknowledgement or a local `/proc` lookup of a remote PID is not proof.
-pub type CleanupExecutor =
-    Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>;
+pub type CleanupExecutor = Arc<dyn Fn(CleanupExecutionContext) -> CleanupFuture + Send + Sync>;
 
 /// SPEC §§3, 13: execution transport belongs below the existing durable lifecycle.
 /// Construction supplies no arm/send authority; the worker still owns admission,
@@ -1152,15 +1156,23 @@ impl OwnedCoordinator {
         options: CoordinatorOptions,
         bindings: Arc<dyn ExecutionBindings>,
     ) -> Result<Self, CoordinatorError> {
-        Self::spawn_with(owner, observations, clock, options, Arc::new(move |work| {
-            let binding = bindings.resolve(work)?;
-            Ok(Arc::new(Driver {
-                engine: binding.engine,
-                cleanup: binding.cleanup,
-                tools: None,
-                settle: binding.settle,
-            }))
-        }), true, None)
+        Self::spawn_with(
+            owner,
+            observations,
+            clock,
+            options,
+            Arc::new(move |work| {
+                let binding = bindings.resolve(work)?;
+                Ok(Arc::new(Driver {
+                    engine: binding.engine,
+                    cleanup: binding.cleanup,
+                    tools: None,
+                    settle: binding.settle,
+                }))
+            }),
+            true,
+            None,
+        )
     }
 
     /// Spawn a coordinator that drives whichever engine family each binding
@@ -1238,9 +1250,11 @@ impl OwnedCoordinator {
                                 key.as_str(),
                                 mllm_store::secrets::SecretRole::Inference,
                             ))
-                            .chain(admin_key.as_deref().map(|admin| {
-                                (admin, mllm_store::secrets::SecretRole::Admin)
-                            }));
+                            .chain(
+                                admin_key
+                                    .as_deref()
+                                    .map(|admin| (admin, mllm_store::secrets::SecretRole::Admin)),
+                            );
                             for (key, role) in roles {
                                 let sealed: [u8; 32] = hex::decode(key)
                                     .ok()
@@ -1916,16 +1930,17 @@ impl StartupPeak {
             .iter()
             .find(|o| &o.domain == domain && o.sampled_at_ms > since && o.available_bytes >= 0)
         {
-            self.lowest = Some(self.lowest.map_or(o.available_bytes, |l| l.min(o.available_bytes)));
+            self.lowest = Some(
+                self.lowest
+                    .map_or(o.available_bytes, |l| l.min(o.available_bytes)),
+            );
         }
     }
 
     /// The measured peak, when a fresh sample showed availability dropping.
     fn peak(&self) -> Option<i64> {
         let (available, _) = self.baseline?;
-        available
-            .checked_sub(self.lowest?)
-            .filter(|drop| *drop > 0)
+        available.checked_sub(self.lowest?).filter(|drop| *drop > 0)
     }
 }
 
@@ -1972,8 +1987,12 @@ async fn drive(
     let max_parked = controls.max_parked as usize;
     // SPEC §6.5 (W5): a start that does not fit first reclaims the least
     // recently parked instances on its host; it waits, planned, meanwhile.
-    let (reclaim_step, reclaim_observed, reclaim_limits, reclaim_residents) =
-        (step.clone(), observed.clone(), limits.clone(), residents.clone());
+    let (reclaim_step, reclaim_observed, reclaim_limits, reclaim_residents) = (
+        step.clone(),
+        observed.clone(),
+        limits.clone(),
+        residents.clone(),
+    );
     if let Some(reason) = shared
         .read(move |owner, now| {
             owner.store().reclaim_for_start_with_residents(
@@ -2164,7 +2183,9 @@ async fn drive_residency(
     stop: &mut watch::Receiver<bool>,
 ) -> Result<bool, CoordinatorError> {
     if *stop.borrow() || !shared.accepting.load(Ordering::Acquire) {
-        return Err(CoordinatorError::Stopped("shutdown before a residency arm".into()));
+        return Err(CoordinatorError::Stopped(
+            "shutdown before a residency arm".into(),
+        ));
     }
     let driver = shared
         .retained
@@ -2176,8 +2197,9 @@ async fn drive_residency(
         return Ok(false);
     };
     let now = (shared.clock)()?;
-    let bound = Duration::from_millis(u64::try_from(work.deadline_ms.saturating_sub(now)).unwrap_or(0))
-        .min(shared.options.protocol_timeout);
+    let bound =
+        Duration::from_millis(u64::try_from(work.deadline_ms.saturating_sub(now)).unwrap_or(0))
+            .min(shared.options.protocol_timeout);
     if bound.is_zero() {
         return Ok(false);
     }
@@ -2264,8 +2286,9 @@ async fn execute_residency(
     let now = (shared.clock)()?;
     // A restore reloads weights and probes the model: bounded by its own
     // deadline (the deployment's wake window), under the Initialize ceiling.
-    let bound = Duration::from_millis(u64::try_from(context.deadline_ms.saturating_sub(now)).unwrap_or(0))
-        .min(shared.options.initialize_timeout);
+    let bound =
+        Duration::from_millis(u64::try_from(context.deadline_ms.saturating_sub(now)).unwrap_or(0))
+            .min(shared.options.initialize_timeout);
     let outcome = tokio::select! {
         biased;
         _ = stop.changed() => None,
@@ -2281,9 +2304,11 @@ async fn execute_residency(
         async move {
             shared
                 .read(move |owner, _| {
-                    owner
-                        .store()
-                        .mark_residency_uncertain(owner.session(), &step, &redact_text(&reason))
+                    owner.store().mark_residency_uncertain(
+                        owner.session(),
+                        &step,
+                        &redact_text(&reason),
+                    )
                 })
                 .await
                 .map(|_| ())
@@ -2292,7 +2317,9 @@ async fn execute_residency(
     match outcome {
         None => {
             uncertain(format!("the controller stopped during the {verb}")).await?;
-            return Err(CoordinatorError::Stopped(format!("shutdown during a {verb}")));
+            return Err(CoordinatorError::Stopped(format!(
+                "shutdown during a {verb}"
+            )));
         }
         Some(Err(_)) => uncertain(format!("the {verb} outlived its deadline")).await?,
         Some(Ok(Ok(observation))) => {
@@ -2471,11 +2498,9 @@ async fn drain_before_terminate(
 ) -> Result<(), CoordinatorError> {
     let now = (shared.clock)()?;
     // Leave the cleanup its protocol bound before its deadline.
-    let budget = u64::try_from(
-        work.deadline_ms
-            .saturating_sub(now)
-            .saturating_sub(i64::try_from(shared.options.protocol_timeout.as_millis()).unwrap_or(i64::MAX)),
-    )
+    let budget = u64::try_from(work.deadline_ms.saturating_sub(now).saturating_sub(
+        i64::try_from(shared.options.protocol_timeout.as_millis()).unwrap_or(i64::MAX),
+    ))
     .unwrap_or(0);
     let bound = shared
         .options

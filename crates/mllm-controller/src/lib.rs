@@ -15,9 +15,9 @@ pub mod engine_exit;
 pub mod enrollment;
 pub mod host_publication;
 // ADR 0008: the embedded host's installation fingerprint and drift.
-pub mod installation_gate;
 pub mod engine_provider;
 pub mod fault;
+pub mod installation_gate;
 pub mod local_readiness;
 // ADR 0008: declared remote model sources materialized on their hosts.
 pub mod model_sources;

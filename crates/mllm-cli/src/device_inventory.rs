@@ -107,8 +107,11 @@ fn run_collector(runtime_root: &Path) -> std::io::Result<String> {
 pub fn publication(raw: &str) -> Option<InventoryPublication> {
     let document: Value = serde_json::from_str(raw.trim()).ok()?;
     let host_id = document["host_id"].as_str()?;
-    if host_id.is_empty() || host_id.len() > 253
-        || !host_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    if host_id.is_empty()
+        || host_id.len() > 253
+        || !host_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
     {
         return None;
     }

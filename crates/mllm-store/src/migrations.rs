@@ -5,29 +5,27 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::StoreError;
 
 use crate::schema::{
-    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23, SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V30, SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34,
-    SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
+    SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
+    SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
+    SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+    SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
 pub const MIGRATIONS: &[&str] = &[
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17, SCHEMA_V18, SCHEMA_V19,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
+    SCHEMA_V17, SCHEMA_V18, SCHEMA_V19,
     // ADR 0014 §7 (WE3): recorded checkpoint digests.
-    SCHEMA_V20,
-    // SPEC §3: endpoint port leases keyed per host.
-    SCHEMA_V21,
-    // ADR 0013 §5: deployment instances.
+    SCHEMA_V20, // SPEC §3: endpoint port leases keyed per host.
+    SCHEMA_V21, // ADR 0013 §5: deployment instances.
     SCHEMA_V22,
     // ADR 0013 §4, §6, §7 (I2): the instance is the unit of runtime.
-    SCHEMA_V23,
-    // SPEC §4.3, owner decision 4: durable host drain markers.
-    SCHEMA_V24,
-    // SPEC §§3.1, 7.3: hosts advertising per-launch journal claims.
-    SCHEMA_V25,
-    // ADR 0013 §4 (P1): hosts advertising per-instance fencing.
-    SCHEMA_V26,
-    // Owner decision 2026-09-23: measured startup peaks.
+    SCHEMA_V23, // SPEC §4.3, owner decision 4: durable host drain markers.
+    SCHEMA_V24, // SPEC §§3.1, 7.3: hosts advertising per-launch journal claims.
+    SCHEMA_V25, // ADR 0013 §4 (P1): hosts advertising per-instance fencing.
+    SCHEMA_V26, // Owner decision 2026-09-23: measured startup peaks.
     SCHEMA_V27,
     // W10 gaps: dispatch closure reasons, switches in progress, warm residency.
     SCHEMA_V28,
@@ -425,8 +423,18 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("host-a".into(), "127.0.0.1".into(), 20000, "binding-a".into()),
-                ("host-b".into(), "127.0.0.1".into(), 20001, "binding-b".into()),
+                (
+                    "host-a".into(),
+                    "127.0.0.1".into(),
+                    20000,
+                    "binding-a".into()
+                ),
+                (
+                    "host-b".into(),
+                    "127.0.0.1".into(),
+                    20001,
+                    "binding-b".into()
+                ),
                 ("".into(), "127.0.0.1".into(), 20002, "binding-f1".into()),
             ]
         );
@@ -471,7 +479,10 @@ mod tests {
         )
         .unwrap();
         assert!(conn
-            .execute("INSERT INTO host_launch_claims VALUES('b','per_instance',8)", [])
+            .execute(
+                "INSERT INTO host_launch_claims VALUES('b','per_instance',8)",
+                []
+            )
             .is_err());
         apply(&conn).unwrap();
         apply(&conn).unwrap();
@@ -483,13 +494,22 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(rows, vec![("a".into(), "per_launch".into(), 7)]);
-        conn.execute("INSERT INTO host_launch_claims VALUES('b','per_instance',8)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO host_launch_claims VALUES('b','per_instance',8)",
+            [],
+        )
+        .unwrap();
         assert!(conn
-            .execute("UPDATE host_launch_claims SET mode='per_host' WHERE host_id='a'", [])
+            .execute(
+                "UPDATE host_launch_claims SET mode='per_host' WHERE host_id='a'",
+                []
+            )
             .is_err());
         assert!(conn
-            .execute("INSERT INTO host_launch_claims VALUES('missing','per_launch',9)", [])
+            .execute(
+                "INSERT INTO host_launch_claims VALUES('missing','per_launch',9)",
+                []
+            )
             .is_err());
     }
 
@@ -517,13 +537,17 @@ mod tests {
         apply(&conn).unwrap();
         apply(&conn).unwrap();
         let version: i64 = conn
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(version, MIGRATIONS.len() as i64);
         let marker: (String, String, i64) = conn
-            .query_row("SELECT host_id,operation_id,recorded_at_ms FROM host_drains", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+            .query_row(
+                "SELECT host_id,operation_id,recorded_at_ms FROM host_drains",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
         assert_eq!(marker, ("lab".into(), "op".into(), 7));
         conn.execute(

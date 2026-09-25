@@ -132,12 +132,17 @@ pub(crate) fn admit_start(
 ) -> std::result::Result<(), LifecycleError> {
     let states: Vec<(String, bool)> = tx
         .prepare("SELECT state,terminal FROM model_sources WHERE deployment_id=?1 AND revision=?2")?
-        .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![deployment, revision], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     if states.is_empty() || states.iter().any(|(state, _)| state == "verified") {
         return Ok(());
     }
-    if states.iter().all(|(state, terminal)| state == "failed" && *terminal) {
+    if states
+        .iter()
+        .all(|(state, terminal)| state == "failed" && *terminal)
+    {
         return Err(LifecycleError::ModelSourceFailed);
     }
     Err(LifecycleError::ModelSourcePending)
@@ -150,7 +155,11 @@ pub(crate) const DIGEST_READY_CLAUSE: &str = "NOT EXISTS(SELECT 1 FROM model_sou
 /// One stored row: host, key, state, done, total, reason, terminal.
 type StoredRow = (String, String, String, i64, i64, Option<String>, bool);
 
-fn read_all(tx: &Transaction<'_>, deployment: &str, revision: i64) -> Result<Vec<ModelSourceRecord>> {
+fn read_all(
+    tx: &Transaction<'_>,
+    deployment: &str,
+    revision: i64,
+) -> Result<Vec<ModelSourceRecord>> {
     let rows: Vec<StoredRow> = tx
         .prepare("SELECT host_id,source_key,state,bytes_done,bytes_total,reason,terminal FROM model_sources WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id")?
         .query_map(params![deployment, revision], |r| {
@@ -158,17 +167,21 @@ fn read_all(tx: &Transaction<'_>, deployment: &str, revision: i64) -> Result<Vec
         })?
         .collect::<rusqlite::Result<_>>()?;
     rows.into_iter()
-        .map(|(host_id, source_key, state, done, total, reason, terminal)| {
-            Ok(ModelSourceRecord {
-                host_id,
-                source_key,
-                state: SourceState::parse(&state)?,
-                bytes_done: u64::try_from(done).map_err(|_| ModelSourceError::CorruptStoredData)?,
-                bytes_total: u64::try_from(total).map_err(|_| ModelSourceError::CorruptStoredData)?,
-                reason,
-                terminal,
-            })
-        })
+        .map(
+            |(host_id, source_key, state, done, total, reason, terminal)| {
+                Ok(ModelSourceRecord {
+                    host_id,
+                    source_key,
+                    state: SourceState::parse(&state)?,
+                    bytes_done: u64::try_from(done)
+                        .map_err(|_| ModelSourceError::CorruptStoredData)?,
+                    bytes_total: u64::try_from(total)
+                        .map_err(|_| ModelSourceError::CorruptStoredData)?,
+                    reason,
+                    terminal,
+                })
+            },
+        )
         .collect()
 }
 
@@ -255,10 +268,7 @@ impl crate::Store {
         }
         let done = i64::try_from(report.bytes_done).map_err(|_| ModelSourceError::Invalid)?;
         let total = i64::try_from(report.bytes_total).map_err(|_| ModelSourceError::Invalid)?;
-        let terminal = report
-            .reason
-            .as_deref()
-            .is_some_and(reason::terminal);
+        let terminal = report.reason.as_deref().is_some_and(reason::terminal);
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, session).map_err(|_| ModelSourceError::StaleSession)?;
         let known: Option<(String, String)> = tx
@@ -277,11 +287,14 @@ impl crate::Store {
             Some(_) => {}
             None => {
                 // ADR 0013 §3: only a host this revision resolved on.
-                let (_, effective) = crate::checkpoint_digests::frozen_revision(&tx, deployment, revision)
-                    .map_err(|_| ModelSourceError::NotFound)?;
+                let (_, effective) =
+                    crate::checkpoint_digests::frozen_revision(&tx, deployment, revision)
+                        .map_err(|_| ModelSourceError::NotFound)?;
                 if effective.model.source.store_key().as_deref() != Some(source_key)
-                    || !crate::checkpoint_digests::is_resolved_host(&tx, deployment, revision, &effective, host_id)
-                        .map_err(|_| ModelSourceError::CorruptStoredData)?
+                    || !crate::checkpoint_digests::is_resolved_host(
+                        &tx, deployment, revision, &effective, host_id,
+                    )
+                    .map_err(|_| ModelSourceError::CorruptStoredData)?
                 {
                     return Err(ModelSourceError::Invalid);
                 }

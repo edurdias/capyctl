@@ -16,8 +16,10 @@ pub fn deployment_command_fingerprint(
     use sha2::{Digest, Sha256};
     // ADR 0013 §2: a claim stated by sharing mode alone names no device; its
     // identity is its position, the same on every host.
-    let mut input: DeploymentInput =
-        decode(&crate::instances::identity_devices(deployment), "deployment")?;
+    let mut input: DeploymentInput = decode(
+        &crate::instances::identity_devices(deployment),
+        "deployment",
+    )?;
     if input.schema_version != 1
         || input.kind != "deployment"
         || input.name.is_empty()

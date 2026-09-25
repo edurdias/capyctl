@@ -818,51 +818,123 @@ async fn registry_configuration_freezes_selected_host_and_replays() {
     let (_directory, state, mut config, mut host) = fixture();
     let host_id = {
         let owner = state.lock().unwrap();
-        owner.store().create_host_invitation(&"b".repeat(64), "host-a", 100, 0).unwrap();
-        let cert = owner.store().redeem_host_invitation(&mllm_store::enrollment::Redemption {
-            invitation_digest:"b".repeat(64), transaction_id:"remote-config".into(),
-            host_name:"host-a".into(),key_digest:"c".repeat(64),csr_digest:"d".repeat(64),
-        },1,|id|Ok(mllm_store::enrollment::CertificateRecord {
-            host_id:id.into(),fingerprint:"a".repeat(64),certificate_pem:"certificate".into(),expires_unix:500,
-        })).unwrap();
+        owner
+            .store()
+            .create_host_invitation(&"b".repeat(64), "host-a", 100, 0)
+            .unwrap();
+        let cert = owner
+            .store()
+            .redeem_host_invitation(
+                &mllm_store::enrollment::Redemption {
+                    invitation_digest: "b".repeat(64),
+                    transaction_id: "remote-config".into(),
+                    host_name: "host-a".into(),
+                    key_digest: "c".repeat(64),
+                    csr_digest: "d".repeat(64),
+                },
+                1,
+                |id| {
+                    Ok(mllm_store::enrollment::CertificateRecord {
+                        host_id: id.into(),
+                        fingerprint: "a".repeat(64),
+                        certificate_pem: "certificate".into(),
+                        expires_unix: 500,
+                    })
+                },
+            )
+            .unwrap();
         host["name"] = "host-a".into();
         host["state_dir"] = "/home/operator/host".into();
         host["identity_dir"] = "/home/operator/host/identity".into();
         let publication = mllm_store::host_publication::HostPublication {
-            host_id:cert.host_id.clone(),config_json:host.to_string(),boot_id:"boot-a".into(),
-            fingerprint:mllm_config::remote_resources::policy_fingerprint(&host),received_at_ms:1000,
+            host_id: cert.host_id.clone(),
+            config_json: host.to_string(),
+            boot_id: "boot-a".into(),
+            fingerprint: mllm_config::remote_resources::policy_fingerprint(&host),
+            received_at_ms: 1000,
         };
-        owner.store().publish_host_configuration(&publication).unwrap();
+        owner
+            .store()
+            .publish_host_configuration(&publication)
+            .unwrap();
         let local = mllm_config::remote_resources::local_host_document(&host).unwrap();
         let policy = mllm_config::effective::normalize_host_policy(&local).unwrap();
-        owner.store().import_remote_resource_policy(owner.session(), &cert.host_id, &policy,
-            &[mllm_domain::resources::MemoryObservation {domain:"unified".into(),capacity_bytes:64_i64<<30,available_bytes:64_i64<<30,sampled_at_ms:1000}],1000).unwrap();
+        owner
+            .store()
+            .import_remote_resource_policy(
+                owner.session(),
+                &cert.host_id,
+                &policy,
+                &[mllm_domain::resources::MemoryObservation {
+                    domain: "unified".into(),
+                    capacity_bytes: 64_i64 << 30,
+                    available_bytes: 64_i64 << 30,
+                    sampled_at_ms: 1000,
+                }],
+                1000,
+            )
+            .unwrap();
         cert.host_id
     };
     let router = configuration_router(
-        ManagementCredentials::from_trusted_resolver(MANAGEMENT,INFERENCE).unwrap(),
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
         Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
     );
     config["host"] = "host-a".into();
     let body = json!({"config":config,"activate":false});
-    let accepted = router.clone().oneshot(request("POST","/management/v1/deployments","remote-create",body.clone())).await.unwrap();
-    let status = accepted.status(); let accepted = json_response(accepted).await;
+    let accepted = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "remote-create",
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    let status = accepted.status();
+    let accepted = json_response(accepted).await;
     assert_eq!(status, 202, "{accepted}");
-    let replay = router.clone().oneshot(request("POST","/management/v1/deployments","remote-create",body)).await.unwrap();
+    let replay = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "remote-create",
+            body,
+        ))
+        .await
+        .unwrap();
     assert_eq!(replay.status(), 202);
     assert_eq!(json_response(replay).await, accepted);
     {
         let owner = state.lock().unwrap();
-        let source = owner.store().managed_configuration_source(accepted["deployment_id"].as_str().unwrap(),1).unwrap().unwrap();
-        assert_eq!(source["devices"][0]["id"], mllm_config::remote_resources::ledger_key(&host_id,"device","gpu0"));
-        let restored = mllm_config::remote_resources::local_deployment_document(&host_id,&source).unwrap();
+        let source = owner
+            .store()
+            .managed_configuration_source(accepted["deployment_id"].as_str().unwrap(), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source["devices"][0]["id"],
+            mllm_config::remote_resources::ledger_key(&host_id, "device", "gpu0")
+        );
+        let restored =
+            mllm_config::remote_resources::local_deployment_document(&host_id, &source).unwrap();
         config.as_object_mut().unwrap().remove("host");
         assert_eq!(restored, config);
     }
     config["host"] = "unknown-host".into();
-    let denied = router.oneshot(request("POST","/management/v1/deployments","unknown-create",json!({"config":config,"activate":false}))).await.unwrap();
-    assert_eq!(denied.status(),503);
-    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(),1);
+    let denied = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "unknown-create",
+            json!({"config":config,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 503);
+    assert_eq!(state.lock().unwrap().store().deployment_count().unwrap(), 1);
 }
 
 /// ADR 0014 §7 (WE3): a deploy returns with its checkpoint digest pending
@@ -914,10 +986,18 @@ async fn a_deploy_returns_with_its_checkpoint_digest_pending() {
 }
 
 /// Enroll and publish one registry host with the given placement labels.
-fn publish_host(state: &Arc<Mutex<OwnedCoordinatorState>>, name: &str, digest: char, labels: Value) -> String {
+fn publish_host(
+    state: &Arc<Mutex<OwnedCoordinatorState>>,
+    name: &str,
+    digest: char,
+    labels: Value,
+) -> String {
     let owner = state.lock().unwrap();
     let invitation = digest.to_string().repeat(64);
-    owner.store().create_host_invitation(&invitation, name, 100, 0).unwrap();
+    owner
+        .store()
+        .create_host_invitation(&invitation, name, 100, 0)
+        .unwrap();
     let cert = owner
         .store()
         .redeem_host_invitation(
@@ -944,7 +1024,10 @@ fn publish_host(state: &Arc<Mutex<OwnedCoordinatorState>>, name: &str, digest: c
             "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
         ))
         .unwrap();
-        (fixture["input"]["deployment"].clone(), fixture["input"]["host"].clone())
+        (
+            fixture["input"]["deployment"].clone(),
+            fixture["input"]["host"].clone(),
+        )
     };
     host["name"] = name.into();
     host["state_dir"] = format!("/home/operator/{name}").into();
@@ -995,14 +1078,20 @@ async fn registry_resolves_every_allowed_host_the_selector_matches() {
         Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
     );
     config["instances"] = json!(1);
-    config["placement"] = json!({"hosts": ["host-a", "host-b"], "selector": {"gpu": "gb10"}});
+    config["placement"] =
+        json!({"hosts": ["host-a", "host-b"], "selector": {"gpu": "gb10"}});
     config["devices"] = json!([{"sharing": "shared"}]);
     for phase in ["cold", "ready", "parking", "wake"] {
         config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
     }
     let response = router
         .clone()
-        .oneshot(request("POST", "/management/v1/deployments", "selected", json!({"config":config,"activate":false})))
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "selected",
+            json!({"config":config,"activate":false}),
+        ))
         .await
         .unwrap();
     let status = response.status();
@@ -1018,7 +1107,11 @@ async fn registry_resolves_every_allowed_host_the_selector_matches() {
         .collect();
     assert!(hosts.contains(&(a, "resolved".into(), None)), "{hosts:?}");
     assert!(
-        hosts.contains(&("host-b".into(), "refused".into(), Some("selector_mismatch".into()))),
+        hosts.contains(&(
+            "host-b".into(),
+            "refused".into(),
+            Some("selector_mismatch".into())
+        )),
         "{hosts:?}"
     );
     let _ = b;
@@ -1027,7 +1120,12 @@ async fn registry_resolves_every_allowed_host_the_selector_matches() {
     config["routes"] = json!(["nowhere"]);
     config["placement"]["selector"] = json!({"gpu": "h100"});
     let response = router
-        .oneshot(request("POST", "/management/v1/deployments", "nowhere", json!({"config":config,"activate":false})))
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "nowhere",
+            json!({"config":config,"activate":false}),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
@@ -1056,11 +1154,20 @@ async fn a_refused_deploy_names_its_configuration_reason() {
     let body = json_response(response).await;
     assert_eq!(body["error"]["code"], "invalid_config", "{body}");
     let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.starts_with("Invalid deployment configuration: "), "{message}");
+    assert!(
+        message.starts_with("Invalid deployment configuration: "),
+        "{message}"
+    );
     assert!(message.contains("engine_config.extra_args"), "{message}");
     assert!(message.contains("reserved option `--port`"), "{message}");
-    assert_eq!(body["error"]["details"]["path"], "engine_config.extra_args", "{body}");
-    assert!(!message.contains("9000"), "values are never echoed: {message}");
+    assert_eq!(
+        body["error"]["details"]["path"], "engine_config.extra_args",
+        "{body}"
+    );
+    assert!(
+        !message.contains("9000"),
+        "values are never echoed: {message}"
+    );
 }
 
 /// SPEC §8.2: `inspect deployment --effective-config` exposes the resolved
@@ -1093,7 +1200,9 @@ async fn effective_configuration_is_served_with_provenance_and_redacted_secrets(
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(format!("/management/v1/deployments/{target}/effective-config"))
+                    .uri(format!(
+                        "/management/v1/deployments/{target}/effective-config"
+                    ))
                     .header("authorization", format!("Bearer {MANAGEMENT}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -1107,8 +1216,15 @@ async fn effective_configuration_is_served_with_provenance_and_redacted_secrets(
         let effective = &view["effective"];
         assert_eq!(effective["name"], "toy", "{view}");
         // Provenance: what the deployment declared and what mllm derived.
-        assert!(effective["engine_config"]["provenance"].is_object(), "{view}");
-        assert_eq!(effective["engine_config"]["extra_args"], json!(["--seed", "7"]), "{view}");
+        assert!(
+            effective["engine_config"]["provenance"].is_object(),
+            "{view}"
+        );
+        assert_eq!(
+            effective["engine_config"]["extra_args"],
+            json!(["--seed", "7"]),
+            "{view}"
+        );
         // The credential reference is redacted, never shown.
         let text = view.to_string();
         assert!(!text.contains("secret://engine-key"), "{text}");
@@ -1146,7 +1262,10 @@ fn effective_view_redacts_secret_argument_values() {
     assert_eq!(value["engine_config"]["extra_args"][3], "--seed");
     assert_eq!(value["engine_config"]["extra_args"][4], "7");
     assert_eq!(value["engine_config"]["extra_args"][0], "--hf-token");
-    assert_eq!(value["engine_config"]["extra_args"][2], "--api-key=[redacted]");
+    assert_eq!(
+        value["engine_config"]["extra_args"][2],
+        "--api-key=[redacted]"
+    );
     // Ordinary settings whose names merely contain such a word stay visible.
     let mut ordinary = json!({"max_total_tokens": 4096, "tokenizer_workers": 2,
                               "extra_args": ["--max-num-batched-tokens", "8192"]});
@@ -1170,20 +1289,33 @@ async fn remote_sources_need_host_opt_in_and_are_listed_as_referenced() {
         json!({"huggingface": {"repo": "Qwen/Qwen3-4B", "revision": sha}}),
     );
     let refused = app(state.clone(), host.clone())
-        .oneshot(request("POST", "/management/v1/deployments", "denied", json!({"config":config,"activate":false})))
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "denied",
+            json!({"config":config,"activate":false}),
+        ))
         .await
         .unwrap();
     assert!(refused.status().is_client_error(), "{}", refused.status());
     let body = json_response(refused).await;
     assert_eq!(body["error"]["details"]["path"], "model.source", "{body}");
     let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("model source denied by host policy"), "{message}");
+    assert!(
+        message.contains("model source denied by host policy"),
+        "{message}"
+    );
 
     host["model_sources"] = json!({"huggingface": "allowed", "max_bytes": "100GiB"});
     let router = app(state, host);
     let created = router
         .clone()
-        .oneshot(request("POST", "/management/v1/deployments", "allowed", json!({"config":config,"activate":false})))
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "allowed",
+            json!({"config":config,"activate":false}),
+        ))
         .await
         .unwrap();
     assert_eq!(created.status(), 202);

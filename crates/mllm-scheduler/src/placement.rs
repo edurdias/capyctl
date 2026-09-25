@@ -208,8 +208,7 @@ pub fn place(
             Err(HostRefusal::MaxPerHost)
         } else if candidate.occupied {
             Err(HostRefusal::Occupied)
-        } else if candidate.whole_host
-            && candidate.ledger.owners.keys().any(|other| other != owner)
+        } else if candidate.whole_host && candidate.ledger.owners.keys().any(|other| other != owner)
         {
             // Owner decision 2026-09-23: no other engine charge on the host.
             Err(HostRefusal::RequiresEmptyHost)
@@ -418,9 +417,15 @@ mod tests {
         busy.footprint = footprint(100 * GIB, None);
         busy.whole_host = true;
         assert_eq!(
-            place(std::slice::from_ref(&busy), "d", Strategy::Spread, None, None)
-                .unwrap_err()
-                .code(),
+            place(
+                std::slice::from_ref(&busy),
+                "d",
+                Strategy::Spread,
+                None,
+                None
+            )
+            .unwrap_err()
+            .code(),
             "startup_requires_empty_host"
         );
         let mut empty = host("host-b", 100 * GIB, 0, &[]);

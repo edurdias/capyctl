@@ -98,13 +98,21 @@ fn sglang_views_note_the_unauthenticated_loopback_metrics() {
     assert!(line.contains("deployment sg"), "{line}");
     assert!(line.contains("/metrics"), "{line}");
     assert!(line.contains("without authentication"), "{line}");
-    assert!(line.contains("loopback") && line.contains("read_only"), "{line}");
+    assert!(
+        line.contains("loopback") && line.contains("read_only"),
+        "{line}"
+    );
 
-    let mut installation = json!({"profile": "sglang-default", "state": "not_exposed", "engine": "sglang"});
+    let mut installation =
+        json!({"profile": "sglang-default", "state": "not_exposed", "engine": "sglang"});
     installation["unauthenticated_local_surfaces"] = surfaces;
     let host = json!({"host_id": "h1", "name": "host-b", "development_controls":
         {"state": "not_exposed", "installations": [installation]}});
     let notices = development_controls_notices(&host);
     assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(notices[0].contains("host host-b installation sglang-default"), "{}", notices[0]);
+    assert!(
+        notices[0].contains("host host-b installation sglang-default"),
+        "{}",
+        notices[0]
+    );
 }

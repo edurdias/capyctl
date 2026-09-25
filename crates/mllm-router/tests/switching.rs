@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mllm_adapters::traits::{
-    AdapterError, CancellationOutcome, EngineAdapter, MemberRef, ParkLevel, ParkOutcome,
-    Phase, PlanInput, Readiness, ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
+    AdapterError, CancellationOutcome, EngineAdapter, MemberRef, ParkLevel, ParkOutcome, Phase,
+    PlanInput, Readiness, ReloadOutcome, RenderedCommand, RequestRef, RestoreOutcome,
     WorkObservation,
 };
 use mllm_controller::{Controller, DeployRequest};
@@ -29,7 +29,10 @@ struct StuckAdapter;
 
 #[async_trait]
 impl EngineAdapter for StuckAdapter {
-    async fn inspect(&self, _: &MemberRef) -> Result<mllm_adapters::traits::EngineState, AdapterError> {
+    async fn inspect(
+        &self,
+        _: &MemberRef,
+    ) -> Result<mllm_adapters::traits::EngineState, AdapterError> {
         Ok(mllm_adapters::traits::EngineState {
             phase: Phase::Ready,
             retained_bytes: 0,
@@ -37,16 +40,24 @@ impl EngineAdapter for StuckAdapter {
         })
     }
     async fn render_plan(&self, _: &PlanInput) -> Result<RenderedCommand, AdapterError> {
-        Ok(RenderedCommand { argv: vec!["sleep".into(), "30".into()], env: Default::default() })
+        Ok(RenderedCommand {
+            argv: vec!["sleep".into(), "30".into()],
+            env: Default::default(),
+        })
     }
     async fn check_readiness(&self, _: &MemberRef) -> Result<Readiness, AdapterError> {
         Ok(Readiness::Ready)
     }
-    async fn prepare_park(&self, _: &MemberRef) -> Result<mllm_adapters::traits::Quiescence, AdapterError> {
+    async fn prepare_park(
+        &self,
+        _: &MemberRef,
+    ) -> Result<mllm_adapters::traits::Quiescence, AdapterError> {
         Ok(mllm_adapters::traits::Quiescence { quiescent: false })
     }
     async fn observe_work(&self, _: &MemberRef) -> Result<WorkObservation, AdapterError> {
-        Ok(WorkObservation::Streaming { request_ref: "r1".into() })
+        Ok(WorkObservation::Streaming {
+            request_ref: "r1".into(),
+        })
     }
     async fn park(&self, _: &MemberRef, _: ParkLevel) -> Result<ParkOutcome, AdapterError> {
         Ok(ParkOutcome::Parked { retained_bytes: 0 })
@@ -57,7 +68,12 @@ impl EngineAdapter for StuckAdapter {
     async fn reload_weights(&self, _: &MemberRef) -> Result<ReloadOutcome, AdapterError> {
         Ok(ReloadOutcome::Reloaded)
     }
-    async fn cancel_work(&self, _: &MemberRef, _: &RequestRef, _: bool) -> Result<CancellationOutcome, AdapterError> {
+    async fn cancel_work(
+        &self,
+        _: &MemberRef,
+        _: &RequestRef,
+        _: bool,
+    ) -> Result<CancellationOutcome, AdapterError> {
         Ok(CancellationOutcome::Uncertain)
     }
 }
@@ -73,13 +89,21 @@ fn req(name: &str) -> DeployRequest {
 
 async fn deploy_and_start(c: &Controller, name: &str) -> String {
     let id = c.submit_deploy(req(name)).await.unwrap();
-    let op = c.request_transition(&id, mllm_domain::LifecycleAction::Start).await.unwrap();
+    let op = c
+        .request_transition(&id, mllm_domain::LifecycleAction::Start)
+        .await
+        .unwrap();
     c.wait_terminal(&op).await.unwrap();
     id
 }
 
 fn start_op_count(store: &Arc<Mutex<Store>>, dep: &str) -> usize {
-    store.lock().unwrap().operations_of_kind(dep, "start").unwrap().len()
+    store
+        .lock()
+        .unwrap()
+        .operations_of_kind(dep, "start")
+        .unwrap()
+        .len()
 }
 
 #[tokio::test]
@@ -87,7 +111,10 @@ async fn simultaneous_activations_join_one_wake() {
     let (c, store) = controller();
     let id = c.submit_deploy(req("wake-m")).await.unwrap(); // STOPPED
 
-    let sw = Arc::new(mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_secs(5)));
+    let sw = Arc::new(mllm_router::switch::SwitchEngine::new(
+        c.clone(),
+        Duration::from_secs(5),
+    ));
     let sw2 = sw.clone();
     let id2 = id.clone();
     let (ga, gb) = tokio::join!(sw.switch_to(&id), sw2.switch_to(&id2));
@@ -95,7 +122,11 @@ async fn simultaneous_activations_join_one_wake() {
     // Both activations succeeded and joined the SAME wake operation.
     let gen = ga.unwrap();
     assert_eq!(gen, hb_gen(&gb));
-    assert_eq!(start_op_count(&store, &id), 1, "exactly one Start operation (T15)");
+    assert_eq!(
+        start_op_count(&store, &id),
+        1,
+        "exactly one Start operation (T15)"
+    );
 }
 
 fn hb_gen(r: &Result<u64, mllm_router::switch::SwitchError>) -> u64 {
@@ -136,7 +167,13 @@ async fn a_to_b_to_a_alternates_with_release_evidence() {
     let b = c.submit_deploy(req("model-b")).await.unwrap();
     let gen2 = sw.switch_to(&b).await.unwrap();
     assert_eq!(
-        store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state,
+        store
+            .lock()
+            .unwrap()
+            .get_deployment(&a)
+            .unwrap()
+            .unwrap()
+            .observed_state,
         mllm_domain::LifecycleState::Stopped,
         "stock model release must terminate the process holding the shared port"
     );
@@ -153,14 +190,25 @@ async fn a_to_b_to_a_alternates_with_release_evidence() {
         .unwrap()
         .join("\n");
     assert!(
-        evidence.contains("quiescent") || evidence.contains("terminated") || evidence.contains("parked"),
+        evidence.contains("quiescent")
+            || evidence.contains("terminated")
+            || evidence.contains("parked"),
         "A's release evidence journaled: {evidence}"
     );
 
     // Back to A: correct generation accounting (T16).
     let gen3 = sw.switch_to(&a).await.unwrap();
-    assert!(gen3 > gen1, "A's own generation advanced through park→wake (T16)");
-    let state_a = store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state;
+    assert!(
+        gen3 > gen1,
+        "A's own generation advanced through park→wake (T16)"
+    );
+    let state_a = store
+        .lock()
+        .unwrap()
+        .get_deployment(&a)
+        .unwrap()
+        .unwrap()
+        .observed_state;
     assert_eq!(state_a, mllm_domain::LifecycleState::Ready);
 }
 
@@ -174,17 +222,39 @@ async fn qualified_sleep_profile_keeps_park_restore_switch_path() {
         Arc::new(mllm_testkit::FakeLauncher::new()),
         policy,
     ));
-    let a = c.submit_deploy(DeployRequest { kind: "vllm-sleep".into(), ..req("sleep-a") }).await.unwrap();
+    let a = c
+        .submit_deploy(DeployRequest {
+            kind: "vllm-sleep".into(),
+            ..req("sleep-a")
+        })
+        .await
+        .unwrap();
     let b = c.submit_deploy(req("stock-b")).await.unwrap();
     let sw = mllm_router::switch::SwitchEngine::new(c.clone(), Duration::from_secs(5));
     let gen1 = sw.switch_to(&a).await.unwrap();
     sw.switch_to(&b).await.unwrap();
-    assert_eq!(store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state,
-        mllm_domain::LifecycleState::Parked);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get_deployment(&a)
+            .unwrap()
+            .unwrap()
+            .observed_state,
+        mllm_domain::LifecycleState::Parked
+    );
     let gen2 = sw.switch_to(&a).await.unwrap();
     assert!(gen2 > gen1);
-    assert_eq!(store.lock().unwrap().get_deployment(&a).unwrap().unwrap().observed_state,
-        mllm_domain::LifecycleState::Ready);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get_deployment(&a)
+            .unwrap()
+            .unwrap()
+            .observed_state,
+        mllm_domain::LifecycleState::Ready
+    );
 }
 
 #[tokio::test]
@@ -206,8 +276,16 @@ async fn switch_failure_reopens_a_and_fails_b_fast() {
     // A is reopened: not suspended, on-demand eligible, window preserved.
     assert!(!store.lock().unwrap().is_suspended(&a).unwrap());
     // The failed-switch event is journaled (SPEC §17 failed-switches metric).
-    let evidence = store.lock().unwrap().journal_evidence_of(&a).unwrap().join("\n");
-    assert!(evidence.contains("switch_failed"), "failed-switch event: {evidence}");
+    let evidence = store
+        .lock()
+        .unwrap()
+        .journal_evidence_of(&a)
+        .unwrap()
+        .join("\n");
+    assert!(
+        evidence.contains("switch_failed"),
+        "failed-switch event: {evidence}"
+    );
 }
 
 #[test]

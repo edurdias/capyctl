@@ -533,10 +533,16 @@ async fn a_dropped_host_mid_stop_pauses_its_binding_and_other_loads_continue() {
     assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
     // The armed cleanup is retained, not completed and not released.
     assert_eq!(
-        stop.wait(Duration::from_millis(300)).await.unwrap_err().to_string(),
+        stop.wait(Duration::from_millis(300))
+            .await
+            .unwrap_err()
+            .to_string(),
         CoordinatorError::CallerTimeout.to_string()
     );
-    assert!(loading.active.load(Ordering::SeqCst), "the other load kept running");
+    assert!(
+        loading.active.load(Ordering::SeqCst),
+        "the other load kept running"
+    );
     loading.release.add_permits(1);
     assert_eq!(
         load.wait(Duration::from_secs(10)).await.unwrap(),
@@ -633,7 +639,10 @@ async fn an_unproven_cleanup_is_retried_in_session_and_lifts_its_pause() {
         OrdinaryCleanupStatus::Completed
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "one retry, no more");
-    assert!(!owners(&owner).contains(&fence.deployment_id), "released on evidence");
+    assert!(
+        !owners(&owner).contains(&fence.deployment_id),
+        "released on evidence"
+    );
     // The pause is lifted in session: a new activation is admitted.
     let started = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -688,10 +697,7 @@ async fn an_uncertain_initialize_pauses_admission_as_it_is_recorded() {
         InitializeStatus::Uncertain
     );
     assert!(
-        matches!(
-            w.start(&other, 60_000),
-            Err(CoordinatorError::Stopped(_))
-        ),
+        matches!(w.start(&other, 60_000), Err(CoordinatorError::Stopped(_))),
         "a start was admitted after the launch was recorded uncertain"
     );
     drop(hung_start);
@@ -778,7 +784,10 @@ async fn a_repeated_deferral_is_journaled_once_and_backs_off() {
     for _ in 0..8 {
         let (new, hold) = w.shared.defer("binding", "reclaiming parked instances");
         assert!(!new, "the same reason is journaled once");
-        assert!(hold >= last, "the hold never shrinks while the reason repeats");
+        assert!(
+            hold >= last,
+            "the hold never shrinks while the reason repeats"
+        );
         last = hold;
     }
     assert!(last > poll, "the hold backed off");

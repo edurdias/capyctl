@@ -85,7 +85,10 @@ mod tests {
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         std::fs::write(dir.join("store"), b"rendezvous").unwrap();
         let other = root.launch_dir("01K00000000000000000000003").unwrap();
-        std::fs::DirBuilder::new().mode(0o700).create(&other).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&other)
+            .unwrap();
 
         assert!(root.retire(INCARNATION));
         assert!(!dir.exists());

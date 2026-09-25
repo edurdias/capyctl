@@ -17,7 +17,7 @@ pub struct NativeCredentials {
 struct Bundle {
     version: u32,
     scope: IngressScope,
-    command_digest: [u8;32],
+    command_digest: [u8; 32],
     gate: [u8; 32],
     inference: [u8; 32],
     admin: [u8; 32],
@@ -52,7 +52,11 @@ fn key() -> Result<[u8; 32], IngressIdentityError> {
     }
     Ok(bytes)
 }
-fn decode(bytes: &[u8], scope: &IngressScope, command_digest:[u8;32]) -> Result<NativeCredentials, IngressIdentityError> {
+fn decode(
+    bytes: &[u8],
+    scope: &IngressScope,
+    command_digest: [u8; 32],
+) -> Result<NativeCredentials, IngressIdentityError> {
     let bundle: Bundle = serde_json::from_slice(bytes).map_err(|_| IngressIdentityError)?;
     // ADR 0013 §5: a bundle written before the ingress was keyed by instance
     // names none. Its file is named by the binding, which realizes exactly one
@@ -70,7 +74,7 @@ fn decode(bytes: &[u8], scope: &IngressScope, command_digest:[u8;32]) -> Result<
     if bundle.version != 1
         || !same_scope
         || bundle.command_digest != command_digest
-        || command_digest == [0;32]
+        || command_digest == [0; 32]
         || bundle.gate == [0; 32]
         || bundle.inference == [0; 32]
         || bundle.admin == [0; 32]
@@ -89,18 +93,18 @@ fn decode(bytes: &[u8], scope: &IngressScope, command_digest:[u8;32]) -> Result<
 pub fn load(
     storage: &IdentityDirectory,
     scope: &IngressScope,
-    command_digest:[u8;32],
+    command_digest: [u8; 32],
 ) -> Result<NativeCredentials, IngressIdentityError> {
     let bytes = storage
         .read_bundle(&name(scope)?)
         .map_err(|_| IngressIdentityError)?
         .ok_or(IngressIdentityError)?;
-    decode(&bytes, scope,command_digest)
+    decode(&bytes, scope, command_digest)
 }
 pub fn provision(
     storage: &IdentityDirectory,
     scope: &IngressScope,
-    command_digest:[u8;32],
+    command_digest: [u8; 32],
     gate: [u8; 32],
 ) -> Result<NativeCredentials, IngressIdentityError> {
     let filename = name(scope)?;
@@ -111,7 +115,7 @@ pub fn provision(
         .read_bundle(&filename)
         .map_err(|_| IngressIdentityError)?
     {
-        let existing = decode(&bytes, scope,command_digest)?;
+        let existing = decode(&bytes, scope, command_digest)?;
         return if existing.gate == gate {
             Ok(existing)
         } else {
@@ -127,31 +131,54 @@ pub fn provision(
         admin: key()?,
     };
     let bytes = serde_json::to_vec(&bundle).map_err(|_| IngressIdentityError)?;
-    let credentials = decode(&bytes, scope,command_digest)?;
+    let credentials = decode(&bytes, scope, command_digest)?;
     storage
         .create_bundle(&filename, &bytes)
         .map_err(|_| IngressIdentityError)?;
     Ok(credentials)
 }
 
-pub struct IngressIdentities {storage:IdentityDirectory}
+pub struct IngressIdentities {
+    storage: IdentityDirectory,
+}
 impl IngressIdentities {
-    pub fn new(storage:IdentityDirectory)->std::sync::Arc<Self> {std::sync::Arc::new(Self {storage})}
-    pub fn provision(&self,scope:&IngressScope,command_digest:[u8;32],gate:[u8;32])->Result<NativeCredentials,IngressIdentityError> {
-        provision(&self.storage,scope,command_digest,gate)
+    pub fn new(storage: IdentityDirectory) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { storage })
     }
-    pub fn load(&self,scope:&IngressScope,command_digest:[u8;32])->Result<NativeCredentials,IngressIdentityError> {
-        load(&self.storage,scope,command_digest)
+    pub fn provision(
+        &self,
+        scope: &IngressScope,
+        command_digest: [u8; 32],
+        gate: [u8; 32],
+    ) -> Result<NativeCredentials, IngressIdentityError> {
+        provision(&self.storage, scope, command_digest, gate)
+    }
+    pub fn load(
+        &self,
+        scope: &IngressScope,
+        command_digest: [u8; 32],
+    ) -> Result<NativeCredentials, IngressIdentityError> {
+        load(&self.storage, scope, command_digest)
     }
     /// SPEC §13.3 / T37: delete the credentials of exactly this launch (scope
     /// and command digest) once it is settled: proven gone, or refused before
     /// any effect. A bundle naming another launch is left alone.
-    pub fn retire(&self,scope:&IngressScope,command_digest:[u8;32])->Result<(),IngressIdentityError> {
+    pub fn retire(
+        &self,
+        scope: &IngressScope,
+        command_digest: [u8; 32],
+    ) -> Result<(), IngressIdentityError> {
         let filename = name(scope)?;
-        let Some(bytes) = self.storage.read_bundle(&filename).map_err(|_| IngressIdentityError)? else {
+        let Some(bytes) = self
+            .storage
+            .read_bundle(&filename)
+            .map_err(|_| IngressIdentityError)?
+        else {
             return Ok(());
         };
         decode(&bytes, scope, command_digest)?;
-        self.storage.remove_bundle(&filename).map_err(|_| IngressIdentityError)
+        self.storage
+            .remove_bundle(&filename)
+            .map_err(|_| IngressIdentityError)
     }
 }

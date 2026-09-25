@@ -10,7 +10,8 @@ pub fn decode_effective_snapshot(text: &str) -> Result<EffectiveDeployment, Conf
     // intrinsic rule; exact normalized equality rejects omitted/unknown fields,
     // changed fixed allocator settings, and untrusted fingerprint claims.
     let value = crate::strict_yaml::build_value(text)?;
-    let (engine_config, resources_derived, facts) = declared_engine_config(&value["engine_config"])?;
+    let (engine_config, resources_derived, facts) =
+        declared_engine_config(&value["engine_config"])?;
     let (deployment, host) = snapshot_inputs(&value, engine_config, resources_derived)?;
     let effective = resolve_effective_with_checkpoint(&deployment, &host, facts)?;
     let mut encoded =
@@ -81,7 +82,10 @@ pub(super) fn snapshot_inputs(
     let mut timeouts = serde_json::Map::new();
     for (field, key) in [("initialize", "initialize_ms"), ("wake", "wake_ms")] {
         if value["timeouts"]["provenance"][field] == "declared" {
-            timeouts.insert(field.into(), json!(quantity(&value["timeouts"][key], "ms")?));
+            timeouts.insert(
+                field.into(),
+                json!(quantity(&value["timeouts"][key], "ms")?),
+            );
         }
     }
     if !timeouts.is_empty() {
@@ -215,7 +219,11 @@ pub(super) fn declared_engine_config(
     }
     let family: &[&str] = match engine {
         Some("vllm") => &["block_size_tokens", "max_num_batched_tokens"],
-        Some("sglang") => &["max_total_tokens", "chunked_prefill_size", "tokenizer_workers"],
+        Some("sglang") => &[
+            "max_total_tokens",
+            "chunked_prefill_size",
+            "tokenizer_workers",
+        ],
         _ => return Err(invalid("snapshot.engine_config", "unsupported engine")),
     };
     let prefix = engine.expect("engine checked above");

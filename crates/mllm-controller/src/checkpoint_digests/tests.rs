@@ -233,7 +233,10 @@ async fn the_supervisor_records_sized_weights_before_the_digest() {
         .pending_checkpoint_digests()
         .unwrap()
         .remove(0);
-    let sized = LocalDigests::new(checkpoints.clone()).size(pending).await.unwrap();
+    let sized = LocalDigests::new(checkpoints.clone())
+        .size(pending)
+        .await
+        .unwrap();
     let expected = checkpoints
         .measure(f.models.path(), &f.models.path().join("toy"))
         .unwrap()
@@ -415,18 +418,28 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
             })
         }
     };
-    let woken = wake_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", measure)
-        .await
-        .unwrap();
+    let woken = wake_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        measure,
+    )
+    .await
+    .unwrap();
     assert_eq!(woken, digest);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let record = record_of(&f);
     assert_eq!(record.state, DigestState::Recorded);
     assert_eq!(record.digest.as_deref(), Some(digest.as_str()));
     // Recorded now: the next wake carries it without asking the host.
-    let again = wake_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
-        Err::<Measured, _>(MeasureError::Unavailable)
-    })
+    let again = wake_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async { Err::<Measured, _>(MeasureError::Unavailable) },
+    )
     .await
     .unwrap();
     assert_eq!(again, digest);
@@ -440,18 +453,31 @@ async fn a_legacy_wake_measures_and_records_the_digest_first() {
 async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
     let f = fixture(declared_other);
     make_legacy(&f);
-    let unmeasured = wake_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
-        Err::<Measured, _>(MeasureError::Unavailable)
-    })
+    let unmeasured = wake_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async { Err::<Measured, _>(MeasureError::Unavailable) },
+    )
     .await
     .unwrap_err();
-    assert!(matches!(unmeasured, RuntimeError::Unsupported), "{unmeasured:?}");
-    let refused = wake_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
-        Ok(Measured {
-            digest: format!("sha256:{}", "2".repeat(64)),
-            weights_bytes: 7,
-        })
-    })
+    assert!(
+        matches!(unmeasured, RuntimeError::Unsupported),
+        "{unmeasured:?}"
+    );
+    let refused = wake_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async {
+            Ok(Measured {
+                digest: format!("sha256:{}", "2".repeat(64)),
+                weights_bytes: 7,
+            })
+        },
+    )
     .await
     .unwrap_err();
     assert!(
@@ -469,12 +495,18 @@ async fn a_legacy_wake_is_refused_on_mismatch_or_without_a_measurement() {
 #[tokio::test]
 async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
     let f = fixture(declared_other);
-    let refused = first_placement_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
-        Ok(Measured {
-            digest: format!("sha256:{}", "2".repeat(64)),
-            weights_bytes: 7,
-        })
-    })
+    let refused = first_placement_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async {
+            Ok(Measured {
+                digest: format!("sha256:{}", "2".repeat(64)),
+                weights_bytes: 7,
+            })
+        },
+    )
     .await
     .unwrap_err();
     assert!(
@@ -484,23 +516,36 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
     assert_eq!(record_of(&f).state, DigestState::Mismatch);
 
     let f = fixture(|_| {});
-    let unmeasured = first_placement_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || async {
-        Err::<Measured, _>(MeasureError::Unavailable)
-    })
+    let unmeasured = first_placement_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || async { Err::<Measured, _>(MeasureError::Unavailable) },
+    )
     .await
     .unwrap_err();
-    assert!(matches!(unmeasured, RuntimeError::Uncertain(_)), "{unmeasured:?}");
+    assert!(
+        matches!(unmeasured, RuntimeError::Uncertain(_)),
+        "{unmeasured:?}"
+    );
     assert_ne!(record_of(&f).state, DigestState::Recorded);
     let digest = format!("sha256:{}", "2".repeat(64));
-    let placed = first_placement_digest(&f.owner, &f.fence.deployment_id, f.fence.revision, "lab", || {
-        let digest = digest.clone();
-        async move {
-            Ok(Measured {
-                digest,
-                weights_bytes: 7,
-            })
-        }
-    })
+    let placed = first_placement_digest(
+        &f.owner,
+        &f.fence.deployment_id,
+        f.fence.revision,
+        "lab",
+        || {
+            let digest = digest.clone();
+            async move {
+                Ok(Measured {
+                    digest,
+                    weights_bytes: 7,
+                })
+            }
+        },
+    )
     .await
     .unwrap();
     assert_eq!(placed, digest);
@@ -512,7 +557,10 @@ async fn a_first_placement_mismatch_is_refused_as_checkpoint_mismatch() {
 // `checkpoint_mismatch` before the engine is asked anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_embedded_gate_wakes_a_legacy_launch_only_on_a_recorded_match() {
-    for (edit, matches) in [(None, true), (Some(declared_other as fn(&mut Value)), false)] {
+    for (edit, matches) in [
+        (None, true),
+        (Some(declared_other as fn(&mut Value)), false),
+    ] {
         let f = fixture(|deployment| {
             if let Some(edit) = edit {
                 edit(deployment)
@@ -544,7 +592,11 @@ async fn the_embedded_gate_wakes_a_legacy_launch_only_on_a_recorded_match() {
                 matches!(woken, Err(RuntimeError::Refused(ref reason)) if reason == "checkpoint_mismatch"),
                 "{woken:?}"
             );
-            assert_eq!(inner.0.load(Ordering::SeqCst), 0, "nothing reached the engine");
+            assert_eq!(
+                inner.0.load(Ordering::SeqCst),
+                0,
+                "nothing reached the engine"
+            );
             assert_eq!(record_of(&f).state, DigestState::Mismatch);
         }
     }

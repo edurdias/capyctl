@@ -171,7 +171,8 @@ fn stop(
 /// slower than the deadline never expires the restart it precedes. Nothing is
 /// released or advanced here; only the pending start's own deadline moves.
 fn reanchor(tx: &Transaction<'_>, c: &Candidate, now: i64) -> Result<(), LifecycleError> {
-    let (Some(until), Some(revision), Some(generation)) = (c.pending_until, c.revision, c.generation)
+    let (Some(until), Some(revision), Some(generation)) =
+        (c.pending_until, c.revision, c.generation)
     else {
         return Ok(());
     };

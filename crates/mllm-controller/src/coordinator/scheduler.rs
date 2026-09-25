@@ -374,11 +374,7 @@ impl Scheduler {
         // in flight without an association is carried out once that launch has
         // settled, as an ordinary Stop.
         let resolved = shared
-            .read(|owner, now| {
-                owner
-                    .store()
-                    .resolve_deferred_stops(owner.session(), now)
-            })
+            .read(|owner, now| owner.store().resolve_deferred_stops(owner.session(), now))
             .await
             .map_err(failed)?;
         if !resolved.is_empty() {
@@ -827,7 +823,11 @@ async fn cleanup_task(
             false,
             matches!(error, CoordinatorError::Stopped(_)),
         ),
-        Err(_) => ("cleanup panicked; durable arm retained".to_owned(), true, false),
+        Err(_) => (
+            "cleanup panicked; durable arm retained".to_owned(),
+            true,
+            false,
+        ),
     };
     let shutdown = stopped || *stop.borrow();
     // Closed admission from a store fault, a poisoned mutex or a binding
@@ -950,8 +950,8 @@ async fn initialize_task(
         &mut stop,
         &contended,
     ))
-        .catch_unwind()
-        .await;
+    .catch_unwind()
+    .await;
     match AssertUnwindSafe(conclude_initialize(&shared, &work, result, &stop))
         .catch_unwind()
         .await
@@ -1318,11 +1318,7 @@ async fn conclude_initialize(
             // generation; a stale incarnation closes nothing (T18).
             owner
                 .store()
-                .close_instance_admission_at(
-                    &closed_deployment,
-                    closed_instance,
-                    closed_generation,
-                )
+                .close_instance_admission_at(&closed_deployment, closed_instance, closed_generation)
                 .map_err(|error| CoordinatorError::Service(error.to_string()))?;
             // SPEC §17: failures are recorded.
             owner

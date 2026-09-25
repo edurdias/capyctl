@@ -137,29 +137,55 @@ async fn ingress_requires_current_open_generation_and_replaces_internal_headers(
 #[tokio::test]
 async fn active_response_prevents_replacing_the_generation_until_body_drop() {
     use futures::StreamExt;
-    let native=Router::new().route("/v1/chat/completions",post(||async {
-        let stream=futures::stream::once(async{Ok::<_,std::convert::Infallible>(axum::body::Bytes::from_static(b"data: first\n\n"))})
+    let native = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let stream = futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                    b"data: first\n\n",
+                ))
+            })
             .chain(futures::stream::pending());
-        Response::builder().header("content-type","text/event-stream").body(Body::from_stream(stream)).unwrap()
-    }));
-    let (native_addr,native_task)=serve(native).await;
-    let ingress=Ingress::new().unwrap();
-    let first=scope(1);
-    ingress.register(first.clone(),native_addr,"model".into(),[1;32],[2;32]).unwrap();
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (native_addr, native_task) = serve(native).await;
+    let ingress = Ingress::new().unwrap();
+    let first = scope(1);
+    ingress
+        .register(first.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
     ingress.open(&first).unwrap();
-    let (address,task)=serve(ingress.clone().router()).await;
-    let mut response=reqwest::Client::new().post(format!("http://{address}/v1/chat/completions"))
-        .bearer_auth(hex::encode([1;32])).json(&serde_json::json!({"model":"model","messages":[],"stream":true})).send().await.unwrap();
+    let (address, task) = serve(ingress.clone().router()).await;
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/chat/completions"))
+        .bearer_auth(hex::encode([1; 32]))
+        .json(&serde_json::json!({"model":"model","messages":[],"stream":true}))
+        .send()
+        .await
+        .unwrap();
     assert!(response.chunk().await.unwrap().is_some());
     ingress.close(&first).unwrap();
-    assert_eq!(ingress.current_requests(&first).unwrap(),1);
-    assert!(ingress.register(scope(2),native_addr,"model".into(),[3;32],[4;32]).is_err());
+    assert_eq!(ingress.current_requests(&first).unwrap(), 1);
+    assert!(ingress
+        .register(scope(2), native_addr, "model".into(), [3; 32], [4; 32])
+        .is_err());
     drop(response);
-    tokio::time::timeout(std::time::Duration::from_secs(2),async {
-        while ingress.current_requests(&first).unwrap()!=0 {tokio::time::sleep(std::time::Duration::from_millis(10)).await;}
-    }).await.unwrap();
-    ingress.register(scope(2),native_addr,"model".into(),[3;32],[4;32]).unwrap();
-    task.abort();native_task.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while ingress.current_requests(&first).unwrap() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ingress
+        .register(scope(2), native_addr, "model".into(), [3; 32], [4; 32])
+        .unwrap();
+    task.abort();
+    native_task.abort();
 }
 
 // T16 T18 T20 (U5 recovery live run, host-a): a failed launch keeps its
@@ -172,8 +198,16 @@ async fn active_response_prevents_replacing_the_generation_until_body_drop() {
 fn a_terminated_launch_entry_is_retired_so_the_same_generation_can_launch_again() {
     let ingress = Ingress::new().unwrap();
     let target: std::net::SocketAddr = "127.0.0.1:8100".parse().unwrap();
-    let failed = IngressScope { binding_id: "failed-binding".into(), incarnation: "failed".into(), ..scope(1) };
-    let retry = IngressScope { binding_id: "retry-binding".into(), incarnation: "retry".into(), ..scope(1) };
+    let failed = IngressScope {
+        binding_id: "failed-binding".into(),
+        incarnation: "failed".into(),
+        ..scope(1)
+    };
+    let retry = IngressScope {
+        binding_id: "retry-binding".into(),
+        incarnation: "retry".into(),
+        ..scope(1)
+    };
     ingress
         .register(failed.clone(), target, "model".into(), [1; 32], [2; 32])
         .unwrap();
@@ -257,8 +291,14 @@ async fn two_instances_of_one_deployment_hold_separate_gates_on_one_host() {
         assert_eq!(response.status(), StatusCode::OK);
         response.text().await.unwrap()
     };
-    assert_eq!(answered(ask([1; 32]).await.unwrap()).await, "{\"instance\":\"zero\"}");
-    assert_eq!(answered(ask([3; 32]).await.unwrap()).await, "{\"instance\":\"one\"}");
+    assert_eq!(
+        answered(ask([1; 32]).await.unwrap()).await,
+        "{\"instance\":\"zero\"}"
+    );
+    assert_eq!(
+        answered(ask([3; 32]).await.unwrap()).await,
+        "{\"instance\":\"one\"}"
+    );
     // W8: both Ready gates report load under their own launch.
     let mut handles: Vec<_> = ingress
         .load_targets()
@@ -292,13 +332,22 @@ async fn two_instances_of_one_deployment_hold_separate_gates_on_one_host() {
         .is_err());
     // T38: instance 1's closed gate fails honestly; instance 0 still serves.
     assert_eq!(ask([3; 32]).await.unwrap().status(), StatusCode::FORBIDDEN);
-    assert_eq!(answered(ask([1; 32]).await.unwrap()).await, "{\"instance\":\"zero\"}");
+    assert_eq!(
+        answered(ask([1; 32]).await.unwrap()).await,
+        "{\"instance\":\"zero\"}"
+    );
     // Retiring instance 1's exact entry never touches instance 0's.
     assert!(ingress.retire(&one).unwrap());
-    assert!(!ingress.retire(&zero).unwrap(), "an open gate is never retired");
+    assert!(
+        !ingress.retire(&zero).unwrap(),
+        "an open gate is never retired"
+    );
     assert_eq!(ingress.current_requests(&zero).unwrap(), 0);
     assert!(ingress.current_requests(&one).is_err());
-    assert_eq!(answered(ask([1; 32]).await.unwrap()).await, "{\"instance\":\"zero\"}");
+    assert_eq!(
+        answered(ask([1; 32]).await.unwrap()).await,
+        "{\"instance\":\"zero\"}"
+    );
     task.abort();
     first_task.abort();
     second_task.abort();
@@ -327,11 +376,17 @@ fn retired_gate_keys_do_not_exhaust_registration() {
     // The live entry's key and the most recent spent keys stay refused for any
     // other scope.
     let live = scope(6000);
-    ingress.register(live.clone(), target, "model".into(), gate(6000), [2; 32]).unwrap();
+    ingress
+        .register(live.clone(), target, "model".into(), gate(6000), [2; 32])
+        .unwrap();
     let mut other = scope(6001);
     other.deployment_id = "other".into();
-    assert!(ingress.register(other.clone(), target, "model".into(), gate(6000), [2; 32]).is_err());
-    assert!(ingress.register(other, target, "model".into(), gate(5000), [2; 32]).is_err());
+    assert!(ingress
+        .register(other.clone(), target, "model".into(), gate(6000), [2; 32])
+        .is_err());
+    assert!(ingress
+        .register(other, target, "model".into(), gate(5000), [2; 32])
+        .is_err());
 }
 
 // T19 T21: SPEC §10. Host ingress forwards the supported chat payload and
@@ -356,26 +411,38 @@ async fn engine_internal_request_fields_never_reach_the_engine() {
     let (native_addr, native_task) = serve(native).await;
     let ingress = Ingress::new().unwrap();
     let live = scope(1);
-    ingress.register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32]).unwrap();
+    ingress
+        .register(live.clone(), native_addr, "model".into(), [1; 32], [2; 32])
+        .unwrap();
     ingress.open(&live).unwrap();
     let (address, task) = serve(ingress.clone().router()).await;
-    let post = |body: serde_json::Value| {
-        async move {
-            reqwest::Client::new()
-                .post(format!("http://{address}/v1/chat/completions"))
-                .bearer_auth(hex::encode([1; 32]))
-                .json(&body)
-                .send()
-                .await
-                .unwrap()
-                .status()
-        }
+    let post = |body: serde_json::Value| async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .bearer_auth(hex::encode([1; 32]))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status()
     };
-    for field in ["rid", "lora_path", "return_hidden_states", "custom_logit_processor",
-                  "bootstrap_room", "kv_transfer_params", "vllm_xargs", "priority"] {
+    for field in [
+        "rid",
+        "lora_path",
+        "return_hidden_states",
+        "custom_logit_processor",
+        "bootstrap_room",
+        "kv_transfer_params",
+        "vllm_xargs",
+        "priority",
+    ] {
         let mut body = serde_json::json!({"model":"model","messages":[]});
         body[field] = serde_json::json!(1);
-        assert_eq!(post(body).await, reqwest::StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(
+            post(body).await,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{field}"
+        );
     }
     assert_eq!(*hits.lock().unwrap(), 0);
     let supported = serde_json::json!({"model":"model","messages":[],"tools":[],
@@ -416,18 +483,39 @@ async fn answering_native(
 #[tokio::test]
 async fn an_engine_rejection_is_relayed_and_other_engine_errors_stay_bad_gateway() {
     let cases: [(u16, &'static str, &'static str, u16); 5] = [
-        (400, "application/json",
-         r#"{"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}"#, 400),
-        (422, "application/json", r#"{"object":"error","message":"tool_choice requires a parser","code":422}"#, 422),
+        (
+            400,
+            "application/json",
+            r#"{"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}"#,
+            400,
+        ),
+        (
+            422,
+            "application/json",
+            r#"{"object":"error","message":"tool_choice requires a parser","code":422}"#,
+            422,
+        ),
         (400, "text/plain", "bad", 502),
-        (500, "application/json", r#"{"error":{"message":"boom"}}"#, 502),
-        (401, "application/json", r#"{"error":{"message":"Unauthorized"}}"#, 502),
+        (
+            500,
+            "application/json",
+            r#"{"error":{"message":"boom"}}"#,
+            502,
+        ),
+        (
+            401,
+            "application/json",
+            r#"{"error":{"message":"Unauthorized"}}"#,
+            502,
+        ),
     ];
     for (engine_status, content_type, body, want) in cases {
         let (native, native_task) = answering_native(engine_status, content_type, body).await;
         let ingress = Ingress::new().unwrap();
         let first = scope(1);
-        ingress.register(first.clone(), native, "model".into(), [1; 32], [2; 32]).unwrap();
+        ingress
+            .register(first.clone(), native, "model".into(), [1; 32], [2; 32])
+            .unwrap();
         ingress.open(&first).unwrap();
         let (address, task) = serve(ingress.clone().router()).await;
         let response = reqwest::Client::new()
@@ -437,7 +525,11 @@ async fn an_engine_rejection_is_relayed_and_other_engine_errors_stay_bad_gateway
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status().as_u16(), want, "engine {engine_status} {body}");
+        assert_eq!(
+            response.status().as_u16(),
+            want,
+            "engine {engine_status} {body}"
+        );
         let answer: serde_json::Value = response.json().await.unwrap();
         if want == 502 {
             assert_eq!(answer["error"]["code"], "inference_unavailable");

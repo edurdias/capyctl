@@ -100,7 +100,10 @@ fn cleanup_worker(
         options,
         Arc::new(move |_: &InitializeWork| {
             let driver = gate.driver();
-            Ok(ExecutionBinding::remote(driver.engine.clone(), driver.cleanup.clone()))
+            Ok(ExecutionBinding::remote(
+                driver.engine.clone(),
+                driver.cleanup.clone(),
+            ))
         }),
     )
     .unwrap()

@@ -188,9 +188,9 @@ pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigE
             };
             let mut next = assigned.iter();
             for claim in claims.iter_mut().filter(|c| c.get("id").is_none()) {
-                let id = next
-                    .next()
-                    .ok_or_else(|| invalid("resources.devices", "more unnamed claims than devices"))?;
+                let id = next.next().ok_or_else(|| {
+                    invalid("resources.devices", "more unnamed claims than devices")
+                })?;
                 claim["id"] = Value::String(id.clone());
             }
         }
@@ -250,7 +250,10 @@ pub fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), ConfigEr
 /// ADR 0013 §2: the placement labels a host document publishes
 /// (`resource_policy.labels`), empty when it states none.
 pub fn host_labels(host: &Value) -> Result<BTreeMap<String, String>, ConfigError> {
-    let Some(raw) = host["resource_policy"].get("labels").filter(|v| !v.is_null()) else {
+    let Some(raw) = host["resource_policy"]
+        .get("labels")
+        .filter(|v| !v.is_null())
+    else {
         return Ok(BTreeMap::new());
     };
     let labels: BTreeMap<String, String> = raw

@@ -247,7 +247,8 @@ async fn serve_standalone(
         .map_err(roles::StartError::from)?;
     // SPEC §16.5: management has its own loopback listener and credential.
     let management = tokio::net::TcpListener::bind(management_address)
-        .await.map_err(roles::StartError::from)?;
+        .await
+        .map_err(roles::StartError::from)?;
     let admission = shutdown::Admission::new();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut inference = tokio::spawn(shutdown::serve(

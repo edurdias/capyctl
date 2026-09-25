@@ -11,8 +11,7 @@ use mllm_agent::{
 };
 use mllm_config::remote_roles::{HostConfig, ServerConfig};
 use mllm_controller::{
-    agent_sessions::AgentSessions, enrollment::EnrollmentAuthority,
-    OwnedCoordinatorState,
+    agent_sessions::AgentSessions, enrollment::EnrollmentAuthority, OwnedCoordinatorState,
 };
 use mllm_management::ManagementCredentials;
 use mllm_protocol::pb::{
@@ -269,8 +268,13 @@ fn load_credentials(config: &ServerConfig) -> Result<Credentials, StructuredErro
     }
     Ok(c)
 }
-pub(crate) fn management_context(config: &ServerConfig) -> Result<(String, String), StructuredError> {
-    Ok((format!("http://{}/management/v1", config.management), load_credentials(config)?.admin_token))
+pub(crate) fn management_context(
+    config: &ServerConfig,
+) -> Result<(String, String), StructuredError> {
+    Ok((
+        format!("http://{}/management/v1", config.management),
+        load_credentials(config)?.admin_token,
+    ))
 }
 fn management_credentials(c: &Credentials) -> Result<ManagementCredentials, StructuredError> {
     ManagementCredentials::from_trusted_resolver(&c.admin_token, &c.api_key)
@@ -290,7 +294,9 @@ impl Drop for AbortOnDrop {
 /// SPEC §10 step 1, §16.2 (W10 gap b): the router's waiting-request bounds
 /// from a host queue policy. The deadline a waiting request is given is the
 /// policy's request deadline.
-pub(crate) fn wait_limits(queue: &mllm_config::effective::QueuePolicy) -> mllm_router::queue::WaitLimits {
+pub(crate) fn wait_limits(
+    queue: &mllm_config::effective::QueuePolicy,
+) -> mllm_router::queue::WaitLimits {
     mllm_router::queue::WaitLimits {
         max_pending_per_deployment: queue.max_pending_per_deployment as usize,
         max_pending_total: queue.max_pending_total as usize,
@@ -323,7 +329,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                     newer @ mllm_store::StoreError::FromNewerVersion { .. },
                 ) => from_newer_version(newer.to_string()),
                 _ => error("Controller state is unsafe or already owned"),
-            }
+            },
         )?,
     ));
     let ca_pem = ca.certificate_pem().to_owned();
@@ -339,33 +345,41 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         },
     );
     let bindings = mllm_controller::remote_execution::RemoteProfileBindings::new(
-        owner.clone(), sessions.clone(), authority.controller_id(),
+        owner.clone(),
+        sessions.clone(),
+        authority.controller_id(),
     );
     let readiness = bindings.readiness();
-    let coordinator = mllm_controller::coordinator::OwnedCoordinator::spawn_with_execution_bindings(
-        owner.clone(), sessions.clone(),
-        Arc::new(|| Ok(mllm_protocol::now_unix_ms())),
-        mllm_controller::coordinator::CoordinatorOptions {
-            // ADR 0014 amendment A1: a ceiling only; each Initialize is bounded
-            // by its step deadline, the deployment's `timeouts.initialize` or
-            // the operator's override, within the host's request deadline.
-            initialize_timeout: Duration::from_secs(3600),
-            // SPEC §6.5 (W5): the server document's idle policy, off unless named.
-            idle: mllm_store::ordinary_lifecycle::park::IdlePolicy {
-                ready_idle_ms: config.idle.ready_idle.map(|d| d.as_millis() as i64),
-                parked_idle_ms: config.idle.parked_idle.map(|d| d.as_millis() as i64),
+    let coordinator =
+        mllm_controller::coordinator::OwnedCoordinator::spawn_with_execution_bindings(
+            owner.clone(),
+            sessions.clone(),
+            Arc::new(|| Ok(mllm_protocol::now_unix_ms())),
+            mllm_controller::coordinator::CoordinatorOptions {
+                // ADR 0014 amendment A1: a ceiling only; each Initialize is bounded
+                // by its step deadline, the deployment's `timeouts.initialize` or
+                // the operator's override, within the host's request deadline.
+                initialize_timeout: Duration::from_secs(3600),
+                // SPEC §6.5 (W5): the server document's idle policy, off unless named.
+                idle: mllm_store::ordinary_lifecycle::park::IdlePolicy {
+                    ready_idle_ms: config.idle.ready_idle.map(|d| d.as_millis() as i64),
+                    parked_idle_ms: config.idle.parked_idle.map(|d| d.as_millis() as i64),
+                },
+                // SPEC §6.3: a Stop drains accepted requests for the same bound a
+                // switch does (`switching.drain_timeout`) before it terminates.
+                stop_drain_timeout: config.switch_drain_timeout,
+                ..Default::default()
             },
-            // SPEC §6.3: a Stop drains accepted requests for the same bound a
-            // switch does (`switching.drain_timeout`) before it terminates.
-            stop_drain_timeout: config.switch_drain_timeout,
-            ..Default::default()
-        },
-        bindings,
-    ).map_err(|_| unavailable())?;
+            bindings,
+        )
+        .map_err(|_| unavailable())?;
     // SPEC §§6.1, 13.2 (G2, D8): a Ready remote engine dispatches only while the
     // host session that proved it is current; a new session must re-prove it.
     let supervisor = mllm_controller::remote_readiness::RemoteReadiness::new(
-        owner.clone(), sessions.clone(), authority.controller_id(), readiness,
+        owner.clone(),
+        sessions.clone(),
+        authority.controller_id(),
+        readiness,
     );
     // SPEC §4.3: a host's drain notice closes dispatch to its engines before
     // the host is acknowledged and closes its ingress.
@@ -398,7 +412,11 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     supervision.supervise(
         mllm_controller::checkpoint_digests::CheckpointDigests::new(
             owner.clone(),
-            mllm_controller::checkpoint_digests::RemoteDigests::new(owner.clone(), sessions.clone(), authority.controller_id()),
+            mllm_controller::checkpoint_digests::RemoteDigests::new(
+                owner.clone(),
+                sessions.clone(),
+                authority.controller_id(),
+            ),
         )
         .spawn_until(supervision.cancel_signal()),
     );
@@ -407,12 +425,21 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     supervision.supervise(
         mllm_controller::model_sources::SourceMaterializer::new(
             owner.clone(),
-            mllm_controller::model_sources::RemoteSources::new(owner.clone(), sessions.clone(), authority.controller_id()),
+            mllm_controller::model_sources::RemoteSources::new(
+                owner.clone(),
+                sessions.clone(),
+                authority.controller_id(),
+            ),
         )
         .spawn_until(supervision.cancel_signal()),
     );
-    let configuration = Arc::new(mllm_management::configuration::SharedConfigurationSource::from_registry(owner.clone(), "owner")
-        .map_err(|_| unavailable())?);
+    let configuration = Arc::new(
+        mllm_management::configuration::SharedConfigurationSource::from_registry(
+            owner.clone(),
+            "owner",
+        )
+        .map_err(|_| unavailable())?,
+    );
     // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching
     // and the operator's `start --evict`, bounded by `switching.drain_timeout`.
     let switcher = Arc::new(mllm_controller::switching::Switcher::new(
@@ -422,9 +449,11 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             ..Default::default()
         },
     ));
-    let actions = Arc::new(mllm_management::actions::OwnedActionSource::new(configuration, coordinator.commands())
-        .map_err(|_| unavailable())?
-        .with_switcher(switcher.clone()));
+    let actions = Arc::new(
+        mllm_management::actions::OwnedActionSource::new(configuration, coordinator.commands())
+            .map_err(|_| unavailable())?
+            .with_switcher(switcher.clone()),
+    );
     // ADR 0013 §10 (I3, D9): the router balances across instances on host
     // liveness and the engine load each host agent reports.
     let controller = Arc::new(
@@ -443,7 +472,11 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         mllm_management::metrics::latency_router(
             management_credentials(&credentials)?,
             Arc::new(move |deployment: Option<&str>| {
-                mllm_router::timing::latency_report(&recorder, &hosts.snapshot(deployment), deployment)
+                mllm_router::timing::latency_report(
+                    &recorder,
+                    &hosts.snapshot(deployment),
+                    deployment,
+                )
             }),
         )
     };
@@ -464,7 +497,10 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     let inference = mllm_router::serve_router(mllm_router::RouterDeps {
         controller: controller.clone(),
         forwards: Arc::new(mllm_router::forwarders::LiveForwarders::new(controller)),
-        limits: mllm_router::QueueLimits { max_requests_per_deployment:32, max_buffered_bytes_total:64 * 1024 * 1024 },
+        limits: mllm_router::QueueLimits {
+            max_requests_per_deployment: 32,
+            max_buffered_bytes_total: 64 * 1024 * 1024,
+        },
         api_key: Some(credentials.api_key.clone()),
         inflight,
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
@@ -476,28 +512,30 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         Arc::new(move |host: &str| sessions.current_session(host).is_some())
     };
     let drain = mllm_management::drain::drain_router_with_presence(
-        management_credentials(&credentials)?, actions.clone(), Vec::new(), presence,
-    );
-    let management = mllm_management::lifecycle_router(
-        management_credentials(&credentials)?, actions,
-    )
-    .merge(drain)
-    .merge(
-        mllm_management::enrollment::enrollment_router(
-            management_credentials(&credentials)?,
-            authority.clone(),
-            config.bootstrap_address.clone(),
-            config.control_address.clone(),
-        )
-        .map_err(|_| unavailable())?
-        .reset_fallback(),
-    )
-    .merge(mllm_management::hosts::hosts_router(
         management_credentials(&credentials)?,
-        owner,
-        sessions.clone(),
-    ))
-    .merge(latency_view);
+        actions.clone(),
+        Vec::new(),
+        presence,
+    );
+    let management =
+        mllm_management::lifecycle_router(management_credentials(&credentials)?, actions)
+            .merge(drain)
+            .merge(
+                mllm_management::enrollment::enrollment_router(
+                    management_credentials(&credentials)?,
+                    authority.clone(),
+                    config.bootstrap_address.clone(),
+                    config.control_address.clone(),
+                )
+                .map_err(|_| unavailable())?
+                .reset_fallback(),
+            )
+            .merge(mllm_management::hosts::hosts_router(
+                management_credentials(&credentials)?,
+                owner,
+                sessions.clone(),
+            ))
+            .merge(latency_view);
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
         .map_err(|_| unavailable())?;
@@ -585,9 +623,15 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     };
     if let Some(result) = failed {
         listeners.abort();
-        supervision.join(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
-        sessions.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
-        switcher.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+        supervision
+            .join(crate::shutdown::SUPERVISION_JOIN_BOUND)
+            .await;
+        sessions
+            .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
+            .await;
+        switcher
+            .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
+            .await;
         let _ = coordinator.shutdown().await;
         result.map_err(|_| unavailable())??;
         return Err(unavailable());
@@ -601,13 +645,21 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     // supervisors finish their pass and are joined, then every host session
     // ends through its teardown (claims retained, SPEC §13), then the
     // switcher's follow-ups, then the coordinator's worker.
-    supervision.join(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
-    sessions.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
-    switcher.shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND).await;
+    supervision
+        .join(crate::shutdown::SUPERVISION_JOIN_BOUND)
+        .await;
+    sessions
+        .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
+        .await;
+    switcher
+        .shutdown(crate::shutdown::SUPERVISION_JOIN_BOUND)
+        .await;
     coordinator.shutdown().await.map_err(|_| unavailable())?;
     drop(storage);
-    Ok(json!({"role":"server","stopped":true,"engines":"retained","drain":drain.to_json(),
-        "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}))
+    Ok(
+        json!({"role":"server","stopped":true,"engines":"retained","drain":drain.to_json(),
+        "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}),
+    )
 }
 /// How long a draining host waits for the controller to acknowledge that its
 /// dispatch is suspended before it closes ingress anyway.
@@ -648,19 +700,49 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         }
         _ => error("Host journal is unsafe or owned by another process"),
     })?;
-    let memory = mllm_agent::memory::read_host_memory().map_err(|_| error("Host memory inventory unavailable"))?.memory;
-    let declared=config.document["resource_policy"]["domains"].as_object();
-    let domains=if let Some(declared)=declared {
-        declared.iter().map(|(name,policy)| {
-            // The supported GB10 preparation has one unified physical pool.
-            // Multiple/distinct pools require their own observers, never copied capacity.
-            let supported=declared.len()==1 && policy["memory"]=="unified";
-            pb::DomainObservation {residents:vec![],domain_id:name.clone(),kind:"system".into(),
-                observed_bytes:if supported {memory.available_bytes} else {-1}, observed_at_unix:memory.sampled_at_ms/1000,
-                capacity_bytes:if supported {memory.capacity_bytes} else {-1}, available_bytes:if supported {memory.available_bytes} else {-1},observed_at_unix_ms:memory.sampled_at_ms}
-        }).collect()
-    } else {vec![pb::DomainObservation {residents:vec![],domain_id:"system".into(),kind:"system".into(),observed_bytes:memory.available_bytes,observed_at_unix:memory.sampled_at_ms/1000,
-        capacity_bytes:memory.capacity_bytes,available_bytes:memory.available_bytes,observed_at_unix_ms:memory.sampled_at_ms}]};
+    let memory = mllm_agent::memory::read_host_memory()
+        .map_err(|_| error("Host memory inventory unavailable"))?
+        .memory;
+    let declared = config.document["resource_policy"]["domains"].as_object();
+    let domains = if let Some(declared) = declared {
+        declared
+            .iter()
+            .map(|(name, policy)| {
+                // The supported GB10 preparation has one unified physical pool.
+                // Multiple/distinct pools require their own observers, never copied capacity.
+                let supported = declared.len() == 1 && policy["memory"] == "unified";
+                pb::DomainObservation {
+                    residents: vec![],
+                    domain_id: name.clone(),
+                    kind: "system".into(),
+                    observed_bytes: if supported {
+                        memory.available_bytes
+                    } else {
+                        -1
+                    },
+                    observed_at_unix: memory.sampled_at_ms / 1000,
+                    capacity_bytes: if supported { memory.capacity_bytes } else { -1 },
+                    available_bytes: if supported {
+                        memory.available_bytes
+                    } else {
+                        -1
+                    },
+                    observed_at_unix_ms: memory.sampled_at_ms,
+                }
+            })
+            .collect()
+    } else {
+        vec![pb::DomainObservation {
+            residents: vec![],
+            domain_id: "system".into(),
+            kind: "system".into(),
+            observed_bytes: memory.available_bytes,
+            observed_at_unix: memory.sampled_at_ms / 1000,
+            capacity_bytes: memory.capacity_bytes,
+            available_bytes: memory.available_bytes,
+            observed_at_unix_ms: memory.sampled_at_ms,
+        }]
+    };
     // ADR 0008 (owner decision 2026-09-23): registration measures each
     // installation (engine package version and a digest over its files);
     // later drift is flagged against this. Unmeasurable is never a refusal.
@@ -692,9 +774,12 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
             protocol_version: mllm_protocol::PROTOCOL_VERSION.into(),
             ..Default::default()
         }),
-        approved_host_config_json:config.document.to_string(),
-        host_boot_id:fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|_|error("Host boot identity unavailable"))?.trim().to_owned(),
-        policy_fingerprint:mllm_config::remote_resources::policy_fingerprint(&config.document),
+        approved_host_config_json: config.document.to_string(),
+        host_boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|_| error("Host boot identity unavailable"))?
+            .trim()
+            .to_owned(),
+        policy_fingerprint: mllm_config::remote_resources::policy_fingerprint(&config.document),
         // SPEC §§3.1, 7.3: the native executor below advertises per-launch
         // claims in the inventory it publishes; this startup snapshot does not.
         launch_claims: String::new(),
@@ -709,11 +794,19 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         // SPEC §8.2 / T21: per-launch SGLang file rendezvous directories,
         // removed on gone evidence (0700, this service user).
         private_dir(&config.state_dir.join("rendezvous"))?;
-        let private = IdentityDirectory::open(&config.state_dir.join("ingress-identity")).map_err(|_| unavailable())?;
+        let private = IdentityDirectory::open(&config.state_dir.join("ingress-identity"))
+            .map_err(|_| unavailable())?;
         let identities = mllm_agent::ingress_identity::IngressIdentities::new(private);
         let execution = mllm_agent::native_execution::NativeHostExecution::new(
-            journal.clone(), ingress.clone(), identities, config.clone(), host.clone(), identity.controller_id(),
-            config.runtime_dir.clone(), config.state_dir.join("logs"), inventory.clone(),
+            journal.clone(),
+            ingress.clone(),
+            identities,
+            config.clone(),
+            host.clone(),
+            identity.controller_id(),
+            config.runtime_dir.clone(),
+            config.state_dir.join("logs"),
+            inventory.clone(),
         )
         // ADR 0014 §7, Q9: the per-host checkpoint stat cache is private state.
         .with_checkpoint_cache(config.state_dir.join("checkpoints"))
@@ -729,9 +822,16 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         // memory rides the availability reports, so the server credits
         // resident engines instead of charging them twice.
         .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia());
-        let listener = tokio::net::TcpListener::bind(settings.bind).await.map_err(|_| unavailable())?;
-        (Some(execution as Arc<dyn mllm_agent::session::SessionExecution>), Some(listener))
-    } else { (None, None) };
+        let listener = tokio::net::TcpListener::bind(settings.bind)
+            .await
+            .map_err(|_| unavailable())?;
+        (
+            Some(execution as Arc<dyn mllm_agent::session::SessionExecution>),
+            Some(listener),
+        )
+    } else {
+        (None, None)
+    };
     // SPEC §4.3 (owner decision P3): a signal is a service restart. Ingress
     // admission and every ingress gate close, admitted streams finish within the
     // bound, and the control session closes (its fence journals the disconnect).
@@ -743,12 +843,21 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let drain_signal = mllm_agent::session::DrainSignal::new();
-    let session = mllm_agent::session::run_session_with_drain(&identity, journal, inventory, receiver, execution, Some(drain_signal.clone()));
+    let session = mllm_agent::session::run_session_with_drain(
+        &identity,
+        journal,
+        inventory,
+        receiver,
+        execution,
+        Some(drain_signal.clone()),
+    );
     let gates = ingress.clone();
     let router = admission.gate(ingress.router());
     let mut ingress_server = tokio::spawn(async move {
         match ingress_listener {
-            Some(listener) => crate::shutdown::serve(listener, router, stopped).await.map_err(|_| unavailable()),
+            Some(listener) => crate::shutdown::serve(listener, router, stopped)
+                .await
+                .map_err(|_| unavailable()),
             None => std::future::pending::<Result<(), StructuredError>>().await,
         }
     });
@@ -800,9 +909,11 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         None => session.await,
     }
     .map_err(|_| host_revoked(&host))?;
-    Ok(json!({"role":"host","host_id":host,"stopped":true,"engines":"retained","drain":drain.to_json(),
+    Ok(
+        json!({"role":"host","host_id":host,"stopped":true,"engines":"retained","drain":drain.to_json(),
         "dispatch_suspension":announced.as_str(),
-        "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}))
+        "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}),
+    )
 }
 /// ADR 0016: how long a recovery invitation stays redeemable.
 const RECOVERY_INVITATION_SECONDS: i64 = 900;
@@ -907,8 +1018,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 }
                 _ => {}
             }
-            let storage = IdentityDirectory::open(&config.identity_dir)
-                .map_err(|_| error("Host identity is unsafe or already in use; stop the host role first"))?;
+            let storage = IdentityDirectory::open(&config.identity_dir).map_err(|_| {
+                error("Host identity is unsafe or already in use; stop the host role first")
+            })?;
             let mut pending = if *recover {
                 PendingEnrollment::prepare_recovery(&storage, &invitation).map_err(|_| {
                     error("Recovery invitation conflicts with the retained host identity")
@@ -957,8 +1069,10 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 &serde_json::to_vec(&result).map_err(|_| unavailable())?,
             )?;
             if *recover {
-                Ok(json!({"invitation_file":path,"host_name":result["host_name"],
-                    "recover_host_id":result["recover_host_id"],"expires_unix":result["expires_unix"]}))
+                Ok(
+                    json!({"invitation_file":path,"host_name":result["host_name"],
+                    "recover_host_id":result["recover_host_id"],"expires_unix":result["expires_unix"]}),
+                )
             } else {
                 Ok(json!({"invitation_file":path,"host_name":name}))
             }

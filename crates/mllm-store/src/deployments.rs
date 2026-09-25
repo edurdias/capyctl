@@ -1383,9 +1383,16 @@ mod tests {
         assert_eq!(instance_admission(&s), vec![(0, 1), (1, 0)]);
         let deployment: i64 = s
             .conn
-            .query_row("SELECT admission_enabled FROM deployments WHERE id='d'", [], |r| r.get(0))
+            .query_row(
+                "SELECT admission_enabled FROM deployments WHERE id='d'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(deployment, 1, "the deployment keeps admitting through instance 0");
+        assert_eq!(
+            deployment, 1,
+            "the deployment keeps admitting through instance 0"
+        );
     }
 
     /// T18: a failure reported for an incarnation a later activation or a stop
@@ -1422,7 +1429,9 @@ mod tests {
             .unwrap();
         assert!(s.set_admission_enabled("d", false).is_err());
         assert_eq!(instance_admission(&s), vec![(0, 1), (1, 1)]);
-        s.conn.execute_batch("DROP TRIGGER refuse_deployment_write").unwrap();
+        s.conn
+            .execute_batch("DROP TRIGGER refuse_deployment_write")
+            .unwrap();
         s.set_admission_enabled("d", false).unwrap();
         assert_eq!(instance_admission(&s), vec![(0, 0), (1, 0)]);
     }

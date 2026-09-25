@@ -145,7 +145,9 @@ pub enum CompletionError {
 fn identities_valid(identities: &[ProcessIdentity]) -> bool {
     crate::group::validate_local_processes(identities).is_ok()
         && identities.iter().any(|identity| identity.role == "api")
-        && identities.iter().any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
+        && identities
+            .iter()
+            .any(|identity| identity.role.starts_with("worker-") && identity.role.len() > 7)
 }
 
 pub fn verify_completion(

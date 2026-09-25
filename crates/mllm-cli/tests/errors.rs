@@ -95,7 +95,11 @@ fn a_store_from_a_newer_version_is_a_non_restartable_refusal() {
         let e = StructuredError::from(error);
         assert_eq!(e.code, mllm_cli::output::STORE_FROM_NEWER_VERSION);
         assert_eq!(e.exit_code(), ExitCode(5));
-        assert!(e.message.contains("99") && e.message.contains("31"), "{}", e.message);
+        assert!(
+            e.message.contains("99") && e.message.contains("31"),
+            "{}",
+            e.message
+        );
         assert!(e.message.contains("backup"), "{}", e.message);
     }
 }
@@ -130,17 +134,28 @@ fn a_revoked_host_exits_with_its_own_code_and_the_recovery_commands() {
     assert!(!e.message.contains('\n'), "one line: {}", e.message);
     assert!(e.message.contains("engines keep running"), "{}", e.message);
     assert!(
-        e.message.contains("mllm invite host 01HOSTID --recover --output FILE"),
+        e.message
+            .contains("mllm invite host 01HOSTID --recover --output FILE"),
         "{}",
         e.message
     );
     assert!(
-        e.message.contains("mllm join host --join-file FILE --recover"),
+        e.message
+            .contains("mllm join host --join-file FILE --recover"),
         "{}",
         e.message
     );
     // The commands named in the message parse with the real grammar.
-    parse(["mllm", "invite", "host", "01HOSTID", "--recover", "--output", "FILE"]).unwrap();
+    parse([
+        "mllm",
+        "invite",
+        "host",
+        "01HOSTID",
+        "--recover",
+        "--output",
+        "FILE",
+    ])
+    .unwrap();
     parse(["mllm", "join", "host", "--join-file", "FILE", "--recover"]).unwrap();
 }
 

@@ -105,10 +105,19 @@ fn shutdown_drain_timeout_defaults_and_is_bounded() {
     let mut server: serde_json::Value =
         serde_json::from_str(&ServerConfig::template(root)).unwrap();
     let mut host: serde_json::Value = serde_json::from_str(&HostConfig::template(root)).unwrap();
-    let mut standalone = serde_json::json!({"schema_version": 1, "kind": "standalone", "name": "local"});
+    let mut standalone =
+        serde_json::json!({"schema_version": 1, "kind": "standalone", "name": "local"});
     assert_eq!(DEFAULT_DRAIN_TIMEOUT, Duration::from_secs(30));
-    assert_eq!(ServerConfig::parse(&server.to_string()).unwrap().drain_timeout, DEFAULT_DRAIN_TIMEOUT);
-    assert_eq!(HostConfig::parse(&host.to_string()).unwrap().drain_timeout, DEFAULT_DRAIN_TIMEOUT);
+    assert_eq!(
+        ServerConfig::parse(&server.to_string())
+            .unwrap()
+            .drain_timeout,
+        DEFAULT_DRAIN_TIMEOUT
+    );
+    assert_eq!(
+        HostConfig::parse(&host.to_string()).unwrap().drain_timeout,
+        DEFAULT_DRAIN_TIMEOUT
+    );
     let parsed = parse_strict(ConfigKind::Standalone, &standalone.to_string()).unwrap();
     assert_eq!(drain_timeout(&parsed).unwrap(), DEFAULT_DRAIN_TIMEOUT);
     for (text, expected) in [("0s", 0), ("45s", 45), ("10m", 600), ("600s", 600)] {
@@ -116,7 +125,12 @@ fn shutdown_drain_timeout_defaults_and_is_bounded() {
         for document in [&mut server, &mut host, &mut standalone] {
             document["shutdown"] = serde_json::json!({"drain_timeout": text});
         }
-        assert_eq!(ServerConfig::parse(&server.to_string()).unwrap().drain_timeout, expected);
+        assert_eq!(
+            ServerConfig::parse(&server.to_string())
+                .unwrap()
+                .drain_timeout,
+            expected
+        );
         let config = HostConfig::parse(&host.to_string()).unwrap();
         assert_eq!(config.drain_timeout, expected);
         // Role-local: never part of the document a deployment resolves against.
@@ -170,16 +184,34 @@ fn server_heartbeat_timeouts_default_and_are_bounded() {
         }
     );
     for (control, path) in [
-        (serde_json::json!({"heartbeat_suspend_after": "1s"}), "control.heartbeat_suspend_after"),
-        (serde_json::json!({"heartbeat_suspend_after": "121s"}), "control.heartbeat_suspend_after"),
-        (serde_json::json!({"heartbeat_suspend_after": "soon"}), "control.heartbeat_suspend_after"),
-        (serde_json::json!({"heartbeat_lost_after": "2s"}), "control.heartbeat_lost_after"),
-        (serde_json::json!({"heartbeat_lost_after": "601s"}), "control.heartbeat_lost_after"),
+        (
+            serde_json::json!({"heartbeat_suspend_after": "1s"}),
+            "control.heartbeat_suspend_after",
+        ),
+        (
+            serde_json::json!({"heartbeat_suspend_after": "121s"}),
+            "control.heartbeat_suspend_after",
+        ),
+        (
+            serde_json::json!({"heartbeat_suspend_after": "soon"}),
+            "control.heartbeat_suspend_after",
+        ),
+        (
+            serde_json::json!({"heartbeat_lost_after": "2s"}),
+            "control.heartbeat_lost_after",
+        ),
+        (
+            serde_json::json!({"heartbeat_lost_after": "601s"}),
+            "control.heartbeat_lost_after",
+        ),
         (
             serde_json::json!({"heartbeat_suspend_after": "10s", "heartbeat_lost_after": "10s"}),
             "control.heartbeat_lost_after",
         ),
-        (serde_json::json!({"heartbeat_lost_after": "4s"}), "control.heartbeat_lost_after"),
+        (
+            serde_json::json!({"heartbeat_lost_after": "4s"}),
+            "control.heartbeat_lost_after",
+        ),
     ] {
         server["control"] = control.clone();
         let error = ServerConfig::parse(&server.to_string()).unwrap_err();
@@ -204,13 +236,17 @@ fn switching_drain_timeout_defaults_and_is_bounded() {
         serde_json::from_str(&ServerConfig::template(root)).unwrap();
     assert_eq!(DEFAULT_SWITCH_DRAIN_TIMEOUT, Duration::from_secs(30));
     assert_eq!(
-        ServerConfig::parse(&server.to_string()).unwrap().switch_drain_timeout,
+        ServerConfig::parse(&server.to_string())
+            .unwrap()
+            .switch_drain_timeout,
         DEFAULT_SWITCH_DRAIN_TIMEOUT
     );
     for (text, seconds) in [("1s", 1), ("45s", 45), ("10m", 600)] {
         server["switching"] = serde_json::json!({"drain_timeout": text});
         assert_eq!(
-            ServerConfig::parse(&server.to_string()).unwrap().switch_drain_timeout,
+            ServerConfig::parse(&server.to_string())
+                .unwrap()
+                .switch_drain_timeout,
             Duration::from_secs(seconds)
         );
         let standalone = serde_json::json!({

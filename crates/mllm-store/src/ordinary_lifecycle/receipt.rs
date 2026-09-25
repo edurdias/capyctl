@@ -536,7 +536,11 @@ pub(crate) fn runtime_fences(
              ORDER BY i.instance_index",
         )?
         .query_map([deployment], |r| {
-            Ok((r.get::<_, u32>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
@@ -553,4 +557,3 @@ pub(crate) fn runtime_fences(
         })
         .collect())
 }
-

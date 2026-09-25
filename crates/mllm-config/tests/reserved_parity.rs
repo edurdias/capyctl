@@ -21,7 +21,9 @@ fn runtime_source(name: &str) -> String {
 fn quoted_block(source: &str, start: &str, end: &str) -> BTreeSet<String> {
     let begin = source.find(start).unwrap_or_else(|| panic!("no `{start}`"));
     let rest = &source[begin + start.len()..];
-    let block = &rest[..rest.find(end).unwrap_or_else(|| panic!("no end for `{start}`"))];
+    let block = &rest[..rest
+        .find(end)
+        .unwrap_or_else(|| panic!("no end for `{start}`"))];
     let mut names = BTreeSet::new();
     for line in block.lines() {
         let code = line.split('#').next().unwrap_or("");
@@ -53,7 +55,9 @@ fn dest(option: &str) -> String {
 }
 
 fn covered(families: &[&str], name: &str) -> bool {
-    families.iter().any(|family| name.starts_with(&dest(family)))
+    families
+        .iter()
+        .any(|family| name.starts_with(&dest(family)))
 }
 
 // T14 T21
@@ -82,7 +86,13 @@ fn vllm_reserved_names_match_the_protected_entry() {
     }
     // Spellings the installed 0.29 parser no longer has are still refused at
     // deploy time; the parser itself refuses them as unknown at launch.
-    let retired = ["device", "swap_space", "kv_cache_bytes", "kv_cache_memory", "disable_log_requests"];
+    let retired = [
+        "device",
+        "swap_space",
+        "kv_cache_bytes",
+        "kv_cache_memory",
+        "disable_log_requests",
+    ];
     for name in &rust {
         assert!(
             python.contains(name)
@@ -121,7 +131,10 @@ fn sglang_reserved_names_match_the_argument_mapper() {
     }
     for field in mllm_config::engine_policy::SGLANG_RESERVED_FIELDS {
         assert!(
-            python.contains(*field) || python_families.iter().any(|f| field.starts_with(f.as_str())),
+            python.contains(*field)
+                || python_families
+                    .iter()
+                    .any(|f| field.starts_with(f.as_str())),
             "engine_policy.rs reserves `{field}`, sglang_server_args.py does not"
         );
     }

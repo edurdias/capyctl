@@ -127,23 +127,21 @@ impl LifecycleState {
     ) -> Result<mllm_domain::completion::ParkedStatusObservation, RuntimeError> {
         let before = self.activity();
         let identities = self.members(c)?;
-        Ok(
-            mllm_domain::completion::ParkedStatusObservation {
-                token: c.token.clone(),
-                binding_id: c.binding_id.clone(),
-                incarnation: c.incarnation.clone(),
-                identities,
-                observed_at_ms: c.issued_at_ms,
-                receipt: format!("fake-lifecycle-v1:parked-status:{}", c.token.step_id),
-                allocations: self.allocations,
-                weights: self.weights,
-                cache: self.cache,
-                quiesced: self.quiesced,
-                unknown_work: self.unknown_work,
-                activity_before: before,
-                activity_after: self.activity(),
-            },
-        )
+        Ok(mllm_domain::completion::ParkedStatusObservation {
+            token: c.token.clone(),
+            binding_id: c.binding_id.clone(),
+            incarnation: c.incarnation.clone(),
+            identities,
+            observed_at_ms: c.issued_at_ms,
+            receipt: format!("fake-lifecycle-v1:parked-status:{}", c.token.step_id),
+            allocations: self.allocations,
+            weights: self.weights,
+            cache: self.cache,
+            quiesced: self.quiesced,
+            unknown_work: self.unknown_work,
+            activity_before: before,
+            activity_after: self.activity(),
+        })
     }
     pub(crate) fn forward(
         &mut self,
@@ -364,10 +362,7 @@ impl LifecycleState {
             incarnation: c.incarnation.clone(),
             identities: self.members.clone(),
             observed_at_ms,
-            receipt: format!(
-                "fake-lifecycle-v1:{:?}:{}",
-                command.action, c.token.step_id
-            ),
+            receipt: format!("fake-lifecycle-v1:{:?}:{}", command.action, c.token.step_id),
             facts,
         })
     }
@@ -468,14 +463,23 @@ mod tests {
         };
         let now = Arc::new(AtomicI64::new(1300));
         let clock = now.clone();
-        let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || {
-            Ok(clock.load(Ordering::SeqCst))
-        }));
+        let engine =
+            FakeEngine::with_lifecycle_clock(Arc::new(move || Ok(clock.load(Ordering::SeqCst))));
         let c = command(RuntimeAction::Initialize, "initialize");
         let initialized = engine.execute_persisted(&c).await.unwrap();
-        let activity=engine.lifecycle_activity().unwrap();
-        assert!(engine.lifecycle_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).is_err(),"inspection must not terminate live Fake members");
-        assert_eq!(engine.lifecycle_activity().unwrap(),activity);
+        let activity = engine.lifecycle_activity().unwrap();
+        assert!(
+            engine
+                .lifecycle_cleanup_mode_observed(
+                    &initialized.binding_id,
+                    &initialized.incarnation,
+                    &initialized.identities,
+                    false
+                )
+                .is_err(),
+            "inspection must not terminate live Fake members"
+        );
+        assert_eq!(engine.lifecycle_activity().unwrap(), activity);
         now.store(1700, Ordering::SeqCst);
         let gone = engine
             .lifecycle_cleanup_observed(
@@ -486,10 +490,17 @@ mod tests {
             .unwrap();
         assert_eq!(gone.observed_at_ms, 1700);
         assert_eq!(gone.identities, initialized.identities);
-        now.store(1800,Ordering::SeqCst);
-        let inspected=engine.lifecycle_cleanup_mode_observed(&initialized.binding_id,&initialized.incarnation,&initialized.identities,false).unwrap();
-        assert_eq!(inspected.observed_at_ms,1800);
-        assert_eq!(inspected.identities,initialized.identities);
+        now.store(1800, Ordering::SeqCst);
+        let inspected = engine
+            .lifecycle_cleanup_mode_observed(
+                &initialized.binding_id,
+                &initialized.incarnation,
+                &initialized.identities,
+                false,
+            )
+            .unwrap();
+        assert_eq!(inspected.observed_at_ms, 1800);
+        assert_eq!(inspected.identities, initialized.identities);
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let failed = FakeEngine::with_lifecycle_clock(Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -500,11 +511,7 @@ mod tests {
         }));
         let identities = failed.execute_persisted(&c).await.unwrap().identities;
         assert!(failed
-            .lifecycle_cleanup_observed(
-                &c.context.binding_id,
-                &c.context.incarnation,
-                &identities
-            )
+            .lifecycle_cleanup_observed(&c.context.binding_id, &c.context.incarnation, &identities)
             .is_err());
         // Failure to timestamp is after the control: read-only inspection sees
         // those exact members gone without another terminate operation.

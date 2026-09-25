@@ -150,9 +150,17 @@ pub fn stream_response(
     guard: StaticStreamGuard,
     // SPEC §10: the durable lease this stream holds until the backend ends, with
     // the authority that closes it. `None` when the authority keeps no ledger.
-    lease: Option<(Arc<dyn mllm_controller::LifecyclePort>, mllm_controller::RequestLease)>,
+    lease: Option<(
+        Arc<dyn mllm_controller::LifecyclePort>,
+        mllm_controller::RequestLease,
+    )>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    stream_planned(crate::balance::Attempt::direct(forward, lease), None, body, guard)
+    stream_planned(
+        crate::balance::Attempt::direct(forward, lease),
+        None,
+        body,
+        guard,
+    )
 }
 
 /// ADR 0013 §10 (I3): stream through `first`, failing over along `plan` only
@@ -243,7 +251,11 @@ pub fn stream_planned_timed(
                 break (result, None);
             };
             let Some(plan) = plan.as_mut() else {
-                let code = if reason.contains("shutting down") { "shutting_down" } else { "unavailable" };
+                let code = if reason.contains("shutting down") {
+                    "shutting_down"
+                } else {
+                    "unavailable"
+                };
                 let reason = reason.clone();
                 break (result, Some((code.to_owned(), reason)));
             };
@@ -263,8 +275,10 @@ pub fn stream_planned_timed(
         if let Some((code, reason)) = refusal {
             // Nothing reached any engine; say so in-band, retryably.
             guard.release();
-            let retryable =
-                !matches!(code.as_str(), "invalid_request" | "unsupported" | "engine_rejected");
+            let retryable = !matches!(
+                code.as_str(),
+                "invalid_request" | "unsupported" | "engine_rejected"
+            );
             let refusal = serde_json::json!({"error": {
                 "code": code, "message": reason, "retryable": retryable}});
             let _ = tokio::time::timeout(

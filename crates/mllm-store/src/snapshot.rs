@@ -601,21 +601,30 @@ impl Store {
                 .map(|json| serde_json::from_str(&json))
                 .transpose()
                 .map_err(|_| SnapshotError::CorruptData)?;
-            Ok((r.get::<_, String>(0)?, InstanceSnapshot {
-                index: r.get(1)?,
-                host_id: r.get(2)?,
-                devices,
-                generation: optional_number(r, 4)?,
-                lifecycle: r.get(5)?,
-                operator_stopped: boolean(r, 6)?,
-                observed_state: r.get(7)?,
-                reservation_owner: r.get(8)?,
-                development_controls: from_stored(r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?),
-                revision: optional_number(r, 14)?,
-                last_error: r.get(15)?,
-                startup: None,
-                latest_operation: None,
-            }))
+            Ok((
+                r.get::<_, String>(0)?,
+                InstanceSnapshot {
+                    index: r.get(1)?,
+                    host_id: r.get(2)?,
+                    devices,
+                    generation: optional_number(r, 4)?,
+                    lifecycle: r.get(5)?,
+                    operator_stopped: boolean(r, 6)?,
+                    observed_state: r.get(7)?,
+                    reservation_owner: r.get(8)?,
+                    development_controls: from_stored(
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                        r.get(13)?,
+                    ),
+                    revision: optional_number(r, 14)?,
+                    last_error: r.get(15)?,
+                    startup: None,
+                    latest_operation: None,
+                },
+            ))
         })?;
         for (deployment, mut instance) in instances {
             if let Some(entry) = deployments.iter_mut().find(|d| d.id == deployment) {
@@ -653,10 +662,25 @@ impl Store {
         }
         for entry in &mut deployments {
             if entry.desired_instances == 0 {
-                entry.desired_instances = u32::try_from(entry.instances.len()).map_err(|_| SnapshotError::CorruptData)?;
+                entry.desired_instances =
+                    u32::try_from(entry.instances.len()).map_err(|_| SnapshotError::CorruptData)?;
             }
-            entry.ready_instances = u32::try_from(entry.instances.iter().filter(|i| i.observed_state == "ready").count()).map_err(|_| SnapshotError::CorruptData)?;
-            let stopped = u32::try_from(entry.instances.iter().filter(|i| i.operator_stopped && i.lifecycle == "active").count()).map_err(|_| SnapshotError::CorruptData)?;
+            entry.ready_instances = u32::try_from(
+                entry
+                    .instances
+                    .iter()
+                    .filter(|i| i.observed_state == "ready")
+                    .count(),
+            )
+            .map_err(|_| SnapshotError::CorruptData)?;
+            let stopped = u32::try_from(
+                entry
+                    .instances
+                    .iter()
+                    .filter(|i| i.operator_stopped && i.lifecycle == "active")
+                    .count(),
+            )
+            .map_err(|_| SnapshotError::CorruptData)?;
             let wanted = entry.desired_instances.saturating_sub(stopped);
             if entry.ready_instances >= 1 && entry.ready_instances < wanted {
                 entry.conditions.push("degraded");

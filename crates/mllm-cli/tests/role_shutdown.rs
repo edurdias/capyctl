@@ -214,7 +214,11 @@ impl Installation {
             .take_while(|line| *line != "shutdown:")
             .map(|line| format!("{line}\n"))
             .collect();
-        std::fs::write(&path, format!("{kept}shutdown:\n  drain_timeout: {value}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("{kept}shutdown:\n  drain_timeout: {value}\n"),
+        )
+        .unwrap();
     }
 
     fn command(&self) -> Command {
@@ -657,13 +661,10 @@ fn a_non_loopback_standalone_listener_is_refused() {
     // A port free now: a regressed refusal would otherwise bind a fixed
     // public port, and serve until the bound below fails the test.
     let out = output_within(
-        installation
-            .command()
-            .args(["start", "standalone"])
-            .env(
-                "MLLM_STANDALONE_INFERENCE_ADDR",
-                format!("0.0.0.0:{}", free_port()),
-            ),
+        installation.command().args(["start", "standalone"]).env(
+            "MLLM_STANDALONE_INFERENCE_ADDR",
+            format!("0.0.0.0:{}", free_port()),
+        ),
         REFUSAL_BOUND,
     );
     assert!(!out.status.success());

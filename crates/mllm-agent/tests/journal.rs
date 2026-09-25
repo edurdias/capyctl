@@ -299,14 +299,13 @@ fn queued_expired_or_fenced_ticket_never_starts() {
             }
             _ => (),
         }
-        assert!(
-            j.execute(
+        assert!(j
+            .execute(
                 ticket,
                 if reason == "deadline" { 1000 } else { 10 },
                 &policy
             )
-            .is_err()
-        );
+            .is_err());
         assert!(!policy.marker.exists());
         assert!(j.history(0, 100).unwrap()[0].claim_retained);
     }
@@ -541,27 +540,42 @@ fn deadline_is_rechecked_after_local_rendering() {
 #[test]
 fn adapter_launch_tools_preserve_gate_ownership_and_disconnect_fence() {
     let d = directory();
-    let policy = std::sync::Arc::new(ChildPolicy { marker: d.path().join("adapter-launch-count") });
+    let policy = std::sync::Arc::new(ChildPolicy {
+        marker: d.path().join("adapter-launch-count"),
+    });
     let j = HostJournal::open(d.path(), "controller", "host").unwrap();
     let s = j.connect().unwrap();
     let c = launch("adapter-launch");
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
     let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
     let rendered = policy.render_launch(&c).unwrap();
-    let api = tools.spawn_durable("adapter-launch", &rendered.command).unwrap();
+    let api = tools
+        .spawn_durable("adapter-launch", &rendered.command)
+        .unwrap();
     let _cleanup = ChildCleanup(api.clone());
     assert_eq!(j.inspect_owned("adapter-launch").unwrap()[0].0, api);
-    assert!(tools.spawn_durable("adapter-launch", &rendered.command).is_err());
-    assert!(matches!(j.accept(s, &c, 10, policy.as_ref()).unwrap(), Acceptance::Replay(_)));
+    assert!(tools
+        .spawn_durable("adapter-launch", &rendered.command)
+        .is_err());
+    assert!(matches!(
+        j.accept(s, &c, 10, policy.as_ref()).unwrap(),
+        Acceptance::Replay(_)
+    ));
     drop(tools);
     stop(&j, s, "adapter-launch", policy.as_ref());
     let c = launch("fenced-adapter");
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
     let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
     j.disconnect(s).unwrap();
-    assert!(tools.spawn_durable("fenced-adapter", &rendered.command).is_err());
+    assert!(tools
+        .spawn_durable("fenced-adapter", &rendered.command)
+        .is_err());
     assert!(j.inspect_owned("fenced-adapter").unwrap().is_empty());
-    assert!(j.history(0, 100).unwrap().iter().any(|r| r.command_id == "fenced-adapter" && r.claim_retained));
+    assert!(j
+        .history(0, 100)
+        .unwrap()
+        .iter()
+        .any(|r| r.command_id == "fenced-adapter" && r.claim_retained));
 }
 
 // T16 / T33: durable model evidence remains tied to the exact owned launch;
@@ -572,51 +586,89 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
     use mllm_protocol::execution::SingleLaunchPlan;
     struct Workers;
     impl LocalExecutionPolicy for Workers {
-        fn authorize(&self, _: &MemberCommand) -> Result<(), JournalError> { Ok(()) }
-        fn render_launch(&self, _: &MemberCommand) -> Result<mllm_agent::journal::ApprovedLaunch, JournalError> {
+        fn authorize(&self, _: &MemberCommand) -> Result<(), JournalError> {
+            Ok(())
+        }
+        fn render_launch(
+            &self,
+            _: &MemberCommand,
+        ) -> Result<mllm_agent::journal::ApprovedLaunch, JournalError> {
             Ok(mllm_agent::journal::ApprovedLaunch {
                 command: mllm_adapters::traits::RenderedCommand {
-                    argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60 & wait".into()], env: Default::default(),
-                }, descriptors: None,
+                    argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60 & wait".into()],
+                    env: Default::default(),
+                },
+                descriptors: None,
             })
         }
     }
     let d = directory();
     let journal = HostJournal::open(d.path(), "controller", "host").unwrap();
     let session = journal.connect().unwrap();
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../../mllm-config/tests/fixtures/effective-vllm-golden.json")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
     let mut c = command("native-once");
     c.identity.deadline_ms = 30_000;
     let binding = "01K00000000000000000000001".to_owned();
     let incarnation = "01K00000000000000000000002".to_owned();
     c.action = MemberAction::LaunchSingle(SingleLaunchPlan {
-        deployment_config: fixture["input"]["deployment"].to_string(), profile_name: "profile".into(),
-        checkpoint_fingerprint: "sha256:model".into(), host_policy_fingerprint: "a".repeat(64),
-        binding_id: binding.clone(), incarnation: incarnation.clone(), grant_id: "01K00000000000000000000003".into(),
-        service_port: 30000, issued_at_ms: 1, coordinator_session_id: "01K00000000000000000000004".into(),
-        checkpoint_digest: String::new(), checkpoint_weights_bytes: None,
+        deployment_config: fixture["input"]["deployment"].to_string(),
+        profile_name: "profile".into(),
+        checkpoint_fingerprint: "sha256:model".into(),
+        host_policy_fingerprint: "a".repeat(64),
+        binding_id: binding.clone(),
+        incarnation: incarnation.clone(),
+        grant_id: "01K00000000000000000000003".into(),
+        service_port: 30000,
+        issued_at_ms: 1,
+        coordinator_session_id: "01K00000000000000000000004".into(),
+        checkpoint_digest: String::new(),
+        checkpoint_weights_bytes: None,
         startup_bytes: None,
     });
     let c = sign(c);
     let policy = std::sync::Arc::new(Workers);
     let ticket = fresh(journal.accept(session, &c, 10, policy.as_ref()).unwrap());
     let tools = journal.launch_tools(ticket, 10, policy.clone()).unwrap();
-    let api = tools.spawn_durable(&incarnation, &policy.render_launch(&c).unwrap().command).unwrap();
+    let api = tools
+        .spawn_durable(&incarnation, &policy.render_launch(&c).unwrap().command)
+        .unwrap();
     let _cleanup = ChildCleanup(api.clone());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let processes = loop {
         let observed = tools.observe_group(&api).unwrap();
-        if observed.len() >= 2 { break observed; }
+        if observed.len() >= 2 {
+            break observed;
+        }
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     };
     let mut observation = EffectObservation {
-        token: TransitionToken { deployment_id: c.identity.deployment_id.clone(), operation_id: c.identity.operation_id.clone(), step_id: c.identity.step_id.clone(), revision:1, generation:1 },
-        binding_id: binding, incarnation, identities: processes, observed_at_ms:20,
-        receipt:"controlled adapter probe".into(), facts:vec![Milestone::AllocationsRestored,Milestone::WeightsUsable,Milestone::CacheValid,Milestone::ModelUsable],
+        token: TransitionToken {
+            deployment_id: c.identity.deployment_id.clone(),
+            operation_id: c.identity.operation_id.clone(),
+            step_id: c.identity.step_id.clone(),
+            revision: 1,
+            generation: 1,
+        },
+        binding_id: binding,
+        incarnation,
+        identities: processes,
+        observed_at_ms: 20,
+        receipt: "controlled adapter probe".into(),
+        facts: vec![
+            Milestone::AllocationsRestored,
+            Milestone::WeightsUsable,
+            Milestone::CacheValid,
+            Milestone::ModelUsable,
+        ],
     };
     observation.identities[0].start_ticks += 1;
-    assert!(journal.record_launch_ready(session, "native-once", &observation).is_err());
+    assert!(journal
+        .record_launch_ready(session, "native-once", &observation)
+        .is_err());
     observation.identities[0].start_ticks -= 1;
     // SPEC §13.2 / T13: readiness evidence is written under the transition
     // lock for the session that is still connected; a stale one records none.
@@ -624,8 +676,15 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
         journal.record_launch_ready(session + 1, "native-once", &observation),
         Err(JournalError::Fenced)
     ));
-    assert!(!journal.execution_result("native-once", 30).unwrap().model_usable);
-    journal.record_launch_ready(session, "native-once", &observation).unwrap();
+    assert!(
+        !journal
+            .execution_result("native-once", 30)
+            .unwrap()
+            .model_usable
+    );
+    journal
+        .record_launch_ready(session, "native-once", &observation)
+        .unwrap();
     let replay = journal.execution_result("native-once", 500).unwrap();
     assert!(replay.model_usable && replay.claim_retained);
     assert_eq!(replay.observed_at_unix_ms, 20);
@@ -633,12 +692,22 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
     // even while the exact recorded processes are still alive after reconnect.
     let private = directory();
     let identities = mllm_agent::ingress_identity::IngressIdentities::new(
-        mllm_agent::identity_storage::IdentityDirectory::open(private.path()).unwrap());
+        mllm_agent::identity_storage::IdentityDirectory::open(private.path()).unwrap(),
+    );
     let host_config = mllm_config::remote_roles::HostConfig::parse(
-        &mllm_config::remote_roles::HostConfig::template(d.path())).unwrap();
+        &mllm_config::remote_roles::HostConfig::template(d.path()),
+    )
+    .unwrap();
     let executor = mllm_agent::native_execution::NativeHostExecution::new(
-        journal.clone(), mllm_agent::ingress::Ingress::new().unwrap(), identities,
-        host_config, "host".into(), "controller".into(), d.path().join("runtime"), d.path().join("logs"), Default::default(),
+        journal.clone(),
+        mllm_agent::ingress::Ingress::new().unwrap(),
+        identities,
+        host_config,
+        "host".into(),
+        "controller".into(),
+        d.path().join("runtime"),
+        d.path().join("logs"),
+        Default::default(),
     );
     use mllm_agent::session::SessionExecution;
     let expired = executor.execute(session, c.clone()).await.unwrap();
@@ -647,10 +716,21 @@ async fn native_result_replay_retains_probe_timestamp_and_rejects_forged_identit
     assert!(expired.processes.iter().all(|p| p.presence == "alive"));
     assert!(!d.path().join("runtime").exists());
     // Reporting current ownership did not overwrite the historical model probe.
-    assert_eq!(journal.execution_result("native-once", 600).unwrap().observed_at_unix_ms, 20);
+    assert_eq!(
+        journal
+            .execution_result("native-once", 600)
+            .unwrap()
+            .observed_at_unix_ms,
+        20
+    );
     drop(tools);
     stop(&journal, session, "native-once", policy.as_ref());
-    assert!(!journal.execution_result("native-once", 600).unwrap().model_usable);
+    assert!(
+        !journal
+            .execution_result("native-once", 600)
+            .unwrap()
+            .model_usable
+    );
 }
 
 fn terminate(id: &str, handle: &str) -> MemberCommand {
@@ -677,7 +757,10 @@ fn terminate_settles_a_launch_that_never_released_a_process() {
     let j = HostJournal::open(d.path(), "controller", "host").unwrap();
     let s = j.connect().unwrap();
     // Accepted, never attempted (the agent died before starting the effect).
-    drop(fresh(j.accept(s, &launch("accepted"), 10, policy.as_ref()).unwrap()));
+    drop(fresh(
+        j.accept(s, &launch("accepted"), 10, policy.as_ref())
+            .unwrap(),
+    ));
     let settle = terminate("settle-accepted", "accepted");
     let ticket = fresh(j.accept(s, &settle, 10, policy.as_ref()).unwrap());
     j.execute(ticket, 10, policy.as_ref()).unwrap();
@@ -693,18 +776,19 @@ fn terminate_settles_a_launch_that_never_released_a_process() {
     let ticket = fresh(j.accept(s, &c, 10, policy.as_ref()).unwrap());
     let tools = j.launch_tools(ticket, 10, policy.clone()).unwrap();
     let ticket = fresh(
-        j.accept(s, &terminate("settle-attempted", "attempted"), 10, policy.as_ref())
-            .unwrap(),
+        j.accept(
+            s,
+            &terminate("settle-attempted", "attempted"),
+            10,
+            policy.as_ref(),
+        )
+        .unwrap(),
     );
     j.execute(ticket, 10, policy.as_ref()).unwrap();
     let rendered = policy.render_launch(&c).unwrap();
     assert!(tools.spawn_durable("attempted", &rendered.command).is_err());
     assert!(!policy.marker.exists(), "a settled launch must never spawn");
-    assert!(j
-        .history(0, 100)
-        .unwrap()
-        .iter()
-        .all(|r| !r.claim_retained));
+    assert!(j.history(0, 100).unwrap().iter().all(|r| !r.claim_retained));
     // The settled claim no longer blocks the host's single launch slot.
     fresh(j.accept(s, &launch("next"), 10, policy.as_ref()).unwrap());
 }
@@ -746,8 +830,10 @@ fn residency_schema_migrates_forward_and_is_never_recreated() {
     drop(fresh(j.accept(s, &command("kept"), 10, &Policy).unwrap()));
     drop(j);
     let db = rusqlite::Connection::open(d.path().join("commands.sqlite")).unwrap();
-    db.execute_batch(&format!("{V4_SHAPE} DROP TABLE residency; PRAGMA user_version=2;"))
-        .unwrap();
+    db.execute_batch(&format!(
+        "{V4_SHAPE} DROP TABLE residency; PRAGMA user_version=2;"
+    ))
+    .unwrap();
     drop(db);
     let j = HostJournal::open(d.path(), "controller", "host").unwrap();
     assert_eq!(j.history(0, 10).unwrap().len(), 1);
@@ -772,8 +858,13 @@ fn residency_commands_need_an_owned_launch_and_explicit_policy() {
     let j = HostJournal::open(d.path(), "controller", "host").unwrap();
     let s = j.connect().unwrap();
     for action in [
-        MemberAction::Park { owned_handle: "never-launched".into() },
-        MemberAction::Restore { owned_handle: "never-launched".into(), checkpoint_digest: String::new() },
+        MemberAction::Park {
+            owned_handle: "never-launched".into(),
+        },
+        MemberAction::Restore {
+            owned_handle: "never-launched".into(),
+            checkpoint_digest: String::new(),
+        },
     ] {
         let mut c = command("residency");
         c.action = action;
@@ -858,8 +949,14 @@ fn per_launch_claims_are_independent_and_survive_restart() {
     };
     let j = HostJournal::open(d.path(), "controller", "host").unwrap();
     let s = j.connect().unwrap();
-    drop(fresh(j.accept(s, &launch_of("a", "deployment-a", 1), 10, &policy).unwrap()));
-    drop(fresh(j.accept(s, &launch_of("b", "deployment-b", 4), 10, &policy).unwrap()));
+    drop(fresh(
+        j.accept(s, &launch_of("a", "deployment-a", 1), 10, &policy)
+            .unwrap(),
+    ));
+    drop(fresh(
+        j.accept(s, &launch_of("b", "deployment-b", 4), 10, &policy)
+            .unwrap(),
+    ));
     assert_eq!(
         *policy.seen.lock().unwrap(),
         vec![vec![], vec![("a".to_string(), ClaimPhase::Starting)]]
@@ -870,14 +967,20 @@ fn per_launch_claims_are_independent_and_survive_restart() {
         Err(JournalError::Unauthorized)
     ));
     // One claim per instance incarnation (deployment, generation).
-    let loose = PerLaunch { room: usize::MAX, ..policy };
+    let loose = PerLaunch {
+        room: usize::MAX,
+        ..policy
+    };
     assert!(matches!(
         j.accept(s, &launch_of("a-again", "deployment-a", 1), 10, &loose),
         Err(JournalError::Uncertain)
     ));
     let history = j.history(0, 100).unwrap();
     assert_eq!(
-        history.iter().map(|r| r.command_id.as_str()).collect::<Vec<_>>(),
+        history
+            .iter()
+            .map(|r| r.command_id.as_str())
+            .collect::<Vec<_>>(),
         ["a", "b"]
     );
     assert!(history.iter().all(|r| r.claim_retained));
@@ -903,7 +1006,8 @@ fn per_launch_claims_are_independent_and_survive_restart() {
     );
     // Its instance may launch again under the same generation once settled.
     drop(fresh(
-        j.accept(s, &launch_of("a-next", "deployment-a", 1), 10, &loose).unwrap(),
+        j.accept(s, &launch_of("a-next", "deployment-a", 1), 10, &loose)
+            .unwrap(),
     ));
     assert!(!loose.child.marker.exists());
 }
@@ -956,7 +1060,9 @@ fn a_single_claim_journal_migrates_and_adopts_its_retained_launch() {
         mllm_agent::journal::JOURNAL_SCHEMA_VERSION
     );
     let indexes: Vec<String> = db
-        .prepare("SELECT name FROM sqlite_schema WHERE type='index' AND name LIKE 'one_%' ORDER BY name")
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type='index' AND name LIKE 'one_%' ORDER BY name",
+        )
         .unwrap()
         .query_map([], |r| r.get(0))
         .unwrap()
@@ -1016,7 +1122,10 @@ fn terminate_of_a_compacted_launch_checks_its_owner() {
     let refused = j
         .accept(s, &foreign, 10, &policy)
         .and_then(|acceptance| j.execute(fresh(acceptance), 10, &policy));
-    assert!(matches!(refused, Err(JournalError::Unauthorized)), "{refused:?}");
+    assert!(
+        matches!(refused, Err(JournalError::Unauthorized)),
+        "{refused:?}"
+    );
     let own = terminate("own-stop", "launch");
     let ticket = fresh(j.accept(s, &own, 10, &policy).unwrap());
     j.execute(ticket, 10, &policy).unwrap();
@@ -1062,7 +1171,10 @@ fn inspection_uncertainty_is_per_launch() {
     let s = j.connect().unwrap();
     let mut cleanups = Vec::new();
     for (id, deployment) in [("a", "deployment-a"), ("b", "deployment-b")] {
-        let ticket = fresh(j.accept(s, &launch_of(id, deployment, 1), 10, &policy).unwrap());
+        let ticket = fresh(
+            j.accept(s, &launch_of(id, deployment, 1), 10, &policy)
+                .unwrap(),
+        );
         j.execute(ticket, 10, &policy).unwrap();
         let api = j.inspect_owned(id).unwrap()[0].0.clone();
         cleanups.push(ChildCleanup(api));
@@ -1087,7 +1199,10 @@ fn inspection_uncertainty_is_per_launch() {
             break;
         }
         assert!(std::time::Instant::now() < deadline, "b was not refreshed");
-        let again = sign(command(&format!("inspect-{}", mllm_protocol::now_unix_ms())));
+        let again = sign(command(&format!(
+            "inspect-{}",
+            mllm_protocol::now_unix_ms()
+        )));
         if let Ok(Acceptance::Fresh(ticket)) = j.accept(s, &again, 10, &policy) {
             let _ = j.execute(ticket, 10, &policy);
         }
@@ -1150,7 +1265,10 @@ fn journal_from_a_newer_version_is_refused_and_left_unmodified() {
     .unwrap();
     drop(db);
     match HostJournal::open(d.path(), "controller", "host") {
-        Err(JournalError::FromNewerVersion { found, supported: known }) => {
+        Err(JournalError::FromNewerVersion {
+            found,
+            supported: known,
+        }) => {
             assert_eq!((found, known), (supported + 1, supported));
         }
         Err(other) => panic!("expected FromNewerVersion, got {other}"),
@@ -1223,7 +1341,11 @@ fn terminate_of_an_unrecorded_launch_reports_the_recorded_identities_without_sig
     gone.role = "worker-0".into();
     gone.start_ticks += 1;
 
-    let first = terminate_recorded("lost-first", "lost-launch", vec![alive.clone(), gone.clone()]);
+    let first = terminate_recorded(
+        "lost-first",
+        "lost-launch",
+        vec![alive.clone(), gone.clone()],
+    );
     let ticket = fresh(j.accept(s, &first, 10, &policy).unwrap());
     j.execute(ticket, 10, &policy).unwrap();
     let result = j.execution_result("lost-first", 20).unwrap();
@@ -1237,10 +1359,19 @@ fn terminate_of_an_unrecorded_launch_reports_the_recorded_identities_without_sig
             .find(|p| p.pid == pid && p.start_ticks == ticks)
             .map(|p| p.presence.clone())
     };
-    assert_eq!(presence(&result, alive.pid, alive.start_ticks).as_deref(), Some("alive"));
-    assert_eq!(presence(&result, gone.pid, gone.start_ticks).as_deref(), Some("gone"));
+    assert_eq!(
+        presence(&result, alive.pid, alive.start_ticks).as_deref(),
+        Some("alive")
+    );
+    assert_eq!(
+        presence(&result, gone.pid, gone.start_ticks).as_deref(),
+        Some("gone")
+    );
     // Nothing was signalled: this very process is the "alive" engine.
-    assert_eq!(mllm_launchers::process_absence::presence(&alive), mllm_domain::completion::Presence::Alive);
+    assert_eq!(
+        mllm_launchers::process_absence::presence(&alive),
+        mllm_domain::completion::Presence::Alive
+    );
     // The handle is fenced: the launch can never start here afterwards.
     assert!(matches!(
         j.accept(s, &launch("lost-launch"), 10, &policy),
@@ -1267,6 +1398,9 @@ fn terminate_of_an_unrecorded_launch_reports_the_recorded_identities_without_sig
     j.execute(ticket, 10, &policy).unwrap();
     let result = j.execution_result("known-stop", 20).unwrap();
     assert!(result.processes.is_empty(), "{result:?}");
-    assert_eq!(mllm_launchers::process_absence::presence(&alive), mllm_domain::completion::Presence::Alive);
+    assert_eq!(
+        mllm_launchers::process_absence::presence(&alive),
+        mllm_domain::completion::Presence::Alive
+    );
     assert!(!policy.marker.exists());
 }

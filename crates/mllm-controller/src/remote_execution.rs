@@ -138,7 +138,11 @@ impl RemoteEvidenceObserver for OwnershipObserver {
                 &self.binding,
                 &process(api),
             )
-            .map_err(|_| Box::new(tonic::Status::internal("remote ownership could not be retained")))
+            .map_err(|_| {
+                Box::new(tonic::Status::internal(
+                    "remote ownership could not be retained",
+                ))
+            })
     }
 }
 impl RemoteEngine {
@@ -166,13 +170,19 @@ impl RemoteEngine {
             c.deadline_ms,
         );
         let sessions = self.sessions.clone();
-        crate::checkpoint_digests::first_placement_digest(&self.owner, &c.token.deployment_id, c.token.revision, &b.host_id, || async move {
-            let result = sessions
-                .execute(command)
-                .await
-                .map_err(|_| crate::checkpoint_digests::MeasureError::Unavailable)?;
-            crate::checkpoint_digests::measured_from(&result)
-        })
+        crate::checkpoint_digests::first_placement_digest(
+            &self.owner,
+            &c.token.deployment_id,
+            c.token.revision,
+            &b.host_id,
+            || async move {
+                let result = sessions
+                    .execute(command)
+                    .await
+                    .map_err(|_| crate::checkpoint_digests::MeasureError::Unavailable)?;
+                crate::checkpoint_digests::measured_from(&result)
+            },
+        )
         .await
     }
 
@@ -260,7 +270,10 @@ impl RemoteEngine {
         let mllm_domain::completion::ExecutionIdentities::Retained(recorded) = &c.identities else {
             return Err(RuntimeError::StaleRevision);
         };
-        if c.binding_id != b.plan.binding_id || c.incarnation != b.plan.incarnation || recorded.is_empty() {
+        if c.binding_id != b.plan.binding_id
+            || c.incarnation != b.plan.incarnation
+            || recorded.is_empty()
+        {
             return Err(RuntimeError::StaleRevision);
         }
         let park = runtime.action == RuntimeAction::Park;
@@ -268,7 +281,10 @@ impl RemoteEngine {
         // needs the digest fields; refused typed before anything is sent.
         let mut needs = Vec::new();
         if !park {
-            needs.extend([capabilities::CHECKPOINT_DIGEST, capabilities::RESTORE_CHECKPOINT_DIGEST]);
+            needs.extend([
+                capabilities::CHECKPOINT_DIGEST,
+                capabilities::RESTORE_CHECKPOINT_DIGEST,
+            ]);
         }
         if b.instance_index != 0 {
             needs.push(capabilities::INSTANCE_INDEX);
@@ -337,7 +353,11 @@ impl RemoteEngine {
             observed_at_ms: result.observed_at_unix_ms,
             receipt: format!(
                 "authenticated host {}",
-                if park { "park" } else { "restore with fresh model probe" }
+                if park {
+                    "park"
+                } else {
+                    "restore with fresh model probe"
+                }
             ),
             facts,
         })
@@ -680,9 +700,12 @@ fn proven_gone(
         || result.claim_retained
         || result.owned_handle != binding.launch_command_id
         || result.processes.iter().any(|p| p.presence != "gone")
-        || recorded
-            .iter()
-            .any(|expected| !result.processes.iter().any(|actual| process(actual) == *expected))
+        || recorded.iter().any(|expected| {
+            !result
+                .processes
+                .iter()
+                .any(|actual| process(actual) == *expected)
+        })
     {
         return Err(CoordinatorError::Service(
             "authenticated remote process absence is incomplete".into(),
@@ -964,9 +987,15 @@ mod tests {
     fn host_evidence_must_cover_every_recorded_identity_gone() {
         let b = binding();
         let api = process(&observed("api", 10, "gone"));
-        let gone = result(vec![observed("api", 10, "gone"), observed("worker-0", 11, "gone")]);
+        let gone = result(vec![
+            observed("api", 10, "gone"),
+            observed("worker-0", 11, "gone"),
+        ]);
         assert!(proven_gone(&b, std::slice::from_ref(&api), &gone).is_ok());
-        assert!(proven_gone(&b, &[], &gone).is_ok(), "the host covers what it journaled");
+        assert!(
+            proven_gone(&b, &[], &gone).is_ok(),
+            "the host covers what it journaled"
+        );
         assert!(proven_gone(&b, &[], &result(vec![])).is_ok());
         assert!(proven_gone(&b, std::slice::from_ref(&api), &result(vec![])).is_err());
         let edits: &[fn(&mut pb::MemberExecutionResult)] = &[
@@ -994,12 +1023,21 @@ mod tests {
     // T16 T20 T33 T34
     #[test]
     fn remote_residency_evidence_must_name_the_recorded_group() {
-        let recorded = vec![process(&observed("api", 10, "alive")), process(&observed("worker-0", 11, "alive"))];
+        let recorded = vec![
+            process(&observed("api", 10, "alive")),
+            process(&observed("worker-0", 11, "alive")),
+        ];
         let with = |state: &str, usable: bool| {
-            let mut r = result(vec![observed("worker-0", 11, "alive"), observed("api", 10, "alive")]);
+            let mut r = result(vec![
+                observed("worker-0", 11, "alive"),
+                observed("api", 10, "alive"),
+            ]);
             r.claim_retained = true;
             r.model_usable = usable;
-            r.residency = Some(pb::ResidencyEvidence { state: state.into(), ..Default::default() });
+            r.residency = Some(pb::ResidencyEvidence {
+                state: state.into(),
+                ..Default::default()
+            });
             r
         };
         let (_, facts) = residency_evidence(true, &recorded, &with("parked", false)).unwrap();
@@ -1019,16 +1057,25 @@ mod tests {
             (true, |r| r.state = "attempted".into()),
             (true, |r| r.processes[0].start_ticks += 1),
             (true, |r| r.processes[1].presence = "gone".into()),
-            (true, |r| r.residency.as_mut().unwrap().state = "restored".into()),
-            (false, |r| r.residency.as_mut().unwrap().state = "parked".into()),
-            (true, |r| r.residency.as_mut().unwrap().state = "unknown".into()),
+            (true, |r| {
+                r.residency.as_mut().unwrap().state = "restored".into()
+            }),
+            (false, |r| {
+                r.residency.as_mut().unwrap().state = "parked".into()
+            }),
+            (true, |r| {
+                r.residency.as_mut().unwrap().state = "unknown".into()
+            }),
             (true, |r| r.residency = None),
         ];
         for (park, edit) in uncertain {
             let mut r = with(if *park { "parked" } else { "restored" }, !park);
             edit(&mut r);
             assert!(
-                matches!(residency_evidence(*park, &recorded, &r), Err(RuntimeError::Uncertain(_))),
+                matches!(
+                    residency_evidence(*park, &recorded, &r),
+                    Err(RuntimeError::Uncertain(_))
+                ),
                 "{r:?}"
             );
         }
@@ -1042,7 +1089,10 @@ mod tests {
     // T20 T26 T27
     #[test]
     fn an_engine_that_exited_before_readiness_is_a_launch_failure() {
-        let mut exited = result(vec![observed("api", 10, "gone"), observed("worker-0", 11, "gone")]);
+        let mut exited = result(vec![
+            observed("api", 10, "gone"),
+            observed("worker-0", 11, "gone"),
+        ]);
         exited.state = "launched".into();
         exited.claim_retained = true;
         exited.launch_failure =
@@ -1059,7 +1109,10 @@ mod tests {
         );
         let mut loading = exited.clone();
         loading.processes[1].presence = "alive".into();
-        assert!(matches!(launch_evidence(&loading), Err(RuntimeError::Uncertain(_))));
+        assert!(matches!(
+            launch_evidence(&loading),
+            Err(RuntimeError::Uncertain(_))
+        ));
         let mut refused = result(vec![]);
         refused.refused = "capability_missing:deep_park".into();
         assert_eq!(
@@ -1084,11 +1137,15 @@ mod tests {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .unwrap();
-        let owned = Arc::new(Mutex::new(crate::OwnedCoordinatorState::open(dir.path()).unwrap()));
+        let owned = Arc::new(Mutex::new(
+            crate::OwnedCoordinatorState::open(dir.path()).unwrap(),
+        ));
         let host = {
             let owner = owned.lock().unwrap();
             let store = owner.store();
-            store.create_host_invitation(&"b".repeat(64), "spark", 100, 0).unwrap();
+            store
+                .create_host_invitation(&"b".repeat(64), "spark", 100, 0)
+                .unwrap();
             store
                 .redeem_host_invitation(
                     &mllm_store::enrollment::Redemption {
@@ -1132,7 +1189,9 @@ mod tests {
             capabilities,
             recorded_at_ms: 1,
         };
-        authority.record_host_version(&host, &declared(vec!["heartbeats".into()])).unwrap();
+        authority
+            .record_host_version(&host, &declared(vec!["heartbeats".into()]))
+            .unwrap();
         assert!(recorded_for(&sessions, &remote, &identities).is_empty());
         authority
             .record_host_version(&host, &declared(capabilities::agent_capabilities()))

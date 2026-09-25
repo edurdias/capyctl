@@ -26,17 +26,18 @@ fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
 fn model_store(host_config: &Path) -> Result<std::path::PathBuf, StructuredError> {
     let text = std::fs::read_to_string(host_config)
         .map_err(|_| error("invalid_config", "Cannot read the host configuration"))?;
-    let host = mllm_config::parse_strict(mllm_config::ConfigKind::Host, &text).map_err(|e| {
-        error(
-            "invalid_config",
-            format!("Invalid host configuration: {e}"),
-        )
-    })?;
+    let host = mllm_config::parse_strict(mllm_config::ConfigKind::Host, &text)
+        .map_err(|e| error("invalid_config", format!("Invalid host configuration: {e}")))?;
     let store = host["model_store"]["path"]
         .as_str()
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| error("invalid_config", "The host configuration names no absolute model store"))?;
+        .ok_or_else(|| {
+            error(
+                "invalid_config",
+                "The host configuration names no absolute model store",
+            )
+        })?;
     Ok(store)
 }
 
@@ -63,9 +64,14 @@ pub fn prune_store(
     apply: bool,
 ) -> Result<Value, StructuredError> {
     let store = model_store(host_config)?;
-    let report = mllm_agent::sources::prune(&store, referenced, apply)
-        .map_err(|_| error("internal", "Cannot read or change the model store's sources"))?;
-    let bytes = |items: &[mllm_agent::sources::PrunedSource]| items.iter().map(|s| s.bytes).sum::<u64>();
+    let report = mllm_agent::sources::prune(&store, referenced, apply).map_err(|_| {
+        error(
+            "internal",
+            "Cannot read or change the model store's sources",
+        )
+    })?;
+    let bytes =
+        |items: &[mllm_agent::sources::PrunedSource]| items.iter().map(|s| s.bytes).sum::<u64>();
     Ok(json!({
         "model_store": store,
         "applied": report.applied,
@@ -133,7 +139,10 @@ mod tests {
             let id = {
                 use sha2::Digest;
                 let digest = sha2::Sha256::digest(key.as_bytes());
-                digest[..12].iter().map(|b| format!("{b:02x}")).collect::<String>()
+                digest[..12]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
             };
             std::fs::write(
                 state.join(format!("{id}.verified")),
@@ -153,7 +162,10 @@ mod tests {
         let referenced = referenced_keys(&json!({"referenced": ["sources/http/aaa"]})).unwrap();
         let listed = prune_store(&host, &referenced, false).unwrap();
         assert_eq!(listed["removed"][0]["key"], "sources/http/bbb");
-        assert!(store.join("sources/http/bbb").is_dir(), "listing removes nothing");
+        assert!(
+            store.join("sources/http/bbb").is_dir(),
+            "listing removes nothing"
+        );
         let applied = prune_store(&host, &referenced, true).unwrap();
         assert_eq!(applied["removed_bytes"], 3);
         assert!(!store.join("sources/http/bbb").exists());

@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use mllm_testkit::FakeEngine;
 use mllm_controller::Controller;
 use mllm_router::admission::InFlight;
 use mllm_router::forwarders::StaticForwarders;
 use mllm_router::{QueueLimits, RouterDeps};
 use mllm_store::Store;
+use mllm_testkit::FakeEngine;
 use tower::ServiceExt;
 
 async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
@@ -29,7 +29,10 @@ async fn app_streaming() -> (axum::Router, Arc<InFlight>, Arc<Controller>) {
             "fake".to_string(),
             fake.clone() as Arc<dyn mllm_adapters::ChatForward>,
         )]))),
-        limits: QueueLimits { max_requests_per_deployment: 8, max_buffered_bytes_total: 64 * 1024 },
+        limits: QueueLimits {
+            max_requests_per_deployment: 8,
+            max_buffered_bytes_total: 64 * 1024,
+        },
         api_key: Some("test-key".into()),
         inflight: Arc::new(mllm_router::admission::InFlight::default()),
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
@@ -71,21 +74,27 @@ async fn streaming_chat_returns_sse_events_in_order() {
                 .body(axum::body::Body::from(
                     serde_json::json!({"model": "stream-m", "stream": true,
                         "messages": [{"role": "user", "content": "hi"}]})
-                        .to_string(),
+                    .to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     let data_lines: Vec<&str> = text
         .lines()
         .filter(|l| l.starts_with("data: "))
         .map(|l| &l[6..])
         .collect();
-    assert_eq!(data_lines.last(), Some(&"[DONE]"), "SSE ends with [DONE]: {text}");
+    assert_eq!(
+        data_lines.last(),
+        Some(&"[DONE]"),
+        "SSE ends with [DONE]: {text}"
+    );
 }
 
 #[tokio::test]

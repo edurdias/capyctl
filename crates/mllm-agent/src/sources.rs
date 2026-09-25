@@ -35,8 +35,8 @@
 mod tar;
 
 use futures::StreamExt;
-use mllm_config::model_source::{pattern_matches, secret_name, Archive, ModelSource};
 use mllm_config::effective::ModelSourcePolicy;
+use mllm_config::model_source::{pattern_matches, secret_name, Archive, ModelSource};
 use serde::{Deserialize, Serialize};
 use sha1::Digest as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -268,7 +268,12 @@ impl SourceStore {
         if let Some(bytes) = self.verified(&key) {
             return SourceStatus::Verified { bytes };
         }
-        if let Some(job) = self.jobs.lock().ok().and_then(|jobs| jobs.get(&key).cloned()) {
+        if let Some(job) = self
+            .jobs
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(&key).cloned())
+        {
             return SourceStatus::Downloading {
                 bytes_done: job.done.load(Ordering::Relaxed),
                 bytes_total: job.total.load(Ordering::Relaxed),
@@ -322,7 +327,11 @@ impl SourceStore {
                 this.log(&format!(
                     "model source {key}: materialization failed: {} (reservation {})",
                     failure.reason,
-                    if failure.reservation_retained { "retained" } else { "released" }
+                    if failure.reservation_retained {
+                        "retained"
+                    } else {
+                        "released"
+                    }
                 ));
                 if let Ok(mut failures) = this.failures.lock() {
                     failures.insert(key.clone(), failure.clone());
@@ -349,7 +358,11 @@ impl SourceStore {
                 SourceStatus::Pending | SourceStatus::Downloading { .. } => {}
             }
             let key = source.store_key().unwrap_or_default();
-            let job = self.jobs.lock().ok().and_then(|jobs| jobs.get(&key).cloned());
+            let job = self
+                .jobs
+                .lock()
+                .ok()
+                .and_then(|jobs| jobs.get(&key).cloned());
             let Some(job) = job else {
                 continue;
             };
@@ -517,16 +530,19 @@ impl SourceStore {
                 if Some(id) == except {
                     continue;
                 }
-                let reservation: Reservation = serde_json::from_slice(&fs::read(entry.path())?)
-                    .map_err(io::Error::other)?;
+                let reservation: Reservation =
+                    serde_json::from_slice(&fs::read(entry.path())?).map_err(io::Error::other)?;
                 // A reservation whose copy was already committed is charged by
                 // its marker instead.
                 if self.read_marker(id).is_some_and(|m| m.state == "verified") {
                     continue;
                 }
                 charged = charged.saturating_add(reservation.bytes);
-                outstanding = outstanding
-                    .saturating_add(reservation.bytes.saturating_sub(dir_bytes(&self.partial_dir(id))));
+                outstanding = outstanding.saturating_add(
+                    reservation
+                        .bytes
+                        .saturating_sub(dir_bytes(&self.partial_dir(id))),
+                );
             }
         }
         Ok((charged, outstanding))
@@ -553,7 +569,11 @@ impl SourceStore {
         };
         let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
         let name = secret_name(reference).ok_or_else(unavailable)?;
-        let path = self.secrets_dir.as_ref().ok_or_else(unavailable)?.join(name);
+        let path = self
+            .secrets_dir
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .join(name);
         let metadata = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
         // SPEC §13.3: a credential is private state; no group or other access,
         // owned by the account this agent runs as.
@@ -573,7 +593,12 @@ impl SourceStore {
         Ok(Some(Secret(token)))
     }
 
-    fn get(&self, url: reqwest::Url, token: Option<&Secret>, offset: u64) -> reqwest::RequestBuilder {
+    fn get(
+        &self,
+        url: reqwest::Url,
+        token: Option<&Secret>,
+        offset: u64,
+    ) -> reqwest::RequestBuilder {
         let mut request = self.client.get(url);
         if let Some(token) = token {
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.0))
@@ -619,11 +644,16 @@ impl SourceStore {
                 url,
                 sha256,
                 archive,
-            } => self.fetch_http(key, id, url, sha256, *archive, &partial, job).await?,
+            } => {
+                self.fetch_http(key, id, url, sha256, *archive, &partial, job)
+                    .await?
+            }
             ModelSource::Local { .. } => return Err(SourceFailure::new(reason::NOT_REMOTE)),
         };
         self.commit(key, id, &tree, bytes, files)?;
-        self.log(&format!("model source {key}: verified ({bytes} bytes, {files} files)"));
+        self.log(&format!(
+            "model source {key}: verified ({bytes} bytes, {files} files)"
+        ));
         Ok(bytes)
     }
 
@@ -675,8 +705,8 @@ impl SourceStore {
                 return Err(SourceFailure::new(reason::INVALID_LISTING));
             }
         }
-        let listing: Listing =
-            serde_json::from_slice(&body).map_err(|_| SourceFailure::new(reason::INVALID_LISTING))?;
+        let listing: Listing = serde_json::from_slice(&body)
+            .map_err(|_| SourceFailure::new(reason::INVALID_LISTING))?;
         // The hub must answer for the pinned commit, not whatever a name moved to.
         if listing.sha != revision {
             return Err(SourceFailure::new(reason::INVALID_LISTING));
@@ -684,10 +714,15 @@ impl SourceStore {
         let mut plan = Vec::new();
         let mut seen = BTreeSet::new();
         for sibling in listing.siblings {
-            if !patterns.is_empty() && !patterns.iter().any(|p| pattern_matches(p, &sibling.rfilename)) {
+            if !patterns.is_empty()
+                && !patterns
+                    .iter()
+                    .any(|p| pattern_matches(p, &sibling.rfilename))
+            {
                 continue;
             }
-            if !safe_repository_path(&sibling.rfilename) || !seen.insert(sibling.rfilename.clone()) {
+            if !safe_repository_path(&sibling.rfilename) || !seen.insert(sibling.rfilename.clone())
+            {
                 return Err(SourceFailure::new(reason::INVALID_LISTING));
             }
             let (size, expected) = match (sibling.lfs, sibling.blob_id, sibling.size) {
@@ -750,8 +785,17 @@ impl SourceStore {
         let mut hasher = Hasher::new(&file.expected, file.size);
         let offset = self.resume(&part, &mut hasher, file.size)?;
         job.done.fetch_add(offset, Ordering::Relaxed);
-        self.stream_into(None, file.url.clone(), token, &part, offset, file.size, &mut hasher, job)
-            .await?;
+        self.stream_into(
+            None,
+            file.url.clone(),
+            token,
+            &part,
+            offset,
+            file.size,
+            &mut hasher,
+            job,
+        )
+        .await?;
         if !hasher.matches(&file.expected) {
             return Err(SourceFailure::new(reason::HASH_MISMATCH));
         }
@@ -925,9 +969,18 @@ impl SourceStore {
 
     /// Put a verified tree in place: record `committing`, rename atomically,
     /// record `verified`, then release the reservation and the partial dir.
-    fn commit(&self, key: &str, id: &str, tree: &Path, bytes: u64, files: u64) -> Result<(), SourceFailure> {
+    fn commit(
+        &self,
+        key: &str,
+        id: &str,
+        tree: &Path,
+        bytes: u64,
+        files: u64,
+    ) -> Result<(), SourceFailure> {
         let target = self.store.join(key);
-        let parent = target.parent().ok_or(SourceFailure::new(reason::IO_ERROR))?;
+        let parent = target
+            .parent()
+            .ok_or(SourceFailure::new(reason::IO_ERROR))?;
         fs::create_dir_all(parent).map_err(io_failure)?;
         let marker_path = self.state_dir().join(format!("{id}.verified"));
         let marker = Marker {
@@ -1026,9 +1079,9 @@ fn safe_repository_path(path: &str) -> bool {
         && !path.starts_with('/')
         && !path.contains('\\')
         && !path.chars().any(char::is_control)
-        && path
-            .split('/')
-            .all(|segment| !segment.is_empty() && segment != "." && segment != ".." && !segment.ends_with(".part"))
+        && path.split('/').all(|segment| {
+            !segment.is_empty() && segment != "." && segment != ".." && !segment.ends_with(".part")
+        })
 }
 
 /// The file name an `http` payload is stored under: the URL's last path
@@ -1187,7 +1240,10 @@ pub fn prune(
         };
         // Only mllm's own keys, and only inside `sources/`.
         let key_ok = marker.key.starts_with("sources/")
-            && !marker.key.split('/').any(|s| s == ".." || s == "." || s.is_empty() || s == STATE_DIR)
+            && !marker
+                .key
+                .split('/')
+                .any(|s| s == ".." || s == "." || s.is_empty() || s == STATE_DIR)
             && SourceStore::id(&marker.key) == id;
         if !key_ok {
             report.skipped.push(entry);
@@ -1228,7 +1284,15 @@ mod tests {
     fn repository_paths_and_names_are_confined() {
         assert!(safe_repository_path("model-00001-of-00002.safetensors"));
         assert!(safe_repository_path("tokenizer/vocab.json"));
-        for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "a\\b", "x.part"] {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a//b",
+            "a\\b",
+            "x.part",
+        ] {
             assert!(!safe_repository_path(bad), "{bad}");
         }
         assert_eq!(file_name("https://h/p/model.gguf?x=1"), "model.gguf");

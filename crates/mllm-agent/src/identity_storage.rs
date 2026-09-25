@@ -45,7 +45,9 @@ impl Drop for IdentityDirectory {
         // its open description until exec, so close alone can retain ownership.
         // An inherited Rust value must never unlock the original process's lock.
         if unsafe { libc::getpid() } == self.owner_pid {
-            unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN); }
+            unsafe {
+                libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 }
@@ -217,7 +219,9 @@ impl IdentityDirectory {
     }
 
     fn revalidate(&self) -> Result<(), StorageError> {
-        if unsafe { libc::getpid() } != self.owner_pid { return Err(StorageError::Invalid); }
+        if unsafe { libc::getpid() } != self.owner_pid {
+            return Err(StorageError::Invalid);
+        }
         validate_directory(&self.path, self.uid)?;
         if !same(
             &self.metadata,

@@ -222,7 +222,10 @@ async fn drain(
         .cloned()
         .unwrap_or_default();
     let refused = accepted["refused"].clone();
-    let host_state = accepted["host_state"].as_str().unwrap_or("online").to_owned();
+    let host_state = accepted["host_state"]
+        .as_str()
+        .unwrap_or("online")
+        .to_owned();
     // Owner decision 4: an offline host's Stops wait for it to reconnect; say so
     // at once instead of polling out the whole window.
     if host_state == "offline" && !wait && !expired {
@@ -258,8 +261,8 @@ async fn drain(
         .saturating_add(SETTLE_MARGIN_MS)
         .saturating_sub(now_ms()?)
         .max(0);
-    let wait_until = tokio::time::Instant::now()
-        + Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
+    let wait_until =
+        tokio::time::Instant::now() + Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
     let mut backoff = FIRST_BACKOFF;
     let settled = loop {
         // SPEC §6.4: a transient failure of one status read does not end the
@@ -472,7 +475,9 @@ mod tests {
         let root = root();
         let journal = journal(root.path(), &endpoint, &ulid::Ulid::new().to_string());
         let started = std::time::Instant::now();
-        let report = drain(&endpoint, "token", "lab", &journal, false).await.unwrap();
+        let report = drain(&endpoint, "token", "lab", &journal, false)
+            .await
+            .unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(report["drained"], false, "{report}");
         assert_eq!(report["host_state"], "offline", "{report}");
@@ -490,8 +495,13 @@ mod tests {
         let (endpoint, seen) = management(2, 0).await;
         let root = root();
         let journal = journal(root.path(), &endpoint, &ulid::Ulid::new().to_string());
-        let report = drain(&endpoint, "token", "lab", &journal, true).await.unwrap();
-        assert!(seen.reads.load(Ordering::SeqCst) >= 3, "it polled until settled");
+        let report = drain(&endpoint, "token", "lab", &journal, true)
+            .await
+            .unwrap();
+        assert!(
+            seen.reads.load(Ordering::SeqCst) >= 3,
+            "it polled until settled"
+        );
         assert_eq!(report["drained"], true, "{report}");
         assert_eq!(report["host_state"], "offline", "{report}");
         assert_eq!(report["deployments"][0]["state"], "succeeded", "{report}");
@@ -505,8 +515,13 @@ mod tests {
         let (endpoint, seen) = management(3, 2).await;
         let root = root();
         let journal = journal(root.path(), &endpoint, &ulid::Ulid::new().to_string());
-        let report = drain(&endpoint, "token", "lab", &journal, true).await.unwrap();
-        assert!(seen.reads.load(Ordering::SeqCst) >= 4, "the failed reads were retried");
+        let report = drain(&endpoint, "token", "lab", &journal, true)
+            .await
+            .unwrap();
+        assert!(
+            seen.reads.load(Ordering::SeqCst) >= 4,
+            "the failed reads were retried"
+        );
         assert_eq!(report["drained"], true, "{report}");
     }
 
@@ -518,21 +533,33 @@ mod tests {
     async fn the_deadline_is_journaled_and_replayed() {
         let (endpoint, seen) = management(0, 0).await;
         let root = root();
-        let old = ulid::Ulid::from_parts(
-            u64::try_from(now_ms().unwrap() - 3_600_000).unwrap(),
-            7,
-        )
-        .to_string();
+        let old = ulid::Ulid::from_parts(u64::try_from(now_ms().unwrap() - 3_600_000).unwrap(), 7)
+            .to_string();
         let before = now_ms().unwrap();
-        drain(&endpoint, "token", "lab", &journal(root.path(), &endpoint, &old), false)
-            .await
-            .unwrap();
-        drain(&endpoint, "token", "lab", &journal(root.path(), &endpoint, &old), false)
-            .await
-            .unwrap();
+        drain(
+            &endpoint,
+            "token",
+            "lab",
+            &journal(root.path(), &endpoint, &old),
+            false,
+        )
+        .await
+        .unwrap();
+        drain(
+            &endpoint,
+            "token",
+            "lab",
+            &journal(root.path(), &endpoint, &old),
+            false,
+        )
+        .await
+        .unwrap();
         let deadlines = seen.deadlines.lock().unwrap().clone();
         assert_eq!(deadlines.len(), 2);
-        assert_eq!(deadlines[0], deadlines[1], "a replay sends the journaled deadline");
+        assert_eq!(
+            deadlines[0], deadlines[1],
+            "a replay sends the journaled deadline"
+        );
         assert!(deadlines[0] >= before + DRAIN_WINDOW_MS, "{deadlines:?}");
     }
 
@@ -557,10 +584,20 @@ mod tests {
             )
             .unwrap();
         drop(saved);
-        let report = drain(&endpoint, "token", "lab", &journal(root.path(), &endpoint, &id), false)
-            .await
-            .unwrap();
-        assert_eq!(seen.posts.load(Ordering::SeqCst), 0, "an expired drain was sent");
+        let report = drain(
+            &endpoint,
+            "token",
+            "lab",
+            &journal(root.path(), &endpoint, &id),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            seen.posts.load(Ordering::SeqCst),
+            0,
+            "an expired drain was sent"
+        );
         assert_eq!(report["deployments"][0]["operation_id"], "op-1", "{report}");
         assert_eq!(report["drained"], true, "{report}");
 
@@ -570,9 +607,15 @@ mod tests {
             .prepare("drain", "/hosts/lab/drain", json!({"deadline_ms": 1_000}))
             .unwrap();
         drop(saved);
-        let refused = drain(&endpoint, "token", "lab", &journal(root.path(), &endpoint, &lost), false)
-            .await
-            .unwrap_err();
+        let refused = drain(
+            &endpoint,
+            "token",
+            "lab",
+            &journal(root.path(), &endpoint, &lost),
+            false,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(refused.code, "command_rejected");
         assert_eq!(seen.posts.load(Ordering::SeqCst), 0);
     }

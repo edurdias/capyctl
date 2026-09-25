@@ -56,7 +56,9 @@ fn lifecycle_deadline(
 /// Initialize window when none is recorded), within the request deadline.
 fn wake_deadline(commands: &CoordinatorCommands, deployment: &str) -> Result<i64, LifecycleFault> {
     let windows = commands.read(|store| store.lifecycle_windows(deployment))?;
-    let window = windows.map_or(ACTIVATION_WINDOW_MS, |w| w.wake_ms.unwrap_or(w.initialize_ms));
+    let window = windows.map_or(ACTIVATION_WINDOW_MS, |w| {
+        w.wake_ms.unwrap_or(w.initialize_ms)
+    });
     commands
         .now_ms()?
         .checked_add(window)
@@ -169,7 +171,9 @@ impl CoordinatorLifecycle {
     /// policies the store holds (`resource_policy.queue`, SPEC §16.2): the
     /// tightest of every published host's, since one router queue serves
     /// them all. `None` while no host has published a policy.
-    pub fn queue_policy(&self) -> Result<Option<mllm_config::effective::QueuePolicy>, LifecycleFault> {
+    pub fn queue_policy(
+        &self,
+    ) -> Result<Option<mllm_config::effective::QueuePolicy>, LifecycleFault> {
         let owner = self.commands.owner_for_read()?;
         owner
             .store()
@@ -217,15 +221,17 @@ impl CoordinatorLifecycle {
             })?;
         // The binding recorded the authority it leased; a caller needs a URL to send
         // to, and forming it here is what keeps every caller from guessing a scheme.
-        let remote = owner.store().remote_ingress_endpoint(&binding.id)
-            .map_err(|_| LifecycleFault::Unavailable("remote ingress binding unavailable".into()))?;
+        let remote = owner
+            .store()
+            .remote_ingress_endpoint(&binding.id)
+            .map_err(|_| {
+                LifecycleFault::Unavailable("remote ingress binding unavailable".into())
+            })?;
         let endpoint = match remote {
             // SPEC §§6.1, 13.2 (G2): a remote engine's readiness belongs to the
             // host session that proved it. While that is unproven the host's
             // gate is closed, and forwarding would only fail after admission.
-            Some(_)
-                if !gate_open =>
-            {
+            Some(_) if !gate_open => {
                 return Err(LifecycleFault::Unavailable(format!(
                     "deployment {deployment}: remote host readiness is being re-proven; \
                      dispatch is closed"
@@ -241,7 +247,9 @@ impl CoordinatorLifecycle {
                 && owner
                     .store()
                     .get_deployment(deployment)?
-                    .is_some_and(|row| row.observed_state == mllm_domain::LifecycleState::Ready) =>
+                    .is_some_and(|row| {
+                        row.observed_state == mllm_domain::LifecycleState::Ready
+                    }) =>
             {
                 return Err(LifecycleFault::Unavailable(format!(
                     "deployment {deployment}: readiness of the adopted engine is being \
@@ -249,14 +257,14 @@ impl CoordinatorLifecycle {
                 )));
             }
             None => crate::port::engine_url(&binding.endpoint)
-            .ok_or_else(|| {
-                LifecycleFault::Conflict(format!(
-                    "deployment {deployment} recorded an endpoint that names no \
+                .ok_or_else(|| {
+                    LifecycleFault::Conflict(format!(
+                        "deployment {deployment} recorded an endpoint that names no \
                      address: {}",
-                    binding.endpoint
-                ))
-            })?
-            .to_string(),
+                        binding.endpoint
+                    ))
+                })?
+                .to_string(),
         };
         Ok(RuntimeEndpoint {
             endpoint,
@@ -520,7 +528,12 @@ impl CoordinatorLifecycle {
         Ok(row)
     }
 
-    fn activate_revision(&self, deployment: &str, row: &DeploymentRow, revision: i64) -> Result<Activation, LifecycleFault> {
+    fn activate_revision(
+        &self,
+        deployment: &str,
+        row: &DeploymentRow,
+        revision: i64,
+    ) -> Result<Activation, LifecycleFault> {
         let key = Self::activation_key(deployment, revision, row.current_generation);
         // Owner decision Q5, ADR 0013 §4 (W5): a parked instance is restored in
         // place, on the host it parked on, before anything starts cold; a
@@ -641,8 +654,10 @@ impl LifecyclePort for CoordinatorLifecycle {
     {
         let lease = self.leases.open(deployment, max_per_deployment).await?;
         // SPEC §6.5 (W5): router activity restarts the ready-idle timer.
-        self.commands
-            .note_activity(deployment, lease.instance().map(|(_, generation)| generation));
+        self.commands.note_activity(
+            deployment,
+            lease.instance().map(|(_, generation)| generation),
+        );
         Ok(Some(lease))
     }
 
@@ -677,23 +692,27 @@ impl LifecyclePort for CoordinatorLifecycle {
         Ok(Some(
             rows.into_iter()
                 .map(|row| {
-                    let (host_live, host_unresponsive, load) = match (&self.routing, &row.remote_host) {
-                        // SPEC §13.2: a remote instance serves only while its
-                        // host's control session is current.
-                        (Some(routing), Some(host)) => (
-                            (routing.host_live)(host),
-                            (routing.host_unresponsive)(host),
-                            routing.load.fresh_at(
-                                &crate::load_table::InstanceKey::new(deployment, row.generation),
-                                host,
-                                now,
+                    let (host_live, host_unresponsive, load) =
+                        match (&self.routing, &row.remote_host) {
+                            // SPEC §13.2: a remote instance serves only while its
+                            // host's control session is current.
+                            (Some(routing), Some(host)) => (
+                                (routing.host_live)(host),
+                                (routing.host_unresponsive)(host),
+                                routing.load.fresh_at(
+                                    &crate::load_table::InstanceKey::new(
+                                        deployment,
+                                        row.generation,
+                                    ),
+                                    host,
+                                    now,
+                                ),
                             ),
-                        ),
-                        // An embedded engine has no session to lose and no
-                        // reported load; a server without routing signals
-                        // relies on the dispatch gate alone.
-                        _ => (true, false, None),
-                    };
+                            // An embedded engine has no session to lose and no
+                            // reported load; a server without routing signals
+                            // relies on the dispatch gate alone.
+                            _ => (true, false, None),
+                        };
                     crate::port::ServingInstance {
                         instance_index: row.instance_index,
                         generation: row.generation,
@@ -818,7 +837,9 @@ impl LifecyclePort for CoordinatorLifecycle {
     async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
         match self.activate_once(deployment)? {
             Activation::Accepted(handle) => Ok(handle),
-            Activation::Capacity => Err(mllm_store::lifecycle::LifecycleError::CapacityBlocked.into()),
+            Activation::Capacity => {
+                Err(mllm_store::lifecycle::LifecycleError::CapacityBlocked.into())
+            }
             Activation::Fault(fault) => Err(fault),
         }
     }
@@ -902,10 +923,11 @@ impl LifecyclePort for CoordinatorLifecycle {
                     if let Some(room) = room.as_ref().filter(|r| !r.switch_id.is_empty()) {
                         match &outcome {
                             Ok(_) => self.switching.completed(room, deployment),
-                            Err(error) => {
-                                self.switching
-                                    .activation_failed(room, deployment, &error.to_string())
-                            }
+                            Err(error) => self.switching.activation_failed(
+                                room,
+                                deployment,
+                                &error.to_string(),
+                            ),
                         }
                     }
                     outcome?;
@@ -966,15 +988,16 @@ impl LifecyclePort for CoordinatorLifecycle {
                     Err(error) => return Err(error.into()),
                 };
                 // Owner decision Q5: an explicit start targets every instance.
-                let operation = match self
-                    .commands
-                    .start(ROUTER_PRINCIPAL, deployment, revision, &key, deadline)
-                {
+                let operation = match self.commands.start(
+                    ROUTER_PRINCIPAL,
+                    deployment,
+                    revision,
+                    &key,
+                    deadline,
+                ) {
                     Ok(receipt) => receipt.operation_id().to_string(),
                     // Every instance was parked (now waking) or running.
-                    Err(_) if woken.is_some() => {
-                        woken.map(|w| w.operation_id).unwrap_or_default()
-                    }
+                    Err(_) if woken.is_some() => woken.map(|w| w.operation_id).unwrap_or_default(),
                     Err(error) => return Err(error.into()),
                 };
                 Ok(OperationHandle {

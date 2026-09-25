@@ -8,16 +8,16 @@ mod legacy;
 mod snapshot;
 mod startup;
 mod timeouts;
+pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
+pub use engine_config::{
+    default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
+    MemoryInputs, ResolvedMemory, PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES,
+    STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
+};
 pub use legacy::{
     is_legacy_effective, legacy_engine_config, legacy_retained_deployment,
     migrate_legacy_effective, strip_legacy_launch_settings, LegacyEffectiveMigration,
     LegacyRefusal,
-};
-pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
-pub use engine_config::{
-    default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
-    MemoryInputs, ResolvedMemory, STARTUP_WEIGHTS_FACTOR,
-    PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES, VLLM_OVERHEAD_MARGIN_BYTES,
 };
 pub use snapshot::decode_effective_snapshot;
 // Owner decision 2026-09-23: the startup memory budget.
@@ -28,8 +28,8 @@ pub use startup::{
 pub use timeouts::{
     derived_initialize_ms, derived_wake_ms, lifecycle_windows, validate_declared_timeouts,
     DeploymentTimeouts, TimeoutBasis, TimeoutSource, INITIALIZE_BASE_MS, INITIALIZE_CAP_MS,
-    INITIALIZE_PER_GB_MS, MIN_INITIALIZE_MS, MIN_WAKE_MS, PENDING_INITIALIZE_MS,
-    PENDING_WAKE_MS, STOP_WINDOW_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
+    INITIALIZE_PER_GB_MS, MIN_INITIALIZE_MS, MIN_WAKE_MS, PENDING_INITIALIZE_MS, PENDING_WAKE_MS,
+    STOP_WINDOW_MS, WAKE_BASE_MS, WAKE_CAP_MS, WAKE_PER_GB_MS,
 };
 // ADR 0014 §7 (WE3): checkpoint identity.
 pub use checkpoint::{

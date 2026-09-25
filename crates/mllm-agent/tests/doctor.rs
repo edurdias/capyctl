@@ -16,7 +16,10 @@ fn doctor_reports_profile_presence_and_fingerprint() {
     let p = &report.profiles[0];
     assert_eq!(p.name, "echo-profile");
     assert!(p.command_exists);
-    assert!(p.build_fingerprint.is_some(), "echo output becomes the fingerprint");
+    assert!(
+        p.build_fingerprint.is_some(),
+        "echo output becomes the fingerprint"
+    );
     assert!(p.fingerprint_redacted, "no secrets in fingerprints");
 }
 

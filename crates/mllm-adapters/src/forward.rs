@@ -27,29 +27,72 @@ impl ChatSink for CallbackSink<'_> {
 /// server-side chat template), is refused before forwarding, never dropped.
 pub const CHAT_REQUEST_FIELDS: &[&str] = &[
     // OpenAI chat completions.
-    "model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens",
-    "temperature", "top_p", "n", "stop", "presence_penalty", "frequency_penalty",
-    "logit_bias", "logprobs", "top_logprobs", "user", "seed", "tools", "tool_choice",
-    "parallel_tool_calls", "response_format", "functions", "function_call",
-    "reasoning_effort", "modalities", "metadata",
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "n",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "user",
+    "seed",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
+    "functions",
+    "function_call",
+    "reasoning_effort",
+    "modalities",
+    "metadata",
     // Sampling extensions.
-    "top_k", "min_p", "repetition_penalty", "min_tokens", "stop_token_ids", "ignore_eos",
-    "skip_special_tokens", "spaces_between_special_tokens", "include_stop_str_in_output",
-    "no_stop_trim", "length_penalty",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "min_tokens",
+    "stop_token_ids",
+    "ignore_eos",
+    "skip_special_tokens",
+    "spaces_between_special_tokens",
+    "include_stop_str_in_output",
+    "no_stop_trim",
+    "length_penalty",
     // Chat templating inputs (never the template itself).
-    "chat_template_kwargs", "add_generation_prompt", "continue_final_message", "echo",
+    "chat_template_kwargs",
+    "add_generation_prompt",
+    "continue_final_message",
+    "echo",
     "documents",
     // Structured output.
-    "guided_json", "guided_regex", "guided_choice", "guided_grammar", "structured_outputs",
-    "json_schema", "regex", "ebnf",
+    "guided_json",
+    "guided_regex",
+    "guided_choice",
+    "guided_grammar",
+    "structured_outputs",
+    "json_schema",
+    "regex",
+    "ebnf",
     // Reasoning.
-    "separate_reasoning", "stream_reasoning", "include_reasoning",
+    "separate_reasoning",
+    "stream_reasoning",
+    "include_reasoning",
 ];
 
 /// Whether `body` is a JSON object carrying only [`CHAT_REQUEST_FIELDS`].
 pub fn chat_request_allowed(body: &Value) -> bool {
-    body.as_object()
-        .is_some_and(|fields| fields.keys().all(|name| CHAT_REQUEST_FIELDS.contains(&name.as_str())))
+    body.as_object().is_some_and(|fields| {
+        fields
+            .keys()
+            .all(|name| CHAT_REQUEST_FIELDS.contains(&name.as_str()))
+    })
 }
 
 /// Why a chat request is refused before anything is sent to an engine.
@@ -99,7 +142,9 @@ impl From<ChatRequestRefusal> for AdapterError {
 /// validates, and neither vLLM nor SGLang documents it as supported).
 pub fn validate_chat_request(body: &Value) -> Result<(), ChatRequestRefusal> {
     let Some(fields) = body.as_object() else {
-        return Err(ChatRequestRefusal::Malformed("the body is not a JSON object"));
+        return Err(ChatRequestRefusal::Malformed(
+            "the body is not a JSON object",
+        ));
     };
     if let Some(name) = fields
         .keys()
@@ -114,7 +159,10 @@ pub fn validate_chat_request(body: &Value) -> Result<(), ChatRequestRefusal> {
     {
         return Err(ChatRequestRefusal::Malformed("model is required"));
     }
-    if fields.get("n").is_some_and(|n| !n.is_null() && n.as_u64() != Some(1)) {
+    if fields
+        .get("n")
+        .is_some_and(|n| !n.is_null() && n.as_u64() != Some(1))
+    {
         return Err(ChatRequestRefusal::Unsupported("n other than 1"));
     }
     if fields.contains_key("functions") || fields.contains_key("function_call") {
@@ -198,7 +246,14 @@ impl ChatHttp {
     ) -> Result<Value, AdapterError> {
         let mut chunks = Vec::new();
         let end = self
-            .stream_inner(body, &mut Collecting { chunks: &mut chunks, observer }, read_idle)
+            .stream_inner(
+                body,
+                &mut Collecting {
+                    chunks: &mut chunks,
+                    observer,
+                },
+                read_idle,
+            )
             .await?;
         if end != StreamEnded::Completed {
             return Err(uncertain());
@@ -258,9 +313,9 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
         match &chunk["choices"][0]["logprobs"] {
             Value::Null => {}
             Value::Object(block) => match block.get("content") {
-                Some(Value::Array(tokens)) => {
-                    logprobs.get_or_insert_with(Vec::new).extend(tokens.iter().cloned())
-                }
+                Some(Value::Array(tokens)) => logprobs
+                    .get_or_insert_with(Vec::new)
+                    .extend(tokens.iter().cloned()),
                 None | Some(Value::Null) => {}
                 Some(_) => return Err(uncertain()),
             },
@@ -301,7 +356,6 @@ fn assemble(chunks: Vec<String>) -> Result<Value, AdapterError> {
 }
 
 impl ChatHttp {
-
     /// The callback and collecting paths have no caller-side bound, so they
     /// keep the transport's own: 60 s between reads and 300 s overall.
     pub(crate) async fn stream(
@@ -311,7 +365,11 @@ impl ChatHttp {
     ) -> Result<StreamEnded, AdapterError> {
         tokio::time::timeout(
             Duration::from_secs(300),
-            self.stream_inner(body, &mut CallbackSink(on_chunk), Some(Duration::from_secs(60))),
+            self.stream_inner(
+                body,
+                &mut CallbackSink(on_chunk),
+                Some(Duration::from_secs(60)),
+            ),
         )
         .await
         .map_err(|_| uncertain())?
@@ -683,7 +741,10 @@ impl<'a> Parser<'a> {
             // A null role is an absent role: SGLang 0.5.20 serializes every
             // tool-call delta with `"role": null` (found live 2026-09-24).
             if delta.keys().any(|k| {
-                !matches!(k.as_str(), "role" | "content" | "reasoning_content" | "tool_calls")
+                !matches!(
+                    k.as_str(),
+                    "role" | "content" | "reasoning_content" | "tool_calls"
+                )
             }) || delta
                 .get("role")
                 .is_some_and(|r| !r.is_null() && r != "assistant")
@@ -701,7 +762,10 @@ impl<'a> Parser<'a> {
             match choices[0].get("finish_reason") {
                 Some(Value::Null) => {}
                 Some(Value::String(s))
-                    if matches!(s.as_str(), "stop" | "length" | "content_filter" | "tool_calls") =>
+                    if matches!(
+                        s.as_str(),
+                        "stop" | "length" | "content_filter" | "tool_calls"
+                    ) =>
                 {
                     self.finished = true
                 }
@@ -718,7 +782,8 @@ impl<'a> Parser<'a> {
 /// with an integer `index` and optional `id`, `type` ("function") and
 /// `function` (`name`, `arguments` strings). Anything else stays uncertain.
 fn valid_tool_call_deltas(calls: &Value) -> bool {
-    let optional_string = |value: Option<&Value>| value.is_none_or(|v| v.is_null() || v.is_string());
+    let optional_string =
+        |value: Option<&Value>| value.is_none_or(|v| v.is_null() || v.is_string());
     calls.as_array().is_some_and(|calls| {
         calls.iter().all(|call| {
             call.as_object().is_some_and(|call| {
@@ -749,7 +814,9 @@ fn valid_tool_call_deltas(calls: &Value) -> bool {
 /// `arguments` fragments are concatenated in stream order.
 fn fold_tool_calls(calls: &mut std::collections::BTreeMap<u64, Value>, deltas: &Value) {
     for delta in deltas.as_array().into_iter().flatten() {
-        let Some(index) = delta["index"].as_u64() else { continue };
+        let Some(index) = delta["index"].as_u64() else {
+            continue;
+        };
         let call = calls.entry(index).or_insert_with(|| {
             json!({"id": Value::Null, "type": "function",
                    "function": {"name": "", "arguments": ""}})
@@ -858,7 +925,8 @@ mod tests {
     async fn only_a_shutting_down_refusal_proves_the_engine_never_saw_the_request() {
         let request = serde_json::json!({"model":"m","messages":[]});
         let refusal = serde_json::json!({"error":{"code":"shutting_down","message":"restarting","retryable":true}});
-        let forward = crate::forward::engine_forwarder(answering(503, refusal).await, "m".into(), None);
+        let forward =
+            crate::forward::engine_forwarder(answering(503, refusal).await, "m".into(), None);
         assert!(matches!(
             forward.forward_chat(&request).await,
             Err(AdapterError::NotAccepted(_))
@@ -868,14 +936,16 @@ mod tests {
             serde_json::json!({"error":{"code":"shutting_down"}}),
             serde_json::json!({"object":"error","code":503}),
         ] {
-            let forward = crate::forward::engine_forwarder(answering(503, body).await, "m".into(), None);
+            let forward =
+                crate::forward::engine_forwarder(answering(503, body).await, "m".into(), None);
             assert!(matches!(
                 forward.forward_chat(&request).await,
                 Err(AdapterError::Uncertain(_))
             ));
         }
         let refusal = serde_json::json!({"error":{"code":"shutting_down","retryable":true}});
-        let forward = crate::forward::engine_forwarder(answering(500, refusal).await, "m".into(), None);
+        let forward =
+            crate::forward::engine_forwarder(answering(500, refusal).await, "m".into(), None);
         assert!(matches!(
             forward.forward_chat(&request).await,
             Err(AdapterError::Uncertain(_))
@@ -893,13 +963,29 @@ mod tests {
     async fn an_invalid_request_rejection_is_terminal_and_keeps_the_engine_message() {
         let request = serde_json::json!({"model":"m","messages":[]});
         for (status, body, needle) in [
-            (400, serde_json::json!({"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}), "maximum context length"),
-            (422, serde_json::json!({"object":"error","message":"tool_choice requires a parser","code":422}), "tool_choice"),
-            (413, serde_json::json!({"error":{"code":"engine_rejected","message":"prompt too large"}}), "prompt too large"),
+            (
+                400,
+                serde_json::json!({"error":{"message":"This model's maximum context length is 16384 tokens.","type":"BadRequestError","code":400}}),
+                "maximum context length",
+            ),
+            (
+                422,
+                serde_json::json!({"object":"error","message":"tool_choice requires a parser","code":422}),
+                "tool_choice",
+            ),
+            (
+                413,
+                serde_json::json!({"error":{"code":"engine_rejected","message":"prompt too large"}}),
+                "prompt too large",
+            ),
         ] {
-            let forward = crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
+            let forward =
+                crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
             match forward.forward_chat(&request).await {
-                Err(AdapterError::Rejected { status: got, message }) => {
+                Err(AdapterError::Rejected {
+                    status: got,
+                    message,
+                }) => {
                     assert_eq!(got, status);
                     assert!(message.contains(needle), "{message}");
                 }
@@ -908,9 +994,14 @@ mod tests {
         }
         let long = "x".repeat(4000);
         let forward = crate::forward::engine_forwarder(
-            answering(400, serde_json::json!({"error":{"message": long}})).await, "m".into(), None);
+            answering(400, serde_json::json!({"error":{"message": long}})).await,
+            "m".into(),
+            None,
+        );
         match forward.forward_chat(&request).await {
-            Err(AdapterError::Rejected { message, .. }) => assert!(message.len() <= 512, "{}", message.len()),
+            Err(AdapterError::Rejected { message, .. }) => {
+                assert!(message.len() <= 512, "{}", message.len())
+            }
             other => panic!("{:?}", other.map(|_| ())),
         }
         for (status, body) in [
@@ -918,8 +1009,15 @@ mod tests {
             (401, serde_json::json!({"error":{"message":"Unauthorized"}})),
             (500, serde_json::json!({"error":{"message":"boom"}})),
         ] {
-            let forward = crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
-            assert!(matches!(forward.forward_chat(&request).await, Err(AdapterError::Uncertain(_))), "status {status}");
+            let forward =
+                crate::forward::engine_forwarder(answering(status, body).await, "m".into(), None);
+            assert!(
+                matches!(
+                    forward.forward_chat(&request).await,
+                    Err(AdapterError::Uncertain(_))
+                ),
+                "status {status}"
+            );
         }
     }
 
@@ -981,23 +1079,49 @@ mod tests {
         ] {
             assert!(chat_request_allowed(&allowed), "{allowed}");
         }
-        for field in ["rid", "lora_path", "return_hidden_states", "custom_logit_processor",
-                      "bootstrap_host", "bootstrap_port", "bootstrap_room", "kv_transfer_params",
-                      "vllm_xargs", "priority", "chat_template", "logits_processors",
-                      "unknown_engine_field"] {
+        for field in [
+            "rid",
+            "lora_path",
+            "return_hidden_states",
+            "custom_logit_processor",
+            "bootstrap_host",
+            "bootstrap_port",
+            "bootstrap_room",
+            "kv_transfer_params",
+            "vllm_xargs",
+            "priority",
+            "chat_template",
+            "logits_processors",
+            "unknown_engine_field",
+        ] {
             let mut body = serde_json::json!({"model":"m","messages":[]});
             body[field] = serde_json::json!(1);
             assert!(!chat_request_allowed(&body), "{field}");
             let forward = crate::forward::engine_forwarder(
-                answering(200, serde_json::json!({})).await, "m".into(), None);
-            assert!(matches!(forward.forward_chat(&body).await, Err(AdapterError::PolicyDenied)),
-                    "{field}");
+                answering(200, serde_json::json!({})).await,
+                "m".into(),
+                None,
+            );
+            assert!(
+                matches!(
+                    forward.forward_chat(&body).await,
+                    Err(AdapterError::PolicyDenied)
+                ),
+                "{field}"
+            );
         }
-        assert!(!chat_request_allowed(&serde_json::json!(["not", "an", "object"])));
+        assert!(!chat_request_allowed(&serde_json::json!([
+            "not", "an", "object"
+        ])));
     }
 
     /// An engine that records each request body and answers with `sse`.
-    async fn recording(sse: String) -> (reqwest::Url, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+    async fn recording(
+        sse: String,
+    ) -> (
+        reqwest::Url,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = seen.clone();
         let router = axum::Router::new().route(
@@ -1047,8 +1171,11 @@ mod tests {
         let message = &response["choices"][0]["message"];
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(message["content"], serde_json::Value::Null);
-        assert_eq!(message["tool_calls"], serde_json::json!([{"id":"call_1","type":"function",
-            "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]));
+        assert_eq!(
+            message["tool_calls"],
+            serde_json::json!([{"id":"call_1","type":"function",
+            "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}])
+        );
         let sent = seen.lock().unwrap()[0].clone();
         assert_eq!(sent["tools"], tools);
         assert_eq!(sent["tool_choice"], "auto");
@@ -1097,9 +1224,12 @@ mod tests {
         assert_eq!(relayed.len(), 4);
         let response = forward.forward_chat(&request).await.unwrap();
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
-        assert_eq!(response["choices"][0]["message"]["tool_calls"], serde_json::json!([{
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"],
+            serde_json::json!([{
             "id":"call_x","type":"function",
-            "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}]));
+            "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}])
+        );
     }
 
     /// SPEC §10, T19: a malformed `tool_calls` delta is not relayed as success.
@@ -1114,8 +1244,11 @@ mod tests {
             serde_json::json!({"role":"user","tool_calls":[{"index":0}]}),
             serde_json::json!({"role":1,"tool_calls":[{"index":0}]}),
         ] {
-            let sse = [tool_chunk(bad.clone(), serde_json::json!("tool_calls")),
-                       "data: [DONE]\n\n".to_owned()].concat();
+            let sse = [
+                tool_chunk(bad.clone(), serde_json::json!("tool_calls")),
+                "data: [DONE]\n\n".to_owned(),
+            ]
+            .concat();
             let (url, _) = recording(sse).await;
             let forward = crate::forward::engine_forwarder(url, "m".into(), None);
             let result = forward
@@ -1136,23 +1269,44 @@ mod tests {
         let mut one = base.clone();
         one["n"] = serde_json::json!(1);
         assert_eq!(validate_chat_request(&one), Ok(()));
-        for (field, value) in [("n", serde_json::json!(2)), ("functions", serde_json::json!([])),
-                               ("function_call", serde_json::json!("auto"))] {
+        for (field, value) in [
+            ("n", serde_json::json!(2)),
+            ("functions", serde_json::json!([])),
+            ("function_call", serde_json::json!("auto")),
+        ] {
             let mut body = base.clone();
             body[field] = value;
-            assert!(matches!(validate_chat_request(&body), Err(ChatRequestRefusal::Unsupported(_))),
-                    "{field}");
+            assert!(
+                matches!(
+                    validate_chat_request(&body),
+                    Err(ChatRequestRefusal::Unsupported(_))
+                ),
+                "{field}"
+            );
             let (url, seen) = recording(String::new()).await;
             let forward = crate::forward::engine_forwarder(url, "m".into(), None);
-            assert!(matches!(forward.forward_chat(&body).await,
-                             Err(AdapterError::UnsupportedCapability)), "{field}");
-            assert!(seen.lock().unwrap().is_empty(), "{field} reached the engine");
+            assert!(
+                matches!(
+                    forward.forward_chat(&body).await,
+                    Err(AdapterError::UnsupportedCapability)
+                ),
+                "{field}"
+            );
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{field} reached the engine"
+            );
         }
         let mut internal = base.clone();
         internal["rid"] = serde_json::json!("x");
-        assert_eq!(validate_chat_request(&internal), Err(ChatRequestRefusal::Field("rid".into())));
-        assert!(matches!(validate_chat_request(&serde_json::json!({"messages":[]})),
-                         Err(ChatRequestRefusal::Malformed(_))));
+        assert_eq!(
+            validate_chat_request(&internal),
+            Err(ChatRequestRefusal::Field("rid".into()))
+        );
+        assert!(matches!(
+            validate_chat_request(&serde_json::json!({"messages":[]})),
+            Err(ChatRequestRefusal::Malformed(_))
+        ));
     }
 
     /// SPEC §10: an engine forwarder relays inference and nothing else. The paths

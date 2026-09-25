@@ -98,7 +98,9 @@ impl LiveForwarders {
     /// honest here; propagating a poisoning would turn an unrelated panic into a
     /// permanently unservable router.
     fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, Arc<dyn ChatForward>>> {
-        self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -113,7 +115,11 @@ impl LiveForwarders {
         generation: Option<i64>,
         runtime: mllm_controller::RuntimeEndpoint,
     ) -> Result<Arc<dyn ChatForward>, ForwarderError> {
-        let key = (deployment.to_string(), generation, runtime.incarnation.clone());
+        let key = (
+            deployment.to_string(),
+            generation,
+            runtime.incarnation.clone(),
+        );
         let mut cache = self.cache();
         if let Some(existing) = cache.get(&key) {
             return Ok(existing.clone());

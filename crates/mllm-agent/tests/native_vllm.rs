@@ -255,10 +255,18 @@ impl Fixture {
             std::fs::write(runtime.join("mllm_vllm_guard.py"), "# test guard\n").unwrap();
         }
         // ADR 0008: a sleep-mode launch also imports the capability probes.
-        std::fs::write(runtime.join("engine_capabilities.py"), "# stand-in probes\n").unwrap();
+        std::fs::write(
+            runtime.join("engine_capabilities.py"),
+            "# stand-in probes\n",
+        )
+        .unwrap();
         // SPEC §9.1 / T21: a prepared host's runtime modules are the agent
         // user's and not group- or other-writable, whatever the umask.
-        for module in ["vllm_entry.py", "mllm_vllm_guard.py", "engine_capabilities.py"] {
+        for module in [
+            "vllm_entry.py",
+            "mllm_vllm_guard.py",
+            "engine_capabilities.py",
+        ] {
             let path = runtime.join(module);
             if path.exists() {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -745,17 +753,27 @@ async fn a_launch_refused_after_provisioning_keeps_no_credentials() {
     let host = host(&fixture);
     let launch = fixture.launch();
     host.executor.provision(launch.clone(), GATE).await.unwrap();
-    assert!(host.identities.load(&scope(&launch), launch.identity.payload_digest).is_ok());
+    assert!(host
+        .identities
+        .load(&scope(&launch), launch.identity.payload_digest)
+        .is_ok());
     // The host changes between provisioning and delivery.
     std::fs::set_permissions(
         fixture.root.path().join("runtime/vllm_entry.py"),
         std::fs::Permissions::from_mode(0o666),
     )
     .unwrap();
-    let refused = host.executor.execute(host.session, launch.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
     assert_eq!(refused.refused, "runtime_integrity");
     assert!(fixture.record().is_none(), "no engine may start");
-    assert!(host.identities.load(&scope(&launch), launch.identity.payload_digest).is_err());
+    assert!(host
+        .identities
+        .load(&scope(&launch), launch.identity.payload_digest)
+        .is_err());
 }
 
 /// SPEC §9.1 / ADR 0012: default-on deep parking does not relax the guard. A
@@ -861,8 +879,16 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
     let fixture = Fixture::new(false, true);
     let first = host(&fixture);
     let launch = fixture.launch();
-    first.executor.provision(launch.clone(), GATE).await.unwrap();
-    let ready = first.executor.execute(first.session, launch.clone()).await.unwrap();
+    first
+        .executor
+        .provision(launch.clone(), GATE)
+        .await
+        .unwrap();
+    let ready = first
+        .executor
+        .execute(first.session, launch.clone())
+        .await
+        .unwrap();
     assert!(ready.model_usable, "{ready:?}");
 
     let host = restarted(&fixture, &first);
@@ -874,23 +900,40 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
     let mut forged = fixture.probe(&launch, "probe-forged");
     forged.identity.deployment_id = "other-deployment".into();
     let forged = sign(forged);
-    let refused = host.executor.execute(host.session, forged.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, forged.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&forged, &refused).unwrap();
     assert!(!refused.model_usable);
     assert_ne!(chat(address).await, reqwest::StatusCode::OK);
     let mut unknown = fixture.probe(&launch, "probe-unknown");
-    unknown.action = MemberAction::Probe { owned_handle: "never-launched".into() };
+    unknown.action = MemberAction::Probe {
+        owned_handle: "never-launched".into(),
+    };
     let unknown = sign(unknown);
-    let nothing = host.executor.execute(host.session, unknown.clone()).await.unwrap();
+    let nothing = host
+        .executor
+        .execute(host.session, unknown.clone())
+        .await
+        .unwrap();
     assert!(!nothing.model_usable && !nothing.claim_retained && nothing.processes.is_empty());
 
     let probe = fixture.probe(&launch, "probe-1");
-    let result = host.executor.execute(host.session, probe.clone()).await.unwrap();
+    let result = host
+        .executor
+        .execute(host.session, probe.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&probe, &result).unwrap();
     assert!(result.model_usable && result.claim_retained, "{result:?}");
     assert_eq!(result.state, "completed");
     assert_eq!(result.owned_handle, "launch");
-    assert_eq!((result.binding_id.as_str(), result.incarnation.as_str()), (BINDING, INCARNATION));
+    assert_eq!(
+        (result.binding_id.as_str(), result.incarnation.as_str()),
+        (BINDING, INCARNATION)
+    );
     let alive = |r: &mllm_protocol::pb::MemberExecutionResult| {
         r.processes
             .iter()
@@ -903,7 +946,11 @@ async fn a_restarted_host_serves_again_only_after_a_fresh_probe() {
 
     // A later session inherits nothing from this probe's readiness.
     let again = restarted(&fixture, &host);
-    let replay = again.executor.execute(again.session, probe.clone()).await.unwrap();
+    let replay = again
+        .executor
+        .execute(again.session, probe.clone())
+        .await
+        .unwrap();
     assert!(!replay.model_usable, "{replay:?}");
     server.abort();
     let stopped = again
@@ -924,8 +971,19 @@ async fn a_probe_of_an_engine_that_died_keeps_the_gate_closed_and_the_claim() {
     let fixture = Fixture::new(false, true);
     let first = host(&fixture);
     let launch = fixture.launch();
-    first.executor.provision(launch.clone(), GATE).await.unwrap();
-    assert!(first.executor.execute(first.session, launch.clone()).await.unwrap().model_usable);
+    first
+        .executor
+        .provision(launch.clone(), GATE)
+        .await
+        .unwrap();
+    assert!(
+        first
+            .executor
+            .execute(first.session, launch.clone())
+            .await
+            .unwrap()
+            .model_usable
+    );
     // The engine dies while the agent is down; nothing journals that.
     struct NoSpawn;
     impl mllm_launchers::LaunchAssociation for NoSpawn {
@@ -950,7 +1008,11 @@ async fn a_probe_of_an_engine_that_died_keeps_the_gate_closed_and_the_claim() {
     let host = restarted(&fixture, &first);
     let (address, server) = serve(host.ingress.clone()).await;
     let probe = fixture.probe(&launch, "probe-dead");
-    let result = host.executor.execute(host.session, probe.clone()).await.unwrap();
+    let result = host
+        .executor
+        .execute(host.session, probe.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&probe, &result).unwrap();
     assert!(!result.model_usable, "{result:?}");
     assert!(result.claim_retained);
@@ -1012,13 +1074,21 @@ async fn ready_deep_park() -> (Fixture, Host, MemberCommand) {
     let host = host(&fixture);
     let launch = fixture.launch();
     host.executor.provision(launch.clone(), GATE).await.unwrap();
-    let ready = host.executor.execute(host.session, launch.clone()).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
     assert!(ready.model_usable, "{ready:?}");
     (fixture, host, launch)
 }
 
 fn residency(result: &mllm_protocol::pb::MemberExecutionResult) -> &str {
-    result.residency.as_ref().map(|r| r.state.as_str()).unwrap_or("none")
+    result
+        .residency
+        .as_ref()
+        .map(|r| r.state.as_str())
+        .unwrap_or("none")
 }
 
 fn milestones(result: &mllm_protocol::pb::MemberExecutionResult) -> Vec<String> {
@@ -1087,35 +1157,70 @@ async fn a_deep_park_launch_parks_and_restores_in_place() {
         .unwrap();
 
     let park = fixture.park(&launch, "park-1");
-    let parked = first.executor.execute(first.session, park.clone()).await.unwrap();
+    let parked = first
+        .executor
+        .execute(first.session, park.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&park, &parked).unwrap();
-    assert_eq!((parked.state.as_str(), residency(&parked)), ("completed", "parked"), "{parked:?}");
+    assert_eq!(
+        (parked.state.as_str(), residency(&parked)),
+        ("completed", "parked"),
+        "{parked:?}"
+    );
     assert!(parked.claim_retained && !parked.model_usable);
     assert_eq!(parked.owned_handle, "launch");
-    assert_eq!((parked.binding_id.as_str(), parked.incarnation.as_str()), (BINDING, INCARNATION));
+    assert_eq!(
+        (parked.binding_id.as_str(), parked.incarnation.as_str()),
+        (BINDING, INCARNATION)
+    );
     // SPEC §13.2: the retained group is the journaled one, unchanged.
     assert_eq!(group(&parked), group(&launched));
     assert_eq!(
         milestones(&parked),
-        ["gate_closed", "ingress_idle", "engine_quiescent", "memory_released", "identity_unchanged"]
+        [
+            "gate_closed",
+            "ingress_idle",
+            "engine_quiescent",
+            "memory_released",
+            "identity_unchanged"
+        ]
     );
     let evidence = parked.residency.clone().unwrap();
     assert!(evidence.mem_available_before_bytes > 0 && evidence.mem_available_after_bytes > 0);
     assert_eq!(fixture.controls(), ["sleep:2"]);
-    assert_eq!(first.journal.residency_of("launch").unwrap().as_deref(), Some("parked"));
+    assert_eq!(
+        first.journal.residency_of("launch").unwrap().as_deref(),
+        Some("parked")
+    );
     // The gate closed before the sleep and stays closed while parked.
     assert_ne!(chat(address).await, reqwest::StatusCode::OK);
 
     // Dedupe: the same command is answered from the journal, not re-slept.
-    let replay = first.executor.execute(first.session, park.clone()).await.unwrap();
+    let replay = first
+        .executor
+        .execute(first.session, park.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&park, &replay).unwrap();
     assert_eq!(residency(&replay), "parked");
     assert_eq!(fixture.controls(), ["sleep:2"]);
     // A launch replay no longer claims the model usable.
-    assert!(!first.executor.execute(first.session, launch.clone()).await.unwrap().model_usable);
+    assert!(
+        !first
+            .executor
+            .execute(first.session, launch.clone())
+            .await
+            .unwrap()
+            .model_usable
+    );
     // A second park of a parked launch is refused before it is journaled.
     let again = fixture.park(&launch, "park-2");
-    let refused = first.executor.execute(first.session, again.clone()).await.unwrap();
+    let refused = first
+        .executor
+        .execute(first.session, again.clone())
+        .await
+        .unwrap();
     assert_eq!(refused_unchanged(&again, &refused), "unauthorized");
     server.abort();
 
@@ -1123,13 +1228,21 @@ async fn a_deep_park_launch_parks_and_restores_in_place() {
     let host = restarted(&fixture, &first);
     let (address, server) = serve(host.ingress.clone()).await;
     let probe = fixture.probe(&launch, "probe-parked");
-    let probed = host.executor.execute(host.session, probe.clone()).await.unwrap();
+    let probed = host
+        .executor
+        .execute(host.session, probe.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&probe, &probed).unwrap();
     assert!(!probed.model_usable && probed.claim_retained);
     assert_ne!(chat(address).await, reqwest::StatusCode::OK);
 
     let restore = fixture.restore(&launch, "restore-1");
-    let restored = host.executor.execute(host.session, restore.clone()).await.unwrap();
+    let restored = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&restore, &restored).unwrap();
     assert_eq!(residency(&restored), "restored", "{restored:?}");
     assert!(restored.model_usable && restored.claim_retained);
@@ -1137,16 +1250,34 @@ async fn a_deep_park_launch_parks_and_restores_in_place() {
     assert_eq!(
         milestones(&restored),
         // ADR 0014 §7 (WE3): the checkpoint is verified before any wake call.
-        ["gate_closed", "checkpoint_verified", "allocations_restored", "weights_usable", "cache_valid", "model_usable", "identity_unchanged"]
+        [
+            "gate_closed",
+            "checkpoint_verified",
+            "allocations_restored",
+            "weights_usable",
+            "cache_valid",
+            "model_usable",
+            "identity_unchanged"
+        ]
     );
     assert_eq!(
         fixture.controls(),
-        ["sleep:2", "wake:weights", "collective:reload_weights", "wake:kv_cache", "reset_prefix_cache"]
+        [
+            "sleep:2",
+            "wake:weights",
+            "collective:reload_weights",
+            "wake:kv_cache",
+            "reset_prefix_cache"
+        ]
     );
     assert_eq!(host.journal.residency_of("launch").unwrap(), None);
     assert_eq!(chat(address).await, reqwest::StatusCode::OK);
     // A replayed restore never repeats the collective.
-    let again = host.executor.execute(host.session, restore.clone()).await.unwrap();
+    let again = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&restore, &again).unwrap();
     assert_eq!(fixture.controls().len(), 5);
     server.abort();
@@ -1168,9 +1299,19 @@ async fn a_restart_only_launch_is_never_parked() {
     let host = host(&fixture);
     let launch = fixture.launch();
     host.executor.provision(launch.clone(), GATE).await.unwrap();
-    assert!(host.executor.execute(host.session, launch.clone()).await.unwrap().model_usable);
+    assert!(
+        host.executor
+            .execute(host.session, launch.clone())
+            .await
+            .unwrap()
+            .model_usable
+    );
     let park = fixture.park(&launch, "park");
-    let refused = host.executor.execute(host.session, park.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, park.clone())
+        .await
+        .unwrap();
     assert_eq!(refused_unchanged(&park, &refused), "residency_tier");
     assert!(fixture.controls().is_empty());
     assert_eq!(host.journal.history(0, 100).unwrap().len(), 1);
@@ -1189,7 +1330,11 @@ async fn a_busy_engine_is_not_parked() {
     let (address, server) = serve(host.ingress.clone()).await;
     fixture.engine_file("busy", Some("1"));
     let park = fixture.park(&launch, "park-busy");
-    let refused = host.executor.execute(host.session, park.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, park.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&park, &refused).unwrap();
     assert_eq!(residency(&refused), "unchanged", "{refused:?}");
     assert_eq!(milestones(&refused), ["gate_closed", "ingress_idle"]);
@@ -1199,12 +1344,22 @@ async fn a_busy_engine_is_not_parked() {
     // The refusal left the launch as it was: ready, and forwarding again.
     assert_eq!(chat(address).await, reqwest::StatusCode::OK);
     let restore = fixture.restore(&launch, "restore");
-    let refused = host.executor.execute(host.session, restore.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
     assert_eq!(refused_unchanged(&restore, &refused), "unauthorized");
     assert_eq!(chat(address).await, reqwest::StatusCode::OK);
     fixture.engine_file("busy", None);
     let probe = fixture.probe(&launch, "probe-after");
-    assert!(host.executor.execute(host.session, probe).await.unwrap().model_usable);
+    assert!(
+        host.executor
+            .execute(host.session, probe)
+            .await
+            .unwrap()
+            .model_usable
+    );
     assert_eq!(chat(address).await, reqwest::StatusCode::OK);
     server.abort();
 }
@@ -1226,20 +1381,44 @@ async fn a_failed_restore_is_quarantined_until_terminate() {
     assert_eq!(residency(&parked), "parked");
     fixture.engine_file("fail", Some("collective:reload_weights"));
     let restore = fixture.restore(&launch, "restore-1");
-    let failed = host.executor.execute(host.session, restore.clone()).await.unwrap();
+    let failed = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&restore, &failed).unwrap();
     assert_eq!(residency(&failed), "unknown", "{failed:?}");
-    assert_eq!(milestones(&failed), ["gate_closed", "checkpoint_verified", "allocations_restored"]);
+    assert_eq!(
+        milestones(&failed),
+        ["gate_closed", "checkpoint_verified", "allocations_restored"]
+    );
     assert!(failed.claim_retained && !failed.model_usable);
-    assert_eq!(host.journal.residency_of("launch").unwrap().as_deref(), Some("uncertain"));
+    assert_eq!(
+        host.journal.residency_of("launch").unwrap().as_deref(),
+        Some("uncertain")
+    );
     assert_ne!(chat(address).await, reqwest::StatusCode::OK);
     fixture.engine_file("fail", None);
-    for command in [fixture.restore(&launch, "restore-2"), fixture.park(&launch, "park-2")] {
-        let refused = host.executor.execute(host.session, command.clone()).await.unwrap();
+    for command in [
+        fixture.restore(&launch, "restore-2"),
+        fixture.park(&launch, "park-2"),
+    ] {
+        let refused = host
+            .executor
+            .execute(host.session, command.clone())
+            .await
+            .unwrap();
         assert_eq!(refused_unchanged(&command, &refused), "unauthorized");
     }
     let probe = fixture.probe(&launch, "probe");
-    assert!(!host.executor.execute(host.session, probe).await.unwrap().model_usable);
+    assert!(
+        !host
+            .executor
+            .execute(host.session, probe)
+            .await
+            .unwrap()
+            .model_usable
+    );
     assert_eq!(
         fixture.controls(),
         ["sleep:2", "wake:weights", "collective:reload_weights"],
@@ -1272,16 +1451,31 @@ async fn a_checkpoint_changed_while_parked_is_not_woken() {
     let swapped = fixture.root.path().join("models/toy/model.safetensors");
     std::fs::write(&swapped, "substituted weights").unwrap();
     let restore = fixture.restore(&launch, "restore-1");
-    let refused = host.executor.execute(host.session, restore.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&restore, &refused).unwrap();
     assert_eq!(residency(&refused), "unchanged", "{refused:?}");
     assert_eq!(milestones(&refused), ["gate_closed"]);
     assert!(refused.claim_retained && !refused.model_usable);
-    assert_eq!(fixture.controls(), ["sleep:2"], "no wake reached the engine");
-    assert_eq!(host.journal.residency_of("launch").unwrap().as_deref(), Some("parked"));
+    assert_eq!(
+        fixture.controls(),
+        ["sleep:2"],
+        "no wake reached the engine"
+    );
+    assert_eq!(
+        host.journal.residency_of("launch").unwrap().as_deref(),
+        Some("parked")
+    );
     std::fs::remove_file(&swapped).unwrap();
     let restore = fixture.restore(&launch, "restore-2");
-    let restored = host.executor.execute(host.session, restore.clone()).await.unwrap();
+    let restored = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&restore, &restored).unwrap();
     assert_eq!(residency(&restored), "restored", "{restored:?}");
     let stopped = host
@@ -1299,8 +1493,17 @@ async fn a_checkpoint_changed_while_parked_is_not_woken() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_changed_group_is_not_parked() {
     let (fixture, host, launch) = ready_deep_park().await;
-    let ready = host.executor.execute(host.session, launch.clone()).await.unwrap();
-    let worker = ready.processes.iter().find(|p| p.role == "worker-0").unwrap().pid;
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .unwrap();
+    let worker = ready
+        .processes
+        .iter()
+        .find(|p| p.role == "worker-0")
+        .unwrap()
+        .pid;
     unsafe { libc::kill(worker as i32, libc::SIGKILL) };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while host
@@ -1308,17 +1511,29 @@ async fn a_changed_group_is_not_parked() {
         .inspect_owned("launch")
         .unwrap()
         .iter()
-        .any(|(p, presence)| p.pid == worker && *presence == mllm_domain::completion::Presence::Alive)
+        .any(|(p, presence)| {
+            p.pid == worker && *presence == mllm_domain::completion::Presence::Alive
+        })
     {
-        assert!(std::time::Instant::now() < deadline, "the worker must be reaped");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker must be reaped"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let park = fixture.park(&launch, "park");
-    let refused = host.executor.execute(host.session, park.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, park.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&park, &refused).unwrap();
     assert_eq!(residency(&refused), "unchanged", "{refused:?}");
     assert!(refused.claim_retained && !refused.model_usable);
-    assert!(refused.processes.iter().any(|p| p.pid == worker && p.presence == "gone"));
+    assert!(refused
+        .processes
+        .iter()
+        .any(|p| p.pid == worker && p.presence == "gone"));
     assert!(fixture.controls().is_empty());
     assert_eq!(host.journal.residency_of("launch").unwrap(), None);
 }
@@ -1335,10 +1550,21 @@ async fn park_and_restore_are_fenced_by_expected_state_and_owner() {
     let mut foreign = fixture.park(&launch, "park-foreign");
     foreign.identity.deployment_id = "other-deployment".into();
     let mut unknown = fixture.park(&launch, "park-unknown");
-    unknown.action = MemberAction::Park { owned_handle: "never-launched".into() };
+    unknown.action = MemberAction::Park {
+        owned_handle: "never-launched".into(),
+    };
     let restore_resident = fixture.restore(&launch, "restore-resident");
-    for command in [sign(wrong_state), sign(foreign), sign(unknown), restore_resident] {
-        let refused = host.executor.execute(host.session, command.clone()).await.unwrap();
+    for command in [
+        sign(wrong_state),
+        sign(foreign),
+        sign(unknown),
+        restore_resident,
+    ] {
+        let refused = host
+            .executor
+            .execute(host.session, command.clone())
+            .await
+            .unwrap();
         assert_eq!(refused_unchanged(&command, &refused), "unauthorized");
     }
     assert!(fixture.controls().is_empty());
@@ -1373,14 +1599,29 @@ async fn a_restore_naming_another_digest_is_not_woken() {
         sign(command)
     };
     let other = restore_with("restore-other", format!("sha256:{}", "0".repeat(64)));
-    let refused = host.executor.execute(host.session, other.clone()).await.unwrap();
+    let refused = host
+        .executor
+        .execute(host.session, other.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&other, &refused).unwrap();
     assert_eq!(residency(&refused), "unchanged", "{refused:?}");
     assert_eq!(milestones(&refused), ["gate_closed"]);
-    assert_eq!(fixture.controls(), ["sleep:2"], "no wake reached the engine");
-    assert_eq!(host.journal.residency_of("launch").unwrap().as_deref(), Some("parked"));
+    assert_eq!(
+        fixture.controls(),
+        ["sleep:2"],
+        "no wake reached the engine"
+    );
+    assert_eq!(
+        host.journal.residency_of("launch").unwrap().as_deref(),
+        Some("parked")
+    );
     let same = restore_with("restore-same", plan.checkpoint_digest.clone());
-    let restored = host.executor.execute(host.session, same.clone()).await.unwrap();
+    let restored = host
+        .executor
+        .execute(host.session, same.clone())
+        .await
+        .unwrap();
     mllm_protocol::execution::validate_result(&same, &restored).unwrap();
     assert_eq!(residency(&restored), "restored", "{restored:?}");
     let stopped = host
@@ -1424,7 +1665,10 @@ async fn an_engine_that_exits_before_readiness_is_reported_not_a_lost_session() 
     assert!(!result.model_usable, "{result:?}");
     assert!(result.claim_retained, "{result:?}");
     assert!(!result.processes.is_empty(), "{result:?}");
-    assert!(result.processes.iter().all(|p| p.presence == "gone"), "{result:?}");
+    assert!(
+        result.processes.iter().all(|p| p.presence == "gone"),
+        "{result:?}"
+    );
     assert!(fixture.record().is_none(), "the engine never ran");
 
     let stopped = host
@@ -1451,7 +1695,12 @@ async fn a_parked_launch_that_loses_a_member_is_reported() {
         .await
         .unwrap();
     assert_eq!(residency(&parked), "parked", "{parked:?}");
-    let worker = parked.processes.iter().find(|p| p.role == "worker-0").unwrap().pid;
+    let worker = parked
+        .processes
+        .iter()
+        .find(|p| p.role == "worker-0")
+        .unwrap()
+        .pid;
     unsafe { libc::kill(worker as i32, libc::SIGKILL) };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let exit = loop {
@@ -1459,10 +1708,16 @@ async fn a_parked_launch_that_loses_a_member_is_reported() {
         if let Some(launch) = exited.into_iter().next() {
             break launch.exit;
         }
-        assert!(std::time::Instant::now() < deadline, "no exit reported for a parked launch");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no exit reported for a parked launch"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
     assert_eq!(exit.owned_handle, "launch");
     assert_eq!(exit.process.pid, worker);
-    assert_eq!(host.journal.residency_of("launch").unwrap().as_deref(), Some("parked"));
+    assert_eq!(
+        host.journal.residency_of("launch").unwrap().as_deref(),
+        Some("parked")
+    );
 }

@@ -42,10 +42,8 @@ fn protected_descriptors_are_private_sealed_bounded_and_close_on_drop() {
     drop(descriptors);
     for (fd, inode) in numbers.into_iter().zip(inodes) {
         // Parallel tests can reuse a closed descriptor number immediately.
-        assert!(
-            !std::fs::metadata(format!("/proc/self/fd/{fd}"))
-                .is_ok_and(|metadata| metadata.ino() == inode)
-        );
+        assert!(!std::fs::metadata(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|metadata| metadata.ino() == inode));
     }
     for (launch, inference, admin) in [
         (vec![], b"one".to_vec(), b"two".to_vec()),
@@ -108,17 +106,14 @@ fn protected_descriptors_reach_only_gated_child_and_association_failure_keeps_ga
             }
             assert_eq!(std::fs::read(&marker).unwrap(), b"inference-secret");
         }
-        assert!(
-            launcher
-                .spawn_protected(
-                    "protected",
-                    &command,
-                    &ProtectedLaunchDescriptors::new(b"{}", b"new-inference", b"new-admin")
-                        .unwrap(),
-                    &association
-                )
-                .is_err()
-        );
+        assert!(launcher
+            .spawn_protected(
+                "protected",
+                &command,
+                &ProtectedLaunchDescriptors::new(b"{}", b"new-inference", b"new-admin").unwrap(),
+                &association
+            )
+            .is_err());
     }
 }
 
@@ -151,10 +146,11 @@ fn owned_process_launch_spawns_with_protected_descriptors() {
         ],
         env: Default::default(),
     };
-    let tools: &dyn OwnedProcessLaunch = &DurableProcessLaunch::new(Arc::new(RecordingAssociation {
-        identities: Mutex::new(vec![]),
-        fail: false,
-    }));
+    let tools: &dyn OwnedProcessLaunch =
+        &DurableProcessLaunch::new(Arc::new(RecordingAssociation {
+            identities: Mutex::new(vec![]),
+            fail: false,
+        }));
     let identity = tools
         .spawn_durable_protected("protected-tools", &command, &descriptors)
         .unwrap();
@@ -256,11 +252,9 @@ fn ambiguous_association_is_not_retried_under_same_incarnation() {
         other => panic!("unexpected outcome: {other:?}"),
     };
     assert!(!marker.exists());
-    assert!(
-        launcher
-            .spawn_persisted("incarnation-a", &marker_command(&marker), &association)
-            .is_err()
-    );
+    assert!(launcher
+        .spawn_persisted("incarnation-a", &marker_command(&marker), &association)
+        .is_err());
     assert_eq!(association.identities.lock().unwrap().len(), 1);
     drop(launcher);
     // An unreleased child is disposed of before the outcome is returned, so the

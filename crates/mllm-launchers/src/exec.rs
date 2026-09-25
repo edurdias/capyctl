@@ -160,7 +160,12 @@ pub(crate) fn process_identity(pid: u32, role: &str) -> Option<ProcessIdentity> 
     let start_ticks = proc_starttime(pid)?.parse().ok()?;
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot_id = boot_id.trim().to_owned();
-    Some(ProcessIdentity { role: role.into(), pid, boot_id, start_ticks })
+    Some(ProcessIdentity {
+        role: role.into(),
+        pid,
+        boot_id,
+        start_ticks,
+    })
 }
 
 pub(crate) fn legacy_identity(identity: &ProcessIdentity) -> u128 {
@@ -192,7 +197,9 @@ impl Launcher for ExecLauncher {
             let log_clone = f
                 .try_clone()
                 .map_err(|e| LauncherError::SpawnFailed(format!("engine log clone: {e}")))?;
-            command.stdout(Stdio::from(log_clone)).stderr(Stdio::from(f));
+            command
+                .stdout(Stdio::from(log_clone))
+                .stderr(Stdio::from(f));
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
@@ -220,7 +227,10 @@ impl Launcher for ExecLauncher {
             self.spawned.lock().unwrap().insert(pid, identity.clone());
         }
         let start_identity = process_identity.as_ref().map(legacy_identity).unwrap_or(0);
-        Ok(OwnedHandle { pid, start_identity })
+        Ok(OwnedHandle {
+            pid,
+            start_identity,
+        })
     }
 
     fn terminate(&self, h: &OwnedHandle, grace: Duration) -> Result<ExitReport, LauncherError> {
@@ -233,8 +243,12 @@ impl Launcher for ExecLauncher {
         };
         match self.recorded_identity(h.pid) {
             // We spawned it and the starttime matches: still ours.
-            Some(recorded) if recorded.start_ticks.to_string() == current
-                && legacy_identity(&recorded) == h.start_identity => HandleStatus::Valid,
+            Some(recorded)
+                if recorded.start_ticks.to_string() == current
+                    && legacy_identity(&recorded) == h.start_identity =>
+            {
+                HandleStatus::Valid
+            }
             // PID exists but we never spawned it, or it was replaced: reuse.
             _ => HandleStatus::StaleReused,
         }
@@ -377,13 +391,22 @@ mod tests {
         let result = launcher.terminate_with_signal(&handle, Duration::ZERO, &|_, signal| {
             signals.lock().unwrap().push(signal);
             if signal == nix::sys::signal::Signal::SIGTERM {
-                launcher.spawned.lock().unwrap().get_mut(&handle.pid).unwrap().start_ticks += 1;
+                launcher
+                    .spawned
+                    .lock()
+                    .unwrap()
+                    .get_mut(&handle.pid)
+                    .unwrap()
+                    .start_ticks += 1;
             }
             Ok(())
         });
 
         assert!(matches!(result, Err(LauncherError::TerminateFailed(_))));
-        assert_eq!(signals.into_inner().unwrap(), vec![nix::sys::signal::Signal::SIGTERM]);
+        assert_eq!(
+            signals.into_inner().unwrap(),
+            vec![nix::sys::signal::Signal::SIGTERM]
+        );
         assert!(pid_alive(handle.pid));
         kill_test_group(&handle);
     }

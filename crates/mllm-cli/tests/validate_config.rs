@@ -310,8 +310,14 @@ fn server_heartbeat_bounds_are_validated_with_the_field_named() {
     let (code, _, raw) = validate(&["--file", file.to_str().unwrap()]);
     assert_eq!(code, 0, "{raw}");
     for (control, field) in [
-        (json!({"heartbeat_suspend_after": "1s"}), "control.heartbeat_suspend_after"),
-        (json!({"heartbeat_lost_after": "11m"}), "control.heartbeat_lost_after"),
+        (
+            json!({"heartbeat_suspend_after": "1s"}),
+            "control.heartbeat_suspend_after",
+        ),
+        (
+            json!({"heartbeat_lost_after": "11m"}),
+            "control.heartbeat_lost_after",
+        ),
         (
             json!({"heartbeat_suspend_after": "20s", "heartbeat_lost_after": "15s"}),
             "control.heartbeat_lost_after",

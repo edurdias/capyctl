@@ -253,7 +253,12 @@ pub(crate) fn scoped_to_domain_hosts<'a>(
             .allocations
             .iter()
             .map(|a| ("domain", a.domain.as_str()))
-            .chain(footprint.devices.iter().map(|d| ("device", d.device.as_str())));
+            .chain(
+                footprint
+                    .devices
+                    .iter()
+                    .map(|d| ("device", d.device.as_str())),
+            );
         for (kind, key) in keys {
             match registered_host(transaction, kind, key)? {
                 Some(host) if !in_scope.contains(&host) => {}
@@ -326,7 +331,11 @@ fn reserve_in_transaction(
          FROM deployment_instances i JOIN deployments d ON d.id=i.deployment_id
          JOIN operations o ON o.deployment_id=d.id
          WHERE d.id=?1 AND o.id=?2 AND i.generation=?3",
-            params![request.deployment_id, request.operation_id, request.generation],
+            params![
+                request.deployment_id,
+                request.operation_id,
+                request.generation
+            ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
@@ -807,9 +816,14 @@ mod transaction_fault_tests {
         let (store, mut request) = fixture();
         register_host(&store, "host-a");
         register_host(&store, "host-b");
-        store.conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO deployments(id,name,kind,desired_state,
           admission_enabled,suspended,current_generation,schema_version)
-          VALUES ('b','b','model','ready',1,0,1,1);").unwrap();
+          VALUES ('b','b','model','ready',1,0,1,1);",
+            )
+            .unwrap();
         let elsewhere = PhaseFootprint {
             phase: ResourcePhase::Ready,
             allocations: vec![Allocation {
@@ -857,9 +871,14 @@ mod transaction_fault_tests {
         // A charge whose domain no host registered still fails closed.
         let (store, mut request) = fixture();
         register_host(&store, "host-a");
-        store.conn.execute_batch("INSERT INTO deployments(id,name,kind,desired_state,
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO deployments(id,name,kind,desired_state,
           admission_enabled,suspended,current_generation,schema_version)
-          VALUES ('b','b','model','ready',1,0,1,1);").unwrap();
+          VALUES ('b','b','model','ready',1,0,1,1);",
+            )
+            .unwrap();
         let mut unknown = elsewhere;
         unknown.allocations[0].domain = "unregistered".into();
         unknown.devices.clear();

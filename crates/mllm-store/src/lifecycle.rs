@@ -725,7 +725,11 @@ impl crate::Store {
         } else {
             "UPDATE deployment_instances SET generation=?1,dispatch_enabled=0,desired_state='stopped' WHERE deployment_id=?2 AND generation IN (?3,?1)"
         };
-        if tx.execute(sql, params![generation, target.deployment_id, target.generation])? != 1 {
+        if tx.execute(
+            sql,
+            params![generation, target.deployment_id, target.generation],
+        )? != 1
+        {
             return Err(LifecycleError::Stale);
         }
         if suspend {
@@ -1033,7 +1037,10 @@ impl crate::Store {
         &self,
         deployment_id: &str,
     ) -> Result<Option<StoredRuntimeBinding>, LifecycleError> {
-        self.retained_binding_where("deployment_id=?1 ORDER BY instance_index LIMIT 1", deployment_id)
+        self.retained_binding_where(
+            "deployment_id=?1 ORDER BY instance_index LIMIT 1",
+            deployment_id,
+        )
     }
 
     /// One retained (not released) binding, by its id.

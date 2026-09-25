@@ -175,7 +175,14 @@ impl crate::Store {
         now_ms: i64,
     ) -> Result<ManagedConfigurationReceipt> {
         self.accept_stopped_configuration(
-            session, principal, key, None, request_json, targets, refused, now_ms,
+            session,
+            principal,
+            key,
+            None,
+            request_json,
+            targets,
+            refused,
+            now_ms,
         )
     }
 
@@ -472,13 +479,29 @@ impl crate::Store {
         })?;
         // SPEC §13: retain the source alongside the frozen revision atomically.
         // Remote agents re-resolve local IDs, never execute server-supplied argv.
-        tx.execute("INSERT INTO managed_configuration_sources VALUES(?1,?2,?3)",params![receipt.deployment_id,revision,source.to_string()])?;
+        tx.execute(
+            "INSERT INTO managed_configuration_sources VALUES(?1,?2,?3)",
+            params![receipt.deployment_id, revision, source.to_string()],
+        )?;
         // ADR 0014 §7 (WE3): every accepted revision starts with its checkpoint
         // digest pending (`checkpoint_digest_pending`) until a host measures it.
-        crate::checkpoint_digests::insert_accepted(&tx, &receipt.deployment_id, revision, &effective, provisional, now_ms)?;
+        crate::checkpoint_digests::insert_accepted(
+            &tx,
+            &receipt.deployment_id,
+            revision,
+            &effective,
+            provisional,
+            now_ms,
+        )?;
         // ADR 0008: a declared remote source starts pending on its host until
         // that host materializes it (`model_source_pending`).
-        crate::model_sources::insert_accepted(&tx, &receipt.deployment_id, revision, &effective, now_ms)?;
+        crate::model_sources::insert_accepted(
+            &tx,
+            &receipt.deployment_id,
+            revision,
+            &effective,
+            now_ms,
+        )?;
         persist_receipt(
             &tx,
             principal,
@@ -521,10 +544,17 @@ fn resolve_for_acceptance(
             if error.code == mllm_config::ConfigErrorCode::NotMaterializable
                 && error.path.starts_with("engine_config.memory") =>
         {
-            let placeholder = mllm_config::effective::CheckpointFacts { weights_bytes: Some(0), ..Default::default() };
-            mllm_config::effective::resolve_effective_with_checkpoint(config, trusted_host, placeholder)
-                .map(|effective| (effective, true))
-                .map_err(ManagedConfigurationError::Rejected)
+            let placeholder = mllm_config::effective::CheckpointFacts {
+                weights_bytes: Some(0),
+                ..Default::default()
+            };
+            mllm_config::effective::resolve_effective_with_checkpoint(
+                config,
+                trusted_host,
+                placeholder,
+            )
+            .map(|effective| (effective, true))
+            .map_err(ManagedConfigurationError::Rejected)
         }
         Err(error) => Err(ManagedConfigurationError::Rejected(error)),
     }

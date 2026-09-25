@@ -45,7 +45,8 @@ fn next_plan(
             // SPEC §6.1 FAILED: admission closed.
             // ADR 0015: a step on a busy instance, or a held start, is skipped
             // so that it cannot hide every step queued behind it.
-            &format!("SELECT s.id FROM lifecycle_steps s
+            &format!(
+                "SELECT s.id FROM lifecycle_steps s
          JOIN operations o ON o.id=s.operation_id
          JOIN lifecycle_runs r ON r.operation_id=o.id
          JOIN instance_runtime d ON d.id=s.deployment_id AND d.instance_index=r.instance_index
@@ -56,8 +57,15 @@ fn next_plan(
            AND (?2=0 OR d.admission_enabled=1)
            AND {lane_free}
            AND s.binding_id NOT IN (SELECT value FROM json_each(?4))
-         ORDER BY o.accepted_at,o.id LIMIT 1", lane_free = super::lanes::lane_free(3)),
-            params![session.id(), admitted, busy.instances_json()?, busy.held_json()?],
+         ORDER BY o.accepted_at,o.id LIMIT 1",
+                lane_free = super::lanes::lane_free(3)
+            ),
+            params![
+                session.id(),
+                admitted,
+                busy.instances_json()?,
+                busy.held_json()?
+            ],
             |row| row.get(0),
         )
         .optional()?;
@@ -95,7 +103,8 @@ fn next_expired_plan(
         .query_row(
             // ADR 0015: a step whose instance has an effect in flight is that
             // effect's to settle, deadline included; it is not expired here.
-            &format!("SELECT s.id FROM lifecycle_steps s
+            &format!(
+                "SELECT s.id FROM lifecycle_steps s
          JOIN operations o ON o.id=s.operation_id
          JOIN lifecycle_runs r ON r.operation_id=o.id
          JOIN instance_runtime d ON d.id=s.deployment_id AND d.instance_index=r.instance_index
@@ -105,7 +114,9 @@ fn next_expired_plan(
            AND d.desired_state='ready' AND d.suspended=0
            AND r.deadline_ms<=?2
            AND {lane_free}
-         ORDER BY r.deadline_ms,o.accepted_at,o.id LIMIT 1", lane_free = super::lanes::lane_free(3)),
+         ORDER BY r.deadline_ms,o.accepted_at,o.id LIMIT 1",
+                lane_free = super::lanes::lane_free(3)
+            ),
             params![session.id(), now_ms, busy.instances_json()?],
             |row| row.get(0),
         )
@@ -708,7 +719,11 @@ mod retired_planned_tests {
     fn step_session(store: &Store, step: &str) -> String {
         store
             .conn
-            .query_row("SELECT session_id FROM lifecycle_steps WHERE id=?1", [step], |r| r.get(0))
+            .query_row(
+                "SELECT session_id FROM lifecycle_steps WHERE id=?1",
+                [step],
+                |r| r.get(0),
+            )
             .unwrap()
     }
 
@@ -738,7 +753,10 @@ mod retired_planned_tests {
             .contains_key(&fence.deployment_id));
         // The same Start is joined now, not refused.
         assert_eq!(
-            store.accept_start(&session, &fence, 300, 100_100).unwrap().step_id,
+            store
+                .accept_start(&session, &fence, 300, 100_100)
+                .unwrap()
+                .step_id,
             step
         );
     }
@@ -762,7 +780,11 @@ mod retired_planned_tests {
         ));
         let state: String = store
             .conn
-            .query_row("SELECT state FROM lifecycle_steps WHERE id=?1", [&step], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM lifecycle_steps WHERE id=?1",
+                [&step],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(state, "cancelled");
         let claims: i64 = store

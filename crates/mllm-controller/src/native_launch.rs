@@ -23,9 +23,15 @@ pub fn frozen_from_work(
     admin_ref: String,
 ) -> Result<NativeLaunch, CoordinatorError> {
     mllm_adapters::sglang::frozen_from_effective(
-        work.effective(), work.binding_id(), work.incarnation(), work.endpoint(),
-        served_name, inference_ref, admin_ref,
-    ).map_err(|error| CoordinatorError::Service(error.to_string()))
+        work.effective(),
+        work.binding_id(),
+        work.incarnation(),
+        work.endpoint(),
+        served_name,
+        inference_ref,
+        admin_ref,
+    )
+    .map_err(|error| CoordinatorError::Service(error.to_string()))
 }
 
 /// The private launch descriptor `NativeLaunchHandoff::arm` sends on fd 3.

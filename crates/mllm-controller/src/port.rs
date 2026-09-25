@@ -166,7 +166,8 @@ pub trait LifecyclePort: Send + Sync {
         max_per_deployment: usize,
     ) -> Result<Option<crate::request_leases::RequestLease>, crate::request_leases::LeaseRefused>
     {
-        self.open_request_lease(deployment, max_per_deployment).await
+        self.open_request_lease(deployment, max_per_deployment)
+            .await
     }
 
     // Writes. These exist only because the router currently drives eviction: it

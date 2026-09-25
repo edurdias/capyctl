@@ -254,7 +254,14 @@ pub async fn ensure_materialized(
             Err(_) => None,
         };
         if let Some(report) = &report {
-            let _ = record(owner, deployment_id, revision, host, &plan.source_key, report);
+            let _ = record(
+                owner,
+                deployment_id,
+                revision,
+                host,
+                &plan.source_key,
+                report,
+            );
             match report.state {
                 SourceState::Verified => return Ok(()),
                 SourceState::Failed => {

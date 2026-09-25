@@ -159,9 +159,14 @@ impl Compatibility {
         }
     }
     pub fn parse(text: &str) -> Option<Self> {
-        [Self::Supported, Self::UpgradeRecommended, Self::UpgradeRequired, Self::Refused]
-            .into_iter()
-            .find(|state| state.as_str() == text)
+        [
+            Self::Supported,
+            Self::UpgradeRecommended,
+            Self::UpgradeRequired,
+            Self::Refused,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == text)
     }
     /// Drain-only: existing work may be stopped, probed and inspected; no new
     /// placement, start, wake, park, digest or materialization.

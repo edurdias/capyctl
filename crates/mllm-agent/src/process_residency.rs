@@ -182,10 +182,7 @@ fn run_nvidia_smi() -> Option<String> {
     };
     let mut text = String::new();
     if let Some(stdout) = child.stdout.take() {
-        stdout
-            .take(64 * 1024 + 1)
-            .read_to_string(&mut text)
-            .ok()?;
+        stdout.take(64 * 1024 + 1).read_to_string(&mut text).ok()?;
     }
     status.success().then_some(text)
 }

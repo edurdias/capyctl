@@ -24,9 +24,16 @@ fn respawn_cmd() -> RenderedCommand {
 fn spawn_creates_live_handle_and_terminate_stops_group() {
     let l = ExecLauncher::new();
     let h = l.spawn(&sleep_cmd(30)).unwrap();
-    assert!(matches!(l.verify_handle(&h), mllm_adapters::traits::HandleStatus::Valid));
+    assert!(matches!(
+        l.verify_handle(&h),
+        mllm_adapters::traits::HandleStatus::Valid
+    ));
     let rep = l.terminate(&h, Duration::from_secs(1)).unwrap();
-    assert!(matches!(l.verify_handle(&h), mllm_adapters::traits::HandleStatus::Gone | mllm_adapters::traits::HandleStatus::StaleReused));
+    assert!(matches!(
+        l.verify_handle(&h),
+        mllm_adapters::traits::HandleStatus::Gone
+            | mllm_adapters::traits::HandleStatus::StaleReused
+    ));
     let _ = rep;
 }
 
@@ -74,10 +81,19 @@ fn respawned_process_has_new_start_identity() {
 fn stale_handle_with_wrong_starttime_is_rejected() {
     let l = ExecLauncher::new();
     // PID 1 (init) exists with a different start identity than ours:
-    let stale = OwnedHandle { pid: 1, start_identity: 0xdeadbeef };
-    assert!(matches!(l.verify_handle(&stale), mllm_adapters::traits::HandleStatus::StaleReused));
+    let stale = OwnedHandle {
+        pid: 1,
+        start_identity: 0xdeadbeef,
+    };
+    assert!(matches!(
+        l.verify_handle(&stale),
+        mllm_adapters::traits::HandleStatus::StaleReused
+    ));
     let h = l.spawn(&sleep_cmd(30)).unwrap();
-    assert!(matches!(l.verify_handle(&h), mllm_adapters::traits::HandleStatus::Valid));
+    assert!(matches!(
+        l.verify_handle(&h),
+        mllm_adapters::traits::HandleStatus::Valid
+    ));
     let _ = l.terminate(&h, Duration::from_millis(300)).unwrap();
 }
 
@@ -85,6 +101,12 @@ fn stale_handle_with_wrong_starttime_is_rejected() {
 fn never_spawned_pid_is_gone() {
     let l = ExecLauncher::new();
     // Find an almost-certainly-unbound pid: kernel pid_max - 1.
-    let gone = OwnedHandle { pid: 4000000, start_identity: 0 };
-    assert!(matches!(l.verify_handle(&gone), mllm_adapters::traits::HandleStatus::Gone));
+    let gone = OwnedHandle {
+        pid: 4000000,
+        start_identity: 0,
+    };
+    assert!(matches!(
+        l.verify_handle(&gone),
+        mllm_adapters::traits::HandleStatus::Gone
+    ));
 }

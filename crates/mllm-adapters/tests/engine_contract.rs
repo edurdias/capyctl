@@ -2,9 +2,7 @@ use axum::{http::HeaderMap, routing::post, Json, Router};
 use mllm_adapters::sglang::{SglangAdapter, SglangRuntimeObservation, SglangRuntimeObserver};
 use mllm_adapters::RuntimeError;
 use mllm_adapters::{fake::ParkPolicy, vllm::VllmAdapter, ChatForward, StreamEnded};
-use mllm_domain::launch::{
-    NativeLaunch, NativeLaunchMetadata,
-};
+use mllm_domain::launch::{NativeLaunch, NativeLaunchMetadata};
 use serde_json::{json, Value};
 const BINDING: &str = "01K00000000000000000000001";
 const INCARNATION: &str = "01K00000000000000000000002";
@@ -316,7 +314,8 @@ async fn rejects_changed_response_identity_duplicate_fields_and_trailing_generat
             ),
             format!(
                 "{}data: [DONE]\n\n",
-                chunk("x", json!("stop")).replace("\"content\":\"x\"", "\"tool_calls\":[{\"index\":\"a\"}]")
+                chunk("x", json!("stop"))
+                    .replace("\"content\":\"x\"", "\"tool_calls\":[{\"index\":\"a\"}]")
             ),
             format!("data: {}\n\n", "x".repeat(65536)),
         ] {

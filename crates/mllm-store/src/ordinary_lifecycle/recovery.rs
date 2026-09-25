@@ -423,8 +423,8 @@ impl crate::Store {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{armed_ordinary, identity};
-    use super::RemoteReadinessEvidence;
     use super::super::*;
+    use super::RemoteReadinessEvidence;
     use crate::ordinary_lifecycle::cleanup::OrdinaryCleanupStatus;
     use mllm_domain::completion::{CleanupEvidence, ProcessIdentity};
 
@@ -446,7 +446,9 @@ mod tests {
             .unwrap();
         let step = execution.token.step_id.clone();
         let now = execution.issued_at_ms + 10;
-        assert!(store.mark_initialize_uncertain(&session, &step, now).unwrap());
+        assert!(store
+            .mark_initialize_uncertain(&session, &step, now)
+            .unwrap());
 
         let receipt = store
             .accept_administrative_stop_command(
@@ -480,7 +482,11 @@ mod tests {
             Err(LifecycleError::Conflict)
         ));
         assert_eq!(
-            text(&store, "SELECT state FROM runtime_bindings WHERE id=?1", &execution.binding_id),
+            text(
+                &store,
+                "SELECT state FROM runtime_bindings WHERE id=?1",
+                &execution.binding_id
+            ),
             "uncertain"
         );
         store
@@ -493,15 +499,27 @@ mod tests {
             OrdinaryCleanupStatus::Completed
         );
         assert_eq!(
-            text(&store, "SELECT state FROM runtime_bindings WHERE id=?1", &execution.binding_id),
+            text(
+                &store,
+                "SELECT state FROM runtime_bindings WHERE id=?1",
+                &execution.binding_id
+            ),
             "released"
         );
         assert_eq!(
-            text(&store, "SELECT observed_state FROM deployments WHERE id=?1", &fence.deployment_id),
+            text(
+                &store,
+                "SELECT observed_state FROM deployments WHERE id=?1",
+                &fence.deployment_id
+            ),
             "stopped"
         );
         assert_eq!(
-            text(&store, "SELECT state FROM lifecycle_steps WHERE id=?1", &step),
+            text(
+                &store,
+                "SELECT state FROM lifecycle_steps WHERE id=?1",
+                &step
+            ),
             "cancelled"
         );
         assert!(!store
@@ -522,7 +540,9 @@ mod tests {
         make_remote(&store, &execution.binding_id);
         let step = execution.token.step_id.clone();
         let now = execution.issued_at_ms + 10;
-        store.mark_initialize_uncertain(&session, &step, now).unwrap();
+        store
+            .mark_initialize_uncertain(&session, &step, now)
+            .unwrap();
         let receipt = store
             .accept_ordinary_stop_command(
                 &session,
@@ -547,7 +567,13 @@ mod tests {
             receipt: "authenticated host reports the launch was never released".into(),
         };
         assert!(store
-            .complete_cleanup(&session, &receipt.step_id, &evidence(vec![identity("api", 9)]), now + 3, ttl)
+            .complete_cleanup(
+                &session,
+                &receipt.step_id,
+                &evidence(vec![identity("api", 9)]),
+                now + 3,
+                ttl
+            )
             .is_err());
         store
             .complete_cleanup(&session, &receipt.step_id, &evidence(vec![]), now + 3, ttl)
@@ -569,7 +595,9 @@ mod tests {
         let (store, session, fence, execution) = armed_ordinary();
         let step = execution.token.step_id.clone();
         let now = execution.issued_at_ms + 10;
-        store.mark_initialize_uncertain(&session, &step, now).unwrap();
+        store
+            .mark_initialize_uncertain(&session, &step, now)
+            .unwrap();
         let receipt = store
             .accept_ordinary_stop_command(
                 &session,
@@ -597,7 +625,11 @@ mod tests {
             Err(LifecycleError::Conflict)
         ));
         assert_eq!(
-            text(&store, "SELECT state FROM runtime_bindings WHERE id=?1", &execution.binding_id),
+            text(
+                &store,
+                "SELECT state FROM runtime_bindings WHERE id=?1",
+                &execution.binding_id
+            ),
             "uncertain"
         );
         assert!(store
@@ -629,7 +661,9 @@ mod tests {
                 .unwrap()
                 .observed_state
         };
-        store.mark_initialize_uncertain(&session, &step, now).unwrap();
+        store
+            .mark_initialize_uncertain(&session, &step, now)
+            .unwrap();
         assert_eq!(observed(&store), "uncertain");
         let receipt = store
             .accept_ordinary_stop_command(
@@ -765,7 +799,13 @@ mod tests {
         // Before adoption the retired session's launch is nobody's to stop.
         assert!(matches!(
             store.accept_ordinary_stop_command(
-                &session, "owner", &fence.deployment_id, fence.revision, "stop-before", now, now + 50_000,
+                &session,
+                "owner",
+                &fence.deployment_id,
+                fence.revision,
+                "stop-before",
+                now,
+                now + 50_000,
             ),
             Err(LifecycleError::Stale)
         ));
@@ -854,15 +894,14 @@ mod tests {
 
         let ttl = store.observation_ttl_for_step(&step).unwrap();
         let now = execution.issued_at_ms + 10_000;
-        let evidence = |identities: Vec<ProcessIdentity>, observed_at_ms: i64| {
-            RemoteReadinessEvidence {
+        let evidence =
+            |identities: Vec<ProcessIdentity>, observed_at_ms: i64| RemoteReadinessEvidence {
                 binding_id: execution.binding_id.clone(),
                 incarnation: execution.incarnation.clone(),
                 identities,
                 observed_at_ms,
                 receipt: "authenticated host fresh native model probe".into(),
-            }
-        };
+            };
         // A different group is not the launch that was associated.
         assert!(matches!(
             store.reverify_remote_dispatch(
@@ -887,7 +926,14 @@ mod tests {
         // instance on the drained host.
         store
             .accept_instance_stop_command(
-                &session, "owner", &fence.deployment_id, 0, fence.revision, "stop-after", now, now + 50_000,
+                &session,
+                "owner",
+                &fence.deployment_id,
+                0,
+                fence.revision,
+                "stop-after",
+                now,
+                now + 50_000,
             )
             .unwrap()
             .unwrap();

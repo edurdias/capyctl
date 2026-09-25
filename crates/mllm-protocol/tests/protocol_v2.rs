@@ -583,9 +583,15 @@ fn restore_carries_a_recorded_checkpoint_digest() {
         checkpoint_digest: format!("sha256:{}", "cd".repeat(32)),
     };
     assert!(swapped.verify_digest().is_err());
-    assert_ne!(command.canonical_digest(), restore("launch").canonical_digest());
+    assert_ne!(
+        command.canonical_digest(),
+        restore("launch").canonical_digest()
+    );
     // Without a digest the wire is the pre-decision encoding.
-    assert!(restore("launch").to_wire().restore_checkpoint_digest.is_empty());
+    assert!(restore("launch")
+        .to_wire()
+        .restore_checkpoint_digest
+        .is_empty());
     // Malformed digests are refused.
     for bad in ["sha256:short", "md5:abc", " "] {
         let mut wire = command.to_wire();

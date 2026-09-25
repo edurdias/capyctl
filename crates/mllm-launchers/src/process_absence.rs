@@ -13,8 +13,8 @@
 //! Unlike `ExecLauncher`'s handle check, this works from a recorded identity set
 //! rather than a live handle, so it survives the restart that destroys handles.
 
-use mllm_domain::completion::ProcessIdentity;
 pub use mllm_domain::completion::Presence;
+use mllm_domain::completion::ProcessIdentity;
 
 /// The whole recorded set, resolved together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

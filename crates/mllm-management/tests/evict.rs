@@ -348,11 +348,21 @@ async fn an_evicting_start_that_would_be_refused_evicts_nothing() {
     stale["expected_revision"] = json!(2);
     let (status, body) = send(&lab, action(&lab.b, "stale-evict", stale.clone())).await;
     assert_eq!(status, 409, "{body}");
-    let (status, body) =
-        send(&lab, action(&format!("{}/instances/0", lab.b), "stale-evict-0", stale)).await;
+    let (status, body) = send(
+        &lab,
+        action(&format!("{}/instances/0", lab.b), "stale-evict-0", stale),
+    )
+    .await;
     assert_eq!(status, 409, "{body}");
-    let (status, body) =
-        send(&lab, action(&format!("{}/instances/5", lab.b), "missing-evict", start(true))).await;
+    let (status, body) = send(
+        &lab,
+        action(
+            &format!("{}/instances/5", lab.b),
+            "missing-evict",
+            start(true),
+        ),
+    )
+    .await;
     assert_eq!(status, 404, "{body}");
     // A key already used for another command is a conflict, not an eviction.
     let mut stop = start(false);
@@ -361,7 +371,11 @@ async fn an_evicting_start_that_would_be_refused_evicts_nothing() {
     assert_eq!(status, 202, "{body}");
     let (status, body) = send(&lab, action(&lab.b, "reused", start(true))).await;
     assert_eq!(status, 409, "{body}");
-    assert_eq!(lab.instance(&lab.a, 0), ("ready".into(), true), "A was evicted");
+    assert_eq!(
+        lab.instance(&lab.a, 0),
+        ("ready".into(), true),
+        "A was evicted"
+    );
     assert!(lab.switch_events().is_empty(), "{:?}", lab.switch_events());
     lab.worker.shutdown().await.unwrap();
 }

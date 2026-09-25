@@ -96,12 +96,36 @@ fn invite_join_inspect_doctor() {
     // named positionally or with --name, never both.
     let recover = parse(["mllm", "invite", "host", "host-a", "--recover"]).unwrap();
     assert!(matches!(recover, Command::Invite{name, recover: true} if name == "host-a"));
-    let recover = parse(["mllm", "invite", "host", "--name", "host-a", "--recover"]).unwrap();
+    let recover = parse([
+        "mllm",
+        "invite",
+        "host",
+        "--name",
+        "host-a",
+        "--recover",
+    ])
+    .unwrap();
     assert!(matches!(recover, Command::Invite{name, recover: true} if name == "host-a"));
-    assert!(parse(["mllm", "invite", "host", "host-a", "--name", "host-a"]).is_err());
+    assert!(parse([
+        "mllm",
+        "invite",
+        "host",
+        "host-a",
+        "--name",
+        "host-a"
+    ])
+    .is_err());
     assert!(parse(["mllm", "invite", "host", "--recover"]).is_err());
-    let join = parse(["mllm", "join", "host", "--join-file", "host-a.join", "--recover"]).unwrap();
-    assert!(matches!(join, Command::Join{recover: true, ..}));
+    let join = parse([
+        "mllm",
+        "join",
+        "host",
+        "--join-file",
+        "host-a.join",
+        "--recover",
+    ])
+    .unwrap();
+    assert!(matches!(join, Command::Join { recover: true, .. }));
 
     let inspect_host = parse(["mllm", "inspect", "host", "host-a"]).unwrap();
     assert!(
@@ -173,15 +197,35 @@ fn lifecycle_forms() {
 fn delete_deployment_forms() {
     assert!(matches!(parse(["mllm", "delete", "deployment", "dep_x"]),
         Ok(Command::Delete{deployment, stop: false}) if deployment == "dep_x"));
-    assert!(matches!(parse(["mllm", "delete", "deployment", "dep_x", "--stop"]),
-        Ok(Command::Delete{deployment, stop: true}) if deployment == "dep_x"));
+    assert!(
+        matches!(parse(["mllm", "delete", "deployment", "dep_x", "--stop"]),
+        Ok(Command::Delete{deployment, stop: true}) if deployment == "dep_x")
+    );
     let request = ulid::Ulid::new().to_string();
-    let inv = parse_invocation(["mllm", "delete", "deployment", "dep_x", "--stop", "--request-id", &request]).unwrap();
+    let inv = parse_invocation([
+        "mllm",
+        "delete",
+        "deployment",
+        "dep_x",
+        "--stop",
+        "--request-id",
+        &request,
+    ])
+    .unwrap();
     assert_eq!(inv.request_id.as_deref(), Some(request.as_str()));
     assert_eq!(inv.command.label(), "delete deployment dep_x --stop");
-    assert!(parse(["mllm", "undeploy", "model", "dep_x"]).is_err(), "undeploy was dropped");
-    assert!(parse(["mllm", "delete", "model", "dep_x"]).is_err(), "delete targets deployments");
-    assert!(parse(["mllm", "delete", "deployment"]).is_err(), "delete needs a deployment");
+    assert!(
+        parse(["mllm", "undeploy", "model", "dep_x"]).is_err(),
+        "undeploy was dropped"
+    );
+    assert!(
+        parse(["mllm", "delete", "model", "dep_x"]).is_err(),
+        "delete targets deployments"
+    );
+    assert!(
+        parse(["mllm", "delete", "deployment"]).is_err(),
+        "delete needs a deployment"
+    );
 }
 
 // T09 T13, SPEC §6.4: a request identity is one ULID however it is spelled.
@@ -191,15 +235,28 @@ fn delete_deployment_forms() {
 fn request_identity_is_canonicalized() {
     let request = ulid::Ulid::new().to_string();
     let lower = request.to_ascii_lowercase();
-    let inv = parse_invocation(["mllm", "start", "deployment", "dep_x", "--request-id", &lower]).unwrap();
+    let inv = parse_invocation([
+        "mllm",
+        "start",
+        "deployment",
+        "dep_x",
+        "--request-id",
+        &lower,
+    ])
+    .unwrap();
     assert_eq!(inv.request_id.as_deref(), Some(request.as_str()));
 }
 
 #[test]
 fn validate_config_file() {
     let c = parse(["mllm", "validate", "config", "--file", "host.yaml"]).unwrap();
-    assert!(matches!(c, Command::Validate{file, host: None} if file == std::path::Path::new("host.yaml")));
-    let c = parse(["mllm", "validate", "config", "--file", "d.yaml", "--host", "h.yaml"]).unwrap();
+    assert!(
+        matches!(c, Command::Validate{file, host: None} if file == std::path::Path::new("host.yaml"))
+    );
+    let c = parse([
+        "mllm", "validate", "config", "--file", "d.yaml", "--host", "h.yaml",
+    ])
+    .unwrap();
     assert!(matches!(c, Command::Validate{file, host: Some(host)}
         if file == std::path::Path::new("d.yaml") && host == std::path::Path::new("h.yaml")));
 }
@@ -234,10 +291,20 @@ fn malformed_invocations_rejected() {
 // T22: full native logs require an explicit standalone-only operator flag.
 #[test]
 fn debug_engine_logs_are_explicit_and_scoped_to_standalone() {
-    assert!(!parse_invocation(["mllm", "start", "standalone"]).unwrap().debug_engine_logs);
-    assert!(parse_invocation(["mllm", "start", "standalone", "--debug-engine-logs"]).unwrap().debug_engine_logs);
+    assert!(
+        !parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .debug_engine_logs
+    );
+    assert!(
+        parse_invocation(["mllm", "start", "standalone", "--debug-engine-logs"])
+            .unwrap()
+            .debug_engine_logs
+    );
     assert!(parse_invocation(["mllm", "start", "deployment", "d", "--debug-engine-logs"]).is_err());
-    assert!(parse_invocation(["mllm", "status", "deployment", "d", "--debug-engine-logs"]).is_err());
+    assert!(
+        parse_invocation(["mllm", "status", "deployment", "d", "--debug-engine-logs"]).is_err()
+    );
 }
 
 // SPEC §14 (deploy model): updating an existing deployment requires an
@@ -276,10 +343,34 @@ fn deploy_model_accepts_an_explicit_expected_revision() {
 // T08
 #[test]
 fn start_takes_wait() {
-    assert!(parse_invocation(["mllm", "start", "deployment", "d", "--wait"]).unwrap().wait);
-    assert!(parse_invocation(["mllm", "start", "instance", "d/0", "--wait", "--evict"]).unwrap().wait);
-    assert!(!parse_invocation(["mllm", "start", "deployment", "d"]).unwrap().wait);
-    assert!(!parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--activate", "--wait"]).unwrap().wait);
+    assert!(
+        parse_invocation(["mllm", "start", "deployment", "d", "--wait"])
+            .unwrap()
+            .wait
+    );
+    assert!(
+        parse_invocation(["mllm", "start", "instance", "d/0", "--wait", "--evict"])
+            .unwrap()
+            .wait
+    );
+    assert!(
+        !parse_invocation(["mllm", "start", "deployment", "d"])
+            .unwrap()
+            .wait
+    );
+    assert!(
+        !parse_invocation([
+            "mllm",
+            "deploy",
+            "model",
+            "--file",
+            "d.yaml",
+            "--activate",
+            "--wait"
+        ])
+        .unwrap()
+        .wait
+    );
     assert!(parse_invocation(["mllm", "stop", "deployment", "d", "--wait"]).is_err());
 }
 
@@ -290,7 +381,9 @@ fn start_takes_wait() {
 fn revoke_host_parses_with_a_request_identity() {
     assert_eq!(
         parse(["mllm", "revoke", "host", "host-a"]).unwrap(),
-        Command::Revoke { host: "host-a".into() }
+        Command::Revoke {
+            host: "host-a".into()
+        }
     );
     let id = ulid::Ulid::new().to_string();
     let invocation =
@@ -314,11 +407,30 @@ fn prune_sources_parses_and_lists_by_default() {
             referenced_file: None,
         }
     );
-    let applied = parse(["mllm", "prune", "sources", "--host-config", "h.yaml", "--apply",
-        "--referenced-file", "refs.json"]).unwrap();
+    let applied = parse([
+        "mllm",
+        "prune",
+        "sources",
+        "--host-config",
+        "h.yaml",
+        "--apply",
+        "--referenced-file",
+        "refs.json",
+    ])
+    .unwrap();
     assert_eq!(applied.label(), "prune sources --apply");
-    assert!(matches!(applied, Command::PruneSources { apply: true, referenced_file: Some(_), .. }));
-    assert!(parse(["mllm", "prune", "sources"]).is_err(), "the store is named explicitly");
+    assert!(matches!(
+        applied,
+        Command::PruneSources {
+            apply: true,
+            referenced_file: Some(_),
+            ..
+        }
+    ));
+    assert!(
+        parse(["mllm", "prune", "sources"]).is_err(),
+        "the store is named explicitly"
+    );
     assert!(parse(["mllm", "prune", "deployment", "d"]).is_err());
 }
 
@@ -333,7 +445,26 @@ fn deploy_wait_without_activate_is_refused_with_its_reason() {
         .expect_err("deploy --wait without --activate was accepted");
     let message = refused.to_string();
     assert!(message.contains("--wait requires --activate"), "{message}");
-    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--activate", "--wait"]).is_ok());
+    assert!(parse_invocation([
+        "mllm",
+        "deploy",
+        "model",
+        "--file",
+        "d.yaml",
+        "--activate",
+        "--wait"
+    ])
+    .is_ok());
     assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml"]).is_ok());
-    assert!(parse_invocation(["mllm", "deploy", "model", "--file", "d.yaml", "--revision", "2", "--wait"]).is_err());
+    assert!(parse_invocation([
+        "mllm",
+        "deploy",
+        "model",
+        "--file",
+        "d.yaml",
+        "--revision",
+        "2",
+        "--wait"
+    ])
+    .is_err());
 }

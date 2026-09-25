@@ -91,11 +91,13 @@ sudo systemctl edit mllm-host
 If the timeout expires, systemd kills the mllm process only; engines survive,
 as with any other restart.
 
-### Exit codes the units do not restart
+### Exit codes and restarts
 
 The units restart a role that fails (`Restart=on-failure`) except on exit
-codes that restarting cannot heal (`RestartPreventExitStatus=`). The codes are
-defined in `crates/mllm-cli/src/output.rs`.
+codes that restarting cannot heal (`RestartPreventExitStatus=`). The table
+lists those codes, plus CLI exit codes an operator is likely to meet; the
+"Units" column says which units, if any, refuse to restart on each. The codes
+are defined in `crates/mllm-cli/src/output.rs`.
 
 | Exit | Meaning | Units | What heals it |
 |---|---|---|---|

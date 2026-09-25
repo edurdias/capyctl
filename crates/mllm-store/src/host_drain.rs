@@ -284,7 +284,10 @@ impl Store {
             .map_err(|_| StoreError::Conflict)?;
         }
         tx.commit()?;
-        Ok(expired.into_iter().map(|(host, key, _)| (host, key)).collect())
+        Ok(expired
+            .into_iter()
+            .map(|(host, key, _)| (host, key))
+            .collect())
     }
 
     /// Every host with a pending drain (see `host_drain_pending`).

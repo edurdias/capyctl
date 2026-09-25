@@ -202,7 +202,11 @@ impl Management {
             let deadline = saved.body["deadline_ms"].as_i64().unwrap_or(0);
             let evicting = saved.body["evict"].as_bool().unwrap_or(false);
             let receipt = self
-                .send_action(&saved.path, saved.body, evicting.then(|| evict_bound(deadline)))
+                .send_action(
+                    &saved.path,
+                    saved.body,
+                    evicting.then(|| evict_bound(deadline)),
+                )
                 .await?;
             return Ok((receipt, deadline));
         }
@@ -228,7 +232,8 @@ impl Management {
             None => format!("/deployments/{id}/actions"),
             Some(index) => format!("/deployments/{id}/instances/{index}/actions"),
         };
-        let mut body = json!({"action": action, "expected_revision": revision, "deadline_ms": deadline});
+        let mut body =
+            json!({"action": action, "expected_revision": revision, "deadline_ms": deadline});
         // Owner decision 2026-09-23: only a start evicts, and only when asked.
         let evicting = self.evict && action == "start";
         if evicting {
@@ -353,7 +358,10 @@ impl Management {
             .and_then(|now| i64::try_from(now.as_millis()).ok())
             .unwrap_or(0);
         let remaining = if deadline_ms > 0 {
-            deadline_ms.saturating_sub(now_ms).saturating_add(WAIT_MARGIN_MS).max(WAIT_MARGIN_MS)
+            deadline_ms
+                .saturating_sub(now_ms)
+                .saturating_add(WAIT_MARGIN_MS)
+                .max(WAIT_MARGIN_MS)
         } else {
             LEGACY_WINDOW_MS + WAIT_MARGIN_MS
         };
@@ -403,7 +411,10 @@ impl Management {
                         )
                     }
                     Some("failed" | "cancelled") => {
-                        return Err(error("operation_failed", failure_message(&snapshot, operation)))
+                        return Err(error(
+                            "operation_failed",
+                            failure_message(&snapshot, operation),
+                        ))
                     }
                     _ => {}
                 }
@@ -513,7 +524,9 @@ fn window(
             )),
             _ => Ok(ms),
         },
-        None => Ok(windows["initialize_ms"].as_i64().unwrap_or(LEGACY_WINDOW_MS)),
+        None => Ok(windows["initialize_ms"]
+            .as_i64()
+            .unwrap_or(LEGACY_WINDOW_MS)),
     }
 }
 
@@ -653,7 +666,15 @@ pub async fn execute_with_options(
     request_id: Option<&str>,
     initialize_timeout_ms: Option<i64>,
 ) -> Result<Value, StructuredError> {
-    execute_with_evict(command, state_dir, config, request_id, initialize_timeout_ms, false).await
+    execute_with_evict(
+        command,
+        state_dir,
+        config,
+        request_id,
+        initialize_timeout_ms,
+        false,
+    )
+    .await
 }
 
 /// Owner decision 2026-09-23: as [`execute_with_options`], with `--evict` for
@@ -666,7 +687,16 @@ pub async fn execute_with_evict(
     initialize_timeout_ms: Option<i64>,
     evict: bool,
 ) -> Result<Value, StructuredError> {
-    execute_with_start_options(command, state_dir, config, request_id, initialize_timeout_ms, evict, false).await
+    execute_with_start_options(
+        command,
+        state_dir,
+        config,
+        request_id,
+        initialize_timeout_ms,
+        evict,
+        false,
+    )
+    .await
 }
 
 /// SPEC §6.4: as [`execute_with_evict`], with `--wait` for `start deployment`
@@ -833,7 +863,10 @@ pub async fn execute_with_start_options(
                 &journal_root,
                 request_id,
                 with_evict(
-                    with_timeout(json!({"command":action,"deployment":id}), initialize_timeout_ms),
+                    with_timeout(
+                        json!({"command":action,"deployment":id}),
+                        initialize_timeout_ms,
+                    ),
                     evict && action == "start",
                 ),
             )?;
@@ -979,8 +1012,11 @@ fn read_deployment_file(file: &std::path::Path) -> Result<Value, StructuredError
 /// its id; `None` when the view carries no id the filter would accept.
 fn latency_path(view: &Value) -> Option<String> {
     let id = view["id"].as_str()?;
-    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
-        .then(|| format!("/metrics/latency?deployment={id}"))
+    (!id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    .then(|| format!("/metrics/latency?deployment={id}"))
 }
 
 /// The view's own entry in a latency report, matched by deployment id.
@@ -1007,7 +1043,9 @@ mod tests {
     // T20
     #[test]
     fn a_start_takes_the_deployment_timeout_unless_overridden() {
-        let d = status(json!({"request_deadline_ms": 600_000, "initialize_ms": 300_000, "stop_ms": 600_000}));
+        let d = status(
+            json!({"request_deadline_ms": 600_000, "initialize_ms": 300_000, "stop_ms": 600_000}),
+        );
         assert_eq!(window(&d, "start", None).unwrap(), 300_000);
         assert_eq!(window(&d, "start", Some(540_000)).unwrap(), 540_000);
         assert_eq!(window(&d, "stop", Some(540_000)).unwrap(), 600_000);
@@ -1056,15 +1094,47 @@ mod tests {
         use reqwest::StatusCode;
         let body = |code: &str| json!({"error": {"code": code, "message": "why"}});
         let cases = [
-            (StatusCode::SERVICE_UNAVAILABLE, "capacity_blocked", ExitCode::INSUFFICIENT_RESOURCES),
-            (StatusCode::CONFLICT, "startup_requires_empty_host", ExitCode::INSUFFICIENT_RESOURCES),
-            (StatusCode::SERVICE_UNAVAILABLE, "reconciliation_required", ExitCode::UNRECONCILED),
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal", ExitCode::INTERNAL),
-            (StatusCode::SERVICE_UNAVAILABLE, "unsupported_capability", ExitCode::UNSUPPORTED),
-            (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded", ExitCode::INTERNAL),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity_blocked",
+                ExitCode::INSUFFICIENT_RESOURCES,
+            ),
+            (
+                StatusCode::CONFLICT,
+                "startup_requires_empty_host",
+                ExitCode::INSUFFICIENT_RESOURCES,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reconciliation_required",
+                ExitCode::UNRECONCILED,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                ExitCode::INTERNAL,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unsupported_capability",
+                ExitCode::UNSUPPORTED,
+            ),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "deadline_exceeded",
+                ExitCode::INTERNAL,
+            ),
             (StatusCode::NOT_FOUND, "not_found", ExitCode::INVALID_CONFIG),
-            (StatusCode::UNAUTHORIZED, "unauthorized", ExitCode::UNAUTHORIZED),
-            (StatusCode::CONFLICT, "revision_conflict", ExitCode::INVALID_CONFIG),
+            (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                ExitCode::UNAUTHORIZED,
+            ),
+            (
+                StatusCode::CONFLICT,
+                "revision_conflict",
+                ExitCode::INVALID_CONFIG,
+            ),
             // Owner decision 2026-09-25: not a capacity block, not bad input.
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1075,8 +1145,16 @@ mod tests {
         for (status, code, exit) in cases {
             let refused = refusal(status, &body(code));
             assert_eq!(refused.exit_code(), exit, "{code}");
-            assert!(refused.message.contains(code), "{code}: {}", refused.message);
-            assert!(refused.message.contains("why"), "{code}: {}", refused.message);
+            assert!(
+                refused.message.contains(code),
+                "{code}: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains("why"),
+                "{code}: {}",
+                refused.message
+            );
         }
         // A 5xx without a recognised code is a server fault, not bad input.
         let bare = refusal(StatusCode::BAD_GATEWAY, &json!({}));
@@ -1089,7 +1167,10 @@ mod tests {
     fn the_override_is_part_of_the_intent_only_when_given() {
         let base = json!({"command": "start", "deployment": "d"});
         assert_eq!(with_timeout(base.clone(), None), base);
-        assert_eq!(with_timeout(base, Some(60_000))["initialize_timeout_ms"], 60_000);
+        assert_eq!(
+            with_timeout(base, Some(60_000))["initialize_timeout_ms"],
+            60_000
+        );
     }
 
     /// SPEC §6.4: `--wait` reports why the operation it waited on failed:
@@ -1110,8 +1191,14 @@ mod tests {
                            {"id": "silent", "state": "failed"}]
         });
         let message = failure_message(&snapshot, "op");
-        assert!(message.contains("capability_missing:deep_park"), "{message}");
-        assert!(message.contains("hint: declare residency restart_only"), "{message}");
+        assert!(
+            message.contains("capability_missing:deep_park"),
+            "{message}"
+        );
+        assert!(
+            message.contains("hint: declare residency restart_only"),
+            "{message}"
+        );
         let bare = failure_message(&snapshot, "bare");
         assert!(bare.contains("startup_requires_empty_host"), "{bare}");
         assert!(bare.contains("--evict"), "{bare}");
@@ -1190,9 +1277,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, denied).await.unwrap() });
-        let api = Management { endpoint: format!("http://{address}/management/v1"), ..api };
+        let api = Management {
+            endpoint: format!("http://{address}/management/v1"),
+            ..api
+        };
         let refused = api
-            .wait(json!({"operation_id": "op", "deployment_id": "d"}), deadline)
+            .wait(
+                json!({"operation_id": "op", "deployment_id": "d"}),
+                deadline,
+            )
             .await
             .unwrap_err();
         assert_eq!(refused.code, "unauthorized");

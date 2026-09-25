@@ -838,8 +838,14 @@ mod host_scoped {
                 .import_remote_resource_policy(&session, id, &host(), &observed, 1_500)
                 .unwrap();
         }
-        let ours = store.host_resource_key("host-one", "domain", "ram").unwrap().unwrap();
-        let theirs = store.host_resource_key("host-two", "domain", "ram").unwrap().unwrap();
+        let ours = store
+            .host_resource_key("host-one", "domain", "ram")
+            .unwrap()
+            .unwrap();
+        let theirs = store
+            .host_resource_key("host-two", "domain", "ram")
+            .unwrap()
+            .unwrap();
         let parked = serde_json::json!({"version":1,"phase":"parked","allocations":[[theirs,60,0]],"devices":[]});
         let sql = rusqlite::Connection::open(&path).unwrap();
         sql.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES('X','X','model',NULL,'stopped',1,0,1,1)", []).unwrap();
@@ -883,7 +889,9 @@ mod host_scoped {
         assert!(plan_activation(input(&whole), "B").is_err());
         // Scoped to this host: the plan proceeds, and max_parked 0 is not
         // exhausted by the other host's parked owner.
-        let scoped_ledger = store.host_scoped_resource_snapshot(&[ours.as_str()]).unwrap();
+        let scoped_ledger = store
+            .host_scoped_resource_snapshot(&[ours.as_str()])
+            .unwrap();
         assert!(!scoped_ledger.owners.contains_key("X"));
         assert_eq!(scoped_ledger.epoch, whole.epoch);
         assert!(plan_activation(input(&scoped_ledger), "B").is_ok());

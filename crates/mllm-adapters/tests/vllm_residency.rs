@@ -469,7 +469,12 @@ async fn a_readiness_probe_proves_the_woken_model_usable() {
         (RuntimeAction::InvalidateCache, "c"),
         (RuntimeAction::Probe, "probe"),
     ] {
-        facts.extend(vllm.execute_persisted(&step(action, id)).await.unwrap().facts);
+        facts.extend(
+            vllm.execute_persisted(&step(action, id))
+                .await
+                .unwrap()
+                .facts,
+        );
     }
     assert_eq!(
         facts,
@@ -481,5 +486,8 @@ async fn a_readiness_probe_proves_the_woken_model_usable() {
             Milestone::ModelUsable
         ]
     );
-    assert_eq!(engine.lock().unwrap().calls.last().map(String::as_str), Some("chat"));
+    assert_eq!(
+        engine.lock().unwrap().calls.last().map(String::as_str),
+        Some("chat")
+    );
 }

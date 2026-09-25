@@ -136,17 +136,22 @@ async fn invite(State(state): State<Arc<EnrollmentState>>, request: Request) -> 
     })
     .await;
     match result {
-        Ok(Ok(invitation))=>{
+        Ok(Ok(invitation)) => {
             let mut body = serde_json::json!({"version":1,"server_address":address,"control_address":control_address,"server_ca":invitation.ca_pem,"invitation_id":invitation.id,"invitation_secret":invitation.secret,"host_name":invitation.host_name,"expires_unix":invitation.expires_unix});
             // ADR 0016: only a recovery invitation names the host id it
             // re-enrolls; an ordinary one keeps its exact earlier shape.
             if let Some(host_id) = invitation.recover_host_id {
                 body["recover_host_id"] = host_id.into();
             }
-            (StatusCode::CREATED,[(header::CACHE_CONTROL,"no-store")],Json(body)).into_response()
+            (
+                StatusCode::CREATED,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(body),
+            )
+                .into_response()
         }
-        Ok(Err(refusal))=>refused(refusal),
-        Err(_)=>error(StatusCode::INTERNAL_SERVER_ERROR, "internal", false)
+        Ok(Err(refusal)) => refused(refusal),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", false),
     }
 }
 async fn revoke(
@@ -198,9 +203,7 @@ fn refused(refusal: EnrollmentRefusal) -> Response {
         EnrollmentRefusal::Conflict => error(StatusCode::CONFLICT, "identity_conflict", false),
         // ADR 0016: only a revoked host is recovered.
         EnrollmentRefusal::NotRevoked => error(StatusCode::CONFLICT, "host_not_revoked", false),
-        EnrollmentRefusal::Internal => {
-            error(StatusCode::INTERNAL_SERVER_ERROR, "internal", false)
-        }
+        EnrollmentRefusal::Internal => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", false),
     }
 }
 fn now() -> i64 {

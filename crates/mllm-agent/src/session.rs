@@ -7,7 +7,7 @@ use crate::{
 use mllm_protocol::pb::{
     self, agent_control_client::AgentControlClient, agent_to_server, server_to_agent,
 };
-use std::{sync::Arc, time::Duration, future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 #[derive(Debug, thiserror::Error)]
@@ -23,29 +23,48 @@ pub struct HostRevoked;
 fn frame(msg: agent_to_server::Msg) -> pb::AgentToServer {
     pb::AgentToServer { msg: Some(msg) }
 }
-pub type ExecutionFuture = Pin<Box<dyn Future<Output = Result<pb::MemberExecutionResult, SessionError>> + Send>>;
+pub type ExecutionFuture =
+    Pin<Box<dyn Future<Output = Result<pb::MemberExecutionResult, SessionError>> + Send>>;
 pub type LoadFuture = Pin<Box<dyn Future<Output = Vec<pb::ReportLoad>> + Send>>;
 pub type ExitFuture = Pin<Box<dyn Future<Output = Vec<pb::MemberExit>> + Send>>;
 /// The host implementation owns local policy, durable journal acceptance and
 /// native adapters. Transport cannot render commands or mint launch authority.
 pub trait SessionExecution: Send + Sync {
-    fn execute(&self, session: u64, command: mllm_protocol::execution::MemberCommand) -> ExecutionFuture;
-    fn inventory(&self) -> Option<pb::ReportInventory> { None }
-    fn connected(&self, _session: u64) -> Result<(), SessionError> { Ok(()) }
+    fn execute(
+        &self,
+        session: u64,
+        command: mllm_protocol::execution::MemberCommand,
+    ) -> ExecutionFuture;
+    fn inventory(&self) -> Option<pb::ReportInventory> {
+        None
+    }
+    fn connected(&self, _session: u64) -> Result<(), SessionError> {
+        Ok(())
+    }
     fn disconnected(&self, _session: u64) {}
     /// SPEC §10, D9: one tick of engine load reports for this host's Ready
     /// scopes. `None` when the host reports no load. Sent only on a reconciled
     /// session; a full outbound queue drops the tick, never the session.
-    fn load_reports(&self) -> Option<LoadFuture> { None }
+    fn load_reports(&self) -> Option<LoadFuture> {
+        None
+    }
     /// The load reporting period; clamped to the D9 bounds (250 ms to 5 s).
-    fn load_interval(&self) -> Duration { crate::load::DEFAULT_LOAD_INTERVAL }
+    fn load_interval(&self) -> Duration {
+        crate::load::DEFAULT_LOAD_INTERVAL
+    }
     /// SPEC §13.2 (W13): every Ready launch with an owned process exited now.
     /// `None` when the host watches no engines. Sent only on a reconciled
     /// session, each at once and then again every `EXIT_RESEND_INTERVAL` while
     /// it stands; a full outbound queue defers it to the next scan.
-    fn member_exits(&self) -> Option<ExitFuture> { None }
+    fn member_exits(&self) -> Option<ExitFuture> {
+        None
+    }
 
-    fn provision(&self, _command: mllm_protocol::execution::MemberCommand, _gate_key: [u8; 32]) -> Pin<Box<dyn Future<Output = Result<Provisioned, SessionError>> + Send>> {
+    fn provision(
+        &self,
+        _command: mllm_protocol::execution::MemberCommand,
+        _gate_key: [u8; 32],
+    ) -> Pin<Box<dyn Future<Output = Result<Provisioned, SessionError>> + Send>> {
         Box::pin(async { Err(SessionError) })
     }
 }
@@ -269,7 +288,9 @@ struct Fence {
 }
 impl Drop for Fence {
     fn drop(&mut self) {
-        if let Some(execution) = &self.execution { execution.disconnected(self.session); }
+        if let Some(execution) = &self.execution {
+            execution.disconnected(self.session);
+        }
         let _ = self.journal.disconnect(self.session);
     }
 }
@@ -427,9 +448,10 @@ async fn connect_once(
             if load_gate.wait_for(|ready| *ready).await.is_err() {
                 return Ok(());
             }
-            let period = execution
-                .load_interval()
-                .clamp(crate::load::MIN_LOAD_INTERVAL, crate::load::MAX_LOAD_INTERVAL);
+            let period = execution.load_interval().clamp(
+                crate::load::MIN_LOAD_INTERVAL,
+                crate::load::MAX_LOAD_INTERVAL,
+            );
             let mut tick = tokio::time::interval(period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -531,16 +553,25 @@ async fn connect_once(
                     && !ready.session_id.is_empty() =>
             {
                 let connected = Fence {
-                    session: journal.connect().map_err(end("host journal refused the session"))?,
-                    journal: journal.clone(), execution: execution.clone(),
+                    session: journal
+                        .connect()
+                        .map_err(end("host journal refused the session"))?,
+                    journal: journal.clone(),
+                    execution: execution.clone(),
                 };
                 if let Some(execution) = &execution {
-                    execution.connected(connected.session).map_err(end("host execution refused the session"))?;
+                    execution
+                        .connected(connected.session)
+                        .map_err(end("host execution refused the session"))?;
                 }
                 fence = Some(connected);
                 if ready.heartbeat_interval_ms > 0 && ready.heartbeat_lost_after_ms > 0 {
-                    let period = Duration::from_millis(ready.heartbeat_interval_ms.clamp(250, 10_000) as u64);
-                    lost_after = Some(Duration::from_millis(ready.heartbeat_lost_after_ms.clamp(3_000, 600_000) as u64));
+                    let period = Duration::from_millis(
+                        ready.heartbeat_interval_ms.clamp(250, 10_000) as u64,
+                    );
+                    lost_after = Some(Duration::from_millis(
+                        ready.heartbeat_lost_after_ms.clamp(3_000, 600_000) as u64,
+                    ));
                     last_heard = tokio::time::Instant::now();
                     beat = tokio::time::interval(period);
                     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -558,36 +589,71 @@ async fn connect_once(
                 }
             }
             // Liveness only; hearing it refreshed `last_heard` above.
-            Some(server_to_agent::Msg::Heartbeat(_)) if fence.is_some() && lost_after.is_some() => {}
+            Some(server_to_agent::Msg::Heartbeat(_)) if fence.is_some() && lost_after.is_some() => {
+            }
             Some(server_to_agent::Msg::ExecuteMember(wire)) if fence.is_some() => {
-                let executor = execution.as_ref().ok_or(SessionEnd::fixed("host has no native execution"))?.clone();
-                let command = mllm_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
-                    msg: Some(server_to_agent::Msg::ExecuteMember(wire)),
-                }).map_err(end("controller sent an invalid command"))?;
-                command.verify_digest().map_err(end("controller sent an invalid command"))?;
+                let executor = execution
+                    .as_ref()
+                    .ok_or(SessionEnd::fixed("host has no native execution"))?
+                    .clone();
+                let command =
+                    mllm_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
+                        msg: Some(server_to_agent::Msg::ExecuteMember(wire)),
+                    })
+                    .map_err(end("controller sent an invalid command"))?;
+                command
+                    .verify_digest()
+                    .map_err(end("controller sent an invalid command"))?;
                 let key = format!("execute/{}", command.identity.command_id);
                 if in_flight.contains(&key) {
                     continue;
                 }
-                if effects.len() >= 8 { return Err(SessionEnd::fixed("local effect bound exceeded")); }
-                let session = fence.as_ref().ok_or(SessionEnd::fixed("session is not connected"))?.session;
+                if effects.len() >= 8 {
+                    return Err(SessionEnd::fixed("local effect bound exceeded"));
+                }
+                let session = fence
+                    .as_ref()
+                    .ok_or(SessionEnd::fixed("session is not connected"))?
+                    .session;
                 in_flight.insert(key.clone());
                 effects.spawn(async move {
-                    (key, executor.execute(session, command).await.map(agent_to_server::Msg::MemberResult))
+                    (
+                        key,
+                        executor
+                            .execute(session, command)
+                            .await
+                            .map(agent_to_server::Msg::MemberResult),
+                    )
                 });
             }
             Some(server_to_agent::Msg::ProvisionIngress(provision)) if fence.is_some() => {
-                let executor = execution.as_ref().ok_or(SessionEnd::fixed("host has no native execution"))?.clone();
-                let command = mllm_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
-                    msg: Some(server_to_agent::Msg::ExecuteMember(provision.command.ok_or(SessionEnd::fixed("controller sent an invalid provision"))?)),
-                }).map_err(end("controller sent an invalid provision"))?;
-                command.verify_digest().map_err(end("controller sent an invalid provision"))?;
-                let gate: [u8; 32] = provision.gate_key.try_into().map_err(end("controller sent an invalid provision"))?;
+                let executor = execution
+                    .as_ref()
+                    .ok_or(SessionEnd::fixed("host has no native execution"))?
+                    .clone();
+                let command =
+                    mllm_protocol::execution::MemberCommand::try_from(pb::ServerToAgent {
+                        msg: Some(server_to_agent::Msg::ExecuteMember(
+                            provision
+                                .command
+                                .ok_or(SessionEnd::fixed("controller sent an invalid provision"))?,
+                        )),
+                    })
+                    .map_err(end("controller sent an invalid provision"))?;
+                command
+                    .verify_digest()
+                    .map_err(end("controller sent an invalid provision"))?;
+                let gate: [u8; 32] = provision
+                    .gate_key
+                    .try_into()
+                    .map_err(end("controller sent an invalid provision"))?;
                 let key = format!("provision/{}", command.identity.command_id);
                 if in_flight.contains(&key) {
                     continue;
                 }
-                if effects.len() >= 8 { return Err(SessionEnd::fixed("local effect bound exceeded")); }
+                if effects.len() >= 8 {
+                    return Err(SessionEnd::fixed("local effect bound exceeded"));
+                }
                 let id = command.to_wire().identity;
                 in_flight.insert(key.clone());
                 effects.spawn(async move {
@@ -596,7 +662,10 @@ async fn connect_once(
                             Provisioned::Stored => String::new(),
                             Provisioned::Refused(reason) => reason.into(),
                         };
-                        agent_to_server::Msg::IngressProvisioned(pb::IngressProvisioned { identity: id, refused })
+                        agent_to_server::Msg::IngressProvisioned(pb::IngressProvisioned {
+                            identity: id,
+                            refused,
+                        })
                     });
                     (key, provisioned)
                 });
@@ -622,7 +691,10 @@ mod tests {
         ));
         let logged = refused_session(refusal).to_string();
         assert!(logged.contains("upgrade the server first"), "{logged}");
-        assert!(logged.contains("0.3.0") && logged.contains("0.2.1"), "{logged}");
+        assert!(
+            logged.contains("0.3.0") && logged.contains("0.2.1"),
+            "{logged}"
+        );
         for other in [
             tonic::Status::permission_denied("host session authorization failed"),
             tonic::Status::failed_precondition("something else"),
@@ -631,7 +703,10 @@ mod tests {
                 mllm_protocol::version::NEWER_HOST_REFUSAL
             )),
         ] {
-            assert_eq!(refused_session(other).to_string(), "controller refused the session");
+            assert_eq!(
+                refused_session(other).to_string(),
+                "controller refused the session"
+            );
         }
     }
 

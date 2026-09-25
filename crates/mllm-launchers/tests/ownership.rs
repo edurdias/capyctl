@@ -74,7 +74,7 @@ fn controller_lock_rejects_symlinks_hardlinks_and_nonregular_files() {
 
 #[test]
 fn controller_lock_requires_protected_canonical_directory_and_file() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{symlink, PermissionsExt};
     let dir = protected_directory();
     let parent = dir.path().join("service");
     std::fs::create_dir(&parent).unwrap();

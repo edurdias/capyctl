@@ -228,8 +228,16 @@ fn the_cache_is_used_only_from_a_private_directory_and_files() {
     let linked = cache.path().join("linked");
     std::os::unix::fs::symlink(&real, &linked).unwrap();
     let verifier = CheckpointVerifier::with_cache_dir(linked.clone());
-    let recorded = verifier.measure(&store.root, &checkpoint).unwrap().manifest.digest;
-    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0, "nothing written through a link");
+    let recorded = verifier
+        .measure(&store.root, &checkpoint)
+        .unwrap()
+        .manifest
+        .digest;
+    assert_eq!(
+        std::fs::read_dir(&real).unwrap().count(),
+        0,
+        "nothing written through a link"
+    );
     // A group- or other-writable directory is not trusted either.
     let shared = cache.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
@@ -244,16 +252,34 @@ fn the_cache_is_used_only_from_a_private_directory_and_files() {
     CheckpointVerifier::with_cache_dir(private.clone())
         .measure(&store.root, &checkpoint)
         .unwrap();
-    let file = std::fs::read_dir(&private).unwrap().next().unwrap().unwrap().path();
-    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    let file = std::fs::read_dir(&private)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
     let restarted = CheckpointVerifier::with_cache_dir(private.clone());
-    assert!(restarted.verify(&store.root, &checkpoint, &recorded).unwrap().full_rehash);
+    assert!(
+        restarted
+            .verify(&store.root, &checkpoint, &recorded)
+            .unwrap()
+            .full_rehash
+    );
     let moved = cache.path().join("moved.json");
     std::fs::rename(&file, &moved).unwrap();
     std::os::unix::fs::symlink(&moved, &file).unwrap();
     let restarted = CheckpointVerifier::with_cache_dir(private);
-    assert!(restarted.verify(&store.root, &checkpoint, &recorded).unwrap().full_rehash);
+    assert!(
+        restarted
+            .verify(&store.root, &checkpoint, &recorded)
+            .unwrap()
+            .full_rehash
+    );
 }
 
 // T37, ADR 0014 §7: links are followed only inside the model store (the Hugging

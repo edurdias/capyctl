@@ -205,5 +205,7 @@ fn deployment_engine_config_reaches_the_plan_or_is_refused_by_name() {
     let effective = resolve_effective(&deployment, &host).unwrap();
     let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
     let argv = render_command(&plan).unwrap().argv;
-    assert!(!argv.iter().any(|a| a == "--kv-cache-dtype" || a == "--block-size"));
+    assert!(!argv
+        .iter()
+        .any(|a| a == "--kv-cache-dtype" || a == "--block-size"));
 }

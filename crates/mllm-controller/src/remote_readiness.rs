@@ -59,9 +59,8 @@ const MAX_RETRY: Duration = Duration::from_secs(300);
 const QUIESCENCE_WAIT: Duration = Duration::from_secs(10);
 const QUIESCENCE_POLL: Duration = Duration::from_millis(100);
 
-pub type ProbeFuture = Pin<
-    Box<dyn Future<Output = Result<(String, pb::MemberExecutionResult), ()>> + Send>,
->;
+pub type ProbeFuture =
+    Pin<Box<dyn Future<Output = Result<(String, pb::MemberExecutionResult), ()>> + Send>>;
 
 /// The host side supervision needs: which authenticated session is current,
 /// notice when that changes, and the result of a probe with the session that
@@ -230,13 +229,9 @@ impl RemoteReadiness {
         let Ok(launches) = owner.store().remote_ready_launches(owner.session()) else {
             return;
         };
-        for launch in launches
-            .into_iter()
-            .filter(|launch| {
-                launch.host_id == host
-                    && (launch.dispatch_enabled || !launch.host_closure_recorded)
-            })
-        {
+        for launch in launches.into_iter().filter(|launch| {
+            launch.host_id == host && (launch.dispatch_enabled || !launch.host_closure_recorded)
+        }) {
             let _ = owner
                 .store()
                 .suspend_remote_dispatch(owner.session(), &launch.step_id);
@@ -268,7 +263,9 @@ impl RemoteReadiness {
     fn start_probe(self: &Arc<Self>, launch: RemoteReadyLaunch, session: String) {
         let now = Instant::now();
         {
-            let Ok(mut probes) = self.probes.lock() else { return };
+            let Ok(mut probes) = self.probes.lock() else {
+                return;
+            };
             let state = probes
                 .entry(launch.binding_id.clone())
                 .or_insert_with(|| ProbeState {
@@ -296,7 +293,9 @@ impl RemoteReadiness {
         let supervisor = self.clone();
         self.children.track(tokio::spawn(async move {
             let outcome = supervisor.probe(&launch, &session).await;
-            let Ok(mut probes) = supervisor.probes.lock() else { return };
+            let Ok(mut probes) = supervisor.probes.lock() else {
+                return;
+            };
             if let Some(state) = probes.get_mut(&launch.binding_id) {
                 state.running = false;
                 match outcome {
@@ -515,7 +514,12 @@ fn quiescent(view: &LoadView, launch: &RemoteReadyLaunch, probed_at: i64) -> boo
 
 fn sorted(mut identities: Vec<ProcessIdentity>) -> Vec<ProcessIdentity> {
     identities.sort_by(|a, b| {
-        (&a.role, a.pid, &a.boot_id, a.start_ticks).cmp(&(&b.role, b.pid, &b.boot_id, b.start_ticks))
+        (&a.role, a.pid, &a.boot_id, a.start_ticks).cmp(&(
+            &b.role,
+            b.pid,
+            &b.boot_id,
+            b.start_ticks,
+        ))
     });
     identities
 }
