@@ -14,4 +14,6 @@ pub mod revoke;
 pub mod roles;
 pub mod shutdown;
 pub mod standalone_config;
+// ADR 0018 §5: standalone's engine add, remove and list.
+pub mod standalone_engines;
 pub mod validate;

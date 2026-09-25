@@ -90,6 +90,7 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         support::TEST_CAPACITY_BYTES,
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     let path = dir.path().join("deployment.json");
     std::fs::write(&path, config.to_string()).unwrap();

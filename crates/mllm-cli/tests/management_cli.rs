@@ -50,6 +50,7 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
         support::TEST_CAPACITY_BYTES,
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     let path = dir.path().join("deployment.json");
     std::fs::write(&path, config.to_string()).unwrap();

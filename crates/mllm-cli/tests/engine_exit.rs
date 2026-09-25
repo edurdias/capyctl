@@ -360,6 +360,7 @@ impl Installation {
             capacity,
             mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
             true,
+            "local",
         );
         let file = self.root.path().join("deployment.json");
         std::fs::write(&file, document.to_string()).unwrap();

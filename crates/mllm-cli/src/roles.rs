@@ -39,13 +39,15 @@ use crate::output::{ExitCode, StructuredError};
 /// The provider seam lives in the controller, so a test double can implement it
 /// without depending on this binary. It is re-exported here because this is where
 /// standalone is wired.
-pub use mllm_controller::engine_provider::{EngineInstallation, EngineProvider, ProviderError};
+pub use mllm_controller::engine_provider::{
+    EngineInstallation, EngineProvider, NamedInstallation, ProviderError,
+};
 
 pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 
-/// The engine's executable. Required: a host with no engine cannot serve.
-/// One of these two must name the family this host publishes; a host that
-/// names both is not publishing one installation, and refuses.
+/// The engine's executable. A host with no engine cannot serve: one of these
+/// two, or a profile registered with `mllm engine add`, must name one. ADR
+/// 0018 §5: both set publish two profiles, `local-vllm` and `local-sglang`.
 const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
 const SGLANG_BIN: &str = "MLLM_SGLANG_BIN";
 /// The directory model weights live under (Spec §7). Required for the same reason:
@@ -92,18 +94,14 @@ pub struct App {
     /// A separate read-only connection for direct observation in tests. It never
     /// writes: the coordinator is the only writer.
     pub store: Rc<Store>,
-    /// The engine installation this host published. Deployments are qualified
-    /// against it, so it is kept rather than recomposed per request — recomposing
-    /// risks declaring one thing at boot and a different thing at deploy.
-    installation: EngineInstallation,
-    /// The environment fingerprint published with the installation, kept for the
-    /// same reason.
-    environment_fingerprint: String,
+    /// ADR 0018 §5: the embedded host's installations and the host document
+    /// they publish. Deployments are qualified against that document, so it is
+    /// kept rather than recomposed per request — recomposing risks declaring
+    /// one thing at boot and a different thing at deploy. `engine add` and
+    /// `remove` replace it through the control socket.
+    host: Arc<crate::standalone_engines::EmbeddedHost>,
     /// Observed host capacity the published limits were derived from.
     capacity_bytes: i64,
-    /// The NVIDIA device publication this boot observed, carried so every host
-    /// document it builds states the same placement evidence.
-    inventory: Option<crate::device_inventory::InventoryPublication>,
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     management: axum::Router,
@@ -118,9 +116,6 @@ pub struct App {
     /// SPEC §10, ADR 0013 §8 (W10): the switcher, held so shutdown joins the
     /// `--evict` follow-ups it started.
     switcher: Arc<mllm_controller::switching::Switcher>,
-    /// ADR 0008 (owner decision 2026-09-23): the engine installation this
-    /// boot registered, and any drift its launches found since.
-    engine_installation: Arc<mllm_controller::installation_gate::EmbeddedInstallation>,
     /// SPEC §15.2 (R13) / §15.3: values of the standalone document accepted but
     /// not honoured (only the `server.tls` block an older generator wrote),
     /// reported by the role at boot so nobody believes them in force.
@@ -151,9 +146,24 @@ impl App {
         &self.api_key
     }
 
-    /// ADR 0008: the registered installation's status view.
+    /// ADR 0008: the first registered installation's status view.
     pub fn installation_view(&self) -> serde_json::Value {
-        self.engine_installation.view()
+        self.host
+            .installations()
+            .views()
+            .into_iter()
+            .next()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// ADR 0018 §5: the runtime profiles the embedded host publishes now.
+    pub fn profiles(&self) -> Vec<String> {
+        self.host.profiles()
+    }
+
+    /// The embedded host document deployments are qualified against now.
+    pub fn host_document(&self) -> serde_json::Value {
+        self.host.document()
     }
 
     /// SPEC §4.3 (owner decision P3): an ordinary stop of the standalone role is a
@@ -238,23 +248,26 @@ impl App {
         source: ModelSource,
         request_deadline: &str,
     ) -> Result<String, StartError> {
-        let host = crate::standalone_config::host_policy(
-            &self.installation,
-            &self.environment_fingerprint,
-            self.capacity_bytes,
-            self.inventory.as_ref(),
-        );
+        let host = self.host.document();
+        // The first profile: the environment's when a variable names one.
+        let first = self
+            .host
+            .named()
+            .into_iter()
+            .next()
+            .ok_or_else(|| StartError::Deploy("the host publishes no engine".into()))?;
         let mut deployment = crate::standalone_config::deployment_document(
             name,
             name,
             &source,
-            self.installation.engine,
+            first.installation.engine,
             self.capacity_bytes,
             request_deadline,
-            self.installation.deep_park,
+            first.installation.deep_park,
+            &first.profile,
         );
         // ADR 0014 §2: the engine configuration the environment asked for.
-        deployment["engine_config"] = self.installation.engine_config.clone();
+        deployment["engine_config"] = first.installation.engine_config.clone();
         let receipt = self
             .controller
             .create_configuration(
@@ -283,6 +296,10 @@ pub enum StartError {
     /// than come up serving nothing.
     #[error("no engine installation: {0}")]
     NoEngineInstallation(String),
+    /// ADR 0018 §5: an environment-variable profile and a registered one
+    /// share a name.
+    #[error("{0}")]
+    ProfileExists(String),
     #[error("controller ownership: {0}")]
     Ownership(#[from] mllm_controller::OwnedStateError),
     #[error("coordinator: {0}")]
@@ -298,6 +315,7 @@ impl From<ProviderError> for StartError {
     fn from(error: ProviderError) -> Self {
         match error {
             ProviderError::NoEngineInstallation(what) => StartError::NoEngineInstallation(what),
+            error @ ProviderError::ProfileExists(_) => StartError::ProfileExists(error.to_string()),
         }
     }
 }
@@ -313,6 +331,7 @@ impl From<StartError> for StructuredError {
             )) => crate::output::STORE_FROM_NEWER_VERSION,
             StartError::Config(_) => "invalid_config",
             StartError::NoEngineInstallation(_) => "invalid_config",
+            StartError::ProfileExists(_) => "profile_exists",
             StartError::Setting(_) => "invalid_config",
             _ => "internal",
         };
@@ -422,27 +441,29 @@ fn engine_ports() -> Result<(u16, u16), ProviderError> {
         })
 }
 
-impl EngineProvider for EnvEngineProvider {
-    fn installation(&self) -> Result<EngineInstallation, ProviderError> {
-        let vllm = env_value(ENGINE_BIN);
-        let sglang = env_value(SGLANG_BIN);
-        let (executable, engine) = match (vllm, sglang) {
-            (Some(_), Some(_)) => {
-                return Err(no_installation(format!(
-                    "this host declares two engines ({ENGINE_BIN} and {SGLANG_BIN}); \
-                     standalone publishes exactly one"
-                )))
-            }
-            (Some(vllm), None) => (PathBuf::from(vllm), Engine::Vllm),
-            (None, Some(sglang)) => (PathBuf::from(sglang), Engine::Sglang),
-            (None, None) => {
-                return Err(no_installation(format!(
-                    "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                     for SGLang) to the engine's executable and {MODELS_ROOT} to the \
-                     directory its weights live under"
-                )))
-            }
-        };
+impl EnvEngineProvider {
+    /// The role's installation of `engine` at `executable`: models root,
+    /// ports, KV default, runtime directory and switches from the environment.
+    fn role_installation(
+        &self,
+        engine: Engine,
+        executable: PathBuf,
+    ) -> Result<EngineInstallation, ProviderError> {
+        self.role_installation_as(engine, executable, None, None)
+    }
+
+    /// As [`Self::role_installation`], with the version given instead of
+    /// probed and the deep-park switch given instead of read. ADR 0018 §5: a
+    /// registered profile's version was checked by `engine add`, so nothing is
+    /// executed for it at start, and its own deep-park switch decides which
+    /// runtime modules it needs.
+    fn role_installation_as(
+        &self,
+        engine: Engine,
+        executable: PathBuf,
+        fingerprint: Option<&str>,
+        deep_park: Option<bool>,
+    ) -> Result<EngineInstallation, ProviderError> {
         let models_root = PathBuf::from(env_value(MODELS_ROOT).ok_or_else(|| {
             no_installation(format!(
                 "this host names no model store: set {MODELS_ROOT} to the directory \
@@ -456,14 +477,17 @@ impl EngineProvider for EnvEngineProvider {
             )));
         }
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
-        // out. Sleep mode follows the same switch as deep parking.
-        let deep_park = deep_park_switch()?;
+        // out. Sleep mode follows the same switch as deep parking. A malformed
+        // switch is refused even when a registered profile states its own.
+        let switch = deep_park_switch()?;
+        let deep_park = deep_park.unwrap_or(switch);
         let trust_remote_code = env_value(TRUST_REMOTE_CODE).is_some_and(|value| value == "1");
         let installation_drift = installation_drift_switch()?;
         let engine_ports = engine_ports()?;
-        let build_fingerprint = match env_value(ENGINE_FINGERPRINT) {
-            Some(declared) => declared,
-            None => probe_fingerprint(&executable)?,
+        let build_fingerprint = match (fingerprint, env_value(ENGINE_FINGERPRINT)) {
+            (Some(registered), _) => registered.to_owned(),
+            (None, Some(declared)) => declared,
+            (None, None) => probe_fingerprint(&executable)?,
         };
         let kv_cache_bytes =
             env_value(KV_CACHE_BYTES).unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
@@ -495,6 +519,84 @@ impl EngineProvider for EnvEngineProvider {
             installation_drift,
             engine_ports,
         })
+    }
+}
+
+impl EngineProvider for EnvEngineProvider {
+    /// The environment's one installation. ADR 0018 §5: with both variables
+    /// set this is the vLLM one; [`Self::installations`] publishes both.
+    fn installation(&self) -> Result<EngineInstallation, ProviderError> {
+        match (env_value(ENGINE_BIN), env_value(SGLANG_BIN)) {
+            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm.into()),
+            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang.into()),
+            (None, None) => Err(no_installation(format!(
+                "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
+                 for SGLang) to the engine's executable and {MODELS_ROOT} to the \
+                 directory its weights live under"
+            ))),
+        }
+    }
+
+    fn installations(
+        &self,
+        registered: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<NamedInstallation>, ProviderError> {
+        // ADR 0018 §5: one variable is `local`, as always; both (refused
+        // before, so nothing depends on it) are `local-vllm` and `local-sglang`.
+        let named = |profile: &str, installation| NamedInstallation {
+            profile: profile.into(),
+            installation,
+        };
+        let mut all = match (env_value(ENGINE_BIN), env_value(SGLANG_BIN)) {
+            (Some(vllm), None) => vec![named(
+                crate::standalone_config::STANDALONE_PROFILE,
+                self.role_installation(Engine::Vllm, vllm.into())?,
+            )],
+            (None, Some(sglang)) => vec![named(
+                crate::standalone_config::STANDALONE_PROFILE,
+                self.role_installation(Engine::Sglang, sglang.into())?,
+            )],
+            (Some(vllm), Some(sglang)) => vec![
+                named(
+                    "local-vllm",
+                    self.role_installation(Engine::Vllm, vllm.into())?,
+                ),
+                named(
+                    "local-sglang",
+                    self.role_installation(Engine::Sglang, sglang.into())?,
+                ),
+            ],
+            (None, None) => Vec::new(),
+        };
+        for (name, profile) in registered {
+            if all.iter().any(|n| &n.profile == name) {
+                return Err(ProviderError::ProfileExists(name.clone()));
+            }
+            let engine = if profile["engine"] == "sglang" {
+                Engine::Sglang
+            } else {
+                Engine::Vllm
+            };
+            let executable = PathBuf::from(profile["executable"].as_str().unwrap_or_default());
+            let base = self.role_installation_as(
+                engine,
+                executable,
+                Some(profile["build_fingerprint"].as_str().unwrap_or("unknown")),
+                Some(profile["security"]["deep_park"].as_str() != Some("disabled")),
+            )?;
+            all.push(named(
+                name,
+                mllm_controller::engine_provider::from_profile(&base, profile),
+            ));
+        }
+        if all.is_empty() {
+            return Err(no_installation(format!(
+                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} to the \
+                 engine's executable (and {MODELS_ROOT} to the directory its weights \
+                 live under), or register one with `mllm engine add`"
+            )));
+        }
+        Ok(all)
     }
 
     fn bindings(
@@ -809,10 +911,33 @@ async fn start_standalone_inner(
         None => return Err(StartError::MissingCredentials),
     };
 
-    // Spec §8: what this host publishes about its engine is what it has. There is
-    // no fallback installation: a host with none refuses to boot rather than come
-    // up serving an engine nobody configured.
-    let installation = provider.installation()?;
+    // Spec §8: what this host publishes about its engines is what it has. There
+    // is no fallback installation: a host with none refuses to boot rather than
+    // come up serving an engine nobody configured. ADR 0018 §5: the environment's
+    // installations and the profiles registered in engines.yaml (beside
+    // `--config`, else `<config home>/mllm/engines.yaml`); a name declared in
+    // both is refused `profile_exists`. The standalone document is never written.
+    let engines = match config {
+        Some(document) => Some(mllm_config::registration::engines_beside(document)),
+        None => mllm_config::registration::config_home(&|key| {
+            std::env::var(key).ok().filter(|value| !value.is_empty())
+        })
+        .map(|home| mllm_config::registration::engines_path(None, &home)),
+    };
+    let registered = match &engines {
+        Some(path) => mllm_config::registration::EnginesFile::load(path)?.profiles,
+        None => serde_json::Map::new(),
+    };
+    for (name, profile) in &registered {
+        mllm_config::registration::check_profile(name, profile)?;
+    }
+    let named = provider.installations(&registered)?;
+    // Role-level settings (runtime directory, ports, model store) are the same
+    // for every installation; the first one states them.
+    let installation = named
+        .first()
+        .map(|first| first.installation.clone())
+        .ok_or_else(|| StartError::NoEngineInstallation("this host declares no engine".into()))?;
     let environment_fingerprint = format!("standalone-{}", installation.build_fingerprint);
     let capacity_bytes = memory()
         .map(|sample| sample.capacity_bytes)
@@ -836,7 +961,7 @@ async fn start_standalone_inner(
     // so it has to exist before the coordinator does.
     let declared_host = {
         let host = crate::standalone_config::host_policy(
-            &installation,
+            &named,
             &environment_fingerprint,
             capacity_bytes,
             inventory.as_ref(),
@@ -851,6 +976,7 @@ async fn start_standalone_inner(
             capacity_bytes,
             crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
             installation.deep_park,
+            &named[0].profile,
         );
         mllm_config::effective::resolve_effective(&probe, &host)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
@@ -881,23 +1007,26 @@ async fn start_standalone_inner(
         stop_drain_timeout: switch_drain_timeout,
         ..Default::default()
     };
-    // ADR 0008 (owner decision 2026-09-23): register the installation (its
+    // ADR 0008 (owner decision 2026-09-23): register each installation (its
     // version and a digest over its files) as a host agent does at start; each
-    // Initialize measures it again for drift. Bounded, reads files only, and a
-    // failure is `unmeasured`, never a refusal.
-    let engine_installation = {
-        let (engine, executable) = (installation.engine, installation.executable.clone());
-        Arc::new(
-            tokio::task::spawn_blocking(move || {
-                mllm_controller::installation_gate::EmbeddedInstallation::register(
-                    crate::standalone_config::STANDALONE_PROFILE,
-                    engine,
-                    &executable,
-                )
-            })
-            .await
-            .map_err(|_| StartError::Deploy("installation registration did not finish".into()))?,
-        )
+    // Initialize measures the one its profile names again for drift. Bounded,
+    // reads files only, and a failure is `unmeasured`, never a refusal.
+    let embedded = {
+        let (named, fingerprint, inventory) = (
+            named.clone(),
+            environment_fingerprint.clone(),
+            inventory.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::standalone_engines::EmbeddedHost::new(
+                named,
+                fingerprint,
+                capacity_bytes,
+                inventory,
+            )
+        })
+        .await
+        .map_err(|_| StartError::Deploy("installation registration did not finish".into()))?
     };
     let bindings: Arc<dyn EngineBindings> =
         Arc::new(mllm_controller::installation_gate::InstalledBindings::new(
@@ -906,7 +1035,7 @@ async fn start_standalone_inner(
                 state_dir.join("logs"),
                 installation.runtime_dir.clone(),
             ),
-            engine_installation.clone(),
+            embedded.installations(),
         ));
     // ADR 0014 §7 (WE3): the embedded host measures pending checkpoint digests
     // with the verifier its launches use, so they share one stat cache.
@@ -944,12 +1073,6 @@ async fn start_standalone_inner(
     let management_credentials =
         mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?;
-    let host = crate::standalone_config::host_policy(
-        &installation,
-        &environment_fingerprint,
-        capacity_bytes,
-        inventory.as_ref(),
-    );
     // SPEC §4.3 (P3): the Ready engines a previous run left running are adopted
     // by the coordinator at start; this supervisor re-proves each one locally
     // before dispatch reopens.
@@ -964,8 +1087,12 @@ async fn start_standalone_inner(
             .spawn_local_until(supervision.cancel_signal()),
     );
     let configuration = Arc::new(
-        mllm_management::configuration::SharedConfigurationSource::new(owner, host, "standalone")
-            .map_err(|_| StartError::Deploy("management configuration unavailable".into()))?,
+        mllm_management::configuration::SharedConfigurationSource::new_shared(
+            owner,
+            embedded.shared_document(),
+            "standalone",
+        )
+        .map_err(|_| StartError::Deploy("management configuration unavailable".into()))?,
     );
     // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching
     // and the operator's `start --evict`, so both take the same host turns.
@@ -993,7 +1120,7 @@ async fn start_standalone_inner(
     let installation_view = mllm_management::installation::installation_router(
         mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
             .map_err(|_| StartError::MissingCredentials)?,
-        engine_installation.clone(),
+        embedded.installations(),
     );
     // SPEC §17 (M80): the router's per-request latency distributions. The
     // embedded engine has no host ingress or load report, so only the router
@@ -1010,6 +1137,10 @@ async fn start_standalone_inner(
             }),
         )
     };
+    // ADR 0018 §4, §5: removal retires through the store, as a server does.
+    let retirements = Arc::new(mllm_management::engines::StoreRetirements::new(
+        source.clone(),
+    ));
     let management = mllm_management::lifecycle_router(management_credentials, source)
         .merge(drain)
         .merge(installation_view)
@@ -1060,21 +1191,58 @@ async fn start_standalone_inner(
             .waiting
             .set_limits(crate::remote_roles::wait_limits(&queue));
     }
+    // ADR 0018 §3, §5: the local control channel `mllm engine add` and
+    // `remove` use, bound only inside the role's 0700 state directory. A
+    // socket that cannot be bound (unsafe directory, path too long, another
+    // role, no engines file) is reported and the role runs without it, so
+    // `engine add` answers `agent_unreachable` and takes effect at start.
+    let mut config_notices = config_notices;
+    match &engines {
+        None => config_notices.push(
+            "engine control socket not served: neither XDG_CONFIG_HOME nor HOME is set, \
+             so there is no engines.yaml to reload"
+                .into(),
+        ),
+        Some(engines) => {
+            let socket = state_dir.join(mllm_agent::control_socket::SOCKET_NAME);
+            match mllm_agent::control_socket::ControlServer::bind(&socket) {
+                Ok(server) => {
+                    let handler = crate::standalone_engines::StandaloneControl::new(
+                        engines.clone(),
+                        provider.clone(),
+                        embedded.clone(),
+                        retirements,
+                        coordinator.commands(),
+                        declared_host.name.clone(),
+                    );
+                    // SAFETY: geteuid has no preconditions and cannot fail.
+                    let uid = unsafe { libc::geteuid() };
+                    // Supervised: it stops, and removes its file, with the role.
+                    supervision.supervise(tokio::spawn(server.serve(
+                        handler,
+                        uid,
+                        supervision.cancel_signal(),
+                    )));
+                }
+                Err(failure) => config_notices.push(format!(
+                    "engine control socket unavailable ({failure}); `mllm engine add` \
+                     takes effect when the role restarts"
+                )),
+            }
+        }
+    }
     Ok(App {
         controller,
         _coordinator: coordinator,
         store,
-        installation,
-        environment_fingerprint,
+        host: embedded,
         capacity_bytes,
-        inventory,
         router,
         management,
         deps,
         api_key,
         supervision,
         switcher,
-        engine_installation,
         config_notices,
     })
 }

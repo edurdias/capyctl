@@ -8,10 +8,12 @@
 use crate::device_inventory::InventoryPublication;
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
+use mllm_controller::engine_provider::NamedInstallation;
 use mllm_controller::EngineInstallation;
 use serde_json::{json, Value};
 
-/// Named rather than anonymous so a second installation can be added later.
+/// The profile an environment variable's installation is published under when
+/// only one is set (ADR 0018 §5).
 pub const STANDALONE_PROFILE: &str = "local";
 
 /// Unified: on this hardware device and host memory are one physical pool.
@@ -33,7 +35,39 @@ fn engine_name(engine: Engine) -> &'static str {
     }
 }
 
-/// The host policy standalone publishes: the one engine installation it offers, the
+/// One installation's published runtime profile.
+///
+/// SPEC §13.3, §9.1 / T21, ADR 0012: every launch seals two per-launch keys
+/// under distinct roles, inference and admin, so the profile names both
+/// references; the coordinator resolves them per launch, never from the
+/// profile itself. A vLLM launch keys its development and control routes with
+/// the admin key, apart from the inference key ingress holds.
+fn runtime_profile(installation: &EngineInstallation) -> Value {
+    let mut security = json!({
+        "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
+        "trust_remote_code": installation.trust_remote_code,
+        "credential_ref": "secret://engine-key",
+        "admin_credential_ref": "secret://admin-key"
+    });
+    // ADR 0008 (owner decision 2026-09-23): stated only when the host refuses
+    // drift, so a default document is unchanged.
+    if installation.installation_drift == mllm_config::effective::InstallationDrift::Refuse {
+        security["installation_drift"] = json!("refuse");
+    }
+    json!({
+        "engine": engine_name(installation.engine),
+        "revision": 1,
+        "executable": installation.executable.to_string_lossy(),
+        "build_fingerprint": installation.build_fingerprint,
+        "args": installation.args,
+        "env": {},
+        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+        "security": security
+    })
+}
+
+/// The host policy standalone publishes: the engine installations it offers (ADR
+/// 0018 §5: the environment's and the registered ones, one profile each), the
 /// store its weights live under, and the limits it will admit against.
 ///
 /// Spec §7: the published table states the flags the installation's profile
@@ -52,38 +86,32 @@ fn engine_name(engine: Engine) -> &'static str {
 /// no inventory publishes neither — placement then fails closed at the native
 /// gate, honestly, rather than here.
 pub fn host_policy(
-    installation: &EngineInstallation,
+    installations: &[NamedInstallation],
     environment_fingerprint: &str,
     capacity_bytes: i64,
     inventory: Option<&InventoryPublication>,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
-    let engine = engine_name(installation.engine);
+    // ADR 0018 §5: role-level fields (model store, ports, hardware
+    // fingerprint) come from the first installation; every installation is
+    // one profile. The provider never returns an empty list.
+    let first = &installations
+        .first()
+        .expect("a standalone host publishes at least one installation")
+        .installation;
     let mut gpu0 = json!({"domain": DOMAIN, "sharing": "shared"});
     if let Some(uuid) = inventory.and_then(|published| published.physical_gpu_uuid.as_deref()) {
         gpu0["physical_gpu_uuid"] = json!(uuid);
     }
-    // SPEC §13.3, §9.1 / T21, ADR 0012: every launch seals two per-launch
-    // keys under distinct roles, inference and admin, so the profile names
-    // both references; the coordinator resolves them per launch, never from
-    // the profile itself. A vLLM launch keys its development and control
-    // routes with the admin key, apart from the inference key ingress holds.
-    let mut security = json!({
-        "deep_park": if installation.deep_park { "enabled" } else { "disabled" },
-        "trust_remote_code": installation.trust_remote_code,
-        "credential_ref": "secret://engine-key",
-        "admin_credential_ref": "secret://admin-key"
-    });
-    // ADR 0008 (owner decision 2026-09-23): stated only when the host refuses
-    // drift, so a default document is unchanged.
-    if installation.installation_drift == mllm_config::effective::InstallationDrift::Refuse {
-        security["installation_drift"] = json!("refuse");
-    }
+    let profiles: serde_json::Map<String, Value> = installations
+        .iter()
+        .map(|named| (named.profile.clone(), runtime_profile(&named.installation)))
+        .collect();
     json!({
         "schema_version": 1,
         "kind": "host",
         "name": inventory.map_or("standalone", |published| published.host_id.as_str()),
-        "hardware_fingerprint": format!("standalone-{engine}"),
+        "hardware_fingerprint": format!("standalone-{}", engine_name(first.engine)),
         "environment_fingerprint": environment_fingerprint,
         // SPEC §3: the versioned NVIDIA inventory digest is placement evidence
         // the native launch asserts against. Absent (null) when the host
@@ -91,19 +119,8 @@ pub fn host_policy(
         "device_inventory_digest": inventory.map(|published| published.digest.clone()),
         // Spec §7: a relative model path resolves against this, so the host states
         // it rather than having a directory guessed for it.
-        "model_store": {"path": installation.models_root.to_string_lossy()},
-        "runtime_profiles": {
-            STANDALONE_PROFILE: {
-                "engine": engine,
-                "revision": 1,
-                "executable": installation.executable.to_string_lossy(),
-                "build_fingerprint": installation.build_fingerprint,
-                "args": installation.args,
-                "env": {},
-                "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
-                "security": security
-            }
-        },
+        "model_store": {"path": first.models_root.to_string_lossy()},
+        "runtime_profiles": profiles,
         "resource_policy": {
             "domains": {
                 DOMAIN: {
@@ -121,8 +138,8 @@ pub fn host_policy(
             "max_parked": 4,
             "observation_ttl": "2s",
             "endpoint_port_range": {
-                "start": installation.engine_ports.0,
-                "end": installation.engine_ports.1
+                "start": first.engine_ports.0,
+                "end": first.engine_ports.1
             },
             "planner_max_states": 4096,
             "queue": {
@@ -165,6 +182,11 @@ pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
 /// `deep_park` is the host's switch ([`EngineInstallation::deep_park`]). ADR 0012:
 /// deep parking is on by default and a host opts out, so the generated residency
 /// has to follow that switch rather than state a tier the host's profile refuses.
+///
+/// `profile` is the runtime profile the deployment runs on (ADR 0018 §5: the
+/// host may publish several; [`STANDALONE_PROFILE`] is the environment's).
+// Each argument is a separate field of the document.
+#[allow(clippy::too_many_arguments)]
 pub fn deployment_document(
     name: &str,
     route: &str,
@@ -173,6 +195,7 @@ pub fn deployment_document(
     capacity_bytes: i64,
     request_deadline: &str,
     deep_park: bool,
+    profile: &str,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
@@ -197,7 +220,7 @@ pub fn deployment_document(
         "routes": [route],
         // ADR 0008 calls this an engine installation; the schema key still says
         // runtime_profile, and the rename is tracked there.
-        "runtime_profile": STANDALONE_PROFILE,
+        "runtime_profile": profile,
         "runtime_profile_revision": 1,
         "recipe": "standalone",
         // ADR 0010 makes the residency declarable; the template states the tier

@@ -340,7 +340,12 @@ pub struct SharedConfigurationSource {
     principal: String,
 }
 enum HostSource {
-    Embedded { document: Value, id: String },
+    /// ADR 0018 §5: shared with the standalone control handler, which replaces
+    /// it when an engine is added or removed.
+    Embedded {
+        document: Arc<std::sync::RwLock<Value>>,
+        id: String,
+    },
     Registry,
 }
 impl SharedConfigurationSource {
@@ -355,21 +360,36 @@ impl SharedConfigurationSource {
         trusted_host: Value,
         principal: &str,
     ) -> Result<Self, ConfigurationFailure> {
-        if !identifier(principal) || trusted_host.to_string().len() > MAX_BODY {
-            return Err(ConfigurationFailure::Internal);
-        }
-        let host_id = trusted_host
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|id| identifier(id))
-            .ok_or(ConfigurationFailure::Internal)?
-            .to_owned();
+        Self::new_shared(
+            state,
+            Arc::new(std::sync::RwLock::new(trusted_host)),
+            principal,
+        )
+    }
+
+    /// ADR 0018 §5: the embedded host document shared with the standalone
+    /// control handler, which replaces it when an engine is added or removed.
+    /// The host's name is fixed here; a replacement keeps it.
+    pub fn new_shared(
+        state: Arc<Mutex<OwnedCoordinatorState>>,
+        host: Arc<std::sync::RwLock<Value>>,
+        principal: &str,
+    ) -> Result<Self, ConfigurationFailure> {
+        let id = {
+            let document = host.read().map_err(|_| ConfigurationFailure::Internal)?;
+            if !identifier(principal) || document.to_string().len() > MAX_BODY {
+                return Err(ConfigurationFailure::Internal);
+            }
+            document
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|id| identifier(id))
+                .ok_or(ConfigurationFailure::Internal)?
+                .to_owned()
+        };
         Ok(Self {
             state,
-            host: HostSource::Embedded {
-                document: trusted_host,
-                id: host_id,
-            },
+            host: HostSource::Embedded { document: host, id },
             principal: principal.into(),
         })
     }
@@ -478,8 +498,14 @@ impl ConfigurationSource for SharedConfigurationSource {
                     .resource_policy(id)
                     .map_err(|_| ConfigurationFailure::Internal)?
                     .ok_or(ConfigurationFailure::ReconciliationRequired)?;
+                // A snapshot of the current document: an engine added or
+                // removed later does not change this request.
+                let document = document
+                    .read()
+                    .map_err(|_| ConfigurationFailure::Internal)?
+                    .clone();
                 let host = mllm_config::effective::compose_current_resource_controls(
-                    document,
+                    &document,
                     &policy.context,
                     &policy.controls,
                 )
