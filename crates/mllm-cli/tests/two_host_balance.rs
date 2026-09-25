@@ -861,11 +861,22 @@ async fn a_frozen_host_agent_is_suspended_within_seconds_and_rejoins_after_a_pro
     if status == 200 {
         assert_eq!(answered_by(&body), "a", "{body}");
     }
-    assert_eq!(b.accepted() - accepted_b, 6, "the in-flight request was not replayed on b");
-    assert_eq!(a.accepted(), accepted_a + 1, "the in-flight request ran once");
+    assert_eq!(
+        b.accepted() - accepted_b,
+        6,
+        "the in-flight request was not replayed on b"
+    );
+    assert_eq!(
+        a.accepted(),
+        accepted_a + 1,
+        "the in-flight request ran once"
+    );
     let thawed = Instant::now();
     while logged(&server_log, "heartbeats resumed") == resumed_before {
-        assert!(thawed.elapsed() < Duration::from_secs(10), "host a was never heard again");
+        assert!(
+            thawed.elapsed() < Duration::from_secs(10),
+            "host a was never heard again"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -903,8 +914,15 @@ async fn a_frozen_host_agent_is_suspended_within_seconds_and_rejoins_after_a_pro
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(froze.elapsed() >= Duration::from_secs(11), "{:?}", froze.elapsed());
-    eprintln!("agents dropped a frozen server's sessions after {:?}", froze.elapsed());
+    assert!(
+        froze.elapsed() >= Duration::from_secs(11),
+        "{:?}",
+        froze.elapsed()
+    );
+    eprintln!(
+        "agents dropped a frozen server's sessions after {:?}",
+        froze.elapsed()
+    );
     signal(&server, libc::SIGCONT);
     cluster.eligible_hosts(2);
     b.set("running", "0");

@@ -8,9 +8,9 @@ pub mod managed_runtime;
 pub mod output;
 // SPEC §6.3, ADR 0008: `mllm prune sources`.
 pub mod prune;
-pub mod roles;
 pub mod remote_roles;
 pub mod revoke;
+pub mod roles;
 pub mod shutdown;
 pub mod standalone_config;
 pub mod validate;

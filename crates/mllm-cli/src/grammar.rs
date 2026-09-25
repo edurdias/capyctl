@@ -145,7 +145,10 @@ impl Command {
             Command::Start(role) => format!("start {role:?}").to_lowercase(),
             Command::Init(target) => format!("init {target:?}").to_lowercase(),
             Command::Invite { name, recover } => {
-                format!("invite host {name}{}", if *recover { " --recover" } else { "" })
+                format!(
+                    "invite host {name}{}",
+                    if *recover { " --recover" } else { "" }
+                )
             }
             Command::Join { join_file, recover } => format!(
                 "join host --join-file {}{}",
@@ -446,7 +449,9 @@ enum StartTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StopTarget {
-    Deployment { deployment: String },
+    Deployment {
+        deployment: String,
+    },
     /// Owner decision Q7: stop one instance, `<deployment>/<index>`.
     Instance {
         #[arg(value_parser = parse_instance)]
@@ -463,7 +468,9 @@ fn parse_instance(value: &str) -> Result<(String, u32), String> {
         .parse::<u32>()
         .ok()
         .filter(|n| index == n.to_string() && *n < mllm_config::instances::MAX_INSTANCES)
-        .ok_or_else(|| "the instance index must be a decimal below the instance bound".to_string())?;
+        .ok_or_else(|| {
+            "the instance index must be a decimal below the instance bound".to_string()
+        })?;
     if deployment.is_empty() {
         return Err("expected <deployment>/<index>".into());
     }
@@ -651,9 +658,7 @@ impl From<CliCommand> for Command {
                 deployment,
             },
             CliCommand::Delete { resource } => match resource {
-                DeleteArgs::Deployment { deployment, stop } => {
-                    Command::Delete { deployment, stop }
-                }
+                DeleteArgs::Deployment { deployment, stop } => Command::Delete { deployment, stop },
             },
             CliCommand::Validate { resource } => match resource {
                 ValidateArgs::Config { file, host } => Command::Validate { file, host },
@@ -716,22 +721,41 @@ where
     // any other spelling of the same value) is carried in canonical form.
     if let Some(id) = cli.request_id.take() {
         let parsed = id.parse::<ulid::Ulid>().map_err(|_| {
-            CliError::Clap(clap::Error::raw(clap::error::ErrorKind::InvalidValue, "--request-id must be a ULID"))
+            CliError::Clap(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                "--request-id must be a ULID",
+            ))
         })?;
         cli.request_id = Some(parsed.to_string());
     }
-    let debug_engine_logs = matches!(&cli.command, CliCommand::Start {
-        target: StartTarget::Standalone { debug_engine_logs: true } | StartTarget::Host { debug_engine_logs: true }
-    });
+    let debug_engine_logs = matches!(
+        &cli.command,
+        CliCommand::Start {
+            target: StartTarget::Standalone {
+                debug_engine_logs: true
+            } | StartTarget::Host {
+                debug_engine_logs: true
+            }
+        }
+    );
     let initialize_timeout_ms = match &cli.command {
         CliCommand::Start {
             target:
-                StartTarget::Deployment { initialize_timeout, .. }
-                | StartTarget::Instance { initialize_timeout, .. },
+                StartTarget::Deployment {
+                    initialize_timeout, ..
+                }
+                | StartTarget::Instance {
+                    initialize_timeout, ..
+                },
         }
         | CliCommand::Deploy {
-            resource: DeployArgs::Model { initialize_timeout, .. },
-        } => initialize_timeout.as_deref().map(parse_timeout).transpose()?,
+            resource: DeployArgs::Model {
+                initialize_timeout, ..
+            },
+        } => initialize_timeout
+            .as_deref()
+            .map(parse_timeout)
+            .transpose()?,
         _ => None,
     };
     let evict = matches!(
@@ -752,14 +776,39 @@ where
     // `--activate` a deploy's only operation is its durable acceptance, which
     // the command already returns after, so there is nothing to wait for and
     // the flag would be silently ignored. Refuse it instead.
-    if matches!(&cli.command, CliCommand::Deploy { resource: DeployArgs::Model { wait: true, activate: false, .. } }) {
+    if matches!(
+        &cli.command,
+        CliCommand::Deploy {
+            resource: DeployArgs::Model {
+                wait: true,
+                activate: false,
+                ..
+            }
+        }
+    ) {
         return Err(CliError::Clap(clap::Error::raw(
             clap::error::ErrorKind::ArgumentConflict,
             "deploy model --wait requires --activate: without it the deployment is accepted durably and the command returns its id at once; there is no activation to wait for (use status deployment <id> to observe it)\n",
         )));
     }
-    let command:Command=cli.command.into();
-    if cli.request_id.is_some() && !matches!(command,Command::Deploy {..} | Command::Drain {..} | Command::Revoke {..} | Command::InstanceLifecycle {..} | Command::Delete {..} | Command::Lifecycle {action:LifecycleAction::Start | LifecycleAction::Stop | LifecycleAction::Park | LifecycleAction::Preinitialize,..}) {
+    let command: Command = cli.command.into();
+    if cli.request_id.is_some()
+        && !matches!(
+            command,
+            Command::Deploy { .. }
+                | Command::Drain { .. }
+                | Command::Revoke { .. }
+                | Command::InstanceLifecycle { .. }
+                | Command::Delete { .. }
+                | Command::Lifecycle {
+                    action: LifecycleAction::Start
+                        | LifecycleAction::Stop
+                        | LifecycleAction::Park
+                        | LifecycleAction::Preinitialize,
+                    ..
+                }
+        )
+    {
         return Err(CliError::Clap(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,"--request-id applies to deploy model, start, stop, park or preinitialize deployment, start or stop instance, delete deployment, drain and revoke host")));
     }
     Ok(Invocation {

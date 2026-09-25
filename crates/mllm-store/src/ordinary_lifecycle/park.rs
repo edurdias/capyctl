@@ -982,7 +982,13 @@ impl crate::Store {
             },
             "wake",
         );
-        let hash = request_hash(principal, &receipt_scope, expected_revision, "wake", deadline)?;
+        let hash = request_hash(
+            principal,
+            &receipt_scope,
+            expected_revision,
+            "wake",
+            deadline,
+        )?;
         lookup(&tx, principal, &receipt_scope, key, &hash)
     }
 
@@ -1652,8 +1658,13 @@ fn arm(
     // engine was refused because the memory that engine holds, already out of
     // the host's availability, was charged again. Ready engines are credited
     // what the host sampled for their own processes.
-    let floors =
-        crate::resident_floors::resident_floors(tx, &ledger, &owner, context.observations, residents)?;
+    let floors = crate::resident_floors::resident_floors(
+        tx,
+        &ledger,
+        &owner,
+        context.observations,
+        residents,
+    )?;
     let context = AdmissionContext {
         resident_floors: &floors,
         ..context

@@ -339,8 +339,8 @@ impl Switcher {
                 Err(NoRoom::Fault(LifecycleFault::Failed(_))) if round + 1 < rounds => round += 1,
                 Err(NoRoom::Moved) => {
                     return Err(LifecycleFault::Blocked(format!(
-                        "no room could be made for deployment {target} after {rounds} switch round(s)"
-                    )))
+                    "no room could be made for deployment {target} after {rounds} switch round(s)"
+                )))
                 }
                 Err(NoRoom::Fault(fault)) => return Err(fault),
             }
@@ -371,8 +371,8 @@ impl Switcher {
                 Err(NoRoom::Fault(LifecycleFault::Failed(_))) if round + 1 < rounds => round += 1,
                 Err(NoRoom::Moved) => {
                     return Err(LifecycleFault::Blocked(format!(
-                        "no room could be made for deployment {target} after {rounds} switch round(s)"
-                    )))
+                    "no room could be made for deployment {target} after {rounds} switch round(s)"
+                )))
                 }
                 Err(NoRoom::Fault(fault)) => return Err(fault),
             }
@@ -590,7 +590,14 @@ impl Switcher {
                 );
                 let active = Active::enter(self);
                 let released = self
-                    .release(&switch_id, target, &host, &victims, admission_window_ms, explicit)
+                    .release(
+                        &switch_id,
+                        target,
+                        &host,
+                        &victims,
+                        admission_window_ms,
+                        explicit,
+                    )
                     .await;
                 if released.is_err() {
                     // A failure path records its own end; this covers one

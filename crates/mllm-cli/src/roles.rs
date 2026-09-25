@@ -162,8 +162,10 @@ impl App {
     /// the next boot adopts and re-proves every Ready engine it left running.
     pub async fn shutdown(
         self,
-    ) -> Result<mllm_controller::coordinator::WorkerStatus, mllm_controller::coordinator::CoordinatorError>
-    {
+    ) -> Result<
+        mllm_controller::coordinator::WorkerStatus,
+        mllm_controller::coordinator::CoordinatorError,
+    > {
         // ADR 0015 invariant 6: nothing the role started outlives it. The
         // supervisors finish the pass they are in and are joined, then the
         // switcher's follow-ups, then the coordinator's worker.
@@ -210,7 +212,6 @@ pub fn standalone_management_address() -> Result<std::net::SocketAddr, StartErro
 }
 
 impl App {
-
     /// Create a deployment that can actually be started.
     ///
     /// A deployment comes into existence together with the effective configuration
@@ -505,7 +506,8 @@ impl EngineProvider for EnvEngineProvider {
         // ADR 0014 §7, Q9: the checkpoint stat cache is private host state,
         // kept beside the logs in the standalone state directory.
         let cache = log_dir.with_file_name("checkpoints");
-        let bindings = ProfileBindings::new(log_dir.clone(), runtime_dir).with_checkpoint_cache(cache);
+        let bindings =
+            ProfileBindings::new(log_dir.clone(), runtime_dir).with_checkpoint_cache(cache);
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
         // observation in a private directory beside the logs. One that cannot
         // be made private leaves the source unset, and Park is refused.
@@ -552,9 +554,8 @@ fn runtime_dir(
     let dir = match (env_value(RUNTIME_DIR), managed) {
         (Some(declared), _) => PathBuf::from(declared),
         (None, Some(managed)) => {
-            crate::managed_runtime::prepare(managed).map_err(|error| {
-                no_installation(format!("managed runtime directory: {error}"))
-            })?;
+            crate::managed_runtime::prepare(managed)
+                .map_err(|error| no_installation(format!("managed runtime directory: {error}")))?;
             managed.to_path_buf()
         }
         (None, None) => {
@@ -587,9 +588,9 @@ fn runtime_dir(
     // otherwise fail at render with a refusal this boot could have prevented
     // (found live: the default CARGO_MANIFEST_DIR-relative directory carries
     // `..` and every SGLang launch was refused before spawning).
-    let dir = dir
-        .canonicalize()
-        .map_err(|error| no_installation(format!("runtime directory {}: {error}", dir.display())))?;
+    let dir = dir.canonicalize().map_err(|error| {
+        no_installation(format!("runtime directory {}: {error}", dir.display()))
+    })?;
     // SPEC §9.1, §13.3 / T21 T37: the same integrity the host agent requires
     // before a launch. The engine imports mllm's modules from this directory,
     // so one another account could rewrite is refused here, before anything
@@ -687,7 +688,9 @@ pub async fn start_standalone_from(
     start_standalone_inner(
         state_dir,
         config,
-        Arc::new(EnvEngineProvider::with_managed_runtime(state_dir.join("runtime"))),
+        Arc::new(EnvEngineProvider::with_managed_runtime(
+            state_dir.join("runtime"),
+        )),
         crate::host_observation::proc_meminfo(),
     )
     .await
@@ -699,8 +702,13 @@ pub async fn start_standalone_with(
     state_dir: &Path,
     provider: Arc<dyn EngineProvider>,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, None, provider, crate::host_observation::proc_meminfo())
-        .await
+    start_standalone_inner(
+        state_dir,
+        None,
+        provider,
+        crate::host_observation::proc_meminfo(),
+    )
+    .await
 }
 
 /// As [`start_standalone_with`], reading host memory through `memory`. SPEC
@@ -769,11 +777,13 @@ async fn start_standalone_inner(
             mllm_config::standalone::check_honoured(&document, &config_dir, &absolute(state_dir))
                 .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
         (
-            mllm_config::remote_roles::switch_drain_timeout(&document["server"])
-                .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?,
+            mllm_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
+                |error| StartError::Deploy(format!("standalone configuration: {error}")),
+            )?,
             // SPEC §17 (M80): `server.observability.timing_header`, off unless set.
-            mllm_config::remote_roles::timing_header(&document["server"])
-                .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?,
+            mllm_config::remote_roles::timing_header(&document["server"]).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
             ignored.iter().map(ToString::to_string).collect::<Vec<_>>(),
         )
     };
@@ -785,7 +795,10 @@ async fn start_standalone_inner(
     // its credentials is not repaired: it refuses below (MissingCredentials).
     if config.is_some()
         && !db_path.try_exists()?
-        && !state_dir.join("identity").join("credentials").try_exists()?
+        && !state_dir
+            .join("identity")
+            .join("credentials")
+            .try_exists()?
     {
         created_this_boot = mllm_config::defaults::create_standalone_credentials(state_dir)?;
     }
@@ -910,10 +923,13 @@ async fn start_standalone_inner(
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(
-            HostMemoryObservation::with_reader(declared_host.domains.keys().cloned(), memory.clone())
-                // ADR 0007 (found live 2026-09-23, matrix M33): credit the
-                // engines already resident here instead of charging them twice.
-                .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia()),
+            HostMemoryObservation::with_reader(
+                declared_host.domains.keys().cloned(),
+                memory.clone(),
+            )
+            // ADR 0007 (found live 2026-09-23, matrix M33): credit the
+            // engines already resident here instead of charging them twice.
+            .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia()),
         ),
         system_clock(),
         options,
@@ -921,12 +937,19 @@ async fn start_standalone_inner(
         provider.tools_factory(),
     )?;
     let credentials = std::fs::read_to_string(state_dir.join("identity/credentials"))?;
-    let admin = credentials.lines().find_map(|line| line.strip_prefix("admin_token: "))
+    let admin = credentials
+        .lines()
+        .find_map(|line| line.strip_prefix("admin_token: "))
         .ok_or(StartError::MissingCredentials)?;
-    let management_credentials = mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
-        .map_err(|_| StartError::MissingCredentials)?;
+    let management_credentials =
+        mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+            .map_err(|_| StartError::MissingCredentials)?;
     let host = crate::standalone_config::host_policy(
-        &installation, &environment_fingerprint, capacity_bytes, inventory.as_ref());
+        &installation,
+        &environment_fingerprint,
+        capacity_bytes,
+        inventory.as_ref(),
+    );
     // SPEC §4.3 (P3): the Ready engines a previous run left running are adopted
     // by the coordinator at start; this supervisor re-proves each one locally
     // before dispatch reopens.
@@ -940,8 +963,10 @@ async fn start_standalone_inner(
         mllm_controller::engine_exit::EngineExits::new(coordinator.commands())
             .spawn_local_until(supervision.cancel_signal()),
     );
-    let configuration = Arc::new(mllm_management::configuration::SharedConfigurationSource::new(
-        owner, host, "standalone").map_err(|_| StartError::Deploy("management configuration unavailable".into()))?);
+    let configuration = Arc::new(
+        mllm_management::configuration::SharedConfigurationSource::new(owner, host, "standalone")
+            .map_err(|_| StartError::Deploy("management configuration unavailable".into()))?,
+    );
     // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching
     // and the operator's `start --evict`, so both take the same host turns.
     let switcher = Arc::new(mllm_controller::switching::Switcher::new(
@@ -989,9 +1014,8 @@ async fn start_standalone_inner(
         .merge(drain)
         .merge(installation_view)
         .merge(latency_view);
-    let controller = Arc::new(
-        CoordinatorLifecycle::new(coordinator.commands()).with_switcher(switcher.clone()),
-    );
+    let controller =
+        Arc::new(CoordinatorLifecycle::new(coordinator.commands()).with_switcher(switcher.clone()));
     let deps = mllm_router::RouterDeps {
         controller: controller.clone(),
         // Spec §3: a leased port and a per-launch key belong to one launch, so the
@@ -1015,11 +1039,13 @@ async fn start_standalone_inner(
     {
         // The same source the coordinator will observe through, so the policy and
         // the evidence for it cannot disagree about what a domain is called.
-        let observations =
-            HostMemoryObservation::with_reader(declared_host.domains.keys().cloned(), memory.clone())
-            .observe(declared_host.name.clone())
-            .await
-            .map_err(|error| StartError::Deploy(error.to_string()))?;
+        let observations = HostMemoryObservation::with_reader(
+            declared_host.domains.keys().cloned(),
+            memory.clone(),
+        )
+        .observe(declared_host.name.clone())
+        .await
+        .map_err(|error| StartError::Deploy(error.to_string()))?;
         controller
             .publish_resource_policy(&declared_host, &observations)
             .map_err(|error| StartError::Deploy(error.to_string()))?;
@@ -1030,7 +1056,9 @@ async fn start_standalone_inner(
         .queue_policy()
         .map_err(|error| StartError::Deploy(error.to_string()))?
     {
-        deps.inflight.waiting.set_limits(crate::remote_roles::wait_limits(&queue));
+        deps.inflight
+            .waiting
+            .set_limits(crate::remote_roles::wait_limits(&queue));
     }
     Ok(App {
         controller,

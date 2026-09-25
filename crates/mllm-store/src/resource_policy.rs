@@ -137,7 +137,10 @@ struct StoredQueue {
     admission_window_ms: i64,
     /// SPEC §10: absent in policies stored before it existed, and omitted at
     /// its default so their stored identity is unchanged.
-    #[serde(default = "default_stream_idle", skip_serializing_if = "is_default_stream_idle")]
+    #[serde(
+        default = "default_stream_idle",
+        skip_serializing_if = "is_default_stream_idle"
+    )]
     stream_idle_ms: i64,
 }
 fn default_stream_idle() -> i64 {
@@ -568,27 +571,57 @@ impl crate::Store {
     /// Import an enrolled host's local policy using collision-free durable keys.
     /// SPEC §7: inventory names are local; accounting keys belong to the host.
     pub fn import_remote_resource_policy(
-        &self, session: &CoordinatorSession, host_id: &str, host: &HostPolicy,
-        observations: &[MemoryObservation], now_ms: i64,
+        &self,
+        session: &CoordinatorSession,
+        host_id: &str,
+        host: &HostPolicy,
+        observations: &[MemoryObservation],
+        now_ms: i64,
     ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
-        if !valid_id(host_id) { return Err(ResourcePolicyError::Invalid); }
+        if !valid_id(host_id) {
+            return Err(ResourcePolicyError::Invalid);
+        }
         let local = ResourceContext::from_host(host);
         let mut scoped = host.clone();
         scoped.name = host_id.into();
-        scoped.domains = host.domains.iter().map(|(id,p)|
-            (crate::resource_namespace::ledger_key(host_id,"domain",id),p.clone())).collect();
-        scoped.devices = host.devices.iter().map(|(id,p)| {
-            let mut policy = p.clone();
-            policy.domain = crate::resource_namespace::ledger_key(host_id,"domain",&p.domain);
-            (crate::resource_namespace::ledger_key(host_id,"device",id),policy)
-        }).collect();
-        let observations: Vec<_> = observations.iter().map(|o| {
-            let mut observation = o.clone();
-            observation.domain = crate::resource_namespace::ledger_key(host_id,"domain",&o.domain);
-            observation
-        }).collect();
-        let imported =
-            self.import_policy(session, &scoped, &observations, now_ms, Some((host_id, &local)))?;
+        scoped.domains = host
+            .domains
+            .iter()
+            .map(|(id, p)| {
+                (
+                    crate::resource_namespace::ledger_key(host_id, "domain", id),
+                    p.clone(),
+                )
+            })
+            .collect();
+        scoped.devices = host
+            .devices
+            .iter()
+            .map(|(id, p)| {
+                let mut policy = p.clone();
+                policy.domain = crate::resource_namespace::ledger_key(host_id, "domain", &p.domain);
+                (
+                    crate::resource_namespace::ledger_key(host_id, "device", id),
+                    policy,
+                )
+            })
+            .collect();
+        let observations: Vec<_> = observations
+            .iter()
+            .map(|o| {
+                let mut observation = o.clone();
+                observation.domain =
+                    crate::resource_namespace::ledger_key(host_id, "domain", &o.domain);
+                observation
+            })
+            .collect();
+        let imported = self.import_policy(
+            session,
+            &scoped,
+            &observations,
+            now_ms,
+            Some((host_id, &local)),
+        )?;
         // Found live 2026-09-23 (matrix M32): a host restarted with changed
         // limits (normal to tight) kept its first imported limits here,
         // silently. The host's document governs its limits, so a changed
@@ -629,8 +662,11 @@ impl crate::Store {
     }
 
     fn import_policy(
-        &self, session: &CoordinatorSession, host: &HostPolicy,
-        observations: &[MemoryObservation], now_ms: i64,
+        &self,
+        session: &CoordinatorSession,
+        host: &HostPolicy,
+        observations: &[MemoryObservation],
+        now_ms: i64,
         remote: Option<(&str, &ResourceContext)>,
     ) -> Result<ResourcePolicyImport, ResourcePolicyError> {
         let context = ResourceContext::from_host(host);
@@ -649,9 +685,11 @@ impl crate::Store {
                 "SELECT policy_key,kind FROM host_resource_namespaces WHERE host_id=?1 OR policy_key=?1",
                 [host_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             match existing {
-                Some((key,kind)) if key == host_id && kind == "remote" => {},
+                Some((key, kind)) if key == host_id && kind == "remote" => {}
                 Some(_) => return Err(ResourcePolicyError::RevisionConflict),
-                None => crate::resource_namespace::insert(&tx,host_id,host_id,"remote",local,&context)?,
+                None => crate::resource_namespace::insert(
+                    &tx, host_id, host_id, "remote", local, &context,
+                )?,
             }
         } else {
             crate::resource_namespace::ensure_embedded(&tx, &context)?;

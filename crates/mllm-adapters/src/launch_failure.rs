@@ -23,7 +23,8 @@ pub enum EngineExit {
 /// An option name as the summary may name it: `--` then 1 to 64 of
 /// `[a-z0-9_-]`, starting with a letter or digit.
 fn option_name(token: &str) -> Option<String> {
-    let token = token.trim_matches(|c: char| matches!(c, '\'' | '"' | ',' | ':' | '(' | ')' | '[' | ']'));
+    let token =
+        token.trim_matches(|c: char| matches!(c, '\'' | '"' | ',' | ':' | '(' | ')' | '[' | ']'));
     let token = token.split('=').next()?;
     let name = token.strip_prefix("--")?;
     let valid = !name.is_empty()
@@ -47,7 +48,9 @@ pub fn rejected_options(engine_output: &str) -> Vec<String> {
     };
     for line in engine_output.lines() {
         if let Some((_, rest)) = line.split_once("unrecognized arguments:") {
-            rest.split_whitespace().filter_map(option_name).for_each(&mut push);
+            rest.split_whitespace()
+                .filter_map(option_name)
+                .for_each(&mut push);
         }
         let mut rest = line;
         while let Some(at) = rest.find("argument ") {
@@ -101,7 +104,10 @@ mod tests {
             "the engine exited before readiness with exit code 2; it rejected argument --moe-backend"
         );
         assert!(!text.contains("bogus"));
-        let text = summary("error: unrecognized arguments: --foo=secret --bar value", None);
+        let text = summary(
+            "error: unrecognized arguments: --foo=secret --bar value",
+            None,
+        );
         assert_eq!(
             text,
             "the engine exited before readiness; it rejected arguments --foo, --bar"
@@ -121,7 +127,13 @@ mod tests {
         assert_eq!(rejected_options("argument --tp/-t: bad"), vec!["--tp"]);
         let many = "unrecognized arguments: --a1 --a2 --a3 --a4 --a5";
         assert_eq!(rejected_options(many).len(), MAX_OPTIONS);
-        let long = format!("unrecognized arguments: --{} --{} --{} --{}", "a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64));
+        let long = format!(
+            "unrecognized arguments: --{} --{} --{} --{}",
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64)
+        );
         let text = summary(&long, Some(EngineExit::Code(i32::MIN)));
         assert!(text.len() <= MAX_SUMMARY_BYTES, "{text}");
         assert!(text.contains(&"a".repeat(64)));

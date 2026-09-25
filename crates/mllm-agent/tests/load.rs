@@ -449,17 +449,32 @@ fn parses_the_pinned_engine_latency_histograms() {
         ]
     );
     let ttft = &vllm[0].1;
-    assert_eq!((ttft.bounds(), ttft.counts(), ttft.count()), (&[0.01, 0.1][..], &[1u64, 3, 1][..], 5));
+    assert_eq!(
+        (ttft.bounds(), ttft.counts(), ttft.count()),
+        (&[0.01, 0.1][..], &[1u64, 3, 1][..], 5)
+    );
     assert!((ttft.sum() - 1.55).abs() < 1e-9);
     let (engine, sglang) = load::parse_engine_histograms(SGLANG_HISTOGRAMS).unwrap();
     assert_eq!(engine, "sglang");
     let names: Vec<&str> = sglang.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["engine_time_to_first_token", "engine_queue_time", "engine_inter_token_latency"]);
+    assert_eq!(
+        names,
+        [
+            "engine_time_to_first_token",
+            "engine_queue_time",
+            "engine_inter_token_latency"
+        ]
+    );
     assert_eq!(sglang[0].1.counts(), &[2, 1]);
-    assert_eq!((sglang[1].1.bounds(), sglang[1].1.counts()), (&[0.0, 0.001][..], &[1u64, 2, 0][..]));
+    assert_eq!(
+        (sglang[1].1.bounds(), sglang[1].1.counts()),
+        (&[0.0, 0.001][..], &[1u64, 2, 0][..])
+    );
     // Gauges of neither or both families: no engine histograms at all.
     assert!(load::parse_engine_histograms("").is_none());
-    assert!(load::parse_engine_histograms(&format!("{VLLM_HISTOGRAMS}{SGLANG_HISTOGRAMS}")).is_none());
+    assert!(
+        load::parse_engine_histograms(&format!("{VLLM_HISTOGRAMS}{SGLANG_HISTOGRAMS}")).is_none()
+    );
 }
 
 // SPEC §17: a malformed or inconsistent histogram is dropped, never guessed.
@@ -483,7 +498,10 @@ fn malformed_engine_histograms_are_dropped() {
         .map(|i| format!("{metric}_bucket{{le=\"{i}\"}} 0\n"))
         .collect::<String>()
         + &format!("{metric}_bucket{{le=\"+Inf\"}} 0\n{metric}_count 0\n{metric}_sum 0\n");
-    assert!(load::parse_histogram(&too_many, metric).is_none(), "bucket count is bounded");
+    assert!(
+        load::parse_histogram(&too_many, metric).is_none(),
+        "bucket count is bounded"
+    );
 }
 
 // SPEC §17 T18 (M80): the first report of a launch carries its engine
@@ -493,7 +511,13 @@ fn malformed_engine_histograms_are_dropped() {
 async fn engine_histograms_are_reported_as_deltas() {
     let ingress = Ingress::new().unwrap();
     let s = scope("timed", 1);
-    register(&ingress, &s, engine([2; 32], VLLM_HISTOGRAMS, Duration::ZERO).await, 1, [2; 32]);
+    register(
+        &ingress,
+        &s,
+        engine([2; 32], VLLM_HISTOGRAMS, Duration::ZERO).await,
+        1,
+        [2; 32],
+    );
     ingress.bind_handle(&s, "launch-t").unwrap();
     ingress.open(&s).unwrap();
     let reporter = LoadReporter::new(ingress.clone(), "host".into()).unwrap();
@@ -503,5 +527,8 @@ async fn engine_histograms_are_reported_as_deltas() {
     assert_eq!(latency.histograms.len(), 6);
     let second = samples(reporter.reports().await);
     let latency = second[0].latency.clone().unwrap();
-    assert_eq!((latency.engine.as_deref(), latency.histograms.len()), (Some("vllm"), 0));
+    assert_eq!(
+        (latency.engine.as_deref(), latency.histograms.len()),
+        (Some("vllm"), 0)
+    );
 }

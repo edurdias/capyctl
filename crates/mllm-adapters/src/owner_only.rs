@@ -192,7 +192,9 @@ mod tests {
         assert!(nss_enumerable(None));
         assert!(nss_enumerable(Some("passwd: files\ngroup: files\n")));
         assert!(nss_enumerable(Some("passwd:         files systemd\n")));
-        assert!(nss_enumerable(Some("# passwd: ldap\npasswd: files [NOTFOUND=return]\n")));
+        assert!(nss_enumerable(Some(
+            "# passwd: ldap\npasswd: files [NOTFOUND=return]\n"
+        )));
         for text in [
             "passwd: files systemd sss\n",
             "passwd: files ldap\n",

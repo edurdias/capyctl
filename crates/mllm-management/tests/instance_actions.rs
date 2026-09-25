@@ -249,8 +249,13 @@ async fn a_retired_or_compacted_instance_is_not_found_never_an_internal_error() 
     )
     .unwrap();
     for action in ["stop", "start"] {
-        let (status, body) =
-            send(&app, &format!("{id}/instances/1"), &format!("retiring-{action}"), action).await;
+        let (status, body) = send(
+            &app,
+            &format!("{id}/instances/1"),
+            &format!("retiring-{action}"),
+            action,
+        )
+        .await;
         assert_eq!(status, 404, "{action}: {body}");
     }
     assert_eq!(stopped(&owner, &id), vec![false, false], "no mark was set");
@@ -260,8 +265,13 @@ async fn a_retired_or_compacted_instance_is_not_found_never_an_internal_error() 
     )
     .unwrap();
     for action in ["stop", "start"] {
-        let (status, body) =
-            send(&app, &format!("{id}/instances/1"), &format!("gone-{action}"), action).await;
+        let (status, body) = send(
+            &app,
+            &format!("{id}/instances/1"),
+            &format!("gone-{action}"),
+            action,
+        )
+        .await;
         assert_eq!(status, 404, "{action}: {body}");
     }
     worker.shutdown().await.unwrap();
@@ -299,7 +309,11 @@ async fn replayed_instance_and_deployment_commands_leave_operator_marks_alone() 
     let (status, replay) = send(&app, &id, "start-all", "start").await;
     assert_eq!(status, 202, "{replay}");
     assert_eq!(replay, start);
-    assert_eq!(stopped(&owner, &id), vec![true], "a replayed start lifted a later stop");
+    assert_eq!(
+        stopped(&owner, &id),
+        vec![true],
+        "a replayed start lifted a later stop"
+    );
     // Lift the stop with a new start, then replay the old stop.
     let (status, restart) = send(&app, &format!("{id}/instances/0"), "start-0", "start").await;
     assert_eq!(status, 202, "{restart}");
@@ -308,7 +322,11 @@ async fn replayed_instance_and_deployment_commands_leave_operator_marks_alone() 
     let (status, replay) = send(&app, &format!("{id}/instances/0"), "stop-0", "stop").await;
     assert_eq!(status, 202, "{replay}");
     assert_eq!(replay, stop);
-    assert_eq!(stopped(&owner, &id), vec![false], "a replayed stop re-set a lifted mark");
+    assert_eq!(
+        stopped(&owner, &id),
+        vec![false],
+        "a replayed stop re-set a lifted mark"
+    );
     worker.shutdown().await.unwrap();
 }
 
@@ -344,7 +362,12 @@ async fn an_instance_action_retry_is_answered_before_the_revision_check() {
     // A new command at the stale revision is still a conflict.
     let response = app
         .clone()
-        .oneshot(request_at(&format!("{id}/instances/0"), "stop-new", "stop", 1))
+        .oneshot(request_at(
+            &format!("{id}/instances/0"),
+            "stop-new",
+            "stop",
+            1,
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), 409);

@@ -327,7 +327,8 @@ pub(super) fn accept(
     command: &cleanup::StopCommand,
 ) -> Result<Option<OrdinaryStopReceipt>, LifecycleError> {
     // ADR 0013 §5: the planned start of the instance the fence names.
-    let Some(instance) = crate::instances::generation_instance(tx, &f.deployment_id, f.generation)? else {
+    let Some(instance) = crate::instances::generation_instance(tx, &f.deployment_id, f.generation)?
+    else {
         return Ok(None);
     };
     let id:Option<String>=tx.query_row("SELECT s.id FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released' AND s.state='planned'",params![f.deployment_id,instance],|r|r.get(0)).optional()?;

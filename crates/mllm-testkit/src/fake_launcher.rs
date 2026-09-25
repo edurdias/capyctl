@@ -74,7 +74,10 @@ impl Launcher for FakeLauncher {
         let identity = st.next_identity;
         st.next_identity += 1;
         st.live.insert(pid, identity);
-        Ok(OwnedHandle { pid, start_identity: identity })
+        Ok(OwnedHandle {
+            pid,
+            start_identity: identity,
+        })
     }
 
     fn terminate(&self, h: &OwnedHandle, _grace: Duration) -> Result<ExitReport, LauncherError> {
@@ -82,7 +85,12 @@ impl Launcher for FakeLauncher {
         match st.live.get(&h.pid) {
             Some(id) if *id == h.start_identity => {
                 st.live.remove(&h.pid);
-                Ok(ExitReport { pid: h.pid, exit_code: Some(0), signal: None, killed: true })
+                Ok(ExitReport {
+                    pid: h.pid,
+                    exit_code: Some(0),
+                    signal: None,
+                    killed: true,
+                })
             }
             _ => Err(LauncherError::TerminateFailed(format!(
                 "pid {} is not owned by this handle",

@@ -319,10 +319,18 @@ mod tests {
             observed_at_ms: now,
             receipt: "no process was associated".into(),
         };
-        let ttl = store.observation_ttl_for_step(&execution.token.step_id).unwrap();
-        store.release_failed_launch(&session, &execution.token.step_id, &evidence, now, ttl).unwrap();
-        store.set_admission_enabled(&fence.deployment_id, false).unwrap();
-        let retry = store.accept_start(&session, &fence, now + 1, now + 1000).unwrap();
+        let ttl = store
+            .observation_ttl_for_step(&execution.token.step_id)
+            .unwrap();
+        store
+            .release_failed_launch(&session, &execution.token.step_id, &evidence, now, ttl)
+            .unwrap();
+        store
+            .set_admission_enabled(&fence.deployment_id, false)
+            .unwrap();
+        let retry = store
+            .accept_start(&session, &fence, now + 1, now + 1000)
+            .unwrap();
         assert!(!retry.joined);
         assert_ne!(retry.operation_id, execution.token.operation_id);
         assert_ne!(retry.binding_id, execution.binding_id);

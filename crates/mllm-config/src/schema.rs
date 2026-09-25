@@ -211,7 +211,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("parked_limit", BYTES),
         ("memory", SCALAR),
     ]);
-    const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[("domain", SCALAR), ("sharing", SCALAR), ("physical_gpu_uuid", SCALAR)]);
+    const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[
+        ("domain", SCALAR),
+        ("sharing", SCALAR),
+        ("physical_gpu_uuid", SCALAR),
+    ]);
     const QUEUE: &[(&str, FieldSpec)] = &[
         ("max_pending_per_deployment", SCALAR),
         ("max_pending_total", SCALAR),
@@ -275,7 +279,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("memory", ENGINE_MEMORY),
         (
             "vllm",
-            FieldSpec::Struct(&[("block_size_tokens", SCALAR), ("max_num_batched_tokens", SCALAR)]),
+            FieldSpec::Struct(&[
+                ("block_size_tokens", SCALAR),
+                ("max_num_batched_tokens", SCALAR),
+            ]),
         ),
         (
             "sglang",
@@ -347,21 +354,30 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("scheduler", FieldSpec::Struct(SCHEDULER)),
                 ("state_dir", SCALAR),
                 ("identity_dir", SCALAR),
-                ("enrollment", FieldSpec::RequiredStruct(&[
-                    ("bootstrap_address", SCALAR),
-                    ("control_address", SCALAR),
-                ])),
+                (
+                    "enrollment",
+                    FieldSpec::RequiredStruct(&[
+                        ("bootstrap_address", SCALAR),
+                        ("control_address", SCALAR),
+                    ]),
+                ),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),
                 // SPEC §6.5, §16.1 (W5): the controller-owned idle policy.
-                ("lifecycle_defaults", FieldSpec::Struct(&[
-                    ("ready_idle_timeout", DURATION),
-                    ("parked_idle_timeout", DURATION),
-                ])),
+                (
+                    "lifecycle_defaults",
+                    FieldSpec::Struct(&[
+                        ("ready_idle_timeout", DURATION),
+                        ("parked_idle_timeout", DURATION),
+                    ]),
+                ),
                 // Owner decision 2026-09-23: control-session heartbeat bounds.
-                ("control", FieldSpec::Struct(&[
-                    ("heartbeat_suspend_after", DURATION),
-                    ("heartbeat_lost_after", DURATION),
-                ])),
+                (
+                    "control",
+                    FieldSpec::Struct(&[
+                        ("heartbeat_suspend_after", DURATION),
+                        ("heartbeat_lost_after", DURATION),
+                    ]),
+                ),
                 // SPEC §10 (W10): the switch drain bound.
                 ("switching", FieldSpec::Struct(SWITCHING)),
                 // SPEC §17 (M80): router observability.
@@ -382,7 +398,14 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("state_dir", SCALAR),
                 ("identity_dir", SCALAR),
                 ("runtime_dir", SCALAR),
-                ("ingress", FieldSpec::Struct(&[("bind", SCALAR), ("address", SCALAR), ("transport", SCALAR)])),
+                (
+                    "ingress",
+                    FieldSpec::Struct(&[
+                        ("bind", SCALAR),
+                        ("address", SCALAR),
+                        ("transport", SCALAR),
+                    ]),
+                ),
                 ("listeners", LISTENERS),
                 ("hardware_fingerprint", SCALAR),
                 ("environment_fingerprint", SCALAR),

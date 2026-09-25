@@ -478,7 +478,13 @@ mod tests {
             .is_err());
     }
 
-    fn lease(store: &crate::Store, id: &str, fence: &DeploymentFence, generation: i64, session: &str) {
+    fn lease(
+        store: &crate::Store,
+        id: &str,
+        fence: &DeploymentFence,
+        generation: i64,
+        session: &str,
+    ) {
         store
             .conn
             .execute(
@@ -551,45 +557,77 @@ mod tests {
         ));
         assert!(!dispatch(&store, &fence.deployment_id));
 
-        let evidence = |probe: i64, quiet: i64, identities: Vec<ProcessIdentity>| QuiescenceEvidence {
-            binding_id: execution.binding_id.clone(),
-            incarnation: execution.incarnation.clone(),
-            identities,
-            readiness_observed_at_ms: probe,
-            quiescent_at_ms: quiet,
-            receipt: "engine running+waiting 0 on a fresh scrape".into(),
-        };
-        let started = ulid::Ulid::from_string(session.id()).unwrap().timestamp_ms() as i64;
+        let evidence =
+            |probe: i64, quiet: i64, identities: Vec<ProcessIdentity>| QuiescenceEvidence {
+                binding_id: execution.binding_id.clone(),
+                incarnation: execution.incarnation.clone(),
+                identities,
+                readiness_observed_at_ms: probe,
+                quiescent_at_ms: quiet,
+                receipt: "engine running+waiting 0 on a fresh scrape".into(),
+            };
+        let started = ulid::Ulid::from_string(session.id())
+            .unwrap()
+            .timestamp_ms() as i64;
         // A different group is not the launch that was associated.
         assert!(matches!(
             store.abandon_retired_request_leases(
                 &session,
                 &step,
-                &evidence(now - 2, now - 1, vec![identity("api", 61), identity("worker-0", 99)]),
+                &evidence(
+                    now - 2,
+                    now - 1,
+                    vec![identity("api", 61), identity("worker-0", 99)]
+                ),
                 now,
             ),
             Err(LifecycleError::Conflict)
         ));
         // A probe from before this session began proves nothing about it.
         assert!(store
-            .abandon_retired_request_leases(&session, &step, &evidence(started - 1, now - 1, group()), now)
+            .abandon_retired_request_leases(
+                &session,
+                &step,
+                &evidence(started - 1, now - 1, group()),
+                now
+            )
             .is_err());
         // Quiescence observed before the probe does not follow it.
         assert!(store
-            .abandon_retired_request_leases(&session, &step, &evidence(now - 1, now - 2, group()), now)
+            .abandon_retired_request_leases(
+                &session,
+                &step,
+                &evidence(now - 1, now - 2, group()),
+                now
+            )
             .is_err());
         // Evidence older than the observation ttl is not fresh; a future one is refused.
         assert!(store
-            .abandon_retired_request_leases(&session, &step, &evidence(now - 2, now - 1, group()), now + ttl + 10)
+            .abandon_retired_request_leases(
+                &session,
+                &step,
+                &evidence(now - 2, now - 1, group()),
+                now + ttl + 10
+            )
             .is_err());
         assert!(store
-            .abandon_retired_request_leases(&session, &step, &evidence(now - 2, now + 1, group()), now)
+            .abandon_retired_request_leases(
+                &session,
+                &step,
+                &evidence(now - 2, now + 1, group()),
+                now
+            )
             .is_err());
         assert_eq!(leases(&store, &fence.deployment_id), 2);
 
         assert_eq!(
             store
-                .abandon_retired_request_leases(&session, &step, &evidence(now - 2, now - 1, group()), now)
+                .abandon_retired_request_leases(
+                    &session,
+                    &step,
+                    &evidence(now - 2, now - 1, group()),
+                    now
+                )
                 .unwrap(),
             2
         );
@@ -642,7 +680,13 @@ mod tests {
         let now = execution.issued_at_ms + 10_000;
         let receipt = store
             .accept_ordinary_stop_command(
-                &session, "owner", &fence.deployment_id, fence.revision, "stop-leases", now, now + 50_000,
+                &session,
+                "owner",
+                &fence.deployment_id,
+                fence.revision,
+                "stop-leases",
+                now,
+                now + 50_000,
             )
             .unwrap();
         let (_, context) = store

@@ -504,7 +504,11 @@ fn read(
     } else {
         "running"
     };
-    let source_is = |step: &str, run: &str, operation: &str, code: Option<&str>| -> Result<bool, LifecycleError> {
+    let source_is = |step: &str,
+                     run: &str,
+                     operation: &str,
+                     code: Option<&str>|
+     -> Result<bool, LifecycleError> {
         Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM lifecycle_steps s JOIN lifecycle_runs r ON r.operation_id=s.operation_id JOIN operations o ON o.id=s.operation_id WHERE s.id=?1 AND s.state=?2 AND r.state=?3 AND o.state=?4 AND o.error_code IS ?5)",params![original.step_id,step,run,operation,code],|r|r.get(0))?)
     };
     let mut source_exact = source_is(
@@ -516,7 +520,12 @@ fn read(
     // An expired Stop's source may since have been resolved by the Stop issued
     // in its place.
     if !source_exact && state == "cancelled" && p.source_state != "completed" {
-        source_exact = source_is("cancelled", "failed", "failed", Some("resolved_by_owned_cleanup"))?;
+        source_exact = source_is(
+            "cancelled",
+            "failed",
+            "failed",
+            Some("resolved_by_owned_cleanup"),
+        )?;
     }
     if !source_exact {
         return Err(LifecycleError::CorruptStoredData);
@@ -753,9 +762,15 @@ impl crate::Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
-        if let Some(receipt) =
-            command_lookup(&tx, principal, &scope(deployment), deployment, revision, key, deadline)?
-        {
+        if let Some(receipt) = command_lookup(
+            &tx,
+            principal,
+            &scope(deployment),
+            deployment,
+            revision,
+            key,
+            deadline,
+        )? {
             return Ok(receipt);
         }
         let receipt = Self::stop_in_transaction(
@@ -856,8 +871,7 @@ impl crate::Store {
             // With a deferred Stop the deployment's command scope answers with
             // the deferred receipt, so every sibling stop has its own scope.
             let command = StopCommand {
-                scope: (deferring || first.is_some())
-                    .then(|| instance_scope(deployment, instance)),
+                scope: (deferring || first.is_some()).then(|| instance_scope(deployment, instance)),
                 revision: Some(revision),
             };
             let receipt = Self::accept_instance_stop_in_transaction(
@@ -947,8 +961,10 @@ impl crate::Store {
         {
             return Ok(receipt);
         }
-        Self::accept_ordinary_cleanup_in_transaction(tx, s, principal, fence, key, now, deadline, &command)
-            .map(Into::into)
+        Self::accept_ordinary_cleanup_in_transaction(
+            tx, s, principal, fence, key, now, deadline, &command,
+        )
+        .map(Into::into)
     }
 
     /// Exact receipts replay independently of the service-resolved generation.
@@ -1334,7 +1350,14 @@ pub(crate) fn complete(
     if unproven {
         return Err(LifecycleError::Conflict);
     }
-    tx.execute("DELETE FROM request_leases WHERE deployment_id=?1 AND revision=?2 AND generation=?3",params![original.deployment_id,original.revision,original.generation])?;
+    tx.execute(
+        "DELETE FROM request_leases WHERE deployment_id=?1 AND revision=?2 AND generation=?3",
+        params![
+            original.deployment_id,
+            original.revision,
+            original.generation
+        ],
+    )?;
     if p.source_state != "completed" {
         one(tx.execute("UPDATE lifecycle_steps SET state='cancelled' WHERE id=?1 AND state IN ('armed','uncertain')",[&original.step_id])?)?;
         one(tx.execute("UPDATE lifecycle_runs SET state='failed' WHERE operation_id=?1 AND state IN ('running','uncertain')",[&original.operation_id])?)?;
@@ -1365,7 +1388,11 @@ pub(crate) fn complete(
     one(tx.execute("UPDATE deployment_instances SET observed_state='stopped' WHERE deployment_id=?1 AND revision=?2 AND generation=?3 AND desired_state='stopped' AND admission_enabled=0 AND dispatch_enabled=0",params![original.deployment_id,p.receipt.revision,p.receipt.generation])?)?;
     // W10 gap (a): the stopped instance holds nothing, so no closure reason of
     // it can matter; a restart that keeps this generation starts with none.
-    crate::switch_state::clear_instance_closures(tx, &original.deployment_id, original.instance_index)?;
+    crate::switch_state::clear_instance_closures(
+        tx,
+        &original.deployment_id,
+        original.instance_index,
+    )?;
     one(tx.execute(
         "UPDATE lifecycle_steps SET state='completed' WHERE id=?1 AND state='armed'",
         [id],

@@ -58,15 +58,13 @@ pub fn lru_parked_victims(
 ) -> Option<Vec<String>> {
     let mut state = ledger.clone();
     let mut victims = Vec::new();
-    let mut remaining = parked_lru
-        .iter()
-        .filter(|owner| {
-            owner.as_str() != candidate
-                && ledger
-                    .owners
-                    .get(owner.as_str())
-                    .is_some_and(|f| f.phase == ResourcePhase::Parked)
-        });
+    let mut remaining = parked_lru.iter().filter(|owner| {
+        owner.as_str() != candidate
+            && ledger
+                .owners
+                .get(owner.as_str())
+                .is_some_and(|f| f.phase == ResourcePhase::Parked)
+    });
     loop {
         if admit_phase(&state, candidate, next, context).is_ok() {
             return Some(victims);
@@ -238,18 +236,36 @@ mod lru_tests {
         let lru: Vec<String> = ["old", "mid", "new"].map(String::from).to_vec();
         // 22 GiB held; a 10 GiB candidate needs 4 GiB back: one victim.
         assert_eq!(
-            lru_parked_victims(&ledger, "c", &footprint(ResourcePhase::Cold, 10), &lru, context),
+            lru_parked_victims(
+                &ledger,
+                "c",
+                &footprint(ResourcePhase::Cold, 10),
+                &lru,
+                context
+            ),
             Some(vec!["old".to_string()])
         );
         // 14 GiB: needs 8 GiB back, two victims, never the Ready owner.
         assert_eq!(
-            lru_parked_victims(&ledger, "c", &footprint(ResourcePhase::Cold, 14), &lru, context),
+            lru_parked_victims(
+                &ledger,
+                "c",
+                &footprint(ResourcePhase::Cold, 14),
+                &lru,
+                context
+            ),
             Some(vec!["old".to_string(), "mid".to_string()])
         );
         // No eviction of Ready work: a candidate that fits only by stopping
         // the Ready owner is refused.
         assert_eq!(
-            lru_parked_victims(&ledger, "c", &footprint(ResourcePhase::Cold, 20), &lru, context),
+            lru_parked_victims(
+                &ledger,
+                "c",
+                &footprint(ResourcePhase::Cold, 20),
+                &lru,
+                context
+            ),
             None
         );
     }
@@ -267,21 +283,39 @@ mod lru_tests {
         let context = AdmissionContext::new(&observations, &limits, 1_000, 2_000, 2);
         let lru: Vec<String> = ["old", "new"].map(String::from).to_vec();
         assert_eq!(
-            lru_parked_victims(&ledger, "c", &footprint(ResourcePhase::Parked, 1), &lru, context),
+            lru_parked_victims(
+                &ledger,
+                "c",
+                &footprint(ResourcePhase::Parked, 1),
+                &lru,
+                context
+            ),
             Some(vec!["old".to_string()])
         );
         // A parked residual budget is enforced the same way.
         let limits = self::limits(64, Some(2));
         let context = AdmissionContext::new(&observations, &limits, 1_000, 2_000, 8);
         assert_eq!(
-            lru_parked_victims(&ledger, "c", &footprint(ResourcePhase::Parked, 1), &lru, context),
+            lru_parked_victims(
+                &ledger,
+                "c",
+                &footprint(ResourcePhase::Parked, 1),
+                &lru,
+                context
+            ),
             Some(vec!["old".to_string()])
         );
         // The candidate never reclaims itself, and a non-parked owner named in
         // the order is ignored.
         let lru: Vec<String> = ["c", "old", "new"].map(String::from).to_vec();
         assert_eq!(
-            lru_parked_victims(&ledger, "c", &footprint(ResourcePhase::Parked, 1), &lru, context),
+            lru_parked_victims(
+                &ledger,
+                "c",
+                &footprint(ResourcePhase::Parked, 1),
+                &lru,
+                context
+            ),
             Some(vec!["old".to_string()])
         );
     }

@@ -5,9 +5,9 @@
 //! with distinct memory-retention signatures, ambiguous outcomes (effect
 //! applied, ack lost), the deep-park policy gate, and crash injection.
 
+use async_trait::async_trait;
 use mllm_adapters::traits::*;
 use mllm_adapters::ParkPolicy;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -136,8 +136,11 @@ impl FakeEngine {
     }
     /// Preserve the persisted cleanup mode and sample time after the gone check.
     pub fn lifecycle_cleanup_mode_observed(
-        &self, binding: &str, incarnation: &str,
-        identities: &[mllm_domain::completion::ProcessIdentity], terminate: bool,
+        &self,
+        binding: &str,
+        incarnation: &str,
+        identities: &[mllm_domain::completion::ProcessIdentity],
+        terminate: bool,
     ) -> Result<mllm_domain::completion::CleanupEvidence, RuntimeError> {
         let clock = self
             .lifecycle_clock

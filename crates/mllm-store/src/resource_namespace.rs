@@ -47,7 +47,7 @@ pub(crate) fn insert(
     Ok(())
 }
 pub(crate) fn ledger_key(host: &str, kind: &str, local: &str) -> String {
-    mllm_config::remote_resources::ledger_key(host,kind,local)
+    mllm_config::remote_resources::ledger_key(host, kind, local)
 }
 pub(crate) fn ensure_embedded(
     tx: &Transaction<'_>,

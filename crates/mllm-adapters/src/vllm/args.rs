@@ -167,8 +167,8 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
         .chain(&input.extra_args)
         .cloned()
         .collect();
-    validate_rendered_args(Engine::Vllm, &pass_through, dev_mode_requested).map_err(
-        |error| match error {
+    validate_rendered_args(Engine::Vllm, &pass_through, dev_mode_requested).map_err(|error| {
+        match error {
             ProfileArgError::Reserved(flag) | ProfileArgError::ConfigFile(flag) => {
                 ArgsError::ReservedConflict(flag)
             }
@@ -179,8 +179,8 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
             }
             ProfileArgError::ShortOption(flag) => ArgsError::UnexpectedArgument(flag),
             other => ArgsError::UnsupportedFlag(other.to_string()),
-        },
-    )?;
+        }
+    })?;
     // ADR 0014 §2: one way to say each thing. A typed field the deployment set
     // cannot also arrive in the pass-through vector; the marker is mllm's own.
     let typed = typed_args(input);

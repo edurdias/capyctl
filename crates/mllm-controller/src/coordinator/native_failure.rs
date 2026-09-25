@@ -87,9 +87,8 @@ pub(super) async fn settle_failed_launch(
         // gone. The settlement is bounded like any other control, and anything
         // short of evidence for exactly the recorded identities retains it all.
         let bound = shared.options.protocol_timeout;
-        let deadline_ms = (shared.clock)()?.saturating_add(
-            i64::try_from(bound.as_millis()).unwrap_or(i64::MAX),
-        );
+        let deadline_ms =
+            (shared.clock)()?.saturating_add(i64::try_from(bound.as_millis()).unwrap_or(i64::MAX));
         let context = SettlementContext {
             fence: launch.fence.clone(),
             operation_id: operation_id.clone(),

@@ -233,9 +233,21 @@ async fn operation(owner: &Arc<Mutex<OwnedCoordinatorState>>, id: &str) {
 #[tokio::test]
 async fn a_management_start_lifts_an_earlier_management_stop() {
     let (_dir, owner, worker, id, app) = setup().await;
-    let start = value(app.clone().oneshot(request(&id, "start-1", "start")).await.unwrap()).await;
+    let start = value(
+        app.clone()
+            .oneshot(request(&id, "start-1", "start"))
+            .await
+            .unwrap(),
+    )
+    .await;
     operation(&owner, start["operation_id"].as_str().unwrap()).await;
-    let stop = value(app.clone().oneshot(request(&id, "stop-1", "stop")).await.unwrap()).await;
+    let stop = value(
+        app.clone()
+            .oneshot(request(&id, "stop-1", "stop"))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
     operation(&owner, stop["operation_id"].as_str().unwrap()).await;
     let response = app
@@ -730,13 +742,29 @@ async fn store_failure_is_redacted_and_closes_new_command_admission() {
 #[tokio::test]
 async fn park_is_accepted_and_an_engine_refusal_leaves_the_deployment_serving() {
     let (_dir, owner, worker, id, app) = setup().await;
-    let start = value(app.clone().oneshot(request(&id, "start", "start")).await.unwrap()).await;
+    let start = value(
+        app.clone()
+            .oneshot(request(&id, "start", "start"))
+            .await
+            .unwrap(),
+    )
+    .await;
     operation(&owner, start["operation_id"].as_str().unwrap()).await;
-    let response = app.clone().oneshot(request(&id, "park", "park")).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(request(&id, "park", "park"))
+        .await
+        .unwrap();
     assert_eq!(response.status(), 202);
     let park = value(response).await;
     assert_eq!(
-        value(app.clone().oneshot(request(&id, "park", "park")).await.unwrap()).await,
+        value(
+            app.clone()
+                .oneshot(request(&id, "park", "park"))
+                .await
+                .unwrap()
+        )
+        .await,
         park,
         "an exact retry replays the receipt"
     );

@@ -42,32 +42,61 @@ struct JournalExecutor {
 }
 struct InspectPolicy;
 impl mllm_agent::journal::LocalExecutionPolicy for InspectPolicy {
-    fn authorize(&self, command: &mllm_protocol::execution::MemberCommand) -> Result<(), mllm_agent::journal::JournalError> {
-        if matches!(command.action, mllm_protocol::execution::MemberAction::Inspect) { Ok(()) }
-        else { Err(mllm_agent::journal::JournalError::Unauthorized) }
+    fn authorize(
+        &self,
+        command: &mllm_protocol::execution::MemberCommand,
+    ) -> Result<(), mllm_agent::journal::JournalError> {
+        if matches!(
+            command.action,
+            mllm_protocol::execution::MemberAction::Inspect
+        ) {
+            Ok(())
+        } else {
+            Err(mllm_agent::journal::JournalError::Unauthorized)
+        }
     }
-    fn render_launch(&self, _: &mllm_protocol::execution::MemberCommand) -> Result<mllm_agent::journal::ApprovedLaunch, mllm_agent::journal::JournalError> {
+    fn render_launch(
+        &self,
+        _: &mllm_protocol::execution::MemberCommand,
+    ) -> Result<mllm_agent::journal::ApprovedLaunch, mllm_agent::journal::JournalError> {
         Err(mllm_agent::journal::JournalError::Unauthorized)
     }
 }
 impl mllm_agent::session::SessionExecution for JournalExecutor {
-    fn execute(&self, session: u64, command: mllm_protocol::execution::MemberCommand) -> mllm_agent::session::ExecutionFuture {
+    fn execute(
+        &self,
+        session: u64,
+        command: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
         let journal = self.journal.clone();
         let fresh = self.fresh.clone();
-        let lose = self.lose_first.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let lose = self
+            .lose_first
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let now = mllm_protocol::now_unix_ms();
-                match journal.accept(session, &command, now, &InspectPolicy).map_err(|_| mllm_agent::session::SessionError)? {
+                match journal
+                    .accept(session, &command, now, &InspectPolicy)
+                    .map_err(|_| mllm_agent::session::SessionError)?
+                {
                     mllm_agent::journal::Acceptance::Fresh(ticket) => {
                         fresh.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        journal.execute(ticket, now, &InspectPolicy).map_err(|_| mllm_agent::session::SessionError)?;
+                        journal
+                            .execute(ticket, now, &InspectPolicy)
+                            .map_err(|_| mllm_agent::session::SessionError)?;
                     }
                     mllm_agent::journal::Acceptance::Replay(_) => {}
                 }
-                if lose { return Err(mllm_agent::session::SessionError); }
-                journal.execution_result(&command.identity.command_id, mllm_protocol::now_unix_ms()).map_err(|_| mllm_agent::session::SessionError)
-            }).await.map_err(|_| mllm_agent::session::SessionError)?
+                if lose {
+                    return Err(mllm_agent::session::SessionError);
+                }
+                journal
+                    .execution_result(&command.identity.command_id, mllm_protocol::now_unix_ms())
+                    .map_err(|_| mllm_agent::session::SessionError)
+            })
+            .await
+            .map_err(|_| mllm_agent::session::SessionError)?
         })
     }
 }
@@ -175,7 +204,8 @@ async fn outbound_reconnect_fences_old_stream_and_revocation_closes_current() {
     let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
     let fresh = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let executor = Arc::new(JournalExecutor {
-        journal: journal.clone(), fresh: fresh.clone(),
+        journal: journal.clone(),
+        fresh: fresh.clone(),
         lose_first: std::sync::atomic::AtomicBool::new(true),
     });
     let controller_id = identity.controller_id();
@@ -219,17 +249,29 @@ async fn outbound_reconnect_fences_old_stream_and_revocation_closes_current() {
     let mut command = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.clone(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: "inspect-once".into(), step_id: "inspect-step".into(),
-            generation: 1, revision: 1, deadline_ms: mllm_protocol::now_unix_ms() + 10_000,
-            payload_digest: [0; 32], expected_state: "stopped".into(), profile_fingerprint: "local-profile".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.clone(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: "inspect-once".into(),
+            step_id: "inspect-step".into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 10_000,
+            payload_digest: [0; 32],
+            expected_state: "stopped".into(),
+            profile_fingerprint: "local-profile".into(),
             instance_index: 0,
         },
         action: mllm_protocol::execution::MemberAction::Inspect,
     };
     command.identity.payload_digest = command.canonical_digest();
-    let result = tokio::time::timeout(Duration::from_secs(12), sessions.execute(command.clone())).await.unwrap().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(12), sessions.execute(command.clone()))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(result.state, "completed");
     assert!(!result.model_usable);
     assert_eq!(fresh.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -238,8 +280,14 @@ async fn outbound_reconnect_fences_old_stream_and_revocation_closes_current() {
     eventually(|| !sessions.inspect(&host).unwrap().online).await;
     // ADR 0016 (owner decision 2026-09-24): told its certificate is revoked,
     // the agent stops by itself instead of reconnecting.
-    let ended = tokio::time::timeout(Duration::from_secs(15), task).await.unwrap().unwrap();
-    assert!(matches!(ended, Err(mllm_agent::session::HostRevoked)), "{ended:?}");
+    let ended = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(ended, Err(mllm_agent::session::HostRevoked)),
+        "{ended:?}"
+    );
     drop(stop);
     server.abort();
 }
@@ -418,7 +466,10 @@ async fn enrolled_host() -> Enrolled {
     let authority = Arc::new(EnrollmentAuthority::new(state, ca));
     let sessions = AgentSessions::new(authority.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = format!("https://localhost:{}", listener.local_addr().unwrap().port());
+    let address = format!(
+        "https://localhost:{}",
+        listener.local_addr().unwrap().port()
+    );
     let server = tokio::spawn(
         Server::builder()
             .tls_config(
@@ -452,8 +503,16 @@ async fn enrolled_host() -> Enrolled {
         .await
         .unwrap()
         .into_inner();
-    let host = identity.accept_certificate(&storage, certificate, now()).unwrap();
-    Enrolled { sessions, identity, host, server, _dirs: (state_dir, storage_dir) }
+    let host = identity
+        .accept_certificate(&storage, certificate, now())
+        .unwrap();
+    Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs: (state_dir, storage_dir),
+    }
 }
 fn domain(observed_bytes: i64) -> pb::DomainObservation {
     pb::DomainObservation {
@@ -475,7 +534,11 @@ struct SlowExecutor {
     hold: Duration,
 }
 impl mllm_agent::session::SessionExecution for SlowExecutor {
-    fn execute(&self, session: u64, command: mllm_protocol::execution::MemberCommand) -> mllm_agent::session::ExecutionFuture {
+    fn execute(
+        &self,
+        session: u64,
+        command: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let journal = self.journal.clone();
         let hold = self.hold;
@@ -483,15 +546,27 @@ impl mllm_agent::session::SessionExecution for SlowExecutor {
             tokio::time::sleep(hold).await;
             tokio::task::spawn_blocking(move || {
                 let now = mllm_protocol::now_unix_ms();
-                if let mllm_agent::journal::Acceptance::Fresh(ticket) = journal.accept(session, &command, now, &InspectPolicy).map_err(|_| mllm_agent::session::SessionError)? {
-                    journal.execute(ticket, now, &InspectPolicy).map_err(|_| mllm_agent::session::SessionError)?;
+                if let mllm_agent::journal::Acceptance::Fresh(ticket) = journal
+                    .accept(session, &command, now, &InspectPolicy)
+                    .map_err(|_| mllm_agent::session::SessionError)?
+                {
+                    journal
+                        .execute(ticket, now, &InspectPolicy)
+                        .map_err(|_| mllm_agent::session::SessionError)?;
                 }
-                journal.execution_result(&command.identity.command_id, mllm_protocol::now_unix_ms()).map_err(|_| mllm_agent::session::SessionError)
-            }).await.map_err(|_| mllm_agent::session::SessionError)?
+                journal
+                    .execution_result(&command.identity.command_id, mllm_protocol::now_unix_ms())
+                    .map_err(|_| mllm_agent::session::SessionError)
+            })
+            .await
+            .map_err(|_| mllm_agent::session::SessionError)?
         })
     }
     fn inventory(&self) -> Option<pb::ReportInventory> {
-        Some(pb::ReportInventory { domains: vec![domain(2048)], ..Default::default() })
+        Some(pb::ReportInventory {
+            domains: vec![domain(2048)],
+            ..Default::default()
+        })
     }
 }
 
@@ -504,7 +579,13 @@ impl mllm_agent::session::SessionExecution for SlowExecutor {
 // reconnect after the observation TTL fail (U5, host-a).
 #[tokio::test]
 async fn redelivery_during_a_running_effect_keeps_the_session_and_reports_fresh_inventory() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let journal_dir = directory();
     let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -545,11 +626,20 @@ async fn redelivery_during_a_running_effect_keeps_the_session_and_reports_fresh_
     let mut command = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.clone(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: "slow-inspect".into(), step_id: "slow-step".into(),
-            generation: 1, revision: 1, deadline_ms: mllm_protocol::now_unix_ms() + 20_000,
-            payload_digest: [0; 32], expected_state: "stopped".into(), profile_fingerprint: "local-profile".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.clone(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: "slow-inspect".into(),
+            step_id: "slow-step".into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 20_000,
+            payload_digest: [0; 32],
+            expected_state: "stopped".into(),
+            profile_fingerprint: "local-profile".into(),
             instance_index: 0,
         },
         action: mllm_protocol::execution::MemberAction::Inspect,
@@ -576,23 +666,42 @@ struct LeadingExecutor {
     lead_ms: i64,
 }
 impl mllm_agent::session::SessionExecution for LeadingExecutor {
-    fn execute(&self, session: u64, command: mllm_protocol::execution::MemberCommand) -> mllm_agent::session::ExecutionFuture {
+    fn execute(
+        &self,
+        session: u64,
+        command: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
         let journal = self.journal.clone();
         let lead = self.lead_ms;
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 let now = mllm_protocol::now_unix_ms() + lead;
-                if let mllm_agent::journal::Acceptance::Fresh(ticket) = journal.accept(session, &command, now, &InspectPolicy).map_err(|_| mllm_agent::session::SessionError)? {
-                    journal.execute(ticket, now, &InspectPolicy).map_err(|_| mllm_agent::session::SessionError)?;
+                if let mllm_agent::journal::Acceptance::Fresh(ticket) = journal
+                    .accept(session, &command, now, &InspectPolicy)
+                    .map_err(|_| mllm_agent::session::SessionError)?
+                {
+                    journal
+                        .execute(ticket, now, &InspectPolicy)
+                        .map_err(|_| mllm_agent::session::SessionError)?;
                 }
-                journal.execution_result(&command.identity.command_id, mllm_protocol::now_unix_ms() + lead).map_err(|_| mllm_agent::session::SessionError)
-            }).await.map_err(|_| mllm_agent::session::SessionError)?
+                journal
+                    .execution_result(
+                        &command.identity.command_id,
+                        mllm_protocol::now_unix_ms() + lead,
+                    )
+                    .map_err(|_| mllm_agent::session::SessionError)
+            })
+            .await
+            .map_err(|_| mllm_agent::session::SessionError)?
         })
     }
     fn inventory(&self) -> Option<pb::ReportInventory> {
         let mut observation = domain(2048);
         observation.observed_at_unix_ms += self.lead_ms;
-        Some(pb::ReportInventory { domains: vec![observation], ..Default::default() })
+        Some(pb::ReportInventory {
+            domains: vec![observation],
+            ..Default::default()
+        })
     }
 }
 
@@ -603,17 +712,29 @@ impl mllm_agent::session::SessionExecution for LeadingExecutor {
 // controller clock, so no downstream freshness check sees a future time.
 #[tokio::test]
 async fn a_host_clock_leading_within_the_bound_keeps_the_session_and_its_results() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let journal_dir = directory();
     let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
-    let executor = Arc::new(LeadingExecutor { journal: journal.clone(), lead_ms: 150 });
+    let executor = Arc::new(LeadingExecutor {
+        journal: journal.clone(),
+        lead_ms: 150,
+    });
     let controller_id = identity.controller_id();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         mllm_agent::session::run_session_with_execution(
             &identity,
             journal,
-            pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+            pb::ReportInventory {
+                domains: vec![domain(1024)],
+                ..Default::default()
+            },
             shutdown,
             Some(executor),
         )
@@ -625,11 +746,20 @@ async fn a_host_clock_leading_within_the_bound_keeps_the_session_and_its_results
     let mut command = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.clone(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: "leading-inspect".into(), step_id: "leading-step".into(),
-            generation: 1, revision: 1, deadline_ms: mllm_protocol::now_unix_ms() + 10_000,
-            payload_digest: [0; 32], expected_state: "stopped".into(), profile_fingerprint: "local-profile".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.clone(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: "leading-inspect".into(),
+            step_id: "leading-step".into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 10_000,
+            payload_digest: [0; 32],
+            expected_state: "stopped".into(),
+            profile_fingerprint: "local-profile".into(),
             instance_index: 0,
         },
         action: mllm_protocol::execution::MemberAction::Inspect,
@@ -640,14 +770,29 @@ async fn a_host_clock_leading_within_the_bound_keeps_the_session_and_its_results
         .expect("a result from a slightly leading host clock is accepted")
         .unwrap();
     assert_eq!(result.state, "completed");
-    assert!(result.observed_at_unix_ms <= mllm_protocol::now_unix_ms(), "recorded on the controller clock");
+    assert!(
+        result.observed_at_unix_ms <= mllm_protocol::now_unix_ms(),
+        "recorded on the controller clock"
+    );
     let after = sessions.inspect(&host).unwrap();
-    assert_eq!(after.session_id, first.session_id, "the session was never torn down");
+    assert_eq!(
+        after.session_id, first.session_id,
+        "the session was never torn down"
+    );
     // A lead beyond the bound is still refused.
     let now = mllm_protocol::now_unix_ms();
-    assert_eq!(mllm_controller::agent_sessions::controller_time(now + 100, now), Some(now));
-    assert_eq!(mllm_controller::agent_sessions::controller_time(now - 100, now), Some(now - 100));
-    assert_eq!(mllm_controller::agent_sessions::controller_time(now + 501, now), None);
+    assert_eq!(
+        mllm_controller::agent_sessions::controller_time(now + 100, now),
+        Some(now)
+    );
+    assert_eq!(
+        mllm_controller::agent_sessions::controller_time(now - 100, now),
+        Some(now - 100)
+    );
+    assert_eq!(
+        mllm_controller::agent_sessions::controller_time(now + 501, now),
+        None
+    );
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
     server.abort();
@@ -659,7 +804,13 @@ async fn a_host_clock_leading_within_the_bound_keeps_the_session_and_its_results
 // first session drops mid-command, and the replayed result names the new one.
 #[tokio::test]
 async fn session_changes_are_published_and_results_name_their_session() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let mut changes = sessions.subscribe();
     let before = *changes.borrow_and_update();
     assert!(sessions.current_session(&host).is_none());
@@ -677,7 +828,10 @@ async fn session_changes_are_published_and_results_name_their_session() {
         mllm_agent::session::run_session_with_execution(
             &identity,
             journal,
-            pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+            pb::ReportInventory {
+                domains: vec![domain(1024)],
+                ..Default::default()
+            },
             shutdown,
             Some(executor),
         )
@@ -685,15 +839,27 @@ async fn session_changes_are_published_and_results_name_their_session() {
     });
     eventually(|| sessions.current_session(&host).is_some()).await;
     let first = sessions.current_session(&host).unwrap();
-    assert!(*changes.borrow_and_update() > before, "connect and reconcile are published");
+    assert!(
+        *changes.borrow_and_update() > before,
+        "connect and reconcile are published"
+    );
     let mut command = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.clone(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: "inspect-across".into(), step_id: "inspect-across".into(),
-            generation: 1, revision: 1, deadline_ms: mllm_protocol::now_unix_ms() + 15_000,
-            payload_digest: [0; 32], expected_state: "stopped".into(), profile_fingerprint: "local-profile".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.clone(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: "inspect-across".into(),
+            step_id: "inspect-across".into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 15_000,
+            payload_digest: [0; 32],
+            expected_state: "stopped".into(),
+            profile_fingerprint: "local-profile".into(),
             instance_index: 0,
         },
         action: mllm_protocol::execution::MemberAction::Inspect,
@@ -710,7 +876,10 @@ async fn session_changes_are_published_and_results_name_their_session() {
     // The first session died with the lost acknowledgement; the result came
     // back on the host's next authenticated session, and it says so.
     assert_ne!(answered_on, first);
-    assert_eq!(sessions.current_session(&host).as_deref(), Some(answered_on.as_str()));
+    assert_eq!(
+        sessions.current_session(&host).as_deref(),
+        Some(answered_on.as_str())
+    );
     assert!(changes.has_changed().unwrap() || *changes.borrow() > before);
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
@@ -725,17 +894,28 @@ struct LoadingExecutor {
     lie: Arc<std::sync::atomic::AtomicBool>,
 }
 impl mllm_agent::session::SessionExecution for LoadingExecutor {
-    fn execute(&self, _: u64, _: mllm_protocol::execution::MemberCommand) -> mllm_agent::session::ExecutionFuture {
+    fn execute(
+        &self,
+        _: u64,
+        _: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
         Box::pin(async { Err(mllm_agent::session::SessionError) })
     }
     fn inventory(&self) -> Option<pb::ReportInventory> {
-        Some(pb::ReportInventory { domains: vec![domain(2048)], ..Default::default() })
+        Some(pb::ReportInventory {
+            domains: vec![domain(2048)],
+            ..Default::default()
+        })
     }
     fn load_interval(&self) -> Duration {
         Duration::from_millis(250)
     }
     fn load_reports(&self) -> Option<mllm_agent::session::LoadFuture> {
-        let host = if self.lie.load(std::sync::atomic::Ordering::SeqCst) { "other-host".into() } else { self.host.clone() };
+        let host = if self.lie.load(std::sync::atomic::Ordering::SeqCst) {
+            "other-host".into()
+        } else {
+            self.host.clone()
+        };
         Some(Box::pin(async move {
             vec![mllm_protocol::reports::LoadReport {
                 host_id: host,
@@ -745,7 +925,11 @@ impl mllm_agent::session::SessionExecution for LoadingExecutor {
                     owned_handle: "launch-2".into(),
                     sampled_at_ms: mllm_protocol::now_unix_ms(),
                     ingress_in_flight: 1,
-                    engine: Some(mllm_protocol::reports::EngineLoad { running: 3, waiting: 4, kv_usage_ppm: 500_000 }),
+                    engine: Some(mllm_protocol::reports::EngineLoad {
+                        running: 3,
+                        waiting: 4,
+                        kv_usage_ppm: 500_000,
+                    }),
                     latency: None,
                 }],
             }
@@ -761,18 +945,30 @@ impl mllm_agent::session::SessionExecution for LoadingExecutor {
 #[tokio::test]
 async fn host_load_reports_reach_the_load_table_and_are_fenced() {
     use mllm_controller::load_table::InstanceKey;
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let table = sessions.load_table();
     let journal_dir = directory();
     let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
     let lie = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let executor = Arc::new(LoadingExecutor { host: host.clone(), lie: lie.clone() });
+    let executor = Arc::new(LoadingExecutor {
+        host: host.clone(),
+        lie: lie.clone(),
+    });
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         mllm_agent::session::run_session_with_execution(
             &identity,
             journal,
-            pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+            pb::ReportInventory {
+                domains: vec![domain(1024)],
+                ..Default::default()
+            },
             shutdown,
             Some(executor),
         )
@@ -781,24 +977,46 @@ async fn host_load_reports_reach_the_load_table_and_are_fenced() {
     let current = InstanceKey::new("deployment", 2);
     eventually(|| table.fresh(&current, &host).is_some()).await;
     let view = table.fresh(&current, &host).unwrap();
-    assert_eq!((view.owned_handle.as_str(), view.ingress_in_flight, view.engine_queue()), ("launch-2", 1, Some(7)));
+    assert_eq!(
+        (
+            view.owned_handle.as_str(),
+            view.ingress_in_flight,
+            view.engine_queue()
+        ),
+        ("launch-2", 1, Some(7))
+    );
     assert_eq!(view.engine.unwrap().kv_usage_ppm, 500_000);
     // T34: the previous generation of the same deployment never reads this load.
-    assert!(table.fresh(&InstanceKey::new("deployment", 1), &host).is_none());
+    assert!(table
+        .fresh(&InstanceKey::new("deployment", 1), &host)
+        .is_none());
     // Only the reporting host's view counts.
     assert!(table.fresh(&current, "other-host").is_none());
     let first = sessions.current_session(&host).unwrap();
     // A report naming another host is refused and ends the session.
     lie.store(true, std::sync::atomic::Ordering::SeqCst);
     eventually(|| sessions.current_session(&host).is_none_or(|s| s != first)).await;
-    eventually(|| table.sample_at(&current, mllm_protocol::now_unix_ms()).is_none()).await;
-    assert!(table.snapshot_at(mllm_protocol::now_unix_ms()).iter().all(|v| v.host_id == host));
+    eventually(|| {
+        table
+            .sample_at(&current, mllm_protocol::now_unix_ms())
+            .is_none()
+    })
+    .await;
+    assert!(table
+        .snapshot_at(mllm_protocol::now_unix_ms())
+        .iter()
+        .all(|v| v.host_id == host));
     lie.store(false, std::sync::atomic::Ordering::SeqCst);
     eventually(|| table.fresh(&current, &host).is_some()).await;
     // SPEC §13.2: the host goes away; its load goes with it.
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
-    eventually(|| table.sample_at(&current, mllm_protocol::now_unix_ms()).is_none()).await;
+    eventually(|| {
+        table
+            .sample_at(&current, mllm_protocol::now_unix_ms())
+            .is_none()
+    })
+    .await;
     server.abort();
 }
 
@@ -808,7 +1026,13 @@ async fn host_load_reports_reach_the_load_table_and_are_fenced() {
 // acknowledges. The host learns dispatch is suspended before it closes ingress.
 #[tokio::test]
 async fn a_draining_host_is_suspended_before_it_is_acknowledged() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let suspended = Arc::new(Mutex::new(Vec::<String>::new()));
     {
         let suspended = suspended.clone();
@@ -830,7 +1054,10 @@ async fn a_draining_host_is_suspended_before_it_is_acknowledged() {
             mllm_agent::session::run_session_with_drain(
                 &identity,
                 journal,
-                pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+                pb::ReportInventory {
+                    domains: vec![domain(1024)],
+                    ..Default::default()
+                },
                 shutdown,
                 Some(executor),
                 Some(drain),
@@ -840,8 +1067,15 @@ async fn a_draining_host_is_suspended_before_it_is_acknowledged() {
     };
     eventually(|| sessions.current_session(&host).is_some()).await;
     let announced = drain.announce(Duration::from_secs(5)).await;
-    assert_eq!(announced, mllm_agent::session::DrainAnnouncement::Acknowledged);
-    assert_eq!(*suspended.lock().unwrap(), vec![host.clone()], "suspended before the ack");
+    assert_eq!(
+        announced,
+        mllm_agent::session::DrainAnnouncement::Acknowledged
+    );
+    assert_eq!(
+        *suspended.lock().unwrap(),
+        vec![host.clone()],
+        "suspended before the ack"
+    );
     // The session stays up (admitted streams still finish through it), but it
     // no longer stands for readiness, so nothing re-opens dispatch.
     assert!(sessions.current_session(&host).is_none());
@@ -880,7 +1114,13 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
     };
     use mllm_config::remote_roles::HostConfig;
     use mllm_controller::agent_sessions::ProvisionOutcome;
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let root = directory();
     let keys = directory();
     let models = root.path().join("models");
@@ -889,7 +1129,13 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
     std::fs::write(models.join("toy/model.safetensors"), "weights").unwrap();
     std::fs::create_dir_all(root.path().join("runtime")).unwrap();
     std::fs::write(root.path().join("runtime/mllm_vllm_guard.py"), "").unwrap();
-    std::fs::write(root.path().join("runtime").join(mllm_adapters::vllm::VLLM_ENTRY), "").unwrap();
+    std::fs::write(
+        root.path()
+            .join("runtime")
+            .join(mllm_adapters::vllm::VLLM_ENTRY),
+        "",
+    )
+    .unwrap();
     // ADR 0008: a sleep-mode vLLM launch also imports the capability probes.
     std::fs::write(root.path().join("runtime/engine_capabilities.py"), "").unwrap();
     // SPEC §9.1 / T21: a prepared host's runtime directory is the agent user's
@@ -897,7 +1143,9 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
     for path in [
         root.path().join("runtime"),
         root.path().join("runtime/mllm_vllm_guard.py"),
-        root.path().join("runtime").join(mllm_adapters::vllm::VLLM_ENTRY),
+        root.path()
+            .join("runtime")
+            .join(mllm_adapters::vllm::VLLM_ENTRY),
         root.path().join("runtime/engine_capabilities.py"),
     ] {
         use std::os::unix::fs::PermissionsExt;
@@ -909,7 +1157,12 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
     .unwrap();
     let mut document: serde_json::Value =
         serde_json::from_str(&HostConfig::template(root.path())).unwrap();
-    for field in ["hardware_fingerprint", "environment_fingerprint", "resource_policy", "runtime_profiles"] {
+    for field in [
+        "hardware_fingerprint",
+        "environment_fingerprint",
+        "resource_policy",
+        "runtime_profiles",
+    ] {
         document[field] = fixture["host"][field].clone();
     }
     let config = HostConfig::parse(&document.to_string()).unwrap();
@@ -940,7 +1193,10 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
         mllm_agent::session::run_session_with_execution(
             &identity,
             session_journal,
-            pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+            pb::ReportInventory {
+                domains: vec![domain(1024)],
+                ..Default::default()
+            },
             shutdown,
             Some(executor),
         )
@@ -953,47 +1209,75 @@ async fn a_checkpoint_mismatch_is_answered_and_the_session_stays_up() {
     let mut launch = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.clone(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: "launch".into(), step_id: "launch".into(),
-            generation: 1, revision: 1, deadline_ms: mllm_protocol::now_unix_ms() + 60_000,
-            payload_digest: [0; 32], expected_state: "reserved".into(), profile_fingerprint: "vllm-build-1".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.clone(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: "launch".into(),
+            step_id: "launch".into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 60_000,
+            payload_digest: [0; 32],
+            expected_state: "reserved".into(),
+            profile_fingerprint: "vllm-build-1".into(),
             instance_index: 0,
         },
-        action: mllm_protocol::execution::MemberAction::LaunchSingle(mllm_protocol::execution::SingleLaunchPlan {
-            deployment_config: deployment.to_string(),
-            profile_name: "local".into(),
-            checkpoint_fingerprint: "sha256:model".into(),
-            host_policy_fingerprint: policy,
-            binding_id: "01K00000000000000000000001".into(),
-            incarnation: "01K00000000000000000000002".into(),
-            grant_id: "01K00000000000000000000003".into(),
-            service_port: 8100,
-            issued_at_ms: 1,
-            coordinator_session_id: "01K00000000000000000000004".into(),
-            checkpoint_digest: recorded,
-            checkpoint_weights_bytes: None,
-            startup_bytes: None,
-        }),
+        action: mllm_protocol::execution::MemberAction::LaunchSingle(
+            mllm_protocol::execution::SingleLaunchPlan {
+                deployment_config: deployment.to_string(),
+                profile_name: "local".into(),
+                checkpoint_fingerprint: "sha256:model".into(),
+                host_policy_fingerprint: policy,
+                binding_id: "01K00000000000000000000001".into(),
+                incarnation: "01K00000000000000000000002".into(),
+                grant_id: "01K00000000000000000000003".into(),
+                service_port: 8100,
+                issued_at_ms: 1,
+                coordinator_session_id: "01K00000000000000000000004".into(),
+                checkpoint_digest: recorded,
+                checkpoint_weights_bytes: None,
+                startup_bytes: None,
+            },
+        ),
     };
     launch.identity.payload_digest = launch.canonical_digest();
     // Answered well inside one redelivery interval pair, not at the deadline.
-    let outcome = tokio::time::timeout(Duration::from_secs(5), sessions.provision_ingress(&launch, [7; 32]))
-        .await
-        .expect("the refusal is answered, not left to the deadline")
-        .unwrap();
-    assert_eq!(outcome, ProvisionOutcome::Refused("checkpoint_mismatch".into()));
-    let (answered_on, result) =
-        tokio::time::timeout(Duration::from_secs(5), sessions.execute_on_session(launch.clone(), None))
-            .await
-            .expect("the refused launch is a terminal result")
-            .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        sessions.provision_ingress(&launch, [7; 32]),
+    )
+    .await
+    .expect("the refusal is answered, not left to the deadline")
+    .unwrap();
+    assert_eq!(
+        outcome,
+        ProvisionOutcome::Refused("checkpoint_mismatch".into())
+    );
+    let (answered_on, result) = tokio::time::timeout(
+        Duration::from_secs(5),
+        sessions.execute_on_session(launch.clone(), None),
+    )
+    .await
+    .expect("the refused launch is a terminal result")
+    .unwrap();
     assert_eq!(result.refused, "checkpoint_mismatch");
     assert_eq!(result.state, "completed");
     assert!(!result.claim_retained && !result.model_usable && result.processes.is_empty());
-    assert_eq!(answered_on, first, "the session that refused is the one still up");
-    assert_eq!(sessions.current_session(&host).as_deref(), Some(first.as_str()));
-    assert!(journal.history(0, 100).unwrap().is_empty(), "nothing was journaled");
+    assert_eq!(
+        answered_on, first,
+        "the session that refused is the one still up"
+    );
+    assert_eq!(
+        sessions.current_session(&host).as_deref(),
+        Some(first.as_str())
+    );
+    assert!(
+        journal.history(0, 100).unwrap().is_empty(),
+        "nothing was journaled"
+    );
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
     server.abort();
@@ -1006,7 +1290,11 @@ struct LaunchObservation {
     presence: &'static str,
 }
 impl mllm_agent::session::SessionExecution for LaunchObservation {
-    fn execute(&self, _: u64, command: mllm_protocol::execution::MemberCommand) -> mllm_agent::session::ExecutionFuture {
+    fn execute(
+        &self,
+        _: u64,
+        command: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
         let presence = self.presence;
         Box::pin(async move {
             Ok(pb::MemberExecutionResult {
@@ -1023,43 +1311,65 @@ impl mllm_agent::session::SessionExecution for LaunchObservation {
                 claim_retained: true,
                 model_usable: false,
                 // SPEC §§6.4, 13.2: an exited launch says why, bounded.
-                launch_failure: if presence == "gone" { EXITED.into() } else { String::new() },
+                launch_failure: if presence == "gone" {
+                    EXITED.into()
+                } else {
+                    String::new()
+                },
                 ..Default::default()
             })
         })
     }
 }
 
-const EXITED: &str = "the engine exited before readiness with exit code 2; it rejected argument --moe-backend";
+const EXITED: &str =
+    "the engine exited before readiness with exit code 2; it rejected argument --moe-backend";
 
-fn launch_command(controller_id: String, host: &str, deadline_ms: i64) -> mllm_protocol::execution::MemberCommand {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../../mllm-config/tests/fixtures/f2-deployment.json")).unwrap();
+fn launch_command(
+    controller_id: String,
+    host: &str,
+    deadline_ms: i64,
+) -> mllm_protocol::execution::MemberCommand {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../mllm-config/tests/fixtures/f2-deployment.json"
+    ))
+    .unwrap();
     let mut launch = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.into(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: "launch".into(), step_id: "launch".into(),
-            generation: 1, revision: 1, deadline_ms,
-            payload_digest: [0; 32], expected_state: "reserved".into(), profile_fingerprint: "sglang-0.5.20".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.into(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: "launch".into(),
+            step_id: "launch".into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms,
+            payload_digest: [0; 32],
+            expected_state: "reserved".into(),
+            profile_fingerprint: "sglang-0.5.20".into(),
             instance_index: 0,
         },
-        action: mllm_protocol::execution::MemberAction::LaunchSingle(mllm_protocol::execution::SingleLaunchPlan {
-            deployment_config: fixture["deployment"].to_string(),
-            profile_name: "sglang".into(),
-            checkpoint_fingerprint: "sha256:model".into(),
-            host_policy_fingerprint: "a".repeat(64),
-            binding_id: "01K00000000000000000000001".into(),
-            incarnation: "01K00000000000000000000002".into(),
-            grant_id: "01K00000000000000000000003".into(),
-            service_port: 8100,
-            issued_at_ms: 1,
-            coordinator_session_id: "01K00000000000000000000004".into(),
-            checkpoint_digest: String::new(),
-            checkpoint_weights_bytes: None,
-            startup_bytes: None,
-        }),
+        action: mllm_protocol::execution::MemberAction::LaunchSingle(
+            mllm_protocol::execution::SingleLaunchPlan {
+                deployment_config: fixture["deployment"].to_string(),
+                profile_name: "sglang".into(),
+                checkpoint_fingerprint: "sha256:model".into(),
+                host_policy_fingerprint: "a".repeat(64),
+                binding_id: "01K00000000000000000000001".into(),
+                incarnation: "01K00000000000000000000002".into(),
+                grant_id: "01K00000000000000000000003".into(),
+                service_port: 8100,
+                issued_at_ms: 1,
+                coordinator_session_id: "01K00000000000000000000004".into(),
+                checkpoint_digest: String::new(),
+                checkpoint_weights_bytes: None,
+                startup_bytes: None,
+            },
+        ),
     };
     launch.identity.payload_digest = launch.canonical_digest();
     launch
@@ -1075,16 +1385,26 @@ fn launch_command(controller_id: String, host: &str, deadline_ms: i64) -> mllm_p
 #[tokio::test]
 async fn an_engine_gone_before_readiness_is_a_terminal_launch_result() {
     for (presence, terminal) in [("gone", true), ("alive", false), ("unknown", false)] {
-        let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+        let Enrolled {
+            sessions,
+            identity,
+            host,
+            server,
+            _dirs,
+        } = enrolled_host().await;
         let journal_dir = directory();
-        let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
+        let journal =
+            HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
         let controller_id = identity.controller_id();
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             mllm_agent::session::run_session_with_execution(
                 &identity,
                 journal,
-                pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+                pb::ReportInventory {
+                    domains: vec![domain(1024)],
+                    ..Default::default()
+                },
                 shutdown,
                 Some(Arc::new(LaunchObservation { presence })),
             )
@@ -1094,14 +1414,22 @@ async fn an_engine_gone_before_readiness_is_a_terminal_launch_result() {
         let launch = launch_command(controller_id, &host, mllm_protocol::now_unix_ms() + 60_000);
         let outcome = tokio::time::timeout(Duration::from_secs(3), sessions.execute(launch)).await;
         if terminal {
-            let result = outcome.expect("an engine gone before readiness is answered at once").unwrap();
+            let result = outcome
+                .expect("an engine gone before readiness is answered at once")
+                .unwrap();
             assert_eq!(result.state, "launched");
-            assert!(!result.model_usable && result.claim_retained, "the claim stays until absence is settled");
+            assert!(
+                !result.model_usable && result.claim_retained,
+                "the claim stays until absence is settled"
+            );
             assert!(result.processes.iter().all(|p| p.presence == "gone"));
             // T20: the host's bounded reason survives the session.
             assert_eq!(result.launch_failure, EXITED);
         } else {
-            assert!(outcome.is_err(), "a launch with a {presence} process is still in progress");
+            assert!(
+                outcome.is_err(),
+                "a launch with a {presence} process is still in progress"
+            );
         }
         stop.send(true).unwrap();
         task.await.unwrap().unwrap();
@@ -1115,11 +1443,18 @@ struct TimedExecutor {
     reporter: Arc<mllm_agent::load::LoadReporter>,
 }
 impl mllm_agent::session::SessionExecution for TimedExecutor {
-    fn execute(&self, _: u64, _: mllm_protocol::execution::MemberCommand) -> mllm_agent::session::ExecutionFuture {
+    fn execute(
+        &self,
+        _: u64,
+        _: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
         Box::pin(async { Err(mllm_agent::session::SessionError) })
     }
     fn inventory(&self) -> Option<pb::ReportInventory> {
-        Some(pb::ReportInventory { domains: vec![domain(2048)], ..Default::default() })
+        Some(pb::ReportInventory {
+            domains: vec![domain(2048)],
+            ..Default::default()
+        })
     }
     fn load_interval(&self) -> Duration {
         Duration::from_millis(250)
@@ -1150,8 +1485,17 @@ vllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"model\"} 0.2
 // keyed by the instance incarnation.
 #[tokio::test]
 async fn ingress_and_engine_latency_ride_the_load_report() {
-    use axum::{body::Body, routing::{get, post}};
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    use axum::{
+        body::Body,
+        routing::{get, post},
+    };
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let latency = sessions.latency_table();
     // A fake engine: chat streams two chunks 60 ms apart after 40 ms.
     let engine = axum::Router::new()
@@ -1192,7 +1536,9 @@ async fn ingress_and_engine_latency_ride_the_load_report() {
         revision: 1,
         instance_index: 0,
     };
-    ingress.register(scope.clone(), target, "model".into(), [7; 32], [8; 32]).unwrap();
+    ingress
+        .register(scope.clone(), target, "model".into(), [7; 32], [8; 32])
+        .unwrap();
     ingress.bind_handle(&scope, "launch-5").unwrap();
     ingress.open(&scope).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1211,7 +1557,8 @@ async fn ingress_and_engine_latency_ride_the_load_report() {
         .unwrap();
     assert!(response.status().is_success());
     response.bytes().await.unwrap();
-    let reporter = Arc::new(mllm_agent::load::LoadReporter::new(ingress.clone(), host.clone()).unwrap());
+    let reporter =
+        Arc::new(mllm_agent::load::LoadReporter::new(ingress.clone(), host.clone()).unwrap());
     let journal_dir = directory();
     let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
@@ -1219,7 +1566,10 @@ async fn ingress_and_engine_latency_ride_the_load_report() {
         mllm_agent::session::run_session_with_execution(
             &identity,
             journal,
-            pb::ReportInventory { domains: vec![domain(1024)], ..Default::default() },
+            pb::ReportInventory {
+                domains: vec![domain(1024)],
+                ..Default::default()
+            },
             shutdown,
             Some(Arc::new(TimedExecutor { reporter })),
         )
@@ -1231,18 +1581,35 @@ async fn ingress_and_engine_latency_ride_the_load_report() {
             .into_iter()
             .find(|v| v.series == name)
     };
-    eventually(|| series("ingress_time_to_last_byte").is_some() && series("engine_time_to_first_token").is_some()).await;
+    eventually(|| {
+        series("ingress_time_to_last_byte").is_some()
+            && series("engine_time_to_first_token").is_some()
+    })
+    .await;
     // Later ticks carry no new observations: counts do not grow.
     tokio::time::sleep(Duration::from_millis(600)).await;
     let first = series("ingress_time_to_first_byte").unwrap();
     let last = series("ingress_time_to_last_byte").unwrap();
-    assert_eq!((first.generation, first.host_id.as_str(), first.source), (5, host.as_str(), "mllm"));
+    assert_eq!(
+        (first.generation, first.host_id.as_str(), first.source),
+        (5, host.as_str(), "mllm")
+    );
     assert_eq!((first.histogram.count(), last.histogram.count()), (1, 1));
-    assert!(first.histogram.sum() >= 0.04, "first engine byte after 40 ms");
+    assert!(
+        first.histogram.sum() >= 0.04,
+        "first engine byte after 40 ms"
+    );
     assert!(last.histogram.sum() >= 0.1, "last engine byte after 100 ms");
     assert!(series("ingress_time_to_headers").unwrap().histogram.sum() <= first.histogram.sum());
     let engine = series("engine_time_to_first_token").unwrap();
-    assert_eq!((engine.source, engine.engine.as_deref(), engine.histogram.count()), ("engine", Some("vllm"), 3));
+    assert_eq!(
+        (
+            engine.source,
+            engine.engine.as_deref(),
+            engine.histogram.count()
+        ),
+        ("engine", Some("vllm"), 3)
+    );
     assert_eq!(engine.histogram.bounds(), &[0.02, 0.04]);
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
@@ -1259,7 +1626,12 @@ struct RawSession {
     session_id: String,
 }
 async fn raw_session(identity: &PendingEnrollment, host: &str) -> RawSession {
-    let channel = identity.control_endpoint(now()).unwrap().connect().await.unwrap();
+    let channel = identity
+        .control_endpoint(now())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
     let (send, recv) = tokio::sync::mpsc::channel(64);
     send.send(pb::AgentToServer {
         msg: Some(agent_to_server::Msg::Connect(pb::Connect {
@@ -1288,10 +1660,12 @@ async fn raw_session(identity: &PendingEnrollment, host: &str) -> RawSession {
     .await
     .unwrap();
     send.send(pb::AgentToServer {
-        msg: Some(agent_to_server::Msg::ReconcileHistory(pb::ReconcileHistory {
-            records: vec![],
-            complete: true,
-        })),
+        msg: Some(agent_to_server::Msg::ReconcileHistory(
+            pb::ReconcileHistory {
+                records: vec![],
+                complete: true,
+            },
+        )),
     })
     .await
     .unwrap();
@@ -1301,17 +1675,35 @@ async fn raw_session(identity: &PendingEnrollment, host: &str) -> RawSession {
             _ => continue,
         }
     };
-    RawSession { send, stream, session_id }
+    RawSession {
+        send,
+        stream,
+        session_id,
+    }
 }
-fn inspect_command(controller_id: String, host: &str, id: &str, deadline_ms: i64) -> mllm_protocol::execution::MemberCommand {
+fn inspect_command(
+    controller_id: String,
+    host: &str,
+    id: &str,
+    deadline_ms: i64,
+) -> mllm_protocol::execution::MemberCommand {
     let mut command = mllm_protocol::execution::MemberCommand {
         identity: mllm_domain::group::CommandIdentity {
             controller_id,
-            member: mllm_domain::group::MemberKey { host_id: host.into(), member_id: "head".into() },
-            deployment_id: "deployment".into(), operation_id: "operation".into(),
-            command_id: id.into(), step_id: id.into(),
-            generation: 1, revision: 1, deadline_ms,
-            payload_digest: [0; 32], expected_state: "stopped".into(), profile_fingerprint: "local-profile".into(),
+            member: mllm_domain::group::MemberKey {
+                host_id: host.into(),
+                member_id: "head".into(),
+            },
+            deployment_id: "deployment".into(),
+            operation_id: "operation".into(),
+            command_id: id.into(),
+            step_id: id.into(),
+            generation: 1,
+            revision: 1,
+            deadline_ms,
+            payload_digest: [0; 32],
+            expected_state: "stopped".into(),
+            profile_fingerprint: "local-profile".into(),
             instance_index: 0,
         },
         action: mllm_protocol::execution::MemberAction::Inspect,
@@ -1319,20 +1711,31 @@ fn inspect_command(controller_id: String, host: &str, id: &str, deadline_ms: i64
     command.identity.payload_digest = command.canonical_digest();
     command
 }
-fn completed(command: &mllm_protocol::execution::MemberCommand, observed_at_unix_ms: i64) -> pb::AgentToServer {
+fn completed(
+    command: &mllm_protocol::execution::MemberCommand,
+    observed_at_unix_ms: i64,
+) -> pb::AgentToServer {
     pb::AgentToServer {
-        msg: Some(agent_to_server::Msg::MemberResult(pb::MemberExecutionResult {
-            identity: command.to_wire().identity,
-            state: "completed".into(),
-            observed_at_unix_ms,
-            ..Default::default()
-        })),
+        msg: Some(agent_to_server::Msg::MemberResult(
+            pb::MemberExecutionResult {
+                identity: command.to_wire().identity,
+                state: "completed".into(),
+                observed_at_unix_ms,
+                ..Default::default()
+            },
+        )),
     }
 }
 /// The next command the controller sent on a raw session.
 async fn next_command(stream: &mut tonic::Streaming<pb::ServerToAgent>) -> pb::ExecuteMember {
     loop {
-        match tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap().msg {
+        match tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .msg
+        {
             Some(pb::server_to_agent::Msg::ExecuteMember(command)) => return command,
             _ => continue,
         }
@@ -1344,22 +1747,50 @@ async fn next_command(stream: &mut tonic::Streaming<pb::ServerToAgent>) -> pb::E
 // the session stays up; the next fresh result for the same command is taken.
 #[tokio::test]
 async fn a_stale_result_is_ignored_and_the_session_stays_up() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let mut raw = raw_session(&identity, &host).await;
-    let command = inspect_command(identity.controller_id(), &host, "stale-then-fresh", mllm_protocol::now_unix_ms() + 10_000);
+    let command = inspect_command(
+        identity.controller_id(),
+        &host,
+        "stale-then-fresh",
+        mllm_protocol::now_unix_ms() + 10_000,
+    );
     let execution = {
         let (sessions, command) = (sessions.clone(), command.clone());
         tokio::spawn(async move { sessions.execute(command).await })
     };
     next_command(&mut raw.stream).await;
-    raw.send.send(completed(&command, mllm_protocol::now_unix_ms() - 5_000)).await.unwrap();
+    raw.send
+        .send(completed(&command, mllm_protocol::now_unix_ms() - 5_000))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(sessions.current_session(&host).as_deref(), Some(raw.session_id.as_str()), "a stale result never ends the session");
+    assert_eq!(
+        sessions.current_session(&host).as_deref(),
+        Some(raw.session_id.as_str()),
+        "a stale result never ends the session"
+    );
     assert!(!execution.is_finished(), "a stale result is not evidence");
-    raw.send.send(completed(&command, mllm_protocol::now_unix_ms())).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(5), execution).await.unwrap().unwrap().unwrap();
+    raw.send
+        .send(completed(&command, mllm_protocol::now_unix_ms()))
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(result.state, "completed");
-    assert_eq!(sessions.current_session(&host).as_deref(), Some(raw.session_id.as_str()));
+    assert_eq!(
+        sessions.current_session(&host).as_deref(),
+        Some(raw.session_id.as_str())
+    );
     server.abort();
 }
 
@@ -1369,10 +1800,17 @@ struct SlowRetain {
     release: Arc<std::sync::atomic::AtomicBool>,
 }
 impl mllm_controller::agent_sessions::RemoteEvidenceObserver for SlowRetain {
-    fn retain(&self, _: &mllm_protocol::execution::MemberCommand, _: &pb::MemberExecutionResult) -> Result<(), Box<tonic::Status>> {
-        self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+    fn retain(
+        &self,
+        _: &mllm_protocol::execution::MemberCommand,
+        _: &pb::MemberExecutionResult,
+    ) -> Result<(), Box<tonic::Status>> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
-        while !self.release.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < Duration::from_secs(10) {
+        while !self.release.load(std::sync::atomic::Ordering::SeqCst)
+            && started.elapsed() < Duration::from_secs(10)
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
         Ok(())
@@ -1383,23 +1821,43 @@ impl mllm_controller::agent_sessions::RemoteEvidenceObserver for SlowRetain {
 // session table. Readiness supervisors and placement read it for every host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn store_work_for_a_result_does_not_hold_the_session_table() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let mut raw = raw_session(&identity, &host).await;
-    let command = inspect_command(identity.controller_id(), &host, "slow-retain", mllm_protocol::now_unix_ms() + 15_000);
+    let command = inspect_command(
+        identity.controller_id(),
+        &host,
+        "slow-retain",
+        mllm_protocol::now_unix_ms() + 15_000,
+    );
     let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let observer = Arc::new(SlowRetain { entered: entered.clone(), release: release.clone() });
+    let observer = Arc::new(SlowRetain {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
     let execution = {
         let (sessions, command) = (sessions.clone(), command.clone());
         tokio::spawn(async move { sessions.execute_observed(command, Some(observer)).await })
     };
     next_command(&mut raw.stream).await;
-    raw.send.send(completed(&command, mllm_protocol::now_unix_ms())).await.unwrap();
+    raw.send
+        .send(completed(&command, mllm_protocol::now_unix_ms()))
+        .await
+        .unwrap();
     // The runtime's timer may be driven by the very worker the retain blocks,
     // so wait on the plain clock.
     let waited = std::time::Instant::now();
     while !entered.load(std::sync::atomic::Ordering::SeqCst) {
-        assert!(waited.elapsed() < Duration::from_secs(5), "the result reached the observer");
+        assert!(
+            waited.elapsed() < Duration::from_secs(5),
+            "the result reached the observer"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     // A plain thread and channel: the bound must not depend on the runtime.
@@ -1412,10 +1870,16 @@ async fn store_work_for_a_result_does_not_hold_the_session_table() {
     let current = answered.recv_timeout(Duration::from_secs(1));
     release.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        current.expect("the session table stays readable during store work").as_deref(),
+        current
+            .expect("the session table stays readable during store work")
+            .as_deref(),
         Some(raw.session_id.as_str())
     );
-    let result = tokio::time::timeout(Duration::from_secs(5), execution).await.unwrap().unwrap().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(result.state, "completed");
     server.abort();
 }
@@ -1425,20 +1889,38 @@ async fn store_work_for_a_result_does_not_hold_the_session_table() {
 // need, so a busy queue cannot end the session the host is draining through.
 #[tokio::test]
 async fn a_full_command_queue_never_ends_a_draining_session() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let mut raw = raw_session(&identity, &host).await;
-    let command = inspect_command(identity.controller_id(), &host, "fill", mllm_protocol::now_unix_ms() + 30_000);
+    let command = inspect_command(
+        identity.controller_id(),
+        &host,
+        "fill",
+        mllm_protocol::now_unix_ms() + 30_000,
+    );
     // The host reads nothing, so once the transport's window is full the
     // queue stays full while commands keep arriving.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (full, filled) = tokio::sync::oneshot::channel();
     let hammer = {
-        let (sessions, host, wire, stop) = (sessions.clone(), host.clone(), command.to_wire(), stop.clone());
+        let (sessions, host, wire, stop) = (
+            sessions.clone(),
+            host.clone(),
+            command.to_wire(),
+            stop.clone(),
+        );
         std::thread::spawn(move || {
             let mut full = Some(full);
             let mut refused_since = None;
             let started = std::time::Instant::now();
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) && started.elapsed() < Duration::from_secs(30) {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst)
+                && started.elapsed() < Duration::from_secs(30)
+            {
                 if sessions.dispatch(&host, wire.clone()).is_ok() {
                     refused_since = None;
                     continue;
@@ -1453,17 +1935,24 @@ async fn a_full_command_queue_never_ends_a_draining_session() {
             }
         })
     };
-    tokio::time::timeout(Duration::from_secs(30), filled).await.expect("the command queue stays full").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), filled)
+        .await
+        .expect("the command queue stays full")
+        .unwrap();
     raw.send
         .send(pb::AgentToServer {
-            msg: Some(agent_to_server::Msg::HostDraining(pb::HostDraining { host_id: host.clone() })),
+            msg: Some(agent_to_server::Msg::HostDraining(pb::HostDraining {
+                host_id: host.clone(),
+            })),
         })
         .await
         .unwrap();
     let acknowledged = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match raw.stream.message().await {
-                Ok(Some(pb::ServerToAgent { msg: Some(pb::server_to_agent::Msg::HostDrainAcknowledged(_)) })) => return true,
+                Ok(Some(pb::ServerToAgent {
+                    msg: Some(pb::server_to_agent::Msg::HostDrainAcknowledged(_)),
+                })) => return true,
                 Ok(Some(_)) => continue,
                 _ => return false,
             }
@@ -1473,7 +1962,10 @@ async fn a_full_command_queue_never_ends_a_draining_session() {
     .unwrap();
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     hammer.join().unwrap();
-    assert!(acknowledged, "the drain is acknowledged, not the session ended");
+    assert!(
+        acknowledged,
+        "the drain is acknowledged, not the session ended"
+    );
     let view = sessions.inspect(&host).unwrap();
     assert!(view.online);
     assert_eq!(view.session_id, raw.session_id);
@@ -1485,9 +1977,20 @@ async fn a_full_command_queue_never_ends_a_draining_session() {
 // same session and happens at once on a new one.
 #[tokio::test]
 async fn a_delivered_command_is_redelivered_with_backoff_not_every_tick() {
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let mut raw = raw_session(&identity, &host).await;
-    let command = inspect_command(identity.controller_id(), &host, "unanswered", mllm_protocol::now_unix_ms() + 2_200);
+    let command = inspect_command(
+        identity.controller_id(),
+        &host,
+        "unanswered",
+        mllm_protocol::now_unix_ms() + 2_200,
+    );
     let execution = {
         let (sessions, command) = (sessions.clone(), command.clone());
         tokio::spawn(async move { sessions.execute(command).await })
@@ -1495,13 +1998,26 @@ async fn a_delivered_command_is_redelivered_with_backoff_not_every_tick() {
     let mut delivered = 0;
     let window = tokio::time::Instant::now() + Duration::from_millis(2_100);
     while let Ok(Ok(Some(message))) = tokio::time::timeout_at(window, raw.stream.message()).await {
-        if matches!(message.msg, Some(pb::server_to_agent::Msg::ExecuteMember(_))) {
+        if matches!(
+            message.msg,
+            Some(pb::server_to_agent::Msg::ExecuteMember(_))
+        ) {
             delivered += 1;
         }
     }
-    assert!((1..=2).contains(&delivered), "delivered {delivered} times in 2.1 s");
-    assert!(tokio::time::timeout(Duration::from_secs(3), execution).await.unwrap().unwrap().is_err());
-    assert_eq!(sessions.current_session(&host).as_deref(), Some(raw.session_id.as_str()));
+    assert!(
+        (1..=2).contains(&delivered),
+        "delivered {delivered} times in 2.1 s"
+    );
+    assert!(tokio::time::timeout(Duration::from_secs(3), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_eq!(
+        sessions.current_session(&host).as_deref(),
+        Some(raw.session_id.as_str())
+    );
     server.abort();
 }
 
@@ -1510,7 +2026,13 @@ async fn a_delivered_command_is_redelivered_with_backoff_not_every_tick() {
 #[tokio::test]
 async fn a_replaced_session_leaves_no_load_behind() {
     use mllm_controller::load_table::InstanceKey;
-    let Enrolled { sessions, identity, host, server, _dirs } = enrolled_host().await;
+    let Enrolled {
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs,
+    } = enrolled_host().await;
     let table = sessions.load_table();
     let first = raw_session(&identity, &host).await;
     first
@@ -1538,7 +2060,10 @@ async fn a_replaced_session_leaves_no_load_behind() {
     eventually(|| table.fresh(&current, &host).is_some()).await;
     let second = raw_session(&identity, &host).await;
     assert_ne!(second.session_id, first.session_id);
-    assert!(table.fresh(&current, &host).is_none(), "the replaced session's load is gone");
+    assert!(
+        table.fresh(&current, &host).is_none(),
+        "the replaced session's load is gone"
+    );
     drop(first);
     server.abort();
 }

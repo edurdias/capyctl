@@ -12,27 +12,38 @@ fn directory() -> tempfile::TempDir {
 // T04, T33: an unrelated fork must not prolong the parent's ownership lifetime.
 #[test]
 fn inherited_descriptor_does_not_retain_a_dropped_identity_owner() {
-    let dir=directory();
-    let storage=IdentityDirectory::open(dir.path()).unwrap();
-    let mut pipe=[0;2];
-    assert_eq!(unsafe {libc::pipe2(pipe.as_mut_ptr(),libc::O_CLOEXEC)},0);
-    let child=unsafe {libc::fork()};
-    assert!(child>=0);
-    if child==0 {
+    let dir = directory();
+    let storage = IdentityDirectory::open(dir.path()).unwrap();
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
         // Only async-signal-safe syscalls in the child of this multithreaded test.
         unsafe {
             libc::close(pipe[1]);
-            let mut byte=0u8;
-            libc::read(pipe[0],(&mut byte as *mut u8).cast(),1);
+            let mut byte = 0u8;
+            libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
             libc::_exit(0);
         }
     }
-    unsafe {libc::close(pipe[0]);}
+    unsafe {
+        libc::close(pipe[0]);
+    }
     drop(storage);
-    let reopened=IdentityDirectory::open(dir.path());
+    let reopened = IdentityDirectory::open(dir.path());
     // Always reap before asserting, including the intentionally witnessed red.
-    unsafe {libc::close(pipe[1]);libc::waitpid(child,std::ptr::null_mut(),0);}
-    assert!(reopened.is_ok(),"forked child retained the parent's released lock");
+    unsafe {
+        libc::close(pipe[1]);
+        libc::waitpid(child, std::ptr::null_mut(), 0);
+    }
+    assert!(
+        reopened.is_ok(),
+        "forked child retained the parent's released lock"
+    );
 }
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

@@ -278,11 +278,7 @@ impl crate::Store {
                     admission_enabled=0,dispatch_enabled=0,
                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
               WHERE id=?1",
-            params![
-                deployment,
-                DELETED_KIND,
-                format!("deleted/{deployment}")
-            ],
+            params![deployment, DELETED_KIND, format!("deleted/{deployment}")],
         )?;
         tx.execute(
             "INSERT INTO operations(id,deployment_id,kind,state,error_code,idempotency_key) VALUES(?1,?2,'delete','succeeded',NULL,NULL)",

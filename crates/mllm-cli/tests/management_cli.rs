@@ -26,9 +26,7 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
     let app = support::boot(dir.path()).await;
     // An ephemeral loopback port the CLI children are pointed at, so a live
     // standalone or server holding the 7443 default does not collide.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     std::env::set_var(mllm_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string());
     let router = app.management_router();
@@ -88,9 +86,15 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
         "ready"
     );
     let request = ulid::Ulid::new().to_string();
-    let receipt = cli(dir.path(), &["stop", "deployment", id, "--request-id", &request]);
+    let receipt = cli(
+        dir.path(),
+        &["stop", "deployment", id, "--request-id", &request],
+    );
     assert!(receipt["operation_id"].is_string());
-    let replay = cli(dir.path(), &["stop", "deployment", id, "--request-id", &request]);
+    let replay = cli(
+        dir.path(),
+        &["stop", "deployment", id, "--request-id", &request],
+    );
     assert_eq!(replay["operation_id"], receipt["operation_id"]);
     assert_eq!(replay["generation"], receipt["generation"]);
     for _ in 0..100 {
@@ -116,10 +120,28 @@ fn delete_by_name_replays_and_frees_the_name(
     file: &std::path::Path,
 ) -> String {
     let request = ulid::Ulid::new().to_string();
-    let receipt = cli(state, &["delete", "deployment", "cli-model", "--request-id", &request]);
+    let receipt = cli(
+        state,
+        &[
+            "delete",
+            "deployment",
+            "cli-model",
+            "--request-id",
+            &request,
+        ],
+    );
     assert_eq!(receipt["deployment_id"], id);
     assert!(receipt["operation_id"].is_string());
-    let replay = cli(state, &["delete", "deployment", "cli-model", "--request-id", &request]);
+    let replay = cli(
+        state,
+        &[
+            "delete",
+            "deployment",
+            "cli-model",
+            "--request-id",
+            &request,
+        ],
+    );
     assert_eq!(replay, receipt);
     let gone = Command::new(env!("CARGO_BIN_EXE_mllm"))
         .env("MLLM_STATE_DIR", state)
@@ -129,12 +151,22 @@ fn delete_by_name_replays_and_frees_the_name(
     assert!(!gone.status.success());
     let created = cli(
         state,
-        &["deploy", "model", "--file", file.to_str().unwrap(), "--activate", "--wait"],
+        &[
+            "deploy",
+            "model",
+            "--file",
+            file.to_str().unwrap(),
+            "--activate",
+            "--wait",
+        ],
     );
     assert_eq!(created["deployment"]["observed_state"], "ready");
     let fresh = created["deployment"]["id"].as_str().unwrap().to_owned();
     assert_ne!(fresh, id);
-    assert_eq!(cli(state, &["status", "deployment", "cli-model"])["id"], fresh.as_str());
+    assert_eq!(
+        cli(state, &["status", "deployment", "cli-model"])["id"],
+        fresh.as_str()
+    );
     fresh
 }
 
@@ -144,7 +176,14 @@ fn delete_by_name_replays_and_frees_the_name(
 /// receipt. Fake engine; not qualification of any native engine recipe.
 fn delete_with_stop_stops_waits_and_deletes(state: &std::path::Path, id: &str) {
     let request = ulid::Ulid::new().to_string();
-    let args = ["delete", "deployment", "cli-model", "--stop", "--request-id", &request];
+    let args = [
+        "delete",
+        "deployment",
+        "cli-model",
+        "--stop",
+        "--request-id",
+        &request,
+    ];
     let report = cli(state, &args);
     assert_eq!(report["deleted"], true, "{report}");
     assert_eq!(report["deployment_id"], id, "{report}");

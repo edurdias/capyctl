@@ -55,8 +55,8 @@ pub fn standalone_drain_bound_in(path: &std::path::Path) -> Result<Duration, Str
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DEFAULT_DRAIN),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let document = mllm_config::parse_strict(mllm_config::ConfigKind::Standalone, &text)
-        .map_err(refused)?;
+    let document =
+        mllm_config::parse_strict(mllm_config::ConfigKind::Standalone, &text).map_err(refused)?;
     mllm_config::remote_roles::drain_timeout(&document).map_err(refused)
 }
 
@@ -204,9 +204,7 @@ impl Admission {
         // dropped so the count is honest, but never hold the exit on a client,
         // and not at all once the operator has asked twice.
         let grace = if forced { FORCED_GRACE } else { CANCEL_GRACE };
-        let _ = self
-            .wait_idle(tokio::time::Instant::now() + grace)
-            .await;
+        let _ = self.wait_idle(tokio::time::Instant::now() + grace).await;
         DrainReport {
             in_flight_at_close,
             cancelled,
@@ -432,7 +430,10 @@ mod tests {
         }));
         supervision.supervise(tokio::spawn(std::future::pending::<()>()));
         let aborted = supervision.join(Duration::from_millis(300)).await;
-        assert!(finished.load(Ordering::SeqCst), "the cancelled supervisor finished");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the cancelled supervisor finished"
+        );
         assert_eq!(aborted, 1, "only the one ignoring the signal is aborted");
     }
 
@@ -553,7 +554,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)),
             )
             .await;
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(report.forced && !report.drained);
         assert_eq!(report.cancelled, 1);
         assert_eq!(report.to_json()["forced"], true);
@@ -594,7 +599,10 @@ mod tests {
         std::fs::write(&path, base).unwrap();
         assert_eq!(standalone_drain_bound(state.path()), Ok(DEFAULT_DRAIN));
         std::fs::write(&path, format!("{base}shutdown:\n  drain_timeout: 7s\n")).unwrap();
-        assert_eq!(standalone_drain_bound(state.path()), Ok(Duration::from_secs(7)));
+        assert_eq!(
+            standalone_drain_bound(state.path()),
+            Ok(Duration::from_secs(7))
+        );
         for bad in ["later", "601s"] {
             std::fs::write(&path, format!("{base}shutdown:\n  drain_timeout: {bad}\n")).unwrap();
             let error = standalone_drain_bound(state.path()).unwrap_err();
@@ -615,7 +623,14 @@ mod tests {
         )
         .unwrap();
         let explicit = state.path().join("explicit.yaml");
-        std::fs::write(&explicit, format!("{base}shutdown:\n  drain_timeout: 45s\n")).unwrap();
-        assert_eq!(standalone_drain_bound_in(&explicit), Ok(Duration::from_secs(45)));
+        std::fs::write(
+            &explicit,
+            format!("{base}shutdown:\n  drain_timeout: 45s\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            standalone_drain_bound_in(&explicit),
+            Ok(Duration::from_secs(45))
+        );
     }
 }

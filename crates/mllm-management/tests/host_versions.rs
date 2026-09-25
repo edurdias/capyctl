@@ -33,7 +33,9 @@ async fn list_hosts_shows_versions_and_upgrade_required() {
         let owner = owned.lock().unwrap();
         let store = owner.store();
         for (digest, name) in [("b", "host-a"), ("e", "host-b")] {
-            store.create_host_invitation(&digest.repeat(64), name, 100, 0).unwrap();
+            store
+                .create_host_invitation(&digest.repeat(64), name, 100, 0)
+                .unwrap();
             let cert = store
                 .redeem_host_invitation(
                     &mllm_store::enrollment::Redemption {
@@ -91,12 +93,21 @@ async fn list_hosts_shows_versions_and_upgrade_required() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["server_version"], SERVER_VERSION);
     let host = |name: &str| {
-        body["hosts"].as_array().unwrap().iter().find(|h| h["name"] == name).unwrap().clone()
+        body["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["name"] == name)
+            .unwrap()
+            .clone()
     };
     let old = host("host-a");
     assert_eq!(old["compatibility"], "upgrade_required");
     assert_eq!(old["binary_version"], "");
-    assert!(old["compatibility_reason"].as_str().unwrap().contains("drain-only"));
+    assert!(old["compatibility_reason"]
+        .as_str()
+        .unwrap()
+        .contains("drain-only"));
     assert_eq!(old["capabilities"], json!(["heartbeats"]));
     assert_eq!(old["online"], false);
     let unseen = host("host-b");

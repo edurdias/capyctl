@@ -156,7 +156,8 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Measured, MeasureError>>,
 {
-    let unrecorded = || RuntimeError::Uncertain("the checkpoint digest was not recorded before launch".into());
+    let unrecorded =
+        || RuntimeError::Uncertain("the checkpoint digest was not recorded before launch".into());
     let measured = measure().await.map_err(|_| unrecorded())?;
     match record(owner, deployment, revision, host, &measured).map_err(|_| unrecorded())? {
         RecordOutcome::Recorded { digest, .. } if digest == measured.digest => Ok(digest),
@@ -334,7 +335,12 @@ impl RemoteDigests {
             local.to_string(),
             publication.fingerprint,
             mllm_protocol::now_unix_ms()
-                + if size_only { SIZE_DEADLINE } else { DIGEST_DEADLINE }.as_millis() as i64,
+                + if size_only {
+                    SIZE_DEADLINE
+                } else {
+                    DIGEST_DEADLINE
+                }
+                .as_millis() as i64,
             size_only,
         ))
     }
@@ -347,7 +353,11 @@ impl DigestSource for RemoteDigests {
         self.sessions.current_session(host).is_some()
             && self
                 .sessions
-                .preflight(host, &[mllm_protocol::capabilities::CHECKPOINT_DIGEST], true)
+                .preflight(
+                    host,
+                    &[mllm_protocol::capabilities::CHECKPOINT_DIGEST],
+                    true,
+                )
                 .is_ok()
     }
     fn measure(&self, pending: PendingDigest) -> MeasureFuture {

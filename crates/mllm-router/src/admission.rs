@@ -84,7 +84,9 @@ impl InFlight {
 
     fn slots(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, SlotQueue>> {
         // Plain queues: a panic elsewhere leaves nothing half-written.
-        self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn wake(&self, deployment: &str) {

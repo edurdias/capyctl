@@ -82,8 +82,14 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
     for engine in [Engine::Vllm, Engine::Sglang] {
         let host = host_policy(&installed(engine, "/opt/engine"), "env-1", CAPACITY, None);
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
-        assert_eq!(security["credential_ref"], "secret://engine-key", "{engine:?}");
-        assert_eq!(security["admin_credential_ref"], "secret://admin-key", "{engine:?}");
+        assert_eq!(
+            security["credential_ref"], "secret://engine-key",
+            "{engine:?}"
+        );
+        assert_eq!(
+            security["admin_credential_ref"], "secret://admin-key",
+            "{engine:?}"
+        );
     }
 }
 
@@ -380,10 +386,7 @@ fn host_policy_from_env_is_complete() {
     std::fs::create_dir_all(&models).expect("a model store");
     std::env::set_var("MLLM_VLLM_BIN", &bin);
     std::env::set_var("MLLM_MODELS_ROOT", &models);
-    std::env::set_var(
-        "MLLM_RUNTIME_DIR",
-        private_runtime(dir.path()),
-    );
+    std::env::set_var("MLLM_RUNTIME_DIR", private_runtime(dir.path()));
     for name in [
         "MLLM_ENGINE_FINGERPRINT",
         "MLLM_KV_CACHE_BYTES",
@@ -433,7 +436,10 @@ fn host_policy_from_env_is_complete() {
     // sleep mode is derived, and the restart-only standalone vLLM deployment
     // never parks, so it gets none (SPEC §6.2).
     assert!(!settings.enable_sleep_mode);
-    assert_eq!(settings.provenance["enable_sleep_mode"], SettingSource::Derived);
+    assert_eq!(
+        settings.provenance["enable_sleep_mode"],
+        SettingSource::Derived
+    );
     assert_eq!(resolved.profile.security.deep_park, DeepPark::Enabled);
     assert!(!resolved.profile.security.trust_remote_code);
     assert_eq!(resolved.profile.args, ["--max-model-len", "4096"]);
@@ -465,10 +471,7 @@ fn deep_park_is_on_unless_the_host_opts_out() {
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
     std::env::set_var("MLLM_MODELS_ROOT", dir.path());
-    std::env::set_var(
-        "MLLM_RUNTIME_DIR",
-        private_runtime(dir.path()),
-    );
+    std::env::set_var("MLLM_RUNTIME_DIR", private_runtime(dir.path()));
     std::env::set_var("MLLM_DEEP_PARK", "off");
     std::env::set_var("MLLM_TRUST_REMOTE_CODE", "1");
 
@@ -542,7 +545,10 @@ fn installation_drift_is_warn_unless_the_host_refuses() {
             .installation()
             .expect_err("an unrecognized value is refused")
             .to_string();
-        assert!(message.contains("MLLM_INSTALLATION_DRIFT"), "{value:?}: {message}");
+        assert!(
+            message.contains("MLLM_INSTALLATION_DRIFT"),
+            "{value:?}: {message}"
+        );
     }
     for name in [
         "MLLM_VLLM_BIN",
@@ -579,8 +585,10 @@ fn the_engine_port_range_can_be_named_for_one_run() {
         assert_eq!(installation.engine_ports, ports, "{value:?}");
         let host = host_policy(&installation, "env-1", CAPACITY, None);
         let range = &host["resource_policy"]["endpoint_port_range"];
-        assert_eq!((range["start"].as_u64(), range["end"].as_u64()),
-            (Some(ports.0.into()), Some(ports.1.into())));
+        assert_eq!(
+            (range["start"].as_u64(), range["end"].as_u64()),
+            (Some(ports.0.into()), Some(ports.1.into()))
+        );
     }
     for value in ["", "8100", "8199-8100", "80-90", "8100-70000", "a-b"] {
         std::env::set_var(crate::roles::ENGINE_PORTS_ENV, value);
@@ -588,7 +596,10 @@ fn the_engine_port_range_can_be_named_for_one_run() {
             .installation()
             .expect_err("a malformed range is refused")
             .to_string();
-        assert!(message.contains(crate::roles::ENGINE_PORTS_ENV), "{value:?}: {message}");
+        assert!(
+            message.contains(crate::roles::ENGINE_PORTS_ENV),
+            "{value:?}: {message}"
+        );
     }
     for name in [
         "MLLM_VLLM_BIN",
@@ -663,10 +674,7 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
     std::env::set_var("MLLM_SGLANG_BIN", &bin);
     std::env::set_var("MLLM_ENGINE_FINGERPRINT", "sglang 0.5.0");
     std::env::set_var("MLLM_MODELS_ROOT", &models);
-    std::env::set_var(
-        "MLLM_RUNTIME_DIR",
-        private_runtime(dir.path()),
-    );
+    std::env::set_var("MLLM_RUNTIME_DIR", private_runtime(dir.path()));
     std::env::set_var("MLLM_DEEP_PARK", "off");
 
     let installation = crate::roles::EnvEngineProvider::new()
@@ -749,9 +757,16 @@ fn standalone_runs_from_the_embedded_runtime_unless_one_is_named() {
     let installation = crate::roles::EnvEngineProvider::with_managed_runtime(managed.clone())
         .installation()
         .expect("the embedded runtime is materialized");
-    assert_eq!(installation.runtime_dir, managed.canonicalize().expect("created"));
     assert_eq!(
-        std::fs::metadata(&managed).expect("created").permissions().mode() & 0o7777,
+        installation.runtime_dir,
+        managed.canonicalize().expect("created")
+    );
+    assert_eq!(
+        std::fs::metadata(&managed)
+            .expect("created")
+            .permissions()
+            .mode()
+            & 0o7777,
         0o700
     );
     for file in mllm_agent::embedded_runtime::files() {
@@ -767,8 +782,14 @@ fn standalone_runs_from_the_embedded_runtime_unless_one_is_named() {
     let installation = crate::roles::EnvEngineProvider::with_managed_runtime(other.clone())
         .installation()
         .expect("the named runtime is used");
-    assert_eq!(installation.runtime_dir, named.canonicalize().expect("exists"));
-    assert!(!other.exists(), "a named runtime leaves the managed one alone");
+    assert_eq!(
+        installation.runtime_dir,
+        named.canonicalize().expect("exists")
+    );
+    assert!(
+        !other.exists(),
+        "a named runtime leaves the managed one alone"
+    );
     assert!(!named.join(mllm_agent::embedded_runtime::MARKER).exists());
 
     std::env::remove_var("MLLM_RUNTIME_DIR");

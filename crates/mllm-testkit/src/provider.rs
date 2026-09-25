@@ -174,9 +174,8 @@ impl EngineBindings for FakeBindings {
         let clock = self.clock.clone();
         Ok(Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(
             move || {
-                clock().map_err(|_| {
-                    RuntimeError::Uncertain("service observation clock failed".into())
-                })
+                clock()
+                    .map_err(|_| RuntimeError::Uncertain("service observation clock failed".into()))
             },
         ))))
     }

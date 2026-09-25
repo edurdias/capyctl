@@ -318,11 +318,7 @@ fn sensitive_options_need_named_host_approval() {
     assert!(error.to_string().contains("approved_paths"), "{error}");
     approve(&mut host, json!(["--download-dir"]), json!(["/srv/cache"]));
     resolve_effective(&deployment, &host).expect("inside an approved path");
-    for escape in [
-        "/srv/cache/../etc",
-        "/srv/cachex",
-        "relative/dir",
-    ] {
+    for escape in ["/srv/cache/../etc", "/srv/cachex", "relative/dir"] {
         let (deployment, _) = with_extra_args("vllm", json!([format!("--download-dir={escape}")]));
         assert!(resolve_effective(&deployment, &host).is_err(), "{escape}");
     }
@@ -353,12 +349,27 @@ fn sensitive_options_need_named_host_approval() {
 #[test]
 fn sensitive_shapes_and_abbreviations_need_approval() {
     for (engine, args) in [
-        ("sglang", json!(["--decoupled-spec-bind", "tcp://0.0.0.0:1"])),
-        ("sglang", json!(["--decoupled-spec-connect-endpoints", "tcp://x"])),
+        (
+            "sglang",
+            json!(["--decoupled-spec-bind", "tcp://0.0.0.0:1"]),
+        ),
+        (
+            "sglang",
+            json!(["--decoupled-spec-connect-endpoints", "tcp://x"]),
+        ),
         ("sglang", json!(["--engine-info", "29500"])),
         ("sglang", json!(["--decrypted-config", "/tmp/c"])),
-        ("sglang", json!(["--debug-tensor-dump-output-folder", "/tmp/d"])),
-        ("sglang", json!(["--remote-instance-weight-loader-seed-instance-ip", "10.0.0.1"])),
+        (
+            "sglang",
+            json!(["--debug-tensor-dump-output-folder", "/tmp/d"]),
+        ),
+        (
+            "sglang",
+            json!([
+                "--remote-instance-weight-loader-seed-instance-ip",
+                "10.0.0.1"
+            ]),
+        ),
         ("sglang", json!(["--model-loader-extra-config", "{}"])),
         ("vllm", json!(["--compilation-config", "{\"level\": 3}"])),
         ("vllm", json!(["--compilation-config.level", "3"])),

@@ -168,11 +168,15 @@ ValueError: invalid choice bogus-value SECRET'),
     assert_eq!(deployment["instances"][1]["latest_operation"]["id"], "o1");
     // A deployment with no operation shows none.
     writer
-        .execute_batch("DELETE FROM journal_entries; DELETE FROM lifecycle_runs; DELETE FROM operations;")
+        .execute_batch(
+            "DELETE FROM journal_entries; DELETE FROM lifecycle_runs; DELETE FROM operations;",
+        )
         .unwrap();
     let json = serde_json::to_value(store.snapshot().unwrap()).unwrap();
     assert!(json["deployments"][0].get("latest_operation").is_none());
-    assert!(json["deployments"][0]["instances"][0].get("latest_operation").is_none());
+    assert!(json["deployments"][0]["instances"][0]
+        .get("latest_operation")
+        .is_none());
 }
 
 /// ADR 0013 §7: compaction moves an instance that holds no runtime into a free
@@ -203,7 +207,11 @@ fn a_compacted_instance_does_not_inherit_the_history_of_its_index() {
     let snapshot = store.snapshot().unwrap();
     let moved = &snapshot.deployments[0].instances[1];
     assert_eq!(moved.observed_state, "stopped");
-    assert!(moved.latest_operation.is_none(), "{:?}", moved.latest_operation);
+    assert!(
+        moved.latest_operation.is_none(),
+        "{:?}",
+        moved.latest_operation
+    );
     // The same runs recorded against the instance's own incarnation do count.
     writer
         .execute_batch("UPDATE lifecycle_runs SET generation=7 WHERE operation_id='gone'; DELETE FROM lifecycle_runs WHERE operation_id='exit';")

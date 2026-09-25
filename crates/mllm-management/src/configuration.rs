@@ -339,7 +339,10 @@ pub struct SharedConfigurationSource {
     host: HostSource,
     principal: String,
 }
-enum HostSource { Embedded {document:Value,id:String}, Registry }
+enum HostSource {
+    Embedded { document: Value, id: String },
+    Registry,
+}
 impl SharedConfigurationSource {
     pub(crate) fn owned_state(&self) -> &Arc<Mutex<OwnedCoordinatorState>> {
         &self.state
@@ -363,13 +366,25 @@ impl SharedConfigurationSource {
             .to_owned();
         Ok(Self {
             state,
-            host:HostSource::Embedded {document:trusted_host,id:host_id},
+            host: HostSource::Embedded {
+                document: trusted_host,
+                id: host_id,
+            },
             principal: principal.into(),
         })
     }
-    pub fn from_registry(state:Arc<Mutex<OwnedCoordinatorState>>,principal:&str)->Result<Self,ConfigurationFailure> {
-        if !identifier(principal) {return Err(ConfigurationFailure::Internal);}
-        Ok(Self {state,host:HostSource::Registry,principal:principal.into()})
+    pub fn from_registry(
+        state: Arc<Mutex<OwnedCoordinatorState>>,
+        principal: &str,
+    ) -> Result<Self, ConfigurationFailure> {
+        if !identifier(principal) {
+            return Err(ConfigurationFailure::Internal);
+        }
+        Ok(Self {
+            state,
+            host: HostSource::Registry,
+            principal: principal.into(),
+        })
     }
 }
 impl SnapshotSource for SharedConfigurationSource {
@@ -396,7 +411,10 @@ impl ConfigurationSource for SharedConfigurationSource {
         &self,
         deployment: &str,
     ) -> Result<Option<Value>, ConfigurationFailure> {
-        let state = self.state.lock().map_err(|_| ConfigurationFailure::Internal)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConfigurationFailure::Internal)?;
         let Some(found) = state
             .store()
             .effective_configuration(deployment)
@@ -417,7 +435,10 @@ impl ConfigurationSource for SharedConfigurationSource {
         })))
     }
     fn referenced_model_sources(&self) -> Result<Vec<String>, ConfigurationFailure> {
-        let state = self.state.lock().map_err(|_| ConfigurationFailure::Internal)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConfigurationFailure::Internal)?;
         state
             .store()
             .referenced_model_sources()
@@ -425,8 +446,14 @@ impl ConfigurationSource for SharedConfigurationSource {
     }
     fn checkpoint_digest_state(&self, deployment_id: &str, revision: i64) -> Option<String> {
         let state = self.state.lock().ok()?;
-        let record = state.store().checkpoint_digest(deployment_id, revision).ok()??;
-        serde_json::to_value(record.state).ok()?.as_str().map(str::to_owned)
+        let record = state
+            .store()
+            .checkpoint_digest(deployment_id, revision)
+            .ok()??;
+        serde_json::to_value(record.state)
+            .ok()?
+            .as_str()
+            .map(str::to_owned)
     }
     fn accept(
         &self,
@@ -559,13 +586,14 @@ fn registry_targets(
     let mut refusals = Vec::new();
     let mut single = None;
     for selector in &allowed {
-        let refuse = |failure: ConfigurationFailure, reason: &str, refusals: &mut Vec<HostRefusal>| {
-            refusals.push(HostRefusal {
-                host_id: selector.clone(),
-                diagnostic: reason.into(),
-            });
-            failure
-        };
+        let refuse =
+            |failure: ConfigurationFailure, reason: &str, refusals: &mut Vec<HostRefusal>| {
+                refusals.push(HostRefusal {
+                    host_id: selector.clone(),
+                    diagnostic: reason.into(),
+                });
+                failure
+            };
         let Some(publication) = store
             .host_publication(selector)
             .map_err(|_| ConfigurationFailure::Internal)?
@@ -693,8 +721,8 @@ fn secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase().replace('-', "_");
     let words: Vec<&str> = name.split('_').filter(|w| !w.is_empty()).collect();
     words.iter().enumerate().any(|(index, word)| match *word {
-        "credential" | "credentials" | "secret" | "secrets" | "password" | "passwd"
-        | "token" | "apikey" => true,
+        "credential" | "credentials" | "secret" | "secrets" | "password" | "passwd" | "token"
+        | "apikey" => true,
         "key" => index > 0 && matches!(words[index - 1], "api" | "private" | "admin" | "access"),
         _ => false,
     })

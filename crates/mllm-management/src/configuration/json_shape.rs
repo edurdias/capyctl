@@ -1,7 +1,7 @@
 //! Validate duplicate keys recursively without constructing a second JSON tree.
 use serde::{
-    Deserialize, Deserializer,
     de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
 };
 use std::{collections::BTreeSet, fmt};
 

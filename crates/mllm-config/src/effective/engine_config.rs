@@ -565,11 +565,7 @@ pub(super) fn normalize_engine_config(
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
-    let declared_startup = raw_memory
-        .startup
-        .as_deref()
-        .map(parse_bytes)
-        .transpose()?;
+    let declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
     let (startup, startup_source) = resolve_startup(
         declared_startup,
         &memory,

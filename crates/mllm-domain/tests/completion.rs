@@ -209,5 +209,8 @@ fn missing_process_start_identity_cannot_complete() {
     let (mut expected, mut evidence) = fixture();
     expected.identities[1].start_ticks = 0;
     evidence.identities[1].start_ticks = 0;
-    assert_eq!(verify_completion(&expected, &evidence, 151, 60), Err(CompletionError::RuntimeChanged));
+    assert_eq!(
+        verify_completion(&expected, &evidence, 151, 60),
+        Err(CompletionError::RuntimeChanged)
+    );
 }

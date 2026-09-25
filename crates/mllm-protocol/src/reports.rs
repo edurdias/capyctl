@@ -91,9 +91,13 @@ impl SampleLatency {
             if host_series_source(&h.series).is_none() || !seen.insert(h.series.clone()) {
                 return Err(GroupIdentityError);
             }
-            let histogram =
-                mllm_domain::latency::Histogram::from_parts(h.bounds, h.counts, h.sum_seconds, h.count)
-                    .map_err(|_| GroupIdentityError)?;
+            let histogram = mllm_domain::latency::Histogram::from_parts(
+                h.bounds,
+                h.counts,
+                h.sum_seconds,
+                h.count,
+            )
+            .map_err(|_| GroupIdentityError)?;
             // Only observations travel: an empty delta is never sent.
             if histogram.is_empty() {
                 return Err(GroupIdentityError);

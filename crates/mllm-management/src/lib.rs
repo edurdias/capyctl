@@ -21,8 +21,8 @@ pub mod actions;
 pub mod configuration;
 mod credentials;
 pub mod drain;
-pub mod events;
 pub mod enrollment;
+pub mod events;
 pub mod hosts;
 // ADR 0008: the standalone role's embedded installation.
 pub mod installation;

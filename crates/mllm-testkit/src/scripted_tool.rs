@@ -6,8 +6,8 @@
 //! the suite happens to run on, so the tool answers from a script instead and
 //! signals nothing. A real engine is qualified on the host, never here.
 
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use mllm_adapters::traits::{OwnedProcessLaunch, RenderedCommand, RuntimeError};
@@ -59,9 +59,7 @@ impl ScriptedTool {
 
     /// Tools that signal and then cannot prove the group gone.
     pub fn unprovable() -> Arc<Self> {
-        Self::starts_nothing(Some(
-            "a recorded process could not be proven gone".into(),
-        ))
+        Self::starts_nothing(Some("a recorded process could not be proven gone".into()))
     }
 
     fn starts_nothing(refusal: Option<String>) -> Arc<Self> {

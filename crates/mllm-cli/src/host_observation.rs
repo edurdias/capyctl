@@ -34,9 +34,8 @@ pub struct HostMemoryObservation {
 /// production. A test states an explicit capacity instead, so its fixtures
 /// and the standalone policy derived from them do not depend on how much
 /// memory the machine running the suite happens to have free.
-pub type MemoryReader = Arc<
-    dyn Fn() -> Result<mllm_domain::resources::MemoryObservation, String> + Send + Sync,
->;
+pub type MemoryReader =
+    Arc<dyn Fn() -> Result<mllm_domain::resources::MemoryObservation, String> + Send + Sync>;
 
 /// The production reader: the agent's `/proc/meminfo` parser.
 pub fn proc_meminfo() -> MemoryReader {
@@ -102,7 +101,9 @@ impl ServiceObservation for HostMemoryObservation {
         Box::pin(async move {
             // Availability first, then the processes still alive (ADR 0007).
             let observed = observed.await?;
-            let residents = residency.map(|sampler| sampler.current()).unwrap_or_default();
+            let residents = residency
+                .map(|sampler| sampler.current())
+                .unwrap_or_default();
             Ok((observed, residents))
         })
     }

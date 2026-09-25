@@ -43,8 +43,11 @@ pub const VLLM_SLEEP_RUNTIME_FILES: &[&str] =
 
 /// The modules an SGLang launch requires in the runtime directory. Every other
 /// `*.py` there (the remaining `sglang_*.py` helpers) is checked as well.
-pub const SGLANG_RUNTIME_FILES: &[&str] =
-    &["sglang_entry.py", "pinned_file_observation.py", CAPABILITY_PROBE];
+pub const SGLANG_RUNTIME_FILES: &[&str] = &[
+    "sglang_entry.py",
+    "pinned_file_observation.py",
+    CAPABILITY_PROBE,
+];
 
 /// The files one engine requires. `sleep_mode` is whether a vLLM launch renders
 /// sleep mode (deep parking); an SGLang launch always needs its probes.
@@ -244,8 +247,8 @@ mod tests {
 
         let sglang = runtime(&["sglang_entry.py", "pinned_file_observation.py"]);
         for sleep_mode in [false, true] {
-            let error = verify(sglang.path(), required_files(Engine::Sglang, sleep_mode))
-                .unwrap_err();
+            let error =
+                verify(sglang.path(), required_files(Engine::Sglang, sleep_mode)).unwrap_err();
             assert_eq!(error.path, sglang.path().join(CAPABILITY_PROBE));
         }
         std::fs::write(sglang.path().join(CAPABILITY_PROBE), "# probes\n").unwrap();
@@ -394,7 +397,10 @@ mod tests {
             std::fs::write(&path, "x").unwrap();
             let error = verify(dir.path(), VLLM_RUNTIME_FILES).unwrap_err();
             assert_eq!(error.path, path, "{foreign}");
-            assert_eq!(error.problem, "compiled or foreign importable file", "{foreign}");
+            assert_eq!(
+                error.problem, "compiled or foreign importable file",
+                "{foreign}"
+            );
         }
         // An empty cache directory and plain documents are no import surface.
         let dir = runtime(&["mllm_vllm_guard.py", "vllm_entry.py", "README.md"]);
@@ -425,7 +431,10 @@ mod tests {
         );
         chmod(&sub.join("helper.py"), 0o644);
         chmod(&sub, 0o777);
-        assert_eq!(verify(dir.path(), VLLM_RUNTIME_FILES).unwrap_err().path, sub);
+        assert_eq!(
+            verify(dir.path(), VLLM_RUNTIME_FILES).unwrap_err().path,
+            sub
+        );
         chmod(&sub, 0o755);
         let outside = runtime(&["other.py"]);
         std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();

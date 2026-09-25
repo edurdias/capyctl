@@ -24,13 +24,22 @@ pub struct HostVersion {
     pub recorded_at_ms: i64,
 }
 
-const STATES: &[&str] = &["supported", "upgrade_recommended", "upgrade_required", "refused"];
+const STATES: &[&str] = &[
+    "supported",
+    "upgrade_recommended",
+    "upgrade_required",
+    "refused",
+];
 
 impl Store {
     /// Record `host`'s latest declaration. The version and reason are the
     /// server's bounded, printable renderings; an unenrolled or revoked host
     /// records nothing (`Conflict`).
-    pub fn record_host_version(&self, host_id: &str, version: &HostVersion) -> Result<(), StoreError> {
+    pub fn record_host_version(
+        &self,
+        host_id: &str,
+        version: &HostVersion,
+    ) -> Result<(), StoreError> {
         let printable = |text: &str, bound: usize| {
             text.len() <= bound && text.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
         };
@@ -83,16 +92,18 @@ impl Store {
                 },
             )
             .optional()?;
-        row.map(|(binary_version, compatibility, reason, capabilities, recorded_at_ms)| {
-            Ok(HostVersion {
-                binary_version,
-                compatibility,
-                reason,
-                capabilities: serde_json::from_str(&capabilities)
-                    .map_err(|_| StoreError::Conflict)?,
-                recorded_at_ms,
-            })
-        })
+        row.map(
+            |(binary_version, compatibility, reason, capabilities, recorded_at_ms)| {
+                Ok(HostVersion {
+                    binary_version,
+                    compatibility,
+                    reason,
+                    capabilities: serde_json::from_str(&capabilities)
+                        .map_err(|_| StoreError::Conflict)?,
+                    recorded_at_ms,
+                })
+            },
+        )
         .transpose()
     }
 }
@@ -124,15 +135,21 @@ mod tests {
             )
             .unwrap();
         assert!(store.host_version("a").unwrap().is_none());
-        store.record_host_version("a", &version("supported")).unwrap();
+        store
+            .record_host_version("a", &version("supported"))
+            .unwrap();
         let mut older = version("upgrade_required");
         older.binary_version = String::new();
         older.reason = "the host reports no version; it is drain-only".into();
         older.capabilities.clear();
         store.record_host_version("a", &older).unwrap();
         assert_eq!(store.host_version("a").unwrap(), Some(older));
-        assert!(store.record_host_version("missing", &version("supported")).is_err());
-        assert!(store.record_host_version("r", &version("supported")).is_err());
+        assert!(store
+            .record_host_version("missing", &version("supported"))
+            .is_err());
+        assert!(store
+            .record_host_version("r", &version("supported"))
+            .is_err());
         assert!(store.record_host_version("a", &version("maybe")).is_err());
         let mut unprintable = version("refused");
         unprintable.reason = "line\nbreak".into();

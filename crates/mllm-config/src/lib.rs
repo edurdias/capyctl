@@ -8,9 +8,9 @@ pub mod error;
 pub mod instances;
 // ADR 0008: declared model sources and the host's model-source policy.
 pub mod model_source;
-pub mod resource_controls;
-pub mod remote_roles;
 pub mod remote_resources;
+pub mod remote_roles;
+pub mod resource_controls;
 pub mod schema;
 // SPEC §15.3: standalone values the role does not honour are refused.
 pub mod standalone;

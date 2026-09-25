@@ -58,26 +58,52 @@ fn now() -> i64 {
 }
 impl EnrollmentAuthority {
     /// Called only after AgentControl binds this report to its verified peer.
-    pub fn publish_inventory(&self,host:&str,inventory:&mllm_protocol::pb::ReportInventory)->Result<(),EnrollmentError> {
-        crate::host_publication::publish(&self.state,host,inventory).map_err(|_|EnrollmentError)
+    pub fn publish_inventory(
+        &self,
+        host: &str,
+        inventory: &mllm_protocol::pb::ReportInventory,
+    ) -> Result<(), EnrollmentError> {
+        crate::host_publication::publish(&self.state, host, inventory).map_err(|_| EnrollmentError)
     }
     /// ADR 0008 (owner decision 2026-09-23): journal an installation drift the
     /// host newly reported in its status.
-    pub fn record_installation_drift(&self, host: &str, installation: &str, registered: &str, observed: &str) -> Result<(), EnrollmentError> {
-        self.state.lock().map_err(|_| EnrollmentError)?
-            .store().record_installation_drift(host, installation, registered, observed)
+    pub fn record_installation_drift(
+        &self,
+        host: &str,
+        installation: &str,
+        registered: &str,
+        observed: &str,
+    ) -> Result<(), EnrollmentError> {
+        self.state
+            .lock()
+            .map_err(|_| EnrollmentError)?
+            .store()
+            .record_installation_drift(host, installation, registered, observed)
             .map_err(|_| EnrollmentError)
     }
     /// ADR 0017: record the version, capabilities and skew verdict a host
     /// declared on its control session. Status evidence only.
-    pub fn record_host_version(&self, host: &str, version: &mllm_store::host_versions::HostVersion) -> Result<(), EnrollmentError> {
-        self.state.lock().map_err(|_| EnrollmentError)?
-            .store().record_host_version(host, version)
+    pub fn record_host_version(
+        &self,
+        host: &str,
+        version: &mllm_store::host_versions::HostVersion,
+    ) -> Result<(), EnrollmentError> {
+        self.state
+            .lock()
+            .map_err(|_| EnrollmentError)?
+            .store()
+            .record_host_version(host, version)
             .map_err(|_| EnrollmentError)
     }
     /// ADR 0017: the latest declaration the store recorded for `host`.
     pub fn host_version(&self, host: &str) -> Option<mllm_store::host_versions::HostVersion> {
-        self.state.lock().ok()?.store().host_version(host).ok().flatten()
+        self.state
+            .lock()
+            .ok()?
+            .store()
+            .host_version(host)
+            .ok()
+            .flatten()
     }
     /// Owner decision 4 (2026-09-22): the enrolled hosts whose drain still has
     /// an unsettled Stop. `None` when the store cannot be read; callers fail
@@ -197,23 +223,32 @@ impl EnrollmentAuthority {
     /// request leases stay, and its engines count as unverified until an
     /// operator stops or drains them with evidence. Idempotent: a retry of a
     /// revoked host answers the same identity with `newly_revoked: false`.
-    pub fn revoke(&self, host: &str) -> Result<mllm_store::enrollment::Revocation, EnrollmentRefusal> {
+    pub fn revoke(
+        &self,
+        host: &str,
+    ) -> Result<mllm_store::enrollment::Revocation, EnrollmentRefusal> {
         if !mllm_store::enrollment::valid_name(host) {
             return Err(EnrollmentRefusal::Invalid);
         }
         let revocation = {
             let owner = self.state.lock().map_err(|_| EnrollmentRefusal::Internal)?;
-            let revocation = owner.store().revoke_host(host).map_err(|error| match error {
-                // A well-formed name that names no enrolled host.
-                StoreError::Conflict => EnrollmentRefusal::NotFound,
-                _ => EnrollmentRefusal::Internal,
-            })?;
+            let revocation = owner
+                .store()
+                .revoke_host(host)
+                .map_err(|error| match error {
+                    // A well-formed name that names no enrolled host.
+                    StoreError::Conflict => EnrollmentRefusal::NotFound,
+                    _ => EnrollmentRefusal::Internal,
+                })?;
             // SPEC §13.3: revocation prevents new work. Close dispatch to the
             // host's Ready engines in the same critical section; nothing is
             // released. A store that cannot list them leaves the readiness
             // supervisor to close them when the session ends.
             if let Ok(launches) = owner.store().remote_ready_launches(owner.session()) {
-                for launch in launches.iter().filter(|launch| launch.host_id == revocation.host_id) {
+                for launch in launches
+                    .iter()
+                    .filter(|launch| launch.host_id == revocation.host_id)
+                {
                     let _ = owner
                         .store()
                         .suspend_remote_dispatch(owner.session(), &launch.step_id);

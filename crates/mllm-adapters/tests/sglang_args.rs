@@ -153,7 +153,10 @@ fn wrapper_rejects_relative_symlink_nonregular_and_untrusted_writes() {
     let undetermined = |_: u32, _: u32| None;
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o620)).unwrap();
     SglangLaunch::validate_wrapper_path_with(&file, &private).unwrap();
-    for lookup in [&shared as &mllm_adapters::owner_only::PrivateGroup, &undetermined] {
+    for lookup in [
+        &shared as &mllm_adapters::owner_only::PrivateGroup,
+        &undetermined,
+    ] {
         assert!(matches!(
             SglangLaunch::validate_wrapper_path_with(&file, lookup),
             Err(RuntimeError::Unsupported)

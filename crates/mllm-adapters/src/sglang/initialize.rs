@@ -97,10 +97,8 @@ pub(super) async fn initialize(
     // tools or its credentials cannot launch anything, and must not half-run
     // the step.
     let (launch, tools, inference, admin) = adapter.launch_parts()?;
-    if !matches!(
-        context.launch_settings,
-        Some(LaunchSettings::Sglang(_))
-    ) || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
+    if !matches!(context.launch_settings, Some(LaunchSettings::Sglang(_)))
+        || !matches!(context.identities, ExecutionIdentities::OwnedLaunch)
     {
         return Err(RuntimeError::Unsupported);
     }
@@ -133,11 +131,16 @@ pub(super) async fn initialize(
     // SPEC §13.3: tools come from the selected installation and fixed system
     // directories, never the caller's shell PATH. FlashInfer needs venv ninja.
     let engine_bin = std::path::Path::new(launch.frozen.executable())
-        .parent().ok_or(RuntimeError::Unsupported)?;
+        .parent()
+        .ok_or(RuntimeError::Unsupported)?;
     let tool_path = std::env::join_paths([
-        engine_bin, std::path::Path::new("/usr/bin"), std::path::Path::new("/bin"),
-    ]).map_err(|_| RuntimeError::Unsupported)?
-        .into_string().map_err(|_| RuntimeError::Unsupported)?;
+        engine_bin,
+        std::path::Path::new("/usr/bin"),
+        std::path::Path::new("/bin"),
+    ])
+    .map_err(|_| RuntimeError::Unsupported)?
+    .into_string()
+    .map_err(|_| RuntimeError::Unsupported)?;
     cmd.env.insert("PATH".into(), tool_path);
     // SPEC §9.1 / T21: neither the entry nor any engine child writes bytecode
     // beside mllm's checked runtime source.
@@ -244,8 +247,11 @@ pub(super) async fn initialize(
                 let summary = crate::launch_failure::summary(&tail, None);
                 return Err(RuntimeError::LaunchFailed(format!(
                     "{summary}; log tail:\n{}",
-                    if debug_logs { "full native log retained privately; omitted from public diagnostics".into() }
-                    else { tail }
+                    if debug_logs {
+                        "full native log retained privately; omitted from public diagnostics".into()
+                    } else {
+                        tail
+                    }
                 )));
             }
             // Unknown is retained, never absent: the step fails but says why.

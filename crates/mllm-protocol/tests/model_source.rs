@@ -82,7 +82,10 @@ fn materialize_source_round_trips_and_names_remote_sources_only() {
     let MemberAction::MaterializeSource(plan) = &command.action else {
         panic!("{:?}", command.action);
     };
-    assert_eq!(plan.source_key, format!("sources/huggingface/Qwen--Qwen3-4B@{SHA}"));
+    assert_eq!(
+        plan.source_key,
+        format!("sources/huggingface/Qwen--Qwen3-4B@{SHA}")
+    );
     assert!(plan.source().unwrap().is_remote());
     let again = MemberCommand::try_from(pb::ServerToAgent {
         msg: Some(pb::server_to_agent::Msg::ExecuteMember(command.to_wire())),
@@ -128,7 +131,8 @@ fn source_evidence_is_bound_to_its_plan() {
         evidence("failed", 0, 0, "hash_mismatch", false),
         evidence("failed", 0, 0, "network", true),
     ] {
-        validate_result(&command, &result(&command, ok.clone())).unwrap_or_else(|_| panic!("{ok:?}"));
+        validate_result(&command, &result(&command, ok.clone()))
+            .unwrap_or_else(|_| panic!("{ok:?}"));
     }
     let mut other_key = evidence("verified", 1, 1, "", false);
     other_key.source_key = "sources/http/x".into();
@@ -141,7 +145,10 @@ fn source_evidence_is_bound_to_its_plan() {
         evidence("done", 0, 0, "", false),
         other_key,
     ] {
-        assert!(validate_result(&command, &result(&command, bad.clone())).is_err(), "{bad:?}");
+        assert!(
+            validate_result(&command, &result(&command, bad.clone())).is_err(),
+            "{bad:?}"
+        );
     }
     // No evidence, or evidence on another action, is refused.
     let mut empty = result(&command, evidence("pending", 0, 0, "", false));

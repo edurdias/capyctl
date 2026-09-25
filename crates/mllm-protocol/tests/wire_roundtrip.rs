@@ -1,6 +1,8 @@
 use mllm_protocol::pb::agent_control_client::AgentControlClient;
 use mllm_protocol::pb::agent_control_server::{AgentControl, AgentControlServer};
-use mllm_protocol::pb::{agent_to_server, server_to_agent, AgentToServer, Connect, Envelope, LaunchMember, ServerToAgent};
+use mllm_protocol::pb::{
+    agent_to_server, server_to_agent, AgentToServer, Connect, Envelope, LaunchMember, ServerToAgent,
+};
 use mllm_protocol::{deadline_ok, now_unix_ms, PROTOCOL_VERSION, SKEW_TOLERANCE_MS};
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
@@ -152,26 +154,54 @@ fn heartbeat_fields_are_additive_and_default_off() {
         #[prost(string, tag = "2")]
         session_id: String,
     }
-    let old = OldConnect { host_id: "h".into(), protocol_version: PROTOCOL_VERSION.into() };
+    let old = OldConnect {
+        host_id: "h".into(),
+        protocol_version: PROTOCOL_VERSION.into(),
+    };
     let decoded = Connect::decode(old.encode_to_vec().as_slice()).unwrap();
     assert!(!decoded.heartbeats);
-    let old = OldReady { controller_id: "c".into(), session_id: "s".into() };
+    let old = OldReady {
+        controller_id: "c".into(),
+        session_id: "s".into(),
+    };
     let decoded = SessionReady::decode(old.encode_to_vec().as_slice()).unwrap();
-    assert_eq!((decoded.heartbeat_interval_ms, decoded.heartbeat_lost_after_ms), (0, 0));
-    let beat = Heartbeat { sent_at_unix_ms: 42 };
+    assert_eq!(
+        (
+            decoded.heartbeat_interval_ms,
+            decoded.heartbeat_lost_after_ms
+        ),
+        (0, 0)
+    );
+    let beat = Heartbeat {
+        sent_at_unix_ms: 42,
+    };
     for frame in [
-        AgentToServer { msg: Some(agent_to_server::Msg::Heartbeat(beat)) }.encode_to_vec(),
-        ServerToAgent { msg: Some(server_to_agent::Msg::Heartbeat(beat)) }.encode_to_vec(),
+        AgentToServer {
+            msg: Some(agent_to_server::Msg::Heartbeat(beat)),
+        }
+        .encode_to_vec(),
+        ServerToAgent {
+            msg: Some(server_to_agent::Msg::Heartbeat(beat)),
+        }
+        .encode_to_vec(),
     ] {
         assert!(!frame.is_empty());
     }
     let up = AgentToServer::decode(
-        AgentToServer { msg: Some(agent_to_server::Msg::Heartbeat(beat)) }.encode_to_vec().as_slice(),
+        AgentToServer {
+            msg: Some(agent_to_server::Msg::Heartbeat(beat)),
+        }
+        .encode_to_vec()
+        .as_slice(),
     )
     .unwrap();
     assert_eq!(up.msg, Some(agent_to_server::Msg::Heartbeat(beat)));
     let down = ServerToAgent::decode(
-        ServerToAgent { msg: Some(server_to_agent::Msg::Heartbeat(beat)) }.encode_to_vec().as_slice(),
+        ServerToAgent {
+            msg: Some(server_to_agent::Msg::Heartbeat(beat)),
+        }
+        .encode_to_vec()
+        .as_slice(),
     )
     .unwrap();
     assert_eq!(down.msg, Some(server_to_agent::Msg::Heartbeat(beat)));

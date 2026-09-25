@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use futures::StreamExt;
+use mllm_domain::latency::Histogram;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
@@ -18,7 +19,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use mllm_domain::latency::Histogram;
 use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -193,7 +193,11 @@ impl Ingress {
         }
         let key = key(&scope);
         let mut registry = self.registry.lock().map_err(|_| IngressError)?;
-        if registry.entries.values().any(|entry| entry.scope.host_id != scope.host_id) {
+        if registry
+            .entries
+            .values()
+            .any(|entry| entry.scope.host_id != scope.host_id)
+        {
             return Err(IngressError);
         }
         if let Some(old) = registry.entries.get(&key) {
@@ -250,18 +254,21 @@ impl Ingress {
             .ok_or(IngressError)
     }
     pub fn open(&self, scope: &IngressScope) -> Result<(), IngressError> {
-        self.set_open(scope,true)
+        self.set_open(scope, true)
     }
     pub fn close(&self, scope: &IngressScope) -> Result<(), IngressError> {
-        self.set_open(scope,false)
+        self.set_open(scope, false)
     }
-    fn set_open(&self,scope:&IngressScope,open:bool)->Result<(),IngressError> {
+    fn set_open(&self, scope: &IngressScope, open: bool) -> Result<(), IngressError> {
         // Registration and gate changes share the same lock: an old open call
         // cannot reopen a retired entry after a new generation replaces it.
-        let registry=self.registry.lock().map_err(|_|IngressError)?;
-        let entry=registry.entries.get(&key(scope))
-            .filter(|entry|entry.scope==*scope).ok_or(IngressError)?;
-        entry.open.store(open,Ordering::SeqCst);
+        let registry = self.registry.lock().map_err(|_| IngressError)?;
+        let entry = registry
+            .entries
+            .get(&key(scope))
+            .filter(|entry| entry.scope == *scope)
+            .ok_or(IngressError)?;
+        entry.open.store(open, Ordering::SeqCst);
         Ok(())
     }
     /// SPEC §§6, 13.3: a launch whose owned processes are proven gone has no
@@ -289,12 +296,18 @@ impl Ingress {
     /// claiming native quiescence or releasing any in-flight accounting.
     pub fn close_all(&self) -> Result<(), IngressError> {
         let registry = self.registry.lock().map_err(|_| IngressError)?;
-        for entry in registry.entries.values() { entry.open.store(false, Ordering::SeqCst); }
+        for entry in registry.entries.values() {
+            entry.open.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
     /// Bind the owned handle (launch command id) of the launch behind this
     /// exact scope. Load samples are reported only for bound, open entries.
-    pub fn bind_handle(&self, scope: &IngressScope, owned_handle: &str) -> Result<(), IngressError> {
+    pub fn bind_handle(
+        &self,
+        scope: &IngressScope,
+        owned_handle: &str,
+    ) -> Result<(), IngressError> {
         if owned_handle.trim().is_empty() || owned_handle.len() > 4096 {
             return Err(IngressError);
         }
@@ -328,7 +341,10 @@ impl Ingress {
     /// since the last call, as `(series, histogram)` deltas with at least one
     /// observation each. Series names are from
     /// `mllm_protocol::reports::HOST_LATENCY_SERIES`.
-    pub fn drain_latency(&self, scope: &IngressScope) -> Result<Vec<(String, Histogram)>, IngressError> {
+    pub fn drain_latency(
+        &self,
+        scope: &IngressScope,
+    ) -> Result<Vec<(String, Histogram)>, IngressError> {
         let entry = self.entry(scope)?;
         let taken = std::mem::take(&mut *entry.timings.lock().map_err(|_| IngressError)?);
         Ok([
@@ -401,7 +417,10 @@ fn failure(status: StatusCode) -> Response {
 async fn engine_rejection(response: reqwest::Response) -> Response {
     let status = response.status();
     let limit = mllm_adapters::forward::REJECTION_BODY_LIMIT;
-    if response.content_length().is_some_and(|length| length > limit as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
         return failure(StatusCode::BAD_GATEWAY);
     }
     let mut body = Vec::new();
@@ -504,7 +523,9 @@ async fn forward(State(ingress): State<Arc<Ingress>>, request: Request) -> Respo
         // invalid. Its answer is complete and nothing runs for it, so it is
         // relayed as `engine_rejected` with the engine's bounded message; a 502
         // would leave the router unable to tell it from an unverified failure.
-        Ok(Ok(response)) if mllm_adapters::forward::rejection_status(response.status().as_u16()) => {
+        Ok(Ok(response))
+            if mllm_adapters::forward::rejection_status(response.status().as_u16()) =>
+        {
             return engine_rejection(response).await;
         }
         _ => return failure(StatusCode::BAD_GATEWAY),

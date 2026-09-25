@@ -248,7 +248,10 @@ async fn standalone_status_and_inspect_show_the_installation() {
     .unwrap_or_else(|failure| panic!("{}: {}", failure.code, failure.message));
     assert_eq!(view["effective"]["name"], "shown", "{view}");
     assert_eq!(view["revision"], 1, "{view}");
-    assert!(view["effective"]["engine_config"]["provenance"].is_object(), "{view}");
+    assert!(
+        view["effective"]["engine_config"]["provenance"].is_object(),
+        "{view}"
+    );
     assert!(!view.to_string().contains("secret://"), "{view}");
     server.abort();
 }

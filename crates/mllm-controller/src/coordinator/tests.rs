@@ -1923,7 +1923,11 @@ async fn an_operator_stop_of_a_given_up_deployment_holding_a_runtime_cleans_it_u
         )
         .unwrap()
     };
-    assert_eq!(held(), 1, "the given-up start still holds its binding and lease");
+    assert_eq!(
+        held(),
+        1,
+        "the given-up start still holds its binding and lease"
+    );
     let stop = w
         .commands()
         .administrative_stop("owner", &fence.deployment_id, fence.revision, "stop", 10000)
@@ -1935,7 +1939,10 @@ async fn an_operator_stop_of_a_given_up_deployment_holding_a_runtime_cleans_it_u
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(kind, "ordinary_unarmed_stop", "held work is the ordinary Stop's");
+    assert_eq!(
+        kind, "ordinary_unarmed_stop",
+        "held work is the ordinary Stop's"
+    );
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let done: bool = sql
@@ -1958,7 +1965,11 @@ async fn an_operator_stop_of_a_given_up_deployment_holding_a_runtime_cleans_it_u
         assert!(o.store().resource_snapshot().unwrap().owners.is_empty());
         assert!(o.store().is_admin_stopped(&fence.deployment_id).unwrap());
     }
-    assert_eq!(held(), 0, "the completed Stop released the binding and lease");
+    assert_eq!(
+        held(),
+        0,
+        "the completed Stop released the binding and lease"
+    );
     drop(start);
     w.shutdown().await.unwrap();
 }
@@ -2545,7 +2556,9 @@ mod native {
         // SPEC §17: the Stop is journaled with what it found.
         let journal = journal(&owner, stop.operation_id());
         assert!(
-            journal.iter().any(|entry| entry.contains("\"held\":\"nothing\"")),
+            journal
+                .iter()
+                .any(|entry| entry.contains("\"held\":\"nothing\"")),
             "{journal:?}"
         );
         // T09: an exact retry returns the original receipt; the same key with
@@ -2716,7 +2729,11 @@ mod native {
             Some(("administrative_stop_deferred".into(), "pending".into()))
         );
         assert!(owner.lock().unwrap().store().is_admin_stopped(&id).unwrap());
-        assert_eq!(held_bindings(&dir, &id), 1, "nothing released while launching");
+        assert_eq!(
+            held_bindings(&dir, &id),
+            1,
+            "nothing released while launching"
+        );
         // T09: an exact retry answers the same receipt.
         let replay = w
             .commands()
@@ -2737,7 +2754,9 @@ mod native {
         until_operation(&owner, stop.operation_id(), "succeeded").await;
         let cleanup = follow_up(&owner, stop.operation_id());
         assert_eq!(
-            operation_kind(&owner, &cleanup).map(|(kind, _)| kind).as_deref(),
+            operation_kind(&owner, &cleanup)
+                .map(|(kind, _)| kind)
+                .as_deref(),
             Some("ordinary_cleanup")
         );
         until_operation(&owner, &cleanup, "succeeded").await;
@@ -2825,14 +2844,21 @@ mod native {
             operation_kind(&owner, &recorded),
             Some(("administrative_stop_recorded".into(), "succeeded".into()))
         );
-        assert_eq!(tools.terminations().len(), 1, "the failed launch was proven gone");
+        assert_eq!(
+            tools.terminations().len(),
+            1,
+            "the failed launch was proven gone"
+        );
         assert_eq!(
             deployment_states(&owner, &id),
             ("stopped".into(), "stopped".into())
         );
         // The recorded Stop fenced the instance: an observer of the failed
         // start reads it superseded, never corrupt.
-        assert_eq!(status(&owner, start.step_id()), InitializeStatus::Superseded);
+        assert_eq!(
+            status(&owner, start.step_id()),
+            InitializeStatus::Superseded
+        );
         drop(start);
         w.shutdown().await.unwrap();
     }
@@ -2867,7 +2893,11 @@ mod native {
             InitializeStatus::Completed
         );
         until_operation(&owner, stop.operation_id(), "failed").await;
-        assert_eq!(held_bindings(&dir, &id), 1, "the started runtime keeps running");
+        assert_eq!(
+            held_bindings(&dir, &id),
+            1,
+            "the started runtime keeps running"
+        );
         assert_eq!(deployment_states(&owner, &id).1, "ready");
         drop(start);
         w.shutdown().await.unwrap();
@@ -3466,8 +3496,8 @@ mod native {
         };
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-            .expect("the leased endpoint is free");
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("the leased endpoint is free");
         tokio::spawn(stub_engine(
             listener,
             // The golden fixture's first route: the served name is the
@@ -3783,7 +3813,10 @@ async fn an_adopted_vllm_launch_uses_only_the_keys_it_launched_with() {
     // A launch recorded before the admin role existed: one key, the single-key
     // guard, and nothing new sealed by adoption.
     seal(&inference, SecretRole::Inference);
-    assert!(factory(&work).is_ok(), "a single-key launch is still adopted");
+    assert!(
+        factory(&work).is_ok(),
+        "a single-key launch is still adopted"
+    );
     assert_eq!(
         bindings.seen.lock().unwrap().pop().unwrap(),
         (Some(hex::encode(inference)), None),

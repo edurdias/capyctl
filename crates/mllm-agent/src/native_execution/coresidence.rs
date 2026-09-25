@@ -310,7 +310,10 @@ mod tests {
         assert_eq!(woken.bytes, 256 * MIB);
         let other = [charge(&shared, ClaimPhase::Ready, "unified", Some(30000))];
         // Ready alone would fit (128 + 128); the wake peak does not.
-        assert_eq!(fits(&woken, &other, &limit(256 * MIB)), Err("insufficient_memory"));
+        assert_eq!(
+            fits(&woken, &other, &limit(256 * MIB)),
+            Err("insufficient_memory")
+        );
         assert_eq!(fits(&woken, &other, &limit(384 * MIB)), Ok(()));
         let mut settled = recipe(Sharing::Shared);
         settled.wake = footprint(64 * MIB, Sharing::Shared);

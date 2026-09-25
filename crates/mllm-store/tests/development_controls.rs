@@ -226,7 +226,10 @@ fn host_profiles_are_marked_from_the_published_document() {
 fn sglang_marks_its_unauthenticated_loopback_metrics() {
     use mllm_store::development_controls::UNAUTHENTICATED_LOCAL_SURFACES;
     let expected = json!({"surface": ["/metrics"], "listener": "loopback", "access": "read_only"});
-    assert_eq!(serde_json::to_value(UNAUTHENTICATED_LOCAL_SURFACES).unwrap(), expected);
+    assert_eq!(
+        serde_json::to_value(UNAUTHENTICATED_LOCAL_SURFACES).unwrap(),
+        expected
+    );
 
     let effective = effective(None, "deep");
     let mut stored = serde_json::to_value(&effective).unwrap();
@@ -242,11 +245,18 @@ fn sglang_marks_its_unauthenticated_loopback_metrics() {
 
     // vLLM keys every route, `/metrics` included: no such mark, exposed or not.
     let vllm = serde_json::to_value(for_effective(&effective)).unwrap();
-    assert!(vllm.get("unauthenticated_local_surfaces").is_none(), "{vllm}");
+    assert!(
+        vllm.get("unauthenticated_local_surfaces").is_none(),
+        "{vllm}"
+    );
     let (_, golden_host) = golden();
-    let profile = serde_json::to_value(for_host_profile(&golden_host["runtime_profiles"]["local"])).unwrap();
+    let profile =
+        serde_json::to_value(for_host_profile(&golden_host["runtime_profiles"]["local"])).unwrap();
     assert!(profile.get("unauthenticated_local_surfaces").is_none());
     // Nothing is claimed when the engine cannot be derived.
     let unknown = snapshot_controls(Some("{}"));
-    assert!(unknown.get("unauthenticated_local_surfaces").is_none(), "{unknown}");
+    assert!(
+        unknown.get("unauthenticated_local_surfaces").is_none(),
+        "{unknown}"
+    );
 }

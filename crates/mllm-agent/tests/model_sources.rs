@@ -77,9 +77,10 @@ fn serve(hub: &Shared, key: &str, payload: Payload, headers: &HeaderMap) -> Resp
     let body_bytes = payload.bytes[start..].to_vec();
     let mut builder = Response::builder();
     if start > 0 {
-        builder = builder
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header("content-range", format!("bytes {start}-{}/{total}", total - 1));
+        builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
+            "content-range",
+            format!("bytes {start}-{}/{total}", total - 1),
+        );
     }
     let cut = if start == 0 {
         let mut hub = hub.lock().unwrap();
@@ -105,19 +106,22 @@ fn async_stream(
     let limit = cut.unwrap_or(bytes.len());
     let chunks: Vec<Vec<u8>> = bytes[..limit].chunks(4096).map(<[u8]>::to_vec).collect();
     let fail = cut.is_some();
-    futures::stream::unfold((chunks.into_iter(), fail), move |(mut chunks, fail)| async move {
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
-        match chunks.next() {
-            Some(chunk) => Some((Ok(chunk), (chunks, fail))),
-            None if fail => Some((
-                Err(std::io::Error::other("connection cut")),
-                (chunks, false),
-            )),
-            None => None,
-        }
-    })
+    futures::stream::unfold(
+        (chunks.into_iter(), fail),
+        move |(mut chunks, fail)| async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            match chunks.next() {
+                Some(chunk) => Some((Ok(chunk), (chunks, fail))),
+                None if fail => Some((
+                    Err(std::io::Error::other("connection cut")),
+                    (chunks, false),
+                )),
+                None => None,
+            }
+        },
+    )
 }
 
 async fn handle(hub: Shared, request: Request<Body>) -> Response<Body> {
@@ -131,7 +135,10 @@ async fn handle(hub: Shared, request: Request<Body>) -> Response<Body> {
         let mut locked = hub.lock().unwrap();
         locked.log.push((
             path.clone(),
-            headers.get("range").and_then(|v| v.to_str().ok()).map(str::to_owned),
+            headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
             auth.clone(),
         ));
     }
@@ -144,9 +151,16 @@ async fn handle(hub: Shared, request: Request<Body>) -> Response<Body> {
     }
     let (require_token, repos, tamper) = {
         let locked = hub.lock().unwrap();
-        (locked.require_token, locked.repos.clone(), locked.tamper_cdn)
+        (
+            locked.require_token,
+            locked.repos.clone(),
+            locked.tamper_cdn,
+        )
     };
-    if require_token && auth.as_deref() != Some(&format!("Bearer {TOKEN}")) && !path.starts_with("/cdn/") {
+    if require_token
+        && auth.as_deref() != Some(&format!("Bearer {TOKEN}"))
+        && !path.starts_with("/cdn/")
+    {
         return Response::builder().status(401).body(Body::empty()).unwrap();
     }
     if let Some(rest) = path.strip_prefix("/api/models/") {
@@ -268,9 +282,17 @@ fn http(name: &str, bytes: &[u8], archive: Archive) -> ModelSource {
 
 fn weights() -> Vec<RepoFile> {
     vec![
-        ("config.json".into(), br#"{"architectures":["Toy"]}"#.to_vec(), false),
+        (
+            "config.json".into(),
+            br#"{"architectures":["Toy"]}"#.to_vec(),
+            false,
+        ),
         ("tokenizer/vocab.json".into(), b"{\"a\":1}".to_vec(), false),
-        ("model.safetensors".into(), (0..200_000u32).map(|i| (i % 251) as u8).collect(), true),
+        (
+            "model.safetensors".into(),
+            (0..200_000u32).map(|i| (i % 251) as u8).collect(),
+            true,
+        ),
     ]
 }
 
@@ -367,7 +389,9 @@ async fn huggingface_source_materializes_verified_into_the_store() {
     let bytes = store.materialize(&source).await.expect("materialized");
     let expected: u64 = weights().iter().map(|(_, b, _)| b.len() as u64).sum();
     assert_eq!(bytes, expected);
-    let dir = f.store.join(format!("sources/huggingface/org--model@{REV}"));
+    let dir = f
+        .store
+        .join(format!("sources/huggingface/org--model@{REV}"));
     for (name, contents, _) in weights() {
         assert_eq!(std::fs::read(dir.join(&name)).unwrap(), contents, "{name}");
     }
@@ -416,7 +440,10 @@ async fn hash_mismatch_is_refused_and_temp_removed() {
     assert_eq!(failure.reason, reason::HASH_MISMATCH);
     assert!(!failure.reservation_retained);
     assert!(f.partial_empty(), "temporary files removed");
-    assert!(f.state_files(".reservation").is_empty(), "reservation released");
+    assert!(
+        f.state_files(".reservation").is_empty(),
+        "reservation released"
+    );
     assert!(!f.store.join(wrong.store_key().unwrap()).exists());
 
     // A hub whose CDN serves bytes that do not match the LFS pointer's
@@ -426,8 +453,14 @@ async fn hash_mismatch_is_refused_and_temp_removed() {
     assert_eq!(failure.reason, reason::HASH_MISMATCH);
     assert!(!failure.reservation_retained);
     assert!(f.partial_empty(), "temporary files removed");
-    assert!(f.state_files(".reservation").is_empty(), "reservation released");
-    assert!(!f.store.join(hf(vec![], false).store_key().unwrap()).exists());
+    assert!(
+        f.state_files(".reservation").is_empty(),
+        "reservation released"
+    );
+    assert!(!f
+        .store
+        .join(hf(vec![], false).store_key().unwrap())
+        .exists());
 }
 
 // T14 (ADR 0008, SPEC §7.3): a source over the store's max_bytes is refused
@@ -499,10 +532,7 @@ async fn host_policy_denies_remote_sources() {
         Some(f.secrets.clone()),
         &f.origin,
     );
-    for source in [
-        hf(vec![], false),
-        http("x.bin", b"x", Archive::None),
-    ] {
+    for source in [hf(vec![], false), http("x.bin", b"x", Archive::None)] {
         match store.request(&source) {
             SourceStatus::Failed(failure) => assert_eq!(failure.reason, reason::DENIED),
             other => panic!("{other:?}"),
@@ -515,7 +545,10 @@ async fn host_policy_denies_remote_sources() {
         store.request(&hf(vec![], false)),
         SourceStatus::Failed(ref failure) if failure.reason == reason::DENIED
     ));
-    assert!(f.hub.lock().unwrap().log.is_empty(), "no origin was contacted");
+    assert!(
+        f.hub.lock().unwrap().log.is_empty(),
+        "no origin was contacted"
+    );
 }
 
 // T14 (ADR 0008): concurrent requests for one source share one download.
@@ -535,7 +568,10 @@ async fn concurrent_requests_share_one_download() {
     let store = f.source_store(1 << 30);
     let source = http("slow.bin", &bytes, Archive::None);
     let status = store.request(&source);
-    assert!(matches!(status, SourceStatus::Downloading { .. }), "{status:?}");
+    assert!(
+        matches!(status, SourceStatus::Downloading { .. }),
+        "{status:?}"
+    );
     let waiters: Vec<_> = (0..4)
         .map(|_| {
             let store = store.clone();
@@ -578,7 +614,10 @@ async fn download_resumes_after_agent_restart() {
     }
     // Restart: a fresh store over the same directory.
     let store = f.source_store(1 << 30);
-    assert_eq!(store.materialize(&source).await.unwrap(), bytes.len() as u64);
+    assert_eq!(
+        store.materialize(&source).await.unwrap(),
+        bytes.len() as u64
+    );
     let requests = f.requests("/files/big.bin");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].1.as_deref(), Some("bytes=40960-"), "resumed");
@@ -596,7 +635,9 @@ async fn secret_token_is_never_logged_or_persisted() {
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let store = f.source_store(1 << 30);
     let captured = lines.clone();
-    store.set_log(Arc::new(move |line| captured.lock().unwrap().push(line.to_string())));
+    store.set_log(Arc::new(move |line| {
+        captured.lock().unwrap().push(line.to_string())
+    }));
 
     // Without the token the hub refuses; with a reference it is used.
     let failure = store.materialize(&hf(vec![], false)).await.unwrap_err();
@@ -622,7 +663,11 @@ async fn secret_token_is_never_logged_or_persisted() {
             file.display()
         );
     }
-    let status = format!("{:?} {:?}", store.status(&source), SourceStatus::Verified { bytes });
+    let status = format!(
+        "{:?} {:?}",
+        store.status(&source),
+        SourceStatus::Verified { bytes }
+    );
     assert!(!status.contains(TOKEN));
     let log = lines.lock().unwrap().join("\n");
     assert!(!log.is_empty(), "the store logged its outcomes");
@@ -661,7 +706,10 @@ async fn tar_archive_is_verified_then_extracted() {
     let source = http("model.tar", &archive, Archive::Tar);
     assert_eq!(store.materialize(&source).await.unwrap(), 3002);
     let dir = f.store.join(source.store_key().unwrap());
-    assert_eq!(std::fs::read(dir.join("weights/w.bin")).unwrap(), vec![9_u8; 3000]);
+    assert_eq!(
+        std::fs::read(dir.join("weights/w.bin")).unwrap(),
+        vec![9_u8; 3000]
+    );
     assert!(!dir.join("archive.tar").exists());
 }
 
@@ -692,7 +740,10 @@ async fn prune_removes_only_unreferenced_sources() {
 
     let dry = prune(&f.store, &referenced, false).unwrap();
     assert_eq!(dry.removed.len(), 1);
-    assert!(f.store.join(unreferenced.store_key().unwrap()).is_dir(), "dry run");
+    assert!(
+        f.store.join(unreferenced.store_key().unwrap()).is_dir(),
+        "dry run"
+    );
 
     let applied = prune(&f.store, &referenced, true).unwrap();
     assert_eq!(applied.removed[0].key, unreferenced.store_key().unwrap());

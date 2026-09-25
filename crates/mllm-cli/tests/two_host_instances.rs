@@ -466,7 +466,11 @@ impl Cluster {
                 "--output",
                 invitation.to_str().unwrap(),
             ]);
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             let out = cli(
                 &host.state,
                 &[
@@ -478,7 +482,11 @@ impl Cluster {
                     host.config.to_str().unwrap(),
                 ],
             );
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             roles.push(self.start("host", &host.state, &host.config));
         }
         let listed = self.eligible_hosts(self.hosts.len());
@@ -869,7 +877,10 @@ async fn two_deployments_co_reside_on_one_enrolled_host() {
     let stopped = cluster.manage_json(&["stop", "deployment", &first, "--output", "json"]);
     cluster.succeeded(stopped["operation_id"].as_str().unwrap());
     assert_eq!(engines.iter().filter(|pid| alive(**pid)).count(), 1);
-    assert_eq!(cluster.ready_instances(&first, 0)["observed_state"], "stopped");
+    assert_eq!(
+        cluster.ready_instances(&first, 0)["observed_state"],
+        "stopped"
+    );
     let (status, body) = cluster.chat_model("toy2").await;
     assert_eq!(status, 200, "{body}");
     let stopped = cluster.manage_json(&["stop", "deployment", &second, "--output", "json"]);
@@ -924,7 +935,11 @@ async fn two_instances_of_one_deployment_co_reside_on_one_enrolled_host() {
         assert_eq!(instance["host_id"], a.as_str(), "{status}");
     }
     let host_a = &cluster.hosts[0];
-    assert_eq!(host_a.launches().len(), 2, "two engines of one deployment on one host");
+    assert_eq!(
+        host_a.launches().len(),
+        2,
+        "two engines of one deployment on one host"
+    );
     assert!(cluster.hosts[1].launches().is_empty());
     cluster.served(Duration::from_secs(30)).await;
 

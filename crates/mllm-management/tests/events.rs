@@ -1,6 +1,6 @@
 use axum::{body::Body, http::Request};
 use futures::StreamExt;
-use mllm_management::{ManagementCredentials, StoreSnapshotSource, read_only_router};
+use mllm_management::{read_only_router, ManagementCredentials, StoreSnapshotSource};
 use mllm_store::Store;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -172,15 +172,14 @@ fn request(uri: &str) -> axum::http::request::Builder {
 }
 
 use mllm_management::{
-    SnapshotSource, SnapshotUnavailable,
     events::{EventSource, EventStreamOptions},
-    read_only_router_with_event_options,
+    read_only_router_with_event_options, SnapshotSource, SnapshotUnavailable,
 };
 use mllm_store::events::{EventCursor, EventPage, EventReadError, ManagementEvent};
 use std::{
     sync::{
-        Mutex,
         atomic::{AtomicUsize, Ordering},
+        Mutex,
     },
     time::Duration,
 };
@@ -436,11 +435,9 @@ async fn slow_clients_disconnect_without_success_or_unsent_cursor_and_release_ca
         .unwrap();
     assert_eq!(second.status(), 200);
     let mut body = response.into_body().into_data_stream();
-    assert!(
-        next(&mut body)
-            .await
-            .contains(&format!("id: {INCARNATION}:1"))
-    );
+    assert!(next(&mut body)
+        .await
+        .contains(&format!("id: {INCARNATION}:1")));
     assert!(body.next().await.is_none());
 }
 
@@ -544,8 +541,8 @@ async fn dropped_streams_do_not_cancel_accepted_reads_or_release_global_worker_p
     struct Release(Arc<(Mutex<bool>, Condvar)>);
     impl Drop for Release {
         fn drop(&mut self) {
-            *self.0.0.lock().unwrap() = true;
-            self.0.1.notify_all();
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
         }
     }
     let release_on_exit = Release(release);
@@ -619,8 +616,8 @@ async fn cancelled_preflight_retains_workers_and_sanitizes_provider_failure() {
     struct Release(Arc<(Mutex<bool>, Condvar)>);
     impl Drop for Release {
         fn drop(&mut self) {
-            *self.0.0.lock().unwrap() = true;
-            self.0.1.notify_all();
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
         }
     }
     let release_on_exit = Release(release);
@@ -680,10 +677,7 @@ async fn initialize_lifecycle_events_enforce_transition_and_commit_epoch() {
     for (kind, transition) in [
         ("initialize_accepted", "accepted"),
         ("initialize_armed", "armed"),
-        (
-            "owned_launch_associated",
-            "owned_launch_associated",
-        ),
+        ("owned_launch_associated", "owned_launch_associated"),
         ("ready_committed", "ready"),
         ("initialize_uncertain", "uncertain"),
         ("initialize_expired_unarmed", "expired_unarmed"),
@@ -900,7 +894,9 @@ async fn managed_configuration_projection_rejects_corrupt_or_expanded_payloads()
                 2 => payload["session_epoch"] = serde_json::json!(-1),
                 3 => payload["session_epoch"] = serde_json::json!(u64::MAX),
                 4 => payload["deployment_id"] = serde_json::json!("bad-id"),
-                5 => { payload.as_object_mut().unwrap().remove("revision"); },
+                5 => {
+                    payload.as_object_mut().unwrap().remove("revision");
+                }
                 6 => payload["step_id"] = serde_json::json!(INCARNATION),
                 7 => payload["committed_epoch"] = serde_json::json!(1),
                 8 => payload["deployment_id"] = serde_json::json!("x".repeat(16 * 1024)),
@@ -918,9 +914,14 @@ async fn managed_configuration_projection_rejects_corrupt_or_expanded_payloads()
             }
             Ok(page(vec![e], 1))
         });
-        let response = fake_app(source, options()).oneshot(
-            request("/management/v1/events").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let response = fake_app(source, options())
+            .oneshot(
+                request("/management/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), 500, "corruption case {case}");
     }
 }
@@ -1049,31 +1050,61 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
     };
     let ids = (Some(DEP.to_owned()), Some(OP.to_owned()));
     let (payload, (deployment, operation)) = match kind {
-        "coordinator_session_started" => (serde_json::json!({"version":"1","session_epoch":1}), (None, None)),
-        "managed_configuration_accepted" => (serde_json::json!({"version":"1","operation_id":OP,
-            "deployment_id":DEP,"revision":1,"generation":1,"session_epoch":1}), ids),
-        "deployment_deleted" => (serde_json::json!({"version":"1","operation_id":OP,
-            "deployment_id":DEP,"revision":2,"session_epoch":1}), ids),
-        "host_resource_policy_bootstrapped" => (serde_json::json!({"version":"1","revision":1,
-            "ledger_epoch":1,"session_epoch":1}), (None, None)),
-        "host_resource_policy_updated" => (serde_json::json!({"version":"1","operation_id":OP,
+        "coordinator_session_started" => (
+            serde_json::json!({"version":"1","session_epoch":1}),
+            (None, None),
+        ),
+        "managed_configuration_accepted" => (
+            serde_json::json!({"version":"1","operation_id":OP,
+            "deployment_id":DEP,"revision":1,"generation":1,"session_epoch":1}),
+            ids,
+        ),
+        "deployment_deleted" => (
+            serde_json::json!({"version":"1","operation_id":OP,
+            "deployment_id":DEP,"revision":2,"session_epoch":1}),
+            ids,
+        ),
+        "host_resource_policy_bootstrapped" => (
+            serde_json::json!({"version":"1","revision":1,
+            "ledger_epoch":1,"session_epoch":1}),
+            (None, None),
+        ),
+        "host_resource_policy_updated" => (
+            serde_json::json!({"version":"1","operation_id":OP,
             "previous_revision":1,"current_revision":2,"ledger_epoch":2,"session_epoch":1}),
-            (None, Some(OP.to_owned()))),
-        "installation_drift_flagged" => (serde_json::json!({"version":"1","host_id":"host-a",
+            (None, Some(OP.to_owned())),
+        ),
+        "installation_drift_flagged" => (
+            serde_json::json!({"version":"1","host_id":"host-a",
             "installation":"sglang-main","registered_digest":"sha256:aa","observed_digest":"unmeasured"}),
-            (None, None)),
-        "host_revoked" => (serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
-            "host_name":"host-a"}), (None, None)),
-        "host_recovery_invited" => (serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
-            "host_name":"host-a","expires_unix":1790000900}), (None, None)),
-        "host_recovered" => (serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
-            "host_name":"host-a"}), (None, None)),
-        "host_drain_intent_expired" => (serde_json::json!({"version":"1","host_id":"host-a",
-            "drain_key":"01BX5ZZKBKACTAV9WEVGEMMVS3","deadline_ms":900000}), (None, None)),
-        k if k.starts_with("switch_") => (serde_json::json!({"version":"1","phase":&k["switch_".len()..],
+            (None, None),
+        ),
+        "host_revoked" => (
+            serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
+            "host_name":"host-a"}),
+            (None, None),
+        ),
+        "host_recovery_invited" => (
+            serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
+            "host_name":"host-a","expires_unix":1790000900}),
+            (None, None),
+        ),
+        "host_recovered" => (
+            serde_json::json!({"version":"1","host_id":"01BX5ZZKBKACTAV9WEVGEMMVS2",
+            "host_name":"host-a"}),
+            (None, None),
+        ),
+        "host_drain_intent_expired" => (
+            serde_json::json!({"version":"1","host_id":"host-a",
+            "drain_key":"01BX5ZZKBKACTAV9WEVGEMMVS3","deadline_ms":900000}),
+            (None, None),
+        ),
+        k if k.starts_with("switch_") => (
+            serde_json::json!({"version":"1","phase":&k["switch_".len()..],
             "switch_id":"sw-1","target_deployment":DEP,"host":"host-a",
             "victims":[format!("{OP}/0")],"detail":"planned on host-a"}),
-            (Some(DEP.to_owned()), None)),
+            (Some(DEP.to_owned()), None),
+        ),
         "ready_committed" => (step("ready", Some(4)), ids),
         "initialize_failed_released" => (step("launch_failed", Some(4)), ids),
         "ordinary_cleanup_completed" => (step("cleanup_completed", Some(4)), ids),
@@ -1086,7 +1117,11 @@ fn store_shaped(kind: &str) -> (serde_json::Value, Option<String>, Option<String
                 .strip_prefix("initialize_")
                 .or_else(|| k.strip_prefix("ordinary_"))
                 .unwrap_or(k);
-            let transition = if k == "owned_launch_associated" { k } else { transition };
+            let transition = if k == "owned_launch_associated" {
+                k
+            } else {
+                transition
+            };
             let transition = if k.starts_with("ordinary_cleanup_") {
                 k.strip_prefix("ordinary_").unwrap()
             } else {
@@ -1117,7 +1152,11 @@ async fn every_store_event_kind_projects_through_the_events_stream() {
             Ok(page(vec![e], 1))
         });
         let response = fake_app(source, options())
-            .oneshot(request("/management/v1/events").body(Body::empty()).unwrap())
+            .oneshot(
+                request("/management/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), 200, "{kind}");

@@ -279,7 +279,10 @@ fn a_vllm_spec_carries_a_fresh_admin_key_apart_from_the_inference_key() {
     }
     let (next_inference, next_admin) = keys();
     assert_ne!(inference, next_inference);
-    assert_ne!(admin, next_admin, "an admin key is never reused across launches");
+    assert_ne!(
+        admin, next_admin,
+        "an admin key is never reused across launches"
+    );
 }
 
 /// The SGLang branch builds the real frozen native launch and names both
@@ -418,7 +421,9 @@ fn a_memory_saver_sglang_spec_carries_the_saver_observer() {
     let dir = PathBuf::from("/tmp/mllm-test-state/observation");
     let observed = || bindings().with_saver_observation(dir.clone());
     for _restart in 0..2 {
-        let spec = observed().spec(&sglang_work()).expect("the sglang spec builds");
+        let spec = observed()
+            .spec(&sglang_work())
+            .expect("the sglang spec builds");
         let AdapterSpec::Sglang {
             frozen, observer, ..
         } = spec

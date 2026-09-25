@@ -32,8 +32,7 @@ use mllm_domain::completion::{
     TransitionToken,
 };
 use mllm_domain::launch::{
-    LaunchSettings, NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata,
-    SglangLaunchSettings,
+    LaunchSettings, NativeDeviceSelection, NativeLaunch, NativeLaunchMetadata, SglangLaunchSettings,
 };
 use serde_json::{json, Value};
 
@@ -525,7 +524,10 @@ async fn initialize_spawns_protected_waits_probes_and_reports_the_group() {
         Some(log.to_string_lossy().as_ref())
     );
     // T21: SPEC §9.1, no bytecode beside checked runtime source.
-    assert_eq!(env.get("PYTHONDONTWRITEBYTECODE").map(String::as_str), Some("1"));
+    assert_eq!(
+        env.get("PYTHONDONTWRITEBYTECODE").map(String::as_str),
+        Some("1")
+    );
     // T21: ADR 0014 §8, the host approvals the entry gates extras with.
     assert_eq!(
         env.get("MLLM_EXTRA_APPROVALS").map(String::as_str),
@@ -880,7 +882,10 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
         let spawned = tool.spawned.lock().unwrap();
         // T22: compiler tools resolve in the selected environment, not shell PATH.
         let engine_bin = std::path::Path::new(&spawned[0].argv[0]).parent().unwrap();
-        assert_eq!(spawned[0].env["PATH"], format!("{}:/usr/bin:/bin", engine_bin.display()));
+        assert_eq!(
+            spawned[0].env["PATH"],
+            format!("{}:/usr/bin:/bin", engine_bin.display())
+        );
         assert_eq!(
             spawned[0]
                 .env
@@ -956,7 +961,10 @@ async fn a_host_named_rendezvous_directory_reaches_the_entry() {
             .unwrap();
         let spawned = tool.spawned.lock().unwrap();
         assert_eq!(
-            spawned[0].env.get("MLLM_RENDEZVOUS_DIR").map(String::as_str),
+            spawned[0]
+                .env
+                .get("MLLM_RENDEZVOUS_DIR")
+                .map(String::as_str),
             named
         );
     }

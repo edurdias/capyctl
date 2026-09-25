@@ -110,7 +110,10 @@ impl std::fmt::Debug for SaverScope {
             .field("binding_id", &self.binding_id)
             .field("incarnation", &self.incarnation)
             .field("members", &self.members)
-            .field("admin_key", &mllm_adapters::traits::redacted(!self.admin_key.is_empty()))
+            .field(
+                "admin_key",
+                &mllm_adapters::traits::redacted(!self.admin_key.is_empty()),
+            )
             .field("executable", &self.executable)
             .finish()
     }
@@ -291,7 +294,10 @@ impl Run<'_> {
             return None;
         };
         let scope = self.saver_scope()?;
-        read_saver(saver, scope).await.ok().map(|m| m.mapped_bytes())
+        read_saver(saver, scope)
+            .await
+            .ok()
+            .map(|m| m.mapped_bytes())
     }
 
     /// SPEC §10 step 4: engine quiescence, proven by the adapter's own
@@ -546,7 +552,9 @@ impl NativeHostExecution {
         } else {
             None
         };
-        let recorded = journaled.as_deref().unwrap_or(plan.checkpoint_digest.as_str());
+        let recorded = journaled
+            .as_deref()
+            .unwrap_or(plan.checkpoint_digest.as_str());
         let digest = match (recorded, supplied) {
             ("", "") => return false,
             ("", supplied) => supplied,
@@ -590,7 +598,9 @@ impl NativeHostExecution {
         let handle = owner.identity.command_id.clone();
         let store = effective.host.model_store.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let measured = checkpoints.measure(&store, std::path::Path::new(&checkpoint)).ok()?;
+            let measured = checkpoints
+                .measure(&store, std::path::Path::new(&checkpoint))
+                .ok()?;
             journal
                 .record_park_digest(&handle, &measured.manifest.digest)
                 .ok()

@@ -112,6 +112,9 @@ fn current_controls_preserve_physical_device_identity() {
     controls.observation_ttl_ms = 1250;
     let composed = compose_current_resource_controls(&host, &context, &controls).unwrap();
     let effective = resolve_effective(&deployment, &composed).unwrap();
-    assert_eq!(effective.host.devices["gpu0"].physical_gpu_uuid.as_deref(), Some(uuid));
+    assert_eq!(
+        effective.host.devices["gpu0"].physical_gpu_uuid.as_deref(),
+        Some(uuid)
+    );
     assert_eq!(ResourceControls::from_host(&effective.host), controls);
 }

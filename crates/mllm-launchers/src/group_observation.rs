@@ -440,7 +440,11 @@ mod tests {
             collect_members(42, [Ok(init), Ok(impostor)]),
             Err(GroupObservationError::InvalidData)
         );
-        assert!(validate_api(&api(), &[parse_stat(42, &stat(42, 1, 42, 0), BOOT).unwrap()]).is_err());
+        assert!(validate_api(
+            &api(),
+            &[parse_stat(42, &stat(42, 1, 42, 0), BOOT).unwrap()]
+        )
+        .is_err());
     }
 
     #[test]
@@ -464,13 +468,11 @@ mod tests {
             assert!(validate_api(&expected, &facts).is_err());
         }
         assert!(validate_api(&api(), &[]).is_err());
-        assert!(
-            validate_api(
-                &api(),
-                &[parse_stat(42, &stat(42, 1, 41, 10), BOOT).unwrap()]
-            )
-            .is_err()
-        );
+        assert!(validate_api(
+            &api(),
+            &[parse_stat(42, &stat(42, 1, 41, 10), BOOT).unwrap()]
+        )
+        .is_err());
     }
 
     #[test]

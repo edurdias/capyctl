@@ -179,8 +179,7 @@ struct Role {
 
 impl Role {
     fn spawn(mut command: Command, ready: Option<&str>) -> Self {
-        let mut child =
-            Guarded::spawn(command.stdout(Stdio::piped()).stderr(Stdio::inherit()));
+        let mut child = Guarded::spawn(command.stdout(Stdio::piped()).stderr(Stdio::inherit()));
         let (lines, received) = mpsc::channel();
         let stdout = child.child().stdout.take().unwrap();
         std::thread::spawn(move || {

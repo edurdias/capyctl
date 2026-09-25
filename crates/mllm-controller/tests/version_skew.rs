@@ -8,18 +8,18 @@
 //!
 //! CPU-only transport tests: nothing here qualifies a native engine.
 
+use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
 use mllm_agent::{
     enrollment::{JoinInvitation, PendingEnrollment},
     identity::{CertificateAuthority, HostKey},
     identity_storage::IdentityDirectory,
 };
-use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
 use mllm_controller::{
     agent_sessions::{gate_refusal, AgentSessions},
-    remote_execution::{self, ReadinessLedger, RemoteLaunchBinding},
     coordinator::ServiceObservation,
     enrollment::EnrollmentAuthority,
     ownership::SharedCoordinatorState,
+    remote_execution::{self, ReadinessLedger, RemoteLaunchBinding},
     OwnedCoordinatorState,
 };
 use mllm_domain::{
@@ -84,7 +84,10 @@ fn inventory(host: &str) -> pb::ReportInventory {
             .iter()
             .map(|(name, profile)| pb::RuntimeProfileStatus {
                 name: name.clone(),
-                build_fingerprint: profile["build_fingerprint"].as_str().unwrap_or("unknown").into(),
+                build_fingerprint: profile["build_fingerprint"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .into(),
                 eligibility: "unknown".into(),
                 ..Default::default()
             })
@@ -113,7 +116,9 @@ struct Harness {
 
 async fn enrolled() -> Harness {
     let state_dir = directory();
-    let state = Arc::new(Mutex::new(OwnedCoordinatorState::open(state_dir.path()).unwrap()));
+    let state = Arc::new(Mutex::new(
+        OwnedCoordinatorState::open(state_dir.path()).unwrap(),
+    ));
     let ca = CertificateAuthority::generate(now()).unwrap();
     let ca_pem = ca.certificate_pem().to_owned();
     let key = HostKey::generate().unwrap();
@@ -121,7 +126,10 @@ async fn enrolled() -> Harness {
     let authority = Arc::new(EnrollmentAuthority::new(state.clone(), ca));
     let sessions = AgentSessions::new(authority.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = format!("https://localhost:{}", listener.local_addr().unwrap().port());
+    let address = format!(
+        "https://localhost:{}",
+        listener.local_addr().unwrap().port()
+    );
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(cert.pem, key.private_key_pem()))
         .client_ca_root(Certificate::from_pem(&ca_pem));
@@ -154,17 +162,40 @@ async fn enrolled() -> Harness {
         .await
         .unwrap()
         .into_inner();
-    let host = identity.accept_certificate(&storage, certificate, now()).unwrap();
-    Harness { state, authority, sessions, identity, host, server, _dirs: (state_dir, storage_dir) }
+    let host = identity
+        .accept_certificate(&storage, certificate, now())
+        .unwrap();
+    Harness {
+        state,
+        authority,
+        sessions,
+        identity,
+        host,
+        server,
+        _dirs: (state_dir, storage_dir),
+    }
 }
 
-type Opened = (tokio::sync::mpsc::Sender<pb::AgentToServer>, tonic::Streaming<pb::ServerToAgent>);
+type Opened = (
+    tokio::sync::mpsc::Sender<pb::AgentToServer>,
+    tonic::Streaming<pb::ServerToAgent>,
+);
 
 impl Harness {
     /// Open a control session as a host declaring `version` and
     /// `capabilities`. `Err` is the controller's refusal of the session.
-    async fn open(&self, version: &str, capabilities: Vec<String>) -> Result<Opened, Box<tonic::Status>> {
-        let channel = self.identity.control_endpoint(now()).unwrap().connect().await.unwrap();
+    async fn open(
+        &self,
+        version: &str,
+        capabilities: Vec<String>,
+    ) -> Result<Opened, Box<tonic::Status>> {
+        let channel = self
+            .identity
+            .control_endpoint(now())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
         let (send, recv) = tokio::sync::mpsc::channel(64);
         send.send(pb::AgentToServer {
             msg: Some(agent_to_server::Msg::Connect(pb::Connect {
@@ -187,17 +218,22 @@ impl Harness {
 
     /// As `open`, then publish a prepared inventory and reconcile.
     async fn reconciled(&self, version: &str, capabilities: Vec<String>) -> Opened {
-        let (send, mut stream) = self.open(version, capabilities).await.expect("session accepted");
+        let (send, mut stream) = self
+            .open(version, capabilities)
+            .await
+            .expect("session accepted");
         send.send(pb::AgentToServer {
             msg: Some(agent_to_server::Msg::ReportInventory(inventory(&self.host))),
         })
         .await
         .unwrap();
         send.send(pb::AgentToServer {
-            msg: Some(agent_to_server::Msg::ReconcileHistory(pb::ReconcileHistory {
-                records: vec![],
-                complete: true,
-            })),
+            msg: Some(agent_to_server::Msg::ReconcileHistory(
+                pb::ReconcileHistory {
+                    records: vec![],
+                    complete: true,
+                },
+            )),
         })
         .await
         .unwrap();
@@ -212,7 +248,10 @@ impl Harness {
         let mut command = MemberCommand {
             identity: CommandIdentity {
                 controller_id: self.authority.controller_id(),
-                member: MemberKey { host_id: self.host.clone(), member_id: "head".into() },
+                member: MemberKey {
+                    host_id: self.host.clone(),
+                    member_id: "head".into(),
+                },
                 deployment_id: "deployment".into(),
                 operation_id: format!("operation-{id}"),
                 command_id: id.into(),
@@ -235,8 +274,10 @@ impl Harness {
 /// A launch carrying the WE3 digest and a startup reservation, as this server
 /// sends every launch.
 fn launch() -> MemberAction {
-    let fixture: Value =
-        serde_json::from_str(include_str!("../../mllm-config/tests/fixtures/f2-deployment.json")).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../mllm-config/tests/fixtures/f2-deployment.json"
+    ))
+    .unwrap();
     MemberAction::LaunchSingle(SingleLaunchPlan {
         deployment_config: fixture["deployment"].to_string(),
         profile_name: "sglang".into(),
@@ -255,7 +296,12 @@ fn launch() -> MemberAction {
 }
 
 fn recorded() -> ProcessIdentity {
-    ProcessIdentity { role: "api".into(), pid: 4242, boot_id: "boot".into(), start_ticks: 7 }
+    ProcessIdentity {
+        role: "api".into(),
+        pid: 4242,
+        boot_id: "boot".into(),
+        start_ticks: 7,
+    }
 }
 
 /// The typed refusal, answered at once (never left to the deadline).
@@ -264,7 +310,9 @@ async fn refused(sessions: &AgentSessions, command: MemberCommand) -> String {
         .await
         .expect("a gate refusal is answered at once")
         .expect_err("the command is refused");
-    gate_refusal(&status).expect("a typed gate refusal").to_owned()
+    gate_refusal(&status)
+        .expect("a typed gate refusal")
+        .to_owned()
 }
 
 /// The next ExecuteMember the host is sent within `within`, if any.
@@ -275,7 +323,9 @@ async fn next_command(
     tokio::time::timeout(within, async {
         loop {
             match stream.message().await {
-                Ok(Some(pb::ServerToAgent { msg: Some(server_to_agent::Msg::ExecuteMember(c)) })) => return Some(c),
+                Ok(Some(pb::ServerToAgent {
+                    msg: Some(server_to_agent::Msg::ExecuteMember(c)),
+                })) => return Some(c),
                 Ok(Some(_)) => continue,
                 _ => return None,
             }
@@ -302,7 +352,11 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
     let view = h.sessions.inspect(&h.host).unwrap();
     assert!(view.online && view.reconciled);
     assert_eq!(view.compatibility, "upgrade_required");
-    assert!(view.compatibility_reason.contains("drain-only"), "{}", view.compatibility_reason);
+    assert!(
+        view.compatibility_reason.contains("drain-only"),
+        "{}",
+        view.compatibility_reason
+    );
     assert!(!view.eligible, "a drain-only host takes no new placement");
     assert!(!h.sessions.eligible_hosts().unwrap().contains(&h.host));
     // Owner decision 2026-09-25: a start refused for it names the host and
@@ -323,47 +377,100 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
         "it can still be stopped"
     );
     // Status evidence survives in the store.
-    let record = h.state.lock().unwrap().store().host_version(&h.host).unwrap().unwrap();
+    let record = h
+        .state
+        .lock()
+        .unwrap()
+        .store()
+        .host_version(&h.host)
+        .unwrap()
+        .unwrap();
     assert_eq!(record.compatibility, "upgrade_required");
     assert_eq!(record.binary_version, "");
 
     // Start, park and wake are refused typed, before anything is sent.
-    assert_eq!(refused(&h.sessions, h.command("launch", launch())).await, "host_upgrade_required");
-    let handle = || "01K00000000000000000000009".to_owned();
     assert_eq!(
-        refused(&h.sessions, h.command("park", MemberAction::Park { owned_handle: handle() })).await,
+        refused(&h.sessions, h.command("launch", launch())).await,
         "host_upgrade_required"
     );
-    assert_eq!(h.sessions.preflight(&h.host, &[], true).unwrap_err(), "host_upgrade_required");
+    let handle = || "01K00000000000000000000009".to_owned();
+    assert_eq!(
+        refused(
+            &h.sessions,
+            h.command(
+                "park",
+                MemberAction::Park {
+                    owned_handle: handle()
+                }
+            )
+        )
+        .await,
+        "host_upgrade_required"
+    );
+    assert_eq!(
+        h.sessions.preflight(&h.host, &[], true).unwrap_err(),
+        "host_upgrade_required"
+    );
     assert!(h.sessions.preflight(&h.host, &[], false).is_ok());
-    assert!(next_command(&mut stream, Duration::from_millis(300)).await.is_none(), "nothing was sent");
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
 
     // A stop is delivered. The server only includes recorded identities for a
     // host that declared them (ADR 0016 field); this one did not.
-    assert!(!h.sessions.supports(&h.host, capabilities::TERMINATE_RECORDED_PROCESSES));
+    assert!(!h
+        .sessions
+        .supports(&h.host, capabilities::TERMINATE_RECORDED_PROCESSES));
     let with_identities = h.command(
         "stop-recorded",
-        MemberAction::Terminate { owned_handle: handle(), recorded: vec![recorded()] },
+        MemberAction::Terminate {
+            owned_handle: handle(),
+            recorded: vec![recorded()],
+        },
     );
     assert_eq!(
         refused(&h.sessions, with_identities).await,
         "host_capability_missing:terminate_recorded_processes"
     );
-    let stop = h.command("stop", MemberAction::Terminate { owned_handle: handle(), recorded: vec![] });
+    let stop = h.command(
+        "stop",
+        MemberAction::Terminate {
+            owned_handle: handle(),
+            recorded: vec![],
+        },
+    );
     let sessions = h.sessions.clone();
     let pending = tokio::spawn(async move { sessions.execute(stop).await });
-    let sent = next_command(&mut stream, Duration::from_secs(5)).await.expect("the stop is sent");
-    assert!(matches!(sent.action, Some(pb::execute_member::Action::TerminateOwnedHandle(_))));
+    let sent = next_command(&mut stream, Duration::from_secs(5))
+        .await
+        .expect("the stop is sent");
+    assert!(matches!(
+        sent.action,
+        Some(pb::execute_member::Action::TerminateOwnedHandle(_))
+    ));
     assert!(sent.terminate_recorded_processes.is_empty());
     assert!(sent.restore_checkpoint_digest.is_empty());
     pending.abort();
 
     // A probe is delivered too.
-    let probe = h.command("probe", MemberAction::Probe { owned_handle: handle() });
+    let probe = h.command(
+        "probe",
+        MemberAction::Probe {
+            owned_handle: handle(),
+        },
+    );
     let sessions = h.sessions.clone();
     let pending = tokio::spawn(async move { sessions.execute(probe).await });
-    let sent = next_command(&mut stream, Duration::from_secs(5)).await.expect("the probe is sent");
-    assert!(matches!(sent.action, Some(pb::execute_member::Action::ProbeOwnedHandle(_))));
+    let sent = next_command(&mut stream, Duration::from_secs(5))
+        .await
+        .expect("the probe is sent");
+    assert!(matches!(
+        sent.action,
+        Some(pb::execute_member::Action::ProbeOwnedHandle(_))
+    ));
     pending.abort();
     h.server.abort();
 }
@@ -379,11 +486,16 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
 async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_dispatch() {
     let h = enrolled().await;
     let (_send, mut stream) = h.reconciled("", vec![]).await;
-    let MemberAction::LaunchSingle(plan) = launch() else { unreachable!() };
+    let MemberAction::LaunchSingle(plan) = launch() else {
+        unreachable!()
+    };
     let binding_id = plan.binding_id.clone();
     let incarnation = plan.incarnation.clone();
     let readiness: ReadinessLedger = Default::default();
-    readiness.lock().unwrap().insert(binding_id.clone(), "proving-session".into());
+    readiness
+        .lock()
+        .unwrap()
+        .insert(binding_id.clone(), "proving-session".into());
     let engine = remote_execution::engine(
         h.sessions.clone(),
         h.state.clone(),
@@ -427,7 +539,12 @@ async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_disp
         !readiness.lock().unwrap().contains_key(&binding_id),
         "the refused park must leave the launch to a fresh readiness probe"
     );
-    assert!(next_command(&mut stream, Duration::from_millis(300)).await.is_none(), "nothing was sent");
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
     h.server.abort();
 }
 
@@ -437,13 +554,39 @@ async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_disp
 async fn a_newer_host_is_refused_with_upgrade_the_server_first() {
     let h = enrolled().await;
     let own = Version::parse(BINARY_VERSION).unwrap();
-    for newer in [format!("{}.{}.0", own.major, own.minor + 1), format!("{}.0.0", own.major + 1)] {
-        let status = h.open(&newer, all()).await.expect_err("a newer host is refused");
+    for newer in [
+        format!("{}.{}.0", own.major, own.minor + 1),
+        format!("{}.0.0", own.major + 1),
+    ] {
+        let status = h
+            .open(&newer, all())
+            .await
+            .expect_err("a newer host is refused");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert!(status.message().starts_with(mllm_protocol::version::NEWER_HOST_REFUSAL), "{}", status.message());
-        assert!(status.message().contains("upgrade the server first"), "{}", status.message());
-        assert!(h.sessions.inspect(&h.host).is_none(), "no session was registered");
-        let record = h.state.lock().unwrap().store().host_version(&h.host).unwrap().unwrap();
+        assert!(
+            status
+                .message()
+                .starts_with(mllm_protocol::version::NEWER_HOST_REFUSAL),
+            "{}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("upgrade the server first"),
+            "{}",
+            status.message()
+        );
+        assert!(
+            h.sessions.inspect(&h.host).is_none(),
+            "no session was registered"
+        );
+        let record = h
+            .state
+            .lock()
+            .unwrap()
+            .store()
+            .host_version(&h.host)
+            .unwrap()
+            .unwrap();
         assert_eq!(record.compatibility, "refused");
         assert_eq!(record.binary_version, newer);
     }
@@ -469,7 +612,10 @@ async fn a_missing_capability_is_refused_typed_and_never_sent() {
     let (_send, mut stream) = h.reconciled(BINARY_VERSION, declared).await;
     let view = h.sessions.inspect(&h.host).unwrap();
     assert_eq!(view.compatibility, "supported");
-    assert_eq!(view.capabilities_missing, vec![capabilities::STARTUP_BYTES.to_owned()]);
+    assert_eq!(
+        view.capabilities_missing,
+        vec![capabilities::STARTUP_BYTES.to_owned()]
+    );
     assert!(!view.eligible, "a placement requirement is missing");
     assert!(!h.sessions.eligible_hosts().unwrap().contains(&h.host));
     assert_eq!(
@@ -477,11 +623,15 @@ async fn a_missing_capability_is_refused_typed_and_never_sent() {
         "host_capability_missing:startup_bytes"
     );
     assert_eq!(
-        h.sessions.preflight(&h.host, &[capabilities::STARTUP_BYTES], true).unwrap_err(),
+        h.sessions
+            .preflight(&h.host, &[capabilities::STARTUP_BYTES], true)
+            .unwrap_err(),
         "host_capability_missing:startup_bytes"
     );
     // What it declared still reaches it: a wake with the recorded digest.
-    assert!(h.sessions.supports(&h.host, capabilities::RESTORE_CHECKPOINT_DIGEST));
+    assert!(h
+        .sessions
+        .supports(&h.host, capabilities::RESTORE_CHECKPOINT_DIGEST));
     let wake = h.command(
         "wake",
         MemberAction::Restore {
@@ -491,7 +641,9 @@ async fn a_missing_capability_is_refused_typed_and_never_sent() {
     );
     let sessions = h.sessions.clone();
     let pending = tokio::spawn(async move { sessions.execute(wake).await });
-    let sent = next_command(&mut stream, Duration::from_secs(5)).await.expect("the wake is sent");
+    let sent = next_command(&mut stream, Duration::from_secs(5))
+        .await
+        .expect("the wake is sent");
     assert!(!sent.restore_checkpoint_digest.is_empty());
     pending.abort();
     h.server.abort();
@@ -518,7 +670,12 @@ async fn an_n_minus_one_host_is_supported_with_an_upgrade_recommended() {
     let sessions = h.sessions.clone();
     let start = h.command("launch", launch());
     let pending = tokio::spawn(async move { sessions.execute(start).await });
-    assert!(next_command(&mut stream, Duration::from_secs(5)).await.is_some(), "the launch is sent");
+    assert!(
+        next_command(&mut stream, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "the launch is sent"
+    );
     pending.abort();
     h.server.abort();
 }
@@ -544,12 +701,21 @@ async fn status_shows_the_version_after_the_session_ends() {
     })
     .await
     .unwrap();
-    let record = h.state.lock().unwrap().store().host_version(&h.host).unwrap().unwrap();
+    let record = h
+        .state
+        .lock()
+        .unwrap()
+        .store()
+        .host_version(&h.host)
+        .unwrap()
+        .unwrap();
     assert_eq!(record.binary_version, BINARY_VERSION);
     assert_eq!(record.compatibility, "supported");
     assert_eq!(record.capabilities.len(), capabilities::CATALOGUE.len());
     // Offline, the recorded declaration still answers what the host supports.
-    assert!(h.sessions.supports(&h.host, capabilities::TERMINATE_RECORDED_PROCESSES));
+    assert!(h
+        .sessions
+        .supports(&h.host, capabilities::TERMINATE_RECORDED_PROCESSES));
     h.server.abort();
 }
 
@@ -558,7 +724,10 @@ async fn status_shows_the_version_after_the_session_ends() {
 #[tokio::test]
 async fn a_malformed_declaration_is_refused() {
     let h = enrolled().await;
-    let status = h.open(BINARY_VERSION, vec!["Not A Name".into()]).await.expect_err("refused");
+    let status = h
+        .open(BINARY_VERSION, vec!["Not A Name".into()])
+        .await
+        .expect_err("refused");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     h.server.abort();
 }

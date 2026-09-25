@@ -204,7 +204,10 @@ impl Fixture {
         module(&runtime.join("sglang_entry.py"), FAKE_ENGINE);
         module(&runtime.join("pinned_file_observation.py"), "# stand-in\n");
         // ADR 0008: every SGLang launch imports the capability probes.
-        module(&runtime.join("engine_capabilities.py"), "# stand-in probes\n");
+        module(
+            &runtime.join("engine_capabilities.py"),
+            "# stand-in probes\n",
+        );
         let models = private(&path.join("models"));
         for name in ["tv", "ts", "big"] {
             std::fs::create_dir_all(models.join(name)).unwrap();
@@ -781,7 +784,10 @@ async fn a_stopped_sglang_launch_leaves_no_rendezvous_directory() {
         .join(&plan.incarnation);
 
     ready(&host, &sglang, GATE_S).await;
-    assert!(dir.join("store").is_file(), "the entry was handed its directory");
+    assert!(
+        dir.join("store").is_file(),
+        "the entry was handed its directory"
+    );
 
     let stopped = host
         .executor
@@ -789,6 +795,9 @@ async fn a_stopped_sglang_launch_leaves_no_rendezvous_directory() {
         .await
         .unwrap();
     assert!(!stopped.claim_retained && stopped.processes.iter().all(|p| p.presence == "gone"));
-    assert!(!dir.exists(), "the gone launch's rendezvous directory remains");
+    assert!(
+        !dir.exists(),
+        "the gone launch's rendezvous directory remains"
+    );
     assert!(fixture.root.path().join("state/rendezvous").is_dir());
 }

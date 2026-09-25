@@ -21,7 +21,10 @@ pub struct AdmissionWindow {
 
 impl AdmissionWindow {
     pub fn open(duration: Duration) -> Self {
-        Self { opened_at: Instant::now(), duration }
+        Self {
+            opened_at: Instant::now(),
+            duration,
+        }
     }
 
     /// No-op by contract: sustained A load NEVER resets the window.
@@ -66,7 +69,9 @@ impl<E: Clone> Default for WakeJoin<E> {
 
 impl<E: Clone> WakeJoin<E> {
     pub fn new() -> Self {
-        Self { wakes: Mutex::new(HashMap::new()) }
+        Self {
+            wakes: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Run (or join) the wake for `key`: the first caller of the cohort
@@ -95,10 +100,7 @@ impl<E: Clone> WakeJoin<E> {
         };
         // Exactly one leader claims the wake; the rest await the published
         // outcome (retained on the watch, not a one-shot notify).
-        if !slot
-            .claimed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if !slot.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let r = wake().await;
             // Publish BEFORE removing from the map: a caller arriving in
             // between joins the outcome, never a second wake.
@@ -154,10 +156,7 @@ impl<E: Clone + Send + Sync + 'static> WakeJoin<E> {
             let rx = slot.tx.subscribe();
             (slot, rx)
         };
-        if !slot
-            .claimed
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if !slot.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let task = wake();
             let join = self.clone();
             let owned = slot.clone();
@@ -200,7 +199,10 @@ impl<E> Publish<E> {
         // outcome instead of starting a second wake.
         let _ = self.slot.tx.send(Some(outcome));
         let mut wakes = self.join.wakes.lock().unwrap_or_else(|p| p.into_inner());
-        if wakes.get(&self.key).is_some_and(|s| Arc::ptr_eq(s, &self.slot)) {
+        if wakes
+            .get(&self.key)
+            .is_some_and(|s| Arc::ptr_eq(s, &self.slot))
+        {
             wakes.remove(&self.key);
         }
     }
@@ -311,7 +313,10 @@ impl SwitchEngine {
                 // with the residual uncertainty recorded; never block
                 // forever on unprovable work.
                 Ok(mllm_adapters::traits::WorkObservation::Unknown) => {
-                    self.journal_switch(a, r#"{"event":"drain_unknown","residual":"engine work unprovable"}"#);
+                    self.journal_switch(
+                        a,
+                        r#"{"event":"drain_unknown","residual":"engine work unprovable"}"#,
+                    );
                     break;
                 }
                 Ok(other) => {
@@ -341,41 +346,32 @@ impl SwitchEngine {
             .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
         let observed = deployment.as_ref().map(|r| r.observed_state);
         if observed == Some(LifecycleState::Ready) {
-                // Stock profiles release by stopping: parking would keep
-                // the shared F1 engine port bound. Only the sleep profile
-                // is eligible for the park path (design §7).
-                if deployment.as_ref().is_some_and(|r| r.kind != "vllm-sleep") {
-                    let stop = self.controller.idle_stop(a).await
-                        .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
-                    self.controller.wait_terminal(&stop).await
-                        .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
-                    return Ok(());
-                }
-                let op = self
+            // Stock profiles release by stopping: parking would keep
+            // the shared F1 engine port bound. Only the sleep profile
+            // is eligible for the park path (design §7).
+            if deployment.as_ref().is_some_and(|r| r.kind != "vllm-sleep") {
+                let stop = self
                     .controller
-                    .request_transition(a, mllm_domain::LifecycleAction::Park)
-                    .await;
-                match op {
-                    Ok(op) => {
-                        if self.controller.wait_terminal(&op).await.is_err() {
-                            // Park failed: stop after drain (design §7).
-                            let stop = self
-                                .controller
-                                .request_transition(a, mllm_domain::LifecycleAction::Stop)
-                                .await
-                                .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
-                            self.controller
-                                .wait_terminal(&stop)
-                                .await
-                                .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
-                        }
-                    }
-                    Err(_) => {
-                        // Parking unsupported (restart-only): stop instead —
-                        // the idle-stop path keeps A on-demand eligible.
+                    .idle_stop(a)
+                    .await
+                    .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+                self.controller
+                    .wait_terminal(&stop)
+                    .await
+                    .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+                return Ok(());
+            }
+            let op = self
+                .controller
+                .request_transition(a, mllm_domain::LifecycleAction::Park)
+                .await;
+            match op {
+                Ok(op) => {
+                    if self.controller.wait_terminal(&op).await.is_err() {
+                        // Park failed: stop after drain (design §7).
                         let stop = self
                             .controller
-                            .idle_stop(a)
+                            .request_transition(a, mllm_domain::LifecycleAction::Stop)
                             .await
                             .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
                         self.controller
@@ -384,8 +380,22 @@ impl SwitchEngine {
                             .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
                     }
                 }
+                Err(_) => {
+                    // Parking unsupported (restart-only): stop instead —
+                    // the idle-stop path keeps A on-demand eligible.
+                    let stop = self
+                        .controller
+                        .idle_stop(a)
+                        .await
+                        .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+                    self.controller
+                        .wait_terminal(&stop)
+                        .await
+                        .map_err(|e| SwitchError::Activation(a.into(), e.to_string()))?;
+                }
             }
-            Ok(())
+        }
+        Ok(())
     }
 
     async fn fail_switch(&self, a: &str) -> SwitchError {

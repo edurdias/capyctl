@@ -75,11 +75,8 @@ pub fn admit(
     match candidate.category {
         Some(Category::HostKv) => host_kv = host_kv.saturating_add(candidate.activation_peak),
         Some(Category::ParkedResidue) => {
-            parked = parked.saturating_add(
-                candidate
-                    .parked_budget
-                    .unwrap_or(candidate.activation_peak),
-            )
+            parked =
+                parked.saturating_add(candidate.parked_budget.unwrap_or(candidate.activation_peak))
         }
         _ => {}
     }
@@ -101,8 +98,11 @@ pub fn admit(
     // Union charging: all owners' bytes on the domain, including the candidate's
     // own reservations. When the candidate itself holds a Parked reservation, its
     // budget replaces rather than stacks (replace-don't-stack).
-    let charged = charged_bytes(&ledger, &candidate.domain)
-        .saturating_add(rollup_bytes(domains, reservations, &candidate.domain));
+    let charged = charged_bytes(&ledger, &candidate.domain).saturating_add(rollup_bytes(
+        domains,
+        reservations,
+        &candidate.domain,
+    ));
     let holds_parked = ledger
         .get(&candidate.domain)
         .and_then(|owners| owners.get(&candidate.owner))

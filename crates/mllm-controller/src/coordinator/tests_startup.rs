@@ -583,8 +583,7 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
             serde_json::json!("qualification-fake-v1");
         host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
             serde_json::json!("secret://another-admin");
-        host["resource_policy"]["domains"]["unified"]["managed_limit"] =
-            serde_json::json!("36GiB");
+        host["resource_policy"]["domains"]["unified"]["managed_limit"] = serde_json::json!("36GiB");
         let mut deployment = source["input"]["deployment"].clone();
         deployment.as_object_mut().unwrap().remove("resources");
         deployment["name"] = serde_json::json!("big");
@@ -648,7 +647,11 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     let start_big = |key: &str| w.commands().start("owner", &id, big.revision, key, 60_000);
     let status = |owner: &SharedCoordinatorState| {
         let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
-        snapshot.deployments.into_iter().find(|d| d.id == id).unwrap()
+        snapshot
+            .deployments
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap()
     };
 
     // Another engine holds a charge: refused, typed, nothing reserved.
@@ -659,7 +662,9 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     );
     assert!(matches!(
         start_big("start-beside"),
-        Err(CoordinatorCommandError::Lifecycle(LifecycleError::StartupRequiresEmptyHost))
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::StartupRequiresEmptyHost
+        ))
     ));
     assert!(footprint(&owner, &id).is_none());
     let before = serde_json::to_value(status(&owner).startup.unwrap()).unwrap();
@@ -677,8 +682,8 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     let held = footprint(&owner, &id).unwrap();
     assert_eq!(held.phase, ResourcePhase::Cold);
     assert_eq!(held.allocations[0].bytes, 36 * GIB);
-    let reserved = serde_json::to_value(status(&owner).instances[0].startup.clone().unwrap())
-        .unwrap();
+    let reserved =
+        serde_json::to_value(status(&owner).instances[0].startup.clone().unwrap()).unwrap();
     assert_eq!(reserved["provenance"], "whole_host");
     assert_eq!(reserved["bytes"], 36 * GIB);
     // Its load drops availability by 34 GiB, then it settles at Ready.
@@ -691,7 +696,10 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
         footprint(&owner, &id).is_some_and(|held| held.phase == ResourcePhase::Ready)
     })
     .await;
-    assert_eq!(footprint(&owner, &id).unwrap().allocations[0].bytes, 32 * GIB);
+    assert_eq!(
+        footprint(&owner, &id).unwrap().allocations[0].bytes,
+        32 * GIB
+    );
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     let peak = |sql: &rusqlite::Connection| -> Option<i64> {
         sql.query_row(
@@ -715,8 +723,8 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     let held = footprint(&owner, &id).unwrap();
     assert_eq!(held.phase, ResourcePhase::Cold);
     assert_eq!(held.allocations[0].bytes, 34 * GIB);
-    let reserved = serde_json::to_value(status(&owner).instances[0].startup.clone().unwrap())
-        .unwrap();
+    let reserved =
+        serde_json::to_value(status(&owner).instances[0].startup.clone().unwrap()).unwrap();
     assert_eq!(reserved["provenance"], "measured");
     second.release.add_permits(1);
     until("the measured start to reach Ready", || {
@@ -751,8 +759,7 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
             serde_json::json!("qualification-fake-v1");
         host["runtime_profiles"]["local"]["security"]["admin_credential_ref"] =
             serde_json::json!("secret://another-admin");
-        host["resource_policy"]["domains"]["unified"]["managed_limit"] =
-            serde_json::json!("36GiB");
+        host["resource_policy"]["domains"]["unified"]["managed_limit"] = serde_json::json!("36GiB");
         let mut deployment = source["input"]["deployment"].clone();
         deployment.as_object_mut().unwrap().remove("resources");
         deployment["name"] = serde_json::json!("big");
@@ -775,7 +782,11 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
     let id = big.deployment_id.clone();
     let startup = |owner: &SharedCoordinatorState| {
         let snapshot = owner.lock().unwrap().store().snapshot().unwrap();
-        let d = snapshot.deployments.into_iter().find(|d| d.id == id).unwrap();
+        let d = snapshot
+            .deployments
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
         serde_json::to_value(d.startup.unwrap()).unwrap()
     };
     assert_eq!(startup(&owner)["bytes"], 30 * GIB);
@@ -786,7 +797,11 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
             .store()
             .record_checkpoint_weights(o.session(), &id, big.revision, "lab", 24 * GIB, 1700)
             .unwrap());
-        let digest = o.store().checkpoint_digest(&id, big.revision).unwrap().unwrap();
+        let digest = o
+            .store()
+            .checkpoint_digest(&id, big.revision)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             serde_json::to_value(digest.state).unwrap(),
             serde_json::json!("pending")
@@ -810,7 +825,11 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
         Arc::new(|| Ok(1900)),
         CoordinatorOptions::default(),
         Arc::new(move |work| {
-            assert_eq!(work.fence().deployment_id, small, "only the small engine launches");
+            assert_eq!(
+                work.fence().deployment_id,
+                small,
+                "only the small engine launches"
+            );
             Ok(test_driver(a.clone()))
         }),
     )
@@ -821,8 +840,11 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
         InitializeStatus::Completed
     );
     assert!(matches!(
-        w.commands().start("owner", &id, big.revision, "start-beside", 60_000),
-        Err(CoordinatorCommandError::Lifecycle(LifecycleError::StartupRequiresEmptyHost))
+        w.commands()
+            .start("owner", &id, big.revision, "start-beside", 60_000),
+        Err(CoordinatorCommandError::Lifecycle(
+            LifecycleError::StartupRequiresEmptyHost
+        ))
     ));
     assert!(footprint(&owner, &id).is_none());
     w.shutdown().await.unwrap();

@@ -24,7 +24,6 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Json;
 
-
 /// Queue bounds (F1 design §5 / T19): bounded queues, explicit deadlines.
 #[derive(Debug, Clone)]
 pub struct QueueLimits {
@@ -50,8 +49,7 @@ pub struct RouterDeps {
     /// Activation join (T15 at the router tier): concurrent requests waking
     /// the same non-READY deployment join ONE wake — no double-spawn, no
     /// duplicate Start operations.
-    pub activation_join:
-        Arc<WakeJoin<(StatusCode, Json<serde_json::Value>)>>,
+    pub activation_join: Arc<WakeJoin<(StatusCode, Json<serde_json::Value>)>>,
 }
 
 #[derive(Clone)]
@@ -128,9 +126,11 @@ async fn list_models(
     if !authorized(&headers, &state.deps) {
         return Err(err_json("unauthorized", "missing or invalid api key"));
     }
-    let ids = state.deps.controller.list_enabled_route_ids().map_err(|e| {
-        err_json("internal", &format!("store: {e}"))
-    })?;
+    let ids = state
+        .deps
+        .controller
+        .list_enabled_route_ids()
+        .map_err(|e| err_json("internal", &format!("store: {e}")))?;
     let data: Vec<serde_json::Value> = ids
         .into_iter()
         .map(|id| serde_json::json!({"id": id, "object": "model"}))
@@ -151,7 +151,10 @@ async fn chat_completions(
     // SPEC §17 (M80): the router's clock starts when the handler does.
     let mut timing = timing::RequestTiming::start(state.deps.inflight.latency.clone());
     if !authorized(&headers, &state.deps) {
-        return Err(err_json("unauthorized", "missing or valid api key required"));
+        return Err(err_json(
+            "unauthorized",
+            "missing or valid api key required",
+        ));
     }
     // SPEC §10 (T19): the body is read under the router's configured bound
     // and no other. axum's implicit 2 MiB `Bytes` limit would refuse a
@@ -161,9 +164,8 @@ async fn chat_completions(
     let body = axum::body::to_bytes(body, state.deps.limits.max_buffered_bytes_total)
         .await
         .map_err(|_| err_json("request_too_large", "request exceeds buffered-bytes bound"))?;
-    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-        err_json("invalid_request", &format!("bad json: {e}"))
-    })?;
+    let v: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| err_json("invalid_request", &format!("bad json: {e}")))?;
     let Some(model) = v["model"].as_str().map(str::to_owned) else {
         return Err(err_json("invalid_request", "model is required"));
     };

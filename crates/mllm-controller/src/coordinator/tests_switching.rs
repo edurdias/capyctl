@@ -194,26 +194,32 @@ async fn lab_options(
     max_parked: Option<u32>,
     options: CoordinatorOptions,
 ) -> Lab {
-    lab_bindings(managed_gib, window_ms, max_parked, options, |scripted, clock| {
-        Arc::new(move |_: &InitializeWork| {
-            let observed = clock.clone();
-            Ok(ExecutionBinding::remote(
-                scripted.clone(),
-                Arc::new(move |context: CleanupExecutionContext| {
-                    let at = observed.load(Ordering::SeqCst);
-                    Box::pin(async move {
-                        Ok(CleanupEvidence {
-                            binding_id: context.binding_id,
-                            incarnation: context.incarnation,
-                            identities: context.identities,
-                            observed_at_ms: at,
-                            receipt: "scripted host observed the owned group gone".into(),
+    lab_bindings(
+        managed_gib,
+        window_ms,
+        max_parked,
+        options,
+        |scripted, clock| {
+            Arc::new(move |_: &InitializeWork| {
+                let observed = clock.clone();
+                Ok(ExecutionBinding::remote(
+                    scripted.clone(),
+                    Arc::new(move |context: CleanupExecutionContext| {
+                        let at = observed.load(Ordering::SeqCst);
+                        Box::pin(async move {
+                            Ok(CleanupEvidence {
+                                binding_id: context.binding_id,
+                                incarnation: context.incarnation,
+                                identities: context.identities,
+                                observed_at_ms: at,
+                                receipt: "scripted host observed the owned group gone".into(),
+                            })
                         })
-                    })
-                }),
-            ))
-        })
-    })
+                    }),
+                ))
+            })
+        },
+    )
     .await
 }
 
@@ -502,10 +508,26 @@ async fn under_max_parked_one_a_switch_wakes_its_parked_target_in_place() {
     .unwrap()
     .unwrap();
     assert_eq!(lab.state(&lab.a.deployment_id), "ready");
-    assert_eq!(lab.state(&b), "parked", "the victim parks beside the waking target");
-    assert_eq!(lab.instance(&lab.a.deployment_id, 0).2, a_generation, "woken, not restarted");
-    assert_eq!(lab.engine.calls(RuntimeAction::Restore, &lab.a.deployment_id), 1);
-    assert_eq!(lab.engine.calls(RuntimeAction::Initialize, &lab.a.deployment_id), 1);
+    assert_eq!(
+        lab.state(&b),
+        "parked",
+        "the victim parks beside the waking target"
+    );
+    assert_eq!(
+        lab.instance(&lab.a.deployment_id, 0).2,
+        a_generation,
+        "woken, not restarted"
+    );
+    assert_eq!(
+        lab.engine
+            .calls(RuntimeAction::Restore, &lab.a.deployment_id),
+        1
+    );
+    assert_eq!(
+        lab.engine
+            .calls(RuntimeAction::Initialize, &lab.a.deployment_id),
+        1
+    );
     // Nothing reclaimed the target to make room for the victim's park.
     assert!(lab.operations(&lab.a.deployment_id, "stop").is_empty());
     lab.worker.shutdown().await.unwrap();
@@ -777,7 +799,10 @@ async fn a_request_for_an_operator_stopped_deployment_evicts_nothing() {
     );
     assert_eq!(lab.state(&lab.a.deployment_id), "ready");
     assert!(lab.instance(&lab.a.deployment_id, 0).1, "A still admits");
-    assert_eq!(lab.engine.calls(RuntimeAction::Park, &lab.a.deployment_id), 0);
+    assert_eq!(
+        lab.engine.calls(RuntimeAction::Park, &lab.a.deployment_id),
+        0
+    );
     assert!(lab.switch_events().is_empty(), "no switch was planned");
     assert_eq!(lab.state(&b), "stopped");
     lab.worker.shutdown().await.unwrap();
@@ -821,7 +846,10 @@ async fn a_refused_victim_park_falls_back_to_a_verified_stop() {
     assert_eq!(lab.state(&b), "ready");
     assert_eq!(lab.state(&lab.a.deployment_id), "stopped");
     assert_eq!(lab.operations(&lab.a.deployment_id, "park"), ["failed"]);
-    assert_eq!(lab.engine.calls(RuntimeAction::Park, &lab.a.deployment_id), 1);
+    assert_eq!(
+        lab.engine.calls(RuntimeAction::Park, &lab.a.deployment_id),
+        1
+    );
     let kinds = lab.kinds();
     assert_eq!(kinds.first().map(String::as_str), Some("switch_planned"));
     assert!(kinds.contains(&"switch_failed".to_string()));
@@ -923,9 +951,11 @@ async fn a_request_empties_the_host_for_a_solo_first_start() {
     }
     let revision: i64 = lab
         .sql()
-        .query_row("SELECT revision FROM deployments WHERE id=?1", [&big], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT revision FROM deployments WHERE id=?1",
+            [&big],
+            |r| r.get(0),
+        )
         .unwrap();
     // An explicit start without --evict is refused beside A.
     assert!(matches!(
@@ -1064,8 +1094,14 @@ async fn a_stop_drains_an_in_flight_request_before_it_terminates() {
     assert!(!dispatch, "admission closed with the Stop");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (state, held) = stop_progress(&lab, stop.operation_id(), &id);
-    assert_ne!(state, "succeeded", "terminated while a request was in flight");
-    assert!(held, "the runtime was released while a request was in flight");
+    assert_ne!(
+        state, "succeeded",
+        "terminated while a request was in flight"
+    );
+    assert!(
+        held,
+        "the runtime was released while a request was in flight"
+    );
     port.close_request_lease(lease, crate::request_leases::LeaseEnd::Completed)
         .await
         .unwrap();
@@ -1214,8 +1250,14 @@ async fn a_settled_failed_launch_closes_only_its_own_instance() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(deployment_admitting, "the deployment itself stays admitting");
-    assert_eq!(*failing.calls.lock().unwrap(), vec![RuntimeAction::Initialize]);
+    assert!(
+        deployment_admitting,
+        "the deployment itself stays admitting"
+    );
+    assert_eq!(
+        *failing.calls.lock().unwrap(),
+        vec![RuntimeAction::Initialize]
+    );
     assert_eq!(lab.worker.status(), WorkerStatus::Running);
     lab.worker.shutdown().await.unwrap();
 }

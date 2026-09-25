@@ -282,7 +282,13 @@ fn recovery_reenrolls_the_same_host_and_keeps_the_old_certificate_revoked() {
     let hosts = store.enrolled_hosts().unwrap();
     assert_eq!(hosts.len(), 1, "no second host record");
     assert!(!hosts[0].revoked);
-    assert_eq!(store.certificate_host(&recovered.fingerprint, 4).unwrap().host_id, old.host_id);
+    assert_eq!(
+        store
+            .certificate_host(&recovered.fingerprint, 4)
+            .unwrap()
+            .host_id,
+        old.host_id
+    );
     // The old certificate stays revoked, whatever the host's state now.
     assert!(store.certificate_host(&old.fingerprint, 4).is_err());
     // An exact retry of the recovery replays its result; any other
@@ -306,9 +312,14 @@ fn recovery_reenrolls_the_same_host_and_keeps_the_old_certificate_revoked() {
         .expect_err("an active host takes no recovery invitation");
     // Renewal follows the new key only.
     assert!(store
-        .renew_host_certificate(&recovered.fingerprint, &"c".repeat(64), "renewal", &"d".repeat(64), 6, |host| {
-            Ok(certificate_with(host, "e"))
-        })
+        .renew_host_certificate(
+            &recovered.fingerprint,
+            &"c".repeat(64),
+            "renewal",
+            &"d".repeat(64),
+            6,
+            |host| { Ok(certificate_with(host, "e")) }
+        )
         .is_err());
     // Revoking again revokes the new certificate too; recovery never makes an
     // earlier certificate valid, and survives a reopen of the store.
@@ -328,9 +339,18 @@ fn recovery_reenrolls_the_same_host_and_keeps_the_old_certificate_revoked() {
     assert!(store.certificate_host(&"f".repeat(64), 9).is_ok());
     let events = store.events_after(None, 100).unwrap().events;
     let kinds: Vec<_> = events.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(kinds.iter().filter(|k| **k == "host_recovery_invited").count(), 3);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "host_recovery_invited")
+            .count(),
+        3
+    );
     assert_eq!(kinds.iter().filter(|k| **k == "host_recovered").count(), 2);
-    let invited = events.iter().find(|e| e.kind == "host_recovery_invited").unwrap();
+    let invited = events
+        .iter()
+        .find(|e| e.kind == "host_recovery_invited")
+        .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&invited.payload_json).unwrap();
     assert_eq!(payload["host_id"], old.host_id.as_str());
     assert_eq!(payload["expires_unix"], 100);

@@ -2,17 +2,16 @@
 //! admit against bounds and dispatch only to READY deployments; auth is
 //! API-key; queue limits return structured errors.
 
-
 use futures::StreamExt;
-use tower::ServiceExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tower::ServiceExt;
 
-use mllm_testkit::FakeEngine;
 use mllm_controller::Controller;
 use mllm_router::forwarders::StaticForwarders;
 use mllm_router::{QueueLimits, RouterDeps};
 use mllm_store::Store;
+use mllm_testkit::FakeEngine;
 
 async fn app() -> (
     axum::Router,
@@ -35,20 +34,25 @@ async fn app() -> (
             "fake".to_string(),
             adapter,
         )]))),
-        limits: QueueLimits { max_requests_per_deployment: 2, max_buffered_bytes_total: 1024 },
+        limits: QueueLimits {
+            max_requests_per_deployment: 2,
+            max_buffered_bytes_total: 1024,
+        },
         api_key: Some("test-key".into()),
         inflight: Arc::new(mllm_router::admission::InFlight::default()),
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
     };
     let file_store = Store::open_in_memory().unwrap();
-    (mllm_router::serve_router(deps.clone()), shared, controller, file_store, deps)
+    (
+        mllm_router::serve_router(deps.clone()),
+        shared,
+        controller,
+        file_store,
+        deps,
+    )
 }
 
-async fn deploy_ready(
-    _router: &axum::Router,
-    controller: &Controller,
-    name: &str,
-) -> String {
+async fn deploy_ready(_router: &axum::Router, controller: &Controller, name: &str) -> String {
     let id = controller
         .submit_deploy(mllm_controller::DeployRequest {
             name: name.into(),
@@ -83,7 +87,9 @@ async fn models_lists_enabled_never_wakes() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["data"][0]["id"], "m1");
     // Never wakes: observed state unchanged (Ready, since it was ready — but
@@ -184,7 +190,9 @@ async fn chat_dispatches_to_ready_deployment() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v["choices"][0]["message"]["content"].is_string());
 }
@@ -212,7 +220,9 @@ async fn queue_bounds_return_structured_error() {
     // SPEC §10: an oversized body is a body-size refusal (413), not a full
     // queue; retrying the same body can never succeed.
     assert_eq!(res.status(), 413);
-    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["code"], "request_too_large");
 }
@@ -467,7 +477,10 @@ async fn stub_engine(expects: Arc<Mutex<EngineExpects>>) -> String {
     base
 }
 
-async fn chat_once(router: &axum::Router, alias: &str) -> (axum::http::StatusCode, serde_json::Value) {
+async fn chat_once(
+    router: &axum::Router,
+    alias: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
     let response = router
         .clone()
         .oneshot(
@@ -490,7 +503,10 @@ async fn chat_once(router: &axum::Router, alias: &str) -> (axum::http::StatusCod
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// Spec §3: the router resolves endpoint and key per deployment at request time. T19
@@ -532,7 +548,10 @@ async fn the_router_forwards_to_the_deployments_live_endpoint_with_its_key() {
     });
 
     let (status, body) = chat_once(&router, "public-alias").await;
-    assert_eq!(status, 200, "the first launch's key reaches its engine: {body}");
+    assert_eq!(
+        status, 200,
+        "the first launch's key reaches its engine: {body}"
+    );
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
     // The client asked for the alias and is answered in its own terms; the served
     // name is what went upstream and never leaks back.
@@ -638,7 +657,13 @@ async fn chat_stream(router: &axum::Router, alias: &str) -> (axum::http::StatusC
 }
 
 fn ends(authority: &StubAuthority) -> Vec<Option<mllm_controller::LeaseEnd>> {
-    authority.leases.lock().unwrap().iter().map(|(_, end)| *end).collect()
+    authority
+        .leases
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, end)| *end)
+        .collect()
 }
 
 // T17 T19 (SPEC §10, owner decision 2026-09-22): every dispatch holds a durable
@@ -651,7 +676,10 @@ async fn a_completed_dispatch_opens_and_closes_one_lease() {
     let router = mllm_router::serve_router(deps.clone());
     let (status, body) = chat_once(&router, "public-alias").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(ends(&authority), vec![Some(mllm_controller::LeaseEnd::Completed)]);
+    assert_eq!(
+        ends(&authority),
+        vec![Some(mllm_controller::LeaseEnd::Completed)]
+    );
     let (status, text) = chat_stream(&router, "public-alias").await;
     assert_eq!(status, 200);
     assert!(text.contains("[DONE]"), "{text}");
@@ -677,12 +705,21 @@ async fn a_shutting_down_refusal_is_a_retryable_503_that_closes_the_lease() {
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["code"], "shutting_down");
     assert_eq!(body["retryable"], true);
-    assert_eq!(ends(&authority), vec![Some(mllm_controller::LeaseEnd::NotAccepted)]);
+    assert_eq!(
+        ends(&authority),
+        vec![Some(mllm_controller::LeaseEnd::NotAccepted)]
+    );
     assert_eq!(deps.inflight.current("dep-1"), 0, "nothing was accepted");
     let (status, text) = chat_stream(&router, "public-alias").await;
     assert_eq!(status, 200);
-    assert!(text.contains("shutting_down") && !text.contains("[DONE]"), "{text}");
-    assert_eq!(ends(&authority)[1], Some(mllm_controller::LeaseEnd::NotAccepted));
+    assert!(
+        text.contains("shutting_down") && !text.contains("[DONE]"),
+        "{text}"
+    );
+    assert_eq!(
+        ends(&authority)[1],
+        Some(mllm_controller::LeaseEnd::NotAccepted)
+    );
 }
 
 // T17 T19 (SPEC §10, found live 2026-09-24): an engine rejection of an
@@ -701,12 +738,24 @@ async fn an_engine_rejection_is_relayed_and_closes_the_lease() {
         let (status, body) = chat_once(&router, "public-alias").await;
         assert_eq!(status, 400, "{body}");
         assert_eq!(body["code"], "engine_rejected");
-        assert!(body["message"].as_str().unwrap().contains("maximum context length"), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("maximum context length"),
+            "{body}"
+        );
     }
     let (status, text) = chat_stream(&router, "public-alias").await;
     assert_eq!(status, 200);
-    assert!(text.contains("engine_rejected") && text.contains("maximum context length"), "{text}");
-    assert!(text.contains("\"retryable\":false") && !text.contains("[DONE]"), "{text}");
+    assert!(
+        text.contains("engine_rejected") && text.contains("maximum context length"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"retryable\":false") && !text.contains("[DONE]"),
+        "{text}"
+    );
     assert_eq!(
         ends(&authority),
         vec![Some(mllm_controller::LeaseEnd::Completed); bound + 3]
@@ -785,7 +834,9 @@ async fn a_closed_gate_refuses_before_the_engine_with_a_retryable_503() {
         .await
         .unwrap();
     assert_eq!(response.status(), 429);
-    assert!(response.headers().contains_key(axum::http::header::RETRY_AFTER));
+    assert!(response
+        .headers()
+        .contains_key(axum::http::header::RETRY_AFTER));
 }
 
 /// Send one raw chat body (as bytes) with optional headers.
@@ -807,12 +858,18 @@ async fn post_raw(
         .await
         .unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 fn chat_body(alias: &str, extra: serde_json::Value) -> Vec<u8> {
-    let mut body = serde_json::json!({"model": alias, "messages": [{"role":"user","content":"hi"}]});
+    let mut body =
+        serde_json::json!({"model": alias, "messages": [{"role":"user","content":"hi"}]});
     for (key, value) in extra.as_object().cloned().unwrap_or_default() {
         body[key] = value;
     }
@@ -838,10 +895,22 @@ async fn unforwardable_requests_are_400_before_any_engine_and_tools_are_forwarde
     let router = mllm_router::serve_router(deps.clone());
     for (body, code) in [
         (b"{not json".to_vec(), "invalid_request"),
-        (chat_body("public-alias", serde_json::json!({"rid": "x"})), "invalid_request"),
-        (chat_body("public-alias", serde_json::json!({"n": 2})), "unsupported_parameter"),
-        (chat_body("public-alias", serde_json::json!({"functions": []})), "unsupported_parameter"),
-        (chat_body("public-alias", serde_json::json!({"n": 3, "stream": true})), "unsupported_parameter"),
+        (
+            chat_body("public-alias", serde_json::json!({"rid": "x"})),
+            "invalid_request",
+        ),
+        (
+            chat_body("public-alias", serde_json::json!({"n": 2})),
+            "unsupported_parameter",
+        ),
+        (
+            chat_body("public-alias", serde_json::json!({"functions": []})),
+            "unsupported_parameter",
+        ),
+        (
+            chat_body("public-alias", serde_json::json!({"n": 3, "stream": true})),
+            "unsupported_parameter",
+        ),
     ] {
         let (status, answer) = post_raw(&router, body, None).await;
         assert_eq!(status, 400, "{answer}");
@@ -855,8 +924,14 @@ async fn unforwardable_requests_are_400_before_any_engine_and_tools_are_forwarde
     let (status, answer) = post_raw(&router, chat_body("public-alias", tools), None).await;
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["choices"][0]["finish_reason"], "tool_calls");
-    assert_eq!(answer["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup");
-    assert_eq!(ends(&authority), vec![Some(mllm_controller::LeaseEnd::Completed)]);
+    assert_eq!(
+        answer["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(
+        ends(&authority),
+        vec![Some(mllm_controller::LeaseEnd::Completed)]
+    );
 }
 
 // T19 (SPEC §10: limit body size): the router's configured bound is the body
@@ -873,7 +948,10 @@ async fn the_configured_body_bound_is_the_request_limit() {
     let mut body = large.clone();
     body["model"] = serde_json::json!("public-alias");
     let (status, answer) = post_raw(&router, body.to_string().into_bytes(), None).await;
-    assert_eq!(status, 200, "a 3 MiB body under a 4 MiB bound is served: {answer}");
+    assert_eq!(
+        status, 200,
+        "a 3 MiB body under a 4 MiB bound is served: {answer}"
+    );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     body["messages"][0]["content"] = serde_json::json!("x".repeat(5 << 20));
     let (status, answer) = post_raw(&router, body.to_string().into_bytes(), None).await;
@@ -921,9 +999,12 @@ async fn gated_engine() -> (String, Arc<tokio::sync::Semaphore>, Arc<Mutex<Vec<S
         axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let (gate, seen) = (held.clone(), seen.clone());
             async move {
-                seen.lock()
-                    .unwrap()
-                    .push(body["messages"][0]["content"].as_str().unwrap_or_default().to_owned());
+                seen.lock().unwrap().push(
+                    body["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 gate.acquire().await.unwrap().forget();
                 (
                     axum::http::StatusCode::OK,
@@ -987,13 +1068,18 @@ async fn at_the_in_flight_bound_requests_wait_in_arrival_order() {
     // wait is short.
     let holder = send("r4");
     until("r4 at the engine", || order.lock().unwrap().len() == 4).await;
-    deps.inflight.waiting.set_limits(mllm_router::queue::WaitLimits {
-        deadline: std::time::Duration::from_millis(300),
-        ..Default::default()
-    });
+    deps.inflight
+        .waiting
+        .set_limits(mllm_router::queue::WaitLimits {
+            deadline: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
     let started = std::time::Instant::now();
     let (status, answer) = send("r5").await.unwrap();
-    assert!(started.elapsed() >= std::time::Duration::from_millis(250), "waited first");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "waited first"
+    );
     assert_eq!(status, 429, "{answer}");
     assert_eq!(answer["retryable"], true);
     assert_eq!(deps.inflight.slot_waiters("dep-1"), 0, "it left the queue");
@@ -1020,7 +1106,10 @@ async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
             async move {
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
                     .chain(futures::stream::pending());
-                ([("content-type", "text/event-stream")], axum::body::Body::from_stream(stream))
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
             }
         }),
     );
@@ -1028,10 +1117,12 @@ async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
     let endpoint = format!("http://{}", socket.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
     let (authority, deps) = stub_router(&endpoint);
-    deps.inflight.waiting.set_limits(mllm_router::queue::WaitLimits {
-        stream_idle: std::time::Duration::from_millis(300),
-        ..Default::default()
-    });
+    deps.inflight
+        .waiting
+        .set_limits(mllm_router::queue::WaitLimits {
+            stream_idle: std::time::Duration::from_millis(300),
+            ..Default::default()
+        });
     let router = mllm_router::serve_router(deps.clone());
     let (status, answer) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -1041,7 +1132,10 @@ async fn a_non_streaming_request_is_bounded_by_the_stream_idle_bound() {
     .expect("cut at the idle bound, not a fixed 60 s read timeout");
     assert_eq!(status, 500, "{answer}");
     assert_eq!(answer["code"], "engine_error");
-    assert_eq!(ends(&authority), vec![Some(mllm_controller::LeaseEnd::Uncertain)]);
+    assert_eq!(
+        ends(&authority),
+        vec![Some(mllm_controller::LeaseEnd::Uncertain)]
+    );
 }
 
 // T15 (SPEC §10 step 2): a detached activation whose task panics answers its

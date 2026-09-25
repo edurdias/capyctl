@@ -128,7 +128,11 @@ pub fn public_reason(evidence: &str) -> Option<String> {
     }
     if let Some(rest) = text.strip_prefix("deployment ") {
         if let Some((id, tail)) = rest.split_once(": ") {
-            if !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)) {
+            if !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            {
                 text = tail;
             }
         }
@@ -146,7 +150,9 @@ pub fn public_reason(evidence: &str) -> Option<String> {
     }
     let lower = text.to_ascii_lowercase();
     if SENSITIVE.iter().any(|marker| lower.contains(marker)) {
-        return Some("the recorded reason is withheld from status because it may quote a credential".into());
+        return Some(
+            "the recorded reason is withheld from status because it may quote a credential".into(),
+        );
     }
     let mut end = text.len().min(MAX_REASON_BYTES);
     while !text.is_char_boundary(end) {
@@ -193,9 +199,15 @@ mod tests {
     // hint; the engine's own exit is classified from what the reason says.
     #[test]
     fn classification_prefers_the_named_category() {
-        let refused = "host policy refused the launch before any effect: capability_missing:deep_park";
-        assert_eq!(classify(Some("launch_failed"), refused), Some("capability_missing:deep_park"));
-        assert!(operator_hint("capability_missing:deep_park").unwrap().contains("restart_only"));
+        let refused =
+            "host policy refused the launch before any effect: capability_missing:deep_park";
+        assert_eq!(
+            classify(Some("launch_failed"), refused),
+            Some("capability_missing:deep_park")
+        );
+        assert!(operator_hint("capability_missing:deep_park")
+            .unwrap()
+            .contains("restart_only"));
         assert_eq!(
             classify(Some("launch_failed"), "engine launch failed: the engine exited before readiness with exit code 2; it rejected argument --moe-backend"),
             Some("engine_argument_rejected")
@@ -204,9 +216,14 @@ mod tests {
             classify(Some("launch_failed"), "engine exited before readiness"),
             Some("engine_exited")
         );
-        assert_eq!(classify(Some("startup_requires_empty_host"), ""), Some("startup_requires_empty_host"));
+        assert_eq!(
+            classify(Some("startup_requires_empty_host"), ""),
+            Some("startup_requires_empty_host")
+        );
         assert_eq!(classify(Some("launch_failed"), "something else"), None);
-        assert!(operator_hint("startup_requires_empty_host").unwrap().contains("--evict"));
+        assert!(operator_hint("startup_requires_empty_host")
+            .unwrap()
+            .contains("--evict"));
     }
 
     // T29: only a closed code is shown as an operation's error code.

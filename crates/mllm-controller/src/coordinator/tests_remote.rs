@@ -126,7 +126,11 @@ fn owns(owner: &SharedCoordinatorState, fence: &DeploymentFence) -> bool {
 
 fn recorded(owner: &SharedCoordinatorState, fence: &DeploymentFence) -> Vec<ProcessIdentity> {
     let o = owner.lock().unwrap();
-    let binding = o.store().runtime_binding(&fence.deployment_id).unwrap().unwrap();
+    let binding = o
+        .store()
+        .runtime_binding(&fence.deployment_id)
+        .unwrap()
+        .unwrap();
     o.store().runtime_binding_identities(&binding.id).unwrap()
 }
 
@@ -217,7 +221,11 @@ async fn an_operator_stop_settles_an_uncertain_unassociated_remote_launch() {
 fn make_remote(dir: &tempfile::TempDir, owner: &SharedCoordinatorState, fence: &DeploymentFence) {
     let binding = {
         let o = owner.lock().unwrap();
-        o.store().runtime_binding(&fence.deployment_id).unwrap().unwrap().id
+        o.store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .unwrap()
+            .id
     };
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     sql.execute(
@@ -254,7 +262,12 @@ async fn a_restarted_controller_adopts_and_settles_an_uncertain_remote_launch() 
     ));
     assert!(owns(&owner, &fence), "restart releases nothing");
     let restarted = ScriptedHost::new(false);
-    let w = remote_worker(owner.clone(), observations, restarted.clone(), Gate::new(false));
+    let w = remote_worker(
+        owner.clone(),
+        observations,
+        restarted.clone(),
+        Gate::new(false),
+    );
     // The adopted launch is still uncertain, and the worker pauses on it.
     assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
     assert!(restarted.calls.load(Ordering::SeqCst) >= 1);
@@ -283,7 +296,12 @@ async fn a_restart_pauses_and_retries_every_adopted_uncertain_launch() {
     // Hold both launches until each has armed, so the first one's pause does
     // not refuse the second start.
     gate.release.acquire().await.unwrap().forget();
-    let w = remote_worker(owner.clone(), observations.clone(), host.clone(), gate.clone());
+    let w = remote_worker(
+        owner.clone(),
+        observations.clone(),
+        host.clone(),
+        gate.clone(),
+    );
     let first = w.start(&fence, 10000).unwrap();
     let second = w.start(&other, 10000).unwrap();
     gate.entered().await;
@@ -307,7 +325,12 @@ async fn a_restart_pauses_and_retries_every_adopted_uncertain_launch() {
         crate::ownership::OwnedCoordinatorState::open(dir.path()).unwrap(),
     ));
     let restarted = ScriptedHost::new(false);
-    let w = remote_worker(owner.clone(), observations, restarted.clone(), Gate::new(false));
+    let w = remote_worker(
+        owner.clone(),
+        observations,
+        restarted.clone(),
+        Gate::new(false),
+    );
     assert!(matches!(stopped(&w).await, WorkerStatus::Uncertain { .. }));
     let asked = |deployment: &str| {
         restarted
@@ -357,9 +380,7 @@ async fn shutdown_does_not_wait_for_a_settlement_the_host_never_answers() {
             let asked = asked.clone();
             Ok(ExecutionBinding::remote(
                 gate.clone(),
-                Arc::new(|_| {
-                    Box::pin(async { Err(CoordinatorError::Service("unused".into())) })
-                }),
+                Arc::new(|_| Box::pin(async { Err(CoordinatorError::Service("unused".into())) })),
             )
             .with_settlement(Arc::new(move |_| {
                 // The first settlement fails at once; every retry hangs.
@@ -407,7 +428,12 @@ async fn a_restarted_controller_adopts_a_ready_remote_launch_and_can_stop_it() {
     let gate = Gate::new(false);
     *gate.association.lock().unwrap() = Some(owner.clone());
     gate.release.add_permits(1);
-    let w = remote_worker(owner.clone(), observations.clone(), host.clone(), gate.clone());
+    let w = remote_worker(
+        owner.clone(),
+        observations.clone(),
+        host.clone(),
+        gate.clone(),
+    );
     let start = w.start(&fence, 10000).unwrap();
     assert_eq!(
         start.wait(Duration::from_secs(60)).await.unwrap(),
@@ -438,8 +464,15 @@ async fn a_restarted_controller_adopts_a_ready_remote_launch_and_can_stop_it() {
     })
     .await
     .expect("the Ready remote launch was never adopted");
-    assert!(!adopted[0].dispatch_enabled, "no dispatch before a fresh probe");
-    assert_eq!(host.calls.load(Ordering::SeqCst), 0, "a Ready launch is never settled");
+    assert!(
+        !adopted[0].dispatch_enabled,
+        "no dispatch before a fresh probe"
+    );
+    assert_eq!(
+        host.calls.load(Ordering::SeqCst),
+        0,
+        "a Ready launch is never settled"
+    );
     assert_eq!(w.status(), WorkerStatus::Running);
     let stop = w.stop("owner", &fence, "stop-adopted", 10000).unwrap();
     assert_eq!(
@@ -519,7 +552,9 @@ impl crate::remote_readiness::ReadinessHosts for ScriptedReadiness {
     }
 }
 
-fn ready_launch(owner: &SharedCoordinatorState) -> mllm_store::ordinary_lifecycle::recovery::RemoteReadyLaunch {
+fn ready_launch(
+    owner: &SharedCoordinatorState,
+) -> mllm_store::ordinary_lifecycle::recovery::RemoteReadyLaunch {
     let o = owner.lock().unwrap();
     let mut listed = o.store().remote_ready_launches(o.session()).unwrap();
     assert_eq!(listed.len(), 1);
@@ -624,15 +659,25 @@ async fn host_session_loss_closes_dispatch_until_a_fresh_probe_passes() {
     supervisor.pass();
     until(dispatching).await;
     assert_eq!(
-        ledger.lock().unwrap().get(&launch.binding_id).map(String::as_str),
+        ledger
+            .lock()
+            .unwrap()
+            .get(&launch.binding_id)
+            .map(String::as_str),
         Some("session-4")
     );
     let evidence = {
         let o = owner.lock().unwrap();
         o.store().journal_evidence(&launch.operation_id).unwrap()
     };
-    assert!(evidence.iter().any(|e| e.contains("dispatch reopened")), "{evidence:?}");
-    assert!(evidence.iter().any(|e| e.contains("dispatch is closed")), "{evidence:?}");
+    assert!(
+        evidence.iter().any(|e| e.contains("dispatch reopened")),
+        "{evidence:?}"
+    );
+    assert!(
+        evidence.iter().any(|e| e.contains("dispatch is closed")),
+        "{evidence:?}"
+    );
     drop(start);
     w.shutdown().await.unwrap();
 }
@@ -683,15 +728,22 @@ async fn a_failed_switch_never_reopens_a_gate_a_host_loss_closed() {
     let (deployment, generation) = (fence.deployment_id.clone(), launch.fence.generation);
 
     // The switch closes the victim's gate to drain it.
-    assert!(commands.close_for_switch(&deployment, 0, generation).unwrap());
+    assert!(commands
+        .close_for_switch(&deployment, 0, generation)
+        .unwrap());
     // The proving session is lost during the drain window: supervision
     // records its own reason although the gate is already closed.
     *hosts.current.lock().unwrap() = None;
     supervisor.pass();
     assert!(ready_launch(&owner).host_closure_recorded);
     // The switch fails (drain timeout): it must not reopen the gate.
-    assert!(!commands.reopen_after_switch(&deployment, 0, generation).unwrap());
-    assert!(!dispatching(), "a failed switch reopened a host-loss closure");
+    assert!(!commands
+        .reopen_after_switch(&deployment, 0, generation)
+        .unwrap());
+    assert!(
+        !dispatching(),
+        "a failed switch reopened a host-loss closure"
+    );
     // Only the host's fresh probe reopens it.
     *hosts.current.lock().unwrap() = Some("session-2".into());
     supervisor.pass();
@@ -700,17 +752,26 @@ async fn a_failed_switch_never_reopens_a_gate_a_host_loss_closed() {
     // The other order: a switch holds the gate closed, the host flaps and its
     // new session proves the engine again. The probe clears only its own
     // reason; the gate stays closed until the switch ends.
-    assert!(commands.close_for_switch(&deployment, 0, generation).unwrap());
+    assert!(commands
+        .close_for_switch(&deployment, 0, generation)
+        .unwrap());
     *hosts.current.lock().unwrap() = Some("session-3".into());
     supervisor.pass();
     until(|| {
-        ledger.lock().unwrap().get(&launch.binding_id).map(String::as_str) == Some("session-3")
+        ledger
+            .lock()
+            .unwrap()
+            .get(&launch.binding_id)
+            .map(String::as_str)
+            == Some("session-3")
     })
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!dispatching(), "a probe reopened a gate the switch holds");
     assert!(!ready_launch(&owner).host_closure_recorded);
-    assert!(commands.reopen_after_switch(&deployment, 0, generation).unwrap());
+    assert!(commands
+        .reopen_after_switch(&deployment, 0, generation)
+        .unwrap());
     assert!(dispatching());
     drop(start);
     w.shutdown().await.unwrap();
@@ -872,7 +933,12 @@ async fn a_restarted_controller_resumes_a_stop_its_crashed_session_accepted() {
     let gate = Gate::new(false);
     *gate.association.lock().unwrap() = Some(owner.clone());
     gate.release.add_permits(1);
-    let w = remote_worker(owner.clone(), observations.clone(), host.clone(), gate.clone());
+    let w = remote_worker(
+        owner.clone(),
+        observations.clone(),
+        host.clone(),
+        gate.clone(),
+    );
     let start = w.start(&fence, 10000).unwrap();
     assert_eq!(
         start.wait(Duration::from_secs(60)).await.unwrap(),
@@ -895,7 +961,12 @@ async fn a_restarted_controller_resumes_a_stop_its_crashed_session_accepted() {
     ));
     assert!(owns(&owner, &fence), "restart releases nothing");
     let restarted = ScriptedHost::new(true);
-    let w = remote_worker(owner.clone(), observations, restarted.clone(), Gate::new(false));
+    let w = remote_worker(
+        owner.clone(),
+        observations,
+        restarted.clone(),
+        Gate::new(false),
+    );
     until(|| !owns(&owner, &fence)).await;
     assert_eq!(binding_state(&owner, &fence), "released");
     let resent = restarted.cleanups.lock().unwrap().clone();
@@ -906,8 +977,10 @@ async fn a_restarted_controller_resumes_a_stop_its_crashed_session_accepted() {
         o.store().journal_evidence_of(&fence.deployment_id).unwrap()
     };
     assert!(
-        evidence.iter().any(|e| e.contains("adopted its accepted Stop")
-            && e.contains("may already have been sent")),
+        evidence
+            .iter()
+            .any(|e| e.contains("adopted its accepted Stop")
+                && e.contains("may already have been sent")),
         "{evidence:?}"
     );
     assert_eq!(w.status(), WorkerStatus::Running);
@@ -986,20 +1059,33 @@ async fn a_host_policy_refusal_settles_the_launch_at_once_with_its_reason() {
         start.wait(Duration::from_secs(60)).await.unwrap(),
         InitializeStatus::Closed
     );
-    assert_eq!(host.calls.load(Ordering::SeqCst), 1, "settled once, never paused");
+    assert_eq!(
+        host.calls.load(Ordering::SeqCst),
+        1,
+        "settled once, never paused"
+    );
     let context = host.contexts.lock().unwrap()[0].clone();
-    assert!(context.identities.is_empty(), "the refusing host started nothing");
+    assert!(
+        context.identities.is_empty(),
+        "the refusing host started nothing"
+    );
     assert_eq!(binding_state(&owner, &fence), "released");
     assert!(!owns(&owner, &fence));
     {
         let o = owner.lock().unwrap();
         let evidence = o.store().journal_evidence(start.operation_id()).unwrap();
         assert!(
-            evidence.iter().any(|entry| entry.contains("launch failed")
-                && entry.contains("checkpoint_mismatch")),
+            evidence
+                .iter()
+                .any(|entry| entry.contains("launch failed")
+                    && entry.contains("checkpoint_mismatch")),
             "{evidence:?}"
         );
-        let operation = o.store().latest_operation(&fence.deployment_id).unwrap().unwrap();
+        let operation = o
+            .store()
+            .latest_operation(&fence.deployment_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(operation.error_code.as_deref(), Some("launch_failed"));
     }
     running(&w).await;
@@ -1065,7 +1151,11 @@ async fn a_stop_for_an_offline_host_waits_unarmed_until_it_reconnects() {
         host.cleanups.lock().unwrap().is_empty(),
         "nothing is sent to an offline host"
     );
-    assert_eq!(w.status(), WorkerStatus::Running, "the worker keeps running");
+    assert_eq!(
+        w.status(),
+        WorkerStatus::Running,
+        "the worker keeps running"
+    );
     assert!(owns(&owner, &fence), "nothing is released without evidence");
     assert_ne!(binding_state(&owner, &fence), "released");
     presence.online.lock().unwrap().insert("lab".into());
@@ -1074,7 +1164,11 @@ async fn a_stop_for_an_offline_host_waits_unarmed_until_it_reconnects() {
         mllm_store::ordinary_lifecycle::cleanup::OrdinaryCleanupStatus::Completed
     );
     let cleanups = host.cleanups.lock().unwrap().clone();
-    assert_eq!(cleanups.len(), 1, "one Terminate, after the host reconnected");
+    assert_eq!(
+        cleanups.len(),
+        1,
+        "one Terminate, after the host reconnected"
+    );
     assert_eq!(binding_state(&owner, &fence), "released");
     assert!(!owns(&owner, &fence));
     drop(start);
@@ -1123,8 +1217,15 @@ async fn an_offline_stop_whose_deadline_passed_neither_sends_nor_halts() {
     clock.store(20_000, Ordering::SeqCst);
     presence.online.lock().unwrap().insert("lab".into());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(host.cleanups.lock().unwrap().is_empty(), "an elapsed Stop is never sent");
-    assert_eq!(w.status(), WorkerStatus::Running, "the worker keeps running");
+    assert!(
+        host.cleanups.lock().unwrap().is_empty(),
+        "an elapsed Stop is never sent"
+    );
+    assert_eq!(
+        w.status(),
+        WorkerStatus::Running,
+        "the worker keeps running"
+    );
     assert!(owns(&owner, &fence), "nothing is released without evidence");
     assert_ne!(binding_state(&owner, &fence), "released");
     drop((start, stop));
@@ -1184,7 +1285,12 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(host.cleanups.lock().unwrap().is_empty());
     assert!(owns(&owner, &fence), "nothing is released without evidence");
-    assert!(owner.lock().unwrap().store().host_drain_pending("lab").unwrap());
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store()
+        .host_drain_pending("lab")
+        .unwrap());
 
     presence.online.lock().unwrap().insert("lab".into());
     until(|| !owns(&owner, &fence)).await;
@@ -1204,7 +1310,10 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!((state.as_str(), code.as_deref()), ("failed", Some("expired")));
+    assert_eq!(
+        (state.as_str(), code.as_deref()),
+        ("failed", Some("expired"))
+    );
     let reissued: String = sql
         .query_row(
             "SELECT operation_id FROM host_drains WHERE host_id='lab' AND operation_id!=?1",
@@ -1229,7 +1338,9 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
         .unwrap();
     assert!(deadline > 20_000, "the reissued Stop has a new deadline");
     let kinds: Vec<String> = sql
-        .prepare("SELECT kind FROM management_events WHERE operation_id IN (?1,?2) ORDER BY sequence")
+        .prepare(
+            "SELECT kind FROM management_events WHERE operation_id IN (?1,?2) ORDER BY sequence",
+        )
         .unwrap()
         .query_map([&expired, &reissued], |r| r.get(0))
         .unwrap()
@@ -1249,7 +1360,10 @@ async fn an_expired_drain_stop_is_reissued_when_its_host_reconnects() {
         assert!(old.iter().any(|e| e.contains("expired")), "{old:?}");
         let new = o.store().journal_evidence(&reissued).unwrap();
         assert!(new.iter().any(|e| e.contains("reissued")), "{new:?}");
-        assert!(!o.store().host_drain_pending("lab").unwrap(), "the marker clears");
+        assert!(
+            !o.store().host_drain_pending("lab").unwrap(),
+            "the marker clears"
+        );
     }
     // A retried drain replays the original Stop's receipt; it issues nothing.
     let replay = w.stop("owner", &fence, "drain:reissue", 10000).unwrap();
@@ -1329,7 +1443,10 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
     let only = &instances[0];
     assert_eq!(only.generation, fence.generation);
     assert_eq!(only.remote_host.as_deref(), Some("lab"));
-    assert_eq!(only.launch_command_id.as_deref(), Some(launch.step_id.as_str()));
+    assert_eq!(
+        only.launch_command_id.as_deref(),
+        Some(launch.step_id.as_str())
+    );
     assert!(only.dispatch_open && only.host_live);
     let view = only.load.as_ref().expect("a fresh sample for this launch");
     assert_eq!(view.engine_queue(), Some(4));
@@ -1357,7 +1474,10 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
     ));
     // SPEC §13.2: the host's session is gone; the view says so at once.
     live.store(false, Ordering::SeqCst);
-    let instances = lifecycle.serving_instances(&fence.deployment_id).unwrap().unwrap();
+    let instances = lifecycle
+        .serving_instances(&fence.deployment_id)
+        .unwrap()
+        .unwrap();
     assert!(!instances[0].host_live);
     // The gate closes (the supervisor noticed): no lease, no endpoint.
     {
@@ -1367,7 +1487,10 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
             .suspend_remote_dispatch(o.session(), &launch.step_id)
             .unwrap());
     }
-    let instances = lifecycle.serving_instances(&fence.deployment_id).unwrap().unwrap();
+    let instances = lifecycle
+        .serving_instances(&fence.deployment_id)
+        .unwrap()
+        .unwrap();
     assert!(!instances[0].dispatch_open);
     assert!(matches!(
         lifecycle
@@ -1382,7 +1505,13 @@ async fn the_router_sees_each_instance_with_its_host_load_and_generation_fence()
     // T32: the lease already granted stays charged until closed on evidence.
     {
         let o = owner.lock().unwrap();
-        assert_eq!(o.store().pending_dispatches(&fence.deployment_id).unwrap().len(), 1);
+        assert_eq!(
+            o.store()
+                .pending_dispatches(&fence.deployment_id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
     lifecycle
         .close_request_lease(lease, crate::request_leases::LeaseEnd::NotAccepted)
@@ -1452,7 +1581,11 @@ async fn an_unresponsive_host_reproves_readiness_on_the_same_session() {
     until(|| !hosts.probes.lock().unwrap().is_empty()).await;
     until(dispatching).await;
     assert_eq!(
-        ledger.lock().unwrap().get(&launch.binding_id).map(String::as_str),
+        ledger
+            .lock()
+            .unwrap()
+            .get(&launch.binding_id)
+            .map(String::as_str),
         Some("session-1")
     );
     assert!(owns(&owner, &fence));

@@ -52,9 +52,15 @@ impl CoordinatorCommands {
                 .max()
         };
         self.owned(|owner| {
-            owner
-                .store()
-                .plan_switch(owner.session(), target, only, explicit, eligible.as_ref(), protected, &last)
+            owner.store().plan_switch(
+                owner.session(),
+                target,
+                only,
+                explicit,
+                eligible.as_ref(),
+                protected,
+                &last,
+            )
         })
     }
 

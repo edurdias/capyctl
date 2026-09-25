@@ -90,7 +90,13 @@ pub fn extract(archive: &Path, target: &Path, limit: u64) -> Result<u64, TarErro
         let computed: u64 = header
             .iter()
             .enumerate()
-            .map(|(i, b)| if (148..156).contains(&i) { 32 } else { u64::from(*b) })
+            .map(|(i, b)| {
+                if (148..156).contains(&i) {
+                    32
+                } else {
+                    u64::from(*b)
+                }
+            })
             .sum();
         if stored != computed {
             return Err(TarError::Unsafe);

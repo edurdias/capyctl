@@ -162,7 +162,8 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
     use mllm_protocol::execution::{MemberAction, SingleLaunchPlan};
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
-    )).unwrap();
+    ))
+    .unwrap();
     let mut typed = MemberCommand::try_from(command()).unwrap();
     typed.action = MemberAction::LaunchSingle(SingleLaunchPlan {
         deployment_config: fixture["input"]["deployment"].to_string(),
@@ -173,17 +174,22 @@ fn single_host_launch_binds_local_resolution_and_retained_grant() {
         incarnation: "01K00000000000000000000002".into(),
         grant_id: "01K00000000000000000000003".into(),
         service_port: 30000,
-        issued_at_ms: 1, coordinator_session_id: "01K00000000000000000000004".into(),
-        checkpoint_digest: String::new(), checkpoint_weights_bytes: None,
+        issued_at_ms: 1,
+        coordinator_session_id: "01K00000000000000000000004".into(),
+        checkpoint_digest: String::new(),
+        checkpoint_weights_bytes: None,
         startup_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
     typed.verify_digest().unwrap();
     let recovered = MemberCommand::try_from(pb::ServerToAgent {
         msg: Some(pb::server_to_agent::Msg::ExecuteMember(typed.to_wire())),
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(recovered, typed);
-    let MemberAction::LaunchSingle(plan) = &mut typed.action else { panic!() };
+    let MemberAction::LaunchSingle(plan) = &mut typed.action else {
+        panic!()
+    };
     plan.grant_id.push('x');
     assert!(typed.verify_digest().is_err());
     typed.identity.payload_digest = typed.canonical_digest();
@@ -303,7 +309,8 @@ fn launch_single() -> MemberCommand {
     use mllm_protocol::execution::{MemberAction, SingleLaunchPlan};
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
-    )).unwrap();
+    ))
+    .unwrap();
     let mut typed = MemberCommand::try_from(command()).unwrap();
     typed.action = MemberAction::LaunchSingle(SingleLaunchPlan {
         deployment_config: fixture["input"]["deployment"].to_string(),
@@ -314,8 +321,10 @@ fn launch_single() -> MemberCommand {
         incarnation: "01K00000000000000000000002".into(),
         grant_id: "01K00000000000000000000003".into(),
         service_port: 30000,
-        issued_at_ms: 1, coordinator_session_id: "01K00000000000000000000004".into(),
-        checkpoint_digest: String::new(), checkpoint_weights_bytes: None,
+        issued_at_ms: 1,
+        coordinator_session_id: "01K00000000000000000000004".into(),
+        checkpoint_digest: String::new(),
+        checkpoint_weights_bytes: None,
         startup_bytes: None,
     });
     typed.identity.payload_digest = typed.canonical_digest();
@@ -337,7 +346,8 @@ fn a_launch_failure_is_one_bounded_line_on_an_exited_launch_only() {
         process.presence = "gone".into();
     }
     result.launch_failure =
-        "the engine exited before readiness with exit code 2; it rejected argument --moe-backend".into();
+        "the engine exited before readiness with exit code 2; it rejected argument --moe-backend"
+            .into();
     validate_result(&command, &result).unwrap();
     for bad in ["two\nlines", &"x".repeat(257), "tab\there"] {
         let mut refused = result.clone();

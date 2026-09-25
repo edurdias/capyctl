@@ -475,7 +475,9 @@ impl CheckpointVerifier {
             use std::os::unix::fs::OpenOptionsExt;
             let unique = format!(
                 "{}.{}.{}.tmp",
-                path.file_stem().and_then(|s| s.to_str()).unwrap_or("record"),
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("record"),
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

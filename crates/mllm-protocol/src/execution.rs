@@ -42,21 +42,36 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
     type Error = GroupIdentityError;
     fn try_from(plan: pb::SingleLaunchPlan) -> Result<Self, Self::Error> {
         fn ulid(value: &str) -> bool {
-            value.len() == 26 && value.bytes().all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
+            value.len() == 26
+                && value
+                    .bytes()
+                    .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
                 && value.as_bytes()[0] <= b'7'
         }
         if plan.deployment_config.len() > 24 * 1024
-            || plan.profile_name.trim().is_empty() || plan.profile_name.len() > 256
-            || plan.checkpoint_fingerprint.trim().is_empty() || plan.checkpoint_fingerprint.len() > 256
+            || plan.profile_name.trim().is_empty()
+            || plan.profile_name.len() > 256
+            || plan.checkpoint_fingerprint.trim().is_empty()
+            || plan.checkpoint_fingerprint.len() > 256
             || plan.host_policy_fingerprint.len() != 64
-            || !plan.host_policy_fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || !ulid(&plan.coordinator_session_id) || !ulid(&plan.binding_id) || !ulid(&plan.incarnation) || !ulid(&plan.grant_id)
-            || plan.service_port == 0 || plan.issued_at_unix_ms < 0
+            || !plan
+                .host_policy_fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !ulid(&plan.coordinator_session_id)
+            || !ulid(&plan.binding_id)
+            || !ulid(&plan.incarnation)
+            || !ulid(&plan.grant_id)
+            || plan.service_port == 0
+            || plan.issued_at_unix_ms < 0
             || !recorded_checkpoint_ok(&plan.checkpoint_digest, plan.checkpoint_weights_bytes)
             || plan.startup_bytes.is_some_and(|bytes| bytes <= 0)
-        { return Err(GroupIdentityError); }
-        let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
-            .map_err(|_| GroupIdentityError)?;
+        {
+            return Err(GroupIdentityError);
+        }
+        let config =
+            mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
+                .map_err(|_| GroupIdentityError)?;
         Ok(Self {
             deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,
             profile_name: plan.profile_name,
@@ -65,7 +80,10 @@ impl TryFrom<pb::SingleLaunchPlan> for SingleLaunchPlan {
             binding_id: plan.binding_id,
             incarnation: plan.incarnation,
             grant_id: plan.grant_id,
-            service_port: plan.service_port.try_into().map_err(|_| GroupIdentityError)?,
+            service_port: plan
+                .service_port
+                .try_into()
+                .map_err(|_| GroupIdentityError)?,
             issued_at_ms: plan.issued_at_unix_ms,
             coordinator_session_id: plan.coordinator_session_id,
             checkpoint_digest: plan.checkpoint_digest,
@@ -78,9 +96,12 @@ impl SingleLaunchPlan {
     fn to_wire(&self) -> pb::SingleLaunchPlan {
         pb::SingleLaunchPlan {
             deployment_config: mllm_config::parse_strict(
-                mllm_config::ConfigKind::Deployment, &self.deployment_config,
-            ).ok().and_then(|value| serde_json::to_string(&value).ok())
-                .unwrap_or_else(|| self.deployment_config.clone()),
+                mllm_config::ConfigKind::Deployment,
+                &self.deployment_config,
+            )
+            .ok()
+            .and_then(|value| serde_json::to_string(&value).ok())
+            .unwrap_or_else(|| self.deployment_config.clone()),
             profile_name: self.profile_name.clone(),
             checkpoint_fingerprint: self.checkpoint_fingerprint.clone(),
             host_policy_fingerprint: self.host_policy_fingerprint.clone(),
@@ -115,12 +136,18 @@ impl TryFrom<pb::DigestCheckpointRequest> for DigestCheckpointPlan {
     fn try_from(plan: pb::DigestCheckpointRequest) -> Result<Self, Self::Error> {
         if plan.deployment_config.len() > 24 * 1024
             || plan.host_policy_fingerprint.len() != 64
-            || !plan.host_policy_fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !plan
+                .host_policy_fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             || !(plan.expected_digest.is_empty()
                 || mllm_config::effective::is_checkpoint_digest(&plan.expected_digest))
-        { return Err(GroupIdentityError); }
-        let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
-            .map_err(|_| GroupIdentityError)?;
+        {
+            return Err(GroupIdentityError);
+        }
+        let config =
+            mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
+                .map_err(|_| GroupIdentityError)?;
         Ok(Self {
             deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,
             host_policy_fingerprint: plan.host_policy_fingerprint,
@@ -133,9 +160,12 @@ impl DigestCheckpointPlan {
     fn to_wire(&self) -> pb::DigestCheckpointRequest {
         pb::DigestCheckpointRequest {
             deployment_config: mllm_config::parse_strict(
-                mllm_config::ConfigKind::Deployment, &self.deployment_config,
-            ).ok().and_then(|value| serde_json::to_string(&value).ok())
-                .unwrap_or_else(|| self.deployment_config.clone()),
+                mllm_config::ConfigKind::Deployment,
+                &self.deployment_config,
+            )
+            .ok()
+            .and_then(|value| serde_json::to_string(&value).ok())
+            .unwrap_or_else(|| self.deployment_config.clone()),
             host_policy_fingerprint: self.host_policy_fingerprint.clone(),
             expected_digest: self.expected_digest.clone().unwrap_or_default(),
             size_only: self.size_only,
@@ -187,10 +217,16 @@ impl TryFrom<pb::MaterializeSourceRequest> for MaterializeSourcePlan {
     fn try_from(plan: pb::MaterializeSourceRequest) -> Result<Self, Self::Error> {
         if plan.deployment_config.len() > 24 * 1024
             || plan.host_policy_fingerprint.len() != 64
-            || !plan.host_policy_fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        { return Err(GroupIdentityError); }
-        let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
-            .map_err(|_| GroupIdentityError)?;
+            || !plan
+                .host_policy_fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(GroupIdentityError);
+        }
+        let config =
+            mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &plan.deployment_config)
+                .map_err(|_| GroupIdentityError)?;
         let source = remote_source(&config).ok_or(GroupIdentityError)?;
         Ok(Self {
             deployment_config: serde_json::to_string(&config).map_err(|_| GroupIdentityError)?,
@@ -221,11 +257,15 @@ pub enum MemberAction {
     /// SPEC §§6.1, 13.2: re-prove model readiness of one retained launch with a
     /// fresh native probe, after a session loss cleared its readiness authority.
     /// It names the launch by its owned handle and can never launch or release.
-    Probe { owned_handle: String },
+    Probe {
+        owned_handle: String,
+    },
     /// SPEC §§9.1, 10 (protocol version 2): park one retained, drained launch in
     /// place. The process group and its reservation stay owned; a park never
     /// launches, releases or proves a usable model.
-    Park { owned_handle: String },
+    Park {
+        owned_handle: String,
+    },
     /// SPEC §§6.1, 9.1 (protocol version 2): restore one parked launch in place.
     /// Only a fresh native probe after the restore may claim a usable model.
     ///
@@ -358,12 +398,12 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
         use pb::execute_member::Action;
         let restore_digest = command.restore_checkpoint_digest;
         let recorded = recorded_processes(command.terminate_recorded_processes)?;
-        if !recorded.is_empty()
-            && !matches!(command.action, Some(Action::TerminateOwnedHandle(_)))
+        if !recorded.is_empty() && !matches!(command.action, Some(Action::TerminateOwnedHandle(_)))
         {
             return Err(GroupIdentityError);
         }
-        if !(restore_digest.is_empty() || mllm_config::effective::is_checkpoint_digest(&restore_digest))
+        if !(restore_digest.is_empty()
+            || mllm_config::effective::is_checkpoint_digest(&restore_digest))
             || (!restore_digest.is_empty()
                 && !matches!(command.action, Some(Action::RestoreOwnedHandle(_))))
         {
@@ -407,7 +447,9 @@ impl TryFrom<pb::ServerToAgent> for MemberCommand {
             }
         }
         if let MemberAction::LaunchSingle(plan) = &action {
-            if plan.issued_at_ms >= identity.deadline_ms { return Err(GroupIdentityError); }
+            if plan.issued_at_ms >= identity.deadline_ms {
+                return Err(GroupIdentityError);
+            }
         }
         Ok(Self { identity, action })
     }
@@ -451,7 +493,9 @@ impl MemberCommand {
                 MemberAction::Probe { owned_handle } => {
                     Action::ProbeOwnedHandle(owned_handle.clone())
                 }
-                MemberAction::Park { owned_handle } => Action::ParkOwnedHandle(owned_handle.clone()),
+                MemberAction::Park { owned_handle } => {
+                    Action::ParkOwnedHandle(owned_handle.clone())
+                }
                 MemberAction::Restore { owned_handle, .. } => {
                     Action::RestoreOwnedHandle(owned_handle.clone())
                 }
@@ -531,18 +575,33 @@ fn group_wire(plan: &GroupPlan) -> pb::GroupLaunchPlan {
 
 /// SPEC §13: shape and exact command binding only. The caller must establish the
 /// authenticated host/session and observation freshness before consuming evidence.
-pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResult) -> Result<(), GroupIdentityError> {
+pub fn validate_result(
+    command: &MemberCommand,
+    result: &pb::MemberExecutionResult,
+) -> Result<(), GroupIdentityError> {
     if result.identity != command.to_wire().identity
-        || !matches!(result.state.as_str(), "accepted" | "attempted" | "launched" | "completed" | "tombstone")
-        || result.processes.len() > 256 || result.observed_at_unix_ms < 0
-    { return Err(GroupIdentityError); }
+        || !matches!(
+            result.state.as_str(),
+            "accepted" | "attempted" | "launched" | "completed" | "tombstone"
+        )
+        || result.processes.len() > 256
+        || result.observed_at_unix_ms < 0
+    {
+        return Err(GroupIdentityError);
+    }
     let mut seen = std::collections::BTreeSet::new();
     for process in &result.processes {
-        if process.pid == 0 || process.start_ticks == 0 || process.role.is_empty()
-            || process.role.len() > 128 || process.boot_id.is_empty() || process.boot_id.len() > 128
+        if process.pid == 0
+            || process.start_ticks == 0
+            || process.role.is_empty()
+            || process.role.len() > 128
+            || process.boot_id.is_empty()
+            || process.boot_id.len() > 128
             || !matches!(process.presence.as_str(), "alive" | "gone" | "unknown")
             || !seen.insert((process.pid, &process.boot_id, process.start_ticks))
-        { return Err(GroupIdentityError); }
+        {
+            return Err(GroupIdentityError);
+        }
     }
     // A probe, park or restore reports on exactly the launch it names, whatever
     // the outcome.
@@ -550,7 +609,9 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
     | MemberAction::Park { owned_handle }
     | MemberAction::Restore { owned_handle, .. } = &command.action
     {
-        if result.owned_handle != *owned_handle { return Err(GroupIdentityError); }
+        if result.owned_handle != *owned_handle {
+            return Err(GroupIdentityError);
+        }
     }
     // Residency evidence belongs to Park and Restore results only.
     let residency = match (&command.action, &result.residency) {
@@ -567,10 +628,16 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
     match (&command.action, &result.checkpoint) {
         (MemberAction::DigestCheckpoint(plan), Some(evidence)) => {
             validate_checkpoint(plan, evidence)?;
-            if result.state != "completed" || result.claim_retained || result.model_usable
-                || !result.processes.is_empty() || !result.owned_handle.is_empty()
-                || !result.binding_id.is_empty() || !result.incarnation.is_empty()
-            { return Err(GroupIdentityError); }
+            if result.state != "completed"
+                || result.claim_retained
+                || result.model_usable
+                || !result.processes.is_empty()
+                || !result.owned_handle.is_empty()
+                || !result.binding_id.is_empty()
+                || !result.incarnation.is_empty()
+            {
+                return Err(GroupIdentityError);
+            }
         }
         (MemberAction::DigestCheckpoint(_), None) => return Err(GroupIdentityError),
         (_, Some(_)) => return Err(GroupIdentityError),
@@ -581,11 +648,18 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
     match (&command.action, &result.source) {
         (MemberAction::MaterializeSource(plan), Some(evidence)) => {
             validate_source(plan, evidence)?;
-            if result.state != "completed" || result.claim_retained || result.model_usable
-                || !result.processes.is_empty() || !result.owned_handle.is_empty()
-                || !result.binding_id.is_empty() || !result.incarnation.is_empty()
-                || result.checkpoint.is_some() || result.residency.is_some()
-            { return Err(GroupIdentityError); }
+            if result.state != "completed"
+                || result.claim_retained
+                || result.model_usable
+                || !result.processes.is_empty()
+                || !result.owned_handle.is_empty()
+                || !result.binding_id.is_empty()
+                || !result.incarnation.is_empty()
+                || result.checkpoint.is_some()
+                || result.residency.is_some()
+            {
+                return Err(GroupIdentityError);
+            }
         }
         (MemberAction::MaterializeSource(_), None) => return Err(GroupIdentityError),
         (_, Some(_)) => return Err(GroupIdentityError),
@@ -593,14 +667,18 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
     }
     validate_refusal(command, result)?;
     validate_launch_failure(command, result)?;
-    let named_binding = !result.binding_id.is_empty() && result.binding_id.len() <= 128
-        && !result.incarnation.is_empty() && result.incarnation.len() <= 128;
+    let named_binding = !result.binding_id.is_empty()
+        && result.binding_id.len() <= 128
+        && !result.incarnation.is_empty()
+        && result.incarnation.len() <= 128;
     // SPEC §§9.1, 10: parked or restored is claimed only on completion, by the
     // still-owned launch it names, whose api and worker processes are alive.
     // Process identity unchanged against the retained launch is the caller's
     // comparison; this checks that the evidence names one coherent live group.
     if claim != ResidencyClaim::None
-        && (result.state != "completed" || !result.claim_retained || !named_binding
+        && (result.state != "completed"
+            || !result.claim_retained
+            || !named_binding
             || !live_group(result))
     {
         return Err(GroupIdentityError);
@@ -610,12 +688,16 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
         // a fresh probe of the retained launch (including the probe that closes
         // a restore), can claim a usable model. A park never can.
         let bound = match &command.action {
-            MemberAction::LaunchSingle(plan) => result.state == "launched"
-                && result.binding_id == plan.binding_id && result.incarnation == plan.incarnation
-                && result.owned_handle == command.identity.command_id,
+            MemberAction::LaunchSingle(plan) => {
+                result.state == "launched"
+                    && result.binding_id == plan.binding_id
+                    && result.incarnation == plan.incarnation
+                    && result.owned_handle == command.identity.command_id
+            }
             MemberAction::Probe { .. } => result.state == "completed" && named_binding,
-            MemberAction::Restore { .. } => result.state == "completed" && named_binding
-                && claim == ResidencyClaim::Restored,
+            MemberAction::Restore { .. } => {
+                result.state == "completed" && named_binding && claim == ResidencyClaim::Restored
+            }
             _ => false,
         };
         if !bound || !result.claim_retained || !live_group(result) {
@@ -628,21 +710,37 @@ pub fn validate_result(command: &MemberCommand, result: &pb::MemberExecutionResu
 /// The alive processes of a result form one local group with an api process and
 /// at least one worker, all on one boot with distinct roles and PIDs.
 fn live_group(result: &pb::MemberExecutionResult) -> bool {
-    let current: Vec<_> = result.processes.iter().filter(|p| p.presence == "alive")
+    let current: Vec<_> = result
+        .processes
+        .iter()
+        .filter(|p| p.presence == "alive")
         .map(|p| mllm_domain::completion::ProcessIdentity {
-            role: p.role.clone(), pid: p.pid, boot_id: p.boot_id.clone(), start_ticks: p.start_ticks,
-        }).collect();
+            role: p.role.clone(),
+            pid: p.pid,
+            boot_id: p.boot_id.clone(),
+            start_ticks: p.start_ticks,
+        })
+        .collect();
     current.iter().any(|p| p.role == "api")
         && current.iter().any(|p| p.role.starts_with("worker-"))
         && mllm_domain::group::validate_local_processes(&current).is_ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResidencyClaim { None, Parked, Restored }
+enum ResidencyClaim {
+    None,
+    Parked,
+    Restored,
+}
 
 /// The closed refusal categories a host may report for a checkpoint.
 pub const CHECKPOINT_REFUSALS: &[&str] = &[
-    "invalid_root", "unsafe_file", "too_large", "changed", "io_error", "unauthorized",
+    "invalid_root",
+    "unsafe_file",
+    "too_large",
+    "changed",
+    "io_error",
+    "unauthorized",
     "not_materializable",
 ];
 
@@ -668,9 +766,17 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// `restart_only` instead); `capability_missing:core`: the installation lacks
 /// an interface every launch needs.
 pub const POLICY_REFUSALS: &[&str] = &[
-    "checkpoint_mismatch", "checkpoint_unverified", "insufficient_memory", "residency_tier",
-    "runtime_integrity", "unauthorized", "device_conflict", "port_conflict",
-    "installation_drift", "capability_missing:deep_park", "capability_missing:core",
+    "checkpoint_mismatch",
+    "checkpoint_unverified",
+    "insufficient_memory",
+    "residency_tier",
+    "runtime_integrity",
+    "unauthorized",
+    "device_conflict",
+    "port_conflict",
+    "installation_drift",
+    "capability_missing:deep_park",
+    "capability_missing:core",
 ];
 
 /// Whether `reason` is one of the closed [`POLICY_REFUSALS`].
@@ -682,18 +788,33 @@ pub fn is_policy_refusal(reason: &str) -> bool {
 /// refused launch completed with no claim, no process and no usable model; a
 /// refused Park or Restore left the launch `unchanged`. No other action carries
 /// a refusal.
-fn validate_refusal(command: &MemberCommand, result: &pb::MemberExecutionResult) -> Result<(), GroupIdentityError> {
-    if result.refused.is_empty() { return Ok(()); }
-    let unchanged = result.residency.as_ref().is_some_and(|r| r.state == "unchanged");
+fn validate_refusal(
+    command: &MemberCommand,
+    result: &pb::MemberExecutionResult,
+) -> Result<(), GroupIdentityError> {
+    if result.refused.is_empty() {
+        return Ok(());
+    }
+    let unchanged = result
+        .residency
+        .as_ref()
+        .is_some_and(|r| r.state == "unchanged");
     let shape = match &command.action {
-        MemberAction::LaunchSingle(_) => !result.claim_retained && result.processes.is_empty()
-            && result.owned_handle == command.identity.command_id,
+        MemberAction::LaunchSingle(_) => {
+            !result.claim_retained
+                && result.processes.is_empty()
+                && result.owned_handle == command.identity.command_id
+        }
         MemberAction::Park { .. } | MemberAction::Restore { .. } => unchanged,
         _ => false,
     };
-    if !shape || !is_policy_refusal(&result.refused) || result.state != "completed"
+    if !shape
+        || !is_policy_refusal(&result.refused)
+        || result.state != "completed"
         || result.model_usable
-    { return Err(GroupIdentityError); }
+    {
+        return Err(GroupIdentityError);
+    }
     Ok(())
 }
 
@@ -709,13 +830,21 @@ pub fn is_launch_failure_text(text: &str) -> bool {
         && text.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
-fn validate_launch_failure(command: &MemberCommand, result: &pb::MemberExecutionResult) -> Result<(), GroupIdentityError> {
-    if result.launch_failure.is_empty() { return Ok(()); }
+fn validate_launch_failure(
+    command: &MemberCommand,
+    result: &pb::MemberExecutionResult,
+) -> Result<(), GroupIdentityError> {
+    if result.launch_failure.is_empty() {
+        return Ok(());
+    }
     let exited = matches!(command.action, MemberAction::LaunchSingle(_))
-        && result.state == "launched" && !result.model_usable
+        && result.state == "launched"
+        && !result.model_usable
         && !result.processes.is_empty()
         && result.processes.iter().all(|p| p.presence == "gone");
-    if !exited || !is_launch_failure_text(&result.launch_failure) { return Err(GroupIdentityError); }
+    if !exited || !is_launch_failure_text(&result.launch_failure) {
+        return Err(GroupIdentityError);
+    }
     Ok(())
 }
 
@@ -724,7 +853,8 @@ fn validate_launch_failure(command: &MemberCommand, result: &pb::MemberExecution
 /// only a closed reason; `sized` (a size-only request) carries the weights and
 /// no digest. File counts and bytes are bounded by the host's walk.
 fn validate_checkpoint(
-    plan: &DigestCheckpointPlan, evidence: &pb::CheckpointDigestEvidence,
+    plan: &DigestCheckpointPlan,
+    evidence: &pb::CheckpointDigestEvidence,
 ) -> Result<(), GroupIdentityError> {
     let measured = mllm_config::effective::is_checkpoint_digest(&evidence.digest)
         && evidence.weights_bytes >= 0
@@ -734,19 +864,42 @@ fn validate_checkpoint(
     let ok = match evidence.state.as_str() {
         // A size-only request is answered `sized` (or refused), never hashed.
         "computed" | "mismatch" if plan.size_only => false,
-        "sized" => plan.size_only && evidence.digest.is_empty() && evidence.weights_bytes >= 0
-            && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
-            && evidence.file_count <= 65_536 && evidence.reason.is_empty() && !evidence.full_rehash,
-        "computed" => measured
-            && plan.expected_digest.as_ref().is_none_or(|expected| *expected == evidence.digest),
-        "mismatch" => measured
-            && plan.expected_digest.as_ref().is_some_and(|expected| *expected != evidence.digest),
-        "refused" => evidence.digest.is_empty() && evidence.weights_bytes == 0
-            && evidence.file_count == 0 && evidence.total_bytes == 0 && !evidence.full_rehash
-            && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str()),
+        "sized" => {
+            plan.size_only
+                && evidence.digest.is_empty()
+                && evidence.weights_bytes >= 0
+                && u64::try_from(evidence.weights_bytes).is_ok_and(|w| w <= evidence.total_bytes)
+                && evidence.file_count <= 65_536
+                && evidence.reason.is_empty()
+                && !evidence.full_rehash
+        }
+        "computed" => {
+            measured
+                && plan
+                    .expected_digest
+                    .as_ref()
+                    .is_none_or(|expected| *expected == evidence.digest)
+        }
+        "mismatch" => {
+            measured
+                && plan
+                    .expected_digest
+                    .as_ref()
+                    .is_some_and(|expected| *expected != evidence.digest)
+        }
+        "refused" => {
+            evidence.digest.is_empty()
+                && evidence.weights_bytes == 0
+                && evidence.file_count == 0
+                && evidence.total_bytes == 0
+                && !evidence.full_rehash
+                && CHECKPOINT_REFUSALS.contains(&evidence.reason.as_str())
+        }
         _ => false,
     };
-    if !ok { return Err(GroupIdentityError); }
+    if !ok {
+        return Err(GroupIdentityError);
+    }
     Ok(())
 }
 
@@ -754,20 +907,29 @@ fn validate_checkpoint(
 /// total of zero until sized); `failed` only a closed reason; `pending`
 /// nothing. The key must be the one the plan's source names.
 fn validate_source(
-    plan: &MaterializeSourcePlan, evidence: &pb::ModelSourceEvidence,
+    plan: &MaterializeSourcePlan,
+    evidence: &pb::ModelSourceEvidence,
 ) -> Result<(), GroupIdentityError> {
     let quiet = evidence.reason.is_empty() && !evidence.reservation_retained;
-    let ok = evidence.source_key == plan.source_key && match evidence.state.as_str() {
-        "pending" => quiet && evidence.bytes_done == 0 && evidence.bytes_total == 0,
-        "downloading" => quiet
-            && (evidence.bytes_total == 0 && evidence.bytes_done == 0
-                || evidence.bytes_done <= evidence.bytes_total),
-        "verified" => quiet && evidence.bytes_done == evidence.bytes_total,
-        "failed" => evidence.bytes_done == 0 && evidence.bytes_total == 0
-            && mllm_config::model_source::reason::ALL.contains(&evidence.reason.as_str()),
-        _ => false,
-    };
-    if !ok { return Err(GroupIdentityError); }
+    let ok = evidence.source_key == plan.source_key
+        && match evidence.state.as_str() {
+            "pending" => quiet && evidence.bytes_done == 0 && evidence.bytes_total == 0,
+            "downloading" => {
+                quiet
+                    && (evidence.bytes_total == 0 && evidence.bytes_done == 0
+                        || evidence.bytes_done <= evidence.bytes_total)
+            }
+            "verified" => quiet && evidence.bytes_done == evidence.bytes_total,
+            "failed" => {
+                evidence.bytes_done == 0
+                    && evidence.bytes_total == 0
+                    && mllm_config::model_source::reason::ALL.contains(&evidence.reason.as_str())
+            }
+            _ => false,
+        };
+    if !ok {
+        return Err(GroupIdentityError);
+    }
     Ok(())
 }
 
@@ -777,7 +939,8 @@ pub const MAX_RESIDENCY_MILESTONES: usize = 32;
 pub const MAX_MILESTONE_LEN: usize = 64;
 
 fn validate_residency(
-    action: &MemberAction, evidence: &pb::ResidencyEvidence,
+    action: &MemberAction,
+    evidence: &pb::ResidencyEvidence,
 ) -> Result<ResidencyClaim, GroupIdentityError> {
     let claim = match (action, evidence.state.as_str()) {
         (MemberAction::Park { .. }, "parked") => ResidencyClaim::Parked,
@@ -786,10 +949,16 @@ fn validate_residency(
         // A park can never claim restored, nor a restore parked.
         _ => return Err(GroupIdentityError),
     };
-    if evidence.mem_available_before_bytes < -1 || evidence.mem_available_after_bytes < -1
+    if evidence.mem_available_before_bytes < -1
+        || evidence.mem_available_after_bytes < -1
         || evidence.milestones.len() > MAX_RESIDENCY_MILESTONES
-        || evidence.milestones.iter().any(|m| m.is_empty() || m.len() > MAX_MILESTONE_LEN
-            || !m.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b)))
+        || evidence.milestones.iter().any(|m| {
+            m.is_empty()
+                || m.len() > MAX_MILESTONE_LEN
+                || !m
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+        })
     {
         return Err(GroupIdentityError);
     }

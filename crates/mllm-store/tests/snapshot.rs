@@ -215,7 +215,18 @@ fn status_derives_queued_starting_stopping_and_reconciling() {
     let run = |id: &str, action: &str, state: &str, step: &str| {
         writer.execute("INSERT INTO operations(id,deployment_id,kind,state) VALUES(?1,?2,'initialize','running')", params![format!("o-{id}-{action}"), id]).unwrap();
         writer.execute("INSERT INTO lifecycle_runs(operation_id,deployment_id,revision,generation,session_id,action,state,deadline_ms,plan_json) VALUES(?1,?2,1,1,'session',?3,?4,1,'{}')", params![format!("o-{id}-{action}"), id, action, state]).unwrap();
-        writer.execute("INSERT INTO lifecycle_steps VALUES(?1,?2,0,?3,?4,'session',?5,'{}',NULL)", params![format!("s-{id}-{action}"), format!("o-{id}-{action}"), id, format!("b-{id}"), step]).unwrap();
+        writer
+            .execute(
+                "INSERT INTO lifecycle_steps VALUES(?1,?2,0,?3,?4,'session',?5,'{}',NULL)",
+                params![
+                    format!("s-{id}-{action}"),
+                    format!("o-{id}-{action}"),
+                    id,
+                    format!("b-{id}"),
+                    step
+                ],
+            )
+            .unwrap();
     };
     deployment("queued", "stopped", 0);
     run("queued", "activate", "queued", "planned");

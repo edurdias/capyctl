@@ -221,17 +221,14 @@ impl DurableSpawn {
                 .map(super::exec::legacy_identity)
                 .unwrap_or(0),
         };
-        self.retained
-            .lock()
-            .unwrap()
-            .insert(
-                incarnation.into(),
-                RetainedChild {
-                    child,
-                    write_gate,
-                    identity: identity.clone(),
-                },
-            );
+        self.retained.lock().unwrap().insert(
+            incarnation.into(),
+            RetainedChild {
+                child,
+                write_gate,
+                identity: identity.clone(),
+            },
+        );
         let Some(identity) = identity else {
             self.dispose(incarnation, pid);
             return Ok(DurableSpawnOutcome::Uncertain {
@@ -343,7 +340,9 @@ pub fn open_private_log(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() || metadata.uid() != nix::unistd::geteuid().as_raw() {
-        return Err(std::io::Error::other("engine log is not a private regular file"));
+        return Err(std::io::Error::other(
+            "engine log is not a private regular file",
+        ));
     }
     if metadata.permissions().mode() & 0o7777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -472,20 +471,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("env.txt");
         let command = RenderedCommand {
-            argv: vec![
-                "/usr/bin/env".into(),
-            ],
+            argv: vec!["/usr/bin/env".into()],
             env: std::collections::BTreeMap::from([
-                ("MLLM_ENGINE_LOG".to_string(), out.to_str().unwrap().to_string()),
+                (
+                    "MLLM_ENGINE_LOG".to_string(),
+                    out.to_str().unwrap().to_string(),
+                ),
                 ("NAMED".to_string(), "1".to_string()),
             ]),
         };
         assert!(std::env::var_os("HOME").is_some() || std::env::var_os("PATH").is_some());
         let launcher = DurableSpawn::new();
-        launcher.spawn_persisted("env-test", &command, &Accept).unwrap();
+        launcher
+            .spawn_persisted("env-test", &command, &Accept)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let text = std::fs::read_to_string(&out).unwrap();
-        let names: Vec<&str> = text.lines().filter_map(|l| l.split_once('=')).map(|(n, _)| n).collect();
+        let names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(n, _)| n)
+            .collect();
         assert!(names.contains(&"NAMED"), "{text}");
         for inherited in ["HOME", "PATH", "USER", "CARGO_PKG_NAME"] {
             assert!(!names.contains(&inherited), "{inherited} leaked: {text}");
@@ -510,12 +516,16 @@ mod tests {
             )]),
         };
         let launcher = DurableSpawn::new();
-        assert!(launcher.spawn_persisted("symlink-log", &command(&log), &Accept).is_err());
+        assert!(launcher
+            .spawn_persisted("symlink-log", &command(&log), &Accept)
+            .is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
         let plain = dir.path().join("plain.log");
         std::fs::write(&plain, "").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
-        launcher.spawn_persisted("plain-log", &command(&plain), &Accept).unwrap();
+        launcher
+            .spawn_persisted("plain-log", &command(&plain), &Accept)
+            .unwrap();
         let mode = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

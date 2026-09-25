@@ -10,8 +10,8 @@ pub(crate) mod legacy_engine_config;
 pub mod local_recovery;
 pub mod park;
 pub mod placement;
-pub mod reconcile;
 mod receipt;
+pub mod reconcile;
 // SPEC §6.3: an operator's Stop of a deployment that holds nothing.
 mod recorded_stop;
 pub mod recovery;
@@ -253,13 +253,18 @@ pub(crate) fn validate_frozen(
         )
         .optional()?
         .ok_or(LifecycleError::CorruptStoredData)?;
-    crate::managed_configuration::validate_revision_history(tx, deployment_id, revision, &canonical)
-        .map_err(|error| match error {
-            crate::managed_configuration::ManagedConfigurationError::Sql(error) => {
-                LifecycleError::Sql(error)
-            }
-            _ => LifecycleError::CorruptStoredData,
-        })?;
+    crate::managed_configuration::validate_revision_history(
+        tx,
+        deployment_id,
+        revision,
+        &canonical,
+    )
+    .map_err(|error| match error {
+        crate::managed_configuration::ManagedConfigurationError::Sql(error) => {
+            LifecycleError::Sql(error)
+        }
+        _ => LifecycleError::CorruptStoredData,
+    })?;
     if raw != canonical {
         let resolved: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved' AND effective_json=?3)",
@@ -288,10 +293,12 @@ fn effective(
         .flatten();
     let (raw, fingerprint) =
         frozen_on_host(tx, &fence.deployment_id, fence.revision, host.as_deref())?;
-    validate_frozen(tx, &fence.deployment_id, fence.revision, &raw).map_err(|error| match error {
-        LifecycleError::Sql(error) => LifecycleError::Sql(error),
-        _ => LifecycleError::CorruptStoredData,
-    })?;
+    validate_frozen(tx, &fence.deployment_id, fence.revision, &raw).map_err(
+        |error| match error {
+            LifecycleError::Sql(error) => LifecycleError::Sql(error),
+            _ => LifecycleError::CorruptStoredData,
+        },
+    )?;
     let effective =
         decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
     let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE deployment_id=?1 AND kind='managed_configuration_create' AND state='succeeded')", [&fence.deployment_id], |r| r.get(0))?;
@@ -311,8 +318,8 @@ fn effective(
             "SELECT EXISTS(SELECT 1 FROM deployments WHERE id=?1 AND revision=?2 AND name=?3 AND route_model_id IS NULL)",
             params![fence.deployment_id,fence.revision,effective.name],|r|r.get(0),
         )?;
-        let mut routes =
-            tx.prepare("SELECT route FROM deployment_routes WHERE deployment_id=?1 ORDER BY route")?;
+        let mut routes = tx
+            .prepare("SELECT route FROM deployment_routes WHERE deployment_id=?1 ORDER BY route")?;
         let routes = routes
             .query_map([&fence.deployment_id], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -702,12 +709,15 @@ impl crate::Store {
         crate::checkpoint_digests::admit_start(tx, &f.deployment_id, f.revision)?;
         // ADR 0008: and while its declared remote source is not yet on disk.
         crate::model_sources::admit_start(tx, &f.deployment_id, f.revision)?;
-        let identity = binding_identity(tx, &f.deployment_id, f.revision, &e).map_err(|error| match error {
-            LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
-                LifecycleError::Unsupported
-            }
-            error => error,
-        })?;
+        let identity =
+            binding_identity(tx, &f.deployment_id, f.revision, &e).map_err(
+                |error| match error {
+                    LifecycleError::Invalid | LifecycleError::Conflict if detailed => {
+                        LifecycleError::Unsupported
+                    }
+                    error => error,
+                },
+            )?;
         let controls = policy_checked(tx, &e, detailed)?.controls;
         let outstanding: i64 = tx.query_row(
             "SELECT COUNT(*) FROM lifecycle_runs r JOIN operations o ON o.id=r.operation_id WHERE o.kind='initialize' AND r.state NOT IN ('succeeded','failed')",

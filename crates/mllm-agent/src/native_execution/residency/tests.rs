@@ -17,9 +17,7 @@ use axum::{
 };
 use mllm_domain::{
     group::{CommandIdentity, MemberKey},
-    launch::{
-        CommonEngineSettings, MemoryRequest, NativeLaunchMetadata, SglangLaunchSettings,
-    },
+    launch::{CommonEngineSettings, MemoryRequest, NativeLaunchMetadata, SglangLaunchSettings},
 };
 use mllm_protocol::execution::MemberAction;
 use std::sync::Mutex;
@@ -257,7 +255,13 @@ async fn stand() -> Stand {
 }
 
 fn driver(stand: &Stand, saver: Option<Arc<dyn SaverResidency>>, in_flight: usize) -> Driver {
-    driver_with(stand, saver, in_flight, frozen(stand.endpoint.clone()), identities())
+    driver_with(
+        stand,
+        saver,
+        in_flight,
+        frozen(stand.endpoint.clone()),
+        identities(),
+    )
 }
 
 fn driver_with(
@@ -533,10 +537,9 @@ fn enroll(venv: &Venv, admin: &str) -> Enrolled {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let library = venv
-        .root
-        .path()
-        .join("venv/lib/python3.12/site-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so");
+    let library = venv.root.path().join(
+        "venv/lib/python3.12/site-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+    );
     let mut child = Command::new("python3")
         .args(["-I", "-B"])
         .arg(manifest.join("tests/fixtures/enrolled_scheduler.py"))
@@ -592,7 +595,9 @@ async fn an_enrolled_sglang_parks_and_a_restarted_host_restores_it() {
     let expected = enrolled_group(&enrolled.lock().unwrap());
     let (command, plan) = (park_command(), plan());
     let source = |dir: &std::path::Path| -> Option<Arc<dyn SaverResidency>> {
-        Some(Arc::new(super::super::EnrolledSaver::new(dir.to_path_buf())))
+        Some(Arc::new(super::super::EnrolledSaver::new(
+            dir.to_path_buf(),
+        )))
     };
     {
         let run = Run {
@@ -611,7 +616,10 @@ async fn an_enrolled_sglang_parks_and_a_restarted_host_restores_it() {
         assert!(run.quiescent().await);
         assert_eq!(run.saver_mapped_bytes().await, Some(8192));
         let parked = run.run(RuntimeAction::Park, true).await.ok().unwrap();
-        assert_eq!(parked.facts, [mllm_domain::completion::Milestone::MemoryReleased]);
+        assert_eq!(
+            parked.facts,
+            [mllm_domain::completion::Milestone::MemoryReleased]
+        );
         assert_eq!(run.saver_mapped_bytes().await, Some(0));
     }
     // The host restarted: nothing in memory survives but the directory, the
@@ -712,16 +720,15 @@ async fn an_unbound_enrollment_refuses_the_park_before_any_call() {
     assert!(refused(saver(), identities()).await);
     // The saver library changed on disk after the scheduler loaded it.
     std::fs::write(
-        venv.root
-            .path()
-            .join("venv/lib/python3.12/site-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so"),
+        venv.root.path().join(
+            "venv/lib/python3.12/site-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+        ),
         b"other bytes",
     )
     .unwrap();
     assert!(refused(saver(), enrolled_group(&enrolled)).await);
     assert!(stand.engine.lock().unwrap().calls.is_empty());
 }
-
 
 // T21: SPEC §13.3, the observation's admin credential is never formatted.
 #[test]

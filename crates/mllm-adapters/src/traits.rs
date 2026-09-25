@@ -131,7 +131,11 @@ impl std::fmt::Debug for RenderedCommand {
 
 /// How a redacting Debug shows a secret: whether one is set, never its bytes.
 pub fn redacted(set: bool) -> &'static str {
-    if set { "<redacted>" } else { "none" }
+    if set {
+        "<redacted>"
+    } else {
+        "none"
+    }
 }
 
 #[cfg(test)]

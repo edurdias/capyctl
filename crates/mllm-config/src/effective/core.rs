@@ -110,9 +110,12 @@ pub(super) fn normalize_profile(
     }
     for path in &raw_profile.security.approved_paths {
         if !Path::new(path).is_absolute()
-            || Path::new(path)
-                .components()
-                .any(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)))
+            || Path::new(path).components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
         {
             return Err(invalid(
                 "runtime_profiles.security.approved_paths",
@@ -192,13 +195,16 @@ pub(super) fn normalize_model(
         }
         // ADR 0008: a remote source resolves to its fixed directory in the
         // store; the host materializes it there before the first placement.
-        (remote, Some(store)) => remote.store_key().map(|key| {
-            store
-                .join(key)
-                .to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| invalid("host.model_store.path", "must be valid UTF-8"))
-        }).transpose()?,
+        (remote, Some(store)) => remote
+            .store_key()
+            .map(|key| {
+                store
+                    .join(key)
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("host.model_store.path", "must be valid UTF-8"))
+            })
+            .transpose()?,
         (_, None) => None,
     };
     Ok(ModelIdentity {
@@ -429,12 +435,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
 }
 
 pub(super) fn validate_recipe_intrinsic(d: &NormalizedRecipe) -> Result<(), ConfigError> {
-    validate_identity_intrinsic(
-        &d.model,
-        &d.recipe,
-        &d.devices,
-        d.request_deadline_ms,
-    )?;
+    validate_identity_intrinsic(&d.model, &d.recipe, &d.devices, d.request_deadline_ms)?;
     validate_resources_intrinsic(&d.resources, &d.devices)
 }
 
@@ -448,7 +449,10 @@ pub(super) fn validate_identity_intrinsic(
     request_deadline_ms: i64,
 ) -> Result<(), ConfigError> {
     for (path, value) in [
-        ("model.content_fingerprint", model.content_fingerprint.as_str()),
+        (
+            "model.content_fingerprint",
+            model.content_fingerprint.as_str(),
+        ),
         ("model.revision", model.revision.as_str()),
         ("recipe", recipe),
     ] {

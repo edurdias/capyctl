@@ -320,7 +320,10 @@ mod tests {
             assert!(error.detail.contains("30s"), "{}", error.detail);
         }
         let t = resolve_timeouts(None, MIN_INITIALIZE_MS, CheckpointFacts::default()).unwrap();
-        assert_eq!((t.initialize_ms, t.wake_ms), (MIN_INITIALIZE_MS, MIN_INITIALIZE_MS));
+        assert_eq!(
+            (t.initialize_ms, t.wake_ms),
+            (MIN_INITIALIZE_MS, MIN_INITIALIZE_MS)
+        );
         let stated = serde_json::json!({"request_deadline": "5s"});
         assert_eq!(
             validate_declared_timeouts(&stated).unwrap_err().path,

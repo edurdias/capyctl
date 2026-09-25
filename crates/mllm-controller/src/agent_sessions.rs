@@ -40,7 +40,9 @@ async fn send_reply(
 ) -> Result<(), Box<Status>> {
     match tokio::time::timeout(REPLY_BOUND, outgoing.send(Ok(message))).await {
         Ok(Ok(())) => Ok(()),
-        _ => Err(Box::new(Status::resource_exhausted("host response queue unavailable"))),
+        _ => Err(Box::new(Status::resource_exhausted(
+            "host response queue unavailable",
+        ))),
     }
 }
 #[derive(Clone, serde::Serialize)]
@@ -169,17 +171,26 @@ impl ProfileView {
 fn installation_fields_valid(p: &pb::RuntimeProfileStatus) -> bool {
     let digest = |value: &str| {
         value.strip_prefix("sha256:").is_some_and(|hex| {
-            hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
     };
-    (p.installation_version.len() <= 128 && p.installation_version.bytes().all(|b| b.is_ascii_graphic()))
+    (p.installation_version.len() <= 128
+        && p.installation_version.bytes().all(|b| b.is_ascii_graphic()))
         && (p.installation_digest.is_empty() || digest(&p.installation_digest))
-        && matches!(p.installation_state.as_str(), "" | "measured" | "unmeasured" | "drifted")
+        && matches!(
+            p.installation_state.as_str(),
+            "" | "measured" | "unmeasured" | "drifted"
+        )
         && (p.installation_observed_digest.is_empty()
             || p.installation_observed_digest == "unmeasured"
             || digest(&p.installation_observed_digest))
         && p.capabilities_missing.len() <= 8
-        && p.capabilities_missing.iter().all(|c| matches!(c.as_str(), "core" | "deep_park" | "metrics" | "observation"))
+        && p.capabilities_missing
+            .iter()
+            .all(|c| matches!(c.as_str(), "core" | "deep_park" | "metrics" | "observation"))
 }
 /// ADR 0008: the drifts `new` reports that `old` did not (a new drift, or a
 /// drift to a different observed digest): (installation, registered, observed).
@@ -225,8 +236,7 @@ pub const HOST_CLOCK_LEAD_MS: i64 = 500;
 /// otherwise never later than `now`, so no ledger or evidence check downstream
 /// ever sees a future time from an ordinary cross-host clock difference.
 pub fn controller_time(observed: i64, now: i64) -> Option<i64> {
-    (observed >= 0 && observed <= now.saturating_add(HOST_CLOCK_LEAD_MS))
-        .then(|| observed.min(now))
+    (observed >= 0 && observed <= now.saturating_add(HOST_CLOCK_LEAD_MS)).then(|| observed.min(now))
 }
 /// SPEC §13.1: results carry evidence and errors, not only success. A launch
 /// the host reports as `launched`, not usable, with every recorded process
@@ -239,7 +249,10 @@ pub(crate) fn launch_ended_before_readiness(result: &pb::MemberExecutionResult) 
     result.state == "launched"
         && !result.model_usable
         && !result.processes.is_empty()
-        && result.processes.iter().all(|process| process.presence == "gone")
+        && result
+            .processes
+            .iter()
+            .all(|process| process.presence == "gone")
 }
 fn bounded_name(value: &str) -> bool {
     !value.is_empty()
@@ -304,7 +317,11 @@ impl Default for HeartbeatPolicy {
 /// Retain host-scoped ownership in the same controller Store before a result
 /// becomes lifecycle evidence. Implementations must never infer local PID state.
 pub trait RemoteEvidenceObserver: Send + Sync {
-    fn retain(&self, command: &mllm_protocol::execution::MemberCommand, result: &pb::MemberExecutionResult) -> Result<(), Box<Status>>;
+    fn retain(
+        &self,
+        command: &mllm_protocol::execution::MemberCommand,
+        result: &pb::MemberExecutionResult,
+    ) -> Result<(), Box<Status>>;
 }
 struct PendingProvision {
     identity: pb::CommandIdentity,
@@ -321,10 +338,15 @@ pub enum ProvisionOutcome {
     Refused(String),
 }
 struct ProvisionGuard {
-    pending: Arc<Mutex<BTreeMap<String, PendingProvision>>>, id: String,
+    pending: Arc<Mutex<BTreeMap<String, PendingProvision>>>,
+    id: String,
 }
 impl Drop for ProvisionGuard {
-    fn drop(&mut self) { if let Ok(mut pending) = self.pending.lock() { pending.remove(&self.id); } }
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
 }
 struct PendingCommand {
     command: mllm_protocol::execution::MemberCommand,
@@ -338,7 +360,9 @@ struct PendingGuard {
 }
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() { pending.remove(&self.id); }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
     }
 }
 #[derive(Clone)]
@@ -461,7 +485,8 @@ impl AgentSessions {
         self.changes.subscribe()
     }
     fn changed(&self) {
-        self.changes.send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
     /// The host's current authenticated session, only once it has reconciled,
     /// and not while the host is draining (SPEC §4.3): a draining host's session
@@ -487,11 +512,11 @@ impl AgentSessions {
     /// its live session or, with none, on the latest session the store
     /// recorded. A host never seen declaring it is assumed not to have it.
     pub fn supports(&self, host: &str, name: &str) -> bool {
-        let live = self
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|s| s.get(host).filter(|s| s.view.online).map(|s| s.capabilities.contains(name)));
+        let live = self.sessions.lock().ok().and_then(|s| {
+            s.get(host)
+                .filter(|s| s.view.online)
+                .map(|s| s.capabilities.contains(name))
+        });
         match live {
             Some(declared) => declared,
             None => self
@@ -505,14 +530,20 @@ impl AgentSessions {
     /// a typed reason; `Ok` when it may proceed or no session is live (the
     /// command path then waits for one and checks again before sending).
     pub fn preflight(&self, host: &str, needs: &[&str], effect: bool) -> Result<(), String> {
-        let sessions = self.sessions.lock().map_err(|_| capabilities::HOST_UPGRADE_REQUIRED.to_owned())?;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| capabilities::HOST_UPGRADE_REQUIRED.to_owned())?;
         let Some(session) = sessions.get(host).filter(|s| s.view.online) else {
             return Ok(());
         };
         if effect && session.drain_only {
             return Err(capabilities::HOST_UPGRADE_REQUIRED.into());
         }
-        match needs.iter().find(|need| !session.capabilities.contains(**need)) {
+        match needs
+            .iter()
+            .find(|need| !session.capabilities.contains(**need))
+        {
             Some(need) => Err(capabilities::missing(need)),
             None => Ok(()),
         }
@@ -533,7 +564,8 @@ impl AgentSessions {
     /// drain of it is pending (owner decision 4).
     pub fn inspect(&self, host: &str) -> Option<HostSessionView> {
         let pending = self.authority.hosts_with_pending_drain();
-        self.view(host).map(|view| with_drain(view, pending.as_ref()))
+        self.view(host)
+            .map(|view| with_drain(view, pending.as_ref()))
     }
     /// The raw session view, without any store read.
     fn view(&self, host: &str) -> Option<HostSessionView> {
@@ -577,7 +609,9 @@ impl AgentSessions {
         // ADR 0017: never send a drain-only host new work, nor any host a
         // field or action it did not declare (it would refuse the command by
         // digest). The refusal is typed and nothing was sent.
-        if let Some(reason) = capabilities::refusal(session.drain_only, &session.capabilities, &command) {
+        if let Some(reason) =
+            capabilities::refusal(session.drain_only, &session.capabilities, &command)
+        {
             return Err(Box::new(Status::failed_precondition(reason)));
         }
         let queued = send_command(
@@ -587,7 +621,9 @@ impl AgentSessions {
             },
         );
         if !queued {
-            return Err(Box::new(Status::resource_exhausted("host command queue unavailable")));
+            return Err(Box::new(Status::resource_exhausted(
+                "host command queue unavailable",
+            )));
         }
         Ok(session_id)
     }
@@ -604,23 +640,30 @@ impl AgentSessions {
     /// changes its ID/digest or creates a new effect ticket on the host.
     /// SPEC §13: timeout/disconnect provides no absence or completion evidence.
     pub async fn execute(
-        &self, command: mllm_protocol::execution::MemberCommand,
+        &self,
+        command: mllm_protocol::execution::MemberCommand,
     ) -> Result<pb::MemberExecutionResult, Box<Status>> {
         self.execute_observed(command, None).await
     }
     pub async fn execute_observed(
-        &self, command: mllm_protocol::execution::MemberCommand,
+        &self,
+        command: mllm_protocol::execution::MemberCommand,
         observer: Option<Arc<dyn RemoteEvidenceObserver>>,
     ) -> Result<pb::MemberExecutionResult, Box<Status>> {
-        self.execute_on_session(command, observer).await.map(|(_, result)| result)
+        self.execute_on_session(command, observer)
+            .await
+            .map(|(_, result)| result)
     }
     /// As `execute_observed`, also naming the authenticated host session the
     /// terminal result arrived on. Readiness evidence belongs to that session.
     pub async fn execute_on_session(
-        &self, command: mllm_protocol::execution::MemberCommand,
+        &self,
+        command: mllm_protocol::execution::MemberCommand,
         observer: Option<Arc<dyn RemoteEvidenceObserver>>,
     ) -> Result<(String, pb::MemberExecutionResult), Box<Status>> {
-        command.verify_digest().map_err(|_| Status::invalid_argument("invalid command"))?;
+        command
+            .verify_digest()
+            .map_err(|_| Status::invalid_argument("invalid command"))?;
         let host = command.identity.member.host_id.clone();
         let id = command.identity.command_id.clone();
         let deadline = command.identity.deadline_ms;
@@ -629,11 +672,23 @@ impl AgentSessions {
         {
             let mut pending = self.pending.lock().map_err(|_| denied())?;
             if pending.len() >= 128 || pending.contains_key(&id) {
-                return Err(Status::resource_exhausted("command observer capacity unavailable").into());
+                return Err(
+                    Status::resource_exhausted("command observer capacity unavailable").into(),
+                );
             }
-            pending.insert(id.clone(), PendingCommand { command, result: send, observer });
+            pending.insert(
+                id.clone(),
+                PendingCommand {
+                    command,
+                    result: send,
+                    observer,
+                },
+            );
         }
-        let _guard = PendingGuard { pending: self.pending.clone(), id };
+        let _guard = PendingGuard {
+            pending: self.pending.clone(),
+            id,
+        };
         let mut sessions = self.changes.subscribe();
         let mut retry = tokio::time::interval(Duration::from_millis(500));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -643,7 +698,9 @@ impl AgentSessions {
         let mut backoff = REDELIVER_FIRST;
         loop {
             let remaining = deadline - mllm_protocol::now_unix_ms();
-            if remaining <= 0 { return Err(Status::deadline_exceeded("host effect remains unresolved").into()); }
+            if remaining <= 0 {
+                return Err(Status::deadline_exceeded("host effect remains unresolved").into());
+            }
             tokio::select! {
                 _ = retry.tick() => {},
                 _ = sessions.changed() => {},
@@ -656,16 +713,25 @@ impl AgentSessions {
                     return Err(Status::deadline_exceeded("host effect remains unresolved").into());
                 }
             }
-            let Some(current) = self.live_session(&host) else { continue };
+            let Some(current) = self.live_session(&host) else {
+                continue;
+            };
             let due = match &delivered {
-                Some((session, next)) if *session == current => tokio::time::Instant::now() >= *next,
+                Some((session, next)) if *session == current => {
+                    tokio::time::Instant::now() >= *next
+                }
                 _ => true,
             };
-            if !due { continue; }
+            if !due {
+                continue;
+            }
             // Queue failure or an offline host does not imply the effect failed.
             match self.dispatch_to(&host, wire.clone()) {
                 Ok(session) => {
-                    if delivered.as_ref().is_some_and(|(previous, _)| *previous == session) {
+                    if delivered
+                        .as_ref()
+                        .is_some_and(|(previous, _)| *previous == session)
+                    {
                         backoff = (backoff * 2).min(REDELIVER_MAX);
                     } else {
                         backoff = REDELIVER_FIRST;
@@ -686,15 +752,24 @@ impl AgentSessions {
 
     /// `received_at` is when the message arrived on the session, on the
     /// controller clock: freshness is judged there, not after lock waits.
-    fn receive_result(&self, host: &str, session: &str, mut result: pb::MemberExecutionResult, received_at: i64) -> Result<(), Box<Status>> {
+    fn receive_result(
+        &self,
+        host: &str,
+        session: &str,
+        mut result: pb::MemberExecutionResult,
+        received_at: i64,
+    ) -> Result<(), Box<Status>> {
         let identity = result.identity.as_ref().ok_or_else(denied)?;
-        if identity.host_id != host { return Err(denied().into()); }
+        if identity.host_id != host {
+            return Err(denied().into());
+        }
         let pending = self.pending.lock().map_err(|_| denied())?;
         let Some(expected) = pending.get(&identity.command_id) else {
             // A cancelled observer does not authorize adopting late evidence.
             return Ok(());
         };
-        mllm_protocol::execution::validate_result(&expected.command, &result).map_err(|_| denied())?;
+        mllm_protocol::execution::validate_result(&expected.command, &result)
+            .map_err(|_| denied())?;
         // SPEC §13: a result too old (or too far ahead) to be evidence is not
         // evidence, but it is no protocol violation either. It is ignored and
         // the session stays up; the command's redelivery asks for it again.
@@ -710,10 +785,15 @@ impl AgentSessions {
         }
         // Accepted/attempted is retained uncertainty, never a completed effect.
         let terminal = match &expected.command.action {
-            mllm_protocol::execution::MemberAction::LaunchSingle(_) => result.model_usable
-                || (result.state == "completed" && !result.claim_retained)
-                || launch_ended_before_readiness(&result),
-            _ => matches!(result.state.as_str(), "launched" | "completed" | "tombstone"),
+            mllm_protocol::execution::MemberAction::LaunchSingle(_) => {
+                result.model_usable
+                    || (result.state == "completed" && !result.claim_retained)
+                    || launch_ended_before_readiness(&result)
+            }
+            _ => matches!(
+                result.state.as_str(),
+                "launched" | "completed" | "tombstone"
+            ),
         };
         // The session table is read after the result's store work, never
         // across it: evidence names only a session that is still the host's.
@@ -731,24 +811,49 @@ impl AgentSessions {
 
     /// Private credential provisioning is acknowledged only after protected host
     /// storage commits. The command and result journals never receive the key.
-    pub async fn provision_ingress(&self, command: &mllm_protocol::execution::MemberCommand, gate_key: [u8; 32]) -> Result<ProvisionOutcome, Box<Status>> {
+    pub async fn provision_ingress(
+        &self,
+        command: &mllm_protocol::execution::MemberCommand,
+        gate_key: [u8; 32],
+    ) -> Result<ProvisionOutcome, Box<Status>> {
         command.verify_digest().map_err(|_| denied())?;
-        if !matches!(command.action, mllm_protocol::execution::MemberAction::LaunchSingle(_)) || gate_key == [0; 32] { return Err(denied().into()); }
+        if !matches!(
+            command.action,
+            mllm_protocol::execution::MemberAction::LaunchSingle(_)
+        ) || gate_key == [0; 32]
+        {
+            return Err(denied().into());
+        }
         let wire = command.to_wire();
         let identity = wire.identity.clone().ok_or_else(denied)?;
         let id = identity.command_id.clone();
         let (acknowledged, mut received) = tokio::sync::watch::channel(None);
         {
             let mut pending = self.provisions.lock().map_err(|_| denied())?;
-            if pending.len() >= 128 || pending.contains_key(&id) { return Err(Status::resource_exhausted("provision observer unavailable").into()); }
-            pending.insert(id.clone(), PendingProvision { identity: identity.clone(), acknowledged });
+            if pending.len() >= 128 || pending.contains_key(&id) {
+                return Err(Status::resource_exhausted("provision observer unavailable").into());
+            }
+            pending.insert(
+                id.clone(),
+                PendingProvision {
+                    identity: identity.clone(),
+                    acknowledged,
+                },
+            );
         }
-        let _guard = ProvisionGuard { pending: self.provisions.clone(), id };
+        let _guard = ProvisionGuard {
+            pending: self.provisions.clone(),
+            id,
+        };
         let mut retry = tokio::time::interval(Duration::from_millis(500));
         let mut sent = false;
         loop {
             let remaining = identity.deadline_unix_ms - mllm_protocol::now_unix_ms();
-            if remaining <= 0 { return Err(Status::deadline_exceeded("private ingress provision unresolved").into()); }
+            if remaining <= 0 {
+                return Err(
+                    Status::deadline_exceeded("private ingress provision unresolved").into(),
+                );
+            }
             tokio::select! {
                 _ = retry.tick() => {
                     let peer = self.sessions.lock().map_err(|_| denied())?.get(&identity.host_id).map(|s| s.peer.clone());
@@ -776,18 +881,28 @@ impl AgentSessions {
             }
         }
     }
-    fn receive_provision(&self, host: &str, result: pb::IngressProvisioned) -> Result<(), Box<Status>> {
+    fn receive_provision(
+        &self,
+        host: &str,
+        result: pb::IngressProvisioned,
+    ) -> Result<(), Box<Status>> {
         let id = result.identity.ok_or_else(denied)?;
-        if id.host_id != host { return Err(denied().into()); }
+        if id.host_id != host {
+            return Err(denied().into());
+        }
         // SPEC §13: a refusal names one closed category, never free text.
         let outcome = match result.refused.as_str() {
             "" => ProvisionOutcome::Provisioned,
-            reason if mllm_protocol::execution::is_policy_refusal(reason) => ProvisionOutcome::Refused(reason.to_owned()),
+            reason if mllm_protocol::execution::is_policy_refusal(reason) => {
+                ProvisionOutcome::Refused(reason.to_owned())
+            }
             _ => return Err(denied().into()),
         };
         let pending = self.provisions.lock().map_err(|_| denied())?;
         if let Some(expected) = pending.get(&id.command_id) {
-            if expected.identity != id { return Err(denied().into()); }
+            if expected.identity != id {
+                return Err(denied().into());
+            }
             let _ = expected.acknowledged.send(Some(outcome));
         }
         Ok(())
@@ -795,7 +910,12 @@ impl AgentSessions {
 
     /// Owner decision 2026-09-23: mark this session's host silent or heard
     /// again, and tell supervisors at once.
-    fn set_unresponsive(&self, host: &str, id: &str, unresponsive: bool) -> Result<(), Box<Status>> {
+    fn set_unresponsive(
+        &self,
+        host: &str,
+        id: &str,
+        unresponsive: bool,
+    ) -> Result<(), Box<Status>> {
         {
             let mut sessions = self.sessions.lock().map_err(|_| denied())?;
             let s = sessions.get_mut(host).ok_or_else(denied)?;
@@ -1095,7 +1215,10 @@ impl AgentSessions {
         if let Err(status) = result {
             // SPEC §13: the end of a session retains every claim. The reason is
             // a fixed status phrase for the operator, never command payloads.
-            eprintln!("host {host} control session {id} ended: {}", status.message());
+            eprintln!(
+                "host {host} control session {id} ended: {}",
+                status.message()
+            );
             let _ = outgoing.try_send(Err(status));
         }
     }
@@ -1195,13 +1318,23 @@ impl AgentControl for AgentSessions {
         };
         // Status evidence only: a store that cannot record it never refuses
         // or admits a session.
-        if self.authority.record_host_version(&connect.host_id, &record).is_err() {
-            eprintln!("host {} control session: its version could not be recorded", connect.host_id);
+        if self
+            .authority
+            .record_host_version(&connect.host_id, &record)
+            .is_err()
+        {
+            eprintln!(
+                "host {} control session: its version could not be recorded",
+                connect.host_id
+            );
         }
         if skew.state == version::Compatibility::Refused {
             // ADR 0017: a newer host is refused with the policy's sentence;
             // the host logs it and keeps reconnecting with its backoff.
-            eprintln!("host {} control session refused: {}", connect.host_id, skew.reason);
+            eprintln!(
+                "host {} control session refused: {}",
+                connect.host_id, skew.reason
+            );
             return Err(Status::failed_precondition(format!(
                 "{}: {}",
                 version::NEWER_HOST_REFUSAL,
@@ -1275,10 +1408,14 @@ impl AgentControl for AgentSessions {
             self.load.forget_host(&host);
         }
         self.changed();
-        self.tasks.track(tokio::spawn(
-            self.clone()
-                .serve(host, id, peer, incoming, outgoing, cancellation),
-        ));
+        self.tasks.track(tokio::spawn(self.clone().serve(
+            host,
+            id,
+            peer,
+            incoming,
+            outgoing,
+            cancellation,
+        )));
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
 }
@@ -1396,17 +1533,38 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
     }
     /// ADR 0007: the processes the host sampled in the same report as its
     /// availability (one report, so the two are coherent).
-    fn observe_with_residents(&self, host_id: String) -> crate::coordinator::ResidentObservationFuture {
+    fn observe_with_residents(
+        &self,
+        host_id: String,
+    ) -> crate::coordinator::ResidentObservationFuture {
         let current = self.view(&host_id);
         Box::pin(async move {
-            let host = current.filter(|h| h.online && h.reconciled)
-                .ok_or_else(|| crate::coordinator::CoordinatorError::Service("remote memory observation unavailable".into()))?;
-            let residents = host.domains.iter().flat_map(|d| d.residents.iter().cloned()).collect();
-            let observed = host.domains.into_iter().map(|d| mllm_domain::resources::MemoryObservation {
-                domain: mllm_config::remote_resources::ledger_key(&host_id, "domain", &d.domain_id),
-                capacity_bytes: d.capacity_bytes, available_bytes: d.available_bytes,
-                sampled_at_ms: d.observed_at_unix_ms,
-            }).collect();
+            let host = current
+                .filter(|h| h.online && h.reconciled)
+                .ok_or_else(|| {
+                    crate::coordinator::CoordinatorError::Service(
+                        "remote memory observation unavailable".into(),
+                    )
+                })?;
+            let residents = host
+                .domains
+                .iter()
+                .flat_map(|d| d.residents.iter().cloned())
+                .collect();
+            let observed = host
+                .domains
+                .into_iter()
+                .map(|d| mllm_domain::resources::MemoryObservation {
+                    domain: mllm_config::remote_resources::ledger_key(
+                        &host_id,
+                        "domain",
+                        &d.domain_id,
+                    ),
+                    capacity_bytes: d.capacity_bytes,
+                    available_bytes: d.available_bytes,
+                    sampled_at_ms: d.observed_at_unix_ms,
+                })
+                .collect();
             Ok((observed, residents))
         })
     }
@@ -1469,6 +1627,8 @@ mod installation_tests {
             assert!(!installation_fields_valid(&profile), "{bad:?}");
         }
         // An older host publishes none of it.
-        assert!(installation_fields_valid(&pb::RuntimeProfileStatus::default()));
+        assert!(installation_fields_valid(
+            &pb::RuntimeProfileStatus::default()
+        ));
     }
 }

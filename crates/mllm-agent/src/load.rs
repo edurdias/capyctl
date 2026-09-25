@@ -160,21 +160,39 @@ pub fn parse_engine_load(text: &str) -> Option<EngineLoad> {
 /// installed engine sources, read on host-a on 2026-09-23:
 /// vLLM 0.29.0 `vllm/v1/metrics/loggers.py` (labels `model_name`, `engine`).
 const VLLM_HISTOGRAMS: &[(&str, &str)] = &[
-    ("engine_time_to_first_token", "vllm:time_to_first_token_seconds"),
-    ("engine_e2e_request_latency", "vllm:e2e_request_latency_seconds"),
+    (
+        "engine_time_to_first_token",
+        "vllm:time_to_first_token_seconds",
+    ),
+    (
+        "engine_e2e_request_latency",
+        "vllm:e2e_request_latency_seconds",
+    ),
     ("engine_queue_time", "vllm:request_queue_time_seconds"),
     ("engine_prefill_time", "vllm:request_prefill_time_seconds"),
     ("engine_decode_time", "vllm:request_decode_time_seconds"),
-    ("engine_inter_token_latency", "vllm:inter_token_latency_seconds"),
+    (
+        "engine_inter_token_latency",
+        "vllm:inter_token_latency_seconds",
+    ),
 ];
 /// SGLang 0.5.20 `sglang/srt/observability/metrics_collector.py`. SGLang has
 /// no prefill or decode phase histogram; its TTFT and end-to-end series carry
 /// an `is_streaming` label, summed here. Exported only with `enable_metrics`.
 const SGLANG_HISTOGRAMS: &[(&str, &str)] = &[
-    ("engine_time_to_first_token", "sglang:time_to_first_token_seconds"),
-    ("engine_e2e_request_latency", "sglang:e2e_request_latency_seconds"),
+    (
+        "engine_time_to_first_token",
+        "sglang:time_to_first_token_seconds",
+    ),
+    (
+        "engine_e2e_request_latency",
+        "sglang:e2e_request_latency_seconds",
+    ),
     ("engine_queue_time", "sglang:queue_time_seconds"),
-    ("engine_inter_token_latency", "sglang:inter_token_latency_seconds"),
+    (
+        "engine_inter_token_latency",
+        "sglang:inter_token_latency_seconds",
+    ),
 ];
 
 /// Every sample of the exact metric `name`, as (label set, value). `Err` when
@@ -292,7 +310,11 @@ pub fn parse_histogram(text: &str, metric: &str) -> Option<Histogram> {
         }
     }
     by_le.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let sum: f64 = labelled(text, &format!("{metric}_sum")).ok()?.iter().map(|(_, v)| v).sum();
+    let sum: f64 = labelled(text, &format!("{metric}_sum"))
+        .ok()?
+        .iter()
+        .map(|(_, v)| v)
+        .sum();
     let total = labelled(text, &format!("{metric}_count"))
         .ok()?
         .iter()
@@ -437,7 +459,8 @@ impl LoadReporter {
         // on one host are one launch: report it once. ADR 0013 §5: two
         // instances of one deployment on one host are reported apart. The
         // dropped member's ingress timings are merged into the kept one.
-        let key = |(instance, s): &(u32, LoadSample)| (s.deployment_id.clone(), *instance, s.generation);
+        let key =
+            |(instance, s): &(u32, LoadSample)| (s.deployment_id.clone(), *instance, s.generation);
         samples.sort_by_key(key);
         samples.dedup_by(|a, b| {
             if key(a) != key(b) {
@@ -459,7 +482,10 @@ impl LoadReporter {
         body: Option<&str>,
         baselines: &mut EngineBaselines,
     ) -> Option<SampleLatency> {
-        let mut histograms = self.ingress.drain_latency(&target.scope).unwrap_or_default();
+        let mut histograms = self
+            .ingress
+            .drain_latency(&target.scope)
+            .unwrap_or_default();
         let mut engine = None;
         if let Some((family, current)) = body.and_then(parse_engine_histograms) {
             engine = Some(family.to_owned());

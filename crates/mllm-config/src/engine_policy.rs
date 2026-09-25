@@ -236,14 +236,54 @@ const VLLM_SENSITIVE: &[(&str, Sensitivity)] = &[
     ("--logits-processor-pattern", Sensitivity::Code),
     ("--tool-parser-plugin", Sensitivity::Code),
     ("--reasoning-parser-plugin", Sensitivity::Code),
-    ("--download-dir", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--tokenizer", Sensitivity::Path { checkpoint_exempt: true }),
-    ("--chat-template", Sensitivity::Path { checkpoint_exempt: true }),
-    ("--lora-modules", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--speculative-config", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--generation-config", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--allowed-local-media-path", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--hf-config-path", Sensitivity::Path { checkpoint_exempt: false }),
+    (
+        "--download-dir",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--tokenizer",
+        Sensitivity::Path {
+            checkpoint_exempt: true,
+        },
+    ),
+    (
+        "--chat-template",
+        Sensitivity::Path {
+            checkpoint_exempt: true,
+        },
+    ),
+    (
+        "--lora-modules",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--speculative-config",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--generation-config",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--allowed-local-media-path",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--hf-config-path",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
     ("--otlp-traces-endpoint", Sensitivity::ListenerOrEgress),
     ("--kv-transfer-config", Sensitivity::ListenerOrEgress),
     ("--kv-events-config", Sensitivity::ListenerOrEgress),
@@ -253,17 +293,50 @@ const VLLM_SENSITIVE: &[(&str, Sensitivity)] = &[
 ];
 const SGLANG_SENSITIVE: &[(&str, Sensitivity)] = &[
     ("--enable-custom-logit-processor", Sensitivity::Code),
-    ("--download-dir", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--chat-template", Sensitivity::Path { checkpoint_exempt: true }),
-    ("--completion-template", Sensitivity::Path { checkpoint_exempt: true }),
-    ("--lora-paths", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--speculative-draft-model-path", Sensitivity::Path { checkpoint_exempt: false }),
-    ("--file-storage-path", Sensitivity::Path { checkpoint_exempt: false }),
+    (
+        "--download-dir",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--chat-template",
+        Sensitivity::Path {
+            checkpoint_exempt: true,
+        },
+    ),
+    (
+        "--completion-template",
+        Sensitivity::Path {
+            checkpoint_exempt: true,
+        },
+    ),
+    (
+        "--lora-paths",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--speculative-draft-model-path",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
+    (
+        "--file-storage-path",
+        Sensitivity::Path {
+            checkpoint_exempt: false,
+        },
+    ),
     ("--otlp-traces-endpoint", Sensitivity::ListenerOrEgress),
     ("--tool-server", Sensitivity::ListenerOrEgress),
     ("--kv-events-config", Sensitivity::ListenerOrEgress),
     ("--load-format", Sensitivity::ListenerOrEgress),
-    ("--remote-instance-weight-loader-seed-instance-ip", Sensitivity::ListenerOrEgress),
+    (
+        "--remote-instance-weight-loader-seed-instance-ip",
+        Sensitivity::ListenerOrEgress,
+    ),
 ];
 
 /// ADR 0014 open issue 5: the explicit lists above are initial. These name
@@ -273,8 +346,19 @@ const SGLANG_SENSITIVE: &[(&str, Sensitivity)] = &[
 /// applies the same shapes to the destination the engine's own parser resolves,
 /// at launch, which is where an abbreviation is finally known.
 const LISTENER_SUFFIXES: &[&str] = &[
-    "-port", "-ports", "-host", "-address", "-addr", "-ip", "-socket", "-endpoint", "-endpoints",
-    "-url", "-urls", "-token", "-bind",
+    "-port",
+    "-ports",
+    "-host",
+    "-address",
+    "-addr",
+    "-ip",
+    "-socket",
+    "-endpoint",
+    "-endpoints",
+    "-url",
+    "-urls",
+    "-token",
+    "-bind",
 ];
 const PATH_SUFFIXES: &[&str] = &["-path", "-paths", "-dir", "-directory", "-folder", "-file"];
 /// SPEC §8.2: a JSON configuration value can name paths and endpoints that no
@@ -429,16 +513,16 @@ pub enum ProfileArgError {
     ShortOption(String),
     #[error("configuration-file option `{0}` would hide values from validation (SPEC §8.2)")]
     ConfigFile(String),
-    #[error("option `{option}` duplicates typed field `engine_config.{field}`; set the typed field")]
+    #[error(
+        "option `{option}` duplicates typed field `engine_config.{field}`; set the typed field"
+    )]
     TypedField { option: String, field: String },
     #[error(
         "option `{0}` is security-sensitive; it needs the host installation to list it \
          in security.approved_options (ADR 0014 §8)"
     )]
     Sensitive(String),
-    #[error(
-        "option `{0}` names a path outside the host's security.approved_paths (ADR 0014 §8)"
-    )]
+    #[error("option `{0}` names a path outside the host's security.approved_paths (ADR 0014 §8)")]
     PathNotApproved(String),
 }
 
@@ -467,7 +551,11 @@ pub fn reserved_options(engine: Engine, sleep_mode: bool) -> Vec<String> {
         Engine::Sglang => SGLANG_RESERVED_FIELDS
             .iter()
             .map(|field| sglang_field_option(field))
-            .chain(SGLANG_RESERVED_ALIASES.iter().map(|name| (*name).to_owned()))
+            .chain(
+                SGLANG_RESERVED_ALIASES
+                    .iter()
+                    .map(|name| (*name).to_owned()),
+            )
             .collect(),
     }
 }
@@ -507,7 +595,10 @@ fn matches_name(given: &str, protected: &str) -> bool {
 /// (vLLM's boolean options accept `--no-<name>`), and a dotted JSON sub-key's
 /// base (`--compilation-config.level`).
 fn candidate_names(name: &str) -> Vec<String> {
-    let base = name.split_once('.').map_or(name, |(base, _)| base).to_owned();
+    let base = name
+        .split_once('.')
+        .map_or(name, |(base, _)| base)
+        .to_owned();
     let mut names = vec![base.clone()];
     if let Some(stripped) = base.strip_prefix("--no-") {
         names.push(format!("--{stripped}"));
@@ -518,7 +609,9 @@ fn candidate_names(name: &str) -> Vec<String> {
 fn reserved_option(engine: Engine, name: &str, sleep_mode: bool) -> bool {
     let reserved = reserved_options(engine, sleep_mode);
     candidate_names(name).iter().any(|candidate| {
-        reserved.iter().any(|protected| matches_name(candidate, protected))
+        reserved
+            .iter()
+            .any(|protected| matches_name(candidate, protected))
             || reserved_families(engine)
                 .iter()
                 .any(|family| candidate.starts_with(family))
@@ -546,12 +639,16 @@ fn typed_option(engine: Engine, name: &str) -> Option<(&'static str, &'static st
 fn shape(name: &str) -> Option<Sensitivity> {
     let parts: Vec<&str> = name.trim_start_matches('-').split('-').collect();
     if CODE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
-        || parts.iter().any(|part| matches!(*part, "plugin" | "plugins"))
+        || parts
+            .iter()
+            .any(|part| matches!(*part, "plugin" | "plugins"))
     {
         return Some(Sensitivity::Code);
     }
     let bind_like = parts.contains(&"bind");
-    if LISTENER_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+    if LISTENER_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
         || bind_like
         || name.contains("remote-instance")
     {
@@ -627,7 +724,9 @@ pub fn parse_options(args: &[String]) -> Result<Vec<ParsedOption>, ProfileArgErr
             awaiting_value = value.is_none();
             options.push(ParsedOption { name, value });
         } else if token.starts_with('-') && token.len() > 1 && token.parse::<f64>().is_err() {
-            return Err(ProfileArgError::ShortOption(token.chars().take(2).collect()));
+            return Err(ProfileArgError::ShortOption(
+                token.chars().take(2).collect(),
+            ));
         } else if awaiting_value {
             awaiting_value = false;
             if let Some(last) = options.last_mut() {
@@ -691,9 +790,7 @@ pub fn validate_extra_args(
                 field: field.to_owned(),
             });
         }
-        let base = candidate_names(&name)
-            .pop()
-            .unwrap_or_else(|| name.clone());
+        let base = candidate_names(&name).pop().unwrap_or_else(|| name.clone());
         if !seen.insert(base.clone()) || context.host_fixed.contains(&base) {
             return Err(ProfileArgError::Duplicate(name));
         }

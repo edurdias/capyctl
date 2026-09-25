@@ -497,7 +497,10 @@ impl crate::Store {
             crate::switch_state::ClosureReason::Switch,
         )?;
         let deadline = now.saturating_add(e.request_deadline_ms);
-        let release = if may_park && parks(&e) && !park_refused(&tx, deployment, instance, generation)? {
+        let release = if may_park
+            && parks(&e)
+            && !park_refused(&tx, deployment, instance, generation)?
+        {
             let receipt = Self::instance_park_in_transaction(
                 &tx, s, principal, deployment, instance, key, now, deadline,
             )?;
@@ -572,7 +575,13 @@ impl crate::Store {
         check_session(&tx, s)?;
         if matches!(record.phase, SwitchPhase::Completed | SwitchPhase::Failed) {
             for v in record.victims {
-                end_victim_closure(&tx, record.switch_id, &v.deployment_id, v.instance, Some(v.generation))?;
+                end_victim_closure(
+                    &tx,
+                    record.switch_id,
+                    &v.deployment_id,
+                    v.instance,
+                    Some(v.generation),
+                )?;
             }
         }
         // W10 gap (c): the switch in progress, for status.
@@ -622,7 +631,11 @@ impl crate::Store {
     /// caller gave up). Status stops showing it, and (W10 gap (a)) every
     /// closure it still holds on a victim it listed ends, reopening a gate only
     /// it held exactly as [`Self::reopen_after_switch`] would.
-    pub fn end_switch(&self, s: &CoordinatorSession, switch_id: &str) -> Result<(), LifecycleError> {
+    pub fn end_switch(
+        &self,
+        s: &CoordinatorSession,
+        switch_id: &str,
+    ) -> Result<(), LifecycleError> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         check_session(&tx, s)?;
         let listed: Option<String> = tx
@@ -877,7 +890,10 @@ fn plan_in(
         // Owner decision 2026-09-23 (solo first start): a whole-host start
         // fits only where no other owner holds a charge.
         let alone = !c.whole_host || c.ledger.owners.keys().all(|other| *other == owner);
-        if fits(&c.ledger, &owner, &c.footprint, &c.limits, c.max_parked).is_ok() && !c.occupied && alone {
+        if fits(&c.ledger, &owner, &c.footprint, &c.limits, c.max_parked).is_ok()
+            && !c.occupied
+            && alone
+        {
             // Rule 2: it fits without eviction; placement takes it, on the
             // host placement's own order chooses.
             let last_host: Option<String> = tx
@@ -990,7 +1006,11 @@ fn plan_in(
                 Ok(occupants
                     .iter()
                     .cloned()
-                    .chain(rest.iter().filter(|v| others.contains(&v.owner)).map(|v| v.owner.clone()))
+                    .chain(
+                        rest.iter()
+                            .filter(|v| others.contains(&v.owner))
+                            .map(|v| v.owner.clone()),
+                    )
                     .collect::<Vec<_>>())
             } else {
                 Err(mllm_scheduler::placement::HostRefusal::RequiresEmptyHost)

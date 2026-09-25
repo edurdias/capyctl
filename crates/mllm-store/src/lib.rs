@@ -8,8 +8,8 @@ pub mod checkpoint_digests;
 pub mod deployments;
 pub mod development_controls;
 pub mod dispatch;
-pub mod events;
 pub mod enrollment;
+pub mod events;
 pub mod host_drain;
 pub mod host_publication;
 pub mod host_versions;
@@ -27,8 +27,8 @@ pub mod residency;
 pub mod resource_ledger;
 // ADR 0007: resident floors attributed by process identity.
 mod resident_floors;
-pub mod resource_policy;
 mod resource_namespace;
+pub mod resource_policy;
 pub mod schema;
 pub mod secrets;
 // ADR 0013 §10 (I3): the router's read of serving instances.

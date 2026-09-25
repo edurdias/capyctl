@@ -7,7 +7,7 @@ use futures::{FutureExt, StreamExt};
 use mllm_adapters::traits::StreamEnded;
 use mllm_adapters::{AdapterError, ChatForward};
 use mllm_router::{admission::InFlight, stream::stream_response};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 struct Forward {
@@ -222,7 +222,7 @@ async fn nonstream_failure_retains_accounting_and_redacts_backend_details() {
         .await
         .unwrap_err();
     assert_eq!(deps.inflight.current(&id), 1);
-    assert!(!error.1.0.to_string().contains("private-backend-detail"));
+    assert!(!error.1 .0.to_string().contains("private-backend-detail"));
 }
 
 #[tokio::test]
@@ -344,12 +344,10 @@ async fn backend_panic_keeps_abandoned_accounting() {
         None,
     )
     .into_response();
-    assert!(
-        axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(counts.current("d"), 1);
 }
 
@@ -386,7 +384,12 @@ impl ChatForward for Paced {
     }
 }
 
-fn paced(forward: Paced, counts: &Arc<InFlight>, first_ms: u64, idle_ms: u64) -> axum::response::Response {
+fn paced(
+    forward: Paced,
+    counts: &Arc<InFlight>,
+    first_ms: u64,
+    idle_ms: u64,
+) -> axum::response::Response {
     let bounds = mllm_router::stream::StreamBounds {
         first_event_by: tokio::time::Instant::now() + std::time::Duration::from_millis(first_ms),
         idle: std::time::Duration::from_millis(idle_ms),
@@ -421,7 +424,9 @@ async fn progressing_stream_is_never_cut_at_a_fixed_wall_time() {
         400,
     );
     let started = std::time::Instant::now();
-    let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
     assert!(started.elapsed() > std::time::Duration::from_millis(1000));
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("data: 11\n\n"), "{text}");

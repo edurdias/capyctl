@@ -98,7 +98,12 @@ impl SourceHost for Scripted {
     }
     fn request(&self, _: PendingSource) -> ReportFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let answer = self.answers.lock().unwrap().pop_front().unwrap_or(Err(Unavailable));
+        let answer = self
+            .answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Err(Unavailable));
         Box::pin(async move { answer })
     }
 }
@@ -184,7 +189,11 @@ async fn failures_are_recorded_and_terminal_ones_are_not_retried() {
     assert!(state_of(&f).terminal);
     supervisor.attempts.lock().unwrap().clear();
     run(&supervisor).await;
-    assert_eq!(host.calls.load(Ordering::SeqCst), 2, "terminal: not retried");
+    assert_eq!(
+        host.calls.load(Ordering::SeqCst),
+        2,
+        "terminal: not retried"
+    );
 }
 
 // T34 (ADR 0008): only source evidence converts into a report.

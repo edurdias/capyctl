@@ -12,11 +12,9 @@ use mllm_adapters::protected::ProtectedLaunchDescriptors;
 use mllm_adapters::traits::{OwnedProcessLaunch, RenderedCommand, RuntimeError};
 use mllm_domain::completion::{Presence, ProcessIdentity};
 
-use crate::durable::{
-    DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation,
-};
+use crate::durable::{DurableSpawn, DurableSpawnError, DurableSpawnOutcome, LaunchAssociation};
 use crate::group_observation::observe_process_group_or_empty;
-use crate::process_absence::{GoneProof, presence, verify_gone};
+use crate::process_absence::{presence, verify_gone, GoneProof};
 
 /// How long to wait after SIGKILL before the outcome is reported as uncertain.
 const KILL_PROOF_WINDOW: Duration = Duration::from_secs(5);
@@ -49,7 +47,9 @@ fn uncertain(reason: impl Into<String>) -> RuntimeError {
 
 /// The launcher's outcome is release evidence, and it maps the same way whether
 /// descriptors were inherited or not.
-fn released(outcome: Result<DurableSpawnOutcome, DurableSpawnError>) -> Result<ProcessIdentity, RuntimeError> {
+fn released(
+    outcome: Result<DurableSpawnOutcome, DurableSpawnError>,
+) -> Result<ProcessIdentity, RuntimeError> {
     match outcome {
         Ok(DurableSpawnOutcome::Uncertain {
             api_identity: Some(identity),

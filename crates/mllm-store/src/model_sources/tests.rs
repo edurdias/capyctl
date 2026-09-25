@@ -43,9 +43,22 @@ fn setup() -> (Store, CoordinatorSession, Value, Value) {
     (store, session, config, host)
 }
 
-fn deploy(store: &Store, session: &CoordinatorSession, key: &str, config: &Value, host: &Value) -> ManagedConfigurationReceipt {
+fn deploy(
+    store: &Store,
+    session: &CoordinatorSession,
+    key: &str,
+    config: &Value,
+    host: &Value,
+) -> ManagedConfigurationReceipt {
     store
-        .create_stopped_managed_configuration(session, "p", key, &json!({"config": config}).to_string(), host, 1)
+        .create_stopped_managed_configuration(
+            session,
+            "p",
+            key,
+            &json!({"config": config}).to_string(),
+            host,
+            1,
+        )
         .unwrap()
 }
 
@@ -78,14 +91,25 @@ fn a_remote_source_gates_activation_and_the_digest_until_verified() {
     assert_eq!(records[0].state, SourceState::Pending);
     assert_eq!(records[0].source_key, key());
     assert_eq!(store.pending_model_sources().unwrap().len(), 1);
-    assert!(store.pending_checkpoint_digests().unwrap().is_empty(), "nothing to hash yet");
+    assert!(
+        store.pending_checkpoint_digests().unwrap().is_empty(),
+        "nothing to hash yet"
+    );
     assert!(matches!(
         store.accept_start(&session, &fence(&receipt), 100, 100_100),
         Err(LifecycleError::ModelSourcePending)
     ));
 
     store
-        .record_model_source(&session, &id, 1, "lab", &key(), &report(SourceState::Downloading, 10, 100, None), 2)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &key(),
+            &report(SourceState::Downloading, 10, 100, None),
+            2,
+        )
         .unwrap();
     let status = serde_json::to_value(&store.snapshot().unwrap().deployments[0]).unwrap();
     assert_eq!(status["model_sources"][0]["state"], "downloading");
@@ -93,16 +117,41 @@ fn a_remote_source_gates_activation_and_the_digest_until_verified() {
     assert_eq!(status["model_sources"][0]["bytes_total"], 100);
 
     store
-        .record_model_source(&session, &id, 1, "lab", &key(), &report(SourceState::Verified, 100, 100, None), 3)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &key(),
+            &report(SourceState::Verified, 100, 100, None),
+            3,
+        )
         .unwrap();
     // A later answer never downgrades a verified copy.
     store
-        .record_model_source(&session, &id, 1, "lab", &key(), &report(SourceState::Pending, 0, 0, None), 4)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &key(),
+            &report(SourceState::Pending, 0, 0, None),
+            4,
+        )
         .unwrap();
-    assert_eq!(store.model_source(&id, 1, "lab").unwrap().unwrap().state, SourceState::Verified);
+    assert_eq!(
+        store.model_source(&id, 1, "lab").unwrap().unwrap().state,
+        SourceState::Verified
+    );
     assert!(store.pending_model_sources().unwrap().is_empty());
-    assert_eq!(store.pending_checkpoint_digests().unwrap().len(), 1, "now measurable");
-    store.accept_start(&session, &fence(&receipt), 100, 100_100).unwrap();
+    assert_eq!(
+        store.pending_checkpoint_digests().unwrap().len(),
+        1,
+        "now measurable"
+    );
+    store
+        .accept_start(&session, &fence(&receipt), 100, 100_100)
+        .unwrap();
     store
         .record_checkpoint_digest(&session, &id, 1, "lab", DIGEST, 7, 5)
         .unwrap();
@@ -117,7 +166,15 @@ fn a_terminal_failure_refuses_activation() {
     let receipt = deploy(&store, &session, "k", &config, &host);
     let id = receipt.deployment_id.clone();
     store
-        .record_model_source(&session, &id, 1, "lab", &key(), &report(SourceState::Failed, 0, 0, Some("network")), 2)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &key(),
+            &report(SourceState::Failed, 0, 0, Some("network")),
+            2,
+        )
         .unwrap();
     assert_eq!(store.pending_model_sources().unwrap().len(), 1, "retryable");
     assert!(matches!(
@@ -125,9 +182,20 @@ fn a_terminal_failure_refuses_activation() {
         Err(LifecycleError::ModelSourcePending)
     ));
     store
-        .record_model_source(&session, &id, 1, "lab", &key(), &report(SourceState::Failed, 0, 0, Some("hash_mismatch")), 3)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            &key(),
+            &report(SourceState::Failed, 0, 0, Some("hash_mismatch")),
+            3,
+        )
         .unwrap();
-    assert!(store.pending_model_sources().unwrap().is_empty(), "terminal");
+    assert!(
+        store.pending_model_sources().unwrap().is_empty(),
+        "terminal"
+    );
     assert!(matches!(
         store.accept_start(&session, &fence(&receipt), 100, 100_100),
         Err(LifecycleError::ModelSourceFailed)
@@ -146,10 +214,26 @@ fn a_terminal_failure_refuses_activation() {
     }
     // A host the revision did not resolve on, or another key, records nothing.
     assert!(store
-        .record_model_source(&session, &id, 1, "elsewhere", &key(), &report(SourceState::Pending, 0, 0, None), 5)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "elsewhere",
+            &key(),
+            &report(SourceState::Pending, 0, 0, None),
+            5
+        )
         .is_err());
     assert!(store
-        .record_model_source(&session, &id, 1, "lab", "sources/http/x", &report(SourceState::Pending, 0, 0, None), 5)
+        .record_model_source(
+            &session,
+            &id,
+            1,
+            "lab",
+            "sources/http/x",
+            &report(SourceState::Pending, 0, 0, None),
+            5
+        )
         .is_err());
 }
 
@@ -178,7 +262,12 @@ fn a_local_source_has_no_record() {
         )
         .unwrap();
     let receipt = deploy(&store, &session2, "k", &value["deployment"], &value["host"]);
-    assert!(store.model_sources(&receipt.deployment_id, 1).unwrap().is_empty());
+    assert!(store
+        .model_sources(&receipt.deployment_id, 1)
+        .unwrap()
+        .is_empty());
     assert!(store.referenced_model_sources().unwrap().is_empty());
-    store.accept_start(&session2, &fence(&receipt), 100, 100_100).unwrap();
+    store
+        .accept_start(&session2, &fence(&receipt), 100, 100_100)
+        .unwrap();
 }

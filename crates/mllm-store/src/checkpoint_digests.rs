@@ -299,18 +299,20 @@ impl crate::Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(deployment_id, revision, generation, host_id, expected, weights_bytes)| {
-                let (_, effective) = frozen(&tx, &deployment_id, revision)?;
-                Ok(PendingDigest {
-                    deployment_id,
-                    revision,
-                    generation,
-                    host_id,
-                    expected,
-                    effective,
-                    weights_bytes,
-                })
-            })
+            .map(
+                |(deployment_id, revision, generation, host_id, expected, weights_bytes)| {
+                    let (_, effective) = frozen(&tx, &deployment_id, revision)?;
+                    Ok(PendingDigest {
+                        deployment_id,
+                        revision,
+                        generation,
+                        host_id,
+                        expected,
+                        effective,
+                        weights_bytes,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -481,7 +483,8 @@ impl crate::Store {
                         .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?)))?
                         .collect::<rusqlite::Result<_>>()?;
                     for (host, frozen_json) in hosts {
-                        let Ok(mut on_host) = resolve_snapshot_with_checkpoint(&frozen_json, facts) else {
+                        let Ok(mut on_host) = resolve_snapshot_with_checkpoint(&frozen_json, facts)
+                        else {
                             return Err(CheckpointDigestError::CorruptStoredData);
                         };
                         on_host.routes.sort();
