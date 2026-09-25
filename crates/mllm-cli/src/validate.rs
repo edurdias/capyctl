@@ -115,6 +115,12 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                             // reserves from arm until Ready, before any
                             // measurement on the host.
                             "startup": mllm_config::effective::startup_budget(&effective),
+                            // ADR 0014 §5 (owner decision 2026-09-25): the
+                            // context the launch passes, fitted to the KV
+                            // grant when undeclared, read from the checkpoint
+                            // as this machine sees it (a remote host fits it
+                            // again from its own copy at launch).
+                            "context": mllm_config::context_fit::fit_for_effective(&effective),
                         },
                     }));
                 }

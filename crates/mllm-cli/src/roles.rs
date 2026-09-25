@@ -70,9 +70,6 @@ const DEFAULT_ENGINE_PORTS: (u16, u16) = (8100, 8199);
 /// budget bounds the engine's pool, and a smaller grant keeps two engines from
 /// overcommitting the domain during a stop-start overlap.
 const DEFAULT_KV_CACHE: &str = "16GiB";
-/// vLLM's startup check requires the model's context to fit the KV pool, and a
-/// modern checkpoint's default context would demand far more than the grant.
-const DEFAULT_ENGINE_ARGS: &str = "--max-model-len 4096";
 /// How long `<engine> --version` is given before the probe is a refusal. A version
 /// print that takes longer than this is not a healthy installation.
 const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -494,9 +491,12 @@ impl EnvEngineProvider {
         // ADR 0014 §1: the installation keeps host-fixed arguments only; engine
         // tuning belongs to the deployment. SGLang's protected entry takes no
         // argument vector (`engine_policy.rs` refuses any on that family).
+        // ADR 0014 §5 (owner decision 2026-09-25): no `--max-model-len`
+        // default; an undeclared context is fitted to the KV grant at launch.
+        // An explicit `MLLM_ENGINE_ARGS` is kept as the host's fixed args.
         let args = match engine {
             Engine::Vllm => env_value(ENGINE_ARGS)
-                .unwrap_or_else(|| DEFAULT_ENGINE_ARGS.to_string())
+                .unwrap_or_default()
                 .split(' ')
                 .filter(|argument| !argument.is_empty())
                 .map(str::to_owned)
