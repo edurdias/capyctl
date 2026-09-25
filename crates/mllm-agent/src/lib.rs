@@ -12,6 +12,8 @@ pub mod doctor;
 // SPEC §3.3 / ADR 0001: the runtime helpers compiled into the one binary.
 pub mod embedded_runtime;
 pub mod enrollment;
+// SPEC §7.2 / ADR 0019: per-device GPU memory and the host shape.
+pub mod gpu_memory;
 // ADR 0018 §3: the owner-only local control socket for engine add, remove
 // and list.
 pub mod control_socket;
