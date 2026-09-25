@@ -2,35 +2,36 @@
 
 **Goal:** Let an operator register the vLLM and SGLang installations already on a machine with `mllm engine detect|add|list|remove` (identical on a host and in standalone), see every host's engines with `mllm list engines`, and have an added or removed engine take effect without restarting the role.
 
-**Architecture:** Detection and resolution read package metadata only (`mllm-agent::engines`). `engine add` runs the bounded version check, the ADR 0008 fingerprint and the deep-park probe, writes the profile into the machine document atomically (revision header plus lock), then asks the running role over an owner-only Unix socket (`<state_dir>/control.sock`) to reload. A host agent re-measures and re-publishes its preparation on the live mTLS session (new capability `live_profile_update`, ADR 0017 gating); the server validates it like a startup publish and swaps the approved snapshot, or keeps the previous one. Removal is two-phase: the server writes a durable profile retirement (placement excludes the profile on that host in the same transaction), checks references, optionally stops them through the ordinary stop path and confirms only on stop evidence; the agent then rewrites the document and re-publishes. Standalone runs the same steps in one process against its embedded host document.
+**Architecture:** Detection and resolution read package metadata only (`mllm-agent::engines`). `engine add` runs the bounded version check, the ADR 0008 fingerprint and the deep-park probe, writes the profile into `engines.yaml`, an mllm-owned file beside the role's configuration file (revision header plus lock; the role's own document is never rewritten), then asks the running role over an owner-only Unix socket (`<state_dir>/control.sock`) to reload. A host agent re-measures and re-publishes its preparation on the live mTLS session (new capability `live_profile_update`, ADR 0017 gating); the server validates it like a startup publish and swaps the approved snapshot, or keeps the previous one. Removal is two-phase: the server writes a durable profile retirement (placement excludes the profile on that host in the same transaction), checks references, optionally stops them through the ordinary stop path and confirms only on stop evidence; the agent then rewrites `engines.yaml` and re-publishes. Standalone runs the same steps in one process against its embedded host document. A deploy naming a profile that no allowed host publishes is refused at once.
 
 **Tech Stack:** Rust 2021 workspace (tokio, tonic/prost, axum, rusqlite, clap, serde_json, saphyr-parser strict YAML), bash live harness under `scripts/live/matrix/`.
 
-**Spec:** `docs/superpowers/specs/2026-09-25-engine-registration-design.md` (owner-approved, merged in d067252). Read it with this plan. Governing documents: `docs/SPEC.md` (§4.2, §13, §14, §15), ADR 0008, ADR 0012, ADR 0017, and `AGENTS.md`.
+**Spec:** `docs/superpowers/specs/2026-09-25-engine-registration-design.md` (owner-approved, merged in d067252; revised in this PR with the owner's 2026-09-25 decisions). Read it with this plan. Governing documents: `docs/SPEC.md` (§4.2, §13, §14, §15), ADR 0008, ADR 0012, ADR 0017, and `AGENTS.md`.
 
-## Owner check (decisions that change or sharpen the spec's meaning)
+## Decisions (owner-decided 2026-09-25)
 
-Each item below is a decision this plan makes where the spec is silent, ambiguous or does not match the code. Items marked **owner check** change what the spec says and need the owner's confirmation before the task that implements them starts. The rest are recorded for the ADR.
+The owner reviewed the first version of this plan on PR #22 and decided the items below on 2026-09-25. Items 1, 2, 4, 8 and 14 changed the design; the spec (`docs/superpowers/specs/2026-09-25-engine-registration-design.md`) is updated in the same PR. One item still needs the owner: **20**, marked **owner check**.
 
-1. **owner check — standalone document location.** The spec says the standalone profile is written "under `~/.config/mllm/`". No code reads that directory for standalone: the role's document is `<state_dir>/config/standalone.yaml` (default `~/.local/state/mllm/config/standalone.yaml`) or the explicit `--config` file. `~/.config/mllm/` holds only `host.yaml` (the user unit's `MLLM_CONFIG`) and `standalone.env`. The plan writes to the document the role actually loads.
-2. **owner check — where the document revision lives.** Neither host nor standalone documents have a revision field, and adding one to the schema would make every rewritten document unreadable to an rc.3 server or agent (strict unknown-field refusal), which breaks the version-skew fallback. The plan records the revision as the first line of the file, `# mllm-document-revision: N`. YAML comments are ignored by the parser, so the published document and its policy fingerprint are unchanged by it.
-3. **owner check — rewriting the operator's YAML.** There is no YAML serializer in the workspace; every generated document is JSON-shaped YAML (`mllm init host` writes `serde_json::to_string_pretty`). `engine add` and `engine remove` rewrite the whole document the same way, so comments and layout are lost. The first rewrite keeps the operator's original once, as `<file>.before-engine-registration` (0600, never overwritten). SPEC §15.1 ("no continuous rewriting of administrator YAML") is amended by ADR 0018 to allow this explicit, operator-invoked rewrite.
-4. **owner check — `engine remove` without a reachable role.** The spec defines `agent_unreachable` as "the document is written; it takes effect when the role starts". For a removal that would be unsafe: a host restarted without a profile that running engines still use has no retirement proof. The plan refuses `engine remove` of a published profile with `agent_unreachable` and writes nothing when the role is not running or has no control session. A profile the running role reports as never published is removed locally, as the spec says.
-5. **owner check — the rc.3 live row.** "An rc.3 agent against the new server: `engine add` falls back to restart to publish" cannot run as written: an rc.3 binary has no `engine` command, and an rc.3 agent has no control socket, so the new CLI reports `agent_unreachable`. The fallback the spec describes ("either side lacks `live_profile_update`") is reachable with a new agent against an rc.3 server. Row ENG4 covers both: (a) the new CLI beside a running rc.3 agent gives `agent_unreachable`, the document is written, and the profile is published by the rc.3 agent's next start; (b) a new agent against an rc.3 server gives `restart_required`, and the host's next start publishes.
-6. **owner check — what a live re-publish may change.** The server accepts a live re-publish only when the new document differs from the approved one in `runtime_profiles` alone, and only removes a profile whose retirement it confirmed. Anything else is `publish_rejected` ("only runtime profiles change live; restart the host"). Reason: a resource-policy change under live charges is the startup import's job (it revises limits against current reservations), and it is not what `engine add` or `remove` writes.
-7. **owner check — retirement bound.** A drained removal waits for stop evidence up to the drain window (900 s, the same bound `mllm drain host` uses). If a stop is still unsettled or failed at the bound, the retirement ends, placements on the profile resume, the stops keep their accounting, and the CLI reports `profile_in_use` naming what is unsettled. It never confirms on a guess.
-8. Existing deployments are not re-resolved. A deployment's per-host resolution is frozen when it is deployed (`host_effective_revisions`). A deployment that named a profile the host lacked is `refused` on that host until it is deployed again (a new revision); `engine add` does not change that. The live rows deploy after the add.
-9. `custom` is derived, not stored: a profile is `custom` when its installed version is not in the verified set. The verified set is the versions the live matrix qualifies: vLLM `0.29.0`, SGLang `0.5.20` (`mllm_config::registration::VERIFIED`). Nothing new is written to the document for it, so older peers read the document unchanged.
-10. Version check: vLLM runs `<env>/bin/vllm --version`; SGLang runs `<env>/bin/python3 -I -B -c "import importlib.metadata,sys;print(importlib.metadata.version(sys.argv[1]))" sglang`, which reads the same metadata the interpreter would import without importing the engine. Both run with a cleared environment (only `HOME` and `PATH=/usr/bin:/bin` are passed), stdin and stderr closed, in their own process group, for at most 60 s (importing vLLM loads torch, which takes several seconds on a Spark; `roles.rs`'s 20 s `--version` bound was set for the fingerprint bypass path), with at most 4 KiB of output kept. The reported version must equal the `dist-info` version, or the add is refused `engine_version_failed`. The profile's `build_fingerprint` is that version string, matching the matrix host documents.
-11. Entry points: vLLM profiles use `<env>/bin/vllm`, SGLang profiles use `<env>/bin/python3`, both as the lexical path inside the environment. The resolver never follows the `python3` symlink, which in a venv points at the system interpreter.
-12. When the deep-park probe reports `deep_park` missing and the operator did not pass `--deep-park`, the profile is written with `security.deep_park: disabled`, so deployments on it resolve `restart_only`, as the spec requires. An explicit `--deep-park enabled` is kept and the report says `capability_missing`; the existing launch refusal (`capability_missing:deep_park`) then applies. A probe that cannot run is `unknown` and changes nothing.
-13. `--arg` values go through the existing profile rule, `engine_policy::validate_profile_args` (reserved options refused; SGLang profiles take no host-fixed arguments). `accept_extra_args` is a deployment `engine_config` switch and does not apply to profile arguments; the spec's mention of it is read as "the existing argument rules".
-14. The default detection locations are the spec's list. Home-level environments such as `~/mllm-vllm-venv2` (the Sparks' layout) are found with `--path ~`; the live rows use that. Conda roots: `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, `~/.conda`, `/opt/conda`, `/opt/miniconda3`, `/opt/anaconda3` (each root and its `envs/*`), plus every path in `~/.conda/environments.txt`. uv tools: `${XDG_DATA_HOME:-~/.local/share}/uv/tools/*`. pipx: `${PIPX_HOME:-~/.local/pipx}/venvs/*` and `~/.local/share/pipx/venvs/*`.
-15. Control socket protocol: one JSON request line and one JSON response line per connection, at most 64 KiB each, version field `"v": 1`. Operations are `add` (reload the document and publish), `remove` (`profile`, `drain`) and `list`. Nothing else is accepted.
-16. Proto: `AgentToServer.publish_profiles = 11`, `AgentToServer.retire_profile = 12`, `ServerToAgent.profiles_published = 12`, `ServerToAgent.profile_retirement = 13`, `SessionReady.capabilities = 5` (the server's own feature list, so a host learns whether its server has `live_profile_update`). `live_profile_update` is a server-to-host capability in the ADR 0017 catalogue: the server sends the two new server messages only to a host that declared it.
+1. **`host.yaml` is never rewritten.** Registered engines live in a separate, mllm-owned file, `engines.yaml`, merged with the role's own document at load. A profile name declared in both is refused (at role start, and by `engine add` as `profile_exists`). There is no rewrite of the role document, no `.before-engine-registration` backup and no SPEC §15.1 rewrite exception; ADR 0018 instead adds the engines file to the §15.1 authority table. `engines.yaml` is `schema_version: 1`, `kind: engines`, `runtime_profiles: {…}`, mode 0600, written as JSON-shaped YAML.
+2. **Where `engines.yaml` lives.** It sits beside the role's configuration file, with the same rule for both roles: `--config dir/x.yaml` (or `$MLLM_CONFIG`) means `dir/engines.yaml`; without one it is `~/.config/mllm/engines.yaml` (`$XDG_CONFIG_HOME/mllm/engines.yaml`) for a host and for standalone alike. The generated standalone document stays in the state directory. Consequence: a host and a standalone role that both run with implicit documents on one machine would share one engines file; the CLI refuses that ambiguity and asks for `--config`.
+3. **The revision is a first-line comment** of `engines.yaml`, `# mllm-document-revision: N`, increased by one per write.
+4. **Remove while the role is unreachable is refused.** `engine remove` of a published profile writes nothing and answers `agent_unreachable` when the role is not running or has no control session. A profile the running role never published is removed locally.
+5. **Row ENG4 adapted.** (a) The new CLI beside a running rc.3 agent gives `agent_unreachable` and writes `engines.yaml`; an rc.3 agent never reads `engines.yaml`, so the profile stays unpublished until the host runs the new binary, which publishes it at start. (b) A new agent against an rc.3 server gives `restart_required`; the host's next start publishes.
+6. **A live re-publish changes `runtime_profiles` only**, and only removes a profile whose retirement the server confirmed. Anything else is `publish_rejected` ("only runtime profiles change live; restart the role").
+7. **Retirement bound 900 s** (the `mllm drain host` window). Unsettled or failed stops at the bound end the retirement unconfirmed; accounting is kept; the CLI reports `profile_in_use` naming what is unsettled.
+8. **Deploy fails fast; no re-resolution.** A deploy naming a `runtime_profile` that no allowed host publishes is refused at once and nothing is stored. The error names the profile, each allowed host with the profiles it publishes, and the fix: `mllm engine add <path> --name <profile>`, then deploy again. Deployments are never re-resolved after `engine add` (Task 17).
+9. `custom` is derived, not stored: a version outside the verified set, vLLM `0.29.0` and SGLang `0.5.20` (`mllm_config::registration::VERIFIED`).
+10. **Version check 60 s.** vLLM runs `<env>/bin/vllm --version`; SGLang runs `<env>/bin/python3 -I -B -c "import importlib.metadata,sys;print(importlib.metadata.version(sys.argv[1]))" sglang`. Both run with a cleared environment (only `HOME` and `PATH=/usr/bin:/bin`), stdin and stderr closed, their own process group, at most 60 s and 4 KiB of output. The reported version must equal the `dist-info` version, else `engine_version_failed`. `build_fingerprint` is that version.
+11. Entry points: `<env>/bin/vllm` for vLLM and `<env>/bin/python3` for SGLang, lexical; the venv's `python3` symlink is never followed.
+12. **Deep park disabled when the probe reports it missing**, unless the operator passed `--deep-park enabled` (then the report says `capability_missing` and the existing launch refusal applies). A probe that cannot run is `unknown` and changes nothing.
+13. `--arg` values follow the existing profile rule (`engine_policy::validate_profile_args`); `accept_extra_args` is a deployment `engine_config` switch and does not govern profile arguments.
+14. **Detection also scans the home directory's top level**, one level deep: a directory with `pyvenv.cfg` and a vllm or sglang `dist-info` (metadata only), so `~/mllm-vllm-venv2` is found without `--path`. Conda roots: `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, `~/.conda`, `/opt/conda`, `/opt/miniconda3`, `/opt/anaconda3` (each root and its `envs/*`), plus `~/.conda/environments.txt`. uv tools: `${XDG_DATA_HOME:-~/.local/share}/uv/tools/*`. pipx: `${PIPX_HOME:-~/.local/pipx}/venvs/*` and `~/.local/share/pipx/venvs/*`.
+15. Control socket protocol: one JSON request line and one JSON reply line per connection, at most 64 KiB each, `"v": 1`; operations `add`, `remove` (`profile`, `drain`), `list`; nothing else.
+16. Proto field numbers: `AgentToServer.publish_profiles = 11`, `AgentToServer.retire_profile = 12`, `ServerToAgent.profiles_published = 12`, `ServerToAgent.profile_retirement = 13`, `SessionReady.capabilities = 5`. `live_profile_update` is a server-to-host capability.
 17. Exit codes: 16 `engine_not_found`, 17 `engine_unsupported`, 18 `engine_version_failed`, 19 `profile_exists`, 20 `profile_in_use`, 21 `publish_rejected`, 22 `agent_unreachable`, 23 `not_interactive`. 9 stays unused.
-18. Target document for the `engine` commands: `--config FILE` when given (its `kind` decides host or standalone); otherwise `$MLLM_CONFIG`; otherwise `${XDG_CONFIG_HOME:-~/.config}/mllm/host.yaml` if it exists; otherwise `<state_dir>/config/standalone.yaml` if it exists. When both implicit documents exist the command is refused `invalid_config` and asks for `--config`.
-19. Standalone environment-variable profiles (`local`, `local-vllm`, `local-sglang`) cannot be removed with `engine remove`; the refusal names the variable to unset. Standalone still needs `MLLM_MODELS_ROOT`; it no longer needs an engine variable when the document registers at least one engine.
+18. Role document for the `engine` commands: `--config`; else `$MLLM_CONFIG`; else `~/.config/mllm/host.yaml` if it exists; else `<state_dir>/config/standalone.yaml` if it exists; both implicit present is refused `invalid_config`. The engines file follows item 2.
+19. Standalone environment profiles (`local`, `local-vllm`, `local-sglang`) are not removable with `engine remove`; a profile declared in `host.yaml` is not removable either (the operator edits it). Standalone still needs `MLLM_MODELS_ROOT`; an engine variable is no longer required when `engines.yaml` registers an engine.
+20. **owner check — exit code for the fail-fast deploy.** Item 8 needs a closed code; the plan uses `profile_not_published`, HTTP 409, CLI exit **24** (next free after 23). The owner accepted 16–23; 24 is new.
 
 ## Global Constraints
 
@@ -55,11 +56,11 @@ Each item below is a decision this plan makes where the spec is silent, ambiguou
 
 The inputs below are the ones the spec implies but does not test, most likely to bite first. Each has a pinning test in the task named.
 
-1. **A document hand-edited outside `runtime_profiles` while the role runs** (for example a changed `resource_policy`), followed by `engine add`: the reload must refuse with "only runtime profiles change live; restart the role" and publish nothing, not silently publish the edit. Test: Task 13, `a_reload_refuses_a_document_changed_outside_profiles`.
+1. **`host.yaml` hand-edited outside `runtime_profiles` while the role runs** (for example a changed `resource_policy`), followed by `engine add`: the reload must refuse with "only runtime profiles change live; restart the role" and publish nothing, not silently publish the edit. Test: Task 13, `a_reload_refuses_a_document_changed_outside_profiles`.
 2. **A venv whose `bin/python3` is a symlink to `/usr/bin/python3`:** resolution must stay inside the venv and register `<venv>/bin/python3`, never `/usr`. Test: Task 4, `the_interpreter_symlink_is_not_followed`.
 3. **A state directory whose socket path exceeds the 107-byte `sun_path` limit:** the role must still start (the socket is refused with a logged reason) and the CLI must say `agent_unreachable` with the path, not panic. Test: Task 12, `an_overlong_socket_path_is_refused_cleanly`.
-4. **A document that would exceed the 32 KiB publication bound after an add:** refused before anything is written, naming the bound. Test: Task 2, `a_document_over_the_publication_bound_is_not_written`.
-5. **Two `engine add` runs at once on one machine:** the document lock serializes them; the second sees the first's profile (`profile_exists` for the same name, or revision + 2 for another name), never a lost update. Test: Task 2, `concurrent_writers_never_lose_an_update`.
+4. **An `engines.yaml` whose merged host document would exceed the 32 KiB publication bound:** refused before anything is written, naming the bound. Test: Task 2, `a_document_over_the_publication_bound_is_not_written`.
+5. **Two `engine add` runs at once on one machine:** the `engines.yaml` lock serializes them; the second sees the first's profile (`profile_exists` for the same name, or revision + 2 for another name), never a lost update. Test: Task 2, `concurrent_writers_never_lose_an_update`.
 
 ---
 
@@ -69,8 +70,8 @@ New files:
 
 | File | Responsibility |
 |---|---|
-| `docs/design/adr/0018-engine-registration.md` | The decision record; amends SPEC §4.2 and §15. |
-| `crates/mllm-config/src/registration.rs` | Machine document load, revision header, lock, atomic write, profile builder and checks, verified set, name rule, profiles-only comparison. |
+| `docs/design/adr/0018-engine-registration.md` | The decision record; amends SPEC §4.2 and the §15.1 authority table. |
+| `crates/mllm-config/src/registration.rs` | `engines.yaml`: location rule, load, revision header, lock, atomic write, merge into the host document; profile builder and checks, verified set, name rule, profiles-only comparison. |
 | `crates/mllm-config/tests/registration.rs` | Tests for the above. |
 | `crates/mllm-agent/src/engines.rs` | Module root: `Engine` candidate types, dist-info reader. |
 | `crates/mllm-agent/src/engines/detect.rs` | Bounded metadata-only scan. |
@@ -81,7 +82,6 @@ New files:
 | `crates/mllm-agent/src/host_control.rs` | Host implementation of the control handler (reload, retire, list). |
 | `crates/mllm-agent/tests/control_socket.rs` | Socket permission, uid refusal, protocol bounds, stale socket. |
 | `crates/mllm-store/src/profile_retirement.rs` | Durable retirements, candidates by profile, progress, confirmation, republish transaction. |
-| `crates/mllm-store/tests/profile_retirement.rs` | Store tests including the placement race. |
 | `crates/mllm-controller/tests/live_profiles.rs` | mTLS session tests for re-publish and retirement, and the agent's live reload and removal end to end. |
 | `crates/mllm-management/src/engines.rs` | `StoreRetirements` (retirement service over the ordinary stop path); `GET /management/v1/engines` lives in `hosts.rs`. |
 | `crates/mllm-management/tests/engines.rs` | Retirement service and engines endpoint tests. |
@@ -96,21 +96,22 @@ Modified files (main ones; each task lists exact lines):
 
 | File | Change |
 |---|---|
-| `docs/SPEC.md` | "Amended by ADR 0018" notes in §4.2 and §15.1. |
+| `docs/SPEC.md` | "Amended by ADR 0018" notes in §4.2 and §15.1 (engines file row). |
+| `docs/superpowers/specs/2026-09-25-engine-registration-design.md` | Updated in this PR with the owner's 2026-09-25 decisions. |
 | `crates/mllm-config/src/lib.rs`, `effective.rs` | Export `registration`; `check_runtime_profile`. |
-| `crates/mllm-config/src/standalone.rs` | `check_honoured` accepts valid `host.runtime_profiles`. |
+| `crates/mllm-config/src/schema.rs`, `remote_roles.rs` | `ConfigKind::Engines`; `HostConfig::load` merges `engines.yaml`. |
 | `crates/mllm-protocol/proto/mllm/management/v1/management.proto`, `src/capabilities.rs`, `tests/version_skew.rs` | New messages and capability. |
 | `crates/mllm-store/src/schema.rs`, `migrations.rs`, `lib.rs`, `ordinary_lifecycle/placement.rs` | Schema v35; placement exclusion. |
 | `crates/mllm-controller/src/host_publication.rs`, `agent_sessions.rs` | Live re-publish, retirement messages, SessionReady capabilities. |
 | `crates/mllm-agent/src/session.rs`, `native_execution.rs`, `lib.rs` | Profile updates channel; swappable profiles. |
 | `crates/mllm-cli/src/grammar.rs`, `main.rs`, `output.rs`, `remote_roles.rs`, `roles.rs`, `standalone_config.rs`, `lib.rs`, `client.rs` | Commands, codes, wiring, standalone multi-engine. |
 | `crates/mllm-controller/src/installation_gate.rs`, `engine_provider.rs` | Embedded installations keyed by executable; provider lists installations. |
-| `crates/mllm-management/src/configuration.rs`, `drain.rs`, `installation.rs`, `lib.rs` | Swappable embedded host document; `drain_rounds` shared. |
+| `crates/mllm-management/src/configuration.rs`, `drain.rs`, `installation.rs`, `lib.rs` | Swappable embedded host document; `drain_rounds` shared; deploy fails fast on an unpublished profile. |
 | `crates/mllm-cli/tests/errors.rs` | Exit-code table. |
 | `docs/operations/install.md`, `docs/runbooks/f2-current-status.md` | Operator docs, status. |
 | `scripts/live/matrix/lib.sh`, `roles.sh`, `gen_host_doc.py`, `README.md` | Per-host binary override, systemd host bring-up, profile-less host document. |
 
-Task order and dependencies: 1 (ADR) → 2, 3 (config) → 4, 5 (agent engine discovery) → 6 (protocol) → 7, 8 (store) → 9, 10 (controller) → 11 (management) → 12 (control socket) → 13 (host live reload and removal, with role wiring) → 14 (CLI engine commands, exit codes, `list engines`, install guide) → 15 (standalone: environment compatibility, several engines, live add and remove) → 16 (live harness, rows ENG1–ENG4, status runbook).
+Task order and dependencies: 1 (ADR) → 2, 3 (config) → 4, 5 (agent engine discovery) → 6 (protocol) → 7, 8 (store) → 9, 10 (controller) → 11 (management) → 12 (control socket) → 13 (host live reload and removal, with role wiring) → 14 (CLI engine commands, exit codes, `list engines`, install guide) → 15 (standalone: environment compatibility, several engines, live add and remove) → 16 (live harness, rows ENG1–ENG4, status runbook). 17 (deploy fails fast on an unpublished profile) depends only on Task 14's exit codes and may run any time after it, before Task 16's live rows.
 
 ---
 
@@ -118,23 +119,23 @@ Task order and dependencies: 1 (ADR) → 2, 3 (config) → 4, 5 (agent engine di
 
 **Files:**
 - Create: `docs/design/adr/0018-engine-registration.md`
-- Modify: `docs/SPEC.md` §4.2 (after the paragraph ending "destructive park/restore verification is an explicit operation.", line 156) and §15.1 (after the paragraph ending "an explicit documented exception.", line 546)
+- Modify: `docs/SPEC.md` §4.2 (after the paragraph ending "destructive park/restore verification is an explicit operation.", line 156) and §15.1 (the authority table, lines 538-544)
 
 **Interfaces:**
-- Consumes: the spec, owner-check items 1–19 above (after the owner confirms the items marked owner check).
-- Produces: the names every later task cites: `ADR 0018`, capability `live_profile_update`, codes `engine_not_found` … `not_interactive`, exit codes 16–23, `# mllm-document-revision: N`, `<state_dir>/control.sock`.
+- Consumes: the spec and the owner decisions 1–20 above (item 20 once the owner answers it).
+- Produces: the names every later task cites: `ADR 0018`, `engines.yaml`, capability `live_profile_update`, codes `engine_not_found` … `not_interactive` and `profile_not_published`, exit codes 16–24, `# mllm-document-revision: N`, `<state_dir>/control.sock`.
 
-- [ ] **Step 1: Confirm the owner-check items.** Read the "Owner check" list at the top of this plan with the owner. Record each answer. If the owner changes a decision, edit this plan's affected tasks before continuing (the ADR text below states the decisions as planned).
+- [ ] **Step 1: Confirm item 20.** Items 1–19 were decided by the owner on 2026-09-25. Ask the owner about item 20 (exit 24 for `profile_not_published`); if the answer differs, edit Task 17 and the ADR text below before continuing.
 
-- [ ] **Step 2: Write the ADR.** Create `docs/design/adr/0018-engine-registration.md` with exactly this content (adjusted only for owner answers from Step 1):
+- [ ] **Step 2: Write the ADR.** Create `docs/design/adr/0018-engine-registration.md` with exactly this content (adjusted only for the answer from Step 1):
 
 ```markdown
 # ADR 0018 — Engine registration: detect, add, list and remove, with live reload
 
 **Status:** Accepted (owner decision 2026-09-25).
 **Amends:** `SPEC.md` §4.2 (how host administrators register trusted runtime profiles) and
-§15.1 ("no continuous rewriting of administrator YAML": an explicit, operator-invoked
-engine registration rewrites the machine document).
+§15.1 (a new mllm-owned engines file beside the role document; the role document itself is
+never rewritten).
 **Related:** ADR 0008 (engine installations, fingerprints, capability probes), ADR 0012
 (deep parking default-on), ADR 0017 (capability gating). Design:
 `docs/superpowers/specs/2026-09-25-engine-registration-design.md`.
@@ -162,54 +163,59 @@ behave the same on a host and in standalone.
   environment), conda environments (`~/.conda/environments.txt` and the roots `~/miniconda3`,
   `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, `~/.conda`, `/opt/conda`, `/opt/miniconda3`,
   `/opt/anaconda3`), `~/venvs/*`, `~/.venv`, `~/.virtualenvs/*`, uv tool environments,
-  pipx venvs, `/opt/*` and every `--path`.
+  pipx venvs, `/opt/*`, every directory directly in the home directory that holds a
+  `pyvenv.cfg` (one level deep), and every `--path`.
 - `add` resolves the environment lexically (a venv's `python3` symlink is never followed),
   reads the engine and version from its `dist-info`, and only then, because the operator
   named or picked it, runs the bounded version check (60 s, 4 KiB, cleared environment,
   own process group), measures the ADR 0008 fingerprint and runs the deep-park probe. The
-  profile name defaults to the engine (`vllm`, `sglang`); an existing name is refused
-  `profile_exists`. The entry point is `<env>/bin/vllm` for vLLM and `<env>/bin/python3` for
+  profile name defaults to the engine (`vllm`, `sglang`); a name already registered, or
+  declared in the role document, is refused `profile_exists`. The entry point is `<env>/bin/vllm` for vLLM and `<env>/bin/python3` for
   SGLang; `build_fingerprint` is the checked version.
 - A version outside the verified set (vLLM 0.29.0, SGLang 0.5.20) is shown as `custom`.
   The mark is derived when listing; nothing is written for it.
 - A probe that reports `deep_park` missing writes `security.deep_park: disabled` unless the
   operator asked for `enabled`, so deployments on it resolve `restart_only`.
 
-### 2. The machine document
+### 2. The engines file
 
-The profile is written into the document the role loads: the host document, or the
-standalone document (`<state_dir>/config/standalone.yaml`, or the explicit `--config`
-file). The write holds `<document>.lock`, writes a temporary file in the same directory,
-syncs it and renames it over the document, then syncs the directory. The first line records
-the document revision, `# mllm-document-revision: N`, which increases by one per write; the
-parser ignores comments, so the published document and its fingerprint do not change
-because of it, and older peers read it unchanged. The document is written as JSON-shaped
-YAML, like `mllm init`; comments are not preserved, and the first rewrite keeps the original
-as `<document>.before-engine-registration`. A document that would exceed the 32 KiB
-publication bound is refused before anything is written.
+mllm never rewrites the role's own document (`host.yaml`, `standalone.yaml`). Registered
+profiles live in `engines.yaml`, an mllm-owned file (`kind: engines`, `schema_version: 1`,
+`runtime_profiles`), mode 0600, beside the role's configuration file: `--config dir/x.yaml`
+(or `$MLLM_CONFIG`) means `dir/engines.yaml`; without one it is
+`~/.config/mllm/engines.yaml` (`$XDG_CONFIG_HOME/mllm/engines.yaml`), for a host and for
+standalone alike. The role merges it with its own document at load; a profile name declared
+in both is refused. A write holds `engines.yaml.lock`, writes a temporary file in the same
+directory, syncs it, renames it over the file and syncs the directory. The first line
+records the revision, `# mllm-document-revision: N`, increased by one per write; the parser
+ignores comments. A host whose merged document would exceed the 32 KiB publication bound is
+refused before anything is written. `engine remove` removes only registered profiles; one
+declared in the role document stays the operator's to edit.
 
 ### 3. Live reload
 
 The role listens on `<state_dir>/control.sock`, a Unix socket with mode 0600 whose
 connections are accepted only from the user id running mllm (`SO_PEERCRED`). It carries one
-JSON request and one JSON response per connection, `add` (reload the document), `remove` and
+JSON request and one JSON response per connection, `add` (reload the engines file), `remove` and
 `list`, and nothing else. It never reaches an engine.
 
-On `add` the host agent re-reads the document, refuses it if anything outside
-`runtime_profiles` changed ("restart the role"), re-measures every profile and sends
+On `add` the host agent re-reads its document merged with `engines.yaml`, refuses it if
+anything outside `runtime_profiles` changed ("restart the role"), re-measures every profile and sends
 `PublishProfiles` on its live session. While that is outstanding the host authorizes launch
 plans against either the accepted or the pending document, and sends no inventory refresh.
 The server validates the document as it validates a startup publication, accepts it only if
 `runtime_profiles` alone changed and every removed profile's retirement is confirmed, and
 then replaces the approved snapshot in one transaction. A rejection keeps the previous
 snapshot and the session; the CLI prints the reason as `publish_rejected`, and `engine list`
-shows the profile `not published`. If the role is not running the document stays written and
-the CLI reports `agent_unreachable`: the profile is published when the role starts.
+shows the profile `not published`. If the role is not running `engines.yaml` stays written
+and the CLI reports `agent_unreachable`: the profile is published when the role starts.
 
 Re-publishing is capability `live_profile_update` (ADR 0017), declared by the host in
 `Connect.capabilities` and by the server in `SessionReady.capabilities` (field 5). The server
 sends `ProfilesPublished` and `ProfileRetirement` only to a host that declared it. If either
-side lacks it, `engine add` writes the document and says a restart of the role is needed.
+side lacks it, `engine add` writes `engines.yaml` and says a restart of the role is needed.
+An agent that predates this ADR never reads `engines.yaml`; its profiles are published once
+the host runs a release with it.
 
 ### 4. Removal
 
@@ -223,14 +229,14 @@ ordinary stop path (drain up to `switching.drain_timeout`, then terminate, gone 
 required), and the retirement is confirmed only when every stop succeeded and a fresh
 enumeration is empty. An unsettled or failed stop keeps its accounting; at the drain window
 (900 s) the retirement ends and the CLI reports `profile_in_use` with what is unsettled.
-After confirmation the host rewrites its document without the profile and re-publishes; the
+After confirmation the host rewrites `engines.yaml` without the profile and re-publishes; the
 publication transaction deletes the retirement. A profile the role never published is
 removed locally. A published profile is never removed while the role is unreachable
 (`agent_unreachable`, nothing written).
 
 ### 5. Standalone
 
-Standalone runs the same steps in one process: the same socket, the same document write,
+Standalone runs the same steps in one process: the same socket, the same `engines.yaml` write,
 the same retirement over the embedded host. `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone still
 gives profile `local`; both give `local-vllm` and `local-sglang`. They coexist with added
 profiles; a name collision is refused at start with `profile_exists`. Environment profiles are
@@ -240,26 +246,39 @@ not removable with `engine remove`.
 
 Closed codes and CLI exit codes: `engine_not_found` 16, `engine_unsupported` 17,
 `engine_version_failed` 18, `profile_exists` 19, `profile_in_use` 20, `publish_rejected` 21,
-`agent_unreachable` 22, `not_interactive` 23. Exit code 9 stays unused.
+`agent_unreachable` 22, `not_interactive` 23, `profile_not_published` 24. Exit code 9 stays
+unused.
+
+### 7. Deploy fails fast
+
+A deploy naming a `runtime_profile` that no allowed host publishes is refused at once
+(`profile_not_published`, HTTP 409) and nothing is stored. The refusal names the profile,
+each allowed host with the profiles it publishes, and the fix: `mllm engine add <path>
+--name <profile>` on a host, then deploy again. Deployments are never re-resolved after
+`engine add`; an allowed host that lacks the profile while another has it is recorded
+refused (`profile_not_published`) for that deployment.
 
 ## Consequences
 
 - A host's approved document can now change during a session. Every consumer already reads
   it per use (`Store::host_publication`); placement additionally requires the deployment's
   profile to be present in it and not retiring.
-- Existing deployments are not re-resolved: one deployed before its profile existed on a
-  host stays `refused` there until it is deployed again.
+- Existing deployments are not re-resolved; a deploy whose profile no allowed host publishes
+  is refused up front instead of being stored unplaceable.
+- A host and a standalone role that both use implicit documents on one machine share
+  `~/.config/mllm/engines.yaml`; the CLI asks for `--config` when both implicit documents
+  exist.
 - Older hosts list `live_profile_update` among `capabilities_missing` in `mllm list hosts`.
-- `mllm list engines` shows what the server accepted; a profile only in a host's document
-  file is visible in that host's `mllm engine list`.
+- `mllm list engines` shows what the server accepted; a profile only in a host's
+  `engines.yaml` is visible in that host's `mllm engine list`.
 
 ## Verification
 
 CPU and transport tests (`crates/mllm-config/tests/registration.rs`,
-`crates/mllm-agent/tests/engines.rs`, `control_socket.rs`, `host_control.rs`,
-`crates/mllm-store/tests/profile_retirement.rs`, `crates/mllm-controller/tests/live_profiles.rs`,
-`crates/mllm-management/tests/engines.rs`, `crates/mllm-cli/tests/engine_cli.rs`,
-`standalone_engines.rs`). They are not qualification. Live rows ENG1–ENG4
+`crates/mllm-agent/tests/engines.rs`, `control_socket.rs`,
+`crates/mllm-store/tests/instances_placement.rs`, `host_publication.rs`,
+`crates/mllm-controller/tests/live_profiles.rs`, `crates/mllm-management/tests/engines.rs`,
+`configuration.rs`, `crates/mllm-cli/tests/engine_cli.rs`, `standalone_engines.rs`). They are not qualification. Live rows ENG1–ENG4
 (`scripts/live/matrix/rows/`) on host-a and host-b with the existing engine
 environments are.
 ```
@@ -269,21 +288,25 @@ environments are.
 ```markdown
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-Host administrators register runtime profiles with `mllm engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. mllm still installs no engine.
+Host administrators register runtime profiles with `mllm engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; mllm never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). mllm still installs no engine.
 ```
 
-- [ ] **Step 4: Amend SPEC §15.1.** After the paragraph that ends "Creating a missing configuration during initialization/enrollment is an explicit documented exception." (line 546), insert:
+- [ ] **Step 4: Amend SPEC §15.1.** Add a row to the authority table (after the "Host YAML" row, line 541) and, after the paragraph ending "Creating a missing configuration during initialization/enrollment is an explicit documented exception." (line 546), a note:
+
+```markdown
+| Engines file (`engines.yaml`) | Runtime profiles registered with `mllm engine add`, beside the role's configuration file; written only by `mllm engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
+```
 
 ```markdown
 > **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
 
-`mllm engine add` and `mllm engine remove` are a second explicit exception: an operator-invoked rewrite of the machine document's runtime profiles, under a lock, atomically (temporary file and rename), with the document revision recorded in the first-line comment `# mllm-document-revision: N`. The original document is kept once as `<document>.before-engine-registration`. No role rewrites administrator YAML on its own initiative.
+The engines file is mllm-owned operational state, not administrator YAML: mllm writes it only when the operator runs `mllm engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# mllm-document-revision: N`. The role's own document is never rewritten.
 ```
 
 - [ ] **Step 5: Check the links render and nothing else changed.**
 
 Run: `git diff --stat && grep -n "ADR 0018" docs/SPEC.md`
-Expected: two SPEC hunks, one new ADR file; two `Amended by [ADR 0018]` lines.
+Expected: SPEC hunks in §4.2 and §15.1, one new ADR file; two `Amended by [ADR 0018]` lines.
 
 - [ ] **Step 6: Commit**
 
@@ -293,38 +316,46 @@ git commit -m "docs: ADR 0018 engine registration, amending SPEC 4.2 and 15.1
 
 Records the owner-approved design for mllm engine detect, add, list and
 remove: metadata-only detection, explicit execution only after the
-operator names an installation, an atomic document write with a revision
-header, live re-publication gated by the live_profile_update capability,
-and two-phase removal confirmed only on stop evidence."
+operator names an installation, an mllm-owned engines.yaml beside the
+role document (never rewritten), live re-publication gated by the
+live_profile_update capability, two-phase removal confirmed only on stop
+evidence, and a deploy that fails fast on an unpublished profile."
 ```
 
 ---
 
-### Task 2: The machine document: revision header, lock, atomic write, bounds
+### Task 2: `engines.yaml`: the mllm-owned engines file, its lock, atomic write, and the merge into the host document
 
 **Files:**
 - Create: `crates/mllm-config/src/registration.rs`
 - Create: `crates/mllm-config/tests/registration.rs`
 - Modify: `crates/mllm-config/src/lib.rs:4-17` (add `pub mod registration;`)
 - Modify: `crates/mllm-config/Cargo.toml` (add `libc = "0.2"`, already a dependency of `mllm-agent` and `mllm-cli`, so `Cargo.lock` gains no new package)
+- Modify: `crates/mllm-config/src/schema.rs` (`ConfigKind::Engines` in the enum `:10-15`, `as_str` `:17-26`, `from_str` `:30-43`, and a `KindSchema` arm after `ConfigKind::Standalone` `:440-450`)
+- Modify: `crates/mllm-config/src/remote_roles.rs` (new `HostConfig::load` beside `parse` at `:387`)
+- Modify: `crates/mllm-cli/src/remote_roles.rs:871-882, 890-891` (`start host` and `join host` load the host document with `HostConfig::load`)
 
 **Interfaces:**
-- Consumes: `mllm_config::parse_strict(ConfigKind, &str) -> Result<Value, ConfigError>` (`strict_yaml.rs:43`), `ConfigError::new(code, path, detail)` (`error.rs:54`), `ConfigErrorCode::{Io, UnsupportedCombination}`.
-- Produces (used by Tasks 3, 14, 17, 18, 19, 20):
-  - `pub const REVISION_HEADER: &str = "# mllm-document-revision: "`
-  - `pub const BACKUP_SUFFIX: &str = ".before-engine-registration"`
-  - `pub const MAX_PUBLISHED_BYTES: usize = 32 * 1024`
-  - `pub enum DocumentKind { Host, Standalone }`
-  - `pub struct MachineDocument { pub path: PathBuf, pub kind: DocumentKind, pub revision: u64, pub document: Value }` with `load(&Path)`, `parse(&Path, &str)`, `profiles(&self) -> Map<String, Value>`, `set_profiles(&mut self, Map<String, Value>)`, `render(&self, revision: u64) -> String`
+- Consumes: `mllm_config::parse_strict(ConfigKind, &str) -> Result<Value, ConfigError>` (`strict_yaml.rs:43`), `ConfigError::new(code, path, detail)` (`error.rs:54`), `ConfigErrorCode::{Io, UnsupportedCombination}`, `HostConfig::parse` (`remote_roles.rs:387`).
+- Produces (used by Tasks 3, 13, 14, 15):
+  - `pub const ENGINES_FILE: &str = "engines.yaml"`, `pub const REVISION_HEADER: &str = "# mllm-document-revision: "`, `pub const MAX_PUBLISHED_BYTES: usize = 32 * 1024`
+  - `pub fn engines_beside(role_document: &Path) -> PathBuf` (the role document's directory + `engines.yaml`)
+  - `pub fn engines_path(role_document: Option<&Path>, config_home: &Path) -> PathBuf` (`--config dir/x.yaml` → `dir/engines.yaml`; none → `<config_home>/mllm/engines.yaml`)
+  - `pub fn config_home(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf>` (`$XDG_CONFIG_HOME`, else `$HOME/.config`)
   - `pub fn revision_of(text: &str) -> u64`
-  - `pub struct DocumentLock` and `pub fn lock_document(path: &Path) -> Result<DocumentLock, ConfigError>`
-  - `pub fn write_document(doc: &MachineDocument, lock: &DocumentLock) -> Result<u64, ConfigError>` (returns the new revision)
+  - `pub struct EnginesFile { pub path: PathBuf, pub revision: u64, pub profiles: Map<String, Value> }` with `load(&Path)` (a missing file is empty at revision 0), `parse(&Path, &str)`, `render(&self, revision: u64) -> String`
+  - `pub struct EnginesLock` and `pub fn lock_engines(path: &Path) -> Result<EnginesLock, ConfigError>`
+  - `pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<(), ConfigError>` (a name in both is refused)
+  - `pub fn write_engines(file: &EnginesFile, lock: &EnginesLock, host_document: Option<&Value>) -> Result<u64, ConfigError>` (returns the new revision; with a host document, checks names and the merged publication size)
+  - `HostConfig::load(path: &Path) -> Result<HostConfig, ConfigError>` (the host document merged with `engines_beside(path)`)
+  - `ConfigKind::Engines` (`kind: engines`; fields `schema_version`, `kind`, `runtime_profiles`)
 
 - [ ] **Step 1: Write the failing tests.** Create `crates/mllm-config/tests/registration.rs`:
 
 ```rust
-//! ADR 0018 §2: the machine document engine registration rewrites.
-//! CPU tests only; they are not qualification.
+//! ADR 0018 §2: `engines.yaml`, the mllm-owned file engine registration
+//! writes beside the role's document. The role's own document is never
+//! rewritten. CPU tests only; they are not qualification.
 use mllm_config::registration::*;
 use mllm_config::remote_roles::HostConfig;
 use std::os::unix::fs::PermissionsExt;
@@ -345,110 +376,122 @@ fn profile() -> serde_json::Value {
             "credential_ref":"secret://engine-key","admin_credential_ref":"secret://admin-key"}})
 }
 
-// T04 T03: the first write records revision 1, keeps the original once, and
-// the written document parses to the same value plus the new profile.
+fn host_value(path: &Path) -> serde_json::Value {
+    mllm_config::parse_strict(mllm_config::ConfigKind::Host, &std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+// ADR 0018 §2 (owner decision 2026-09-25): the engines file sits beside the
+// role's configuration file; without one, under the user's config home.
 #[test]
-fn a_write_records_the_revision_and_keeps_the_original_once() {
+fn the_engines_file_sits_beside_the_role_document() {
+    assert_eq!(engines_path(Some(Path::new("/etc/mllm/x.yaml")), Path::new("/home/u/.config")), Path::new("/etc/mllm/engines.yaml"));
+    assert_eq!(engines_path(None, Path::new("/home/u/.config")), Path::new("/home/u/.config/mllm/engines.yaml"));
+    assert_eq!(engines_beside(Path::new("/r/host.yaml")), Path::new("/r/engines.yaml"));
+    let env = |k: &str| (k == "HOME").then(|| "/home/u".to_string());
+    assert_eq!(config_home(&env).unwrap(), Path::new("/home/u/.config"));
+    let xdg = |k: &str| (k == "XDG_CONFIG_HOME").then(|| "/x".to_string());
+    assert_eq!(config_home(&xdg).unwrap(), Path::new("/x"));
+}
+
+// T04 T03: the first write creates the file at revision 1 with mode 0600;
+// the host document is never touched; the merged host document parses.
+#[test]
+fn a_write_creates_the_engines_file_and_never_touches_the_host_document() {
     let dir = tempfile::tempdir().unwrap();
-    let path = host_doc(dir.path());
-    let original = std::fs::read_to_string(&path).unwrap();
-    let mut doc = MachineDocument::load(&path).unwrap();
-    assert_eq!(doc.kind, DocumentKind::Host);
-    assert_eq!(doc.revision, 0);
-    let mut profiles = doc.profiles();
-    profiles.insert("vllm".into(), profile());
-    doc.set_profiles(profiles);
-    let lock = lock_document(&path).unwrap();
-    assert_eq!(write_document(&doc, &lock).unwrap(), 1);
+    let host = host_doc(dir.path());
+    let before = std::fs::read(&host).unwrap();
+    let path = engines_beside(&host);
+    let mut engines = EnginesFile::load(&path).unwrap();
+    assert_eq!((engines.revision, engines.profiles.len()), (0, 0));
+    engines.profiles.insert("vllm".into(), profile());
+    let lock = lock_engines(&path).unwrap();
+    assert_eq!(write_engines(&engines, &lock, Some(&host_value(&host))).unwrap(), 1);
     drop(lock);
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(written.starts_with("# mllm-document-revision: 1\n"), "{written}");
-    assert_eq!(revision_of(&written), 1);
-    let backup = format!("{}{BACKUP_SUFFIX}", path.display());
-    assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
-    let reread = MachineDocument::load(&path).unwrap();
-    assert_eq!(reread.revision, 1);
-    assert_eq!(reread.document, doc.document);
-    // A second write increases the revision and never replaces the backup.
-    let lock = lock_document(&path).unwrap();
-    assert_eq!(write_document(&reread, &lock).unwrap(), 2);
-    assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
-    // The written document still parses as a host document (T03).
-    assert!(HostConfig::parse(&std::fs::read_to_string(&path).unwrap()).is_ok());
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::read(&host).unwrap(), before, "host.yaml is never rewritten");
+    let config = HostConfig::load(&host).unwrap();
+    assert!(config.profiles.contains_key("vllm"));
+    assert_eq!(config.document["runtime_profiles"]["vllm"], profile());
+    let lock = lock_engines(&path).unwrap();
+    assert_eq!(write_engines(&EnginesFile::load(&path).unwrap(), &lock, None).unwrap(), 2);
+}
+
+// T03 (owner decision 2026-09-25): the same profile name in the host document
+// and the engines file is refused, at load and at write.
+#[test]
+fn a_name_in_both_files_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_doc(dir.path());
+    let mut document = host_value(&host);
+    document["runtime_profiles"]["vllm"] = profile();
+    std::fs::write(&host, document.to_string()).unwrap();
+    let path = engines_beside(&host);
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert("vllm".into(), profile());
+    let lock = lock_engines(&path).unwrap();
+    let refused = write_engines(&engines, &lock, Some(&document)).unwrap_err();
+    assert!(refused.detail.contains("vllm") && refused.detail.contains("both"), "{refused:?}");
+    assert!(!path.exists(), "nothing was written");
+    std::fs::write(&path, format!("kind: engines\nschema_version: 1\nruntime_profiles:\n  vllm: {}\n", profile())).unwrap();
+    let error = HostConfig::load(&host).unwrap_err();
+    assert_eq!(error.path, "runtime_profiles.vllm");
 }
 
 // T04: the lock serializes writers, so no update is lost.
 #[test]
 fn concurrent_writers_never_lose_an_update() {
     let dir = tempfile::tempdir().unwrap();
-    let path = host_doc(dir.path());
+    let host = host_doc(dir.path());
+    let path = engines_beside(&host);
     let workers: Vec<_> = ["a", "b", "c", "d"]
         .into_iter()
         .map(|name| {
-            let path = path.clone();
+            let (path, host) = (path.clone(), host_value(&host));
             std::thread::spawn(move || {
-                let lock = lock_document(&path).unwrap();
-                let mut doc = MachineDocument::load(&path).unwrap();
-                let mut profiles = doc.profiles();
-                profiles.insert(name.into(), profile());
-                doc.set_profiles(profiles);
-                write_document(&doc, &lock).unwrap()
+                let lock = lock_engines(&path).unwrap();
+                let mut engines = EnginesFile::load(&path).unwrap();
+                engines.profiles.insert(name.into(), profile());
+                write_engines(&engines, &lock, Some(&host)).unwrap()
             })
         })
         .collect();
     let mut revisions: Vec<u64> = workers.into_iter().map(|w| w.join().unwrap()).collect();
     revisions.sort();
     assert_eq!(revisions, vec![1, 2, 3, 4]);
-    let doc = MachineDocument::load(&path).unwrap();
-    assert_eq!(doc.profiles().len(), 4);
+    assert_eq!(EnginesFile::load(&path).unwrap().profiles.len(), 4);
 }
 
-// T03 (Review Focus 4): a document over the publication bound is refused
-// before anything is written.
+// T03 (Review Focus 4): an engines file whose merged host document would
+// exceed the publication bound is refused before anything is written.
 #[test]
 fn a_document_over_the_publication_bound_is_not_written() {
     let dir = tempfile::tempdir().unwrap();
-    let path = host_doc(dir.path());
-    let before = std::fs::read(&path).unwrap();
-    let mut doc = MachineDocument::load(&path).unwrap();
-    let mut profiles = doc.profiles();
+    let host = host_doc(dir.path());
+    let path = engines_beside(&host);
+    let mut engines = EnginesFile::load(&path).unwrap();
     for i in 0..80 {
         let mut p = profile();
         p["args"] = serde_json::json!(["--served-model-name", "x".repeat(300)]);
-        profiles.insert(format!("p{i}"), p);
+        engines.profiles.insert(format!("p{i}"), p);
     }
-    doc.set_profiles(profiles);
-    let lock = lock_document(&path).unwrap();
-    let error = write_document(&doc, &lock).unwrap_err();
+    let lock = lock_engines(&path).unwrap();
+    let error = write_engines(&engines, &lock, Some(&host_value(&host))).unwrap_err();
     assert!(error.detail.contains("32768"), "{error:?}");
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert!(!Path::new(&format!("{}{BACKUP_SUFFIX}", path.display())).exists());
+    assert!(!path.exists());
 }
 
-// T03: a standalone document keeps its profiles under `host`.
+// T03: an engines file is strict: unknown fields and another kind are refused.
 #[test]
-fn a_standalone_document_holds_profiles_under_host() {
+fn the_engines_file_is_strict() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("standalone.yaml");
-    std::fs::write(&path, "schema_version: 1\nkind: standalone\nname: local\nhost:\n  name: local\n  runtime_profiles: {}\n").unwrap();
-    let mut doc = MachineDocument::load(&path).unwrap();
-    assert_eq!(doc.kind, DocumentKind::Standalone);
-    assert!(doc.profiles().is_empty());
-    let mut profiles = doc.profiles();
-    profiles.insert("vllm".into(), profile());
-    doc.set_profiles(profiles);
-    assert_eq!(doc.document["host"]["runtime_profiles"]["vllm"]["engine"], "vllm");
-}
-
-// T03: a server document is not a machine document.
-#[test]
-fn a_server_document_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("server.yaml");
-    std::fs::write(&path, "schema_version: 1\nkind: server\nname: s\n").unwrap();
-    assert!(MachineDocument::load(&path).is_err());
+    let path = dir.path().join("engines.yaml");
+    for text in ["kind: host\nschema_version: 1\nname: x\n", "kind: engines\nschema_version: 1\nruntime_profiles: {}\nextra: 1\n"] {
+        assert!(EnginesFile::parse(&path, text).is_err(), "{text}");
+    }
+    let ok = EnginesFile::parse(&path, "# mllm-document-revision: 7\nkind: engines\nschema_version: 1\nruntime_profiles: {}\n").unwrap();
+    assert_eq!(ok.revision, 7);
 }
 ```
 
@@ -457,14 +500,31 @@ fn a_server_document_is_refused() {
 Run: `cargo test -p mllm-config --test registration --locked`
 Expected: FAIL to compile: `unresolved import mllm_config::registration`.
 
-- [ ] **Step 3: Implement.** Add `pub mod registration;` to `crates/mllm-config/src/lib.rs` (beside `pub mod remote_roles;`). Create `crates/mllm-config/src/registration.rs`:
+- [ ] **Step 3: Add the `engines` document kind.** In `schema.rs`: add `Engines` to `enum ConfigKind`; `ConfigKind::Engines => "engines"` in `as_str`; `"engines" => Ok(ConfigKind::Engines)` in `from_str`; and in `schema()` after the `Standalone` arm:
 
 ```rust
-//! ADR 0018 §2 (amends SPEC §15.1): the machine document `mllm engine add`
-//! and `remove` rewrite. An explicit, operator-invoked rewrite: under a lock,
-//! atomically (temporary file, sync, rename, directory sync), with the
-//! document revision on the first line. The parser ignores comments, so the
-//! revision changes neither the published document nor its fingerprint.
+        // ADR 0018 §2: the mllm-owned engines file beside a role document.
+        ConfigKind::Engines => &KindSchema {
+            required: &["schema_version", "kind"],
+            fields: &[
+                ("schema_version", SCALAR),
+                ("kind", SCALAR),
+                ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
+            ],
+        },
+```
+
+(If any other `match kind` over `ConfigKind` in the crate is exhaustive, give `Engines` the arm the compiler asks for; `mllm validate config` treats it like any other kind.)
+
+- [ ] **Step 4: Implement.** Add `pub mod registration;` to `lib.rs` and `libc = "0.2"` to `crates/mllm-config/Cargo.toml`. Create `crates/mllm-config/src/registration.rs`:
+
+```rust
+//! ADR 0018 §2 (owner decision 2026-09-25): engine registration writes only
+//! `engines.yaml`, an mllm-owned file beside the role's configuration file.
+//! The host or standalone document is never rewritten; the role merges the
+//! two at load, and a profile name declared in both is refused. Writes hold
+//! `engines.yaml.lock`, go through a temporary file, sync and rename, and
+//! record the revision on the first line (a comment the parser ignores).
 use crate::{parse_strict, ConfigError, ConfigErrorCode, ConfigKind};
 use serde_json::{Map, Value};
 use std::fs::{self, File, OpenOptions};
@@ -472,32 +532,36 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// ADR 0018 §2: the first line of a document mllm has rewritten.
+pub const ENGINES_FILE: &str = "engines.yaml";
 pub const REVISION_HEADER: &str = "# mllm-document-revision: ";
-/// ADR 0018 §2: the operator's original, kept once beside the document.
-pub const BACKUP_SUFFIX: &str = ".before-engine-registration";
 /// The largest host document a publication carries
 /// (`mllm_store::host_publication`, `config_json.len() > 32768` is refused).
 pub const MAX_PUBLISHED_BYTES: usize = 32 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocumentKind {
-    Host,
-    Standalone,
-}
-
-/// A host or standalone document, as the role loads it.
-#[derive(Debug, Clone)]
-pub struct MachineDocument {
-    pub path: PathBuf,
-    pub kind: DocumentKind,
-    /// The revision on the first line; 0 for a document mllm never rewrote.
-    pub revision: u64,
-    pub document: Value,
-}
-
 fn io(path: &Path, error: impl std::fmt::Display) -> ConfigError {
     ConfigError::new(ConfigErrorCode::Io, path.display().to_string(), error.to_string())
+}
+
+/// ADR 0018 §2: `dir/x.yaml` → `dir/engines.yaml`.
+pub fn engines_beside(role_document: &Path) -> PathBuf {
+    role_document.parent().unwrap_or(Path::new(".")).join(ENGINES_FILE)
+}
+
+/// ADR 0018 §2: beside the role document named with `--config`; without one,
+/// `<config home>/mllm/engines.yaml`, for a host and for standalone alike.
+pub fn engines_path(role_document: Option<&Path>, config_home: &Path) -> PathBuf {
+    match role_document {
+        Some(document) => engines_beside(document),
+        None => config_home.join("mllm").join(ENGINES_FILE),
+    }
+}
+
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config` (absolute paths only).
+pub fn config_home(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")).filter(|p| p.is_absolute()))
 }
 
 /// ADR 0018 §2: the revision on the first line, or 0.
@@ -509,64 +573,82 @@ pub fn revision_of(text: &str) -> u64 {
         .unwrap_or(0)
 }
 
-impl MachineDocument {
+/// The registered profiles of one role.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnginesFile {
+    pub path: PathBuf,
+    /// 0 when the file does not exist yet.
+    pub revision: u64,
+    pub profiles: Map<String, Value>,
+}
+
+impl EnginesFile {
+    /// A missing file is an empty one at revision 0.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = fs::read_to_string(path).map_err(|e| io(path, e))?;
-        Self::parse(path, &text)
-    }
-
-    /// SPEC §15.3: validated strictly for the kind it declares; a server or
-    /// deployment document is not a machine document.
-    pub fn parse(path: &Path, text: &str) -> Result<Self, ConfigError> {
-        let (kind, document) = match parse_strict(ConfigKind::Host, text) {
-            Ok(document) => (DocumentKind::Host, document),
-            Err(host) => match parse_strict(ConfigKind::Standalone, text) {
-                Ok(document) => (DocumentKind::Standalone, document),
-                Err(_) => return Err(host),
-            },
-        };
-        Ok(Self { path: path.to_path_buf(), kind, revision: revision_of(text), document })
-    }
-
-    /// The document's runtime profiles (an empty map when it declares none).
-    pub fn profiles(&self) -> Map<String, Value> {
-        let profiles = match self.kind {
-            DocumentKind::Host => &self.document["runtime_profiles"],
-            DocumentKind::Standalone => &self.document["host"]["runtime_profiles"],
-        };
-        profiles.as_object().cloned().unwrap_or_default()
-    }
-
-    pub fn set_profiles(&mut self, profiles: Map<String, Value>) {
-        match self.kind {
-            DocumentKind::Host => self.document["runtime_profiles"] = Value::Object(profiles),
-            DocumentKind::Standalone => {
-                self.document["host"]["runtime_profiles"] = Value::Object(profiles)
+        match fs::read_to_string(path) {
+            Ok(text) => Self::parse(path, &text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self { path: path.to_path_buf(), revision: 0, profiles: Map::new() })
             }
+            Err(e) => Err(io(path, e)),
         }
     }
 
-    /// ADR 0018 §2: JSON-shaped YAML, like `mllm init`, under the revision line.
+    /// SPEC §15.3: strict, like every role document.
+    pub fn parse(path: &Path, text: &str) -> Result<Self, ConfigError> {
+        let value = parse_strict(ConfigKind::Engines, text)?;
+        let profiles = value["runtime_profiles"].as_object().cloned().unwrap_or_default();
+        Ok(Self { path: path.to_path_buf(), revision: revision_of(text), profiles })
+    }
+
+    /// JSON-shaped YAML, as `mllm init` writes, under the revision line.
     pub fn render(&self, revision: u64) -> String {
-        let body = serde_json::to_string_pretty(&self.document)
-            .expect("a parsed document always encodes to JSON");
+        let body = serde_json::json!({"schema_version": 1, "kind": "engines", "runtime_profiles": self.profiles});
         format!(
-            "{REVISION_HEADER}{revision}\n# Written by `mllm engine add` or `remove`; comments are not kept (the original is {}{BACKUP_SUFFIX}).\n{body}\n",
-            self.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            "{REVISION_HEADER}{revision}\n# Written by `mllm engine add` and `remove`. The role merges it with its own document.\n{}\n",
+            serde_json::to_string_pretty(&body).expect("profiles always encode")
         )
     }
 }
 
-/// An exclusive advisory lock on `<document>.lock`, held for one
+/// ADR 0018 §2: `document` (a host document) with `engines`' profiles added.
+/// A profile name the host document already declares is refused.
+pub fn merge_into_host(document: &mut Value, engines: &EnginesFile) -> Result<(), ConfigError> {
+    if engines.profiles.is_empty() {
+        return Ok(());
+    }
+    let declared = document
+        .as_object_mut()
+        .ok_or_else(|| ConfigError::new(ConfigErrorCode::UnsupportedCombination, "", "not a mapping"))?
+        .entry("runtime_profiles")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let declared = declared
+        .as_object_mut()
+        .ok_or_else(|| ConfigError::new(ConfigErrorCode::UnsupportedCombination, "runtime_profiles", "must be a mapping"))?;
+    for (name, profile) in &engines.profiles {
+        if declared.contains_key(name) {
+            return Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                format!("runtime_profiles.{name}"),
+                format!("profile {name} is declared in both the role document and {}; remove one", engines.path.display()),
+            ));
+        }
+        declared.insert(name.clone(), profile.clone());
+    }
+    Ok(())
+}
+
+/// An exclusive advisory lock on `<engines file>.lock` for one
 /// read-modify-write. Dropping it releases the lock.
-pub struct DocumentLock {
+pub struct EnginesLock {
     _file: File,
     path: PathBuf,
 }
 
-/// ADR 0018 §2: serialize writers of one document (the CLI's add and a
-/// role's remove). Blocks until the lock is free.
-pub fn lock_document(path: &Path) -> Result<DocumentLock, ConfigError> {
+pub fn lock_engines(path: &Path) -> Result<EnginesLock, ConfigError> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+    }
     let lock = PathBuf::from(format!("{}.lock", path.display()));
     let file = OpenOptions::new()
         .create(true)
@@ -577,98 +659,100 @@ pub fn lock_document(path: &Path) -> Result<DocumentLock, ConfigError> {
         .open(&lock)
         .map_err(|e| io(&lock, e))?;
     file.lock().map_err(|e| io(&lock, e))?;
-    Ok(DocumentLock { _file: file, path: path.to_path_buf() })
+    Ok(EnginesLock { _file: file, path: path.to_path_buf() })
 }
 
-/// ADR 0018 §2: write `doc` under `lock` at the next revision and return it.
-/// The revision is read again from disk under the lock, so a concurrent
-/// writer's revision is never reused. Nothing is written when the published
-/// form would exceed [`MAX_PUBLISHED_BYTES`] or the result does not parse.
-pub fn write_document(doc: &MachineDocument, lock: &DocumentLock) -> Result<u64, ConfigError> {
-    if lock.path != doc.path {
-        return Err(ConfigError::new(
-            ConfigErrorCode::UnsupportedCombination,
-            doc.path.display().to_string(),
-            "the lock names another document",
-        ));
+/// ADR 0018 §2: write `file` under `lock` at the next revision and return it.
+/// The revision is read again under the lock. With `host_document`, a name
+/// the host document declares is refused and the merged document must fit a
+/// publication. Nothing is written when a check fails.
+pub fn write_engines(file: &EnginesFile, lock: &EnginesLock, host_document: Option<&Value>) -> Result<u64, ConfigError> {
+    if lock.path != file.path {
+        return Err(ConfigError::new(ConfigErrorCode::UnsupportedCombination, file.path.display().to_string(), "the lock names another file"));
     }
-    let current = fs::read_to_string(&doc.path).map_err(|e| io(&doc.path, e))?;
-    let revision = revision_of(&current) + 1;
-    let published = doc.document.to_string().len();
-    if published > MAX_PUBLISHED_BYTES {
-        return Err(ConfigError::new(
-            ConfigErrorCode::UnsupportedCombination,
-            doc.path.display().to_string(),
-            format!(
-                "the document would be {published} bytes; a host publication carries at most {MAX_PUBLISHED_BYTES} (32768)"
-            ),
-        ));
-    }
-    let text = doc.render(revision);
-    // SPEC §15.3: validate before side effects.
-    MachineDocument::parse(&doc.path, &text)?;
-    let dir = doc.path.parent().unwrap_or(Path::new("."));
-    let mode = fs::metadata(&doc.path).map_err(|e| io(&doc.path, e))?.permissions().mode() & 0o777;
-    if revision_of(&current) == 0 {
-        // ADR 0018 §2: keep the operator's original once, never overwritten.
-        let backup = PathBuf::from(format!("{}{BACKUP_SUFFIX}", doc.path.display()));
-        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&backup) {
-            Ok(mut file) => {
-                file.write_all(current.as_bytes()).map_err(|e| io(&backup, e))?;
-                file.sync_all().map_err(|e| io(&backup, e))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io(&backup, e)),
+    if let Some(host) = host_document {
+        let mut merged = host.clone();
+        merge_into_host(&mut merged, file)?;
+        let published = merged.to_string().len();
+        if published > MAX_PUBLISHED_BYTES {
+            return Err(ConfigError::new(
+                ConfigErrorCode::UnsupportedCombination,
+                file.path.display().to_string(),
+                format!("the host document with these engines would be {published} bytes; a publication carries at most {MAX_PUBLISHED_BYTES} (32768)"),
+            ));
         }
     }
+    let current = EnginesFile::load(&file.path)?;
+    let revision = current.revision + 1;
+    let text = file.render(revision);
+    // SPEC §15.3: validate before side effects.
+    EnginesFile::parse(&file.path, &text)?;
+    let dir = file.path.parent().unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| io(dir, e))?;
     tmp.write_all(text.as_bytes()).map_err(|e| io(tmp.path(), e))?;
-    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode)).map_err(|e| io(tmp.path(), e))?;
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o600)).map_err(|e| io(tmp.path(), e))?;
     tmp.as_file().sync_all().map_err(|e| io(tmp.path(), e))?;
-    tmp.persist(&doc.path).map_err(|e| io(&doc.path, e.error))?;
+    tmp.persist(&file.path).map_err(|e| io(&file.path, e.error))?;
     File::open(dir).and_then(|d| d.sync_all()).map_err(|e| io(dir, e))?;
     Ok(revision)
 }
 ```
 
+In `crates/mllm-config/src/remote_roles.rs`, beside `parse`:
+
+```rust
+    /// ADR 0018 §2: the host document at `path` with the engines registered
+    /// beside it (`engines.yaml`) merged in. The file itself is never
+    /// rewritten; a profile name declared in both is refused.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::new(ConfigErrorCode::Io, path.display().to_string(), e.to_string()))?;
+        let mut document = crate::parse_strict(crate::ConfigKind::Host, &text)?;
+        let engines = crate::registration::EnginesFile::load(&crate::registration::engines_beside(path))?;
+        crate::registration::merge_into_host(&mut document, &engines)?;
+        Self::parse(&document.to_string())
+    }
+```
+
+In `crates/mllm-cli/src/remote_roles.rs`, `start host` (`:879-881`) becomes `serve_host(HostConfig::load(&path).map_err(|e| error(&format!("Invalid host configuration: {}: {}", e.path, e.detail)))?)` (keep `read_config(&path)?` before it for the existing size and file checks), and `join host` (`:890`) uses `HostConfig::load(&path)` the same way.
+
 Note for the implementer: `std::fs::File::lock` is stable since Rust 1.89 (the toolchain is 1.98). `O_NOFOLLOW` differs between x86_64 and aarch64 (the Sparks), so it comes from `libc`, never a literal.
 
-- [ ] **Step 4: Run the tests to verify they pass.**
+- [ ] **Step 5: Run the tests to verify they pass.**
 
 Run: `cargo test -p mllm-config --test registration --locked`
-Expected: 5 passed.
+Expected: 7 passed.
 
-- [ ] **Step 5: Run the crate suite and Clippy.**
+- [ ] **Step 6: Run the crate suites and Clippy.**
 
-Run: `cargo test -p mllm-config --all-targets --locked && cargo clippy -p mllm-config --all-targets --locked -- -D warnings`
-Expected: all pass, no warnings.
+Run: `cargo test -p mllm-config -p mllm-cli --all-targets --locked && cargo clippy -p mllm-config -p mllm-cli --all-targets --locked -- -D warnings`
+Expected: all pass, no warnings (a host with no `engines.yaml` loads exactly as before).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/mllm-config/Cargo.toml Cargo.lock crates/mllm-config/src/lib.rs crates/mllm-config/src/registration.rs crates/mllm-config/tests/registration.rs
-git commit -m "feat(config): machine document rewrite with revision header and lock
+git add crates/mllm-config crates/mllm-cli/src/remote_roles.rs Cargo.lock
+git commit -m "feat(config): engines.yaml beside the role document, merged at load
 
-ADR 0018 section 2: engine registration rewrites the host or standalone
-document under an advisory lock, atomically, with the revision on the
-first line and the original kept once. A document over the 32 KiB
-publication bound is refused before anything is written."
+ADR 0018 section 2 (owner decision 2026-09-25): engine registration
+writes only an mllm-owned engines.yaml beside the role's configuration
+file, under a lock, atomically, with the revision on the first line.
+The host document is never rewritten; the host role merges the two at
+load and refuses a profile name declared in both."
 ```
 
 ---
 
-### Task 3: Profile builder, profile checks, verified set, and standalone profiles in the schema
+### Task 3: Profile builder, profile checks and the verified set
 
 **Files:**
 - Modify: `crates/mllm-config/src/registration.rs` (append)
 - Modify: `crates/mllm-config/src/effective.rs` (new `pub fn check_runtime_profile` after `resolve_effective_with_checkpoint`, near line 851)
-- Modify: `crates/mllm-config/src/schema.rs:336` (standalone `host.runtime_profiles` becomes `FieldSpec::MapOf(&PROFILE)`; move the `PROFILE` const above `STANDALONE_HOST` if the compiler requires it)
-- Modify: `crates/mllm-config/src/standalone.rs:224-231` (accept valid profiles) and its test case at `:383-386`
 - Test: `crates/mllm-config/tests/registration.rs` (append)
 
 **Interfaces:**
-- Consumes: Task 2's `MachineDocument`; `engine_policy::{Engine, validate_profile_args}`; `effective::InstallationDrift`.
-- Produces (used by Tasks 5, 8, 11, 14, 17, 19, 20):
+- Consumes: Task 2's `EnginesFile`; `engine_policy::{Engine, validate_profile_args}`; `effective::InstallationDrift`.
+- Produces (used by Tasks 5, 8, 11, 13, 14, 15):
   - `pub const VERIFIED: &[(Engine, &str)] = &[(Engine::Vllm, "0.29.0"), (Engine::Sglang, "0.5.20")]`
   - `pub fn is_verified(engine: Engine, version: &str) -> bool`
   - `pub fn valid_profile_name(name: &str) -> bool` (`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -769,22 +853,6 @@ fn profile_only_changes_are_recognised() {
     let mut edited = new.clone();
     edited["load_report_interval"] = "9s".into();
     assert!(!only_profiles_differ(&old, &edited));
-}
-
-// T03: standalone documents accept valid profiles and refuse invalid ones.
-#[test]
-fn standalone_documents_accept_valid_profiles_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("standalone.yaml");
-    let good = serde_json::json!({"schema_version":1,"kind":"standalone","name":"local",
-        "host":{"name":"local","runtime_profiles":{"vllm": profile_document(&spec(Engine::Vllm))}}});
-    std::fs::write(&path, good.to_string()).unwrap();
-    let doc = MachineDocument::load(&path).unwrap();
-    mllm_config::standalone::check_honoured(&doc.document, dir.path(), dir.path()).unwrap();
-    let mut bad = good.clone();
-    bad["host"]["runtime_profiles"]["vllm"]["executable"] = "relative/vllm".into();
-    let error = mllm_config::standalone::check_honoured(&bad, dir.path(), dir.path()).unwrap_err();
-    assert_eq!(error.path, "host.runtime_profiles.vllm");
 }
 ```
 
@@ -926,40 +994,12 @@ pub fn added_profiles(old: &Value, new: &Value) -> Vec<String> {
 }
 ```
 
-- [ ] **Step 5: Let standalone documents carry profiles.** In `schema.rs`, replace the `STANDALONE_HOST` entry `("runtime_profiles", FieldSpec::Struct(NO_FIELDS)),` and its two-line comment with:
-
-```rust
-        // ADR 0018 §5: `mllm engine add` registers engines here, in the host
-        // profile shape.
-        ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
-```
-
-In `standalone.rs:224-231`, replace the `runtime_profiles` refusal with:
-
-```rust
-    // ADR 0018 §5: registered engines live here; each must pass the rules a
-    // deployment resolution applies, so the role never starts on one it
-    // would refuse later.
-    if let Some(profiles) = host.get("runtime_profiles") {
-        let map = profiles.as_object().ok_or_else(|| {
-            refuse("host.runtime_profiles", "must be a mapping of profile names to profiles")
-        })?;
-        for (name, profile) in map {
-            crate::registration::check_profile(name, profile).map_err(|error| {
-                refuse(&format!("host.runtime_profiles.{name}"), &error.detail)
-            })?;
-        }
-    }
-```
-
-(`refuse(path, detail)` is the existing helper at `standalone.rs:81`; if it takes `&str` for both, pass `&format!(...)` as shown.) In the unit test `values_the_role_would_ignore_are_refused` (`standalone.rs:383-386`), change the expected path of the `runtime_profiles` case from `"host.runtime_profiles"` to `"host.runtime_profiles.p"`: an incomplete profile is still refused, now by name.
-
-- [ ] **Step 6: Run the tests to verify they pass.**
+- [ ] **Step 5: Run the tests to verify they pass.**
 
 Run: `cargo test -p mllm-config --all-targets --locked`
-Expected: all pass, including the 6 new tests and the updated standalone unit test.
+Expected: all pass, including the 5 new tests.
 
-- [ ] **Step 7: Clippy and commit.**
+- [ ] **Step 6: Clippy and commit.**
 
 Run: `cargo clippy -p mllm-config --all-targets --locked -- -D warnings`
 
@@ -969,8 +1009,7 @@ git commit -m "feat(config): engine profile builder, checks and verified set
 
 ADR 0018: the profile engine add writes (both per-launch key references,
 deep park and drift as chosen), checked with the rules deployment
-resolution applies. Standalone documents may now carry runtime profiles,
-each validated at load. The verified set (vLLM 0.29.0, SGLang 0.5.20)
+resolution applies. The verified set (vLLM 0.29.0, SGLang 0.5.20)
 decides the derived custom mark."
 ```
 
@@ -1512,6 +1551,28 @@ fn detection_finds_the_documented_locations_and_runs_nothing() {
     assert!(!marker.exists(), "detection executed an installation");
 }
 
+// T07 T37 (owner decision 2026-09-25): environments directly in the home
+// directory (the Sparks' `~/mllm-vllm-venv2` layout) are found without
+// `--path`, one level deep and only when they carry `pyvenv.cfg`.
+#[test]
+fn home_level_environments_are_found_without_a_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let venv = fake_env(&home.join("mllm-vllm-venv2"), &[("vllm", "0.29.0")]);
+    script(&venv.join("bin/vllm"), "echo 0.29.0");
+    let bare = fake_env(&home.join("not-a-venv"), &[("sglang", "0.5.20")]);
+    std::fs::remove_file(bare.join("pyvenv.cfg")).unwrap();
+    script(&bare.join("bin/python3"), "echo 0.5.20");
+    let deeper = fake_env(&home.join("projects/env"), &[("vllm", "0.29.0")]);
+    script(&deeper.join("bin/vllm"), "echo 0.29.0");
+    let found = detect(&empty_roots(&home), &ScanBounds::default());
+    let envs: Vec<_> = found.iter().map(|c| c.env.clone()).collect();
+    assert!(envs.contains(&venv), "{found:?}");
+    assert!(found.iter().any(|c| c.env == venv && c.source == "home"));
+    assert!(!envs.contains(&bare), "no pyvenv.cfg: not a home-level venv");
+    assert!(!envs.contains(&deeper), "one level deep only");
+}
+
 // T37: a symlink that resolves outside the scanned root is not followed.
 #[test]
 fn a_symlink_escaping_its_root_is_not_followed() {
@@ -1551,7 +1612,7 @@ fn the_scan_is_bounded() {
 
 - [ ] **Step 2: Run the tests to verify they fail.**
 
-Run: `cargo test -p mllm-agent --test engines --locked detection a_symlink the_scan`
+Run: `cargo test -p mllm-agent --test engines --locked detection home_level a_symlink the_scan`
 Expected: FAIL to compile (`ScanRoots`, `detect` not found).
 
 - [ ] **Step 3: Implement.** Replace `crates/mllm-agent/src/engines/detect.rs` with:
@@ -1571,7 +1632,7 @@ pub struct Candidate {
     pub version: String,
     pub env: PathBuf,
     pub entry: PathBuf,
-    /// Where it was found: `PATH`, `conda`, `venv`, `uv`, `pipx`, `opt` or `path`.
+    /// Where it was found: `PATH`, `conda`, `home`, `venv`, `uv`, `pipx`, `opt` or `path`.
     pub source: &'static str,
     pub custom: bool,
 }
@@ -1602,7 +1663,7 @@ pub struct ScanRoots {
     pub extra: Vec<PathBuf>,
 }
 
-/// ADR 0018 §1 (owner-check item 14): the conda roots detection reads.
+/// ADR 0018 §1 (owner decision 2026-09-25): the conda roots detection reads.
 const HOME_CONDA_ROOTS: &[&str] = &["miniconda3", "anaconda3", "miniforge3", "mambaforge", ".conda"];
 const SYSTEM_CONDA_ROOTS: &[&str] = &["/opt/conda", "/opt/miniconda3", "/opt/anaconda3"];
 
@@ -1719,6 +1780,13 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
         }
     }
     if let Some(home) = &roots.home {
+        // Owner decision 2026-09-25: a venv directly in the home directory,
+        // one level deep, recognised by its `pyvenv.cfg` (metadata only).
+        for child in scan.children(home) {
+            if std::fs::symlink_metadata(child.join("pyvenv.cfg")).is_ok_and(|m| m.is_file()) {
+                scan.env(&child, "home");
+            }
+        }
         scan.env(&home.join(".venv"), "venv");
         for parent in ["venvs", ".virtualenvs"] {
             for env in scan.children(&home.join(parent)) {
@@ -1756,7 +1824,7 @@ pub fn detect(roots: &ScanRoots, bounds: &ScanBounds) -> Vec<Candidate> {
 - [ ] **Step 4: Run the tests to verify they pass.**
 
 Run: `cargo test -p mllm-agent --test engines --locked`
-Expected: 7 passed.
+Expected: 8 passed.
 
 - [ ] **Step 5: Clippy and commit.**
 
@@ -1767,7 +1835,7 @@ git add crates/mllm-agent/src/engines/detect.rs crates/mllm-agent/tests/engines.
 git commit -m "feat(agent): metadata-only engine detection
 
 ADR 0018 section 1: mllm engine detect scans PATH environments, conda,
-venv, uv, pipx, /opt and --path roots for vllm and sglang dist-info,
+home-level venvs, venv, uv, pipx, /opt and --path roots for vllm and sglang dist-info,
 executes nothing, never follows a symlink out of its root, and is
 bounded in environments, depth and directory entries."
 ```
@@ -2071,7 +2139,7 @@ fn a_retirement_names_its_instances_and_waits_for_evidence() {
     assert_eq!(t.store.profile_retirement("host-a", "local").unwrap().unwrap().1, "confirmed");
 }
 
-/// ADR 0018 §4 (owner-check item 7): a failed stop ends the retirement
+/// ADR 0018 §4 (owner decision 2026-09-25): a failed stop ends the retirement
 /// without confirming it, and so does the deadline; placements resume and
 /// nothing is released by the retirement itself.
 // T32
@@ -2431,7 +2499,7 @@ impl Store {
             .optional()?)
     }
 
-    /// ADR 0018 §4 (owner-check item 7): a retirement abandoned past its
+    /// ADR 0018 §4 (owner decision 2026-09-25): a retirement abandoned past its
     /// deadline (a server that stopped mid-removal) ends unconfirmed, so it
     /// cannot hold a profile out of placement for ever. Returns what ended.
     pub fn expire_profile_retirements(&self, now_ms: i64) -> Result<Vec<(String, String)>, StoreError> {
@@ -3530,7 +3598,7 @@ use mllm_store::profile_retirement::{RetirementProgress, RetirementStart};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// ADR 0018 §4 (owner-check item 7): the same bound as `mllm drain host`.
+/// ADR 0018 §4 (owner decision 2026-09-25): the same bound as `mllm drain host`.
 pub const RETIREMENT_WINDOW: Duration = Duration::from_secs(900);
 
 pub struct StoreRetirements {
@@ -3904,7 +3972,7 @@ const CONCURRENT: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlRequest {
-    /// Re-read the machine document and publish it.
+    /// Re-read the role document merged with engines.yaml and publish it.
     Add,
     /// Retire a published profile, then rewrite the document and publish.
     Remove { profile: String, drain: bool },
@@ -4126,7 +4194,7 @@ One deliverable: on a running host, `add` over the socket publishes a changed do
 - Test: `crates/mllm-agent/src/profiles.rs` (unit), `crates/mllm-controller/tests/live_profiles.rs` (append)
 
 **Interfaces:**
-- Consumes: Task 2 `MachineDocument`, `lock_document`, `write_document`; Task 3 `only_profiles_differ`; Task 6 messages; Tasks 9–10 server behaviour; Task 11 `StoreRetirements`; Task 12 `ControlHandler`, `ControlRequest`, `ControlServer`, `SOCKET_NAME`.
+- Consumes: Task 2 `EnginesFile`, `engines_beside`, `lock_engines`, `write_engines`, `HostConfig::load`; Task 3 `only_profiles_differ`; Task 6 messages; Tasks 9–10 server behaviour; Task 11 `StoreRetirements`; Task 12 `ControlHandler`, `ControlRequest`, `ControlServer`, `SOCKET_NAME`.
 - Produces (used by Tasks 14 and 15):
   - `pub fn profile_statuses(config: &HostConfig) -> Vec<pb::RuntimeProfileStatus>`
   - `pub struct ProfileSet { pub config: HostConfig, pub inventory: pb::ReportInventory, pub installations: Arc<InstallationRegistry>, pub fingerprint: String }` with `new(config, inventory)` and `measure(config, base: &pb::ReportInventory)`
@@ -4135,7 +4203,7 @@ One deliverable: on a running host, `add` over the socket publishes a changed do
   - `pub struct ProfileUpdates` with `new(Arc<HostProfiles>) -> Arc<Self>`, `profiles()`, `connected()`, `server_supports()`, `async publish(ProfileSet, Duration) -> PublishOutcome`, `async retire(&str, bool, Duration) -> RetireOutcome`
   - `pub enum PublishOutcome { Accepted, Rejected(String), RestartRequired, NotConnected, SessionEnded, Busy }`, `pub enum RetireOutcome { Confirmed, InUse(Vec<String>), Holding(Vec<String>), Refused(String), RestartRequired, NotConnected, SessionEnded }`
   - `pub async fn run_session_with_updates(identity, journal, inventory, shutdown, execution, drain, updates: Option<Arc<ProfileUpdates>>) -> Result<(), HostRevoked>`
-  - `pub struct HostControl` with `new(document: PathBuf, running: HostConfig, updates: Arc<ProfileUpdates>, journal: Arc<HostJournal>) -> Arc<Self>`; `impl ControlHandler`
+  - `pub struct HostControl` with `new(document: PathBuf, running: HostConfig, updates: Arc<ProfileUpdates>, journal: Arc<HostJournal>) -> Arc<Self>` (`document` is the role's `host.yaml`; its engines file is `engines_beside(document)`); `impl ControlHandler`
   - `pub const PUBLISH_BOUND: Duration = Duration::from_secs(30)`, `pub const RETIRE_BOUND: Duration = Duration::from_secs(960)`
   - Control replies (the CLI in Task 14 reads exactly these): add → `{"ok":true,"published":"published"|"unchanged"|"restart_required"|"pending_session"}` or `{"ok":false,"code":"publish_rejected"|"invalid_config","message":..}`; remove → `{"ok":true,"removed":NAME,"published":..}` or `{"ok":false,"code":"profile_in_use","deployments":[..],"message":..}` / `agent_unreachable` / `publish_rejected`; list → `{"ok":true,"connected":bool,"live_profile_update":bool,"accepted":{NAME:{...}},"users":{NAME:[..]}}`
 
@@ -4378,7 +4446,8 @@ Expected: all existing native execution tests pass unchanged in behaviour.
 use mllm_agent::control_socket::{ControlHandler, ControlRequest};
 use mllm_agent::host_control::HostControl;
 use mllm_agent::profiles::{HostProfiles, ProfileSet};
-use mllm_agent::session::{run_session_with_updates, ProfileUpdates, PublishOutcome};
+use mllm_agent::session::{run_session_with_updates, ProfileUpdates};
+use mllm_config::registration::EnginesFile;
 
 /// A running agent session with live updates, its host document on disk, and
 /// the control handler over both.
@@ -4414,14 +4483,15 @@ async fn agent(h: &Harness) -> Agent {
     Agent { updates, control, document, _dir: dir, stop }
 }
 
+/// `engine add`'s write: `vllm` into the engines file beside `document`.
 fn add_vllm_to(document: &std::path::Path) {
-    let lock = mllm_config::registration::lock_document(document).unwrap();
-    let mut doc = mllm_config::registration::MachineDocument::load(document).unwrap();
-    let mut profiles = doc.profiles();
+    use mllm_config::registration::{engines_beside, lock_engines, write_engines, EnginesFile};
+    let path = engines_beside(document);
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
     let with: Value = serde_json::from_str(&with_vllm("x").approved_host_config_json).unwrap();
-    profiles.insert("vllm".into(), with["runtime_profiles"]["vllm"].clone());
-    doc.set_profiles(profiles);
-    mllm_config::registration::write_document(&doc, &lock).unwrap();
+    engines.profiles.insert("vllm".into(), with["runtime_profiles"]["vllm"].clone());
+    write_engines(&engines, &lock, Some(&prepared_document())).unwrap();
 }
 
 // T07 T34: an added profile is published live and promoted on acceptance.
@@ -4430,9 +4500,11 @@ async fn an_added_profile_is_published_and_promoted() {
     let h = enrolled().await;
     let a = agent(&h).await;
     add_vllm_to(&a.document);
+    let host_before = std::fs::read(&a.document).unwrap();
     let reply = a.control.handle(ControlRequest::Add).await;
     assert_eq!(reply["published"], "published", "{reply}");
     assert!(a.updates.profiles().accepted().config.profiles.contains_key("vllm"));
+    assert_eq!(std::fs::read(&a.document).unwrap(), host_before, "host.yaml is never rewritten");
     let approved = h.state.lock().unwrap().store().host_publication(&h.host).unwrap().unwrap();
     assert!(approved.config_json.contains("\"vllm\""));
     // Nothing changed since: not published again.
@@ -4461,7 +4533,7 @@ async fn a_reload_refuses_a_document_changed_outside_profiles() {
 }
 
 // T16: a published profile is removed only after the server confirms; the
-// document is rewritten and the removal published.
+// engines file is rewritten (host.yaml never) and the removal published.
 #[tokio::test]
 async fn a_confirmed_removal_rewrites_and_publishes() {
     let h = enrolled().await;
@@ -4476,9 +4548,9 @@ async fn a_confirmed_removal_rewrites_and_publishes() {
     h.state.lock().unwrap().store().begin_profile_retirement(&h.host, "vllm", "k", 1, i64::MAX / 2, false).unwrap();
     let reply = a.control.handle(ControlRequest::Remove { profile: "vllm".into(), drain: false }).await;
     assert_eq!(reply["removed"], "vllm", "{reply}");
-    let doc = mllm_config::registration::MachineDocument::load(&a.document).unwrap();
-    assert!(!doc.profiles().contains_key("vllm"));
-    assert_eq!(doc.revision, 2);
+    let engines = mllm_config::registration::EnginesFile::load(&mllm_config::registration::engines_beside(&a.document)).unwrap();
+    assert!(!engines.profiles.contains_key("vllm"));
+    assert_eq!(engines.revision, 2);
     assert!(!a.updates.profiles().accepted().config.profiles.contains_key("vllm"));
     a.stop.send(true).unwrap();
     h.server.abort();
@@ -4492,28 +4564,36 @@ async fn a_removal_in_use_writes_nothing() {
         first: RetirementStep::InUse(vec!["q14".into()]), waits: 0.into(), last: RetirementStep::Confirmed, seen: Mutex::new(vec![]),
     }));
     let a = agent(&h).await;
-    let before = std::fs::read(&a.document).unwrap();
-    let reply = a.control.handle(ControlRequest::Remove { profile: "local".into(), drain: false }).await;
+    add_vllm_to(&a.document);
+    assert_eq!(a.control.handle(ControlRequest::Add).await["published"], "published");
+    let engines = mllm_config::registration::engines_beside(&a.document);
+    let before = std::fs::read(&engines).unwrap();
+    let reply = a.control.handle(ControlRequest::Remove { profile: "vllm".into(), drain: false }).await;
     assert_eq!(reply["code"], "profile_in_use");
     assert_eq!(reply["deployments"], json!(["q14"]));
-    assert_eq!(std::fs::read(&a.document).unwrap(), before);
+    assert_eq!(std::fs::read(&engines).unwrap(), before);
+    // A profile declared in host.yaml is the operator's: never removed here.
+    let theirs = a.control.handle(ControlRequest::Remove { profile: "local".into(), drain: false }).await;
+    assert_eq!(theirs["code"], "invalid_config", "{theirs}");
     a.stop.send(true).unwrap();
     h.server.abort();
 }
 
-// Owner-check 4: without a session, a published profile is not removed.
+// Owner decision 2026-09-25: without a session, a published profile is not removed.
 #[tokio::test]
 async fn a_removal_without_a_session_writes_nothing() {
     let dir = directory();
     let document = dir.path().join("host.yaml");
     std::fs::write(&document, prepared_document().to_string()).unwrap();
-    let config = mllm_config::remote_roles::HostConfig::parse(&prepared_document().to_string()).unwrap();
-    let updates = ProfileUpdates::new(HostProfiles::new(ProfileSet::new(config.clone(), inventory("h"))));
     let journal = mllm_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
+    add_vllm_to(&document);
+    let config = mllm_config::remote_roles::HostConfig::load(&document).unwrap();
+    let set = ProfileSet::new(config.clone(), with_vllm("h"));
+    let updates = ProfileUpdates::new(HostProfiles::new(set));
     let control = HostControl::new(document.clone(), config, updates, journal);
-    let reply = control.handle(ControlRequest::Remove { profile: "local".into(), drain: true }).await;
+    let reply = control.handle(ControlRequest::Remove { profile: "vllm".into(), drain: true }).await;
     assert_eq!(reply["code"], "agent_unreachable");
-    let _ = PublishOutcome::NotConnected;
+    assert!(EnginesFile::load(&mllm_config::registration::engines_beside(&document)).unwrap().profiles.contains_key("vllm"));
 }
 ```
 
@@ -4698,14 +4778,15 @@ New incoming arms before the final `_ =>`:
 
 ```rust
 //! ADR 0018 §3, §4: the host's answers to `mllm engine add`, `remove` and
-//! `list` over the control socket. Add re-reads the document and publishes it
-//! live; remove retires on the server first and rewrites the document only
+//! `list` over the control socket. Add re-reads host.yaml merged with its
+//! engines.yaml and publishes it live; remove retires on the server first and
+//! rewrites engines.yaml (never host.yaml) only
 //! after confirmation. Nothing here reaches an engine.
 use crate::control_socket::{ControlHandler, ControlRequest};
 use crate::journal::HostJournal;
 use crate::profiles::ProfileSet;
 use crate::session::{ProfileUpdates, PublishOutcome, RetireOutcome};
-use mllm_config::registration::{lock_document, only_profiles_differ, write_document, MachineDocument};
+use mllm_config::registration::{engines_beside, lock_engines, only_profiles_differ, write_engines, EnginesFile};
 use mllm_config::remote_roles::HostConfig;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -4733,8 +4814,7 @@ impl HostControl {
 
     /// Re-read the document and publish it if it changed (profiles only).
     async fn reload(&self) -> Value {
-        let loaded = MachineDocument::load(&self.document)
-            .and_then(|doc| HostConfig::parse(&doc.document.to_string()));
+        let loaded = HostConfig::load(&self.document);
         let config = match loaded {
             Ok(config) => config,
             Err(error) => return refused("invalid_config", format!("{}: {}", error.path, error.detail)),
@@ -4766,18 +4846,27 @@ impl HostControl {
     }
 
     fn write_without(&self, profile: &str) -> Result<u64, Value> {
-        let lock = lock_document(&self.document).map_err(|e| refused("internal", e.detail))?;
-        let mut doc = MachineDocument::load(&self.document).map_err(|e| refused("invalid_config", e.detail))?;
-        let mut profiles = doc.profiles();
-        profiles.remove(profile);
-        doc.set_profiles(profiles);
-        write_document(&doc, &lock).map_err(|e| refused("internal", e.detail))
+        let path = engines_beside(&self.document);
+        let lock = lock_engines(&path).map_err(|e| refused("internal", e.detail))?;
+        let mut engines = EnginesFile::load(&path).map_err(|e| refused("invalid_config", e.detail))?;
+        engines.profiles.remove(profile);
+        write_engines(&engines, &lock, None).map_err(|e| refused("internal", e.detail))
     }
 
     async fn remove(&self, profile: &str, drain: bool) -> Value {
+        // ADR 0018 §2: only what `engine add` registered is removed here; a
+        // profile the operator declared in host.yaml stays theirs to edit.
+        match EnginesFile::load(&engines_beside(&self.document)) {
+            Ok(engines) if engines.profiles.contains_key(profile) => {}
+            Ok(_) if self.running.profiles.contains_key(profile) => {
+                return refused("invalid_config", format!("{profile} is declared in {}; edit that file and restart the role", self.document.display()))
+            }
+            Ok(_) => return refused("invalid_config", format!("no registered profile named {profile}")),
+            Err(e) => return refused("invalid_config", e.detail),
+        }
         let published = self.updates.profiles().accepted().config.profiles.contains_key(profile);
         if published {
-            // Owner-check 4: never without the server's confirmation.
+            // Owner decision 2026-09-25: never without the server's confirmation.
             match self.updates.retire(profile, drain, RETIRE_BOUND).await {
                 RetireOutcome::Confirmed => {}
                 RetireOutcome::InUse(deployments) | RetireOutcome::Holding(deployments) => {
@@ -4847,7 +4936,7 @@ impl ControlHandler for HostControl {
 
 - [ ] **Step 10: Wire the host and server roles.** In `crates/mllm-cli/src/remote_roles.rs`:
 
-- `serve_host(config: HostConfig, document: PathBuf)`; `execute` passes the resolved `--config` path it already parsed.
+- `serve_host(config: HostConfig, document: PathBuf)`; `execute` passes the resolved `--config` path it already loaded with `HostConfig::load` (Task 2), so the running configuration is host.yaml merged with its engines.yaml.
 - Replace the inline profile measurement (`:668-683`) with `let profiles = tokio::task::spawn_blocking({ let c = config.clone(); move || mllm_agent::profiles::profile_statuses(&c) }).await.map_err(|_| unavailable())?;`.
 - After `execution` is built: `let host_profiles = match &execution_native { Some(e) => e.profiles(), None => mllm_agent::profiles::HostProfiles::new(mllm_agent::profiles::ProfileSet::new(config.clone(), inventory.clone())) };` (keep a typed `Arc<NativeHostExecution>` before erasing it to `Arc<dyn SessionExecution>`), then `let updates = mllm_agent::session::ProfileUpdates::new(host_profiles);`.
 - Call `run_session_with_updates(&identity, journal.clone(), inventory, receiver, execution, Some(drain_signal.clone()), Some(updates.clone()))`.
@@ -4931,8 +5020,8 @@ git commit -m "feat(agent): live engine add and remove on a running host
 ADR 0018 sections 3 and 4: the host keeps its accepted, pending and
 previous profile sets and authorizes plans against whichever the plan
 names; the session carries PublishProfiles and RetireProfile when the
-server supports them; the control handler reloads the document (profiles
-only), publishes it, and removes a published profile only after the
+server supports them; the control handler reloads host.yaml merged with
+engines.yaml (profiles only), publishes it, and removes a published profile only after the
 server confirms its retirement. The host role serves the socket and the
 server installs the retirement service."
 ```
@@ -4948,12 +5037,12 @@ One deliverable: the operator-facing commands, their grammar, their closed codes
 - Modify: `crates/mllm-cli/src/lib.rs` (`pub mod engine;`), `crates/mllm-cli/src/grammar.rs` (`ListResource` `:40-44`, `Command` `:53-140`, `label` `:142-213`, `CliCommand` `:233-332`, `ListArgs` `:473-477`, `From<CliCommand>` `:550-688`), `crates/mllm-cli/src/output.rs` (`ExitCode` `:11-34`, `exit_code` `:125-141`), `crates/mllm-cli/src/main.rs` (new branch beside `Drain`, `:60-84`), `crates/mllm-cli/src/remote_roles.rs` (`supports` `:809-824`, list arm `:966-990`), `crates/mllm-cli/tests/grammar.rs`, `crates/mllm-cli/tests/errors.rs`, `docs/operations/install.md` (exit-code table near `:106`)
 
 **Interfaces:**
-- Consumes: Tasks 2–5 (document, profile spec, resolve, check_version, detect), Task 12 (`request`, `ControlRequest`, `SOCKET_NAME`), Task 13 reply shapes, `mllm_agent::installation::{InstallationMeasurer, probe_capabilities, PROBE_TIMEOUT}`, `crate::managed_runtime::prepare_for_role`.
+- Consumes: Tasks 2–5 (`EnginesFile`, `engines_path`, `config_home`, `lock_engines`, `write_engines`, profile spec, resolve, check_version, detect), Task 12 (`request`, `ControlRequest`, `SOCKET_NAME`), Task 13 reply shapes, `mllm_agent::installation::{InstallationMeasurer, probe_capabilities, PROBE_TIMEOUT}`, `crate::managed_runtime::prepare_for_role`.
 - Produces (used by Task 15):
   - `pub enum DeepParkChoice { Enabled, Disabled }`, `pub enum DriftChoice { Warn, Refuse }` (clap `ValueEnum`)
   - `Command::EngineDetect { paths: Vec<PathBuf> }`, `Command::EngineAdd { path: Option<PathBuf>, name: Option<String>, deep_park: Option<DeepParkChoice>, drift: DriftChoice, args: Vec<String> }`, `Command::EngineList`, `Command::EngineRemove { name: String, drain: bool }`, `ListResource::Engines`
   - `ExitCode::{ENGINE_NOT_FOUND(16), ENGINE_UNSUPPORTED(17), ENGINE_VERSION_FAILED(18), PROFILE_EXISTS(19), PROFILE_IN_USE(20), PUBLISH_REJECTED(21), AGENT_UNREACHABLE(22), NOT_INTERACTIVE(23)}`
-  - `pub struct Target { pub document: PathBuf, pub kind: DocumentKind, pub state_dir: PathBuf, pub socket: PathBuf }`, `pub fn resolve_target(explicit: Option<&Path>, state_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Target, StructuredError>`
+  - `pub enum RoleKind { Host, Standalone }`, `pub struct Target { pub role_document: PathBuf, pub kind: RoleKind, pub engines: PathBuf, pub state_dir: PathBuf, pub socket: PathBuf }`, `pub fn resolve_target(explicit: Option<&Path>, state_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Target, StructuredError>`
   - `pub async fn execute(command: &Command, config: Option<&Path>, state_dir: &Path) -> Result<Value, StructuredError>`
   - `pub fn is_engine_command(command: &Command) -> bool`
 
@@ -5130,10 +5219,10 @@ Expected: pass (the `From` match is exhaustive, so compile errors point at any m
 ```rust
 //! ADR 0018: `mllm engine` against fake environments and a scripted role
 //! socket. CPU tests only; they are not qualification.
-use mllm_agent::control_socket::{ControlHandler, ControlRequest, ControlServer, SOCKET_NAME};
+use mllm_agent::control_socket::{ControlHandler, ControlRequest, ControlServer};
 use mllm_cli::engine::{execute, resolve_target};
 use mllm_cli::grammar::{Command, DeepParkChoice, DriftChoice};
-use mllm_config::registration::MachineDocument;
+use mllm_config::registration::{engines_beside, EnginesFile};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -5150,13 +5239,14 @@ fn script(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A vLLM venv: `vllm --version` prints `version`; the interpreter answers
+/// A vLLM venv: `vllm --version` prints `reported`; the interpreter answers
 /// the capability probe with `deep_park_missing` labels.
 fn vllm_env(root: &Path, version: &str, reported: &str, deep_park_missing: &[&str]) -> PathBuf {
     let site = root.join("lib/python3.12/site-packages");
     std::fs::create_dir_all(site.join("vllm")).unwrap();
     std::fs::create_dir_all(site.join(format!("vllm-{version}.dist-info"))).unwrap();
     std::fs::write(site.join(format!("vllm-{version}.dist-info/METADATA")), format!("Name: vllm\nVersion: {version}\n")).unwrap();
+    std::fs::write(root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
     std::fs::create_dir_all(root.join("bin")).unwrap();
     script(&root.join("bin/vllm"), &format!("echo {reported}"));
     let report = json!({"schema": "mllm/engine-capabilities/v1", "engine": "vllm",
@@ -5175,6 +5265,10 @@ fn host_doc(dir: &Path) -> PathBuf {
     path
 }
 
+fn engines_of(document: &Path) -> EnginesFile {
+    EnginesFile::load(&engines_beside(document)).unwrap()
+}
+
 struct Role(Mutex<Vec<ControlRequest>>, Value);
 #[async_trait::async_trait]
 impl ControlHandler for Role {
@@ -5185,7 +5279,7 @@ impl ControlHandler for Role {
 }
 
 async fn role(document: &Path, reply: Value) -> (Arc<Role>, tokio::sync::watch::Sender<bool>) {
-    let target = resolve_target(Some(document), Path::new("/nonexistent"), &|_| None).unwrap();
+    let target = resolve_target(Some(document), Path::new("/nonexistent"), &|k| (k == "HOME").then(|| "/home/u".into())).unwrap();
     let server = ControlServer::bind(&target.socket).unwrap();
     let handler = Arc::new(Role(Mutex::new(vec![]), reply));
     let (stop, shutdown) = tokio::sync::watch::channel(false);
@@ -5197,27 +5291,30 @@ fn add(path: &Path) -> Command {
     Command::EngineAdd { path: Some(path.into()), name: None, deep_park: None, drift: DriftChoice::Warn, args: vec![] }
 }
 
-// T07 (ADR 0018 §1, §3): add writes the profile with the entry point and the
-// checked version, at revision 1, and asks the running role to publish it.
+// T07 (ADR 0018 §1–§3): add writes the profile into engines.yaml beside the
+// host document, which is never touched, and asks the role to publish it.
 #[tokio::test]
 async fn add_writes_the_profile_and_publishes() {
     let dir = private_dir();
     let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
     let document = host_doc(dir.path());
+    let host_before = std::fs::read(&document).unwrap();
     let (role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
     let out = execute(&add(&env), Some(&document), dir.path()).await.unwrap();
     assert_eq!(out["published"], "published");
     assert_eq!(out["custom"], false);
-    let doc = MachineDocument::load(&document).unwrap();
-    assert_eq!(doc.revision, 1);
-    let profile = &doc.profiles()["vllm"];
+    let engines = engines_of(&document);
+    assert_eq!(engines.revision, 1);
+    let profile = &engines.profiles["vllm"];
     assert_eq!(profile["executable"], env.join("bin/vllm").to_string_lossy().as_ref());
     assert_eq!(profile["build_fingerprint"], "0.29.0");
     assert_eq!(profile["security"]["deep_park"], "enabled");
+    assert_eq!(std::fs::read(&document).unwrap(), host_before, "host.yaml is never rewritten");
     assert_eq!(*role.0.lock().unwrap(), vec![ControlRequest::Add]);
 }
 
-// T03: an existing name is refused and nothing is written.
+// T03 (owner decision 2026-09-25): a name registered already, or declared in
+// the host document, is refused and nothing is written.
 #[tokio::test]
 async fn add_refuses_an_existing_name() {
     let dir = private_dir();
@@ -5225,10 +5322,15 @@ async fn add_refuses_an_existing_name() {
     let document = host_doc(dir.path());
     let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
     execute(&add(&env), Some(&document), dir.path()).await.unwrap();
-    let before = std::fs::read(&document).unwrap();
+    let before = std::fs::read(engines_beside(&document)).unwrap();
     let error = execute(&add(&env), Some(&document), dir.path()).await.unwrap_err();
     assert_eq!(error.code, "profile_exists");
-    assert_eq!(std::fs::read(&document).unwrap(), before);
+    assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
+    let mut host: Value = serde_json::from_str(&std::fs::read_to_string(&document).unwrap()).unwrap();
+    host["runtime_profiles"]["sg"] = engines_of(&document).profiles["vllm"].clone();
+    std::fs::write(&document, host.to_string()).unwrap();
+    let named = Command::EngineAdd { path: Some(env.clone()), name: Some("sg".into()), deep_park: None, drift: DriftChoice::Warn, args: vec![] };
+    assert_eq!(execute(&named, Some(&document), dir.path()).await.unwrap_err().code, "profile_exists");
 }
 
 // ADR 0018 §3: a refused publication is reported; the profile stays written.
@@ -5240,10 +5342,10 @@ async fn add_reports_a_rejected_publication() {
     let (_role, _stop) = role(&document, json!({"ok": false, "code": "publish_rejected", "message": "no"})).await;
     let error = execute(&add(&env), Some(&document), dir.path()).await.unwrap_err();
     assert_eq!(error.code, "publish_rejected");
-    assert!(MachineDocument::load(&document).unwrap().profiles().contains_key("vllm"));
+    assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 
-// ADR 0018 §3: without a running role the document is written and the
+// ADR 0018 §3: without a running role engines.yaml is written and the
 // command says the profile takes effect at the next start.
 #[tokio::test]
 async fn add_without_a_running_role_is_agent_unreachable() {
@@ -5253,7 +5355,7 @@ async fn add_without_a_running_role_is_agent_unreachable() {
     let error = execute(&add(&env), Some(&document), dir.path()).await.unwrap_err();
     assert_eq!(error.code, "agent_unreachable");
     assert!(error.message.contains("revision 1"), "{}", error.message);
-    assert!(MachineDocument::load(&document).unwrap().profiles().contains_key("vllm"));
+    assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 
 // T34 (ADR 0017 fallback): a peer without live_profile_update means restart.
@@ -5273,14 +5375,13 @@ async fn add_version_mismatch_writes_nothing() {
     let dir = private_dir();
     let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.28.0", &[]);
     let document = host_doc(dir.path());
-    let before = std::fs::read(&document).unwrap();
     let error = execute(&add(&env), Some(&document), dir.path()).await.unwrap_err();
     assert_eq!(error.code, "engine_version_failed");
-    assert_eq!(std::fs::read(&document).unwrap(), before);
+    assert!(!engines_beside(&document).exists());
 }
 
-// T21 (owner-check 12): a probe that reports deep park missing writes it
-// disabled, unless the operator asked for enabled.
+// T21 (owner decision 2026-09-25): a probe that reports deep park missing
+// writes it disabled, unless the operator asked for enabled.
 #[tokio::test]
 async fn add_disables_deep_park_when_the_probe_reports_it_missing() {
     let dir = private_dir();
@@ -5289,11 +5390,11 @@ async fn add_disables_deep_park_when_the_probe_reports_it_missing() {
     let (_role, _stop) = role(&document, json!({"ok": true, "published": "published"})).await;
     let out = execute(&add(&env), Some(&document), dir.path()).await.unwrap();
     assert_eq!(out["deep_park_probe"], "capability_missing");
-    assert_eq!(MachineDocument::load(&document).unwrap().profiles()["vllm"]["security"]["deep_park"], "disabled");
+    assert_eq!(engines_of(&document).profiles["vllm"]["security"]["deep_park"], "disabled");
     let asked = Command::EngineAdd { path: Some(env.clone()), name: Some("vllm-deep".into()),
         deep_park: Some(DeepParkChoice::Enabled), drift: DriftChoice::Warn, args: vec![] };
     execute(&asked, Some(&document), dir.path()).await.unwrap();
-    assert_eq!(MachineDocument::load(&document).unwrap().profiles()["vllm-deep"]["security"]["deep_park"], "enabled");
+    assert_eq!(engines_of(&document).profiles["vllm-deep"]["security"]["deep_park"], "enabled");
 }
 
 // T01: add without a path needs a terminal (tests run without one).
@@ -5318,7 +5419,7 @@ async fn detect_lists_candidates_and_runs_nothing() {
     assert!(!marker.exists());
 }
 
-// Owner-check 18: which document an engine command acts on.
+// Owner decision 2026-09-25: which role document and which engines file.
 #[test]
 fn target_resolution_follows_the_documented_order() {
     let dir = private_dir();
@@ -5329,18 +5430,27 @@ fn target_resolution_follows_the_documented_order() {
     let state = dir.path().join("state");
     std::fs::create_dir_all(state.join("config")).unwrap();
     std::fs::write(state.join("config/standalone.yaml"), "schema_version: 1\nkind: standalone\nname: local\n").unwrap();
-    let env = |home: Option<&Path>| {
-        let home = home.map(|h| h.to_string_lossy().into_owned());
-        move |key: &str| (key == "XDG_CONFIG_HOME").then(|| home.clone()).flatten()
-    };
-    assert_eq!(resolve_target(Some(&explicit), &state, &env(None)).unwrap().document, explicit);
-    let both = resolve_target(None, &state, &env(Some(&config_home))).unwrap_err();
-    assert_eq!(both.code, "invalid_config");
+    let cfg = config_home.to_string_lossy().into_owned();
+    let env = |key: &str| (key == "XDG_CONFIG_HOME").then(|| cfg.clone());
+    // --config dir/x.yaml → dir/engines.yaml.
+    let t = resolve_target(Some(&explicit), &state, &env).unwrap();
+    assert_eq!((t.role_document.clone(), t.engines.clone()), (explicit.clone(), dir.path().join("engines.yaml")));
+    // Both implicit documents: ambiguous.
+    assert_eq!(resolve_target(None, &state, &env).unwrap_err().code, "invalid_config");
+    // Implicit standalone: its document in the state dir, engines in the config home.
+    std::fs::remove_file(config_home.join("mllm/host.yaml")).unwrap();
+    let t = resolve_target(None, &state, &env).unwrap();
+    assert_eq!(t.kind, mllm_cli::engine::RoleKind::Standalone);
+    assert_eq!(t.engines, config_home.join("mllm/engines.yaml"));
+    // Implicit host: the same engines file.
     std::fs::remove_file(state.join("config/standalone.yaml")).unwrap();
-    assert_eq!(resolve_target(None, &state, &env(Some(&config_home))).unwrap().document, config_home.join("mllm/host.yaml"));
-    let from_var = |key: &str| (key == "MLLM_CONFIG").then(|| explicit.to_string_lossy().into_owned());
-    assert_eq!(resolve_target(None, &state, &from_var).unwrap().document, explicit);
-    assert!(resolve_target(None, &state, &|_| None).is_err());
+    std::fs::copy(&explicit, config_home.join("mllm/host.yaml")).unwrap();
+    let t = resolve_target(None, &state, &env).unwrap();
+    assert_eq!((t.kind, t.engines), (mllm_cli::engine::RoleKind::Host, config_home.join("mllm/engines.yaml")));
+    // $MLLM_CONFIG counts as naming the document.
+    let path = explicit.to_string_lossy().into_owned();
+    let named = |key: &str| match key { "MLLM_CONFIG" => Some(path.clone()), "XDG_CONFIG_HOME" => Some(cfg.clone()), _ => None };
+    assert_eq!(resolve_target(None, &state, &named).unwrap().engines, dir.path().join("engines.yaml"));
 }
 
 // T16 T32: removal in use is refused with the list, nothing written.
@@ -5361,29 +5471,32 @@ async fn remove_in_use_is_refused_with_the_list() {
     assert!(error.message.contains("q14"), "{}", error.message);
 }
 
-// Owner-check 4: without a role nothing is removed.
+// Owner decision 2026-09-25: without a role nothing is removed; a profile the
+// operator declared in host.yaml is never removed by mllm.
 #[tokio::test]
 async fn remove_without_a_role_writes_nothing() {
     let dir = private_dir();
+    let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
     let document = host_doc(dir.path());
-    let before = std::fs::read(&document).unwrap();
     let error = execute(&Command::EngineRemove { name: "vllm".into(), drain: true }, Some(&document), dir.path()).await.unwrap_err();
-    assert_eq!(error.code, "invalid_config", "no such profile in the document");
-    let mut doc = MachineDocument::load(&document).unwrap();
-    let mut profiles = doc.profiles();
-    profiles.insert("vllm".into(), json!({}));
-    doc.set_profiles(profiles);
-    std::fs::write(&document, serde_json::to_string(&doc.document).unwrap()).unwrap();
-    let before_named = std::fs::read(&document).unwrap();
+    assert_eq!(error.code, "invalid_config", "no such profile");
+    let _ = execute(&add(&env), Some(&document), dir.path()).await;
+    let before = std::fs::read(engines_beside(&document)).unwrap();
     let error = execute(&Command::EngineRemove { name: "vllm".into(), drain: true }, Some(&document), dir.path()).await.unwrap_err();
     assert_eq!(error.code, "agent_unreachable");
-    assert_eq!(std::fs::read(&document).unwrap(), before_named);
-    assert_ne!(before, before_named);
+    assert_eq!(std::fs::read(engines_beside(&document)).unwrap(), before);
+    let mut host: Value = serde_json::from_str(&std::fs::read_to_string(&document).unwrap()).unwrap();
+    host["runtime_profiles"]["theirs"] = engines_of(&document).profiles["vllm"].clone();
+    std::fs::write(&document, host.to_string()).unwrap();
+    let error = execute(&Command::EngineRemove { name: "theirs".into(), drain: false }, Some(&document), dir.path()).await.unwrap_err();
+    assert_eq!(error.code, "invalid_config");
+    assert!(error.message.contains("edit that file"), "{}", error.message);
 }
 
-// ADR 0018 §1: list merges the document with what the role accepted.
+// ADR 0018 §1: list shows registered and declared profiles with what the
+// role accepted.
 #[tokio::test]
-async fn list_merges_the_document_and_the_role() {
+async fn list_merges_the_files_and_the_role() {
     let dir = private_dir();
     let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
     let document = host_doc(dir.path());
@@ -5394,6 +5507,7 @@ async fn list_merges_the_document_and_the_role() {
     let offline = execute(&Command::EngineList, Some(&document), dir.path()).await.unwrap();
     assert_eq!(offline["agent"], "unreachable");
     assert_eq!(offline["engines"][0]["published"], "unknown");
+    assert_eq!(offline["engines"][0]["source"], "engines.yaml");
     let (_r, _stop) = role(&document, json!({"ok": true, "connected": true, "live_profile_update": true,
         "accepted": {}, "users": {}})).await;
     let listed = execute(&Command::EngineList, Some(&document), dir.path()).await.unwrap();
@@ -5417,17 +5531,27 @@ Expected: FAIL to compile (`mllm_cli::engine` not found).
 - [ ] **Step 7: Implement the target.** Create `crates/mllm-cli/src/engine/target.rs`:
 
 ```rust
-//! ADR 0018 (owner-check 18): which machine document, and which role socket,
-//! an `mllm engine` command acts on.
+//! ADR 0018 §2 (owner decision 2026-09-25): which role document, engines
+//! file and role socket an `mllm engine` command acts on. The engines file
+//! sits beside the role document named with `--config` (or `$MLLM_CONFIG`);
+//! otherwise it is `<config home>/mllm/engines.yaml`, for a host and for
+//! standalone alike, which is where the role looks too.
 use crate::output::StructuredError;
 use mllm_agent::control_socket::SOCKET_NAME;
-use mllm_config::registration::{DocumentKind, MachineDocument};
+use mllm_config::registration::{config_home, engines_path};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleKind {
+    Host,
+    Standalone,
+}
 
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub document: PathBuf,
-    pub kind: DocumentKind,
+    pub role_document: PathBuf,
+    pub kind: RoleKind,
+    pub engines: PathBuf,
     pub state_dir: PathBuf,
     pub socket: PathBuf,
 }
@@ -5436,18 +5560,17 @@ pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
     StructuredError { code: "invalid_config", message: message.into() }
 }
 
-/// `--config`; else `$MLLM_CONFIG`; else `${XDG_CONFIG_HOME:-~/.config}/mllm/host.yaml`
-/// if it exists; else `<state_dir>/config/standalone.yaml` if it exists. Both
-/// implicit documents present is ambiguous and refused.
+/// The role document: `--config`; else `$MLLM_CONFIG`; else
+/// `<config home>/mllm/host.yaml` if it exists; else
+/// `<state_dir>/config/standalone.yaml` if it exists. Both implicit documents
+/// present is ambiguous and refused.
 pub fn resolve_target(explicit: Option<&Path>, state_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Target, StructuredError> {
-    let chosen = match (explicit, env("MLLM_CONFIG")) {
-        (Some(path), _) => path.to_path_buf(),
-        (None, Some(path)) => PathBuf::from(path),
-        (None, None) => {
-            let config_home = env("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".config")));
-            let host = config_home.map(|c| c.join("mllm/host.yaml")).filter(|p| p.exists());
+    let home = config_home(env).ok_or_else(|| invalid("neither XDG_CONFIG_HOME nor HOME is set; pass --config"))?;
+    let named = explicit.map(Path::to_path_buf).or_else(|| env("MLLM_CONFIG").map(PathBuf::from));
+    let chosen = match &named {
+        Some(path) => path.clone(),
+        None => {
+            let host = Some(home.join("mllm/host.yaml")).filter(|p| p.exists());
             let standalone = Some(state_dir.join("config/standalone.yaml")).filter(|p| p.exists());
             match (host, standalone) {
                 (Some(host), Some(standalone)) => {
@@ -5463,14 +5586,21 @@ pub fn resolve_target(explicit: Option<&Path>, state_dir: &Path, env: &dyn Fn(&s
             }
         }
     };
-    let doc = MachineDocument::load(&chosen).map_err(|e| invalid(format!("{}: {}", chosen.display(), e.detail)))?;
-    let state = match doc.kind {
-        DocumentKind::Host => mllm_config::remote_roles::HostConfig::parse(&doc.document.to_string())
-            .map_err(|e| invalid(format!("{}: {}", chosen.display(), e.detail)))?
-            .state_dir,
-        DocumentKind::Standalone => state_dir.to_path_buf(),
+    let text = std::fs::read_to_string(&chosen).map_err(|e| invalid(format!("{}: {e}", chosen.display())))?;
+    let (kind, state) = match mllm_config::remote_roles::HostConfig::parse(&text) {
+        Ok(host) => (RoleKind::Host, host.state_dir),
+        Err(host_error) => match mllm_config::parse_strict(mllm_config::ConfigKind::Standalone, &text) {
+            Ok(_) => (RoleKind::Standalone, state_dir.to_path_buf()),
+            Err(_) => return Err(invalid(format!("{}: {}", chosen.display(), host_error.detail))),
+        },
     };
-    Ok(Target { document: chosen, kind: doc.kind, socket: state.join(SOCKET_NAME), state_dir: state })
+    Ok(Target {
+        engines: engines_path(named.as_deref(), &home),
+        role_document: chosen,
+        kind,
+        socket: state.join(SOCKET_NAME),
+        state_dir: state,
+    })
 }
 ```
 
@@ -5481,7 +5611,7 @@ pub fn resolve_target(explicit: Option<&Path>, state_dir: &Path, env: &dyn Fn(&s
 //! standalone. Detection reads metadata only; an installation runs only
 //! after the operator named or picked it.
 mod target;
-pub use target::{resolve_target, Target};
+pub use target::{resolve_target, RoleKind, Target};
 
 use crate::grammar::{Command, DeepParkChoice, DriftChoice};
 use crate::output::StructuredError;
@@ -5490,8 +5620,8 @@ use mllm_agent::engines::{check_version, detect, resolve, Resolved, ScanBounds, 
 use mllm_config::effective::InstallationDrift;
 use mllm_config::engine_policy::Engine;
 use mllm_config::registration::{
-    check_profile, lock_document, profile_document, valid_profile_name, write_document, DocumentKind, MachineDocument,
-    ProfileSpec, ENVIRONMENT_PROFILES,
+    check_profile, lock_engines, profile_document, valid_profile_name, write_engines, EnginesFile, ProfileSpec,
+    ENVIRONMENT_PROFILES,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -5599,19 +5729,43 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
     Ok(Registration { version, fingerprint, deep_park_missing: report.and_then(|r| r.available("deep_park")).map(|a| !a) })
 }
 
-/// Lock, re-check the name, validate, write. The revision written.
+/// The role document, strictly parsed (never written).
+fn role_document(target: &Target) -> Result<Value, StructuredError> {
+    let text = std::fs::read_to_string(&target.role_document)
+        .map_err(|e| error("invalid_config", format!("{}: {e}", target.role_document.display())))?;
+    let kind = match target.kind {
+        RoleKind::Host => mllm_config::ConfigKind::Host,
+        RoleKind::Standalone => mllm_config::ConfigKind::Standalone,
+    };
+    mllm_config::parse_strict(kind, &text).map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))
+}
+
+/// Profiles the operator declared in the role document itself.
+fn declared_by_operator(target: &Target) -> Result<serde_json::Map<String, Value>, StructuredError> {
+    let document = role_document(target)?;
+    let profiles = match target.kind {
+        RoleKind::Host => &document["runtime_profiles"],
+        RoleKind::Standalone => &document["host"]["runtime_profiles"],
+    };
+    Ok(profiles.as_object().cloned().unwrap_or_default())
+}
+
+/// ADR 0018 §2: lock engines.yaml, re-check the name against both files,
+/// validate, write. The role document is never written. The revision written.
 fn write_profile(target: &Target, name: &str, spec: &ProfileSpec) -> Result<u64, StructuredError> {
-    let lock = lock_document(&target.document).map_err(|e| error("internal", e.detail))?;
-    let mut doc = MachineDocument::load(&target.document).map_err(|e| error("invalid_config", e.detail))?;
-    let mut profiles = doc.profiles();
-    if profiles.contains_key(name) {
+    let lock = lock_engines(&target.engines).map_err(|e| error("internal", e.detail))?;
+    let mut engines = EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
+    if engines.profiles.contains_key(name) || declared_by_operator(target)?.contains_key(name) {
         return Err(error("profile_exists", format!("profile {name} exists; use --name, or remove it first")));
     }
     let profile = profile_document(spec);
     check_profile(name, &profile).map_err(|e| error("invalid_config", format!("{}: {}", e.path, e.detail)))?;
-    profiles.insert(name.to_owned(), profile);
-    doc.set_profiles(profiles);
-    write_document(&doc, &lock).map_err(|e| error("invalid_config", e.detail))
+    engines.profiles.insert(name.to_owned(), profile);
+    let host = match target.kind {
+        RoleKind::Host => Some(role_document(target)?),
+        RoleKind::Standalone => None,
+    };
+    write_engines(&engines, &lock, host.as_ref()).map_err(|e| error("invalid_config", e.detail))
 }
 
 async fn add(
@@ -5631,11 +5785,12 @@ async fn add(
     if !valid_profile_name(&name) {
         return Err(error("invalid_config", format!("profile name {name:?} must be lowercase letters, digits, '-' or '_'")));
     }
-    if target.kind == DocumentKind::Standalone && ENVIRONMENT_PROFILES.contains(&name.as_str()) {
+    if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name.as_str()) {
         return Err(error("profile_exists", format!("{name} is reserved for the MLLM_VLLM_BIN / MLLM_SGLANG_BIN installation; use --name")));
     }
-    let existing = MachineDocument::load(&target.document).map_err(|e| error("invalid_config", e.detail))?;
-    if existing.profiles().contains_key(&name) {
+    // Checked before anything runs, and again under the lock when writing.
+    let existing = EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
+    if existing.profiles.contains_key(&name) || declared_by_operator(target)?.contains_key(&name) {
         return Err(error("profile_exists", format!("profile {name} exists; use --name, or remove it first")));
     }
     let (r, state) = (resolved.clone(), target.state_dir.clone());
@@ -5647,7 +5802,7 @@ async fn add(
         Some(false) => "available",
         None => "unknown",
     };
-    // Owner-check 12: missing deep park is recorded as disabled unless asked.
+    // Owner decision 2026-09-25: missing deep park is recorded as disabled unless asked.
     let deep = match deep_park {
         Some(DeepParkChoice::Enabled) => true,
         Some(DeepParkChoice::Disabled) => false,
@@ -5670,7 +5825,7 @@ async fn add(
         "custom": resolved.custom(), "executable": resolved.executable,
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
-        "document": target.document, "revision": revision,
+        "engines_file": target.engines, "revision": revision,
     });
     match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
         Ok(reply) if reply["ok"] == true => {
@@ -5683,18 +5838,21 @@ async fn add(
         )),
         Err(e) => Err(error(
             "agent_unreachable",
-            format!("{e}; the document is written (revision {revision}); it takes effect when the role starts"),
+            format!("{e}; {} is written (revision {revision}); it takes effect when the role starts", target.engines.display()),
         )),
     }
 }
 
 async fn list(target: &Target) -> Result<Value, StructuredError> {
-    let doc = MachineDocument::load(&target.document).map_err(|e| error("invalid_config", e.detail))?;
+    let engines = EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
     let role = request(&target.socket, &ControlRequest::List, LIST_REPLY).await.ok().filter(|r| r["ok"] == true);
-    let rows: Vec<Value> = doc
-        .profiles()
+    // ADR 0018 §2: registered profiles, then the ones the operator declared.
+    let mut all: Vec<(String, Value, &'static str)> =
+        engines.profiles.clone().into_iter().map(|(n, p)| (n, p, "engines.yaml")).collect();
+    all.extend(declared_by_operator(target)?.into_iter().map(|(n, p)| (n, p, "role document")));
+    let rows: Vec<Value> = all
         .into_iter()
-        .map(|(name, profile)| {
+        .map(|(name, profile, source)| {
             let engine = match profile["engine"].as_str() { Some("sglang") => Engine::Sglang, _ => Engine::Vllm };
             let accepted = role.as_ref().map(|r| r["accepted"].get(&name).cloned());
             let version = accepted
@@ -5704,7 +5862,7 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| profile["build_fingerprint"].as_str().unwrap_or("unknown").to_owned());
             json!({
-                "profile": name, "engine": profile["engine"], "version": version,
+                "profile": name, "source": source, "engine": profile["engine"], "version": version,
                 "custom": !mllm_config::registration::is_verified(engine, &version),
                 "executable": profile["executable"],
                 "fingerprint": accepted.clone().flatten().map(|a| a["installation"].clone()),
@@ -5715,19 +5873,24 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
             })
         })
         .collect();
-    Ok(json!({"document": target.document, "revision": doc.revision,
+    Ok(json!({"engines_file": target.engines, "revision": engines.revision,
         "agent": if role.is_some() { "reachable" } else { "unreachable" }, "engines": rows}))
 }
 
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
-    if target.kind == DocumentKind::Standalone && ENVIRONMENT_PROFILES.contains(&name) {
+    if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name) {
         return Err(error("invalid_config", format!(
             "{name} comes from MLLM_VLLM_BIN / MLLM_SGLANG_BIN; unset the variable and restart the role instead"
         )));
     }
-    let doc = MachineDocument::load(&target.document).map_err(|e| error("invalid_config", e.detail))?;
-    if !doc.profiles().contains_key(name) {
-        return Err(error("invalid_config", format!("{} has no profile named {name}", target.document.display())));
+    let engines = EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
+    if !engines.profiles.contains_key(name) {
+        // ADR 0018 §2: a profile declared in the role document is the operator's.
+        return Err(error("invalid_config", if declared_by_operator(target)?.contains_key(name) {
+            format!("{name} is declared in {}; edit that file and restart the role", target.role_document.display())
+        } else {
+            format!("{} has no profile named {name}", target.engines.display())
+        }));
     }
     match request(&target.socket, &ControlRequest::Remove { profile: name.into(), drain }, REMOVE_REPLY).await {
         Ok(reply) if reply["ok"] == true => Ok(reply),
@@ -5739,7 +5902,7 @@ async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, Struc
             }
             Err(error(closed(reply["code"].as_str().unwrap_or("")), message))
         }
-        // Owner-check 4: a published profile is never removed unconfirmed.
+        // Owner decision 2026-09-25: a published profile is never removed unconfirmed.
         Err(e) => Err(error("agent_unreachable", format!("{e}; nothing was removed; start the role and retry"))),
     }
 }
@@ -5802,7 +5965,7 @@ a published profile only after the server confirms. Closed codes exit
 
 ### Task 15: Standalone: environment compatibility, several engines, live add and remove
 
-One deliverable: standalone runs the same registration steps in one process. Both engine variables give two profiles; registered profiles in the standalone document coexist with them; the same socket adds and removes live.
+One deliverable: standalone runs the same registration steps in one process. Both engine variables give two profiles; profiles registered in its `engines.yaml` (beside `--config`, else `<config home>/mllm/engines.yaml`) coexist with them; the same socket adds and removes live. The standalone document itself is never written.
 
 **Files:**
 - Modify: `crates/mllm-controller/src/engine_provider.rs:26-80` (`NamedInstallation`, `ProviderError::ProfileExists`, `EngineProvider::installations`)
@@ -5815,7 +5978,7 @@ One deliverable: standalone runs the same registration steps in one process. Bot
 - Modify: `crates/mllm-cli/src/standalone_config/tests.rs:42` and add env tests there; Create: `crates/mllm-cli/tests/standalone_engines.rs`
 
 **Interfaces:**
-- Consumes: Tasks 2–3 (document, `ENVIRONMENT_PROFILES`, `check_honoured` accepting profiles), Task 7 store API, Task 11 `StoreRetirements`, Task 12 socket, Task 13 reply shapes, Task 14 CLI (unchanged: the socket is the contract).
+- Consumes: Tasks 2–3 (`EnginesFile`, `engines_path`, `config_home`, `lock_engines`, `write_engines`, `ENVIRONMENT_PROFILES`), Task 7 store API, Task 11 `StoreRetirements`, Task 12 socket, Task 13 reply shapes, Task 14 CLI (unchanged: the socket is the contract).
 - Produces:
   - `pub struct NamedInstallation { pub profile: String, pub installation: EngineInstallation }`
   - `EngineProvider::installations(&self, registered: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<NamedInstallation>, ProviderError>` with a default implementation
@@ -5922,11 +6085,11 @@ pub struct NamedInstallation {
 }
 ```
 
-`ProviderError` gains `#[error("profile {0} is declared twice (an environment variable and the standalone document); rename the registered one")] ProfileExists(String)`. `EngineProvider` gains:
+`ProviderError` gains `#[error("profile {0} is declared twice (an environment variable and engines.yaml); rename the registered one")] ProfileExists(String)`. `EngineProvider` gains:
 
 ```rust
     /// ADR 0018 §5: every installation this host publishes: the environment's
-    /// (`local`) and the document's registered profiles, which reuse its role
+    /// (`local`) and the profiles registered in engines.yaml, which reuse its role
     /// settings. A name declared twice is refused.
     fn installations(&self, registered: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<NamedInstallation>, ProviderError> {
         let base = self.installation()?;
@@ -6040,11 +6203,11 @@ Expected: pass.
 
 ```rust
 //! ADR 0018 §5: standalone runs engine registration in one process: the
-//! same document write, the same socket, the same retirement. Fake-engine
+//! same engines.yaml write, the same socket, the same retirement. Fake-engine
 //! tests; not qualification.
 mod support;
 use mllm_agent::control_socket::{request, ControlRequest, SOCKET_NAME};
-use mllm_config::registration::{lock_document, write_document, MachineDocument, ProfileSpec};
+use mllm_config::registration::{engines_beside, lock_engines, write_engines, EnginesFile, ProfileSpec};
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
@@ -6057,11 +6220,12 @@ fn standalone_doc(state: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// `engine add`'s write: `name` into engines.yaml beside the standalone document.
 fn register(document: &std::path::Path, name: &str) {
-    let lock = lock_document(document).unwrap();
-    let mut doc = MachineDocument::load(document).unwrap();
-    let mut profiles = doc.profiles();
-    profiles.insert(name.into(), mllm_config::registration::profile_document(&ProfileSpec {
+    let path = engines_beside(document);
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    engines.profiles.insert(name.into(), mllm_config::registration::profile_document(&ProfileSpec {
         engine: mllm_config::engine_policy::Engine::Vllm,
         executable: "/bin/true".into(),
         build_fingerprint: "0.29.0".into(),
@@ -6069,8 +6233,7 @@ fn register(document: &std::path::Path, name: &str) {
         installation_drift: mllm_config::effective::InstallationDrift::Warn,
         args: vec![],
     }));
-    doc.set_profiles(profiles);
-    write_document(&doc, &lock).unwrap();
+    write_engines(&engines, &lock, None).unwrap();
 }
 
 // ADR 0018 §3, §5: a profile added while standalone runs is published
@@ -6100,7 +6263,7 @@ async fn standalone_remove_rewrites_and_unpublishes() {
     let socket = state.path().join(SOCKET_NAME);
     let reply = request(&socket, &ControlRequest::Remove { profile: "vllm-patched".into(), drain: false }, Duration::from_secs(10)).await.unwrap();
     assert_eq!(reply["removed"], "vllm-patched", "{reply}");
-    assert!(!MachineDocument::load(&document).unwrap().profiles().contains_key("vllm-patched"));
+    assert!(!EnginesFile::load(&engines_beside(&document)).unwrap().profiles.contains_key("vllm-patched"));
     assert_eq!(app.profiles(), vec!["local".to_string()]);
     let refused = request(&socket, &ControlRequest::Remove { profile: "local".into(), drain: false }, Duration::from_secs(10)).await.unwrap();
     assert_eq!(refused["code"], "invalid_config");
@@ -6138,11 +6301,12 @@ Create `crates/mllm-cli/src/standalone_engines.rs`:
 
 ```rust
 //! ADR 0018 §5: standalone's answers to `mllm engine add`, `remove` and
-//! `list`, in one process. Add re-reads the standalone document, rebuilds
-//! the embedded host document and swaps it; remove retires through the store
-//! (the ordinary stop path when drained) before rewriting the document.
+//! `list`, in one process. Add re-reads engines.yaml, rebuilds the embedded
+//! host document and swaps it; remove retires through the store (the
+//! ordinary stop path when drained) before rewriting engines.yaml. The
+//! standalone document is never written.
 use mllm_agent::control_socket::{ControlHandler, ControlRequest};
-use mllm_config::registration::{lock_document, write_document, MachineDocument, ENVIRONMENT_PROFILES};
+use mllm_config::registration::{lock_engines, write_engines, EnginesFile, ENVIRONMENT_PROFILES};
 use mllm_controller::engine_provider::{EngineProvider, NamedInstallation};
 use mllm_controller::installation_gate::EmbeddedInstallations;
 use mllm_controller::profile_retirement::{ProfileRetirements, RetirementStep, RETIREMENT_POLL};
@@ -6177,7 +6341,8 @@ impl EmbeddedHost {
 }
 
 pub struct StandaloneControl {
-    pub document: PathBuf,
+    /// The role's engines.yaml (Task 2's `engines_path`).
+    pub engines: PathBuf,
     pub provider: Arc<dyn EngineProvider>,
     pub host: Arc<EmbeddedHost>,
     pub retirements: Arc<dyn ProfileRetirements>,
@@ -6190,11 +6355,10 @@ fn refused(code: &str, message: impl Into<String>) -> Value {
 
 impl StandaloneControl {
     fn reload(&self) -> Value {
-        let doc = match MachineDocument::load(&self.document) {
-            Ok(doc) => doc,
+        let registered = match EnginesFile::load(&self.engines) {
+            Ok(engines) => engines.profiles,
             Err(e) => return refused("invalid_config", e.detail),
         };
-        let registered = doc.profiles();
         for (name, profile) in &registered {
             if let Err(e) = mllm_config::registration::check_profile(name, profile) {
                 return refused("publish_rejected", format!("profile {name}: {}", e.detail));
@@ -6238,12 +6402,10 @@ impl StandaloneControl {
             RetirementStep::Refused(reason) => return refused("publish_rejected", reason),
             RetirementStep::Draining(_) => unreachable!("loop above"),
         }
-        let written = lock_document(&self.document).and_then(|lock| {
-            let mut doc = MachineDocument::load(&self.document)?;
-            let mut profiles = doc.profiles();
-            profiles.remove(profile);
-            doc.set_profiles(profiles);
-            write_document(&doc, &lock)
+        let written = lock_engines(&self.engines).and_then(|lock| {
+            let mut engines = EnginesFile::load(&self.engines)?;
+            engines.profiles.remove(profile);
+            write_engines(&engines, &lock, None)
         });
         if let Err(e) = written {
             return refused("internal", e.detail);
@@ -6270,7 +6432,7 @@ impl ControlHandler for StandaloneControl {
 
 (Confirmed retirements on the embedded host are deleted after the rewrite: call `store.cancel_profile_retirement(host_id, profile, key)` through the same `commands` the service uses, so the retirement does not keep the profile out of placement if it is added again.)
 
-- [ ] **Step 10: Wire it in `start_standalone_inner`.** Replace `let installation = provider.installation()?;` with reading the loaded document's `host.runtime_profiles` and `let named = provider.installations(&registered)?;` (`ProviderError::ProfileExists` maps to a `StartError` whose structured code is `profile_exists`); `installation` becomes `named[0].installation.clone()`. Build `host_policy(&named, ..)`; register each installation in `EmbeddedInstallations::new()`; pass the shared document `Arc<RwLock<Value>>` to `SharedConfigurationSource::new_shared`; build `EmbeddedHost` and keep it in `App.host`; add `pub fn profiles(&self) -> Vec<String> { self.host.profiles() }`. After the management routers exist, bind `ControlServer::bind(&state_dir.join(SOCKET_NAME))` (on error, keep the reason in `config_notices`) and spawn `serve(Arc::new(StandaloneControl { document, provider, host, retirements: Arc::new(StoreRetirements::new(actions.clone())), host_id }), geteuid(), shutdown)`, where `document` is the standalone document path the role loaded and `host_id` is the embedded host's name. The socket task stops with the role's supervision.
+- [ ] **Step 10: Wire it in `start_standalone_inner`.** Replace `let installation = provider.installation()?;` with `let engines = EnginesFile::load(&engines_path(config, &config_home(&env)?))?;` (the `config` path `start_standalone_configured` received, else the user's config home; `check_honoured` still refuses `host.runtime_profiles` in the standalone document itself) and `let named = provider.installations(&engines.profiles)?;` (`ProviderError::ProfileExists` maps to a `StartError` whose structured code is `profile_exists`); `installation` becomes `named[0].installation.clone()`. Build `host_policy(&named, ..)`; register each installation in `EmbeddedInstallations::new()`; pass the shared document `Arc<RwLock<Value>>` to `SharedConfigurationSource::new_shared`; build `EmbeddedHost` and keep it in `App.host`; add `pub fn profiles(&self) -> Vec<String> { self.host.profiles() }`. After the management routers exist, bind `ControlServer::bind(&state_dir.join(SOCKET_NAME))` (on error, keep the reason in `config_notices`) and spawn `serve(Arc::new(StandaloneControl { engines, provider, host, retirements: Arc::new(StoreRetirements::new(actions.clone())), host_id }), geteuid(), shutdown)`, where `engines` is the engines.yaml path above and `host_id` is the embedded host's name. The socket task stops with the role's supervision.
 
 - [ ] **Step 11: Run the tests.**
 
@@ -6286,8 +6448,8 @@ git add crates/mllm-controller crates/mllm-management crates/mllm-cli crates/mll
 git commit -m "feat(standalone): several engines and live engine add and remove
 
 ADR 0018 section 5: MLLM_VLLM_BIN alone still gives local; both
-variables give local-vllm and local-sglang; engines registered in the
-standalone document coexist, and a name declared twice is refused
+variables give local-vllm and local-sglang; engines registered in
+engines.yaml coexist, and a name declared twice is refused
 profile_exists at start. The standalone role serves the same control
 socket, swaps its embedded host document on add, and removes a profile
 only after the store-backed retirement confirms it."
@@ -6305,7 +6467,7 @@ One deliverable: everything the live qualification needs, plus the operator docu
 - Modify: `docs/operations/install.md` (new section "Registering engines"), `docs/runbooks/f2-current-status.md` (new top section)
 
 **Interfaces:**
-- Consumes: Tasks 13–15 behaviour through the real binaries; `rowlib.sh` (`step`, `deploy`, `wait_state`, `infer`, `keep_owned`, `cleanup_check`, `stop_dep`, `delete_dep`, `refused_with`, `timed`, `host_idle`), `lib.sh` (`rsh`, `rsh_out`, `cli`, `vllm_venv`, `SGLANG_VENV`, `RRD`, `RBIN`).
+- Consumes: Tasks 13–15 and 17 behaviour through the real binaries; `rowlib.sh` (`step`, `deploy`, `wait_state`, `infer`, `keep_owned`, `cleanup_check`, `stop_dep`, `delete_dep`, `refused_with`, `timed`, `host_idle`), `lib.sh` (`rsh`, `rsh_out`, `cli`, `vllm_venv`, `SGLANG_VENV`, `RRD`, `RBIN`).
 - Produces: `rbin <host>`; `roles.sh host-doc-bare <host> <policy>`, `roles.sh host-up-systemd <host>`, `roles.sh host-down-systemd <host>`; rows ENG1–ENG4.
 
 - [ ] **Step 1: Harness hooks.**
@@ -6359,7 +6521,10 @@ In `host_doc`, pass `${NO_PROFILES:+--no-profiles}` to `gen_host_doc.py`, and ad
 #   run_row.sh ENG1 --tag 17 -- host-b v17-4 s17-4
 #
 # Expected:
-#   a  engine detect --path ~ lists both environments (metadata only).
+#   a  engine detect (no --path) lists both home-level environments
+#      (metadata only; owner decision 2026-09-25).
+#   a2 host.yaml is byte-identical before and after the adds; the profiles
+#      live in $RRD/engines.yaml beside it.
 #   b  engine add of each exits 0 with published=published within 10 s.
 #   c  list engines on the server shows vllm and sglang on the host, custom=false.
 #   d  the standard fixtures (profiles vllm and sglang, revision 1) reach
@@ -6386,6 +6551,7 @@ PY
 eng_bare_systemd() { # eng_bare_systemd <host>: profile-less document, systemd role
   local host=$1
   "$MATRIX_DIR/roles.sh" host-down "$host" &&
+    rsh "$host" "rm -f $RRD/engines.yaml $RRD/engines.yaml.lock" &&
     "$MATRIX_DIR/roles.sh" host-doc-bare "$host" "${POLICY:-normal}" &&
     "$MATRIX_DIR/roles.sh" host-up-systemd "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180
@@ -6394,6 +6560,9 @@ eng_bare_systemd() { # eng_bare_systemd <host>: profile-less document, systemd r
 eng_restore() { # eng_restore <host>: back to the tmux role and full document
   local host=$1
   "$MATRIX_DIR/roles.sh" host-down-systemd "$host" || true
+  # The full matrix document declares vllm and sglang itself; the same names
+  # in engines.yaml would be refused at start.
+  rsh "$host" "rm -f $RRD/engines.yaml $RRD/engines.yaml.lock" || return 1
   "$MATRIX_DIR/roles.sh" host-doc "$host" "${POLICY:-normal}" &&
     "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180
@@ -6440,10 +6609,13 @@ row_main() {
   local host=$1 vfix=$2 sfix=$3 rc=0
   step before host_idle "$host" || return 1
   step bare-systemd eng_bare_systemd "$host" || return 1
-  step detect eng_remote "$host" detect --path "$REMOTE_HOME" || rc=1
+  step host-yaml-before rsh "$host" "sha256sum $RRD/host.yaml > $RRD/host-yaml.sum" || rc=1
+  step detect eng_remote "$host" detect || rc=1
   step add-vllm timed add-vllm eng_add "$host" "$(vllm_venv "$host")/bin/vllm" || rc=1
   step add-sglang timed add-sglang eng_add "$host" "$SGLANG_VENV/bin/python3" || rc=1
   step listed eng_listed "$host" vllm sglang || rc=1
+  step host-yaml-unchanged rsh "$host" "sha256sum -c $RRD/host-yaml.sum" || rc=1
+  step engines-file rsh "$host" "head -1 $RRD/engines.yaml" || rc=1
   eng_serves "$vfix" || rc=1
   eng_serves "$sfix" || rc=1
   step restore eng_restore "$host" || rc=1
@@ -6559,11 +6731,11 @@ row_main() {
 
 (Serving a deployment on each standalone profile uses the standalone client's `deploy model --file` with a document naming `runtime_profile: local-vllm` or `local-sglang`; add those two steps once Task 15's CPU tests have fixed the standalone deployment shape, generating the files with `gen_deployment.py --document-json '{"runtime_profile":"local-vllm","placement":null}'` and deploying with `MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") deploy model --file <file> --activate --wait`.)
 
-- [ ] **Step 5: Row ENG4** (version-skew fallback, owner-check 5). Create `scripts/live/matrix/rows/ENG4.sh`:
+- [ ] **Step 5: Row ENG4** (version-skew fallback, owner decision 2026-09-25). Create `scripts/live/matrix/rows/ENG4.sh`:
 
 ```bash
 # shellcheck shell=bash
-# ENG4 (ADR 0018 §3, owner-check 5): engine add beside an rc.3 agent, and a
+# ENG4 (ADR 0018 §3, owner decision 2026-09-25): engine add beside an rc.3 agent, and a
 # new agent against an rc.3 server:
 #   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- host-b
 #
@@ -6573,8 +6745,10 @@ row_main() {
 #
 # Expected:
 #   a  rc.3 host role, new CLI binary: engine add exits 22 agent_unreachable
-#      and the document is written (revision 1); after an rc.3 host restart
-#      the profile is published (list hosts).
+#      and engines.yaml is written (revision 1). An rc.3 agent never reads
+#      engines.yaml, so after an rc.3 restart the profile is still not
+#      published; after the host role is upgraded to the new binary it is
+#      published at start (list hosts).
 #   b  rc.3 server, new host role: engine add exits 0 with
 #      published=restart_required; after a host restart it is published.
 #   c  both sides are returned to the new binaries.
@@ -6591,7 +6765,7 @@ eng4_preconditions() {
 eng4_rc3_agent() { # (a)
   local host=$1 short
   short=$(host_short "$host")
-  "$MATRIX_DIR/roles.sh" host-down "$host" &&
+  "$MATRIX_DIR/roles.sh" host-down "$host" && rsh "$host" "rm -f $RRD/engines.yaml" &&
     "$MATRIX_DIR/roles.sh" host-doc-bare "$host" "${POLICY:-normal}" || return 1
   env "MLLM_REMOTE_BIN_$short=$MLLM_RC3_REMOTE" "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
@@ -6599,14 +6773,21 @@ eng4_rc3_agent() { # (a)
   "$MATRIX_DIR/roles.sh" host-down "$host" &&
     env "MLLM_REMOTE_BIN_$short=$MLLM_RC3_REMOTE" "$MATRIX_DIR/roles.sh" host-up "$host" &&
     "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
-  cli list hosts --output json | tee "$EVID/rc3-agent-hosts.json" | grep -q '"vllm"'
+  # rc.3 ignores engines.yaml: not published.
+  if ! dry && cli list hosts --output json | tee "$EVID/rc3-agent-hosts.json" | grep -q '"vllm"'; then
+    echo "UNEXPECTED: an rc.3 agent published engines.yaml"; return 1
+  fi
+  "$MATRIX_DIR/roles.sh" host-down "$host" && "$MATRIX_DIR/roles.sh" host-up "$host" &&
+    "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
+  cli list hosts --output json | tee "$EVID/upgraded-agent-hosts.json" | grep -q '"vllm"'
 }
 
 eng4_rc3_server() { # (b)
   local host=$1 out
   "$MATRIX_DIR/roles.sh" down || true
   MLLM_LOCAL_BIN=$MLLM_RC3_LOCAL "$MATRIX_DIR/roles.sh" up "${POLICY:-normal}" || return 1
-  "$MATRIX_DIR/roles.sh" host-down "$host" && "$MATRIX_DIR/roles.sh" host-doc-bare "$host" "${POLICY:-normal}" &&
+  "$MATRIX_DIR/roles.sh" host-down "$host" && rsh "$host" "rm -f $RRD/engines.yaml" &&
+    "$MATRIX_DIR/roles.sh" host-doc-bare "$host" "${POLICY:-normal}" &&
     "$MATRIX_DIR/roles.sh" host-up "$host" && "$MATRIX_DIR/roles.sh" wait-online 180 || return 1
   out=$(eng_remote "$host" add "$(vllm_venv "$host")/bin/vllm") || return 1
   printf '%s\n' "$out" | tee "$EVID/rc3-server-add.json"
@@ -6621,6 +6802,7 @@ row_main() {
   step preconditions eng4_preconditions "$host" || return 1
   step rc3-agent eng4_rc3_agent "$host" || rc=1
   step rc3-server eng4_rc3_server "$host" || rc=1
+  step restore-engines rsh "$host" "rm -f $RRD/engines.yaml" || true
   step restore-server "$MATRIX_DIR/roles.sh" down || true
   step restore-up "$MATRIX_DIR/roles.sh" up "${POLICY:-normal}" || rc=1
   return "$rc"
@@ -6649,22 +6831,32 @@ mllm uses engines you install yourself. Register them on the machine that runs t
     mllm engine remove vllm [--drain]
     mllm list engines --config server.yaml # on the server: every host's engines
 
+`detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,
+`~/.virtualenvs`, uv and pipx tool environments, `/opt`, and any venv directly
+in your home directory (for example `~/mllm-vllm-venv2`).
+
 `engine add` runs the installation only after you name or pick it (a bounded
-version check, the installation fingerprint and the deep-park probe), writes the
-profile into the machine document, and asks the running role to publish it
-without a restart. The command acts on `--config`, else `$MLLM_CONFIG`, else
-`~/.config/mllm/host.yaml`, else `<state_dir>/config/standalone.yaml`.
+version check, the installation fingerprint and the deep-park probe), writes
+the profile into `engines.yaml`, and asks the running role to publish it
+without a restart. mllm never rewrites `host.yaml` or `standalone.yaml`.
+`engines.yaml` sits beside the role's configuration file (`--config
+dir/host.yaml` means `dir/engines.yaml`); without `--config` it is
+`~/.config/mllm/engines.yaml`, for a host and for standalone alike. The role
+merges it with its own document at start; a profile name declared in both is
+refused. Its first line records its revision (`# mllm-document-revision: N`).
+The running role listens on `<state_dir>/control.sock` (mode 0600, your user
+only) for these commands.
 
-The document is rewritten as JSON-shaped YAML with `# mllm-document-revision: N`
-on its first line; comments are not kept, and your original is saved once as
-`<document>.before-engine-registration`. The running role listens on
-`<state_dir>/control.sock` (mode 0600, your user only) for these commands.
+`engine remove` removes only profiles `engine add` registered; one you wrote
+into `host.yaml` stays yours to edit. It is refused while a deployment on this
+machine uses the profile (`profile_in_use`); `--drain` stops those deployments
+through the ordinary stop path first, and the profile is removed only after the
+server confirms their stop evidence. A role that is not running cannot remove a
+published profile (`agent_unreachable`); start it and retry.
 
-`engine remove` of a profile a deployment on this machine uses is refused
-(`profile_in_use`); `--drain` stops those deployments through the ordinary stop
-path first, and the profile is removed only after the server confirms their
-stop evidence. A role that is not running cannot remove a published profile
-(`agent_unreachable`); start it and retry.
+A deployment naming a runtime profile that no allowed host publishes is refused
+at `deploy` (`profile_not_published`), naming the profile and each host; run
+`mllm engine add <path> --name <profile>` on a host, then deploy again.
 
 In standalone, `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
@@ -6684,7 +6876,7 @@ Evidence: CPU and Fake-engine tests only (`crates/*/tests/{registration,engines,
 control_socket,live_profiles,engine_cli,standalone_engines}.rs`). These are not
 qualification. Live rows ENG1–ENG4 are written and not yet run.
 
-Owner answers to the plan's owner-check items: <record them>.
+Owner decisions of 2026-09-25 are recorded in the plan and ADR 0018; the answer on the exit code for `profile_not_published` (plan item 20): <record it>.
 ```
 
 (Fill `<date>`, the commit range and the owner's answers when the section is written; they are facts of the execution, not of the plan.)
@@ -6704,31 +6896,244 @@ profile-less host document. Written and dry-run only; not run live."
 
 ---
 
+### Task 17: Deploy fails fast on a runtime profile no allowed host publishes
+
+Owner decision 2026-09-25: a deployment is never re-resolved after `engine add`. Instead, `deploy` refuses at once, storing nothing, when no allowed host publishes the named `runtime_profile`, and the refusal names the profile, each host with what it does publish, and the fix. This task can run any time after Task 14 (it adds one CLI code beside 16–23).
+
+**Files:**
+- Modify: `crates/mllm-management/src/configuration.rs` (`ConfigurationFailure` `:33-80` gains `ProfileNotPublished`; `response` `:84-125`; the embedded path in `accept` `:449-468`; `registry_targets` `:539-640`)
+- Modify: every exhaustive `match` over `ConfigurationFailure` the compiler names (for example `crates/mllm-management/src/actions.rs:820` area)
+- Modify: `crates/mllm-cli/src/client.rs:595-622` (`refusal`), `crates/mllm-cli/src/output.rs` (`ExitCode::PROFILE_NOT_PUBLISHED = 24` and its `exit_code` arm), `docs/operations/install.md` (exit-code table row 24)
+- Test: `crates/mllm-management/tests/configuration.rs` (append), `crates/mllm-cli/tests/errors.rs` (append)
+
+**Interfaces:**
+- Consumes: `Store::host_publication`, `Store::enrolled_hosts`; the deployment document's `runtime_profile` field.
+- Produces: `ConfigurationFailure::ProfileNotPublished { profile: String, hosts: Vec<(String, Vec<String>)> }` → HTTP 409, `{"error":{"code":"profile_not_published","message":..,"retryable":false,"details":{"profile":..,"hosts":{HOST:[PROFILES]}}}}`; CLI code `profile_not_published`, exit 24; per-host refusal diagnostic `profile_not_published` for an allowed host that lacks the profile while another has it.
+
+- [ ] **Step 1: Write the failing tests.** Append to `crates/mllm-management/tests/configuration.rs` (it has `fixture`, `app`, `request`, `json_response`, `publish_host`):
+
+```rust
+/// ADR 0018 §7 (owner decision 2026-09-25): a deploy naming a runtime profile
+/// no allowed host publishes is refused at once and nothing is stored; the
+/// refusal names the profile, each host with what it publishes, and the fix.
+// T03 T07
+#[tokio::test]
+async fn a_deploy_naming_an_unpublished_profile_fails_fast() {
+    let (_directory, state, mut config, _) = fixture();
+    publish_host(&state, "host-a", 'e', json!({}));
+    publish_host(&state, "host-b", 'f', json!({}));
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    config["instances"] = json!(1);
+    config["placement"] = json!({"hosts": ["host-a", "host-b"]});
+    config["devices"] = json!([{"sharing": "shared"}]);
+    for phase in ["cold", "ready", "parking", "wake"] {
+        config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
+    }
+    let before = state.lock().unwrap().store().snapshot().unwrap().deployments.len();
+    let mut missing = config.clone();
+    missing["runtime_profile"] = json!("vllm-patched");
+    let response = router
+        .clone()
+        .oneshot(request("POST", "/management/v1/deployments", "missing", json!({"config":missing,"activate":false})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let body = json_response(response).await;
+    assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    for needle in ["vllm-patched", "host-a", "host-b", "local", "mllm engine add", "--name vllm-patched"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert_eq!(body["error"]["details"]["profile"], "vllm-patched");
+    assert_eq!(state.lock().unwrap().store().snapshot().unwrap().deployments.len(), before, "nothing stored");
+    // The same deployment naming a published profile is accepted.
+    let response = router
+        .oneshot(request("POST", "/management/v1/deployments", "present", json!({"config":config,"activate":false})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+}
+
+/// ADR 0018 §7: the embedded (standalone) host fails fast the same way.
+// T03 T07
+#[tokio::test]
+async fn an_embedded_deploy_naming_an_unpublished_profile_fails_fast() {
+    let (_directory, state, mut config, host) = fixture();
+    let router = app(state.clone(), host);
+    config["runtime_profile"] = json!("sglang");
+    let response = router
+        .oneshot(request("POST", "/management/v1/deployments", "embedded", json!({"config":config,"activate":false})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let body = json_response(response).await;
+    assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
+    assert!(state.lock().unwrap().store().snapshot().unwrap().deployments.is_empty());
+}
+```
+
+Append to `crates/mllm-cli/tests/errors.rs`:
+
+```rust
+// T01 (ADR 0018 §7): a deploy refused for an unpublished profile exits 24.
+#[test]
+fn profile_not_published_exits_24() {
+    let error = StructuredError { code: "profile_not_published", message: String::new() };
+    assert_eq!(error.exit_code(), ExitCode(24));
+    assert_eq!(ExitCode::PROFILE_NOT_PUBLISHED, ExitCode(24));
+}
+```
+
+- [ ] **Step 2: Run them to verify they fail.**
+
+Run: `cargo test -p mllm-management --test configuration --locked unpublished_profile && cargo test -p mllm-cli --test errors --locked`
+Expected: the management tests get 202 (or 403) instead of 409; the CLI test fails to compile (`PROFILE_NOT_PUBLISHED`).
+
+- [ ] **Step 3: The failure and its answer.** In `configuration.rs`, add to `ConfigurationFailure`:
+
+```rust
+    /// ADR 0018 §7 (owner decision 2026-09-25): no allowed host publishes the
+    /// deployment's runtime profile. Refused before anything is stored.
+    ProfileNotPublished { profile: String, hosts: Vec<(String, Vec<String>)> },
+```
+
+and in `response`, beside the `HostIneligible` arm (and add `ProfileNotPublished { .. }` to the `unreachable!` arm below it):
+
+```rust
+            ProfileNotPublished { profile, hosts } => {
+                let each: Vec<String> = hosts
+                    .iter()
+                    .map(|(host, names)| {
+                        format!("{host}: {}", if names.is_empty() { "none".to_owned() } else { names.join(", ") })
+                    })
+                    .collect();
+                let message = format!(
+                    "runtime profile `{profile}` is not published by any allowed host ({}); register it on a host with `mllm engine add <path> --name {profile}`, then deploy again",
+                    each.join("; ")
+                );
+                let details: serde_json::Map<String, Value> =
+                    hosts.iter().map(|(h, n)| (h.clone(), serde_json::json!(n))).collect();
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"api_version":"1","error":{
+                        "code":"profile_not_published","message":message,"retryable":false,
+                        "operation_id":null,"details":{"profile":profile,"hosts":details}}})),
+                )
+                    .into_response();
+            }
+```
+
+- [ ] **Step 4: Check before anything is stored.** Add a helper beside `registry_targets`:
+
+```rust
+/// ADR 0018 §7: the profile the deployment names, and whether `published`
+/// (host, profiles) carries it anywhere. Refused as a whole when nowhere.
+fn require_published(config_json: &str, published: Vec<(String, Vec<String>)>) -> Result<String, ConfigurationFailure> {
+    let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, config_json)?;
+    let profile = config["runtime_profile"].as_str().unwrap_or_default().to_owned();
+    if published.iter().any(|(_, names)| names.iter().any(|n| *n == profile)) {
+        Ok(profile)
+    } else {
+        Err(ConfigurationFailure::ProfileNotPublished { profile, hosts: published })
+    }
+}
+
+fn profile_names(document: &Value) -> Vec<String> {
+    document["runtime_profiles"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+}
+```
+
+In `registry_targets`, right after `allowed` is validated:
+
+```rust
+    // ADR 0018 §7 (owner decision 2026-09-25): fail fast, storing nothing.
+    let mut published = Vec::new();
+    for selector in &allowed {
+        let names = store
+            .host_publication(selector)
+            .map_err(|_| ConfigurationFailure::Internal)?
+            .and_then(|p| serde_json::from_str::<Value>(&p.config_json).ok())
+            .map(|d| profile_names(&d))
+            .unwrap_or_default();
+        published.push((selector.clone(), names));
+    }
+    let profile = require_published(config_json, published)?;
+```
+
+and in the loop, after the `no_runtime_profiles` check:
+
+```rust
+        if original["runtime_profiles"].get(&profile).is_none() {
+            single = Some(refuse(ConfigurationFailure::HostPolicyDenied, "profile_not_published", &mut refusals));
+            continue;
+        }
+```
+
+In the `HostSource::Embedded { document, id }` arm, before composing controls:
+
+```rust
+                let (ConfigurationCommand::Create { config_json }
+                | ConfigurationCommand::Replace { config_json, .. }) = &command;
+                require_published(config_json, vec![(id.clone(), profile_names(document))])?;
+```
+
+(After Task 15, `document` is behind the `RwLock`; take the read guard first. If Task 17 runs before Task 15, use it as it is.)
+
+- [ ] **Step 5: CLI code and exit code.** In `client.rs::refusal` add `"profile_not_published" => "profile_not_published",` beside `"host_ineligible"`. In `output.rs` add `pub const PROFILE_NOT_PUBLISHED: Self = Self(24);` after `NOT_INTERACTIVE` and the arm `"profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,`. In `errors.rs`'s `a_start_with_no_eligible_host_exits_15` add `24` to the `assert_ne!` list. Add row `24 profile_not_published` (remedy: register the profile on a host with `mllm engine add … --name <profile>`, then deploy again) to the exit table in `docs/operations/install.md`.
+
+- [ ] **Step 6: Run the tests.**
+
+Run: `cargo test -p mllm-management --all-targets --locked && cargo test -p mllm-cli --test errors --locked`
+Expected: all pass, including the three new tests; `registry_resolves_every_allowed_host_the_selector_matches` still answers 403 for its selector miss (its profile `local` is published).
+
+- [ ] **Step 7: Core suite, workspace, Clippy.** Run the three Global Constraints commands. Expected: pass.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/mllm-management crates/mllm-cli docs/operations/install.md
+git commit -m "feat(management): refuse a deploy whose runtime profile no host publishes
+
+ADR 0018 section 7 (owner decision 2026-09-25): a deploy naming a
+runtime profile that no allowed host publishes is refused at once with
+profile_not_published (CLI exit 24), storing nothing. The refusal names
+the profile, each host with the profiles it publishes, and the fix:
+mllm engine add <path> --name <profile>, then deploy again. Deployments
+are never re-resolved after engine add."
+```
+
+---
+
 ## Self-review
 
-**Spec coverage.**
+**Spec coverage** (spec as revised in this PR).
 
 | Spec item | Task |
 |---|---|
-| `engine detect`: locations, metadata only, bounds, no symlink escape | 5; CLI 14 |
-| `engine add`: resolve, detect, register (version check, fingerprint, probe), name, custom mark, atomic write with revision, reload | 4, 3, 2, 14, 13, 15 |
+| `engine detect`: locations (including home-level venvs), metadata only, bounds, no symlink escape | 5; CLI 14 |
+| `engine add`: resolve, detect, register (version check, fingerprint, probe), name, custom mark, write `engines.yaml` (lock, atomic, revision), reload | 4, 3, 2, 14, 13, 15 |
+| Role document never rewritten; `engines.yaml` location rule; name in both files refused | 2, 13, 14, 15 |
 | Options `--deep-park`, `--drift`, `--arg` | 3, 14 |
-| Probe reports missing deep park → restart_only | 14 (owner-check 12) |
+| Probe reports missing deep park → restart_only | 14 |
 | Interactive pick; `not_interactive` | 14 |
-| `engine list` columns (name, engine, version, custom, fingerprint, probe, published, deployments) | 13 (role side), 14 |
-| `engine remove [--drain]`: two phases, no placement slips in, stop evidence only, never-published removed locally | 7, 10, 11, 13, 14, 15 |
+| `engine list` columns | 13 (role side), 14 |
+| `engine remove [--drain]`: two phases, no placement slips in, stop evidence only; never-published removed locally; operator-declared profiles not removable | 7, 10, 11, 13, 14, 15 |
 | `list engines` on the server | 11, 14 |
 | Environment variables: one → `local`; both → `local-vllm`/`local-sglang`; collision → `profile_exists` at start | 15 |
-| Control socket: 0600, `SO_PEERCRED`, add/remove/list only, never reaches an engine | 12, 13, 15 |
-| Re-publish validated like a startup publish; accepted swaps atomically; rejected keeps the previous snapshot; `publish_rejected`; `not published` in list | 8, 9, 13, 14 |
-| Agent not running → `agent_unreachable` (document written) | 14 (add); removal per owner-check 4 |
-| `live_profile_update` in Connect; fallback "restart needed" when either side lacks it | 6, 9, 13, 14 |
-| Closed error codes; exit codes from 16, 9 not reused | 14 |
-| Security rules | 4, 5, 12; Global Constraints (ADR 0012 unchanged) |
-| ADR 0018 amending SPEC §4.2 and §15 | 1 |
-| Spec's CPU test list (detect tree, add/list/remove with fake engine, atomic write, `profile_exists`, custom, socket uid, re-publish accepted/rejected, removal race, `profile_in_use`, `--drain` evidence and uncertain hold, capability fallback, env compatibility) | 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15 |
-| Spec's live checks (systemd host add + serve; standalone both engines; removal refused then drain; rc.3 fallback) | 16 (ENG1–ENG4) |
+| Control socket: 0600, `SO_PEERCRED`, add/remove/list only | 12, 13, 15 |
+| Re-publish validated like a startup publish; accepted swaps; rejected keeps the snapshot; `publish_rejected`; `not published` in list | 8, 9, 13, 14 |
+| `agent_unreachable` (add writes `engines.yaml`; remove writes nothing) | 13, 14 |
+| `live_profile_update` and the restart fallback | 6, 9, 13, 14 |
+| Deploy fails fast on an unpublished profile; no re-resolution | 17 |
+| Closed codes; exit codes 16–24, 9 unused | 14, 17 |
+| Security rules | 4, 5, 12; Global Constraints |
+| ADR 0018 amending SPEC §4.2 and §15.1 | 1 |
+| Spec's CPU test list | 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 17 |
+| Spec's live checks | 16 (ENG1–ENG4) |
 
-**Spec gaps found** (each is an owner-check item at the top): the standalone document path (1); where the document revision lives (2); rewriting YAML loses comments (3); removal while the role is unreachable (4); the rc.3 live check as written cannot run (5); what a live re-publish may change (6); the retirement bound (7); existing deployments are not re-resolved after an add (8); `accept_extra_args` does not govern profile arguments (13); home-level venvs are found only with `--path` (14). ENG2's per-profile deployment steps depend on the standalone deployment shape Task 15 settles.
+**Open item:** decision 20 (exit 24 for `profile_not_published`). **Known limit:** ENG2 checks that standalone publishes both environment profiles and refuses to remove one. Its "switch between them" step is written as a note, to be added once Task 15 has fixed the standalone deployment shape.
 
-**Type consistency** (names checked across tasks): `MachineDocument`, `DocumentKind`, `lock_document`, `write_document`, `revision_of` (2 → 13, 14, 15); `ProfileSpec`, `profile_document`, `check_profile`, `is_verified`, `valid_profile_name`, `ENVIRONMENT_PROFILES`, `only_profiles_differ`, `added_profiles`, `removed_profiles` (3 → 8, 9, 11, 13, 14, 15); `Resolved`, `resolve`, `check_version`, `VERSION_CHECK_TIMEOUT`, `Candidate`, `ScanRoots`, `ScanBounds`, `detect` (4, 5 → 14); `LIVE_PROFILE_UPDATE`, `server_capabilities`, `MAX_REQUEST_ID`, `MAX_REASON`, `MAX_RETIREMENT_DEPLOYMENTS` (6 → 9, 10, 13); `RetirementStart`, `RetirementProgress`, `RetirementCandidate`, `begin_profile_retirement`, `profile_candidates`, `record_profile_retirement_stops`, `profile_retirement_progress`, `cancel_profile_retirement`, `profile_retirement`, `expire_profile_retirements` (7 → 8, 11, 13, 15); `RepublishRefusal`, `republish_host_configuration`, `host_publication::republish`, `republish_inventory` (8 → 9); `RetirementStep`, `ProfileRetirements`, `RETIREMENT_POLL`, `with_profile_retirements` (10 → 11, 13, 15); `StoreRetirements` (11 → 13, 15); `ControlRequest`, `ControlHandler`, `ControlServer`, `request`, `SOCKET_NAME` (12 → 13, 14, 15); `ProfileSet`, `HostProfiles`, `ProfileUpdates`, `PublishOutcome`, `RetireOutcome`, `run_session_with_updates`, `HostControl` (13 → 15 reply shapes); `NamedInstallation`, `EmbeddedInstallations`, `EmbeddedHost`, `StandaloneControl` (15).
+**Type consistency** (names checked across tasks): `ENGINES_FILE`, `engines_beside`, `engines_path`, `config_home`, `EnginesFile`, `lock_engines`, `write_engines`, `merge_into_host`, `revision_of`, `HostConfig::load`, `ConfigKind::Engines` (2 → 13, 14, 15); `ProfileSpec`, `profile_document`, `check_profile`, `is_verified`, `valid_profile_name`, `ENVIRONMENT_PROFILES`, `only_profiles_differ`, `added_profiles`, `removed_profiles` (3 → 8, 9, 11, 13, 14, 15); `Resolved`, `resolve`, `check_version`, `VERSION_CHECK_TIMEOUT`, `Candidate`, `ScanRoots`, `ScanBounds`, `detect` (4, 5 → 14); `LIVE_PROFILE_UPDATE`, `server_capabilities`, `MAX_REQUEST_ID`, `MAX_REASON`, `MAX_RETIREMENT_DEPLOYMENTS` (6 → 9, 10, 13); `RetirementStart`, `RetirementProgress`, `RetirementCandidate`, `begin_profile_retirement`, `profile_candidates`, `record_profile_retirement_stops`, `profile_retirement_progress`, `cancel_profile_retirement`, `profile_retirement`, `expire_profile_retirements` (7 → 8, 11, 13, 15); `RepublishRefusal`, `republish_host_configuration`, `host_publication::republish`, `republish_inventory` (8 → 9); `RetirementStep`, `ProfileRetirements`, `RETIREMENT_POLL`, `with_profile_retirements` (10 → 11, 13, 15); `StoreRetirements` (11 → 13, 15); `ControlRequest`, `ControlHandler`, `ControlServer`, `request`, `SOCKET_NAME` (12 → 13, 14, 15); `ProfileSet`, `HostProfiles`, `ProfileUpdates`, `PublishOutcome`, `RetireOutcome`, `run_session_with_updates`, `HostControl` (13 → 15 reply shapes); `RoleKind`, `Target`, `resolve_target` (14); `NamedInstallation`, `EmbeddedInstallations`, `EmbeddedHost`, `StandaloneControl` (15); `ConfigurationFailure::ProfileNotPublished`, `ExitCode::PROFILE_NOT_PUBLISHED` (17).
