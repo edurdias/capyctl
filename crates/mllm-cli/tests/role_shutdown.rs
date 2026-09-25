@@ -504,7 +504,7 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     // T33: the next start re-attaches the same engine and serves only after
     // re-proving it; nothing was relaunched.
     let role = installation.start(Some(2));
-    let status = installation.cli(&["status", "deployment", &deployment]);
+    let status = installation.cli(&["status", "deployment", &deployment, "--format", "json"]);
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     // Phase B follow-up: until the adopted engine is re-proven its dispatch is
     // closed, and status says so rather than claiming it is serving.
@@ -516,7 +516,7 @@ async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
         "{status}"
     );
     served_within(&installation, Duration::from_secs(20)).await;
-    let status = installation.cli(&["status", "deployment", &deployment]);
+    let status = installation.cli(&["status", "deployment", &deployment, "--format", "json"]);
     let status: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["observed_state"], "ready", "{status}");
     assert_eq!(
@@ -933,7 +933,7 @@ impl TwoRoles {
     fn hosts(&self, online: bool, expected: usize) -> Value {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let out = self.manage(&["list", "hosts", "--output", "json"]);
+            let out = self.manage(&["list", "hosts", "--format", "json"]);
             if out.status.success() {
                 let value: Value = serde_json::from_slice(&out.stdout).unwrap();
                 if value["hosts"].as_array().is_some_and(|hosts| {

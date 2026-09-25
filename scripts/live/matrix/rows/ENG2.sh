@@ -38,7 +38,7 @@ $(rbin "$host") start standalone --debug-engine-logs"
 
 eng2_list() { # eng2_list <host>
   local host=$1
-  rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list" | tee "$EVID/eng2-list.json"
+  rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list --format json" | tee "$EVID/eng2-list.json"
   dry && return 0
   python3 - "$EVID/eng2-list.json" <<'PY'
 import json, sys
@@ -68,8 +68,8 @@ eng2_serve() { # eng2_serve <host> <fixture> <tag> <profile> [gen_deployment arg
   variant "$fix" "$tag" --document-json "{\"runtime_profile\": \"$profile\", \"host\": null}" "$@" || return 1
   file=$(FIXTURE_VARIANT=$tag fixture_file "$fix")
   rcopy "$file" "$host:$ENG2_DIR/$dep.yaml" || return 1
-  rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR timeout 1200 $(rbin "$host") deploy model --file $ENG2_DIR/$dep.yaml --activate --wait --output json | tail -c 1500; echo; \
-MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") status deployment $dep --output json | python3 -c 'import json,sys
+  rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR timeout 1200 $(rbin "$host") deploy model --file $ENG2_DIR/$dep.yaml --activate --wait --format json | tail -c 1500; echo; \
+MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") status deployment $dep --format json | python3 -c 'import json,sys
 d=json.load(sys.stdin); d=d.get(\"deployment\",d)
 print(json.dumps({k: d.get(k) for k in (\"name\", \"observed_state\", \"conditions\")}))'"
 }
@@ -84,7 +84,7 @@ eng2_engine_reason() { # eng2_engine_reason <host>: context-length lines of the 
   rsh "$1" "grep -rhaiE 'max_model_len|max model len|model length|KV cache' $ENG2_DIR/logs 2>/dev/null | grep -viE 'key|token=|secret|bearer' | tail -n 6; true"
 }
 
-eng2_delete() { rsh "$1" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$1") delete deployment $2 --stop --output json"; }
+eng2_delete() { rsh "$1" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$1") delete deployment $2 --stop --format json"; }
 
 eng2_argv() { # eng2_argv <host>: the running vLLM api process's argv tail (no credential is on argv)
   rsh "$1" "for p in \$(pgrep -f 'vllm_entr[y]'); do tr '\\0' ' ' < /proc/\$p/cmdline | grep -o -- '--mllm-user-args.*' ; done; true"
@@ -108,7 +108,7 @@ row_main() {
   step infer-local-sglang eng2_infer "$host" sa-4-ls || rc=1
   step delete-local-sglang eng2_delete "$host" sa-4-ls || rc=1
   step add-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine add $(vllm_venv "$host")/bin/vllm --name vllm-reg" || rc=1
-  step list-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list" || rc=1
+  step list-registered rsh "$host" "MLLM_STATE_DIR=$ENG2_DIR $(rbin "$host") engine list --format json" || rc=1
   step serve-registered eng2_serve "$host" va-4 reg vllm-reg || rc=1
   step argv-registered eng2_argv "$host"
   step infer-registered eng2_infer "$host" va-4-reg || rc=1

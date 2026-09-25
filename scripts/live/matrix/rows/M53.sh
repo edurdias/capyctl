@@ -34,7 +34,7 @@ row_main() {
   step owned-a3 keep_owned "$a" end
   step start-bad refused_with startup_requires_empty_host start_dep "$db" || rc=1
   step status-bad2 status_dep "$db"
-  step delete-stop-bad timed delete-stop cli delete deployment "$db" --stop --output json || rc=1
+  step delete-stop-bad timed delete-stop cli delete deployment "$db" --stop --format json || rc=1
   step gone-bad refused status_dep "$db" || rc=1
   step stop-a stop_dep "$a"
   step stopped-a wait_state "$a" stopped 300 || rc=1

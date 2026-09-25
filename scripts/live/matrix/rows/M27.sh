@@ -91,7 +91,7 @@ switch_row() {
   fi
   step switch-log bash -c "grep -aE 'switch' '$LRD/server.log' | grep -viE 'key|secret|bearer|token' | tail -n 60"
   # Operator eviction: B again, explicitly.
-  step evict timed evict cli start deployment "$db" --evict --output json || rc=1
+  step evict timed evict cli start deployment "$db" --evict --format json || rc=1
   step evict-ready wait_state "$db" ready 1800 || rc=1
   step states-evict states
   for d in $da $db; do step "stop-$d" stop_dep "$d"; done

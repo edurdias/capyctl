@@ -16,7 +16,7 @@
 SERVER_LOG_LINE=0
 sel_mark() { SERVER_LOG_LINE=$(wc -l <"$LRD/server.log"); }
 sel_count() { local label=$1; shift
-  cli list hosts --output json >"$EVID/hosts-$label.json" 2>/dev/null || true
+  cli list hosts --format json >"$EVID/hosts-$label.json" 2>/dev/null || true
   python3 "$MATRIX_DIR/selections.py" --log "$LRD/server.log" --from-line "$SERVER_LOG_LINE" \
     --hosts-json "$EVID/hosts-$label.json" "$@" | tee "$EVID/selections-$label.json"; }
 
@@ -54,7 +54,7 @@ import json, sys
 d = json.load(open(sys.argv[1])); d["instances"] = int(sys.argv[3])
 json.dump(d, open(sys.argv[2], "w"), indent=1)
 PY
-  cli deploy model --file "$EVID/revision-$n.json" --revision "$rev" --output json
+  cli deploy model --file "$EVID/revision-$n.json" --revision "$rev" --format json
 }
 
 burst() { load --route "$1" --nonstream 24 --concurrency 12 --max-tokens 64; }
@@ -71,13 +71,13 @@ row_same() {
   step accounting-ready keep_owned "$dep" ready
   sel_mark; step burst burst "$dep" || rc=1
   step selections sel_count burst
-  step stop-1 cli stop instance "$dep/1" --output json || rc=1
+  step stop-1 cli stop instance "$dep/1" --format json || rc=1
   step one-ready ready_count "$dep" 1 300 || rc=1
   sleep 5
   step instances-after-stop instances "$dep"
   step owned-after-stop owned_by_instance "$dep" stop1
   step burst-after-stop burst "$dep" || rc=1
-  step start-1 cli start instance "$dep/1" --output json || rc=1
+  step start-1 cli start instance "$dep/1" --format json || rc=1
   step two-ready ready_count "$dep" 2 900 || rc=1
   step instances-after-start instances "$dep"
   step owned-after-start owned_by_instance "$dep" start1

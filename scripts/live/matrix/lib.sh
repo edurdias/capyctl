@@ -169,11 +169,39 @@ save_run_var() { # save_run_var NAME VALUE
   mv "$RUNSTATE/run.env.tmp" "$RUNSTATE/run.env"
 }
 
+# Machine-readable CLI output is `--format json`: without it, record views
+# (list, status, engine list/detect) print a table. A release binary from
+# before the table default (rc.4 and earlier, e.g. ENG4's rc.3 or a release
+# under validation) knows only `--output json`, which every later binary still
+# accepts, so the flag is translated for it. The probe is cached per binary.
+cli_format_probe() {
+  [ "${CLI_FORMAT_BIN:-}" = "$MLLM" ] && return 0
+  CLI_FORMAT_BIN=$MLLM
+  case "$("$MLLM" --help 2>/dev/null)" in
+    *--format*) CLI_FORMAT_FLAG=--format ;;
+    *) CLI_FORMAT_FLAG=--output ;;
+  esac
+}
+
+# The flag that selects JSON on $MLLM, for direct invocations: `"$MLLM" list
+# hosts "$(cli_format_flag)" json`.
+cli_format_flag() {
+  if dry; then echo --format; return 0; fi
+  cli_format_probe
+  echo "$CLI_FORMAT_FLAG"
+}
+
 # The CLI against the run's server. Output is the caller's to redirect.
 cli() {
-  log_cmd control-host "mllm $* --config $SERVER_CFG"
+  local args=() arg
+  dry || cli_format_probe
+  for arg in "$@"; do
+    [ "$arg" = --format ] && [ "${CLI_FORMAT_FLAG:---format}" = --output ] && arg=--output
+    args+=("$arg")
+  done
+  log_cmd control-host "mllm ${args[*]} --config $SERVER_CFG"
   dry && { echo '{}'; return 0; }
-  "$MLLM" "$@" --config "$SERVER_CFG"
+  "$MLLM" "${args[@]}" --config "$SERVER_CFG"
 }
 
 # Read the inference key into the environment only. Never echo it.

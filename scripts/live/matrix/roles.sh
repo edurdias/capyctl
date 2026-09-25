@@ -70,7 +70,7 @@ server_up() {
   local i
   for i in $(seq 1 60); do
     dry && break
-    if cli list hosts --output json >/dev/null 2>&1; then echo "server up"; return 0; fi
+    if cli list hosts --format json >/dev/null 2>&1; then echo "server up"; return 0; fi
     sleep 1
   done
   dry || die "server did not answer within 60 s (see $LRD/server.log)"
@@ -172,8 +172,8 @@ wait_online() {
   load_run
   dry || mkdir -p "$RUNSTATE"
   for i in $(seq 1 "$timeout"); do
-    if dry; then cli list hosts --output json >/dev/null; break; fi
-    cli list hosts --output json >"$RUNSTATE/hosts.json" 2>/dev/null || true
+    if dry; then cli list hosts --format json >/dev/null; break; fi
+    cli list hosts --format json >"$RUNSTATE/hosts.json" 2>/dev/null || true
     if python3 - "$RUNSTATE/hosts.json" "${MATRIX_HOSTS[@]}" <<'PY'
 import json, sys
 hosts = {h["name"]: h for h in json.load(open(sys.argv[1])).get("hosts", [])}

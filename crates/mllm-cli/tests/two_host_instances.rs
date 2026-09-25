@@ -331,7 +331,7 @@ impl Cluster {
     fn eligible_hosts(&self, expected: usize) -> Value {
         let deadline = Instant::now() + Duration::from_secs(40);
         loop {
-            let out = self.manage(&["list", "hosts", "--output", "json"]);
+            let out = self.manage(&["list", "hosts", "--format", "json"]);
             if out.status.success() {
                 let value: Value = serde_json::from_slice(&out.stdout).unwrap();
                 if value["hosts"].as_array().is_some_and(|hosts| {
@@ -416,7 +416,7 @@ impl Cluster {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let status =
-                self.manage_json(&["status", "deployment", deployment, "--output", "json"]);
+                self.manage_json(&["status", "deployment", deployment, "--format", "json"]);
             if status["ready_instances"] == json!(ready) {
                 return status;
             }
@@ -590,7 +590,7 @@ async fn two_instances_are_placed_across_two_hosts_and_managed_one_at_a_time() {
     let server = cluster.start("server", &cluster.server_state, &cluster.server_config);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !cluster
-        .manage(&["list", "hosts", "--output", "json"])
+        .manage(&["list", "hosts", "--format", "json"])
         .status
         .success()
     {
@@ -736,7 +736,7 @@ async fn two_instances_are_placed_across_two_hosts_and_managed_one_at_a_time() {
         "stop",
         "instance",
         &format!("{id}/{one}"),
-        "--output",
+        "--format",
         "json",
     ]);
     cluster.succeeded(stopped["operation_id"].as_str().unwrap());
@@ -756,7 +756,7 @@ async fn two_instances_are_placed_across_two_hosts_and_managed_one_at_a_time() {
         "start",
         "instance",
         &format!("{id}/{one}"),
-        "--output",
+        "--format",
         "json",
     ]);
     cluster.succeeded(started["operation_id"].as_str().unwrap());
@@ -809,7 +809,7 @@ async fn two_instances_are_placed_across_two_hosts_and_managed_one_at_a_time() {
     cluster.served(Duration::from_secs(10)).await;
 
     // An operator stop of the deployment stops what runs, with cleanup.
-    let stopped = cluster.manage_json(&["stop", "deployment", &id, "--output", "json"]);
+    let stopped = cluster.manage_json(&["stop", "deployment", &id, "--format", "json"]);
     cluster.succeeded(stopped["operation_id"].as_str().unwrap());
     assert!(!alive(engine_b));
     let status = cluster.ready_instances(&id, 0);
@@ -836,7 +836,7 @@ async fn two_deployments_co_reside_on_one_enrolled_host() {
     let server = cluster.start("server", &cluster.server_state, &cluster.server_config);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !cluster
-        .manage(&["list", "hosts", "--output", "json"])
+        .manage(&["list", "hosts", "--format", "json"])
         .status
         .success()
     {
@@ -874,7 +874,7 @@ async fn two_deployments_co_reside_on_one_enrolled_host() {
 
     // Each stops on its own: only its engine is proved gone.
     let engines = host_a.launches();
-    let stopped = cluster.manage_json(&["stop", "deployment", &first, "--output", "json"]);
+    let stopped = cluster.manage_json(&["stop", "deployment", &first, "--format", "json"]);
     cluster.succeeded(stopped["operation_id"].as_str().unwrap());
     assert_eq!(engines.iter().filter(|pid| alive(**pid)).count(), 1);
     assert_eq!(
@@ -883,7 +883,7 @@ async fn two_deployments_co_reside_on_one_enrolled_host() {
     );
     let (status, body) = cluster.chat_model("toy2").await;
     assert_eq!(status, 200, "{body}");
-    let stopped = cluster.manage_json(&["stop", "deployment", &second, "--output", "json"]);
+    let stopped = cluster.manage_json(&["stop", "deployment", &second, "--format", "json"]);
     cluster.succeeded(stopped["operation_id"].as_str().unwrap());
     assert!(engines.iter().all(|pid| !alive(*pid)));
 
@@ -909,7 +909,7 @@ async fn two_instances_of_one_deployment_co_reside_on_one_enrolled_host() {
     let server = cluster.start("server", &cluster.server_state, &cluster.server_config);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !cluster
-        .manage(&["list", "hosts", "--output", "json"])
+        .manage(&["list", "hosts", "--format", "json"])
         .status
         .success()
     {
@@ -950,7 +950,7 @@ async fn two_instances_of_one_deployment_co_reside_on_one_enrolled_host() {
             "stop",
             "instance",
             &format!("{id}/{index}"),
-            "--output",
+            "--format",
             "json",
         ]);
         cluster.succeeded(stopped["operation_id"].as_str().unwrap());
@@ -960,7 +960,7 @@ async fn two_instances_of_one_deployment_co_reside_on_one_enrolled_host() {
             "start",
             "instance",
             &format!("{id}/{index}"),
-            "--output",
+            "--format",
             "json",
         ]);
         cluster.succeeded(started["operation_id"].as_str().unwrap());
@@ -998,10 +998,10 @@ async fn two_instances_of_one_deployment_co_reside_on_one_enrolled_host() {
     cluster.served(Duration::from_secs(10)).await;
 
     // The deployment's stop is one operation per instance; wait for both.
-    cluster.manage_json(&["stop", "deployment", &id, "--output", "json"]);
+    cluster.manage_json(&["stop", "deployment", &id, "--format", "json"]);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let status = cluster.manage_json(&["status", "deployment", &id, "--output", "json"]);
+        let status = cluster.manage_json(&["status", "deployment", &id, "--format", "json"]);
         if status["observed_state"] == "stopped" {
             break;
         }

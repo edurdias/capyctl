@@ -56,10 +56,10 @@ Sections in order (approved in the phone-width mockup, v2):
 1. **Hero.** Heading: "A model manager for vLLM and SGLang on your own GPUs."
    Sub-line: "Park, wake and switch models on machines that can't hold them all.
    One OpenAI-compatible endpoint across every box on your network." Two buttons:
-   Install (to `/docs/install/`) and Docs. Below, a terminal block with
-   `mllm list deployments` output showing two `ready` models and one `parked`
-   model on two generic hosts. The output must match the real CLI format of the
-   release the site documents.
+   Install (to `/docs/install/`) and Docs. Below, a terminal block with the
+   `mllm list deployments` table (the CLI's default output) showing two `ready`
+   models and one `parked` model on two generic hosts. The output must match
+   the real CLI format of the release the site documents.
 2. **Why.** Heading "More models than memory". One paragraph: most home GPUs hold
    one or two models at a time; mllm parks the idle ones, releases their GPU
    memory and wakes the one a request asks for, behind the same endpoint.

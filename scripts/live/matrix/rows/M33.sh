@@ -38,4 +38,4 @@ row_main() {
   return "$rc"
 }
 
-preinit_dep() { cli preinitialize deployment "$1" --output json; }
+preinit_dep() { cli preinitialize deployment "$1" --format json; }

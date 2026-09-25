@@ -13,7 +13,7 @@ row_main() {
   step status-bad status_dep "$db"
   depid=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("deployment",d)["id"])' "$EVID/05-status-bad.out")
   step evidence-bad evidence "$db" failed
-  step delete-stop-bad timed delete-stop cli delete deployment "$db" --stop --output json || rc=1
+  step delete-stop-bad timed delete-stop cli delete deployment "$db" --stop --format json || rc=1
   step gone-bad refused status_dep "$db" || rc=1
   sleep 3
   step residue residue_check "$depid" || rc=1

@@ -337,7 +337,7 @@ impl Installation {
     }
 
     fn status(&self, deployment: &str) -> Value {
-        let out = self.cli(&["status", "deployment", deployment]);
+        let out = self.cli(&["status", "deployment", deployment, "--format", "json"]);
         serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
     }
 
@@ -589,7 +589,7 @@ impl TwoRoles {
     fn hosts(&self, expected: usize) -> Value {
         let deadline = Instant::now() + Duration::from_secs(40);
         loop {
-            let out = self.manage(&["list", "hosts", "--output", "json"]);
+            let out = self.manage(&["list", "hosts", "--format", "json"]);
             if out.status.success() {
                 let value: Value = serde_json::from_slice(&out.stdout).unwrap();
                 if value["hosts"].as_array().is_some_and(|hosts| {
@@ -650,7 +650,7 @@ impl TwoRoles {
     }
 
     fn status(&self, deployment: &str) -> Value {
-        let out = self.manage(&["status", "deployment", deployment, "--output", "json"]);
+        let out = self.manage(&["status", "deployment", deployment, "--format", "json"]);
         serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
     }
 }
@@ -696,7 +696,7 @@ async fn a_remote_engine_exit_is_reported_settled_and_relaunched_on_demand() {
     let _server = roles.start("server");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !roles
-        .manage(&["list", "hosts", "--output", "json"])
+        .manage(&["list", "hosts", "--format", "json"])
         .status
         .success()
     {

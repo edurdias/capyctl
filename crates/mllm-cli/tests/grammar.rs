@@ -254,6 +254,34 @@ fn machine_mode_output_flag() {
     assert_eq!(inv.output.as_deref(), Some("text"));
 }
 
+// Owner decision 2026-09-25: `--format table|json`, `--json` for short;
+// anything else, or both at once, is a usage error.
+#[test]
+fn format_flag_selects_table_or_json() {
+    let format = |args: &[&str]| parse_invocation(args).map(|inv| inv.format);
+    assert_eq!(format(&["mllm", "list", "hosts"]).unwrap(), None);
+    assert_eq!(
+        format(&["mllm", "list", "hosts", "--format", "json"])
+            .unwrap()
+            .as_deref(),
+        Some("json")
+    );
+    assert_eq!(
+        format(&["mllm", "--format", "table", "list", "deployments"])
+            .unwrap()
+            .as_deref(),
+        Some("table")
+    );
+    assert_eq!(
+        format(&["mllm", "engine", "list", "--json"])
+            .unwrap()
+            .as_deref(),
+        Some("json")
+    );
+    assert!(format(&["mllm", "list", "hosts", "--format", "yaml"]).is_err());
+    assert!(format(&["mllm", "list", "hosts", "--format", "table", "--json"]).is_err());
+}
+
 #[test]
 fn malformed_invocations_rejected() {
     assert!(parse(["mllm", "start"]).is_err(), "start requires a role");
