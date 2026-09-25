@@ -35,7 +35,7 @@ CONFIG = "config"
 SPECULATIVE = "speculative_config"
 SPECULATIVE_KEYS = frozenset(("method", "model", "num_speculative_tokens",
                               "draft_tensor_parallel_size", "prompt_lookup_max",
-                              "prompt_lookup_min", "draft_sample_method"))
+                              "prompt_lookup_min", "draft_sample_method", "moe_backend"))
 
 # The same shapes the deploy-time check applies to option spellings, here on
 # parsed destinations (ADR 0014 open issue 5).

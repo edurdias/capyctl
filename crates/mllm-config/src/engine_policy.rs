@@ -236,7 +236,8 @@ pub enum Sensitivity {
 }
 
 /// The `--speculative-config` keys a deployment may set. Only `model` names a
-/// path; every other key is a number or a closed word. A key outside this list
+/// path; every other key is a number or a closed word (`moe_backend` picks the
+/// draft's MoE kernels, e.g. `triton` where FlashInfer would JIT-compile). A key outside this list
 /// (a tokenizer, a revision, a quantization config) is refused.
 pub const SPECULATIVE_CONFIG_KEYS: &[&str] = &[
     "method",
@@ -246,6 +247,7 @@ pub const SPECULATIVE_CONFIG_KEYS: &[&str] = &[
     "prompt_lookup_max",
     "prompt_lookup_min",
     "draft_sample_method",
+    "moe_backend",
 ];
 
 /// Whether a `--speculative-config` value is admissible under the host's

@@ -90,6 +90,8 @@ class CheckTests(unittest.TestCase):
         policy.check("vllm", {"speculative_config": {"method": "dflash", "model": "/srv/models/d",
                                                      "num_speculative_tokens": 7}}, ok, "/srv/models/m")
         policy.check("vllm", {"speculative_config": '{"model": "/srv/models/d"}'}, ok, "/srv/models/m")
+        policy.check("vllm", {"speculative_config": {"method": "mtp", "moe_backend": "triton"}}, ok,
+                     "/srv/models/m")
         for value in ({"method": "mtp"},):
             with self.assertRaises(policy.Refused):
                 policy.check("vllm", {"speculative_config": value}, approvals(paths=["/srv/models"]),

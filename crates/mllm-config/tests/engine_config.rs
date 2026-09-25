@@ -355,6 +355,7 @@ fn speculative_config_is_admitted_key_by_key() {
         r#"{"method":"mtp","num_speculative_tokens":3}"#,
         r#"{"method":"dflash","model":"/srv/models/draft","num_speculative_tokens":7}"#,
         r#"{"model":"/srv/models/draft","num_speculative_tokens":2}"#,
+        r#"{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}"#,
     ] {
         let (deployment, mut host) =
             with_extra_args("vllm", json!(["--speculative-config", config]));
