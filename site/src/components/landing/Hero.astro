@@ -1,0 +1,13 @@
+---
+// Generated at build time by scripts/gen-hero.mjs from the CLI's table code.
+import table from '../../generated/hero-table.txt?raw';
+import { HERO_COMMAND, heroSegments } from '../../data/hero.mjs';
+const lines = heroSegments(table);
+---
+<section class="hero">
+  <h1>A model manager for vLLM and SGLang on your own GPUs.</h1>
+  <p class="lede">Park, wake and switch models on machines that can't hold them all. One OpenAI-compatible endpoint across every box on your network.</p>
+  <p class="actions"><a class="button" href="/docs/install/">Install</a><a class="button secondary" href="/docs/">Docs</a></p>
+  <pre class="terminal" tabindex="0" aria-label="Example terminal output"><code><span class="prompt">$ </span>{HERO_COMMAND}
+{lines.map((segs) => <>{segs.map((s) => s.parked ? <span class="state-parked">{s.text}</span> : s.text)}{'\n'}</>)}</code></pre>
+</section>

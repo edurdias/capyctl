@@ -1,0 +1,1 @@
+{ "hosts": [{ "host_id": "h-01", "name": "gpu-box" }, { "host_id": "h-02", "name": "workstation" }] }

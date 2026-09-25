@@ -1,0 +1,38 @@
+---
+import '../styles/tokens.css';
+import '../styles/landing.css';
+import ThemeToggle from '../components/landing/ThemeToggle.astro';
+import { REPO_URL } from '../../site.config.mjs';
+const { title, description } = Astro.props;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={new URL('/', Astro.site)} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- Website spec, Visual system: follow the system theme; same storage key
+         as Starlight so the choice carries into /docs/. Inline to avoid a flash. -->
+    <script is:inline>
+      (() => {
+        let t = null;
+        try { t = localStorage.getItem('starlight-theme'); } catch {}
+        if (t !== 'light' && t !== 'dark') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        document.documentElement.dataset.theme = t;
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="bar">
+      <a class="wordmark" href="/">mllm</a>
+      <nav aria-label="Site"><a href="/docs/">Docs</a><a href={REPO_URL}>GitHub</a><ThemeToggle /></nav>
+    </header>
+    <main><slot /></main>
+    <footer class="bar">
+      <a href={REPO_URL}>GitHub</a> · <a href="/docs/">Docs</a> · <a href={`${REPO_URL}/releases`}>Releases</a> · Apache-2.0
+    </footer>
+  </body>
+</html>

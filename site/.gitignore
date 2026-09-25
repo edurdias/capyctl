@@ -4,3 +4,4 @@ dist/
 .npm-cache/
 src/content/docs/docs/
 voice-denylist.local.txt
+src/generated/

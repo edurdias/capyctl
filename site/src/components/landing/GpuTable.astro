@@ -1,0 +1,25 @@
+---
+import { GPU_CLASSES, gpuRow } from '../../data/gpu.mjs';
+const rows = GPU_CLASSES.map((c) => ({ ...c, ...gpuRow(c.budget) }));
+---
+<section>
+  <h2>What it looks like on your GPU</h2>
+  <div class="scroll" tabindex="0" role="region" aria-label="GPU memory examples">
+  <table>
+    <thead><tr><th scope="col">Memory</th><th scope="col">Typical setup</th></tr></thead>
+    <tbody>
+      {rows.map((r) => (
+        <tr>
+          <th scope="row">{r.label}<br /><small>{r.budget} GB</small></th>
+          <td>One {r.largestBf16} model at 16-bit or one {r.largestQ4} model at 4-bit stays live{r.count8bBf16 > 1 ? `, or ${r.count8bBf16} 8B models at once` : ''}. Everything else is parked and wakes on request.</td>
+        </tr>
+      ))}
+      <tr>
+        <th scope="row">Several machines</th>
+        <td>Each machine as above. The server places each model on a machine with room and routes requests there.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">Illustrative, from model weight sizes. KV cache and engine overhead vary with context length and settings. One model runs on one GPU today. Not a list of supported cards.</p>
+</section>
