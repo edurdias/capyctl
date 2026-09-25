@@ -13,6 +13,13 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Debug, thiserror::Error)]
 #[error("host session unavailable")]
 pub struct SessionError;
+/// SPEC §4.1, ADR 0016: the controller answered, over the host's mutual-TLS
+/// control session, that this host's certificate is revoked. Reconnecting
+/// cannot heal that; only `invite host --recover` and `join host --recover`
+/// can. The host's engines are left exactly as they are.
+#[derive(Debug, thiserror::Error)]
+#[error("the controller revoked this host's certificate")]
+pub struct HostRevoked;
 fn frame(msg: agent_to_server::Msg) -> pb::AgentToServer {
     pb::AgentToServer { msg: Some(msg) }
 }
@@ -149,7 +156,7 @@ pub async fn run_session(
     journal: Arc<HostJournal>,
     inventory: pb::ReportInventory,
     shutdown: watch::Receiver<bool>,
-) -> Result<(), SessionError> {
+) -> Result<(), HostRevoked> {
     run_session_with_execution(identity, journal, inventory, shutdown, None).await
 }
 
@@ -159,12 +166,18 @@ pub async fn run_session_with_execution(
     inventory: pb::ReportInventory,
     shutdown: watch::Receiver<bool>,
     execution: Option<Arc<dyn SessionExecution>>,
-) -> Result<(), SessionError> {
+) -> Result<(), HostRevoked> {
     run_session_with_drain(identity, journal, inventory, shutdown, execution, None).await
 }
 
 /// As `run_session_with_execution`, also carrying the host's drain notice to
 /// the controller on every session (SPEC §4.3).
+///
+/// Every session end is retried with backoff (an unreachable or restarting
+/// controller, a version refusal, any generic refusal), except the one
+/// authoritative answer that this host's certificate is revoked
+/// (SPEC §4.1, ADR 0016): then the loop returns [`HostRevoked`] at once,
+/// logging nothing itself, so the role can say so once and exit.
 pub async fn run_session_with_drain(
     identity: &PendingEnrollment,
     journal: Arc<HostJournal>,
@@ -172,7 +185,7 @@ pub async fn run_session_with_drain(
     mut shutdown: watch::Receiver<bool>,
     execution: Option<Arc<dyn SessionExecution>>,
     drain: Option<Arc<DrainSignal>>,
-) -> Result<(), SessionError> {
+) -> Result<(), HostRevoked> {
     let mut delay = Duration::from_millis(250);
     loop {
         if *shutdown.borrow() {
@@ -185,8 +198,12 @@ pub async fn run_session_with_drain(
         // SPEC §13: a session end retains every claim and grants nothing. Its
         // reason is operator diagnostics only: a fixed phrase, never a command
         // payload, key or credential.
-        if let Err(reason) = ended {
-            eprintln!("host control session ended: {reason}; reconnecting");
+        match ended {
+            Ok(()) => {}
+            // SPEC §4.1, ADR 0016: nothing is stopped or signalled here; the
+            // session's fence has journaled the disconnect like any other end.
+            Err(SessionEnd::Revoked) => return Err(HostRevoked),
+            Err(reason) => eprintln!("host control session ended: {reason}; reconnecting"),
         }
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
@@ -197,15 +214,23 @@ pub async fn run_session_with_drain(
 }
 /// Why one control session ended, as a fixed phrase safe for operator logs.
 #[derive(Debug)]
-struct SessionEnd(std::borrow::Cow<'static, str>);
+enum SessionEnd {
+    /// Retried with backoff.
+    Ended(std::borrow::Cow<'static, str>),
+    /// SPEC §4.1, ADR 0016: the controller's authoritative revocation answer.
+    Revoked,
+}
 impl SessionEnd {
     fn fixed(reason: &'static str) -> Self {
-        Self(std::borrow::Cow::Borrowed(reason))
+        Self::Ended(std::borrow::Cow::Borrowed(reason))
     }
 }
 impl std::fmt::Display for SessionEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Ended(reason) => f.write_str(reason),
+            Self::Revoked => f.write_str("the controller revoked this host's certificate"),
+        }
     }
 }
 /// ADR 0017: a controller older than this host refuses the session and says
@@ -213,14 +238,22 @@ impl std::fmt::Display for SessionEnd {
 /// retrying with its backoff, so the host connects once the server is
 /// upgraded. The logged reason is the controller's fixed policy sentence
 /// (two version numbers), bounded and printable, never a payload.
+///
+/// SPEC §4.1, ADR 0016: the controller's exact revocation refusal ends the
+/// reconnect loop. It can only arrive here as the answer on this host's own
+/// control channel, which is mutual TLS against the controller CA pinned at
+/// enrollment; a look-alike or garbled refusal stays a generic one.
 fn refused_session(status: tonic::Status) -> SessionEnd {
+    if mllm_protocol::is_host_revoked_refusal(&status) {
+        return SessionEnd::Revoked;
+    }
     let message = status.message();
     if status.code() == tonic::Code::FailedPrecondition
         && message.starts_with(mllm_protocol::version::NEWER_HOST_REFUSAL)
         && message.len() <= 512
         && message.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
     {
-        return SessionEnd(std::borrow::Cow::Owned(format!(
+        return SessionEnd::Ended(std::borrow::Cow::Owned(format!(
             "the controller refused this host's version ({message}); upgrade the server first"
         )));
     }
@@ -447,8 +480,16 @@ async fn connect_once(
                 continue;
             },
             message = stream.message() => {
+                // SPEC §4.1, ADR 0016: a live session the controller closes
+                // because this host was revoked carries the same exact refusal.
                 let message = message
-                    .map_err(end("controller closed the session with an error"))?
+                    .map_err(|status| {
+                        if mllm_protocol::is_host_revoked_refusal(&status) {
+                            SessionEnd::Revoked
+                        } else {
+                            SessionEnd::fixed("controller closed the session with an error")
+                        }
+                    })?
                     .ok_or(SessionEnd::fixed("controller closed the session"))?;
                 last_heard = tokio::time::Instant::now();
                 message
@@ -591,6 +632,33 @@ mod tests {
             )),
         ] {
             assert_eq!(refused_session(other).to_string(), "controller refused the session");
+        }
+    }
+
+    // T06 (SPEC §4.1, ADR 0016): only the controller's exact revocation
+    // refusal ends the reconnect loop. A look-alike message, another status
+    // code carrying the same text, or a generic refusal stays retryable.
+    #[test]
+    fn only_the_exact_revocation_refusal_stops_reconnecting() {
+        assert!(matches!(
+            refused_session(mllm_protocol::host_revoked_refusal()),
+            SessionEnd::Revoked
+        ));
+        let revoked = mllm_protocol::HOST_REVOKED_REFUSAL;
+        for other in [
+            tonic::Status::permission_denied("host session authorization failed"),
+            tonic::Status::permission_denied(format!("{revoked} ")),
+            tonic::Status::permission_denied(format!("{revoked}:spoofed")),
+            tonic::Status::permission_denied(revoked.to_uppercase()),
+            tonic::Status::unauthenticated(revoked),
+            tonic::Status::failed_precondition(revoked),
+            tonic::Status::unavailable(revoked),
+            tonic::Status::unknown(revoked),
+        ] {
+            assert!(
+                matches!(refused_session(other.clone()), SessionEnd::Ended(_)),
+                "{other:?} stopped the reconnect loop"
+            );
         }
     }
 }

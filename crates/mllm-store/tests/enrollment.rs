@@ -376,3 +376,37 @@ fn certificates_of_hosts_revoked_before_v32_stay_revoked() {
     assert!(store.certificate_host(&old.fingerprint, 4).is_err());
     assert!(store.certificate_host(&"8".repeat(64), 4).is_ok());
 }
+
+// T06 (SPEC §4.1, ADR 0016): the controller tells a host its certificate is
+// revoked only when the store says so for that exact certificate. An active
+// certificate, an unknown fingerprint and the recovered host's new
+// certificate are not revoked; the old one stays revoked after recovery.
+#[test]
+fn certificate_revoked_names_only_revoked_certificates() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("store.sqlite3")).unwrap();
+    store
+        .create_host_invitation(&"b".repeat(64), "host-a", 100, 0)
+        .unwrap();
+    let old = store
+        .redeem_host_invitation(&request("transaction-one"), 1, |host| Ok(certificate(host)))
+        .unwrap();
+    assert!(!store.certificate_revoked(&old.fingerprint).unwrap());
+    assert!(!store.certificate_revoked(&"e".repeat(64)).unwrap());
+    assert!(store.certificate_revoked("not-a-fingerprint").is_err());
+
+    store.revoke_host("host-a").unwrap();
+    assert!(store.certificate_revoked(&old.fingerprint).unwrap());
+    assert!(!store.certificate_revoked(&"e".repeat(64)).unwrap());
+
+    store
+        .create_host_recovery_invitation(&"1".repeat(64), "host-a", 100, 2)
+        .unwrap();
+    store
+        .redeem_host_invitation(&recovery("1", "recover-one", "7"), 3, |host| {
+            Ok(certificate_with(host, "8"))
+        })
+        .unwrap();
+    assert!(store.certificate_revoked(&old.fingerprint).unwrap());
+    assert!(!store.certificate_revoked(&"8".repeat(64)).unwrap());
+}

@@ -99,3 +99,46 @@ fn a_store_from_a_newer_version_is_a_non_restartable_refusal() {
         assert!(e.message.contains("backup"), "{}", e.message);
     }
 }
+
+// T06 (SPEC §4.1, ADR 0016, owner decision 2026-09-24): a host the controller
+// revoked exits with its own code, distinct from every other one, and says
+// how to recover with the real CLI verbs. The packaged host units list this
+// code in RestartPreventExitStatus (scripts/verify-packaging.sh checks it).
+#[test]
+fn a_revoked_host_exits_with_its_own_code_and_the_recovery_commands() {
+    assert_eq!(ExitCode::HOST_REVOKED, ExitCode(14));
+    for other in [
+        ExitCode::SUCCESS,
+        ExitCode::INVALID_CONFIG,
+        ExitCode::UNAUTHORIZED,
+        ExitCode::INSUFFICIENT_RESOURCES,
+        ExitCode::UNSUPPORTED,
+        ExitCode::UNRECONCILED,
+        ExitCode::DEVICE_CONFLICT,
+        ExitCode::CATEGORY_LIMIT,
+        ExitCode::ACTIVATION_TIMEOUT,
+        ExitCode::TOPOLOGY_UNKNOWN,
+        ExitCode::NO_SAFE_ESTIMATE,
+        ExitCode::INTERNAL,
+    ] {
+        assert_ne!(other, ExitCode::HOST_REVOKED);
+    }
+    let e = mllm_cli::remote_roles::host_revoked("01HOSTID");
+    assert_eq!(e.code, mllm_cli::output::HOST_REVOKED);
+    assert_eq!(e.exit_code(), ExitCode(14));
+    assert!(!e.message.contains('\n'), "one line: {}", e.message);
+    assert!(e.message.contains("engines keep running"), "{}", e.message);
+    assert!(
+        e.message.contains("mllm invite host 01HOSTID --recover --output FILE"),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message.contains("mllm join host --join-file FILE --recover"),
+        "{}",
+        e.message
+    );
+    // The commands named in the message parse with the real grammar.
+    parse(["mllm", "invite", "host", "01HOSTID", "--recover", "--output", "FILE"]).unwrap();
+    parse(["mllm", "join", "host", "--join-file", "FILE", "--recover"]).unwrap();
+}

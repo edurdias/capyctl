@@ -236,8 +236,11 @@ async fn outbound_reconnect_fences_old_stream_and_revocation_closes_current() {
     mllm_protocol::execution::validate_result(&command, &result).unwrap();
     authority.revoke(&host).unwrap();
     eventually(|| !sessions.inspect(&host).unwrap().online).await;
-    stop.send(true).unwrap();
-    task.await.unwrap().unwrap();
+    // ADR 0016 (owner decision 2026-09-24): told its certificate is revoked,
+    // the agent stops by itself instead of reconnecting.
+    let ended = tokio::time::timeout(Duration::from_secs(15), task).await.unwrap().unwrap();
+    assert!(matches!(ended, Err(mllm_agent::session::HostRevoked)), "{ended:?}");
+    drop(stop);
     server.abort();
 }
 

@@ -99,6 +99,20 @@ for unit in "${units[@]}"; do
   problems=()
   [ "$(service_value "$unit" Type)" = simple ] || problems+=("Type is not simple")
   [ "$(service_value "$unit" Restart)" = on-failure ] || problems+=("Restart is not on-failure")
+  # Exit codes that never heal by restarting (crates/mllm-cli/src/output.rs):
+  # 2 invalid config, 3 unauthorized, 5 unsupported, and for a host, 14 (the
+  # controller revoked it; SPEC §4.1, ADR 0016).
+  prevent=" $(service_value "$unit" RestartPreventExitStatus) "
+  required=(2 3 5)
+  if [ "$role" = host ]; then
+    required+=(14)
+  fi
+  for code in "${required[@]}"; do
+    case "$prevent" in
+      *" $code "*) ;;
+      *) problems+=("RestartPreventExitStatus lacks $code") ;;
+    esac
+  done
   [ -z "$(service_value "$unit" ExecStop)" ] || problems+=("has an ExecStop (a stop must never drain)")
   start=$(service_value "$unit" ExecStart)
   case "$start" in

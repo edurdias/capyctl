@@ -90,6 +90,14 @@ The owner decided on 2026-09-24 that a revoked host recovers by re-enrolling und
   after it carries a different payload digest; the host refuses the replay as a conflict
   and the cleanup stays uncertain until the operator acts. Only a cleanup in flight across
   the upgrade can meet this.
+- A revoked host stops reconnecting (owner decision 2026-09-24). The controller answers
+  a revoked certificate's session, and closes its live one, with a typed refusal
+  (`PermissionDenied`, exactly `host_certificate_revoked`) only when the certificate
+  presented over mutual TLS is one it revoked. The host acts on that exact answer alone:
+  it logs one line naming the recovery commands and exits with code 14, which the
+  packaged host units do not restart. It stops and signals nothing, so its engines stay
+  for this recovery to re-prove. Every other session end, refusal or transport failure is
+  still retried with backoff.
 - CPU and Fake-engine tests cover this (T05, T06, T33, T34). They are not qualification;
   the live revocation row (M45) and a live recovery row remain to be run on the Sparks.
 

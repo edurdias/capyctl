@@ -44,6 +44,18 @@ fn from_newer_version(message: String) -> StructuredError {
         message,
     }
 }
+/// SPEC §4.1, ADR 0016 (owner decision 2026-09-24): the one line a host role
+/// logs when the controller answers that its certificate is revoked, before it
+/// exits with [`crate::output::ExitCode::HOST_REVOKED`] instead of retrying.
+/// Its engines are left running, owned and journaled, for recovery to re-prove.
+pub fn host_revoked(host: &str) -> StructuredError {
+    StructuredError {
+        code: crate::output::HOST_REVOKED,
+        message: format!(
+            "Host {host} is revoked; its engines keep running. To recover the same identity, run `mllm invite host {host} --recover --output FILE` on the server for a new recovery invitation, then `mllm join host --join-file FILE --recover` on this host, and start the host again"
+        ),
+    }
+}
 fn unavailable() -> StructuredError {
     StructuredError {
         code: "management_unavailable",
@@ -747,7 +759,9 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
             return Err(unavailable());
         }
         result = &mut session => {
-            result.map_err(|_| unavailable())?;
+            // SPEC §4.1, ADR 0016: a revoked host exits without draining or
+            // signalling anything; engines stay running for `join --recover`.
+            result.map_err(|_| host_revoked(&host))?;
             return Err(unavailable());
         }
         _ = signals.recv() => {}
@@ -785,7 +799,7 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         Some(ended) => ended,
         None => session.await,
     }
-    .map_err(|_| unavailable())?;
+    .map_err(|_| host_revoked(&host))?;
     Ok(json!({"role":"host","host_id":host,"stopped":true,"engines":"retained","drain":drain.to_json(),
         "dispatch_suspension":announced.as_str(),
         "drain_bound_secs":bound.as_secs(),"shutdown_ms":crate::shutdown::elapsed_ms(started)}))

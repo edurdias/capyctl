@@ -315,7 +315,7 @@ enum CliCommand {
     },
     /// Revoke an enrolled host's identity. Its control session closes at once,
     /// it can no longer reconnect, take commands or placements, and dispatch
-    /// to its engines closes. Engines it runs are not stopped and their
+    /// to its engines closes. The host role is told so and exits (code 14). Engines it runs are not stopped and their
     /// accounting is kept until an operator settles them with evidence. The
     /// host comes back only through `invite host <name|id> --recover` and
     /// `join host --recover`, under the same identity with a new certificate.
