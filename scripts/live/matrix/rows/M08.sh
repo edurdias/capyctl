@@ -116,7 +116,7 @@ engine_sockets() { # engine_sockets <host>
 status_marks() {
   dry && return 0
   status_dep va-4 >"$EVID/status-va-4.json"; status_dep sa-4 >"$EVID/status-sa-4.json"
-  cli list hosts --output json >"$EVID/hosts-marks.json"
+  cli list hosts --format json >"$EVID/hosts-marks.json"
   python3 - "$EVID/status-va-4.json" "$EVID/status-sa-4.json" <<'PY'
 import json, sys
 v = json.load(open(sys.argv[1])); s = json.load(open(sys.argv[2]))

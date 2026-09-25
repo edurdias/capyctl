@@ -66,7 +66,7 @@ optout_case() {
   step optout-host-down "$MATRIX_DIR/roles.sh" host-down "$host" || return 1
   step optout-host-up "$MATRIX_DIR/roles.sh" host-up "$host" || return 1
   step optout-online "$MATRIX_DIR/roles.sh" wait-online 180 || rc=1
-  step optout-hosts cli list hosts --output json
+  step optout-hosts cli list hosts --format json
   step optout-deep refused deploy sb-4 --activate --wait || rc=1
   step optout-deep-status status_dep sb-4
   step optout-deep-delete delete_dep sb-4

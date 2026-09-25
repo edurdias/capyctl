@@ -1,5 +1,7 @@
 //! Output plumbing: stdout carries results/IDs, stderr carries diagnostics,
-//! `--output json` selects machine mode, and stable exit codes per design §7.
+//! `--format json` (or the older `--output json`) selects machine mode, and
+//! stable exit codes per design §7. Record views print tables otherwise
+//! (see `table`).
 
 use std::fmt;
 

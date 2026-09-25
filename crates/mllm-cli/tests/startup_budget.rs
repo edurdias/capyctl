@@ -30,7 +30,7 @@ fn validate(args: &[&str]) -> (i32, Value, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
         .args(["validate", "config"])
         .args(args)
-        .args(["--output", "json"])
+        .args(["--format", "json"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -116,5 +116,49 @@ fn validate_refuses_an_impossible_startup_peak_without_a_host() {
                 || value["message"].as_str().unwrap().contains("bytes"),
             "{raw}"
         );
+    }
+}
+
+/// ADR 0014 §5 (owner decision 2026-09-25): resolution against a host shows
+/// the effective context: fitted to the KV grant from the checkpoint's
+/// configuration, or the declared value (flagged when the grant cannot hold it).
+// T14
+#[test]
+fn validate_shows_the_effective_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(models.join("toy")).unwrap();
+    // 512 KiB of bfloat16 KV per token: the 4 GiB grant holds 8192.
+    std::fs::write(
+        models.join("toy/config.json"),
+        json!({
+            "num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096,
+            "max_position_embeddings": 32768, "torch_dtype": "bfloat16",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut host = host_document(dir.path());
+    host["model_store"]["path"] = json!(models);
+    host["runtime_profiles"]["local"]["args"] = json!([]);
+    let host = write(dir.path(), "host.yaml", &host);
+    let mut doc = golden()["input"]["deployment"].clone();
+    doc["model"]["path"] = json!(models.join("toy"));
+    for (declared, expected) in [
+        (None, json!({"tokens": 8192, "source": "fitted"})),
+        (Some(2048), json!({"tokens": 2048, "source": "declared"})),
+    ] {
+        if let Some(tokens) = declared {
+            doc["engine_config"]["context_length"] = json!(tokens);
+        }
+        let deployment = write(dir.path(), "deployment.yaml", &doc);
+        let (code, value, raw) = validate(&[
+            "--file",
+            deployment.to_str().unwrap(),
+            "--host",
+            host.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{raw}");
+        assert_eq!(value["effective"]["context"], expected, "{raw}");
     }
 }

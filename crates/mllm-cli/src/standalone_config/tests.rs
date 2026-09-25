@@ -552,7 +552,9 @@ fn host_policy_from_env_is_complete() {
     );
     assert_eq!(resolved.profile.security.deep_park, DeepPark::Enabled);
     assert!(!resolved.profile.security.trust_remote_code);
-    assert_eq!(resolved.profile.args, ["--max-model-len", "4096"]);
+    // ADR 0014 §5 (owner decision 2026-09-25): no host-fixed context default;
+    // the launch fits the context to the KV grant.
+    assert!(resolved.profile.args.is_empty());
     assert_eq!(resolved.profile.executable, bin.to_string_lossy());
     assert_eq!(resolved.host.model_store, models);
     assert_eq!(

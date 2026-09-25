@@ -2149,6 +2149,44 @@ mod cleanup_evidence {
         Arc::new(move || Ok(value))
     }
 
+    /// Bindings that record which launches were reported gone.
+    #[derive(Default)]
+    pub(super) struct Recording(pub(super) std::sync::Mutex<Vec<String>>);
+
+    impl EngineBindings for Recording {
+        fn spec(
+            &self,
+            _work: &InitializeWork,
+        ) -> Result<mllm_adapters::resolve::AdapterSpec, CoordinatorError> {
+            Err(CoordinatorError::Service("no engine here".into()))
+        }
+
+        fn launch_gone(&self, incarnation: &str) {
+            self.0.lock().unwrap().push(incarnation.to_owned());
+        }
+    }
+
+    /// SPEC §8.2 / T21 (owner decision 2026-09-25): per-launch host state (the
+    /// rendezvous directory) is released only on verified gone evidence; a
+    /// launch whose absence is not proved keeps it.
+    // T21 T33
+    #[tokio::test]
+    async fn per_launch_state_is_released_only_after_the_gone_proof() {
+        let recording = Arc::new(Recording::default());
+        let cleanup = terminate_then_prove_gone(
+            mllm_testkit::ScriptedTool::proving(),
+            clock(7),
+            Duration::from_millis(1),
+            recording.clone(),
+        );
+        let gone = vec![identity(0x7FFF_FFF0, 1, &boot())];
+        assert!(cleanup(context(gone)).await.is_ok());
+        assert_eq!(*recording.0.lock().unwrap(), ["inc-1"]);
+        // No identities is a missing record, not absence: nothing is released.
+        assert!(cleanup(context(Vec::new())).await.is_err());
+        assert_eq!(recording.0.lock().unwrap().len(), 1);
+    }
+
     /// Absence of every recorded process is the only shape that yields evidence,
     /// and the evidence must carry exactly what was proven.
     #[test]
@@ -2236,6 +2274,7 @@ mod native {
                 tools.clone(),
                 Arc::new(|| Ok(1900)),
                 options.terminate_grace,
+                Arc::new(super::cleanup_evidence::Recording::default()),
             ),
             tools: Some(tools),
             settle: None,

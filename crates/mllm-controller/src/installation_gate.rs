@@ -299,6 +299,10 @@ impl EngineBindings for InstalledBindings {
         self.inner.checkpoint_verifier()
     }
 
+    fn launch_gone(&self, incarnation: &str) {
+        self.inner.launch_gone(incarnation)
+    }
+
     /// ADR 0018 §5: picked by the frozen profile's executable. One that is
     /// not registered is admitted without a drift check: unmeasured is never
     /// a refusal (ADR 0008).

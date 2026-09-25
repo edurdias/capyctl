@@ -19,7 +19,7 @@ row_main() {
   spid=$!
   sleep 6
   echo "delete_request $(now_ms)" >>"$EVID/marks.txt"
-  step delete-stop timed delete-stop cli delete deployment "$fix" --stop --output json || rc=1
+  step delete-stop timed delete-stop cli delete deployment "$fix" --stop --format json || rc=1
   echo "delete_returned $(now_ms)" >>"$EVID/marks.txt"
   wait "$spid"
   echo "stream_joined $(now_ms)" >>"$EVID/marks.txt"

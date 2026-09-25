@@ -39,7 +39,7 @@ row_main() {
   step infer-a infer "$a" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
   step delete-plain refused delete_dep "$a" || rc=1
   step after-plain wait_state "$a" ready 10 || rc=1
-  step delete-stop timed delete-stop cli delete deployment "$a" --stop --output json || rc=1
+  step delete-stop timed delete-stop cli delete deployment "$a" --stop --format json || rc=1
   sleep 3
   step cleanup-a cleanup_check_deleted "$aid" "$ha" "$EVID/owned-$a-ready.json" || rc=1
   step host-a host_idle "$ha" || rc=1
@@ -52,11 +52,11 @@ row_main() {
 
   step deploy-b deploy "$b" --activate --wait || return 1
   step owned-b keep_owned "$b" ready
-  step drain timed drain cli drain host "$hb" --wait --output json || rc=1
+  step drain timed drain cli drain host "$hb" --wait --format json || rc=1
   step drained wait_state "$b" stopped 300 || rc=1
   sleep 3
   step cleanup-b cleanup_check "$b" "$hb" "$EVID/owned-$b-ready.json" "$EVID/accounting-$b-ready.json" drained || rc=1
-  step hosts-after-drain cli list hosts --output json
+  step hosts-after-drain cli list hosts --format json
   step on-demand timed on-demand infer "$b" "What is 17+25? Answer with only the number." --expect 42 --max-tokens 1024 || rc=1
   step owned-b2 keep_owned "$b" gen2
   step stop-b stop_dep "$b" || rc=1

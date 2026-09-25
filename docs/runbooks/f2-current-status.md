@@ -4,6 +4,69 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Context fitted to the KV grant; standalone rendezvous root — 2026-09-25 (branch `fix/context-fit-standalone-rdzv`)
+
+Two owner decisions of 2026-09-25. CPU tests only; live proof on real engines
+is pending (no live run was made: the hosts were busy with a benchmark).
+
+- **Context fitted to the KV grant** (ADR 0014 §5). With no
+  `engine_config.context_length`, the shared launch builders compute the
+  largest context the KV cache grant holds from the checkpoint's `config.json`
+  (layers, KV heads, head dim; KV element width from `kv_cache_dtype`, then
+  `dtype`, then the checkpoint's, fp8 at one byte), cap it at
+  `max_position_embeddings`, round it down to a 16-token block (or
+  `vllm.block_size_tokens`) and pass it as vLLM `--max-model-len` or SGLang
+  `--context-length`, for every profile on both engines. Sliding-window and
+  hybrid layers count as full attention; MLA, missing fields, an unknown KV
+  dtype or a missing `config.json` fall back to 4096 with the reason. An
+  explicit value wins (with a warning when the grant provably cannot hold
+  it); a host-fixed `--max-model-len` in `MLLM_ENGINE_ARGS` is kept. The
+  standalone `--max-model-len 4096` environment default is removed. The fit
+  runs where the checkpoint is (embedded host or host agent) and is not part
+  of the effective configuration. `validate config` shows `effective.context`;
+  `status` shows each deployment's `context` (`declared`, `host_fixed`,
+  `fitted`, `fallback`, or `on_host` for a remote host's revision).
+- **Standalone rendezvous root** (SPEC §8.2 / T21). Standalone creates
+  `<state>/rendezvous` (0700, refused if not owned/0700, as a host) at start,
+  names each SGLang launch's rendezvous directory in it, removes it once the
+  launch's processes are proved gone, and at start sweeps directories no
+  retained binding owns (never through a symlink, never outside the root).
+  The directory name matches the host's (`rendezvous`), not `rdzv`.
+
+Live checks still owed: a vLLM and an SGLang standalone deployment with no
+`context_length` start and report the fitted value; an SGLang stop leaves no
+directory in `<state>/rendezvous` and none in `/tmp`.
+
+## Table output for record views — 2026-09-25 (branch `feat/cli-table-output`)
+
+Owner decision 2026-09-25 (recorded in SPEC §14): like the docker CLI, commands
+that read records print an aligned table by default, terminal or not: `list
+hosts`, `list deployments`, `list engines`, `status deployment` (the
+deployment, then its instances), `engine list` and `engine detect`. Upper-case
+headers, host names resolved from the host inventory (the id when a host has
+none, or the inventory cannot be read), memory in GiB, timeouts in seconds;
+nested detail stays in the JSON. An empty result prints the headers only.
+`--format json` (or `--json`) prints the JSON result byte for byte as before
+and reports errors as JSON, exactly as `--output json` did; `--output json`
+is still accepted. Mutations, `inspect`, `validate`, `prune`, `drain` and
+`revoke` print JSON as before; exit codes are unchanged.
+
+- Rendering: `crates/mllm-cli/src/table.rs` (unit tests: alignment, empty
+  results, host-name resolution and fallback, units, host states, status
+  sections, engine views). Binary tests: `management_cli` (T10: `list
+  deployments` and `status deployment` tables; `--format json`, `--json` and
+  `--output json` print identical bytes), `engine_cli` (T37: `engine detect`
+  and `engine list`), `host_recovery` (`list hosts` names a revoked host).
+- Every CLI test that parses JSON passes `--format json`.
+- Live matrix: every script passes `--format json`. `lib.sh`'s `cli` probes
+  the binary once and translates the flag to `--output json` for a release
+  from before this change (ENG4's rc.3 binaries, release validation).
+- Verified locally: workspace and core suites, clippy with warnings denied,
+  `cargo fmt --check`, `scripts/test-install.sh`, `scripts/verify-packaging.sh`,
+  harness dry-runs of M73, M08 and ENG1 to ENG4 (M54's dry-run fails the same
+  way on `main`). CPU and Fake-engine tests only; no live run, and nothing
+  here qualifies an engine recipe.
+
 ## Engine registration — 2026-09-25 (branch `feat/engine-registration`)
 
 ADR 0018 (amends SPEC §4.2, §15.1): `mllm engine detect|add|list|remove` and

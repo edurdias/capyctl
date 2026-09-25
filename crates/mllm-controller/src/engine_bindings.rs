@@ -27,6 +27,10 @@ pub struct ProfileBindings {
     /// SPEC §9.2 (W5): the saver observation source a memory-saver SGLang
     /// launch is parked and restored on. Without one its Park is refused.
     saver: Option<std::sync::Arc<dyn mllm_agent::native_execution::SaverResidency>>,
+    /// SPEC §8.2 / T21 (owner decision 2026-09-25): the private root SGLang
+    /// launches keep their file rendezvous in, as on a host. Without one the
+    /// entry falls back to its own temporary directory.
+    rendezvous: Option<mllm_agent::rendezvous::RendezvousRoot>,
 }
 
 impl ProfileBindings {
@@ -45,7 +49,16 @@ impl ProfileBindings {
                 mllm_agent::checkpoint::CheckpointVerifier::in_memory(),
             ),
             saver: None,
+            rendezvous: None,
         }
+    }
+
+    /// SPEC §8.2 / T21 (owner decision 2026-09-25): SGLang launches keep their
+    /// rendezvous in `<dir>/<incarnation>` (the role creates `dir` 0700), and
+    /// each launch's directory is removed once its group is proved gone.
+    pub fn with_rendezvous_root(mut self, dir: PathBuf) -> Self {
+        self.rendezvous = Some(mllm_agent::rendezvous::RendezvousRoot::new(dir));
+        self
     }
 
     /// SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
@@ -113,6 +126,15 @@ impl ProfileBindings {
 }
 
 impl EngineBindings for ProfileBindings {
+    /// SPEC §8.2 / T21: a signalled stop never runs the entry's exit handler,
+    /// so the gone launch's rendezvous directory is removed here, on the same
+    /// verified cleanup evidence a host removes it on.
+    fn launch_gone(&self, incarnation: &str) {
+        if let Some(root) = &self.rendezvous {
+            root.retire(incarnation);
+        }
+    }
+
     fn checkpoint_verifier(
         &self,
     ) -> Option<std::sync::Arc<mllm_agent::checkpoint::CheckpointVerifier>> {
@@ -231,6 +253,13 @@ impl EngineBindings for ProfileBindings {
                         &effective.profile.security.approved_paths,
                         effective.profile.security.trust_remote_code,
                     )),
+                    // SPEC §8.2 / T21: the launch's rendezvous directory in
+                    // the private root, never the entry's `/tmp` fallback
+                    // while the root is private.
+                    rendezvous: self
+                        .rendezvous
+                        .as_ref()
+                        .and_then(|root| root.launch_dir(work.incarnation())),
                 })
             }
         }

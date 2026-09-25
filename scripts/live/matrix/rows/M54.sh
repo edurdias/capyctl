@@ -30,7 +30,7 @@ SERVER_LOG_LINE=0
 sel_mark() { SERVER_LOG_LINE=$(wc -l <"$LRD/server.log"); echo "server.log line $SERVER_LOG_LINE"; }
 sel_count() { # sel_count <label> [selections.py args]
   local label=$1; shift
-  cli list hosts --output json >"$EVID/hosts-$label.json" 2>/dev/null || true
+  cli list hosts --format json >"$EVID/hosts-$label.json" 2>/dev/null || true
   python3 "$MATRIX_DIR/selections.py" --log "$LRD/server.log" --from-line "$SERVER_LOG_LINE" \
     --hosts-json "$EVID/hosts-$label.json" "$@" | tee "$EVID/selections-$label.json"
 }
@@ -67,7 +67,7 @@ host_poll_start() {
   rm -f "$HOSTPOLL_STOP"
   (while [ ! -f "$HOSTPOLL_STOP" ]; do
      printf '%s ' "$(now_ms)"
-     "$MLLM" list hosts --output json --config "$SERVER_CFG" 2>/dev/null | python3 -c 'import json,sys
+     "$MLLM" list hosts "$(cli_format_flag)" json --config "$SERVER_CFG" 2>/dev/null | python3 -c 'import json,sys
 try:
     hs=json.load(sys.stdin).get("hosts",[])
     print(json.dumps({h["name"]:{k:h.get(k) for k in ("online","eligible","state","responsive","suspended","unresponsive","session")} for h in hs}, separators=(",",":")))
@@ -93,14 +93,14 @@ m57_block() { # m57_block <dep>: the M57 skew and steering check
   # (long prompt, long output) all land on instance 0, instance 1 is started
   # again, and only then do the short requests arrive: they should lean to the
   # host holding none of the long work.
-  step m57-stop-1 cli stop instance "$dep/1" --output json || rc=1
+  step m57-stop-1 cli stop instance "$dep/1" --format json || rc=1
   step m57-one-ready n_ready "$dep" 1 600 || rc=1
   sel_mark
   bg_load m57-long --long 8 --long-tokens 4000 --long-max-tokens "${M57_LONG_MAX_TOKENS:-2500}" --long-ignore-eos --skew-delay 0 --concurrency 8
   M57_LONG=$BG_LOAD
   sleep 20
   step m57-long-selections sel_count m57-long
-  step m57-start-1 cli start instance "$dep/1" --output json || rc=1
+  step m57-start-1 cli start instance "$dep/1" --format json || rc=1
   step m57-both-ready both_ready "$dep" 900 || rc=1
   sleep 3
   step m57-status status_dep "$dep"

@@ -46,7 +46,7 @@ that calibration. Warmup requests are never part of the measured statistics.
 
 mllm-level timings (owner decision 2026-09-23): the server's latency view
 (`GET /management/v1/metrics/latency`, also embedded as `latency` in
-`mllm status deployment --output json`) holds bucketed distributions per
+`mllm status deployment --format json`) holds bucketed distributions per
 instance: router phases (tier router), host ingress times (tier ingress) and the
 engine's own histograms (tier engine, `source: engine`) for both engines. The row
 saves that view before and after each cell through the CLI; `latencydelta`

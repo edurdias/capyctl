@@ -8,8 +8,8 @@ row_main() {
   step variant-b variant "$b" r55 --route qwen3-14b || return 1
   FIXTURE_VARIANT=r55 step deploy-a deploy "$a" || return 1
   FIXTURE_VARIANT=r55 step deploy-b-refused refused deploy "$b" || rc=1
-  step list cli list deployments --output json
+  step list cli list deployments --format json
   step delete-a delete_dep "$a-r55" || rc=1
-  cli status deployment "$b-r55" --output json >/dev/null 2>&1 && { step delete-b delete_dep "$b-r55"; rc=1; }
+  cli status deployment "$b-r55" --format json >/dev/null 2>&1 && { step delete-b delete_dep "$b-r55"; rc=1; }
   return "$rc"
 }
