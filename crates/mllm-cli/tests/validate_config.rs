@@ -340,8 +340,8 @@ fn examples() -> PathBuf {
 }
 
 // T03: every documented example is a document the product accepts, through
-// the same parsers `mllm validate config` runs, and every deployment example
-// also resolves against the host example.
+// the same parsers `mllm validate config` runs, and every server-mode
+// deployment example also resolves against the host example.
 #[test]
 fn every_documented_example_passes_validate_config() {
     let mut files: Vec<PathBuf> = std::fs::read_dir(examples())
@@ -356,7 +356,13 @@ fn every_documented_example_passes_validate_config() {
         assert_eq!(code, 0, "{}: {raw}", file.display());
         assert_eq!(value["valid"], true, "{}: {raw}", file.display());
         let kind = value["kind"].as_str().unwrap().to_owned();
-        if kind == "deployment" {
+        // The quickstart's standalone deployment names standalone's `local`
+        // engine, which host.yaml does not publish; `site_quickstart.rs`
+        // places it on a fresh standalone instead.
+        let standalone = file
+            .file_name()
+            .is_some_and(|n| n == "deployment-standalone.yaml");
+        if kind == "deployment" && !standalone {
             let host = examples().join("host.yaml");
             let (code, value, raw) = validate(&[
                 "--file",

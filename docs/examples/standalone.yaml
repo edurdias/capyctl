@@ -3,7 +3,7 @@
 # this shape under its state directory when none exists; the engine
 # installation comes from the environment (MLLM_VLLM_BIN or MLLM_SGLANG_BIN,
 # MLLM_MODELS_ROOT, ...), not from this file. The listeners serve plain HTTP
-# on loopback, so there is no `tls` block (SPEC §16.5).
+# on loopback, so there is no `tls` block.
 # Parsed by the product: `mllm validate config --file docs/examples/standalone.yaml`.
 schema_version: 1
 kind: standalone

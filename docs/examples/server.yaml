@@ -8,7 +8,7 @@ state_dir: /var/lib/mllm/server
 # Must be `<state_dir>/identity`.
 identity_dir: /var/lib/mllm/server/identity
 listeners:
-  # Management and inference stay on loopback (SPEC §16.5).
+  # Management and inference stay on loopback.
   management:
     bind: "127.0.0.1:7443"
     authentication: token
