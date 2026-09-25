@@ -48,8 +48,8 @@ private for now, so use a logged-in `gh` (`gh auth login`) or set
 release" skips, so always pass `--version`:
 
 ```bash
-gh release download v0.1.0-rc.3 -R edurdias/mllm -p install.sh
-sh install.sh --version v0.1.0-rc.3         # installs ~/.local/bin/mllm
+gh release download v0.1.0-rc.4 -R edurdias/mllm -p install.sh
+sh install.sh --version v0.1.0-rc.4         # installs ~/.local/bin/mllm
 # sudo sh install.sh --system ...           # /usr/local/bin/mllm
 # add --systemd <server|host|standalone> to install that role's unit
 ```
