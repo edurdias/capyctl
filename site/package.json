@@ -1,0 +1,21 @@
+{
+  "name": "mllm-site",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "sync": "node scripts/sync-docs.mjs",
+    "gen:cli": "node scripts/gen-cli.mjs",
+    "build": "npm run sync && npm run gen:cli && astro build",
+    "dev": "npm run sync && npm run gen:cli && astro dev",
+    "preview": "astro preview",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.4",
+    "astro": "7.3.5",
+    "starlight-links-validator": "0.26.0"
+  }
+}
