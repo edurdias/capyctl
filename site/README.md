@@ -6,11 +6,14 @@ here; see `.nvmrc`. Building also needs the Rust toolchain, because the CLI
 reference and the landing page's terminal output are generated from the CLI.
 
 ```bash
+cargo fetch --locked # once: the generators run cargo offline
 npm ci
 npm run dev          # local preview with live reload
-npm run check        # tests, build with link validation, size and voice checks
+npm run check        # tests, build, link, hero, size and voice checks
 CHROME_PATH=/path/to/chrome npm run lighthouse   # after a build
 ```
+
+Astro's telemetry is turned off in every script.
 
 ## Where the content comes from
 
@@ -27,12 +30,21 @@ CHROME_PATH=/path/to/chrome npm run lighthouse   # after a build
 
 ## Settings
 
-- `MLLM_REPO_URL`: the public repository, for links and the installer. The
-  default is a placeholder; set it for any build that will be published.
-- `MLLM_INSTALL_PUBLIC=1`: show the `curl | sh` installer once releases are public.
-- `MLLM_SITE_URL`: the site's own URL, for canonical links and the sitemap.
+The site is published to GitHub Pages by `.github/workflows/site.yml` on every
+push to `main`. Each URL is a build setting whose default is the production
+value (`scripts/lib/settings.mjs`):
+
+- `MLLM_SITE_URL`: where the site is served; its path is the base path every
+  link is built under.
+- `MLLM_INSTALL_URL`: the installer the install command runs. The build copies
+  `packaging/install.sh` to `<MLLM_SITE_URL>/install.sh`.
+- `MLLM_REPO_URL`: the repository, for links. The installer's own default
+  repository must match it.
+- `MLLM_PUBLISH=1`: a publish build. It fails when a setting is empty or a
+  placeholder, or when the installer downloads from another repository. Any
+  other build with such a value shows a preview banner on every page.
 - `voice-denylist.local.txt` (not committed): names that must never appear on
-  the site, one per line.
+  the site, one per line. The configured URLs are exempt.
 
 ## Before launch
 
@@ -40,5 +52,5 @@ CHROME_PATH=/path/to/chrome npm run lighthouse   # after a build
   current models and update `tests/gpu.test.mjs` on purpose.
 - Run every command on the landing page and in the quickstart against the
   release the site documents.
-- Settle the open decisions in the website spec: domain and hosting, the
-  installer one-liner, a community link, a logo.
+- Settle the remaining open decisions in the website spec: a community link
+  and a logo.

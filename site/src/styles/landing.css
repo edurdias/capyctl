@@ -31,5 +31,9 @@ h2 { font-size: 1.375rem; margin: 0 0 12px; }
 .hosts { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); width: 100%; }
 figcaption { margin-top: 12px; color: var(--mllm-muted); }
 .scroll { overflow-x: auto; }
+.preview { margin: 0; padding: 8px 16px; text-align: center; background: var(--mllm-surface); color: var(--mllm-text); border-bottom: 1px solid var(--mllm-accent); }
+/* Review item 6: the real table is 69 columns; it scrolls inside its box and
+   its text is never changed, but a smaller size shows more of it on a phone. */
+@media (max-width: 480px) { .terminal { font-size: 12px; } }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; vertical-align: top; padding: 8px; border-top: 1px solid var(--mllm-rule); }

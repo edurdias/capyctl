@@ -5,3 +5,4 @@ dist/
 src/content/docs/docs/
 voice-denylist.local.txt
 src/generated/
+public/install.sh

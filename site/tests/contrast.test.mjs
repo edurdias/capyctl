@@ -21,3 +21,11 @@ for (const [name, vars] of Object.entries(themes(css))) {
     assert.ok(ratio(vars.accent, vars.bg) >= 3);
   });
 }
+
+test('without JavaScript, the light system setting gets the same light tokens', () => {
+  const light = themes(css).light;
+  const start = css.indexOf('@media (prefers-color-scheme: light)');
+  assert.ok(start >= 0);
+  const fallback = Object.fromEntries([...css.slice(start, css.indexOf('}', start)).matchAll(/--mllm-([a-z-]+):\s*(#[0-9a-f]{6})/gi)].map((m) => [m[1], m[2].toLowerCase()]));
+  assert.deepEqual(fallback, light);
+});

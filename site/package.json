@@ -8,12 +8,12 @@
   "scripts": {
     "sync": "node scripts/sync-docs.mjs",
     "gen:cli": "node scripts/gen-cli.mjs",
-    "build": "npm run sync && npm run gen:cli && npm run gen:hero && astro build",
-    "dev": "npm run sync && npm run gen:cli && npm run gen:hero && astro dev",
-    "preview": "astro preview",
+    "build": "npm run sync && npm run gen:cli && npm run gen:hero && ASTRO_TELEMETRY_DISABLED=1 astro build",
+    "dev": "npm run sync && npm run gen:cli && npm run gen:hero && ASTRO_TELEMETRY_DISABLED=1 astro dev",
+    "preview": "ASTRO_TELEMETRY_DISABLED=1 astro preview",
     "test": "node --test tests/",
     "gen:hero": "node scripts/gen-hero.mjs",
-    "check": "npm test && npm run build && node scripts/check-size.mjs && node scripts/check-voice.mjs",
+    "check": "npm test && npm run build && node scripts/check-links.mjs && node scripts/check-hero.mjs && node scripts/check-size.mjs && node scripts/check-voice.mjs",
     "lighthouse": "node scripts/lighthouse.mjs"
   },
   "dependencies": {

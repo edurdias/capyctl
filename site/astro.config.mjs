@@ -1,12 +1,13 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
-import { REPO_URL } from './site.config.mjs';
+import { BASE, REPO_URL, SITE_ORIGIN } from './site.config.mjs';
 
 export default defineConfig({
-  // Hosting is undecided (website spec, Open decisions 1); `site` only feeds
-  // canonical URLs and the sitemap. Override with MLLM_SITE_URL.
-  site: process.env.MLLM_SITE_URL ?? 'https://mllm.invalid',
+  // Website spec, Open decisions 1: MLLM_SITE_URL (scripts/lib/settings.mjs),
+  // split into the origin and the path GitHub Pages serves the site under.
+  site: SITE_ORIGIN,
+  base: BASE || '/',
   // Website spec, Technical approach: the landing page ships no client-side
   // JavaScript except the theme toggle, so no link prefetching script.
   prefetch: false,
@@ -19,8 +20,8 @@ export default defineConfig({
       expressiveCode: { themes: ['github-dark'] },
       customCss: ['./src/styles/tokens.css'],
       sidebar: [
-        { label: 'Start', items: ['docs', 'docs/install', 'docs/quickstart', 'docs/concepts', 'docs/multiple-machines'] },
-        { label: 'Reference', items: ['docs/reference/configuration', 'docs/reference/cli', 'docs/reference/errors'] },
+        { label: 'Guide', items: ['docs', 'docs/install', 'docs/quickstart', 'docs/several-machines'] },
+        { label: 'Reference', items: ['docs/reference/cli', 'docs/reference/configuration', 'docs/reference/installer', 'docs/reference/errors'] },
       ],
       // Website spec, Quality checks: no broken internal links.
       plugins: [starlightLinksValidator()],

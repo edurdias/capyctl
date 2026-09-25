@@ -2,8 +2,10 @@
 import '../styles/tokens.css';
 import '../styles/landing.css';
 import ThemeToggle from '../components/landing/ThemeToggle.astro';
-import { REPO_URL } from '../../site.config.mjs';
+import { PREVIEW, PREVIEW_NOTE, REPO_URL, SITE_URL, href } from '../../site.config.mjs';
 const { title, description } = Astro.props;
+// Website spec, Visual system: follow the system theme; same storage key as
+// Starlight so the choice carries into /docs/. Inline to avoid a flash.
 ---
 <!doctype html>
 <html lang="en">
@@ -12,10 +14,8 @@ const { title, description } = Astro.props;
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{title}</title>
     <meta name="description" content={description} />
-    <link rel="canonical" href={new URL('/', Astro.site)} />
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <!-- Website spec, Visual system: follow the system theme; same storage key
-         as Starlight so the choice carries into /docs/. Inline to avoid a flash. -->
+    <link rel="canonical" href={`${SITE_URL}/`} />
+    <link rel="icon" href={href('/favicon.svg')} type="image/svg+xml" />
     <script is:inline>
       (() => {
         let t = null;
@@ -26,13 +26,14 @@ const { title, description } = Astro.props;
     </script>
   </head>
   <body>
+    {PREVIEW && <p class="preview" role="note">{PREVIEW_NOTE}</p>}
     <header class="bar">
-      <a class="wordmark" href="/">mllm</a>
-      <nav aria-label="Site"><a href="/docs/">Docs</a><a href={REPO_URL}>GitHub</a><ThemeToggle /></nav>
+      <a class="wordmark" href={href('/')}>mllm</a>
+      <nav aria-label="Site"><a href={href('/docs/')}>Docs</a><a href={REPO_URL}>GitHub</a><ThemeToggle /></nav>
     </header>
     <main><slot /></main>
     <footer class="bar">
-      <a href={REPO_URL}>GitHub</a> · <a href="/docs/">Docs</a> · <a href={`${REPO_URL}/releases`}>Releases</a> · Apache-2.0
+      <a href={REPO_URL}>GitHub</a> · <a href={href('/docs/')}>Docs</a> · <a href={`${REPO_URL}/releases`}>Releases</a> · Apache-2.0
     </footer>
   </body>
 </html>

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { rewriteLink, expandIncludes, toStarlight } from '../scripts/lib/sync.mjs';
+import { rewriteLink, expandIncludes, toStarlight, substitute } from '../scripts/lib/sync.mjs';
 
 const REPO = 'https://github.com/example/mllm';
 const PAGES = [
@@ -21,7 +21,7 @@ test('link to a repository file that is not a page goes to GitHub', () => {
 });
 
 test('external, absolute-site and hash-only links are unchanged', () => {
-  for (const href of ['https://example.org/x', 'mailto:a@b.c', '#layout', '/docs/install/']) {
+  for (const href of ['https://example.org/x', 'mailto:a@b.c', '#layout', '/docs/install/']) { // no base path
     assert.equal(rewriteLink(href, 'docs/guide/quickstart.md', PAGES, REPO), href);
   }
 });
@@ -56,6 +56,28 @@ test('every docs/examples file is embedded verbatim on the configuration page', 
   const page = { source: 'docs/guide/configuration.md', slug: 'docs/reference/configuration', title: 'Configuration' };
   const out = toStarlight(read(page.source), page, [page], REPO, read);
   const files = readdirSync(new URL('docs/examples/', root)).filter((f) => f.endsWith('.yaml'));
-  assert.equal(files.length, 5);
+  assert.equal(files.length, 6);
   for (const f of files) assert.ok(out.includes(read(`docs/examples/${f}`)), f);
+});
+
+test('a link to a directory goes to its tree', () => {
+  assert.equal(rewriteLink('../examples/', 'docs/guide/configuration.md', PAGES, REPO), `${REPO}/tree/main/docs/examples/`);
+});
+
+const SETTINGS = { installUrl: 'https://get.example.net/install.sh', installCommand: 'curl -fsSL https://get.example.net/install.sh | sh -s -- --version v1.0.0-rc.1', version: '1.0.0-rc.1', defaultInstallUrl: 'https://h.test/install.sh' };
+
+test('the main install line becomes the exact install command; other lines get the URL and version', () => {
+  const md = 'Run\n\n```bash\ncurl -fsSL https://h.test/install.sh | sh\ncurl -fsSL https://h.test/install.sh | sh -s -- --uninstall\n```\n\nVersion `v<version>`.\n';
+  assert.equal(substitute(md, SETTINGS), 'Run\n\n```bash\n' + SETTINGS.installCommand + '\ncurl -fsSL https://get.example.net/install.sh | sh -s -- --uninstall\n```\n\nVersion `v1.0.0-rc.1`.\n');
+});
+
+test('a preview build puts a banner on every synced page', () => {
+  const out = toStarlight('# T\n\nBody\n', PAGES[2], PAGES, REPO, () => '', { settings: SETTINGS, banner: 'Preview' });
+  assert.match(out, /^---\ntitle: "T"\nbanner:\n  content: "Preview"\n---\n/);
+});
+
+test('links to pages and site paths get the base path', () => {
+  assert.equal(rewriteLink('quickstart.md', 'docs/guide/index.md', PAGES, REPO, '/mllm'), '/mllm/docs/quickstart/');
+  assert.equal(rewriteLink('/docs/reference/cli/', 'docs/guide/index.md', PAGES, REPO, '/mllm'), '/mllm/docs/reference/cli/');
+  assert.equal(rewriteLink('../examples/host.yaml', 'docs/guide/index.md', PAGES, REPO, '/mllm'), `${REPO}/blob/main/docs/examples/host.yaml`);
 });

@@ -1,15 +1,12 @@
 ---
-import { RELEASE_VERSION, REPO_SLUG, INSTALL_PUBLIC } from '../../../site.config.mjs';
-const v = `v${RELEASE_VERSION}`;
-// Website spec, Open decisions 2: `curl | sh` only once releases are public.
-const installer = INSTALL_PUBLIC
-  ? `curl -fsSL https://github.com/${REPO_SLUG}/releases/download/${v}/install.sh | sh -s -- --version ${v}`
-  : `gh release download ${v} -R ${REPO_SLUG} -p install.sh && sh install.sh --version ${v}`;
+// Website spec, Landing page 6 and Open decisions 2: one install command,
+// from the MLLM_INSTALL_URL build setting (scripts/lib/settings.mjs).
+import { INSTALL_COMMAND, href } from '../../../site.config.mjs';
 ---
 <section>
   <h2>Install</h2>
-  <pre class="terminal" tabindex="0"><code><span class="prompt">$ </span>{installer}
+  <pre class="terminal" tabindex="0"><code><span class="prompt">$ </span>{INSTALL_COMMAND}
 <span class="prompt">$ </span>mllm start standalone
 <span class="prompt">$ </span>mllm deploy model --file deployment.yaml --activate</code></pre>
-  <p>One static binary. Bring your own engine and weights. <a href="/docs/quickstart/">Quickstart</a></p>
+  <p>One static binary. Bring your own engine and weights. <a href={href('/docs/quickstart/')}>Quickstart</a></p>
 </section>

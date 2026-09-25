@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const data = join(repo, 'site', 'src', 'data');
-const table = execFileSync('cargo', ['run', '--quiet', '--locked', '-p', 'mllm-cli', '--example', 'hero_table', '--',
+const table = execFileSync('cargo', ['run', '--quiet', '--locked', '--offline', '-p', 'mllm-cli', '--example', 'hero_table', '--',
   join(data, 'hero-deployments.json'), join(data, 'hero-hosts.json')], {
   cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
 });

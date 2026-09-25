@@ -6,14 +6,18 @@ const INCLUDE = /^<!-- include: (\S+) -->$/;
 const FENCE = /^(`{3,}|~{3,})/;
 const LINK = /\]\(([^)\s]+)\)/g;
 
-export function rewriteLink(href, sourcePath, pages, repoUrl) {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('#') || href.startsWith('/')) return href;
+export function rewriteLink(href, sourcePath, pages, repoUrl, base = '') {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('#')) return href;
+  // A site path written in a doc (`/docs/reference/cli/`) is under the base path.
+  if (href.startsWith('/')) return `${base}${href}`;
   const [target, hash] = href.split('#');
   const resolved = path.normalize(path.join(path.dirname(sourcePath), target));
   const suffix = hash ? `#${hash}` : '';
   const page = pages.find((p) => p.source === resolved);
-  if (page) return `/${page.slug}/${suffix}`;
-  return `${repoUrl}/blob/main/${resolved}${suffix}`;
+  if (page) return `${base}/${page.slug}/${suffix}`;
+  // A directory is a tree on GitHub, a file a blob.
+  const kind = target.endsWith('/') ? 'tree' : 'blob';
+  return `${repoUrl}/${kind}/main/${resolved}${suffix}`;
 }
 
 export function expandIncludes(md, sourcePath, read) {
@@ -45,8 +49,25 @@ function rewriteOutsideFences(md, fn) {
   }).join('\n');
 }
 
-export function toStarlight(md, page, pages, repoUrl, read) {
-  let body = md;
+// The docs name the production install URL and `<version>`; the site shows
+// the configured values. The main install line becomes the site's exact
+// install command.
+export function substitute(md, { installUrl, installCommand, version, defaultInstallUrl }) {
+  const main = `curl -fsSL ${defaultInstallUrl} | sh`;
+  let open = null;
+  return md.split('\n').map((line) => {
+    const f = line.match(FENCE);
+    if (f) {
+      if (!open) open = f[1];
+      else if (line.startsWith(open) && line.trim() === open) open = null;
+    }
+    if (open && line.trim() === main) return line.replace(main, installCommand);
+    return line.replaceAll(defaultInstallUrl, installUrl).replaceAll('<version>', version);
+  }).join('\n');
+}
+
+export function toStarlight(md, page, pages, repoUrl, read, { settings, banner, base = '' } = {}) {
+  let body = settings ? substitute(md, settings) : md;
   let title = page.title;
   const h1 = body.match(/^# (.+)\n+/);
   if (h1) {
@@ -54,7 +75,9 @@ export function toStarlight(md, page, pages, repoUrl, read) {
     body = body.slice(h1[0].length);
   }
   if (!title) throw new Error(`${page.source}: no title and no H1`);
-  body = rewriteOutsideFences(body, (href) => rewriteLink(href, page.source, pages, repoUrl));
+  body = rewriteOutsideFences(body, (href) => rewriteLink(href, page.source, pages, repoUrl, base));
   body = expandIncludes(body, page.source, read);
-  return `---\ntitle: ${JSON.stringify(title)}\n---\n\n${body}`;
+  const head = [`title: ${JSON.stringify(title)}`];
+  if (banner) head.push('banner:', `  content: ${JSON.stringify(banner)}`);
+  return `---\n${head.join('\n')}\n---\n\n${body}`;
 }
