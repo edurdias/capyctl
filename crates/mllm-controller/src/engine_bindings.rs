@@ -218,6 +218,9 @@ impl EngineBindings for ProfileBindings {
                     // cannot sleep, wake or reload the engine. The remote host
                     // agent keys its vLLM launches the same way.
                     admin_key: Some(hex::encode(mllm_store::secrets::new_engine_key())),
+                    // ADR 0010, discrete GPU design §5: `host_backed` parks at
+                    // sleep level 1, fixed by the frozen residency.
+                    residency: effective.residency,
                 })
             }
             Engine::Sglang => {

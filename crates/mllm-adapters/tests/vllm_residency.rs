@@ -1,7 +1,9 @@
-//! SPEC §9.1 deep park for vLLM as persisted steps (T16, T20, T21).
+//! SPEC §9.1 deep park for vLLM as persisted steps (T16, T20, T21), and the
+//! discrete GPU design §5 host-backed park at sleep level 1.
 //!
 //! A local axum engine models vLLM's development-mode residency surface: a
-//! level-2 sleep that drops weights and KV, separate weight and KV wakes, a
+//! level-2 sleep that drops weights and KV, a level-1 sleep that keeps the
+//! weights in host RAM, separate weight and KV wakes, a
 //! `reload_weights` collective, a prefix-cache reset, `/is_sleeping`, and the
 //! running and waiting gauges on `/metrics`. Every route is keyed, as mllm's
 //! guard keys them. Nothing here qualifies a native vLLM recipe: it proves the
@@ -23,6 +25,7 @@ use mllm_adapters::traits::{
 };
 use mllm_adapters::vllm::VllmAdapter;
 use mllm_adapters::ParkPolicy;
+use mllm_config::effective::Residency;
 use mllm_domain::completion::{
     ExecutionIdentities, Milestone, ProcessIdentity, StepExecutionContext, TransitionToken,
 };
@@ -71,7 +74,9 @@ async fn sleep(
     let mut e = engine.lock().unwrap();
     e.sleeping = true;
     e.weights_awake = false;
-    e.weights_loaded = false;
+    // Level 1 offloads the weights to host RAM; the weights wake copies them
+    // back, so they stay loaded. Level 2 discards them.
+    e.weights_loaded = q.get("level").map(String::as_str) == Some("1");
     e.kv_awake = false;
     StatusCode::OK.into_response()
 }
@@ -490,4 +495,103 @@ async fn a_readiness_probe_proves_the_woken_model_usable() {
         engine.lock().unwrap().calls.last().map(String::as_str),
         Some("chat")
     );
+}
+
+/// Discrete GPU design §5 (ADR 0010): a `host_backed` deployment parks at
+/// sleep level 1, and its restoration wakes the weights from host RAM without
+/// a `reload_weights` collective. The persisted step sequence is unchanged:
+/// the reload step answers `WeightsUsable` with no engine call.
+// T20 T16
+#[tokio::test]
+async fn host_backed_parks_at_level_one_and_never_reloads() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Enabled).with_residency(Residency::HostBacked);
+    let parked = vllm
+        .execute_persisted(&step(RuntimeAction::Park, "p"))
+        .await
+        .unwrap();
+    assert_eq!(parked.facts, vec![Milestone::MemoryReleased]);
+    assert_eq!(engine.lock().unwrap().calls, ["sleep:1"]);
+    engine.lock().unwrap().calls.clear();
+    let mut facts = Vec::new();
+    for (action, id) in [
+        (RuntimeAction::Restore, "w"),
+        (RuntimeAction::ReloadWeights, "r"),
+        (RuntimeAction::InvalidateCache, "c"),
+        (RuntimeAction::Probe, "probe"),
+    ] {
+        facts.extend(
+            vllm.execute_persisted(&step(action, id))
+                .await
+                .unwrap()
+                .facts,
+        );
+    }
+    assert_eq!(
+        facts,
+        vec![
+            Milestone::AllocationsRestored,
+            Milestone::WeightsUsable,
+            Milestone::CacheValid,
+            Milestone::ModelUsable
+        ]
+    );
+    let e = engine.lock().unwrap();
+    assert_eq!(
+        e.calls,
+        [
+            "wake:weights",
+            "wake:kv_cache",
+            "reset_prefix_cache",
+            "chat"
+        ]
+    );
+    assert!(!e.calls.iter().any(|c| c.contains("reload_weights")));
+    assert!(!e.sleeping && e.weights_loaded);
+}
+
+/// ADR 0010: the level follows the declared residency; `deep` still sleeps at
+/// level 2 and reloads the weights through the collective.
+// T16
+#[tokio::test]
+async fn deep_still_parks_at_level_two_and_reloads() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Enabled).with_residency(Residency::Deep);
+    vllm.execute_persisted(&step(RuntimeAction::Park, "p"))
+        .await
+        .unwrap();
+    assert_eq!(engine.lock().unwrap().calls[0], "sleep:2");
+    vllm.execute_persisted(&step(RuntimeAction::Restore, "w"))
+        .await
+        .unwrap();
+    vllm.execute_persisted(&step(RuntimeAction::ReloadWeights, "r"))
+        .await
+        .unwrap();
+    assert!(engine
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .any(|c| c == "reload_weights"));
+}
+
+/// SPEC §9.1 / T21: an opted-out host makes no call at level 1 either.
+// T21
+#[tokio::test]
+async fn an_opted_out_host_backed_launch_makes_no_residency_call() {
+    let engine = Shared::default();
+    let port = serve(engine.clone()).await;
+    let vllm = adapter(port, ParkPolicy::Disabled).with_residency(Residency::HostBacked);
+    for (action, id) in [
+        (RuntimeAction::Park, "a"),
+        (RuntimeAction::ReloadWeights, "b"),
+    ] {
+        assert_eq!(
+            vllm.execute_persisted(&step(action, id)).await.unwrap_err(),
+            RuntimeError::Unsupported
+        );
+    }
+    assert!(engine.lock().unwrap().calls.is_empty());
 }

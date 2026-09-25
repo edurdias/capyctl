@@ -1451,9 +1451,10 @@ impl LocalExecutionPolicy for NativeHostExecution {
         let effective = self.resolve_retained(owner)?;
         // Owner decision (ADR 0012): park only at the declared tier. A
         // `restart_only` deployment never parks. `host_backed` is refused on
-        // unified pools at resolution (ADR 0010 decision 5) and has no remote
-        // park path; only `deep` parks here.
-        if effective.residency != mllm_config::effective::Residency::Deep {
+        // unified pools at resolution (ADR 0010 decision 5), so where it
+        // resolved the pools are distinct and it parks to host RAM (discrete
+        // GPU design §5); `deep` parks everywhere.
+        if !effective.residency.parks() {
             return Err(JournalError::Unauthorized);
         }
         // ADR 0008: a Park needs the internals deep parking drives; a build the

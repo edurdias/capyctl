@@ -383,15 +383,17 @@ impl NativeHostExecution {
                 _ => "unauthorized",
             }),
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
-                // ADR 0012: only a `deep` launch parks. A `restart_only` one
-                // (any engine, SPEC §6.2) is refused by its declared tier.
+                // ADR 0012: only a parking tier (`deep`, or `host_backed`
+                // where it resolved, discrete GPU design §5) parks. A
+                // `restart_only` one (any engine, SPEC §6.2) is refused by its
+                // declared tier.
                 let tier = self
                     .journal
                     .retained_command(owned_handle)
                     .ok()
                     .filter(|owner| matches!(owner.action, MemberAction::LaunchSingle(_)))
                     .and_then(|owner| self.resolve_retained(&owner).ok())
-                    .is_some_and(|effective| effective.residency != Residency::Deep);
+                    .is_some_and(|effective| !effective.residency.parks());
                 // SPEC §§3.1, 7.3, 9.1: a wake that does not fit beside the
                 // other claims is refused by the rule it breaks.
                 let wake = || match &command.action {

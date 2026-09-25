@@ -51,6 +51,9 @@ pub enum AdapterSpec {
         /// on those routes only. `None` is the single-key guard an engine
         /// launched before the admin role keeps until it restarts.
         admin_key: Option<String>,
+        /// ADR 0010, discrete GPU design §5: the deployment's declared
+        /// residency, which fixes the sleep level a park uses.
+        residency: mllm_config::effective::Residency,
     },
     /// SGLang refuses the un-fenced control path, so it takes the frozen launch
     /// it was verified against, the two per-launch credentials, and — when the
@@ -127,8 +130,10 @@ pub fn resolve(
             launch,
             engine_key,
             admin_key,
+            residency,
         } => {
-            let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id);
+            let mut adapter = VllmAdapter::new(endpoint, api_key, fingerprint, policy, model_id)
+                .with_residency(residency);
             if let Some(launch) = launch {
                 adapter = adapter.with_launch(launch);
             }

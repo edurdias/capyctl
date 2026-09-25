@@ -99,6 +99,9 @@ impl NativeHostExecution {
             park_policy(effective),
             served.into(),
         )
+        // ADR 0010, discrete GPU design §5: the park level is the declared
+        // residency of the approved launch, never the command's.
+        .with_residency(effective.residency)
         .with_engine_key(hex::encode(keys.inference))
         // SPEC §9.1 / T21: the development routes are keyed with the launch's
         // admin credential, apart from the inference key ingress presents.

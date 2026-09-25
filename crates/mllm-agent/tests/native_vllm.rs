@@ -168,6 +168,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(500); self.end_headers(); return
         if call == "sleep:2":
             state.update(sleeping=True, weights=False, loaded=False, kv=False)
+        elif call == "sleep:1":
+            # Level 1 offloads the weights to host RAM; the weights wake
+            # copies them back, so they stay loaded.
+            state.update(sleeping=True, weights=False, kv=False)
         elif call == "wake:weights":
             state["weights"] = True
         elif call == "wake:kv_cache":
@@ -1325,6 +1329,63 @@ async fn a_restart_only_launch_is_never_parked() {
     assert!(fixture.controls().is_empty());
     assert_eq!(host.journal.history(0, 100).unwrap().len(), 1);
     assert_eq!(host.journal.residency_of("launch").unwrap(), None);
+}
+
+/// Discrete GPU design §5: a `host_backed` launch (distinct host and device
+/// memory) is admitted to Park, sleeps at level 1, and is restored by the
+/// weights wake with no `reload_weights` collective, then the KV wake, the
+/// prefix-cache reset and a fresh model probe.
+// T16 T20 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_backed_launch_parks_at_level_one_and_restores_without_a_reload() {
+    let fixture = Fixture::build(Some(true), true, |host, deployment| {
+        // ADR 0010 decision 5: host_backed needs distinct pools.
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+        deployment["residency"] = json!("host_backed");
+    });
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    assert!(
+        host.executor
+            .execute(host.session, launch.clone())
+            .await
+            .unwrap()
+            .model_usable
+    );
+    let park = fixture.park(&launch, "park");
+    let parked = host
+        .executor
+        .execute(host.session, park.clone())
+        .await
+        .unwrap();
+    mllm_protocol::execution::validate_result(&park, &parked).unwrap();
+    assert_eq!(residency(&parked), "parked", "{parked:?}");
+    assert_eq!(fixture.controls(), ["sleep:1"]);
+    let restore = fixture.restore(&launch, "restore");
+    let restored = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
+    mllm_protocol::execution::validate_result(&restore, &restored).unwrap();
+    assert_eq!(residency(&restored), "restored", "{restored:?}");
+    assert!(restored.model_usable && restored.claim_retained);
+    assert_eq!(
+        fixture.controls(),
+        [
+            "sleep:1",
+            "wake:weights",
+            "wake:kv_cache",
+            "reset_prefix_cache"
+        ]
+    );
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(!stopped.claim_retained);
 }
 
 /// SPEC §10 step 4: work the engine still reports is not quiescence. The park
