@@ -236,6 +236,22 @@ if [ -n "$role" ]; then
   mv -f "$unit_dir/.$unit.new" "$unit_dir/$unit"
   printf '%s\n' "$unit_dir/$unit" >>"$record.tmp"
   say "installed $unit_dir/$unit (not enabled)"
+  if [ "$scope" = user ]; then
+    # The user units keep state in StateDirectory=mllm (~/.local/state/mllm).
+    # systemd 254 and later, finding that missing while ~/.config/mllm (where
+    # the units read <role>.yaml and <role>.env) exists, assumes the pre-254
+    # layout and makes ~/.local/state/mllm a symlink to ~/.config/mllm; state
+    # then lands in the configuration directory, behind a symlink the roles'
+    # identity rules refuse (found live 2026-09-24). An empty owner-only
+    # directory made now prevents that; nothing in it is ever touched.
+    state_root=${XDG_STATE_HOME:-$HOME/.local/state}/mllm
+    if [ -L "$state_root" ]; then
+      say "warning: $state_root is a symlink (systemd's pre-254 compatibility link?); the roles refuse state behind it. Stop the unit, remove the link, and run this installer again."
+    elif [ ! -e "$state_root" ]; then
+      (umask 077 && mkdir -p "$state_root") && chmod 0700 "$state_root"
+      say "created $state_root (0700) for the unit's state"
+    fi
+  fi
   reload_systemd
 fi
 sort -u "$record.tmp" >"$record"

@@ -119,6 +119,10 @@ for shell in "${shells[@]}"; do
     [ -f "$home/.local/share/mllm/packaging/systemd/system/mllm-server.service" ] || problems+=("units not kept")
     grep -qx -- '--user daemon-reload' "$log" || problems+=("no systemctl --user daemon-reload")
     grep -q 'enable\|start' "$log" && problems+=("the unit was enabled or started")
+    # systemd >= 254 would otherwise link the state root to ~/.config/mllm.
+    { [ -d "$home/.local/state/mllm" ] && [ ! -L "$home/.local/state/mllm" ] &&
+      [ "$(stat -c %a "$home/.local/state/mllm")" = 700 ]; } ||
+      problems+=("the state root ~/.local/state/mllm is not a 0700 directory")
     if [ "${#problems[@]}" -eq 0 ]; then pass "$label user install over file://"; else
       for p in "${problems[@]}"; do fail "$label user install: $p"; done; echo "$out" >&2; fi
 
@@ -142,6 +146,19 @@ for shell in "${shells[@]}"; do
     else
       fail "$label uninstall"
     fi
+
+    # A state root systemd already replaced by its compatibility link is
+    # reported, never touched.
+    fresh_home
+    mkdir -p "$home/.config/mllm" "$home/.local/state"
+    ln -s ../../.config/mllm "$home/.local/state/mllm"
+    if out=$(run "$shell" MLLM_INSTALL_BASE_URL="file://$release" -- --version "$version" --systemd host 2>&1) &&
+      printf '%s\n' "$out" | grep -q 'is a symlink' && [ -L "$home/.local/state/mllm" ]; then
+      pass "$label warns about a linked state root and leaves it"
+    else
+      fail "$label linked state root"; echo "$out" >&2
+    fi
+
   else
     fail "$label user install over file:// exited non-zero"
     echo "$out" >&2
