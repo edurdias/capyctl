@@ -13,6 +13,42 @@ const CAPACITY: i64 = 128 * 1024 * 1024 * 1024;
 /// them concurrently would let one test's exports decide another's result.
 static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
+/// Names the one test a child copy of this binary runs (see [`isolated`]).
+const ISOLATED_TEST: &str = "MLLM_ISOLATED_TEST";
+
+/// The environment is process-wide, and so is every other test in this binary:
+/// one that reads `MLLM_*` or `HOME` while another exports it, or forks while
+/// another has an engine script open for writing, sees the other's state. A
+/// test that changes the environment therefore runs alone, in a child copy of
+/// this test binary, and never changes the parent's environment. In the parent
+/// this runs `test` there and returns `None` (the caller returns); in the child
+/// it returns the lock, and the caller's body runs.
+fn isolated(test: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
+    if std::env::var_os(ISOLATED_TEST).is_some_and(|named| named == test) {
+        return Some(
+            ENVIRONMENT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            &format!("standalone_config::tests::{test}"),
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env(ISOLATED_TEST, test)
+        .output()
+        .expect("the isolated test runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{test} in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    None
+}
+
 /// An installation with nothing interesting in it, for the tests that are about the
 /// shape of the published table rather than about any particular engine.
 fn installed(engine: Engine, executable: &str) -> EngineInstallation {
@@ -449,9 +485,9 @@ fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
 /// every start at the point where the refusal is hardest to read.
 #[test]
 fn host_policy_from_env_is_complete() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("host_policy_from_env_is_complete") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let models = dir.path().join("models");
@@ -538,9 +574,9 @@ fn host_policy_from_env_is_complete() {
 // T21 T03
 #[test]
 fn deep_park_is_on_unless_the_host_opts_out() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("deep_park_is_on_unless_the_host_opts_out") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -591,9 +627,9 @@ fn deep_park_is_on_unless_the_host_opts_out() {
 #[test]
 fn installation_drift_is_warn_unless_the_host_refuses() {
     use mllm_config::effective::InstallationDrift;
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("installation_drift_is_warn_unless_the_host_refuses") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -640,9 +676,9 @@ fn installation_drift_is_warn_unless_the_host_refuses() {
 // T03
 #[test]
 fn the_engine_port_range_can_be_named_for_one_run() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("the_engine_port_range_can_be_named_for_one_run") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -692,9 +728,9 @@ fn the_engine_port_range_can_be_named_for_one_run() {
 // T21 T22 T37
 #[test]
 fn the_capability_probe_is_required_when_vllm_may_sleep() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("the_capability_probe_is_required_when_vllm_may_sleep") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let runtime = private_runtime(dir.path());
@@ -730,9 +766,10 @@ fn the_capability_probe_is_required_when_vllm_may_sleep() {
 // T21 T22
 #[test]
 fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only")
+    else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let models = dir.path().join("models");
@@ -821,9 +858,10 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
 #[test]
 fn standalone_runs_from_the_embedded_runtime_unless_one_is_named() {
     use std::os::unix::fs::PermissionsExt;
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("standalone_runs_from_the_embedded_runtime_unless_one_is_named")
+    else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -931,7 +969,9 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
 // T01 T07
 #[test]
 fn one_variable_gives_local() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(_guard) = isolated("one_variable_gives_local") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().unwrap();
     engine_env(dir.path(), true, false);
     let found = crate::roles::EnvEngineProvider::new()
@@ -944,7 +984,9 @@ fn one_variable_gives_local() {
 // T01 T07
 #[test]
 fn both_variables_give_local_vllm_and_local_sglang() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(_guard) = isolated("both_variables_give_local_vllm_and_local_sglang") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().unwrap();
     engine_env(dir.path(), true, true);
     let found = crate::roles::EnvEngineProvider::new()
@@ -959,7 +1001,9 @@ fn both_variables_give_local_vllm_and_local_sglang() {
 // T03 T07
 #[test]
 fn registered_profiles_coexist_and_collide_by_name() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(_guard) = isolated("registered_profiles_coexist_and_collide_by_name") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().unwrap();
     engine_env(dir.path(), true, false);
     let bin = dir.path().join("venv/bin/vllm");
@@ -981,4 +1025,15 @@ fn registered_profiles_coexist_and_collide_by_name() {
     assert!(crate::roles::EnvEngineProvider::new()
         .installations(&Default::default())
         .is_err());
+}
+
+// The isolation itself: what an environment test exports stays in its own
+// process, so no other test in this binary can see it.
+#[test]
+fn an_isolated_test_leaves_this_process_environment_alone() {
+    if let Some(_guard) = isolated("an_isolated_test_leaves_this_process_environment_alone") {
+        std::env::set_var("MLLM_ISOLATION_PROBE", "child");
+        return;
+    }
+    assert!(std::env::var_os("MLLM_ISOLATION_PROBE").is_none());
 }
