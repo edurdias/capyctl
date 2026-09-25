@@ -148,6 +148,17 @@ pub fn shape(sample: Option<&GpuSample>) -> Result<HostShape, GpuShapeError> {
     }
 }
 
+/// The nvidia-smi index a `gpuN` device id names, the id standalone publishes
+/// each discrete device under. `None` for any other id: such a device has no
+/// source, so its domain stays unobserved rather than read from a guess.
+pub fn device_index(device_id: &str) -> Option<u32> {
+    device_id
+        .strip_prefix("gpu")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
+}
+
 /// The live sample; `None` on any failure (no binary, timeout, bad output).
 pub fn sample() -> Option<GpuSample> {
     let program = ["/usr/bin/nvidia-smi", "/bin/nvidia-smi"]
@@ -271,6 +282,15 @@ mod tests {
             run_bounded("/bin/echo", &["ok"], BOUND).as_deref(),
             Some("ok\n")
         );
+    }
+
+    #[test]
+    fn a_device_index_is_read_only_from_a_gpu_id() {
+        assert_eq!(device_index("gpu0"), Some(0));
+        assert_eq!(device_index("gpu12"), Some(12));
+        for other in ["gpu", "gpu-1", "gpu+1", "GPU0", "npu0", "gpu0a", ""] {
+            assert_eq!(device_index(other), None, "{other}");
+        }
     }
 
     #[test]

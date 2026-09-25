@@ -847,7 +847,7 @@ pub async fn start_standalone_from(
         // device domains (Task 8 of the discrete GPU plan switches it on);
         // until then a discrete host would publish domains its own template
         // cannot name, and refuse to boot.
-        &no_gpu,
+        no_gpu(),
     )
     .await
 }
@@ -867,7 +867,7 @@ pub async fn start_standalone_with(
         None,
         provider,
         crate::host_observation::proc_meminfo(),
-        &no_gpu,
+        no_gpu(),
     )
     .await
 }
@@ -881,7 +881,7 @@ pub async fn start_standalone_with_memory(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, None, provider, memory, &no_gpu).await
+    start_standalone_inner(state_dir, None, provider, memory, no_gpu()).await
 }
 
 /// As [`start_standalone_with_memory`], sampling the host's GPUs through `gpu`
@@ -890,14 +890,14 @@ pub async fn start_standalone_with_gpu(
     state_dir: &Path,
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
-    gpu: &GpuSampler,
+    gpu: Arc<GpuSampler>,
 ) -> Result<App, StartError> {
     start_standalone_inner(state_dir, None, provider, memory, gpu).await
 }
 
 /// The sampler of a boot that observes no GPU.
-fn no_gpu() -> Option<mllm_agent::gpu_memory::GpuSample> {
-    None
+fn no_gpu() -> Arc<GpuSampler> {
+    Arc::new(|| None)
 }
 
 /// As [`start_standalone_with_memory`], with an explicit role document
@@ -908,7 +908,7 @@ pub async fn start_standalone_configured(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, config, provider, memory, &no_gpu).await
+    start_standalone_inner(state_dir, config, provider, memory, no_gpu()).await
 }
 
 async fn start_standalone_inner(
@@ -916,7 +916,7 @@ async fn start_standalone_inner(
     config: Option<&Path>,
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
-    gpu: &GpuSampler,
+    gpu: Arc<GpuSampler>,
 ) -> Result<App, StartError> {
     // Fail-closed credentials (SPEC §15.2): the generated api key lives in
     // the protected credentials file. The hardcoded fallback exists ONLY
@@ -1147,10 +1147,13 @@ async fn start_standalone_inner(
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(
-            HostMemoryObservation::with_reader(
-                declared_host.domains.keys().cloned(),
-                memory.clone(),
-            )
+            // SPEC §7.2 / ADR 0019: host domains from host memory, each device
+            // domain from its GPU; an unobserved device closes admission there.
+            HostMemoryObservation::with_domains(crate::host_observation::observed_domains(
+                &declared_host.domains,
+            ))
+            .with_memory_reader(memory.clone())
+            .with_gpu_sampler(gpu.clone())
             // ADR 0007 (found live 2026-09-23, matrix M33): credit the
             // engines already resident here instead of charging them twice.
             .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia()),
@@ -1265,10 +1268,11 @@ async fn start_standalone_inner(
     {
         // The same source the coordinator will observe through, so the policy and
         // the evidence for it cannot disagree about what a domain is called.
-        let observations = HostMemoryObservation::with_reader(
-            declared_host.domains.keys().cloned(),
-            memory.clone(),
+        let observations = HostMemoryObservation::with_domains(
+            crate::host_observation::observed_domains(&declared_host.domains),
         )
+        .with_memory_reader(memory.clone())
+        .with_gpu_sampler(gpu.clone())
         .observe(declared_host.name.clone())
         .await
         .map_err(|error| StartError::Deploy(error.to_string()))?;

@@ -375,7 +375,7 @@ async fn standalone_refuses_mixed_integrated_and_discrete_gpus() {
             sampled_at_ms: 1,
         })
     };
-    let error = support::try_boot_with_gpu(dir.path(), &mixed)
+    let error = support::try_boot_with_gpu(dir.path(), mixed)
         .await
         .err()
         .expect("a mixed host must refuse to boot");
@@ -407,7 +407,7 @@ async fn standalone_on_a_unified_host_keeps_the_unified_shape() {
             sampled_at_ms: 1,
         })
     };
-    let app = support::try_boot_with_gpu(dir.path(), &unified)
+    let app = support::try_boot_with_gpu(dir.path(), unified)
         .await
         .expect("a unified host boots");
     assert_eq!(app.gpu_shape, HostShape::Unified);

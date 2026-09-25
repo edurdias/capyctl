@@ -56,7 +56,7 @@ pub async fn try_boot_on(
 /// instead of the machine's own `nvidia-smi`.
 pub async fn try_boot_with_gpu(
     state_dir: &std::path::Path,
-    gpu: &mllm_agent::gpu_memory::GpuSampler,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
 ) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
     mllm_cli::roles::start_standalone_with_gpu(
         state_dir,
@@ -66,7 +66,7 @@ pub async fn try_boot_with_gpu(
             members: None,
         }),
         test_memory(),
-        gpu,
+        Arc::new(gpu),
     )
     .await
 }

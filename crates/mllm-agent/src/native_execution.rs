@@ -106,6 +106,9 @@ pub struct NativeHostExecution {
     /// model store under its own `model_sources` policy. `None` when the host
     /// document states no usable store, which refuses every request.
     sources: Option<Arc<crate::sources::SourceStore>>,
+    /// SPEC §7.2 / ADR 0019: where a device domain's memory is read from. It
+    /// runs only when the accepted policy declares a device domain.
+    gpu: Option<Arc<crate::gpu_memory::GpuSampler>>,
 }
 
 /// How long a pre-admission stands for the locked recheck.
@@ -187,6 +190,7 @@ impl NativeHostExecution {
             residency: None,
             rendezvous: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            gpu: Some(Arc::new(crate::gpu_memory::sample)),
         })
     }
 
@@ -244,6 +248,15 @@ impl NativeHostExecution {
         sampler: Arc<crate::process_residency::ResidencySampler>,
     ) -> Arc<Self> {
         Arc::make_mut(&mut self).residency = Some(sampler);
+        self
+    }
+    /// SPEC §7.2 / ADR 0019: read device domains through `sampler` instead
+    /// of `nvidia-smi`.
+    pub fn with_gpu_sampler(
+        mut self: Arc<Self>,
+        sampler: Arc<crate::gpu_memory::GpuSampler>,
+    ) -> Arc<Self> {
+        Arc::make_mut(&mut self).gpu = Some(sampler);
         self
     }
     /// ADR 0018 §3: the host's runtime profile sets, shared with the live
@@ -1469,11 +1482,17 @@ impl SessionExecution for NativeHostExecution {
         let mut inventory = set.inventory.clone();
         // ADR 0008: status carries installation drift and missing capabilities.
         set.installations.overlay(&mut inventory.profiles);
-        // Startup only publishes measured domains. Refresh exactly the same
-        // single unified pool, preserving its approved name and policy binding.
-        if inventory.domains.len() != 1 {
+        // SPEC §7.2 / ADR 0019: each domain is refreshed from its own source.
+        // A device domain reads its GPU; every other domain reads host memory.
+        let devices = device_domains(&set.config.document);
+        let (device, host): (Vec<usize>, Vec<usize>) = (0..inventory.domains.len())
+            .partition(|i| devices.contains_key(&inventory.domains[*i].domain_id));
+        // Startup only publishes measured domains. Refresh exactly the one host
+        // pool, preserving its approved name and policy binding; several host
+        // pools would need their own observers, never a copied reading.
+        let [host] = host[..] else {
             return None;
-        }
+        };
         let memory = crate::memory::read_host_memory().ok()?.memory;
         // ADR 0007: availability first, then the processes still alive, so a
         // process that grew in between is under-credited, never over-credited.
@@ -1482,7 +1501,7 @@ impl SessionExecution for NativeHostExecution {
             .as_ref()
             .map(|sampler| sampler.current())
             .unwrap_or_default();
-        let domain = &mut inventory.domains[0];
+        let domain = &mut inventory.domains[host];
         domain.observed_bytes = memory.available_bytes;
         domain.available_bytes = memory.available_bytes;
         domain.capacity_bytes = memory.capacity_bytes;
@@ -1497,8 +1516,68 @@ impl SessionExecution for NativeHostExecution {
                 resident_bytes: p.bytes,
             })
             .collect();
+        if !device.is_empty() {
+            // One sample for every device domain, taken only on a host that
+            // declares one. A failed sample leaves every device unobserved.
+            let sample = self.gpu.as_ref().and_then(|sampler| sampler());
+            for i in device {
+                let domain = &mut inventory.domains[i];
+                let observed = devices[&domain.domain_id].and_then(|index| {
+                    let sample = sample.as_ref()?;
+                    let memory = sample
+                        .devices
+                        .iter()
+                        .find(|d| d.index == index)?
+                        .memory
+                        .as_ref()?;
+                    Some((memory, sample.sampled_at_ms))
+                });
+                match observed {
+                    Some((memory, sampled_at_ms)) => {
+                        domain.observed_bytes = memory.free_bytes;
+                        domain.available_bytes = memory.free_bytes;
+                        domain.capacity_bytes = memory.total_bytes;
+                        domain.observed_at_unix = sampled_at_ms / 1000;
+                        domain.observed_at_unix_ms = sampled_at_ms;
+                    }
+                    // SPEC §7.2: an unobserved device is unknown (`-1`), which
+                    // closes admission on its domain; RAM never stands in.
+                    None => {
+                        domain.observed_bytes = -1;
+                        domain.available_bytes = -1;
+                        domain.capacity_bytes = -1;
+                    }
+                }
+                domain.residents.clear();
+            }
+        }
         Some(inventory)
     }
+}
+
+/// The device domains of an approved host document, each with the nvidia-smi
+/// index its `gpuN` device names (`None`: a device id with no index, which is
+/// never observed). A document whose policy does not resolve declares none, so
+/// its domains are refreshed as before.
+fn device_domains(document: &serde_json::Value) -> std::collections::BTreeMap<String, Option<u32>> {
+    mllm_config::remote_resources::local_host_document(document)
+        .ok()
+        .and_then(|host| mllm_config::effective::normalize_host_policy(&host).ok())
+        .map(|policy| {
+            policy
+                .domains
+                .into_iter()
+                .filter(|(_, d)| d.memory == mllm_config::effective::DomainMemory::Device)
+                .map(|(id, d)| {
+                    let index = d
+                        .device
+                        .as_deref()
+                        .and_then(crate::gpu_memory::device_index);
+                    (id, index)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

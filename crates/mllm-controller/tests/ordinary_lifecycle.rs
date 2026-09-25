@@ -3068,3 +3068,136 @@ async fn an_unarmed_stop_gives_up_the_starts_engine_key() {
         "the released binding must not leave a sealed key behind"
     );
 }
+
+/// ADR 0019: a discrete host, host RAM in `system` and the GPU's own memory in
+/// the device domain `gpu0`.
+fn discrete_host(host: &mut Value) {
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+}
+
+/// A deployment whose every phase is charged to the device domain.
+fn device_footprint(deployment: &mut Value) {
+    deployment["engine_config"]["memory"]["kv_cache"] = json!("256MiB");
+    for (phase, bytes) in [
+        ("cold", "2GiB"),
+        ("ready", "1GiB"),
+        ("parking", "1GiB"),
+        ("parked", "512MiB"),
+        ("wake", "2GiB"),
+    ] {
+        deployment["resources"][phase]["allocations"] =
+            json!([{"bytes": bytes, "domain": "gpu0", "host_kv_bytes": "0B"}]);
+    }
+}
+
+/// Observations a test can change while the coordinator runs.
+struct Switchable(Mutex<Vec<MemoryObservation>>);
+impl ServiceObservation for Switchable {
+    fn observe(&self, _: String) -> mllm_controller::coordinator::ObservationFuture {
+        let values = self.0.lock().unwrap().clone();
+        Box::pin(async move { Ok(values) })
+    }
+}
+
+/// SPEC §7.2 (T29): when the GPU cannot be read (the collector hung or the
+/// driver went away), the device domain has no observation. A start is then
+/// blocked as `device_unobserved`, never admitted against host RAM, and what
+/// is already reserved stays charged.
+// T29
+#[tokio::test]
+async fn an_unobserved_device_blocks_a_start_and_keeps_existing_charges() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture::fixture_with(|deployment, host| {
+        discrete_host(host);
+        device_footprint(deployment);
+    });
+    let edit = |deployment: &mut Value, host: &mut Value| {
+        discrete_host(host);
+        device_footprint(deployment);
+    };
+    let first = fixture::managed_edit(&f, "first", edit);
+    let second = fixture::managed_edit(&f, "second", edit);
+    let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("srv.sqlite3");
+    f.sql
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = Arc::new(Mutex::new(OwnedCoordinatorState::open(dir.path()).unwrap()));
+    let observations = Arc::new(Switchable(Mutex::new(f.observations.clone())));
+    let worker = mllm_testkit::spawn_fake_coordinator(
+        owner.clone(),
+        observations.clone(),
+        Arc::new(|| Ok(1900)),
+        CoordinatorOptions {
+            retry_cooldown: Duration::from_millis(20),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let live = |fence: &DeploymentFence| {
+        owner
+            .lock()
+            .unwrap()
+            .store()
+            .runtime_binding(&fence.deployment_id)
+            .unwrap()
+            .is_some_and(|b| b.state == "live")
+    };
+    drop(worker.start(&first, 10000).unwrap());
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !live(&first) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first deployment reaches Ready while the GPU is observed");
+    let charged = owner.lock().unwrap().store().resource_snapshot().unwrap();
+    assert_eq!(
+        charged.owners[&first.deployment_id].phase,
+        ResourcePhase::Ready
+    );
+
+    // The GPU stops answering: only host memory is observed.
+    observations
+        .0
+        .lock()
+        .unwrap()
+        .retain(|o| o.domain == "system");
+    drop(worker.start(&second, 10000).unwrap());
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let blocked: bool = sql
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE evidence LIKE ?1)",
+                    [format!(
+                        "deployment {}: %device_unobserved%",
+                        second.deployment_id
+                    )],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the start is blocked as device_unobserved");
+    assert!(!live(&second), "nothing launched against an unknown device");
+    let after = owner.lock().unwrap().store().resource_snapshot().unwrap();
+    assert_eq!(
+        after.owners, charged.owners,
+        "the existing reservation stays charged and nothing new is reserved"
+    );
+    worker.shutdown().await.unwrap();
+}
