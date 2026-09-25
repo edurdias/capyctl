@@ -44,7 +44,8 @@ mod saver_source;
 pub use saver_source::{EnrolledSaver, LaunchSglangObserver};
 // SPEC §13 (WE3 limit 1): pre-effect policy refusals are terminal results.
 mod refusal;
-use refusal::LaunchVerdict;
+// Discrete GPU design §4: the launch check the switch planner agrees with.
+pub use refusal::{admit_memory_with, LaunchVerdict};
 // SPEC §§3.1, 7.3 (per-launch claims): host-side co-residence admission.
 mod coresidence;
 
@@ -207,6 +208,15 @@ impl NativeHostExecution {
         if let Some(gpu) = self.gpu.as_ref().filter(|_| declared) {
             let _ = gpu.current();
         }
+    }
+
+    /// SPEC §7.2 / ADR 0019: a GPU sample taken now, for a launch's memory
+    /// check. The cached reading may predate a victim's verified release by
+    /// seconds, and refusing on it would refuse the very launch the switch
+    /// planner made room for. `None` (no sampler, a failed or overdue
+    /// collector) leaves the device unobserved.
+    fn fresh_gpu(&self) -> Option<crate::gpu_memory::GpuSample> {
+        self.gpu.as_ref().and_then(|sampler| sampler.fresh())
     }
 
     /// SPEC §13.2: run the slow half of a command's admission outside the

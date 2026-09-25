@@ -149,6 +149,36 @@ impl CachedGpuSampler {
     }
 }
 
+impl CachedGpuSampler {
+    /// A sample taken now, for a caller that may block (a launch's memory
+    /// check runs on a blocking thread, never the session loop). The run is
+    /// bounded: a collector that has not answered within [`BOUND`] and a
+    /// second is abandoned and the device is unobserved. The result becomes
+    /// the cached reading, so a failure is never masked by an older sample.
+    pub fn fresh(self: &Arc<Self>) -> Option<GpuSample> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sample = self.sample.clone();
+        std::thread::Builder::new()
+            .name("mllm-gpu-memory-now".into())
+            .spawn(move || {
+                // A panicking collector is a failed sample.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sample()))
+                    .ok()
+                    .flatten();
+                let _ = sender.send(result);
+            })
+            .ok()?;
+        let result = receiver
+            .recv_timeout(BOUND + Duration::from_secs(1))
+            .ok()
+            .flatten();
+        if let Ok(mut state) = self.state.lock() {
+            state.last = Some((Instant::now(), result.clone()));
+        }
+        result
+    }
+}
+
 /// A MiB field in bytes; `Ok(None)` when the device has no memory of its own.
 fn mib(field: &str) -> Result<Option<i64>, ()> {
     match field {
@@ -476,5 +506,46 @@ mod tests {
         until(true);
         fail.store(true, Ordering::SeqCst);
         until(false);
+    }
+
+    // T26 T16: a launch check reads the card as it is now. A cached sample
+    // taken while a victim still held its memory is not what admits or
+    // refuses the launch that victim's release made room for; the fresh
+    // sample also becomes the cached reading.
+    #[test]
+    fn a_fresh_sample_is_taken_now_and_cached() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let used = Arc::new(AtomicI64::new(9_516));
+        let reading = used.clone();
+        let cache = CachedGpuSampler::with_bounds(
+            Arc::new(move || {
+                let used = reading.load(Ordering::SeqCst);
+                parse_query_gpu(
+                    &format!(
+                        "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, {used}, {}\n",
+                        16376 - used
+                    ),
+                    1_000,
+                )
+            }),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let free = |sample: Option<GpuSample>| {
+            sample.expect("sampled").devices[0]
+                .memory
+                .as_ref()
+                .unwrap()
+                .free_bytes
+        };
+        assert_eq!(free(cache.fresh()), (16376 - 9_516) * MIB);
+        // The victim parks: the cache would still report it for a minute.
+        used.store(1024, Ordering::SeqCst);
+        assert_eq!(free(cache.current()), (16376 - 9_516) * MIB);
+        assert_eq!(free(cache.fresh()), (16376 - 1024) * MIB);
+        assert_eq!(free(cache.current()), (16376 - 1024) * MIB);
+        // A failed collector is unobserved, never the reading before it.
+        let failing = CachedGpuSampler::new(Arc::new(|| None));
+        assert!(failing.fresh().is_none());
     }
 }

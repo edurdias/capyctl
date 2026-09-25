@@ -46,6 +46,10 @@ const HINTS: &[(&str, &str)] = &[
         "the host cannot hold the launch now; stop or park another deployment there, or lower the deployment's memory request",
     ),
     (
+        "insufficient_device_memory",
+        "the GPU cannot hold the launch now; stop or park another deployment on that GPU, or lower the deployment's device memory request",
+    ),
+    (
         "no_host_fits",
         "no allowed host has room without eviction; start it with --evict, or free capacity on an allowed host",
     ),

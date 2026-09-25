@@ -195,4 +195,50 @@ mod tests {
             Err(HostRefusal::Insufficient)
         );
     }
+
+    // Discrete GPU design §4 (T16 T27): the motivating case. Two models whose
+    // device requests together exceed the card's limit, while host RAM holds
+    // both, produce a victim: the device domain binds on a small card.
+    #[test]
+    fn the_device_domain_binds_on_a_small_card() {
+        let two = |phase, device: i64, system: i64| PhaseFootprint {
+            phase,
+            allocations: vec![
+                Allocation {
+                    domain: "gpu0".into(),
+                    bytes: device * GIB,
+                    host_kv_bytes: 0,
+                },
+                Allocation {
+                    domain: "system".into(),
+                    bytes: system * GIB,
+                    host_kv_bytes: 0,
+                },
+            ],
+            devices: vec![],
+        };
+        let limit = |domain: &str, managed: i64| MemoryLimit {
+            domain: domain.into(),
+            managed_bytes: managed * GIB,
+            free_reserve_bytes: 0,
+            host_kv_bytes: None,
+            parked_bytes: None,
+        };
+        let limits = vec![limit("gpu0", 15), limit("system", 30)];
+        let l = LedgerSnapshot {
+            epoch: 1,
+            owners: [("a".to_string(), two(ResourcePhase::Ready, 9, 4))].into(),
+        };
+        let want = two(ResourcePhase::Cold, 9, 4);
+        let ordered = vec![candidate("a", false, 1)];
+        assert_eq!(
+            choose_victims(&l, "w", &want, &limits, 16, &ordered).unwrap(),
+            ["a"]
+        );
+        // The same models on a card with room for both evict nothing.
+        let roomy = vec![limit("gpu0", 18), limit("system", 30)];
+        assert!(choose_victims(&l, "w", &want, &roomy, 16, &ordered)
+            .unwrap()
+            .is_empty());
+    }
 }
