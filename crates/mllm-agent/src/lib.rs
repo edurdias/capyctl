@@ -21,6 +21,9 @@ pub mod ingress_identity;
 // ADR 0008 (owner decision 2026-09-23): installation fingerprints and
 // launch-time capability probes, instead of pinned hashes.
 pub mod installation;
+// ADR 0018 §1: resolving a named engine installation and its bounded
+// version check.
+pub mod engines;
 pub mod load;
 pub mod memory;
 // ADR 0007: per-process resident memory, sampled beside availability.
