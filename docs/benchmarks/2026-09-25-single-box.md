@@ -92,7 +92,8 @@ Readings:
   2.13.0, FlashInfer 0.6.18, sglang-kernel 0.4.7, transformers 5.12.1) on host B.
   No custom engine build was needed (see "Custom builds").
 - **mllm.** `main` at `a1298c4` plus the fixes on this branch (see "Product
-  fixes"), built from a snapshot of the worktree and run as a server plus two
+  fixes"); the branch merged later `main` (`be780b9`) after the run, and the
+  live binaries predate that merge. Built from a snapshot of the worktree and run as a server plus two
   enrolled hosts by the live matrix harness (`scripts/live/matrix`). The server
   had `observability.timing_header` on. Host B's role ran with
   `--debug-engine-logs` from 14:14 UTC on, to diagnose one launch failure.

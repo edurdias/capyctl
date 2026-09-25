@@ -4,6 +4,39 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Single-box benchmark through mllm — 2026-09-25 (branch `test/model-benchmark`)
+
+Owner-approved experiment: five models, 256 in / 256 out, one user, vLLM 0.29.0
+on host A and SGLang 0.5.20 on host B, deployed by mllm and requested through
+the router (row M80, bench phase, 1 warmup + 5 measured). Full method, flags,
+results and failures: `docs/benchmarks/2026-09-25-single-box.md`. Evidence:
+`target/live/bench/` on the control-plane host, run `matrix-20260925T125244Z`.
+Not qualification.
+
+- **Live results (decode tok/s, median; baseline → best drafter).** MiniCPM5-2B
+  36 → 85 (DSpark, both engines); Qwen3.6-35B-A3B NVFP4 77 → 126 (vLLM DFlash),
+  85 → 125 (SGLang MTP); Ling-3.0-flash int4 23 → 48 (SGLang DSpark; vLLM not
+  run, needs `trust_remote_code`); Gemma-4-E2B 38 → 96–100 (assistant);
+  Qwen3.8-27B NVFP4 10.5 → 27.6 (DFlash2). mllm path overhead 25–85 ms at first
+  token, 25–55 ms at stream end.
+- **Hugging Face sources worked live** (first use): 17 sources, about 123 GB
+  per host, resumed across three host-role restarts; the Wi-Fi link (about
+  9 MB/s per host) set the pace.
+- **Product fixes, CPU regression tests plus live exercise:** the vLLM engine
+  PATH now carries `/usr/local/cuda/bin` (FlashInfer needs `nvcc`; FP8-KV
+  graph capture failed without it); vLLM `--speculative-config` is admitted key
+  by key under host approval at deploy time and at launch (it was classed as a
+  path and could never be approved, so no vLLM speculation could deploy); a
+  source copy already verified on the host is reused by a new deployment
+  (activation was refused `model_source_pending`).
+- **Open, needs owner attention:** mllm cannot bound FlashInfer JIT parallelism
+  (`MAX_JOBS` is outside the engine environment allowlist); the CUTLASS
+  fused-MoE JIT ran both hosts out of memory once (user session killed, hosts
+  not rebooted). Ling on vLLM needs checkpoint code (`trust_remote_code`), which
+  was not enabled. `deploy --activate --wait` on a source still downloading
+  returns `model_source_pending` at once instead of waiting. SGLang engine
+  output is only captured with `--debug-engine-logs`.
+
 ## Context fitted to the KV grant; standalone rendezvous root — 2026-09-25 (branch `fix/context-fit-standalone-rdzv`)
 
 Two owner decisions of 2026-09-25. CPU tests only; live proof on real engines
