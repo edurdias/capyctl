@@ -1,47 +1,35 @@
 # Discrete NVIDIA GPU support and a network inference endpoint — design
 
-Date: 2026-09-25. Status: owner decisions A and B (2026-09-25) are binding; this
-document turns them into a design. It will be recorded as ADR 0019, amending SPEC
-§7.2, §13.3, §15.2, §16.2 and §16.5, and §20 T26 and T37. Implementation plan:
+Date: 2026-09-25. Status: owner decisions A and B (2026-09-25) are binding, and the
+owner decided the open points on PR #38 the same day (below); this document turns
+them into a design. It will be recorded as ADR 0019, amending SPEC §6.2, §7.2,
+§13.3, §15.1, §15.2, §16.2 and §16.5, and §20 T26 and T37. Implementation plan:
 `docs/plans/2026-09-25-discrete-gpu-and-network-endpoint.md`.
 
-## Owner checks
+## Owner decisions on PR #38 (owner-decided, 2026-09-25)
 
-These points are not settled by decisions A and B. The design below takes the
-recommended option in each case; the owner should confirm or overrule before the
-matching plan task starts.
-
-1. **Existing standalone documents keep a loopback inference listener.** Every
-   generated `standalone.yaml` written before this change states
-   `inference.bind: "127.0.0.1:8443"` explicitly. Honouring it (recommended) means an
-   upgraded install stays on loopback and the new `0.0.0.0` default reaches only new
-   installs, plus a boot hint naming `--listen`. The alternative, treating that exact
-   generated value as "default" (as §16.5 already does for the legacy `tls` block),
-   silently widens exposure on upgrade. The same applies to an existing server
-   document. (Plan Task 11.)
-2. **Host-backed parking stays out of 0.1.0.** On a discrete host the fast park tier
-   (vLLM sleep level 1, SGLang `--enable-weights-cpu-backup`) is meaningful for the
-   first time, but no park path executes it today. Recommended: keep `deep` as the
-   only parking tier, and refuse `residency: host_backed` at resolution on every host
-   with `residency_unsupported:host_backed` until a later slice implements and
-   live-verifies it. (Plan Task 6.)
-3. **Multi-GPU hosts: explicit device selection only.** Publishing every GPU as its
-   own device and memory domain, and letting a deployment name the device
-   (`devices: [{id: gpu1}]`), is cheap and is in this design. Automatic choice of a
-   free GPU by the scheduler is not: a multi-GPU host without an explicit device in
-   the deployment places on `gpu0` only. Confirm that this is "cheap enough", or ask
-   for a clear refusal of multi-GPU hosts instead. (Plan Tasks 2 and 3.)
-4. **Live check on the 16 GB discrete-GPU laptop host.** The live rows need new
-   vLLM and SGLang virtual environments (x86_64 wheels) on that host, and live
-   engine work on it. `AGENTS.md` today authorizes live work only on the two lab
-   hosts and forbids new environments beyond the listed exceptions. The owner update
-   of 2026-09-25 asks for this check; the plan records it in `AGENTS.md` as a named
-   exception (Task 15) and needs the owner to confirm that wording.
-5. **Default for `mllm start server`'s inference listener.** Decision B names both
-   roles. For a server the generated template changes to `0.0.0.0:8443`; management,
-   bootstrap and control listeners are unchanged. Confirm that the server's
-   generated default should move as well (recommended: yes, same rules as
-   standalone).
+1. **Existing configurations migrate to `0.0.0.0`.** On upgrade, a server or
+   standalone document whose inference listener is the old loopback default moves
+   to `0.0.0.0:8443`. The API key stays required unless the document opts out. The
+   upgrade prints a clear one-time notice, and the release notes say how to narrow
+   the address again (`--listen` or the document). (§9; plan Tasks 14 and 15.)
+2. **The host-RAM park tier is in 0.1.0.** A `host_backed` park keeps the weights in
+   pinned host RAM and a wake copies them back: vLLM sleep level 1, SGLang's memory
+   saver with `--enable-weights-cpu-backup`. The host-RAM copy is charged in the
+   ledger on the system domain and bounded by its `parked_limit`. `deep` (drop the
+   weights) stays. The tier is chosen per deployment, with `host_backed` as the
+   default on a discrete-GPU host. (§5; plan Tasks 6, 11 and 12.)
+3. **mllm picks the GPU on a multi-GPU host.** Each GPU is its own device-memory
+   domain; placement chooses the GPU with room, evicting on that GPU when needed;
+   the launch sets `CUDA_VISIBLE_DEVICES` to the chosen GPU. A deployment may pin a
+   GPU with `devices: [{id: gpuN}]`. (§7; plan Task 7.)
+4. **Live work on the maintainers' local machines.** `AGENTS.md` authorizes live
+   work on the maintainers' local machines, a discrete-GPU laptop included: no
+   driver, CUDA or system-package changes, engine virtual environments only in the
+   home directory. (Plan Task 19.)
+5. **The server's generated inference listener is also `0.0.0.0:8443`**, with the
+   same rules as standalone. Management, bootstrap and control listeners are
+   unchanged. (§9; plan Task 14.)
 
 ## Problem
 
@@ -105,7 +93,8 @@ device-memory domain on standalone and on remote hosts, one GPU per model (TP st
 parked). Eviction, parking (deep park frees device memory; host RAM limits govern
 parked and host-KV bytes) and switching must work on a 24–32 GB RTX card. Multi-GPU
 hosts: select one GPU per model by device id if cheap, otherwise refuse clearly
-with the plan for later.
+with the plan for later. (Refined on PR #38: mllm picks the GPU; the host-RAM park
+tier is included; see the owner decisions above.)
 
 B. The server and standalone inference endpoint listens on `0.0.0.0` by default (the
 port is unchanged) so other machines and Tailscale peers can reach it. An API key
@@ -220,6 +209,7 @@ one domain for the selected devices. On a host whose selected device maps to a
 |---|---|---|
 | cold | startup peak (≥ request) | engine host overhead |
 | ready, parking, wake | request | engine host overhead |
+| parked (`host_backed`) | parked device residue | engine host overhead + weights copy (parked residue category) |
 | parked (`deep`) | parked device residue | engine host overhead |
 | parked (`restart_only`) | 0 | 0 |
 
@@ -234,6 +224,12 @@ one domain for the selected devices. On a host whose selected device maps to a
   `PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES = 1 GiB`; measured replaces it the same
   way. The existing `PARKED_RESIDUAL_PLACEHOLDER_BYTES` (2 GiB) stays for unified
   hosts.
+- The `host_backed` weights copy is the checkpoint's weight bytes (ADR 0014
+  checkpoint facts), charged on the system domain as parked residue, so it counts
+  against the system `parked_limit` as well as `managed_limit`. SGLang's
+  `--enable-weights-cpu-backup` keeps that copy for the engine's whole life, so for
+  an SGLang `host_backed` deployment the copy is charged in every phase, not only
+  when parked; vLLM level 1 allocates it only while asleep.
 - A KV-cache host-memory budget (`kv_cache.per_host.host_memory_budget`) charges the
   system domain's `host_kv_bytes`, never the device domain.
 - A deployment that declares `resources:` explicitly must name both domains on a
@@ -248,9 +244,14 @@ discrete host. It states `engine_config.memory.request` instead and omits
 `resources:`, so phases derive as above. The request is
 `weights × 1.10 + kv_cache`, with `kv_cache` defaulting to `min(4 GiB, 25 % of the
 device managed limit)`; the weights come from the checkpoint facts ADR 0014 already
-reads. A request larger than the device managed limit is refused at deploy with
-`insufficient_device_memory` and the numbers, before anything is stored. The
-unified template is unchanged.
+reads. vLLM's request is at least `0.75 ×` the device total, because vLLM 0.29
+with CUDA graphs needs `--gpu-memory-utilization ≥ 0.75` to start a 4B model on a
+16 GB card (observed on the 16 GB discrete-GPU laptop host). A request larger than
+the device managed limit is refused at deploy with `insufficient_device_memory` and
+the numbers, before anything is stored. The template states `residency:
+host_backed` on a discrete host when the host has deep parking on and the weights
+fit the system `parked_limit`; otherwise `deep`; `restart_only` when deep parking
+is off. The unified template is unchanged.
 
 ### 4. Observation, admission and switching
 
@@ -292,25 +293,60 @@ unified template is unchanged.
 
 ### 5. Parking on a discrete host
 
-- **Deep** (the default, ADR 0012) frees device memory: vLLM sleep level 2 and
-  SGLang's memory saver release weights and KV. The parked phase charges the device
-  residue and the host overhead only, so a parked model does not block the next
-  one on the GPU. `parked_limit` on the device domain bounds how many parked
-  engines' contexts may sit on the card; `max_parked` still bounds the count.
-- **Host-backed** stays unimplemented in 0.1.0 (owner check 2). Refusing it at
-  resolution with `residency_unsupported:host_backed` replaces today's state, where
-  it resolves on a `distinct` domain but no park path executes it.
-- **Restart-only** is unchanged: it never parks, and eviction stops it.
+Three tiers, chosen per deployment (`residency`, SPEC §6.2, ADR 0010):
+
+| Tier | Park | Wake | Device after park | Host RAM after park |
+|---|---|---|---|---|
+| `host_backed` | weights copied to pinned host RAM, KV dropped | weights copied back, KV reallocated, prefix cache reset | residue only | weights copy |
+| `deep` | weights and KV dropped | weights reloaded from disk | residue only | none beyond overhead |
+| `restart_only` | never parks; eviction stops it | cold start | 0 | 0 |
+
+- **Default.** On a discrete host the standalone template and the documentation
+  examples use `host_backed` (wake is a host-to-device copy, several times faster
+  than a disk reload, ADR 0010 "What the engines actually do"). On a unified host
+  `host_backed` stays refused at resolution (ADR 0010 decision 5: it frees
+  nothing), and `deep` stays the default.
+- **vLLM `host_backed`**: launch with `--enable-sleep-mode` (as for `deep`); park is
+  `POST /sleep?level=1` and `/is_sleeping`; wake is `POST /wake_up?tags=weights`
+  (copies the weights back), then `POST /wake_up?tags=kv_cache`,
+  `POST /reset_prefix_cache`, `/is_sleeping` false, then the probe. There is no
+  `reload_weights` call; the adapter answers the reload step with `WeightsUsable`
+  from the level-1 restore's evidence, so the coordinator's persisted step
+  sequence is unchanged. The level is fixed by the deployment's residency, never
+  chosen at park time.
+- **SGLang `host_backed`**: launch with `--enable-memory-saver` and
+  `--enable-weights-cpu-backup`; park is `release_memory_occupation` for both tags
+  (the saver copies weights to its pinned host buffer); wake is
+  `resume_memory_occupation`, which restores the weights from that buffer. There is
+  no `update_weights_from_disk`; the reload step is answered from the restore's
+  evidence as for vLLM, then `flush_cache` and the probe. mllm's saver observer and
+  binding (`runtime/sglang_saver_binding.py`, `sglang_saver_residency.py`) refuse
+  `enable_weights_cpu_backup` today and must accept it for the weights tag of a
+  `host_backed` launch only.
+- **Accounting.** The parked phase charges the device residue, the engine host
+  overhead and, for `host_backed`, the weights copy on the system domain (§3). The
+  system `parked_limit` bounds the total of parked copies; `max_parked` still bounds
+  the count; the device `parked_limit` bounds parked CUDA contexts.
+- **When a copy does not fit.** The switch planner releases a victim by parking it
+  when its parked footprint fits the host after the switch, and by stopping it
+  otherwise (the same stop the planner uses for `restart_only`). A `host_backed`
+  park that would exceed the system `parked_limit` therefore becomes a stop, never
+  a silent `deep` park and never an overcommit. The status line says which
+  happened.
+- **Pinned memory.** Both engines pin the copy (page-locked). The system domain's
+  observed availability already reflects pinned pages; the ledger charge is the
+  authority, and the launch check refuses a `host_backed` launch whose copy does not
+  fit the system domain.
 
 ### 6. Engine launch on a discrete device
 
 - The guarded launcher already sets `CUDA_VISIBLE_DEVICES` to the device's physical
   UUID. With several devices, the device the deployment selected is the one set.
-- **vLLM** renders `--kv-cache-memory-bytes` from the grant (unchanged). On a
-  discrete device the adapter does not render `--gpu-memory-utilization`; vLLM 0.29
-  sizes the KV pool from the explicit bytes. The live check verifies that vLLM does
-  not refuse to start because another engine's parked context holds part of the
-  card.
+- **vLLM** renders `--kv-cache-memory-bytes` from the grant (unchanged) and, on a
+  discrete device, `--gpu-memory-utilization` equal to the device request divided
+  by the device total, rounded up to 0.01 and at least 0.75 (see §3). vLLM checks
+  that fraction of the card is free at start, so the launch check and the planner
+  must already have made that room; a parked engine's residue counts against it.
 - **SGLang** needs `mem_fraction_static` as a fraction of the device's total memory
   on a discrete device, not of `MemAvailable`. The agent passes the observed device
   total in the launch placement (a new field of the entry's closed launch spec,
@@ -318,28 +354,40 @@ unified template is unchanged.
   present; the unified path keeps `MemAvailable`. This closes ADR 0014 open issue 2
   for discrete devices, subject to the live check.
 
-### 7. Multi-GPU hosts
+### 7. Multi-GPU hosts: mllm picks the GPU
 
 - Every observed discrete GPU is published as device `gpuN` (N = the driver index at
   boot) with its own device domain `gpuN` and its physical UUID. The inventory
   publication stops withholding UUIDs when more than one device is present; each
   device entry carries its own.
-- A deployment selects its device by id (`devices: [{id: gpu1}]`); the derived
-  budget charges that device's domain. Without a `devices` entry, a standalone
-  deployment and the documentation examples use `gpu0`.
+- **Placement picks the device.** A deployment on a discrete host without a pinned
+  device is resolved once per device of the host (the derived budget names that
+  device's domain). Placement evaluates each (host, device) pair with the existing
+  `fits`, and picks, on the chosen host, the device where the instance fits with the
+  most headroom; ties break by device index. The placement result and the launch
+  command's resource plan carry the chosen device.
+- **Eviction is per device.** When no device fits, the switch planner runs
+  `choose_victims` per device and takes the device whose minimal victim set is
+  smallest, then whose victims were least recently used, then the lower index.
+  Only owners charged on that device's domain are candidates.
+- **Launch.** The agent sets the engine child's `CUDA_VISIBLE_DEVICES` to the chosen
+  device's physical UUID (the existing guarded mechanism), so the engine sees one
+  device as `cuda:0`. The chosen device is recorded with the instance; a stopped
+  instance prefers its last device the way it prefers its last host (ADR 0013 §4).
+- **Pinning.** `devices: [{id: gpuN}]` pins the device; placement then evaluates
+  only that device.
 - A deployment naming two or more devices, or `tensor_parallel > 1`, is refused
-  `multi_gpu_unsupported` with the message "one GPU per model in 0.1.0;
-  tensor-parallel and multi-device placement are planned after 0.1.0".
-- The scheduler does not choose among GPUs of one host. Automatic device choice is
-  the planned follow-up and needs its own design: device choice becomes part of the
-  placement result and the command's resource plan.
+  `multi_gpu_unsupported`: "one GPU per model in 0.1.0; tensor-parallel and
+  multi-device models are planned after 0.1.0".
 
 ### 8. Remote hosts and version skew
 
 - A host reports device domains in its inventory as `DomainObservation` entries with
   `kind: "device"` and the device id. That is a protocol addition, so it is a new
   ADR 0017 capability, `device_memory_domains`, declared by hosts that can observe
-  device memory.
+  device memory. The same capability covers the two other additions a discrete
+  host needs: the chosen device in a launch's resource plan (§7) and the split
+  resident figures (§4).
 - The server places a deployment whose footprint names a device domain only on a
   host that declared the capability; any other host refuses it with the typed
   reason `host_capability_missing:device_memory_domains`. An older host with a
@@ -360,10 +408,38 @@ listeners:
 ```
 
 - **Default bind.** New generated standalone and server documents state
-  `0.0.0.0:8443`. A document stating another address keeps it (owner check 1). The
-  standalone validator accepts any `bind` for `inference` that parses as a socket
-  address with a non-zero port and is not multicast; the management listener keeps
-  its loopback-only rule.
+  `0.0.0.0:8443`. The standalone validator accepts any `bind` for `inference` that
+  parses as a socket address with a non-zero port and is not multicast; the
+  management listener keeps its loopback-only rule.
+- **Migration of existing documents** (owner decision 1). At the first start of the
+  new release, a server or standalone document whose `listeners.inference.bind` is
+  exactly `127.0.0.1:8443` (the old generated default) is migrated to
+  `0.0.0.0:8443`:
+  - The document is rewritten once, atomically (write to a temporary file in the
+    same directory, `fsync`, rename), keeping the original beside it as
+    `<name>.pre-0.1.0` with the same mode. Only that one value changes: the
+    rewrite replaces the value's single occurrence in the text, so comments and
+    layout survive. If the value does not occur exactly once in the text, the
+    document is not rewritten; the role binds `0.0.0.0:8443` for this run and the
+    notice tells the operator to edit the line.
+  - A marker `<state_dir>/migrations/inference-bind-v1` records that the migration
+    ran. After it exists the document is never migrated again, so an operator who
+    sets `127.0.0.1:8443` back keeps it.
+  - The one-time notice, printed to stderr and the log at `warn` on that start:
+
+    ```
+    NOTICE: mllm 0.1.0 serves inference on all interfaces: 0.0.0.0:8443 (was 127.0.0.1:8443).
+    The API key is still required. Configuration updated: <path> (previous copy: <path>.pre-0.1.0).
+    To keep inference local, start with --listen 127.0.0.1:8443 or set listeners.inference.bind.
+    ```
+
+  - Any other address (a different loopback port, a tailnet address) is an
+    operator's choice and is never migrated. Authentication is never changed by the
+    migration.
+  - This is the one sanctioned rewrite of an administrator document; ADR 0019
+    amends SPEC §15.1 and R13 for it.
+- **Release notes** state the change, the notice, and both ways to narrow the
+  address.
 - **`--listen <addr:port>`** on `mllm start standalone` and `mllm start server`
   replaces the inference `bind` for that run (SPEC §15.2: a run-time override of an
   ordinary setting). `MLLM_STANDALONE_INFERENCE_ADDR` is kept and follows the same
@@ -431,14 +507,16 @@ listeners:
 | `unsupported_gpu_topology` | host and standalone start | integrated and discrete GPUs mixed, or two unified domains |
 | `missing_system_allocation` | resolution | explicit resources on a discrete host omit the system domain |
 | `multi_gpu_unsupported` | resolution | more than one device, or tensor parallelism, in one deployment |
-| `residency_unsupported:host_backed` | resolution | owner check 2 |
-| `host_capability_missing:device_memory_domains` | placement | an older host cannot report device memory |
+| `host_backed_unavailable` | resolution | `host_backed` on a unified host (existing ADR 0010 refusal, renamed code), or a build whose probe lacks sleep mode or the weights backup |
+| `host_capability_missing:device_memory_domains` | placement | an older host cannot report device memory or take a device choice |
+| `config_migration_failed` | start | the one-time listener migration could not write the document; the role still starts on `0.0.0.0:8443` and says so |
 
 CLI exit codes: `insufficient_device_memory` and `device_unobserved` use the
 existing insufficient-resources exit (4); `multi_gpu_unsupported`,
-`unsupported_gpu_topology` and `residency_unsupported:host_backed` use the existing
+`unsupported_gpu_topology` and `host_backed_unavailable` use the existing
 unsupported exit (5); `device_policy_mismatch` and `missing_system_allocation` use
-the invalid-configuration exit (2). No new exit number is introduced.
+the invalid-configuration exit (2). `config_migration_failed` is a warning, not an
+exit. No new exit number is introduced.
 
 ### 12. Testing
 
@@ -449,51 +527,65 @@ Deterministic (tagged with SPEC §20 IDs):
 
 - **T26** collector parsing: discrete rows, integrated `[N/A]` rows, malformed,
   duplicate, oversized and timed-out output; shape detection.
-- **T26** standalone host policy on a discrete fixture: system plus device domains,
-  limits from the table, device UUID per device; unified fixture unchanged
-  byte-for-byte.
-- **T26/T23** derived budgets: two allocations per phase; parked residue; explicit
-  resources without a system allocation refused.
-- **T27/T16** switching: two 8 GiB-weight models on a 16 GiB device with 61 GiB of
-  RAM — the planner chooses the first as victim; the launch check with the same
-  fixture refuses before the victim's release and admits after it.
+- **T26** standalone host policy on a discrete fixture (one and two GPUs); unified
+  fixture unchanged byte-for-byte.
+- **T26/T23** derived budgets for all three tiers; the SGLang `host_backed` copy in
+  every phase; explicit resources without a system allocation refused.
+- **T27/T16** switching: two models whose device requests do not fit together on a
+  16 GiB device with 61 GiB of RAM — the planner parks the first; the launch check
+  refuses before the release and admits after it. A `host_backed` victim whose copy
+  exceeds the system `parked_limit` is stopped, not parked.
+- **T27** GPU picker (Fake devices): two GPUs, the instance lands on the one with
+  room; both full, the device with the smaller victim set is chosen; a pinned
+  device is honoured; the chosen device reaches the launch's `CUDA_VISIBLE_DEVICES`.
+- **T20/T16** host-backed park and wake step sequences for both adapters against
+  Fake engines: level 1 sleep, no `reload_weights` or `update_weights_from_disk`
+  call, prefix cache reset, probe.
 - **T29** device observation missing or stale closes admission and keeps
   reservations.
 - **T34** capability gating: a host without `device_memory_domains` is refused
   typed; the command is never sent.
 - **T21/T37** listener and auth: default bind, `--listen`, loopback-only management,
-  `authentication: none` warning text on non-loopback and silence on loopback,
-  unauthorized request rejected on a `0.0.0.0` bind, no constant key.
-- **T02/T03** generated documents: new standalone and server templates; an existing
-  loopback document still starts on loopback.
-- Python: `static_fraction` against a device total; unified path unchanged.
+  `authentication: none` warning on non-loopback and silence on loopback, 401 on
+  every route without the key on a `0.0.0.0` bind, no constant key.
+- **T02/T03** generated documents; migration: the old default is rewritten once with
+  a backup and a marker and the notice; a second start does nothing; a different
+  loopback port is untouched; an unwritable document starts on `0.0.0.0` with
+  `config_migration_failed`; authentication never changes.
+- Python: `static_fraction` against a device total; the saver observer accepts the
+  weights backup only for a `host_backed` launch.
 
-Live (the 16 GB discrete-GPU laptop host, x86_64, RTX-class 16 GB card, 61 GB RAM;
-owner check 4). Two small instruct models whose derived device requests do not fit
-together in the device managed limit (for example a 4B model and a 3B model in
-bf16):
+Live, on the 16 GB discrete-GPU laptop host (single GPU, x86_64, 61 GB RAM), using
+the vLLM 0.29 and SGLang 0.5.20 virtual environments already in that host's home
+directory. vLLM needs `--gpu-memory-utilization` of at least 0.75 for a 4B model
+with CUDA graphs on this card (§3); SGLang there has no flashinfer, so its profile
+passes `--attention-backend triton`. Two small instruct models whose device
+requests do not fit together (a 4B and a 3B model, bf16):
 
-- **DG1** standalone vLLM: deploy both; request A, then B — A deep-parks, B serves;
-  request A — B parks, A wakes; `status` shows device-domain charges; `nvidia-smi`
-  confirms the parked engine's residue is within the placeholder.
-- **DG2** standalone SGLang: the same sequence with the memory saver.
-- **DG3** mixed: A on vLLM, B on SGLang, switching both ways.
-- **DG4** refusal: a model whose request exceeds the device limit is refused at
+- **DG1** vLLM `host_backed`: A, then B (A parks to host RAM), then A (B parks, A
+  wakes from host RAM); `status` shows the device and system charges and the
+  parked copy; wake time recorded.
+- **DG2** vLLM `deep`: the same sequence; wake time recorded for comparison.
+- **DG3** SGLang `host_backed` and `deep`: the same sequences.
+- **DG4** mixed: A on vLLM, B on SGLang, switching both ways.
+- **DG5** refusal: a model whose request exceeds the device limit is refused at
   deploy with `insufficient_device_memory`; nothing hangs.
-- **DG5** network: from a lab host over the tailnet, a request with the key
-  succeeds and one without is 401; with `--listen 127.0.0.1:8443` the peer cannot
-  connect; `authentication: none` on `0.0.0.0` prints the warning.
-- **DG6** remote host (if the laptop host runs a host role against a server): the
-  device domain appears in `mllm list hosts` and a deployment places and switches.
-  Optional for 0.1.0 if DG1–DG5 pass; recorded as pending otherwise.
+- **DG6** network and migration: upgrade a standalone install created by the
+  previous release — the notice appears once and the document is migrated; from
+  another machine on the tailnet a request with the key succeeds and one without is
+  401; `--listen 127.0.0.1:8443` makes the peer's connection fail;
+  `authentication: none` on `0.0.0.0` prints the warning.
+- **DG7** remote host (optional for 0.1.0): the laptop host runs a host role against
+  a server; `mllm list hosts` shows `gpu0`; a deployment places and switches.
 
-The GB10 lab hosts rerun one existing unified switching row to show no regression.
+The multi-GPU picker has no live row in this plan; it is covered by the CPU/Fake
+tests above. The GB10 lab hosts rerun one existing unified switching row to show no
+regression.
 
 ## Out of scope
 
 - Tensor parallelism and multi-device models (parked since the two-host program).
-- Automatic GPU choice on multi-GPU hosts (§7).
-- Host-backed parking (owner check 2).
+- Moving a running or parked instance to another GPU.
 - AMD, Intel and Apple GPUs; MIG partitions; containers.
 - TLS termination in mllm, per-client API keys, rate limiting.
 - Remote access to the management API.
