@@ -30,6 +30,45 @@ Local verification only: core 1070 reported, workspace 1764 passed (1 ignored), 
 clean with warnings denied across the workspace. CPU and mTLS transport tests are not
 qualification; no mixed-version fleet has run on the Sparks. Pending: a live rolling
 upgrade (server first, then host-a, then host-b) once a release carries this change.
+## Release candidate 0.1.0-rc.3 — build and live pass, 2026-09-24 (branch `docs/rc3-live`)
+
+PR #13 (the rc.2 live findings) merged as 603ab7f and PR #14 (version bump,
+plus the pre-release install docs and installer message) as 17469dd. Draft
+pre-release `v0.1.0-rc.3` (unpublished; the owner publishes; the rc.2 draft is
+untouched) targets `main` at 17469dd: `mllm-0.1.0-rc.3-linux-x86_64.tar.gz`
+(control-host, sha256 `4853c80e…d370`), `mllm-0.1.0-rc.3-linux-aarch64.tar.gz` (built
+natively on host-a, nice 19, sha256 `fb516655…20f0`), `install.sh`
+(`43dd6183…2879`) and `SHA256SUMS`. Both passed `scripts/verify-packaging.sh`
+on their own architecture; `BUILDINFO` commit 17469dd, not dirty, runtime
+manifest `80044870…ddee0`.
+
+Live pass with the installed release binaries only (`install.sh` from a
+`file://` mirror of the draft, systemd user units, fresh state, no
+`runtime_dir`). This time the host state used the documented default layout:
+`~/.local/state/mllm/host`, with the host document at
+`~/.config/mllm/host.yaml` (the unit's default `MLLM_CONFIG`, no env file).
+Evidence: `target/live/rc3/`.
+
+| Check | Live verdict |
+|---|---|
+| User state root (fix 1 of #13) | pass on both Sparks: `~/.config/mllm` created first, no `~/.local/state/mllm`; `install.sh --systemd host` printed `created ~/.local/state/mllm (0700)`; after `init`, `join` and the unit's start it is still a real 0700 directory holding `host/`, `tmp/` and the engine runtime; no new "compatibility symlink" journal line |
+| Refused park on a drain-only host (fix 2 of #13) | pass: host-b on rc.1 against the rc.3 server showed `upgrade_required`; v17-4 kept serving; `park deployment v17-4` was refused `park_refused` (`host_upgrade_required`, before any effect); the deployment was `reconciling` for one sample and `ready`, dispatch open, within about 2 s, serving 42, same engine PIDs and start ticks, no host session loss or agent restart. rc.2 reproduced a permanent 503 here |
+| Upgrade host-b back to rc.3 | pass: `supported`, state root still a real directory |
+| M73 v92-4, s92-4 | pass: launched from `~/.local/state/mllm/host/runtime`, loopback only, unkeyed 401, stop and restart clean |
+| M31 v17-4 ↔ s17-4, tight host-b, 1 cycle deep | pass: park and wake on the same processes |
+| M28 s92-14, three runs | pass 3 of 3 (89% of the Ready drop released each time); `native_observation_failed` did not recur (0 lines in the host journal). The single rc.2 occurrence stays unexplained |
+
+Local (CPU only) for #14: core 1004, workspace all-targets 1767, Clippy clean
+with warnings denied, `scripts/test-install.sh` passed including the new
+pre-release case. The CPU tests prove the fixes' logic; only the rows above
+prove them on the Sparks, and none of this qualifies an engine recipe beyond
+the q4/q14 fixtures exercised.
+
+After the pass every role and unit was stopped and uninstalled. Both Sparks
+have no engine, role or GPU compute process, no rendezvous directory, no
+`~/.local/state/mllm`, `~/.config/mllm` or `~/mllm-rc3-*`; the server state
+stays on control-host under `~/mllm-rc3-server` (invitation files removed).
+
 ## Release candidate 0.1.0-rc.2 — live validation, 2026-09-24 (branch `fix/rc2-live-findings`)
 
 PR #10 (soak fixes and harness) and PR #11 (version skew, ADR 0017) merged,
