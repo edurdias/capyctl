@@ -4,7 +4,26 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
-## Refusal codes and `start --evict --wait` for several instances — 2026-09-25 (branch `fix/refusal-codes-evict-wait`)
+## Flaky parallel tests and leaked stand-in engines — 2026-09-25 (branch `fix/flaky-parallel-tests`)
+
+CPU-only test fix; nothing here is live-proven or qualifies an engine recipe.
+
+- Root cause of the intermittent failures (launcher group observation, agent
+  `journal` and `native_vllm` readiness): `observe_process_group` failed with
+  `Visibility` whenever any unrelated process on the host exited between the
+  `/proc` listing and its `stat` read. Under a parallel test run that was nearly
+  every scan (a churn regression test failed 200 of 200 observations). It now
+  skips a pid that no longer exists, as `scan_group_by_pgid` already did; any
+  other unreadable process still fails closed, and a member leaving between the
+  two snapshots is still `Changed`. The same failure applied to production
+  observations on a busy host.
+- Leak: `ready_deep_park` asserted readiness before its callers installed the
+  reap guard, so a failed readiness left the stand-in vLLM running (orphans found
+  on control-host). The guard is now part of the test `Host`, and the stand-in ends its
+  own group if the test process or its fixture directory disappears.
+- Evidence: workspace at default threads failed 2 of 10 runs before the fix;
+  launchers + agent at 32 threads failed 3 of 10 before (each failure leaked an
+  engine) and 0 of 20 after, with no new leaks.
 
 Owner decisions 2026-09-25, both implemented; CPU and Fake-engine tests only, not
 live-proven on the Sparks.
