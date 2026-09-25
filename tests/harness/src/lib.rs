@@ -8,18 +8,18 @@
 //! implementation these checks were developed against, and passing against it
 //! is never qualification of a native recipe.
 
-pub mod f2_pressure;
-pub mod f2_monitor;
-pub mod f2_metrics;
-pub mod f2_bounds;
-pub mod f2_correctness;
-pub mod f2_collected;
-pub mod f2_streamed;
-pub mod f2_sse;
-pub mod f2_timing;
-pub mod f2_records;
 #[cfg(target_os = "linux")]
 pub mod f2_artifacts;
+pub mod f2_bounds;
+pub mod f2_collected;
+pub mod f2_correctness;
+pub mod f2_metrics;
+pub mod f2_monitor;
+pub mod f2_pressure;
+pub mod f2_records;
+pub mod f2_sse;
+pub mod f2_streamed;
+pub mod f2_timing;
 
 use mllm_adapters::{
     AdapterError, EngineAdapter, HandleStatus, Launcher, MemberRef, OwnedHandle, ParkLevel, Phase,
@@ -60,7 +60,10 @@ impl CheckResult {
 /// Benign probe command used by launcher checks. Fake launchers ignore the
 /// command; real launchers under conformance must be able to spawn it.
 fn probe_command() -> RenderedCommand {
-    RenderedCommand { argv: vec!["true".into()], env: Default::default() }
+    RenderedCommand {
+        argv: vec!["true".into()],
+        env: Default::default(),
+    }
 }
 
 /// Runs the core conformance checks over any adapter + launcher pair.
@@ -109,8 +112,13 @@ pub async fn run_conformance(
     launcher: &dyn Launcher,
     gate_mode: ParkGateMode,
 ) -> Vec<CheckResult> {
-    let member = MemberRef { deployment_id: "conformance".into(), member_id: "probe".into() };
-    let req = RequestRef { id: "conformance-probe".into() };
+    let member = MemberRef {
+        deployment_id: "conformance".into(),
+        member_id: "probe".into(),
+    };
+    let req = RequestRef {
+        id: "conformance-probe".into(),
+    };
 
     vec![
         check_readiness_gating(adapter, &member).await,
@@ -235,7 +243,11 @@ async fn check_park_policy_gate(
 
     CheckResult {
         name: "park_policy_gate",
-        status: if l1_ok && l2_ok { CheckStatus::Pass } else { CheckStatus::Fail },
+        status: if l1_ok && l2_ok {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
         detail: format!("level-1: {l1:?}; level-2: {l2:?}"),
     }
 }
@@ -269,7 +281,10 @@ async fn check_cancellation_uncertainty(
 fn check_handle_ownership(launcher: &dyn Launcher) -> CheckResult {
     // Invariant 1: a handle to a process this launcher never spawned must
     // not verify as Valid.
-    let stranger = OwnedHandle { pid: u32::MAX, start_identity: 0 };
+    let stranger = OwnedHandle {
+        pid: u32::MAX,
+        start_identity: 0,
+    };
     if matches!(launcher.verify_handle(&stranger), HandleStatus::Valid) {
         return CheckResult {
             name: "handle_ownership",
@@ -346,11 +361,11 @@ fn check_handle_ownership(launcher: &dyn Launcher) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mllm_testkit::{FakeEngine, FakeLauncher};
     use mllm_adapters::{
         CancellationOutcome, EngineState, ExitReport, LauncherError, ParkOutcome, Quiescence,
         ReloadOutcome, RestoreOutcome, WorkObservation,
     };
+    use mllm_testkit::{FakeEngine, FakeLauncher};
 
     #[tokio::test]
     async fn fake_engine_passes_full_conformance_suite() {
@@ -368,9 +383,16 @@ mod tests {
         let adapter = FakeEngine::new();
         let launcher = FakeLauncher::new().with_pid_reuse();
         let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
-        let ownership = results.iter().find(|r| r.name == "handle_ownership").unwrap();
+        let ownership = results
+            .iter()
+            .find(|r| r.name == "handle_ownership")
+            .unwrap();
         assert!(ownership.passed(), "{}", ownership.detail);
-        assert!(ownership.detail.contains("StaleReused"), "{}", ownership.detail);
+        assert!(
+            ownership.detail.contains("StaleReused"),
+            "{}",
+            ownership.detail
+        );
     }
 
     /// An adapter that fabricates readiness: always claims Ready while its
@@ -380,7 +402,11 @@ mod tests {
     #[async_trait::async_trait]
     impl EngineAdapter for FabricatedReadyAdapter {
         async fn inspect(&self, _: &MemberRef) -> Result<EngineState, AdapterError> {
-            Ok(EngineState { phase: Phase::Startup, retained_bytes: 0, build_fingerprint: None })
+            Ok(EngineState {
+                phase: Phase::Startup,
+                retained_bytes: 0,
+                build_fingerprint: None,
+            })
         }
         async fn render_plan(
             &self,
@@ -421,9 +447,16 @@ mod tests {
         let adapter = FabricatedReadyAdapter;
         let launcher = FakeLauncher::new();
         let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
-        let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
+        let readiness = results
+            .iter()
+            .find(|r| r.name == "readiness_gating")
+            .unwrap();
         assert_eq!(readiness.status, CheckStatus::Fail);
-        assert!(readiness.detail.contains("fabricated"), "{}", readiness.detail);
+        assert!(
+            readiness.detail.contains("fabricated"),
+            "{}",
+            readiness.detail
+        );
     }
 
     /// A real adapter whose engine is briefly unreachable: readiness probes
@@ -474,7 +507,10 @@ mod tests {
         let adapter = UnreachableAdapter;
         let launcher = FakeLauncher::new();
         let results = run_conformance(&adapter, &launcher, ParkGateMode::Level2Only).await;
-        let readiness = results.iter().find(|r| r.name == "readiness_gating").unwrap();
+        let readiness = results
+            .iter()
+            .find(|r| r.name == "readiness_gating")
+            .unwrap();
         assert_eq!(readiness.status, CheckStatus::Warn);
         assert!(!readiness.passed());
     }
@@ -485,10 +521,18 @@ mod tests {
 
     impl Launcher for ReuseObliviousLauncher {
         fn spawn(&self, _: &RenderedCommand) -> Result<OwnedHandle, LauncherError> {
-            Ok(OwnedHandle { pid: 7, start_identity: 1 })
+            Ok(OwnedHandle {
+                pid: 7,
+                start_identity: 1,
+            })
         }
         fn terminate(&self, _: &OwnedHandle, _: Duration) -> Result<ExitReport, LauncherError> {
-            Ok(ExitReport { pid: 7, exit_code: Some(0), signal: None, killed: true })
+            Ok(ExitReport {
+                pid: 7,
+                exit_code: Some(0),
+                signal: None,
+                killed: true,
+            })
         }
         fn verify_handle(&self, h: &OwnedHandle) -> HandleStatus {
             if h.pid == 7 {
@@ -504,6 +548,10 @@ mod tests {
         let launcher = ReuseObliviousLauncher;
         let result = check_handle_ownership(&launcher);
         assert_eq!(result.status, CheckStatus::Fail);
-        assert!(result.detail.contains("PID reuse undetected"), "{}", result.detail);
+        assert!(
+            result.detail.contains("PID reuse undetected"),
+            "{}",
+            result.detail
+        );
     }
 }
