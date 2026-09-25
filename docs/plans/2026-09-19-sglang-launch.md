@@ -189,7 +189,7 @@
 **Files:**
 - Create: `crates/mllm-cli/tests/live_sglang.rs` — scenarios: SGL1 launch (Ready), SGL2 one routed inference, SGL3 stop with group proven gone + memory returns. Pattern: `crates/mllm-cli/tests/live_vllm.rs`, env `MLLM_SGLANG_BIN` (venv `~/mllm-sglang-f2-venv/bin/sglang`), `MLLM_MODELS_ROOT=~/models`, engine `qwen3-4b-instruct`, SGLang 0.5.19.
 - Modify: `scripts/live/run-on-spark.sh` — build `live_sglang` too and run it after `live_vllm` (same pre-flight, one thread).
-- Modify: `docs/runbooks/spark-live-f2.md` — append the SGLang evidence entry from the template.
+- Modify: `docs/runbooks/live-f2.md` — append the SGLang evidence entry from the template.
 
 - [ ] **Step 1:** Implement the test file mirroring `live_vllm.rs` shapes (guarded by `MLLM_SGLANG_BIN` so CPU runs skip).
 - [ ] **Step 2:** `cargo test -p mllm-cli --test live_sglang` compiles and skips off-host.

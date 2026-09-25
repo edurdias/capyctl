@@ -164,7 +164,7 @@ host_clean() { # host_clean <host> [port]
   rsh "$host" "echo '## engine procs'; pgrep -af '$ENGINE_PGREP' | grep -vE 'pgrep|tailscaled|bash -c' && echo LEFTOVER_ENGINE; \
 echo '## compute apps'; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | grep . && echo LEFTOVER_GPU; \
 echo '## port ${port:-none}'; [ -n '$port' ] && ss -ltn | grep -E ':$port\\b' && echo LEFTOVER_PORT; \
-echo '## rendezvous'; ls -d /tmp/mllm-rdzv-* $RRD/host/rendezvous/* 2>/dev/null && echo LEFTOVER_RDZV; true"
+echo '## rendezvous'; ls -d /tmp/mllm-rdzv-* $RRD/host/rendezvous/* 2>/dev/null | grep . && echo LEFTOVER_RDZV; true"
 }
 
 # host_idle <host>: host_clean as a precondition; fails on any leftover.

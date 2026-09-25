@@ -840,6 +840,43 @@ CREATE TABLE IF NOT EXISTS host_versions(
 );
 "#;
 
+/// v35 (ADR 0018 §4): profile retirements. A row holds (host, profile) out of
+/// placement from the transaction that wrote it; `confirmed` means the server
+/// found no instance of the profile left on the host. Its stops are recorded
+/// so progress is judged on their evidence. Deleted when cancelled, refused,
+/// ended unconfirmed, expired, or when the host's re-publication without the
+/// profile is accepted.
+pub const SCHEMA_V35: &str = r#"
+CREATE TABLE IF NOT EXISTS profile_retirements(
+  host_id TEXT NOT NULL CHECK(length(host_id) BETWEEN 1 AND 128),
+  profile TEXT NOT NULL CHECK(length(profile) BETWEEN 1 AND 64),
+  retire_key TEXT NOT NULL CHECK(length(retire_key) BETWEEN 1 AND 128),
+  state TEXT NOT NULL CHECK(state IN ('retiring','confirmed')),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0),
+  deadline_ms INTEGER NOT NULL CHECK(deadline_ms>=recorded_at_ms),
+  PRIMARY KEY(host_id, profile)
+);
+CREATE TABLE IF NOT EXISTS profile_retirement_stops(
+  host_id TEXT NOT NULL,
+  profile TEXT NOT NULL,
+  operation_id TEXT NOT NULL REFERENCES operations(id),
+  PRIMARY KEY(host_id, profile, operation_id),
+  FOREIGN KEY(host_id, profile) REFERENCES profile_retirements(host_id, profile) ON DELETE CASCADE
+);
+"#;
+
+/// v36 (ADR 0018 §4, §5; review decision I2/I3): the profiles standalone's
+/// embedded host publishes now. The embedded host is not enrolled, so it has
+/// no approved publication; this row plays that part for placement: a
+/// profile it no longer lists takes no new instance, as on a server.
+pub const SCHEMA_V36: &str = r#"
+CREATE TABLE IF NOT EXISTS embedded_host_publications(
+  host_id TEXT PRIMARY KEY CHECK(length(host_id) BETWEEN 1 AND 128),
+  profiles_json TEXT NOT NULL CHECK(json_valid(profiles_json) AND json_type(profiles_json)='array'),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

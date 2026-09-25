@@ -22,7 +22,7 @@ Install deviations (owner-visible, no silent decisions): `/opt` is root-owned an
 requires a password; the venv lives in the user's home. The system Python lacks
 `Python.h`; vLLM's `instanttensor` dependency needs C headers, so the venv uses a
 uv-managed Python (3.12.14, headers included). Both recorded in
-`docs/runbooks/spark-vllm-env.md`.
+`docs/runbooks/vllm-env.md`.
 
 ## 2. Doctor capture + recipe freeze (2026-09-12, live)
 
@@ -72,7 +72,7 @@ pre-listen unreachability = Initializing (not crash), engine log capture.
 The initial correctness results below used the default loader. A subsequent
 **host-a-only eager-loader qualification** reduced median wake-to-response to
 7.5s while preserving deep park, at about 8 GiB extra temporary loading memory.
-See [the matched measurements and limits](spark-deep-wake-optimization.md).
+See [the matched measurements and limits](deep-wake-optimization.md).
 
 **PASSED live (2026-09-12): three level-2 park/reload cycles with authenticated
 routed inference after every reload, stock switching, default denial, and

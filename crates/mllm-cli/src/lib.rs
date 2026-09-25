@@ -2,6 +2,7 @@ pub mod client;
 mod client_journal;
 pub mod device_inventory;
 pub mod drain;
+pub mod engine;
 pub mod grammar;
 pub mod host_observation;
 pub mod managed_runtime;
@@ -13,4 +14,6 @@ pub mod revoke;
 pub mod roles;
 pub mod shutdown;
 pub mod standalone_config;
+// ADR 0018 §5: standalone's engine add, remove and list.
+pub mod standalone_engines;
 pub mod validate;

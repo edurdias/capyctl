@@ -70,6 +70,10 @@ host_short() {
 short_host() {
   case $1 in a) echo "$HOST_A" ;; b) echo "$HOST_B" ;; *) die "unknown host code $1" ;; esac
 }
+# A row's host argument: the code a or b, or a configured host name.
+resolve_host() {
+  case $1 in a|b) short_host "$1" ;; "$HOST_A"|"$HOST_B") echo "$1" ;; *) die "unknown host $1 (use a, b, $HOST_A or $HOST_B)" ;; esac
+}
 # Each host's vLLM environment. Only the environments the owner authorized are
 # named in hosts.local.env; no other environment on a host is used.
 vllm_venv() {
@@ -145,6 +149,15 @@ load_run() {
   # rows then only need the harness scripts under MLLM_REMOTE_TREE.
   MLLM=${MLLM_LOCAL_BIN:-$LRD/mllm}                          # the server binary
   RBIN=${MLLM_REMOTE_BIN:-$REMOTE_TREE/target/release/mllm}  # the host binary
+}
+
+# ADR 0018 (row ENG4): one host may run another binary than the rest, e.g. an
+# rc.3 agent beside new ones. MLLM_REMOTE_BIN_a / MLLM_REMOTE_BIN_b override
+# RBIN for that host only.
+rbin() { # rbin <host>
+  local var
+  var="MLLM_REMOTE_BIN_$(host_short "$1")"
+  printf '%s\n' "${!var:-$RBIN}"
 }
 
 save_run_var() { # save_run_var NAME VALUE

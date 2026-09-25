@@ -40,7 +40,7 @@ measurement: no cache-drop operation is performed.
 This workload differs from the earlier 8-token test: it adds an initial
 inference and explicit generation controls. Its 4B baseline is the comparison
 point for larger models; it does not replace the measurements in
-[the eager-loader optimization report](spark-deep-wake-optimization.md).
+[the eager-loader optimization report](deep-wake-optimization.md).
 
 ## Completed measurements
 

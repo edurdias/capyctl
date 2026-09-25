@@ -613,6 +613,9 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
         // Owner decision 2026-09-25: no allowed host is eligible for
         // placement; neither a capacity block nor the operator's input.
         "host_ineligible" => "host_ineligible",
+        // ADR 0018 §7: the deploy named a runtime profile no allowed host
+        // publishes; nothing was stored.
+        "profile_not_published" => "profile_not_published",
         "reconciliation_required" => "unreconciled",
         "unsupported_capability" => "unsupported",
         "not_found" => "not_found",

@@ -180,8 +180,8 @@ Deleted, because their subject is the deleted code:
 `docs/plans/2026-09-16-state-machine-owns-recovery.md` once the new plan
 replaces it. `f2-planning-index.md` entries are removed. Git keeps the history.
 
-Kept unchanged: the hardware evidence runbooks `spark-qualification-f1.md`,
-`spark-model-size-qualification.md`, `spark-deep-wake-optimization.md`, which record
+Kept unchanged: the hardware evidence runbooks `qualification-f1.md`,
+`model-size-qualification.md`, `deep-wake-optimization.md`, which record
 what ran on `host-a`; and the executed historical plans f2a1 to f2b.
 
 Amended in one place each:

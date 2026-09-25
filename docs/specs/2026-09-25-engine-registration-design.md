@@ -8,6 +8,9 @@ fails fast; detection also scans the home directory's top level; removal while t
 role is unreachable is refused. Build starts after the v0.1.0-rc.4 soak. It will be
 recorded as ADR 0018, amending SPEC §4.2 and §15.
 
+Implementation status: implemented on `feat/engine-registration`;
+CPU/Fake-tested; live rows ENG1–ENG4 pending.
+
 ## Problem
 
 mllm uses engines the user has already installed, but registering one is manual:
@@ -167,9 +170,17 @@ host, then deploy again. Deployments are never re-resolved after `engine add`.
 
 **Local control channel.** The agent (host, or the standalone role) listens on
 `<state_dir>/control.sock`, a Unix socket with mode `0600` whose connections are
-accepted only from the user id that runs mllm (checked with `SO_PEERCRED`). It
-carries only engine add, remove and list requests. It offers no other control path
-and never reaches an engine.
+accepted only from the user id that runs mllm and from root, checked with
+`SO_PEERCRED`. A root peer is trusted only as the owner of the socket's
+private (0700) directory — the role's service user under the system units, so
+`sudo mllm engine …` reaches the role it is meant to. It carries only engine
+add, remove and list requests. It offers no other control path and never
+reaches an engine.
+
+As implemented, the role never writes `engines.yaml` itself (controller
+ruling C1): `add` writes the file and then asks the role to reload, in that
+order, below; `remove` asks the role to retire and confirm first and only
+then writes the file, in a different order — see Removal.
 
 **Add flow.**
 
@@ -198,26 +209,69 @@ with it. Nothing else changes for old peers.
 
 ## Removal
 
-Two phases, so no placement can slip in between the check and the removal:
+The running role never writes `engines.yaml`; only the CLI does (controller
+ruling C1). Two phases, so no placement can slip in between the check and the
+removal:
 
-1. The agent asks the server to retire the profile.
-2. The server stops new placements on that profile for this host and checks
-   references.
-   - No deployment on this host uses it: the server confirms.
-   - Some do, without `--drain`: the retirement is cancelled and refused
-     `profile_in_use` with the list; placements on the profile resume.
-   - Some do, with `--drain`: the server stops them through the normal stop path,
-     waits for stop evidence for every one, then confirms. Uncertain stops keep
-     their accounting and the retirement waits, at most 900 s (the drain window);
-     it never confirms on a guess, and at the bound it ends unconfirmed with
-     `profile_in_use` naming what is unsettled.
-3. After confirmation the agent removes the profile from `engines.yaml` and
-   re-publishes.
+1. The CLI asks the role to retire the profile; the role asks the server
+   (`RetireProfile` on its session, or the embedded host in standalone). In
+   one transaction the server writes a durable retirement for (host,
+   profile), which placement excludes from then on, and names every
+   deployment instance on that host holding a runtime of that profile.
+   - None: the retirement confirms at once.
+   - Some, without `--drain`: the retirement is deleted in the same
+     transaction and the request is refused `profile_in_use` with the list;
+     placement resumes.
+   - Some, with `--drain`: each is stopped through the normal stop path
+     (drain up to `switching.drain_timeout`, then terminate, gone evidence
+     required); the retirement confirms only when every stop succeeded and a
+     fresh enumeration is empty. An unsettled or failed stop keeps its
+     accounting; at the drain window (900 s) the retirement ends unconfirmed
+     and the CLI reports `profile_in_use` naming what is unsettled.
+2. The role answers `remove` once the retirement is confirmed, and writes
+   nothing itself.
+3. The CLI rewrites `engines.yaml` without the profile and sends `add`; the
+   role re-publishes, and that publication transaction deletes the
+   retirement. Any accepted publication — startup or live — clears the
+   confirmed retirement of every profile it no longer lists, so a host
+   restart cannot strand a confirmed row.
 
-A profile marked `not published` (never accepted by the server) is removed
-locally without the server round trip. A published profile is never removed while
-the role is unreachable: `engine remove` then writes nothing and reports
-`agent_unreachable`.
+A retirement keeps the key it was first written under until it is cleared, so
+a retried `remove` — after a lost answer, a dropped session, a crash between
+the confirmation and the CLI's write, or a failed reload — resumes the same
+retirement and finishes the removal instead of conflicting with it; a
+retirement still draining is resumed as draining. A profile the role never
+published is removed from `engines.yaml` without a retirement (no server
+round trip). A published profile is never removed while the role is
+unreachable: `engine remove` writes nothing and reports `agent_unreachable`.
+
+A `remove` the role took but did not answer — the connection closed, or the
+CLI's wait bound (the role's 960 s plus a margin) passed — is reported as an
+**unknown outcome**, not "nothing was removed"; `mllm engine list` settles
+what happened.
+
+**Standalone** runs the same two phases in one process, against its embedded
+host. The embedded host is not enrolled, so its published profiles are
+recorded as an embedded publication (store schema v36) that placement reads
+the way it reads a server's approved document: a profile it no longer
+publishes takes no new instance, explicit or on demand. A reload that would
+drop a published profile without a confirmed retirement is refused
+(`publish_rejected`). Standalone expires abandoned retirements at start and
+every 30 s, and its startup publication clears confirmed retirements of
+profiles it no longer lists, so a role stopped mid-drain never wedges a name.
+
+**Under the system units**, `/etc/mllm` is read-only to the role
+(`ProtectSystem=strict`); the operator runs `sudo mllm engine … --config
+/etc/mllm/host.yaml`. The CLI, running as root, keeps an existing
+`engines.yaml`'s owner and mode on a rewrite, and creates a new file (and its
+lock) for the owner of the role's state directory, mode 0600, so the role can
+still read it under a read-only `/etc`.
+
+**Version skew.** An older CLI's `remove` can still reach a newer role and
+get back a confirmed retirement, but the older CLI does not know to write
+`engines.yaml` afterward on this path; the profile stays excluded from
+placement (the retirement is confirmed) but lingers in the file until a
+current CLI runs `remove` again.
 
 ## Errors
 
@@ -243,7 +297,21 @@ CLI exit codes: 16 `engine_not_found` through 23 `not_interactive` in table orde
 - `detect` executes nothing and follows no symlink outside its roots.
 - `add` executes the installation only after the operator names or picks it, and
   only through the existing bounded version check and capability probe.
-- The control socket is owner-only with a peer user-id check.
+- The control socket is owner-only with a peer user-id check (`SO_PEERCRED`);
+  it also admits root, but only as the owner of the socket's own private
+  (0700) directory — the role's service user under the system units — so
+  `sudo mllm engine … --config /etc/mllm/host.yaml` reaches the intended role
+  and nothing else.
+- The running role never writes `engines.yaml` (review decision C1); the
+  CLI is its only writer. `engines.yaml` and its lock are opened `O_NOFOLLOW`
+  and, before any `fchown`, refused unless they are a regular file with
+  exactly one link, owned by root or by the state-dir owner the write is for.
+  Without that check, a hard link planted at either path before the CLI runs
+  as root would let its `fchown` (meant to hand the file to the role's
+  service user) change the ownership of whatever the link really points at,
+  since a hard link shares one inode with its target (ADR 0018; fixed
+  2026-09-25 with a regression test in `crates/mllm-config/tests/
+  registration.rs`).
 - Reserved engine arguments stay reserved; `--arg` goes through the existing
   `accept_extra_args` rules.
 - The deep-park protections of ADR 0012 are unchanged: loopback-only engine

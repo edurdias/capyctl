@@ -2,7 +2,7 @@
 # M32 (T23, T26): `max_parked` is enforced by stopping the least recently parked
 # instance on that host, never ready work. Tight budget on host-a
 # (`max_parked: 1`):
-#   roles.sh host-doc host-a tight; roles.sh host-down host-a; roles.sh host-up host-a
+#   roles.sh host-doc a tight; roles.sh host-down a; roles.sh host-up a
 #   run_row.sh M32
 #
 # Expected: A (va-4) Ready then parked; B (sa-4) Ready then parked, which exceeds

@@ -117,6 +117,59 @@ impl EmbeddedInstallation {
     }
 }
 
+/// ADR 0018 §5: the embedded host's installations, keyed by executable (two
+/// profiles on one executable are one installation), in registration order.
+pub struct EmbeddedInstallations {
+    registered: std::sync::RwLock<Vec<Arc<EmbeddedInstallation>>>,
+}
+
+impl EmbeddedInstallations {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            registered: Default::default(),
+        })
+    }
+
+    /// Register (measure) the installation at `executable` unless one is
+    /// already registered there. Blocking: it reads the installation's files.
+    pub fn register(&self, profile: &str, engine: Engine, executable: &Path) {
+        if self.for_executable(executable).is_some() {
+            return;
+        }
+        let registered = Arc::new(EmbeddedInstallation::register(profile, engine, executable));
+        if let Ok(mut all) = self.registered.write() {
+            if !all.iter().any(|known| known.executable == executable) {
+                all.push(registered);
+            }
+        }
+    }
+
+    /// Forget every installation whose executable is not in `executables`
+    /// (a removed profile's installation is no longer the host's).
+    pub fn retain(&self, executables: &[&Path]) {
+        if let Ok(mut all) = self.registered.write() {
+            all.retain(|known| executables.contains(&known.executable.as_path()));
+        }
+    }
+
+    pub fn for_executable(&self, executable: &Path) -> Option<Arc<EmbeddedInstallation>> {
+        self.registered
+            .read()
+            .ok()?
+            .iter()
+            .find(|known| known.executable == executable)
+            .cloned()
+    }
+
+    /// Every registered installation's status view, in registration order.
+    pub fn views(&self) -> Vec<serde_json::Value> {
+        self.registered
+            .read()
+            .map(|all| all.iter().map(|known| known.view()).collect())
+            .unwrap_or_default()
+    }
+}
+
 /// Wraps an embedded engine adapter: before Initialize the installation is
 /// measured, a new drift is journaled, and `refuse` refuses before any effect.
 pub struct InstallationGate {
@@ -217,18 +270,19 @@ impl EngineAdapter for InstallationGate {
     }
 }
 
-/// Any embedded bindings, carrying the installation the embedded host
-/// registered so the coordinator gates each Initialize on it.
+/// Any embedded bindings, carrying the installations the embedded host
+/// registered so the coordinator gates each Initialize on the one its
+/// profile's executable names.
 pub struct InstalledBindings {
     inner: Arc<dyn EngineBindings>,
-    installation: Arc<EmbeddedInstallation>,
+    installations: Arc<EmbeddedInstallations>,
 }
 
 impl InstalledBindings {
-    pub fn new(inner: Arc<dyn EngineBindings>, installation: Arc<EmbeddedInstallation>) -> Self {
+    pub fn new(inner: Arc<dyn EngineBindings>, installations: Arc<EmbeddedInstallations>) -> Self {
         Self {
             inner,
-            installation,
+            installations,
         }
     }
 }
@@ -245,8 +299,12 @@ impl EngineBindings for InstalledBindings {
         self.inner.checkpoint_verifier()
     }
 
-    fn installation(&self) -> Option<Arc<EmbeddedInstallation>> {
-        Some(self.installation.clone())
+    /// ADR 0018 §5: picked by the frozen profile's executable. One that is
+    /// not registered is admitted without a drift check: unmeasured is never
+    /// a refusal (ADR 0008).
+    fn installation(&self, work: &InitializeWork) -> Option<Arc<EmbeddedInstallation>> {
+        self.installations
+            .for_executable(Path::new(&work.effective().profile.executable))
     }
 
     fn adapter(
@@ -338,5 +396,30 @@ mod tests {
             EmbeddedInstallation::register("local", Engine::Vllm, &dir.path().join("vllm"));
         assert_eq!(installation.view()["state"], "unmeasured");
         assert_eq!(installation.check(InstallationDrift::Refuse).refused, None);
+    }
+
+    // T21 T22 (ADR 0018 §5): the embedded host keeps one installation per
+    // executable; a launch finds its own by executable, an unregistered one
+    // finds none (admitted unmeasured), and a removed one is forgotten.
+    #[test]
+    fn embedded_installations_are_keyed_by_executable() {
+        let sglang = venv();
+        let other = tempfile::tempdir().unwrap();
+        let python = sglang.path().join("bin/python3");
+        let vllm = other.path().join("vllm");
+        let all = EmbeddedInstallations::new();
+        all.register("local-sglang", Engine::Sglang, &python);
+        all.register("sglang-again", Engine::Sglang, &python);
+        all.register("local-vllm", Engine::Vllm, &vllm);
+        let views = all.views();
+        assert_eq!(views.len(), 2, "two profiles on one executable are one");
+        assert_eq!(views[0]["profile"], "local-sglang");
+        assert_eq!(views[0]["state"], "measured");
+        assert_eq!(views[1]["state"], "unmeasured");
+        assert!(all.for_executable(&python).is_some());
+        assert!(all.for_executable(Path::new("/nowhere/python3")).is_none());
+        all.retain(&[python.as_path()]);
+        assert!(all.for_executable(&vllm).is_none());
+        assert_eq!(all.views().len(), 1);
     }
 }

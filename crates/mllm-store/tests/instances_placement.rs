@@ -16,6 +16,7 @@ use mllm_store::dispatch::CoordinatorSession;
 use mllm_store::managed_configuration::{HostRefusal, HostTarget, ManagedConfigurationReceipt};
 use mllm_store::ordinary_lifecycle::placement::StartScope;
 use mllm_store::ordinary_lifecycle::reconcile::Reconciled;
+use mllm_store::profile_retirement::{RetirementProgress, RetirementStart};
 use mllm_store::Store;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -1862,4 +1863,308 @@ fn closure_reasons_are_pruned_on_fence_move_and_cleanup() {
         .unwrap();
     t.cleaned(&t.cleanup_step(stop.operation_id()));
     assert_eq!(closures(), 0, "the verified cleanup retires what is left");
+}
+
+/// ADR 0018 §4: from the moment a retirement of (host, profile) commits, no
+/// new instance of that profile is placed on that host; cancelling it lets
+/// placement resume. Placement elsewhere is unaffected.
+// T16 T33
+#[test]
+fn a_retiring_profile_takes_no_new_placement_on_its_host() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy("deploy", json!({"instances": 1, "placement": {"hosts": ["spark-a", "spark-b"], "strategy": "pack"}}))
+        .deployment_id;
+    let start = t
+        .store
+        .begin_profile_retirement("host-a", "local", "retire-1", NOW, DEADLINE, true)
+        .unwrap();
+    assert!(matches!(start, RetirementStart::Clear), "nothing runs yet");
+    t.start(&id, "start", StartScope::All, None);
+    let hosts: Vec<String> = t.planned(&id).into_iter().map(|(_, _, h)| h).collect();
+    assert_eq!(
+        hosts,
+        vec!["host-b".to_string()],
+        "host-a's profile is retiring"
+    );
+    t.store
+        .cancel_profile_retirement("host-a", "local", "retire-1")
+        .unwrap();
+    assert!(t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .is_none());
+}
+
+/// ADR 0018 §4: the check names only instances of that profile on that host;
+/// without drain it is refused and cancelled in the same transaction; with
+/// drain it stands until its stops settle on evidence.
+// T16 T32
+#[test]
+fn a_retirement_names_its_instances_and_waits_for_evidence() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy("deploy", json!({"instances": 2, "placement": {"hosts": ["spark-a", "spark-b"], "max_per_host": 1}}))
+        .deployment_id;
+    all_ready(&t, &id, "start");
+    // Without drain: refused, listing the host-a instance only, and cancelled.
+    match t
+        .store
+        .begin_profile_retirement("host-a", "local", "k1", NOW, DEADLINE, false)
+        .unwrap()
+    {
+        RetirementStart::InUse(named) => {
+            assert_eq!(named.len(), 1);
+            assert_eq!(named[0].deployment_id, id);
+            // The golden deployment document names the deployment `toy`.
+            assert_eq!(named[0].name, "toy");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .is_none());
+    // Another profile on the same host is clear and confirmed at once.
+    assert!(matches!(
+        t.store
+            .begin_profile_retirement("host-a", "other", "k0", NOW, DEADLINE, false)
+            .unwrap(),
+        RetirementStart::Clear
+    ));
+    assert_eq!(
+        t.store
+            .profile_retirement("host-a", "other")
+            .unwrap()
+            .unwrap()
+            .1,
+        "confirmed"
+    );
+    // With drain: the retirement stands until the stop succeeds and the
+    // runtime is released; an unsettled stop is Waiting, never confirmed.
+    assert!(matches!(
+        t.store.begin_profile_retirement("host-a", "local", "k2", NOW, DEADLINE, true).unwrap(),
+        RetirementStart::Draining(ref named) if named.len() == 1
+    ));
+    t.sql
+        .execute(
+            "INSERT INTO operations(id,kind,state) VALUES('stop-a','ordinary_cleanup','running')",
+            [],
+        )
+        .unwrap();
+    t.store
+        .record_profile_retirement_stops("host-a", "local", "k2", &["stop-a".to_string()])
+        .unwrap();
+    assert!(matches!(
+        t.store
+            .profile_retirement_progress("host-a", "local", "k2", NOW + 1)
+            .unwrap(),
+        RetirementProgress::Waiting(_)
+    ));
+    t.sql
+        .execute(
+            "UPDATE operations SET state='succeeded' WHERE id='stop-a'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            t.store
+                .profile_retirement_progress("host-a", "local", "k2", NOW + 2)
+                .unwrap(),
+            RetirementProgress::Waiting(_)
+        ),
+        "the runtime is still held: success of the operation alone is not evidence"
+    );
+    t.sql
+        .execute(
+            "UPDATE runtime_bindings SET state='released' WHERE deployment_id=?1 AND instance_index IN
+               (SELECT instance_index FROM deployment_instances WHERE deployment_id=?1 AND host_id='host-a')",
+            [&id],
+        )
+        .unwrap();
+    assert!(matches!(
+        t.store
+            .profile_retirement_progress("host-a", "local", "k2", NOW + 3)
+            .unwrap(),
+        RetirementProgress::Settled
+    ));
+    assert_eq!(
+        t.store
+            .profile_retirement("host-a", "local")
+            .unwrap()
+            .unwrap()
+            .1,
+        "confirmed"
+    );
+}
+
+/// ADR 0018 §4 (review decision I1): a retirement still draining is resumed,
+/// not refused and not cancelled, by a retried remove under another key, with
+/// or without drain; the stops keep the first key.
+// T16 T32
+#[test]
+fn a_retried_remove_resumes_a_draining_retirement() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy(
+            "deploy",
+            json!({"instances": 1, "placement": {"hosts": ["spark-a"]}}),
+        )
+        .deployment_id;
+    all_ready(&t, &id, "start");
+    assert!(matches!(
+        t.store.begin_profile_retirement("host-a", "local", "k1", NOW, DEADLINE, true).unwrap(),
+        RetirementStart::Draining(ref named) if named.len() == 1
+    ));
+    for drain in [true, false] {
+        let (key, start) = t
+            .store
+            .begin_profile_retirement_keyed("host-a", "local", "k2", NOW + 5, DEADLINE + 5, drain)
+            .unwrap();
+        assert_eq!(key, "k1");
+        assert!(
+            matches!(start, RetirementStart::Draining(ref named) if named.len() == 1),
+            "{start:?}"
+        );
+    }
+    let (key, state, deadline) = t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (key.as_str(), state.as_str(), deadline),
+        ("k1", "retiring", DEADLINE)
+    );
+}
+
+/// ADR 0018 §4 (owner decision 2026-09-25): a failed stop ends the retirement
+/// without confirming it, and so does the deadline; placements resume and
+/// nothing is released by the retirement itself.
+// T32
+#[test]
+fn a_failed_stop_or_the_deadline_ends_a_retirement_unconfirmed() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy(
+            "deploy",
+            json!({"instances": 1, "placement": {"hosts": ["spark-a"]}}),
+        )
+        .deployment_id;
+    all_ready(&t, &id, "start");
+    t.store
+        .begin_profile_retirement("host-a", "local", "k", NOW, NOW + 100, true)
+        .unwrap();
+    t.sql
+        .execute(
+            "INSERT INTO operations(id,kind,state) VALUES('stop-f','ordinary_cleanup','failed')",
+            [],
+        )
+        .unwrap();
+    t.store
+        .record_profile_retirement_stops("host-a", "local", "k", &["stop-f".to_string()])
+        .unwrap();
+    assert!(matches!(
+        t.store.profile_retirement_progress("host-a", "local", "k", NOW + 1).unwrap(),
+        RetirementProgress::Holding(ref names) if names == &vec!["toy".to_string()]
+    ));
+    assert!(t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .is_none());
+    t.store
+        .begin_profile_retirement("host-a", "local", "k3", NOW, NOW + 100, true)
+        .unwrap();
+    assert!(matches!(
+        t.store
+            .profile_retirement_progress("host-a", "local", "k3", NOW + 101)
+            .unwrap(),
+        RetirementProgress::Expired(_)
+    ));
+    assert!(t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .is_none());
+    // Nothing above released the instance's runtime.
+    let live: i64 = t
+        .sql
+        .query_row(
+            "SELECT COUNT(*) FROM runtime_bindings WHERE deployment_id=?1 AND state!='released'",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 1);
+}
+
+/// ADR 0018 §4: a host whose approved publication no longer carries the
+/// deployment's profile takes no new instance of it; one that carries it, or
+/// has no publication row, is judged as before.
+// T16
+#[test]
+fn a_profile_absent_from_the_hosts_publication_takes_no_new_placement() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy("deploy", json!({"instances": 1, "placement": {"hosts": ["spark-a", "spark-b"], "strategy": "pack"}}))
+        .deployment_id;
+    t.sql
+        .execute(
+            "INSERT INTO approved_host_publications VALUES('host-a',?1,'boot','fp',1)",
+            [json!({"runtime_profiles": {"other": {}}}).to_string()],
+        )
+        .unwrap();
+    t.start(&id, "start", StartScope::All, None);
+    let hosts: Vec<String> = t.planned(&id).into_iter().map(|(_, _, h)| h).collect();
+    assert_eq!(
+        hosts,
+        vec!["host-b".to_string()],
+        "host-a no longer publishes `local`"
+    );
+}
+
+/// ADR 0018 §4 (owner decision 2026-09-25): an abandoned retirement past its
+/// deadline expires unconfirmed, releasing nothing; one within its deadline
+/// stands.
+// T32
+#[test]
+fn an_abandoned_retirement_expires_at_its_deadline() {
+    let t = two_hosts("32GiB");
+    let id = t
+        .deploy(
+            "deploy",
+            json!({"instances": 1, "placement": {"hosts": ["spark-a"]}}),
+        )
+        .deployment_id;
+    all_ready(&t, &id, "start");
+    t.store
+        .begin_profile_retirement("host-a", "local", "k", NOW, NOW + 100, true)
+        .unwrap();
+    assert!(t
+        .store
+        .expire_profile_retirements(NOW + 99)
+        .unwrap()
+        .is_empty());
+    assert!(t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        t.store.expire_profile_retirements(NOW + 100).unwrap(),
+        vec![("host-a".to_string(), "local".to_string())]
+    );
+    assert!(t
+        .store
+        .profile_retirement("host-a", "local")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        t.store.profile_candidates("host-a", "local").unwrap().len(),
+        1
+    );
 }

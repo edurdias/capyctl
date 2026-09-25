@@ -31,6 +31,18 @@ impl ExitCode {
     /// (drain-only after version skew, draining, revoked, offline). A CLI
     /// command's exit, never a role's, so no unit lists it.
     pub const HOST_INELIGIBLE: Self = Self(15);
+    /// ADR 0018 §6: engine registration's closed codes (9 stays unused).
+    pub const ENGINE_NOT_FOUND: Self = Self(16);
+    pub const ENGINE_UNSUPPORTED: Self = Self(17);
+    pub const ENGINE_VERSION_FAILED: Self = Self(18);
+    pub const PROFILE_EXISTS: Self = Self(19);
+    pub const PROFILE_IN_USE: Self = Self(20);
+    pub const PUBLISH_REJECTED: Self = Self(21);
+    pub const AGENT_UNREACHABLE: Self = Self(22);
+    pub const NOT_INTERACTIVE: Self = Self(23);
+    /// ADR 0018 §7: a deploy named a runtime profile no allowed host
+    /// publishes; nothing was stored.
+    pub const PROFILE_NOT_PUBLISHED: Self = Self(24);
 }
 
 impl From<ExitCode> for u8 {
@@ -136,6 +148,15 @@ impl StructuredError {
             "no_safe_estimate" => ExitCode::NO_SAFE_ESTIMATE,
             HOST_REVOKED => ExitCode::HOST_REVOKED,
             "host_ineligible" => ExitCode::HOST_INELIGIBLE,
+            "engine_not_found" => ExitCode::ENGINE_NOT_FOUND,
+            "engine_unsupported" => ExitCode::ENGINE_UNSUPPORTED,
+            "engine_version_failed" => ExitCode::ENGINE_VERSION_FAILED,
+            "profile_exists" => ExitCode::PROFILE_EXISTS,
+            "profile_in_use" => ExitCode::PROFILE_IN_USE,
+            "publish_rejected" => ExitCode::PUBLISH_REJECTED,
+            "agent_unreachable" => ExitCode::AGENT_UNREACHABLE,
+            "not_interactive" => ExitCode::NOT_INTERACTIVE,
+            "profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,
             _ => ExitCode::UNSUPPORTED,
         }
     }

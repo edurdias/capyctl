@@ -180,6 +180,17 @@ fn read_config(path: &Path) -> Result<String, StructuredError> {
     }
     fs::read_to_string(path).map_err(|_| error("Cannot read role configuration"))
 }
+/// The process environment as the role reads it (an empty value is unset).
+fn role_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+/// ADR 0018 §2: a host's engines file, by the same rule as `mllm engine`:
+/// beside the named document, else `<config home>/mllm/engines.yaml`. With
+/// no config home at all it stays beside the document the host loads.
+fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
+    crate::engine::role_engines(named, &role_env)
+        .unwrap_or_else(|| mllm_config::registration::engines_beside(document))
+}
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
 }
@@ -454,6 +465,10 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             .map_err(|_| unavailable())?
             .with_switcher(switcher.clone()),
     );
+    // ADR 0018 §4: retiring a host's runtime profile through the ordinary stop path.
+    sessions.with_profile_retirements(Arc::new(mllm_management::engines::StoreRetirements::new(
+        actions.clone(),
+    )));
     // ADR 0013 §10 (I3, D9): the router balances across instances on host
     // liveness and the engine load each host agent reports.
     let controller = Arc::new(
@@ -665,7 +680,14 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
 /// dispatch is suspended before it closes ingress anyway.
 const DRAIN_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
-async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
+/// `document` is the host.yaml `config` was loaded from, merged with
+/// `engines` (the role's engines.yaml); the control handler re-reads both
+/// (ADR 0018 §3).
+async fn serve_host(
+    config: HostConfig,
+    document: PathBuf,
+    engines: PathBuf,
+) -> Result<Value, StructuredError> {
     // SPEC §3.3 / ADR 0001: an undeclared runtime_dir is the managed copy of
     // the embedded runtime, refreshed before anything can launch from it.
     if !config.runtime_dir_declared {
@@ -746,23 +768,9 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
     // ADR 0008 (owner decision 2026-09-23): registration measures each
     // installation (engine package version and a digest over its files);
     // later drift is flagged against this. Unmeasurable is never a refusal.
-    let declared = config.profiles.clone();
-    let profiles = tokio::task::spawn_blocking(move || {
-        let measurer = mllm_agent::installation::InstallationMeasurer::new();
-        declared
-            .iter()
-            .map(|(name, v)| {
-                let mut status = pb::RuntimeProfileStatus {
-                    name: name.clone(),
-                    build_fingerprint: v["build_fingerprint"].as_str().unwrap_or("unknown").into(),
-                    eligibility: "unknown".into(),
-                    reason: String::new(),
-                    ..Default::default()
-                };
-                mllm_agent::installation::register_profile(&measurer, v, &mut status);
-                status
-            })
-            .collect::<Vec<_>>()
+    let profiles = tokio::task::spawn_blocking({
+        let config = config.clone();
+        move || mllm_agent::profiles::profile_statuses(&config)
     })
     .await
     .map_err(|_| unavailable())?;
@@ -825,10 +833,7 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
         let listener = tokio::net::TcpListener::bind(settings.bind)
             .await
             .map_err(|_| unavailable())?;
-        (
-            Some(execution as Arc<dyn mllm_agent::session::SessionExecution>),
-            Some(listener),
-        )
+        (Some(execution), Some(listener))
     } else {
         (None, None)
     };
@@ -843,13 +848,51 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let drain_signal = mllm_agent::session::DrainSignal::new();
-    let session = mllm_agent::session::run_session_with_drain(
+    // ADR 0018 §3: the profile sets the native executor authorizes against,
+    // shared with the session and the local control handler.
+    let host_profiles = match &execution {
+        Some(native) => native.profiles(),
+        None => mllm_agent::profiles::HostProfiles::new(mllm_agent::profiles::ProfileSet::new(
+            config.clone(),
+            inventory.clone(),
+        )),
+    };
+    let updates = mllm_agent::session::ProfileUpdates::new(host_profiles);
+    // ADR 0018 §3: the local control channel, bound only inside the role's
+    // 0700 state directory. A socket that cannot be bound (unsafe directory,
+    // path too long, another role) is reported and the role runs without it.
+    let (control_stop, control_shutdown) = tokio::sync::watch::channel(false);
+    let control_socket = config
+        .state_dir
+        .join(mllm_agent::control_socket::SOCKET_NAME);
+    let control_server = match mllm_agent::control_socket::ControlServer::bind(&control_socket) {
+        Ok(server) => {
+            let handler = mllm_agent::host_control::HostControl::new(
+                document.clone(),
+                engines.clone(),
+                config.clone(),
+                updates.clone(),
+                journal.clone(),
+            );
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let uid = unsafe { libc::geteuid() };
+            Some(tokio::spawn(server.serve(handler, uid, control_shutdown)))
+        }
+        Err(failure) => {
+            eprintln!("host control socket unavailable: {failure}");
+            None
+        }
+    };
+    let execution =
+        execution.map(|native| native as Arc<dyn mllm_agent::session::SessionExecution>);
+    let session = mllm_agent::session::run_session_with_updates(
         &identity,
         journal,
         inventory,
         receiver,
         execution,
         Some(drain_signal.clone()),
+        Some(updates.clone()),
     );
     let gates = ingress.clone();
     let router = admission.gate(ingress.router());
@@ -904,6 +947,11 @@ async fn serve_host(config: HostConfig) -> Result<Value, StructuredError> {
     let _ = crate::shutdown::join_listeners(&mut ingress_server).await;
     ingress_server.abort();
     let _ = shutdown.send(true);
+    // ADR 0018 §3: the control socket closes with the role and removes its file.
+    let _ = control_stop.send(true);
+    if let Some(server) = control_server {
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    }
     match session_ended {
         Some(ended) => ended,
         None => session.await,
@@ -926,6 +974,9 @@ pub fn supports(command: &Command) -> bool {
             | Command::Join { .. }
             | Command::List {
                 resource: ListResource::Hosts
+            }
+            | Command::List {
+                resource: ListResource::Engines
             }
             | Command::Inspect {
                 resource: Resource::Host,
@@ -958,11 +1009,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 "host"
             };
-            let path = invocation
-                .config
-                .clone()
-                .unwrap_or_else(|| implicit(root, label));
-            if invocation.config.is_none()
+            // ADR 0018 §2 (review decision 2026-09-25): a host's document is
+            // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`.
+            let named = if *role == Role::Host {
+                crate::engine::named_role_document(invocation.config.as_deref(), &role_env)
+            } else {
+                invocation.config.clone()
+            };
+            let path = named.clone().unwrap_or_else(|| implicit(root, label));
+            if named.is_none()
                 && fs::symlink_metadata(&path)
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
             {
@@ -987,19 +1042,37 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 )
                 .await
             } else {
+                // ADR 0018 §2: the host document merged with its `engines.yaml`,
+                // resolved by the same rule as `mllm engine`; the document
+                // itself was already read above for the size and existence
+                // checks.
+                let engines = host_engines(named.as_deref(), &path);
                 serve_host(
-                    HostConfig::parse(&source).map_err(|_| error("Invalid host configuration"))?,
+                    HostConfig::load_with_engines(&path, &engines).map_err(|e| {
+                        error(&format!(
+                            "Invalid host configuration: {}: {}",
+                            e.path, e.detail
+                        ))
+                    })?,
+                    path.clone(),
+                    engines,
                 )
                 .await
             }
         }
         Command::Join { join_file, recover } => {
-            let path = invocation
-                .config
-                .clone()
-                .unwrap_or_else(|| implicit(root, "host"));
-            let config = HostConfig::parse(&read_config(&path)?)
-                .map_err(|_| error("Invalid host configuration"))?;
+            let named = crate::engine::named_role_document(invocation.config.as_deref(), &role_env);
+            let path = named.clone().unwrap_or_else(|| implicit(root, "host"));
+            // ADR 0018 §2: `read_config` keeps the existing size/existence
+            // checks; the host document is loaded merged with `engines.yaml`.
+            read_config(&path)?;
+            let engines = host_engines(named.as_deref(), &path);
+            let config = HostConfig::load_with_engines(&path, &engines).map_err(|e| {
+                error(&format!(
+                    "Invalid host configuration: {}: {}",
+                    e.path, e.detail
+                ))
+            })?;
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery
@@ -1099,6 +1172,13 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 Ok(result)
             }
+        }
+        Command::List {
+            resource: ListResource::Engines,
+        } => {
+            // ADR 0018: every host's published profiles, from the server.
+            let config = server_context(invocation.config.as_deref(), root)?;
+            management_request(&config, reqwest::Method::GET, "/engines", None).await
         }
         _ => Err(error("Unsupported remote role command")),
     }

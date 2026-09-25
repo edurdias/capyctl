@@ -4,7 +4,7 @@
 #   resume: KEEP_FAILED=1 SOAK_RESUME=1 SOAK_SEED=<n> SOAK_FROM_STEP=<k> run_row.sh M48 --tag r<k>
 #
 # Setup: server and both hosts online, host-b on the tight policy
-# (roles.sh host-doc host-b tight; host-down; host-up) and host-a on
+# (roles.sh host-doc b tight; host-down; host-up) and host-a on
 # normal; nothing deployed. KEEP_FAILED=1 keeps the soak state for M49, which
 # is the final cleanup.
 #

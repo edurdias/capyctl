@@ -61,13 +61,13 @@ The opt-in deep-park lab profile additionally uses
 `--safetensors-load-strategy eager`, qualified on **host-a only** to reduce
 immediate wake-to-response to 7–9s. It needs about 8 GiB more temporary loading
 headroom than the default loader; stock/denied profiles remain unchanged.
-See [the optimization measurements and limits](spark-deep-wake-optimization.md).
+See [the optimization measurements and limits](deep-wake-optimization.md).
 The sleep profile requires both `--enable-sleep-mode` and
 `VLLM_SERVER_DEV_MODE=1`; stock launches explicitly set the latter to 0.
 Restoration calls `/wake_up`, then `/collective_rpc` with
 `{"method":"reload_weights"}`. Checkpoint reload has a 120s client timeout
 (the earlier default loader took 44–50s); sleep and wake retain 30s bounds. Full live results and
-the superseded 64 GiB memory recipe are in `spark-qualification-f1.md`.
+the superseded 64 GiB memory recipe are in `qualification-f1.md`.
 
 ## 5. Doctor capture (recipe freeze)
 

@@ -9,7 +9,7 @@ not a spec: each unit below gets its own spec, plan, and review.
 
 | Capability | State |
 |---|---|
-| vLLM single-host launch | live-green (S1 run 6, `docs/runbooks/spark-live-f2.md`) |
+| vLLM single-host launch | live-green (S1 run 6, `docs/runbooks/live-f2.md`) |
 | SGLang single-host launch | blocked: entrypoint denial + no adapter Initialize path |
 | Ordinary park / wake / switch | not built; the product's premise |
 | Remote control (server + agents) | not built; proto and CLI grammar only |

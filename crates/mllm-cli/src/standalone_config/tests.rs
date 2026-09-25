@@ -13,6 +13,42 @@ const CAPACITY: i64 = 128 * 1024 * 1024 * 1024;
 /// them concurrently would let one test's exports decide another's result.
 static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
+/// Names the one test a child copy of this binary runs (see [`isolated`]).
+const ISOLATED_TEST: &str = "MLLM_ISOLATED_TEST";
+
+/// The environment is process-wide, and so is every other test in this binary:
+/// one that reads `MLLM_*` or `HOME` while another exports it, or forks while
+/// another has an engine script open for writing, sees the other's state. A
+/// test that changes the environment therefore runs alone, in a child copy of
+/// this test binary, and never changes the parent's environment. In the parent
+/// this runs `test` there and returns `None` (the caller returns); in the child
+/// it returns the lock, and the caller's body runs.
+fn isolated(test: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
+    if std::env::var_os(ISOLATED_TEST).is_some_and(|named| named == test) {
+        return Some(
+            ENVIRONMENT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            &format!("standalone_config::tests::{test}"),
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env(ISOLATED_TEST, test)
+        .output()
+        .expect("the isolated test runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{test} in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    None
+}
+
 /// An installation with nothing interesting in it, for the tests that are about the
 /// shape of the published table rather than about any particular engine.
 fn installed(engine: Engine, executable: &str) -> EngineInstallation {
@@ -31,6 +67,16 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
     }
 }
 
+/// The one environment installation, published as `local`.
+fn named(
+    installation: &EngineInstallation,
+) -> Vec<mllm_controller::engine_provider::NamedInstallation> {
+    vec![mllm_controller::engine_provider::NamedInstallation {
+        profile: STANDALONE_PROFILE.into(),
+        installation: installation.clone(),
+    }]
+}
+
 fn local(path: &str) -> ModelSource {
     ModelSource::Local { path: path.into() }
 }
@@ -41,7 +87,10 @@ fn local(path: &str) -> ModelSource {
 #[test]
 fn the_host_declares_exactly_one_engine_installation() {
     let host = host_policy(
-        &installed(Engine::Vllm, "/bin/true"),
+        &[mllm_controller::engine_provider::NamedInstallation {
+            profile: "local".into(),
+            installation: installed(Engine::Vllm, "/bin/true"),
+        }],
         "env-1",
         CAPACITY,
         None,
@@ -65,7 +114,7 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
     for allowed in [false, true] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.deep_park = allowed;
-        let host = host_policy(&installation, "env-1", CAPACITY, None);
+        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
         assert_eq!(
             host["runtime_profiles"][STANDALONE_PROFILE]["security"]["deep_park"],
             if allowed { "enabled" } else { "disabled" }
@@ -80,7 +129,12 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
 #[test]
 fn every_engine_profile_names_distinct_inference_and_admin_references() {
     for engine in [Engine::Vllm, Engine::Sglang] {
-        let host = host_policy(&installed(engine, "/opt/engine"), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installed(engine, "/opt/engine")),
+            "env-1",
+            CAPACITY,
+            None,
+        );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         assert_eq!(
             security["credential_ref"], "secret://engine-key",
@@ -99,7 +153,7 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
 fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.trust_remote_code = true;
-    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
     assert_eq!(security["trust_remote_code"], true);
     assert_eq!(security["deep_park"], "disabled");
@@ -115,7 +169,7 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
     for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.installation_drift = policy;
-        let host = host_policy(&installation, "env-1", CAPACITY, None);
+        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         match policy {
             InstallationDrift::Warn => assert!(security.get("installation_drift").is_none()),
@@ -129,6 +183,7 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
             CAPACITY,
             DEFAULT_REQUEST_DEADLINE,
             false,
+            "local",
         );
         let mut deployment = deployment;
         deployment["engine_config"] = installation.engine_config.clone();
@@ -143,7 +198,7 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
 fn the_published_host_names_the_store_its_weights_live_under() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.models_root = "/data/checkpoints".into();
-    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     assert_eq!(host["model_store"]["path"], "/data/checkpoints");
 }
 
@@ -152,8 +207,8 @@ fn the_published_host_names_the_store_its_weights_live_under() {
 #[test]
 fn limits_scale_with_observed_capacity() {
     let installation = installed(Engine::Vllm, "/bin/true");
-    let small = host_policy(&installation, "env-1", 16 << 30, None);
-    let large = host_policy(&installation, "env-1", 128 << 30, None);
+    let small = host_policy(&named(&installation), "env-1", 16 << 30, None);
+    let large = host_policy(&named(&installation), "env-1", 128 << 30, None);
     let managed = |h: &Value| {
         h["resource_policy"]["domains"][DOMAIN]["managed_limit"]
             .as_str()
@@ -172,7 +227,10 @@ fn limits_scale_with_observed_capacity() {
 #[test]
 fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
     let host = host_policy(
-        &installed(Engine::Vllm, "/bin/true"),
+        &[mllm_controller::engine_provider::NamedInstallation {
+            profile: "local".into(),
+            installation: installed(Engine::Vllm, "/bin/true"),
+        }],
         "env-1",
         CAPACITY,
         None,
@@ -204,6 +262,7 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     let resources = d["resources"].as_object().unwrap();
     for phase in ["cold", "ready", "parking", "parked", "wake"] {
@@ -239,6 +298,7 @@ fn a_parked_deployment_holds_no_device() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     assert_eq!(
         d["resources"]["parked"]["devices"]
@@ -265,6 +325,7 @@ fn the_deployment_names_its_installation() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
@@ -282,6 +343,7 @@ fn the_deployment_states_its_model_source() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     assert_eq!(d["model"]["source"]["type"], "local");
     assert_eq!(d["model"]["source"]["path"], "/models/m");
@@ -299,6 +361,7 @@ fn the_deployment_states_its_model_source() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     assert_eq!(fetched["model"]["source"]["type"], "huggingface");
     assert_eq!(fetched["model"]["source"]["repo"], "org/model");
@@ -310,7 +373,10 @@ fn the_deployment_states_its_model_source() {
 #[test]
 fn the_published_host_declares_one_memory_pool() {
     let host = host_policy(
-        &installed(Engine::Vllm, "/bin/true"),
+        &[mllm_controller::engine_provider::NamedInstallation {
+            profile: "local".into(),
+            installation: installed(Engine::Vllm, "/bin/true"),
+        }],
         "env-1",
         1 << 40,
         None,
@@ -331,7 +397,7 @@ fn the_published_host_declares_one_memory_pool() {
 fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm/bin/vllm");
     installation.deep_park = true;
-    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     let deployment = deployment_document(
         "m",
         "m",
@@ -340,6 +406,7 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
+        "local",
     );
     assert_eq!(deployment["residency"], "deep");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
@@ -356,7 +423,7 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     // SPEC §6.2: the opted-out host declares restart_only and launches without
     // sleep mode.
     installation.deep_park = false;
-    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     let deployment = deployment_document(
         "m",
         "m",
@@ -365,6 +432,7 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         false,
+        "local",
     );
     assert_eq!(deployment["residency"], "restart_only");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
@@ -417,9 +485,9 @@ fn fake_engine_bin(dir: &std::path::Path) -> std::path::PathBuf {
 /// every start at the point where the refusal is hardest to read.
 #[test]
 fn host_policy_from_env_is_complete() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("host_policy_from_env_is_complete") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let models = dir.path().join("models");
@@ -444,7 +512,7 @@ fn host_policy_from_env_is_complete() {
     // claiming the same build after an upgrade.
     assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
 
-    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     // ADR 0014 §1: the published profile carries no engine tuning.
     assert!(host["runtime_profiles"][STANDALONE_PROFILE]
         .get("launch_settings")
@@ -457,6 +525,7 @@ fn host_policy_from_env_is_complete() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         installation.deep_park,
+        "local",
     );
     deployment["engine_config"] = installation.engine_config.clone();
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
@@ -505,9 +574,9 @@ fn host_policy_from_env_is_complete() {
 // T21 T03
 #[test]
 fn deep_park_is_on_unless_the_host_opts_out() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("deep_park_is_on_unless_the_host_opts_out") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -558,9 +627,9 @@ fn deep_park_is_on_unless_the_host_opts_out() {
 #[test]
 fn installation_drift_is_warn_unless_the_host_refuses() {
     use mllm_config::effective::InstallationDrift;
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("installation_drift_is_warn_unless_the_host_refuses") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -607,9 +676,9 @@ fn installation_drift_is_warn_unless_the_host_refuses() {
 // T03
 #[test]
 fn the_engine_port_range_can_be_named_for_one_run() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("the_engine_port_range_can_be_named_for_one_run") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -624,7 +693,7 @@ fn the_engine_port_range_can_be_named_for_one_run() {
             .installation()
             .expect("the environment declares an installation");
         assert_eq!(installation.engine_ports, ports, "{value:?}");
-        let host = host_policy(&installation, "env-1", CAPACITY, None);
+        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
         let range = &host["resource_policy"]["endpoint_port_range"];
         assert_eq!(
             (range["start"].as_u64(), range["end"].as_u64()),
@@ -659,9 +728,9 @@ fn the_engine_port_range_can_be_named_for_one_run() {
 // T21 T22 T37
 #[test]
 fn the_capability_probe_is_required_when_vllm_may_sleep() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("the_capability_probe_is_required_when_vllm_may_sleep") else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let runtime = private_runtime(dir.path());
@@ -697,9 +766,10 @@ fn the_capability_probe_is_required_when_vllm_may_sleep() {
 // T21 T22
 #[test]
 fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only")
+    else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     let models = dir.path().join("models");
@@ -724,7 +794,7 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
     assert_eq!(installation.engine, Engine::Sglang);
     assert!(!installation.deep_park, "the host opted out");
 
-    let host = host_policy(&installation, "env-1", CAPACITY, None);
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     let mut deployment = deployment_document(
         "m",
         "m",
@@ -733,6 +803,7 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
         CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         installation.deep_park,
+        "local",
     );
     deployment["engine_config"] = installation.engine_config.clone();
     assert_eq!(deployment["residency"], "restart_only");
@@ -769,6 +840,7 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
             CAPACITY,
             DEFAULT_REQUEST_DEADLINE,
             deep_park,
+            "local",
         )["residency"]
             .clone()
     };
@@ -786,9 +858,10 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
 #[test]
 fn standalone_runs_from_the_embedded_runtime_unless_one_is_named() {
     use std::os::unix::fs::PermissionsExt;
-    let _guard = ENVIRONMENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(_guard) = isolated("standalone_runs_from_the_embedded_runtime_unless_one_is_named")
+    else {
+        return;
+    };
     let dir = tempfile::TempDir::new().expect("a temporary installation");
     let bin = fake_engine_bin(dir.path());
     std::env::set_var("MLLM_VLLM_BIN", &bin);
@@ -844,4 +917,123 @@ fn standalone_runs_from_the_embedded_runtime_unless_one_is_named() {
     for name in ["MLLM_VLLM_BIN", "MLLM_MODELS_ROOT"] {
         std::env::remove_var(name);
     }
+}
+
+fn engine_env(dir: &std::path::Path, vllm: bool, sglang: bool) {
+    let models = dir.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    std::env::set_var("MLLM_MODELS_ROOT", &models);
+    std::env::set_var("MLLM_RUNTIME_DIR", private_runtime(dir));
+    std::env::set_var("MLLM_ENGINE_FINGERPRINT", "0.29.0");
+    let bin = fake_engine_bin(dir);
+    if vllm {
+        std::env::set_var("MLLM_VLLM_BIN", &bin)
+    } else {
+        std::env::remove_var("MLLM_VLLM_BIN")
+    }
+    if sglang {
+        std::env::set_var("MLLM_SGLANG_BIN", bin.with_file_name("python3"))
+    } else {
+        std::env::remove_var("MLLM_SGLANG_BIN")
+    }
+    for name in [
+        "MLLM_KV_CACHE_BYTES",
+        "MLLM_ENGINE_ARGS",
+        "MLLM_DEEP_PARK",
+        "MLLM_TRUST_REMOTE_CODE",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+fn names(found: &[mllm_controller::engine_provider::NamedInstallation]) -> Vec<&str> {
+    found.iter().map(|n| n.profile.as_str()).collect()
+}
+
+fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    let profile =
+        mllm_config::registration::profile_document(&mllm_config::registration::ProfileSpec {
+            engine: Engine::Vllm,
+            executable: executable.into(),
+            build_fingerprint: "0.29.0".into(),
+            deep_park: true,
+            installation_drift: mllm_config::effective::InstallationDrift::Warn,
+            args: vec![],
+        });
+    [("vllm-patched".to_string(), profile)]
+        .into_iter()
+        .collect()
+}
+
+// ADR 0018 §5: one variable gives `local`, exactly as before.
+// T01 T07
+#[test]
+fn one_variable_gives_local() {
+    let Some(_guard) = isolated("one_variable_gives_local") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    engine_env(dir.path(), true, false);
+    let found = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .unwrap();
+    assert_eq!(names(&found), vec!["local"]);
+}
+
+// ADR 0018 §5: both variables (refused before) give two profiles.
+// T01 T07
+#[test]
+fn both_variables_give_local_vllm_and_local_sglang() {
+    let Some(_guard) = isolated("both_variables_give_local_vllm_and_local_sglang") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    engine_env(dir.path(), true, true);
+    let found = crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .unwrap();
+    assert_eq!(names(&found), vec!["local-vllm", "local-sglang"]);
+    assert_eq!(found[1].installation.engine, Engine::Sglang);
+}
+
+// ADR 0018 §5: registered profiles coexist; a collision is profile_exists;
+// a registered profile alone is enough.
+// T03 T07
+#[test]
+fn registered_profiles_coexist_and_collide_by_name() {
+    let Some(_guard) = isolated("registered_profiles_coexist_and_collide_by_name") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    engine_env(dir.path(), true, false);
+    let bin = dir.path().join("venv/bin/vllm");
+    let found = crate::roles::EnvEngineProvider::new()
+        .installations(&registered(&bin))
+        .unwrap();
+    assert_eq!(names(&found), vec!["local", "vllm-patched"]);
+    let mut clash = registered(&bin);
+    clash.insert("local".into(), clash["vllm-patched"].clone());
+    assert!(matches!(
+        crate::roles::EnvEngineProvider::new().installations(&clash),
+        Err(mllm_controller::engine_provider::ProviderError::ProfileExists(name)) if name == "local"
+    ));
+    engine_env(dir.path(), false, false);
+    let alone = crate::roles::EnvEngineProvider::new()
+        .installations(&registered(&bin))
+        .unwrap();
+    assert_eq!(names(&alone), vec!["vllm-patched"]);
+    assert!(crate::roles::EnvEngineProvider::new()
+        .installations(&Default::default())
+        .is_err());
+}
+
+// The isolation itself: what an environment test exports stays in its own
+// process, so no other test in this binary can see it.
+#[test]
+fn an_isolated_test_leaves_this_process_environment_alone() {
+    if let Some(_guard) = isolated("an_isolated_test_leaves_this_process_environment_alone") {
+        std::env::set_var("MLLM_ISOLATION_PROBE", "child");
+        return;
+    }
+    assert!(std::env::var_os("MLLM_ISOLATION_PROBE").is_none());
 }

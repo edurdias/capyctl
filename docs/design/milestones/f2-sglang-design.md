@@ -5,7 +5,7 @@
 **Baseline:** `0efd718`, following the F1 mainline closeout.
 **Sources:** [product specification](../../SPEC.md),
 [F1 design](f1-vllm-path-design.md), [F1 carryovers](f1-open-items.md), and
-[live qualification record](../../runbooks/spark-model-size-qualification.md).
+[live qualification record](../../runbooks/model-size-qualification.md).
 
 ## 1. Outcome and scope
 

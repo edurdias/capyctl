@@ -72,11 +72,22 @@ pub async fn boot_configured(
     state_dir: &std::path::Path,
     config: &std::path::Path,
 ) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    boot_configured_on(state_dir, config, engine_ports()).await
+}
+
+/// As [`boot_configured`], on the engine port range `ports`. The range is part
+/// of the published host document, so a test that restarts the role passes
+/// the same range again, as an operator's unchanged environment would.
+pub async fn boot_configured_on(
+    state_dir: &std::path::Path,
+    config: &std::path::Path,
+    ports: (u16, u16),
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
     mllm_cli::roles::start_standalone_configured(
         state_dir,
         Some(config),
         Arc::new(PortedProvider {
-            ports: engine_ports(),
+            ports,
             deep_park: false,
             members: None,
         }),

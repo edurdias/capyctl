@@ -29,6 +29,7 @@ pub fn hosts_router(
     });
     Router::new()
         .route("/management/v1/hosts", get(hosts))
+        .route("/management/v1/engines", get(engines))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
 }
@@ -110,6 +111,112 @@ async fn hosts(State(state): State<Arc<HostState>>) -> Response {
             "development_controls":controls})
     }).collect();
     Json(serde_json::json!({"api_version":"1","server_version":mllm_controller::agent_sessions::SERVER_VERSION,"hosts":hosts})).into_response()
+}
+
+/// ADR 0018: every host's published runtime profiles, from the approved
+/// snapshots and the hosts' reported inventories. `custom` is derived from
+/// the version (outside the verified set); `deployments` are the instances of
+/// the profile holding a runtime on the host now.
+async fn engines(State(state): State<Arc<HostState>>) -> Response {
+    let Ok(permit) = state.reads.clone().try_acquire_owned() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "queue_full", true);
+    };
+    let owner = state.owner.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let owner = owner.lock().ok()?;
+        let store = owner.store();
+        let mut rows = Vec::new();
+        for host in store.enrolled_hosts().ok()? {
+            let Some(publication) = store.host_publication(&host.host_id).ok().flatten() else {
+                continue;
+            };
+            let Ok(document) = serde_json::from_str::<serde_json::Value>(&publication.config_json)
+            else {
+                continue;
+            };
+            for (name, profile) in document["runtime_profiles"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+            {
+                let deployments: Vec<String> = store
+                    .profile_candidates(&host.host_id, &name)
+                    .map(|found| found.into_iter().map(|c| c.name).collect())
+                    .unwrap_or_default();
+                let retiring = store
+                    .profile_retirement(&host.host_id, &name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                rows.push((
+                    (host.host_id.clone(), host.host_name.clone(), host.revoked),
+                    name,
+                    profile,
+                    deployments,
+                    retiring,
+                ));
+            }
+        }
+        Some(rows)
+    })
+    .await;
+    let Ok(Some(rows)) = rows else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "snapshot_unavailable",
+            true,
+        );
+    };
+    let engines: Vec<_> = rows
+        .into_iter()
+        .map(|((host_id, host_name, revoked), name, profile, deployments, retiring)| {
+            let session = state.sessions.inspect(&host_id);
+            let reported = session
+                .as_ref()
+                .and_then(|s| s.profiles.iter().find(|p| p.name == name).cloned());
+            let engine = profile["engine"].as_str().unwrap_or("unknown").to_owned();
+            let version = reported
+                .as_ref()
+                .map(|p| p.installation.version.clone())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    profile["build_fingerprint"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned()
+                });
+            // ADR 0018 §1: `custom` is derived, never declared.
+            use mllm_config::{engine_policy::Engine, registration::is_verified};
+            let custom = match engine.as_str() {
+                "vllm" => !is_verified(Engine::Vllm, &version),
+                "sglang" => !is_verified(Engine::Sglang, &version),
+                _ => true,
+            };
+            let missing = reported.as_ref().is_some_and(|p| {
+                p.installation
+                    .capabilities_missing
+                    .iter()
+                    .any(|c| c == "deep_park")
+            });
+            serde_json::json!({
+                "host_id": host_id, "host": host_name,
+                "online": session.as_ref().is_some_and(|s| s.online && !revoked),
+                "profile": name, "engine": engine, "version": version, "custom": custom,
+                "executable": profile["executable"],
+                "fingerprint": reported.as_ref().map(|p| serde_json::json!({
+                    "version": p.installation.version, "digest": p.installation.digest,
+                    "state": p.installation.state,
+                })),
+                "deep_park": profile["security"]["deep_park"].as_str().unwrap_or("enabled"),
+                "deep_park_probe": if missing { "capability_missing" } else { "not_reported_missing" },
+                "published": "published",
+                "retiring": retiring,
+                "deployments": deployments,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"api_version":"1","engines":engines})).into_response()
 }
 
 /// SPEC §9.1 / T21 / ADR 0012 / P4: mark every runtime profile (engine

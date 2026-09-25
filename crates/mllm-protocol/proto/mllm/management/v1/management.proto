@@ -57,6 +57,13 @@ message AgentToServer {
     // Owner decision 2026-09-23: application liveness on a reconciled session,
     // sent only when the controller's SessionReady asked for it.
     Heartbeat heartbeat = 10;
+    // ADR 0018 (capability `live_profile_update`, additive): after `mllm
+    // engine add` or `remove`, the host re-publishes its whole preparation on
+    // the live session. The server answers with ProfilesPublished and keeps
+    // the session whatever it decides.
+    PublishProfiles publish_profiles = 11;
+    // ADR 0018 §4: first phase of removing a published profile.
+    RetireProfile retire_profile = 12;
   }
 }
 // Owner decision 2026-09-23 (additive): application-level liveness on the
@@ -68,6 +75,36 @@ message Heartbeat { int64 sent_at_unix_ms = 1; }
 message HostDraining { string host_id = 1; }
 // The controller has suspended dispatch to every engine on the host.
 message HostDrainAcknowledged { string host_id = 1; }
+// ADR 0018 §3: the host's new preparation, validated like a startup
+// publication. `request_id` is a ULID the host chose, echoed in the answer.
+message PublishProfiles {
+  string request_id = 1;
+  ReportInventory inventory = 2;
+}
+// ADR 0018 §3: accepted replaces the approved snapshot; refused keeps the
+// previous one. `reason` is a bounded operator-safe phrase.
+message ProfilesPublished {
+  string request_id = 1;
+  bool accepted = 2;
+  string reason = 3;
+}
+// ADR 0018 §4: ask the server to retire `profile` on this host, stopping the
+// deployments that use it when `drain` is set.
+message RetireProfile {
+  string request_id = 1;
+  string profile = 2;
+  bool drain = 3;
+}
+// ADR 0018 §4: `confirmed` (nothing uses the profile any more), `in_use`
+// (refused without drain; `deployments` names them), `draining` (stops
+// issued; a terminal answer follows), `holding` (stops unsettled at the
+// bound; nothing confirmed, accounting kept), `refused` (`reason` says why).
+message ProfileRetirement {
+  string request_id = 1;
+  string outcome = 2;
+  repeated string deployments = 3;
+  string reason = 4;
+}
 // SPEC §§10, 17: a bounded batch of loopback engine load samples, one per
 // Ready scope. Samples are routing hints, never readiness or release evidence.
 message ReportLoad {
@@ -218,6 +255,10 @@ message ServerToAgent {
     HostDrainAcknowledged host_drain_acknowledged = 10;
     // Sent only to a host whose Connect declared `heartbeats`.
     Heartbeat heartbeat = 11;
+    // ADR 0018: sent only to a host whose Connect declared
+    // `live_profile_update`, and only in answer to its request.
+    ProfilesPublished profiles_published = 12;
+    ProfileRetirement profile_retirement = 13;
   }
 }
 message LaunchMember {
@@ -421,6 +462,10 @@ message SessionReady {
   // without any message from the controller.
   int64 heartbeat_interval_ms = 3;
   int64 heartbeat_lost_after_ms = 4;
+  // ADR 0018 (additive): the server's own post-baseline features by name, so
+  // a host knows whether it may send PublishProfiles and RetireProfile. Empty
+  // from a server that predates it.
+  repeated string capabilities = 5;
 }
 
 // Physical process observations are made on the authenticated assigned host.

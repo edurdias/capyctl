@@ -549,7 +549,7 @@ host name is fixed to `host-a`; any other is refused, and `host-b` is never
 contacted. A pre-flight refuses to start when another engine process is already on the
 box and prints what it found. Nothing is killed by name.
 
-Evidence goes in one hardware runbook for all slices, `docs/runbooks/spark-live-f2.md`:
+Evidence goes in one hardware runbook for all slices, `docs/runbooks/live-f2.md`:
 commit, vLLM version, model, commands, scenario results, timings, memory samples and
 failures. `docs/runbooks/f2-current-status.md` stays the single status authority and
 links to it. Raw logs stay out of git.

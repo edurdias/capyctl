@@ -77,7 +77,7 @@ distinct, which is why the choice belongs in configuration validated against the
 rather than in a constant.
 
 Deep parking is still worth it there. Measured on host-a and recorded in
-`docs/runbooks/spark-deep-wake-optimization.md`: median wake-to-response of 7.505s,
+`docs/runbooks/deep-wake-optimization.md`: median wake-to-response of 7.505s,
 against a cold vLLM start of a minute or more. Waking skips process spawn, CUDA
 context creation and graph compilation, and pays only the weight read.
 
@@ -227,4 +227,4 @@ are tracked in the status runbook.
 - LMSYS, SGLang HiCache — <https://www.lmsys.org/blog/2025-09-10-sglang-hicache/>
 - sgl-project/sglang#22243, KV cache CPU offload during sleep/wakeup — <https://github.com/sgl-project/sglang/issues/22243>
 - LMCache KV offload quickstart — <https://docs.lmcache.ai/getting_started/quickstart/offload_kv_cache.html>
-- Measured wake times on host-a — `docs/runbooks/spark-deep-wake-optimization.md`
+- Measured wake times on host-a — `docs/runbooks/deep-wake-optimization.md`

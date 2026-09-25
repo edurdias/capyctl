@@ -169,6 +169,184 @@ impl Drop for Connected {
     }
 }
 
+/// ADR 0018 §3, §4: requests from the local control handler to the live
+/// session, and what the session learned of its server.
+pub struct ProfileUpdates {
+    profiles: Arc<crate::profiles::HostProfiles>,
+    sender: mpsc::Sender<ProfileRequest>,
+    receiver: tokio::sync::Mutex<mpsc::Receiver<ProfileRequest>>,
+    connected: watch::Sender<bool>,
+    server: watch::Sender<std::collections::BTreeSet<String>>,
+}
+
+enum ProfileRequest {
+    Publish {
+        request_id: String,
+        reply: tokio::sync::oneshot::Sender<PublishOutcome>,
+    },
+    Retire {
+        request_id: String,
+        profile: String,
+        drain: bool,
+        reply: mpsc::Sender<pb::ProfileRetirement>,
+    },
+}
+
+/// How a live publication ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The server accepted it; the set is now the accepted one.
+    Accepted,
+    /// The server refused it, saying why; the previous set stays.
+    Rejected(String),
+    /// ADR 0017: the server does not take live updates; a role restart
+    /// publishes the document.
+    RestartRequired,
+    /// No reconciled session; the next session publishes the accepted set.
+    NotConnected,
+    /// The session ended, or no verdict came inside the bound.
+    SessionEnded,
+    /// Another publication is waiting for its verdict.
+    Busy,
+}
+
+/// How a retirement request ended. `draining` is progress, never an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetireOutcome {
+    Confirmed,
+    InUse(Vec<String>),
+    Holding(Vec<String>),
+    Refused(String),
+    RestartRequired,
+    NotConnected,
+    SessionEnded,
+}
+
+impl ProfileUpdates {
+    pub fn new(profiles: Arc<crate::profiles::HostProfiles>) -> Arc<Self> {
+        let (sender, receiver) = mpsc::channel(4);
+        Arc::new(Self {
+            profiles,
+            sender,
+            receiver: tokio::sync::Mutex::new(receiver),
+            connected: watch::channel(false).0,
+            server: watch::channel(Default::default()).0,
+        })
+    }
+    pub fn profiles(&self) -> &Arc<crate::profiles::HostProfiles> {
+        &self.profiles
+    }
+    /// Whether a reconciled control session is up right now.
+    pub fn connected(&self) -> bool {
+        *self.connected.borrow()
+    }
+    /// ADR 0017: whether the connected server's SessionReady listed
+    /// `live_profile_update`.
+    pub fn server_supports(&self) -> bool {
+        self.server
+            .borrow()
+            .contains(mllm_protocol::capabilities::LIVE_PROFILE_UPDATE)
+    }
+    /// What the session learned: `Some(capabilities)` once SessionReady
+    /// arrives, `None` when the session ends.
+    pub fn observe_session(&self, capabilities: Option<&[String]>) {
+        match capabilities {
+            Some(capabilities) => {
+                self.server
+                    .send_replace(capabilities.iter().cloned().collect());
+                self.connected.send_replace(true);
+            }
+            None => {
+                self.connected.send_replace(false);
+                self.server.send_replace(Default::default());
+            }
+        }
+    }
+
+    /// ADR 0018 §3: stage `set`, send it, and settle on the server's verdict.
+    pub async fn publish(
+        &self,
+        set: crate::profiles::ProfileSet,
+        bound: Duration,
+    ) -> PublishOutcome {
+        if !self.connected() {
+            return PublishOutcome::NotConnected;
+        }
+        if !self.server_supports() {
+            return PublishOutcome::RestartRequired;
+        }
+        let request_id = ulid::Ulid::new().to_string();
+        if self.profiles.stage(&request_id, set).is_err() {
+            return PublishOutcome::Busy;
+        }
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let sent = self
+            .sender
+            .send(ProfileRequest::Publish {
+                request_id: request_id.clone(),
+                reply,
+            })
+            .await;
+        let outcome = match (sent, tokio::time::timeout(bound, answer).await) {
+            (Ok(()), Ok(Ok(outcome))) => outcome,
+            _ => PublishOutcome::SessionEnded,
+        };
+        if outcome != PublishOutcome::Accepted {
+            // Verdicts were settled by the session loop; anything else leaves
+            // nothing staged. A verdict arriving after this ends the session
+            // (see the loop), so the host's accepted set stays authoritative.
+            self.profiles.settle(&request_id, false);
+        }
+        outcome
+    }
+
+    /// ADR 0018 §4: ask the server to retire `profile`; wait for a terminal
+    /// answer (`draining` is progress, not an answer).
+    pub async fn retire(&self, profile: &str, drain: bool, bound: Duration) -> RetireOutcome {
+        if !self.connected() {
+            return RetireOutcome::NotConnected;
+        }
+        if !self.server_supports() {
+            return RetireOutcome::RestartRequired;
+        }
+        let (reply, mut answers) = mpsc::channel(4);
+        let request = ProfileRequest::Retire {
+            request_id: ulid::Ulid::new().to_string(),
+            profile: profile.into(),
+            drain,
+            reply,
+        };
+        if self.sender.send(request).await.is_err() {
+            return RetireOutcome::SessionEnded;
+        }
+        let wait = async {
+            while let Some(answer) = answers.recv().await {
+                match answer.outcome.as_str() {
+                    "draining" => continue,
+                    "confirmed" => return RetireOutcome::Confirmed,
+                    "in_use" => return RetireOutcome::InUse(answer.deployments),
+                    "holding" => return RetireOutcome::Holding(answer.deployments),
+                    _ => return RetireOutcome::Refused(answer.reason),
+                }
+            }
+            RetireOutcome::SessionEnded
+        };
+        tokio::time::timeout(bound, wait)
+            .await
+            .unwrap_or(RetireOutcome::SessionEnded)
+    }
+}
+
+/// Marks the session disconnected for the control handler when it ends.
+struct Disconnected(Option<Arc<ProfileUpdates>>);
+impl Drop for Disconnected {
+    fn drop(&mut self) {
+        if let Some(updates) = &self.0 {
+            updates.observe_session(None);
+        }
+    }
+}
+
 /// Cancellation is local and never releases retained resource claims.
 pub async fn run_session(
     identity: &PendingEnrollment,
@@ -201,9 +379,26 @@ pub async fn run_session_with_drain(
     identity: &PendingEnrollment,
     journal: Arc<HostJournal>,
     inventory: pb::ReportInventory,
+    shutdown: watch::Receiver<bool>,
+    execution: Option<Arc<dyn SessionExecution>>,
+    drain: Option<Arc<DrainSignal>>,
+) -> Result<(), HostRevoked> {
+    run_session_with_updates(
+        identity, journal, inventory, shutdown, execution, drain, None,
+    )
+    .await
+}
+
+/// As `run_session_with_drain`, also carrying the local control handler's
+/// profile publications and retirements (ADR 0018 §3, §4).
+pub async fn run_session_with_updates(
+    identity: &PendingEnrollment,
+    journal: Arc<HostJournal>,
+    inventory: pb::ReportInventory,
     mut shutdown: watch::Receiver<bool>,
     execution: Option<Arc<dyn SessionExecution>>,
     drain: Option<Arc<DrainSignal>>,
+    updates: Option<Arc<ProfileUpdates>>,
 ) -> Result<(), HostRevoked> {
     let mut delay = Duration::from_millis(250);
     loop {
@@ -212,7 +407,7 @@ pub async fn run_session_with_drain(
         }
         let ended = tokio::select! {
             _ = shutdown.changed() => { return Ok(()); }
-            ended = connect_once(identity, journal.clone(), inventory.clone(), execution.clone(), drain.clone()) => ended,
+            ended = connect_once(identity, journal.clone(), inventory.clone(), execution.clone(), drain.clone(), updates.clone()) => ended,
         };
         // SPEC §13: a session end retains every claim and grants nothing. Its
         // reason is operator diagnostics only: a fixed phrase, never a command
@@ -300,6 +495,7 @@ async fn connect_once(
     startup_inventory: pb::ReportInventory,
     execution: Option<Arc<dyn SessionExecution>>,
     drain: Option<Arc<DrainSignal>>,
+    updates: Option<Arc<ProfileUpdates>>,
 ) -> Result<(), SessionEnd> {
     let host = identity
         .host_id()
@@ -341,9 +537,16 @@ async fn connect_once(
     // measurement. The startup snapshot is only a fallback for hosts that
     // publish no measured domains; resending it on a reconnect minutes later
     // made every reconnect fail publication (found live, U5 on host-a).
+    // ADR 0018 §3: without a measured refresh, the accepted profile set's
+    // inventory, so a reconnect publishes what the host now holds.
     let mut inventory = execution
         .as_ref()
         .and_then(|e| e.inventory())
+        .or_else(|| {
+            updates
+                .as_ref()
+                .map(|u| u.profiles.accepted().inventory.clone())
+        })
         .unwrap_or(startup_inventory);
     inventory.envelope = Some(pb::Envelope {
         host_id: host.clone(),
@@ -492,6 +695,16 @@ async fn connect_once(
     let mut lost_after: Option<Duration> = None;
     let mut last_heard = tokio::time::Instant::now();
     let mut beat = tokio::time::interval(Duration::from_secs(1));
+    // ADR 0018: requests from the control handler, held for this session.
+    let mut requests = match &updates {
+        Some(u) => Some(u.receiver.lock().await),
+        None => None,
+    };
+    let mut publishing =
+        std::collections::BTreeMap::<String, tokio::sync::oneshot::Sender<PublishOutcome>>::new();
+    let mut retiring =
+        std::collections::BTreeMap::<String, mpsc::Sender<pb::ProfileRetirement>>::new();
+    let _disconnected = Disconnected(updates.clone());
     loop {
         let message = tokio::select! {
             _ = drain_requested(&mut requested), if fence.is_some() && !announced => {
@@ -499,6 +712,44 @@ async fn connect_once(
                 reports
                     .try_send(frame(agent_to_server::Msg::HostDraining(pb::HostDraining { host_id: host.clone() })))
                     .map_err(end("outbound report queue is full"))?;
+                continue;
+            },
+            request = async {
+                match requests.as_mut() {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if fence.is_some() => {
+                match request {
+                    // A publication whose caller already gave up is never sent.
+                    Some(ProfileRequest::Publish { reply, .. }) if reply.is_closed() => {}
+                    Some(ProfileRequest::Publish { request_id, reply }) => {
+                        let staged = updates
+                            .as_ref()
+                            .and_then(|u| u.profiles.pending())
+                            .filter(|(id, _)| *id == request_id);
+                        let Some((_, set)) = staged else {
+                            let _ = reply.send(PublishOutcome::SessionEnded);
+                            continue;
+                        };
+                        let mut inventory = set.inventory.clone();
+                        inventory.envelope = Some(pb::Envelope { host_id: host.clone(), protocol_version: mllm_protocol::PROTOCOL_VERSION.into(), ..Default::default() });
+                        reports
+                            .try_send(frame(agent_to_server::Msg::PublishProfiles(pb::PublishProfiles { request_id: request_id.clone(), inventory: Some(inventory) })))
+                            .map_err(end("outbound report queue is full"))?;
+                        publishing.insert(request_id, reply);
+                    }
+                    // Likewise a retirement (queued across a reconnect): nobody
+                    // would finish the removal.
+                    Some(ProfileRequest::Retire { reply, .. }) if reply.is_closed() => {}
+                    Some(ProfileRequest::Retire { request_id, profile, drain, reply }) => {
+                        reports
+                            .try_send(frame(agent_to_server::Msg::RetireProfile(pb::RetireProfile { request_id: request_id.clone(), profile, drain })))
+                            .map_err(end("outbound report queue is full"))?;
+                        retiring.insert(request_id, reply);
+                    }
+                    None => {}
+                }
                 continue;
             },
             message = stream.message() => {
@@ -526,7 +777,9 @@ async fn connect_once(
                 })));
                 continue;
             },
-            _ = observations.tick(), if fence.is_some() => {
+            // ADR 0018 §3: no refresh while a publication awaits its verdict;
+            // the verdict settles which document the next one describes.
+            _ = observations.tick(), if fence.is_some() && !updates.as_ref().is_some_and(|u| u.profiles.publishing()) => {
                 if let Some(mut inventory) = execution.as_ref().and_then(|e| e.inventory()) {
                     inventory.envelope = Some(pb::Envelope { host_id: host.clone(), protocol_version: mllm_protocol::PROTOCOL_VERSION.into(), ..Default::default() });
                     reports.try_send(frame(agent_to_server::Msg::ReportInventory(inventory))).map_err(end("outbound report queue is full"))?;
@@ -579,6 +832,11 @@ async fn connect_once(
                 let _ = load_ready.send(true);
                 if let Some(drain) = &drain {
                     drain.connected.send_replace(true);
+                }
+                // ADR 0017, 0018 §3: live updates only to a server that says
+                // it takes them.
+                if let Some(u) = &updates {
+                    u.observe_session(Some(&ready.capabilities));
                 }
             }
             Some(server_to_agent::Msg::HostDrainAcknowledged(ack))
@@ -669,6 +927,42 @@ async fn connect_once(
                     });
                     (key, provisioned)
                 });
+            }
+            // ADR 0018 §3: settle before the next inventory tick.
+            Some(server_to_agent::Msg::ProfilesPublished(verdict))
+                if fence.is_some() && updates.is_some() =>
+            {
+                let settled = updates
+                    .as_ref()
+                    .is_some_and(|u| u.profiles.settle(&verdict.request_id, verdict.accepted));
+                if let Some(reply) = publishing.remove(&verdict.request_id) {
+                    let _ = reply.send(if verdict.accepted {
+                        PublishOutcome::Accepted
+                    } else {
+                        PublishOutcome::Rejected(verdict.reason)
+                    });
+                }
+                // The server accepted a document this host no longer holds
+                // (its caller gave up at the bound): end the session, so the
+                // reconnect publishes the host's accepted set authoritatively.
+                if verdict.accepted && !settled {
+                    return Err(SessionEnd::fixed(
+                        "a profile publication was accepted after the host gave up on it",
+                    ));
+                }
+            }
+            // ADR 0018 §4: relayed to the waiting handler; `draining` is progress.
+            Some(server_to_agent::Msg::ProfileRetirement(answer))
+                if fence.is_some() && updates.is_some() =>
+            {
+                let terminal = answer.outcome != "draining";
+                let id = answer.request_id.clone();
+                if let Some(reply) = retiring.get(&id) {
+                    let _ = reply.try_send(answer);
+                }
+                if terminal {
+                    retiring.remove(&id);
+                }
             }
             // Legacy raw argv and commands before reconciliation remain denied.
             _ => return Err(SessionEnd::fixed("controller sent an unexpected message")),

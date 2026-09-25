@@ -1337,3 +1337,191 @@ async fn remote_sources_need_host_opt_in_and_are_listed_as_referenced() {
         "{body}"
     );
 }
+
+/// ADR 0018 §7 (owner decision 2026-09-25): a deploy naming a runtime profile
+/// no allowed host publishes is refused at once and nothing is stored; the
+/// refusal names the profile, each host with what it publishes, and the fix.
+// T03 T07
+#[tokio::test]
+async fn a_deploy_naming_an_unpublished_profile_fails_fast() {
+    let (_directory, state, mut config, _) = fixture();
+    publish_host(&state, "host-a", 'e', json!({}));
+    publish_host(&state, "host-b", 'f', json!({}));
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    config["instances"] = json!(1);
+    config["placement"] = json!({"hosts": ["host-a", "host-b"]});
+    config["devices"] = json!([{"sharing": "shared"}]);
+    for phase in ["cold", "ready", "parking", "wake"] {
+        config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
+    }
+    let before = state
+        .lock()
+        .unwrap()
+        .store()
+        .snapshot()
+        .unwrap()
+        .deployments
+        .len();
+    let mut missing = config.clone();
+    missing["runtime_profile"] = json!("vllm-patched");
+    let response = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "missing",
+            json!({"config":missing,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let body = json_response(response).await;
+    assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    for needle in [
+        "vllm-patched",
+        "host-a",
+        "host-b",
+        "local",
+        "mllm engine add",
+        "--name vllm-patched",
+    ] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert_eq!(body["error"]["details"]["profile"], "vllm-patched");
+    assert_eq!(
+        body["error"]["details"]["hosts"]["host-a"],
+        json!(["local"]),
+        "{body}"
+    );
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .store()
+            .snapshot()
+            .unwrap()
+            .deployments
+            .len(),
+        before,
+        "nothing stored"
+    );
+    // The same deployment naming a published profile is accepted.
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "present",
+            json!({"config":config,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+}
+
+/// ADR 0018 §7: the embedded (standalone) host fails fast the same way.
+// T03 T07
+#[tokio::test]
+async fn an_embedded_deploy_naming_an_unpublished_profile_fails_fast() {
+    let (_directory, state, mut config, host) = fixture();
+    let router = app(state.clone(), host);
+    config["runtime_profile"] = json!("sglang");
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "embedded",
+            json!({"config":config,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let body = json_response(response).await;
+    assert_eq!(body["error"]["code"], "profile_not_published", "{body}");
+    assert!(state
+        .lock()
+        .unwrap()
+        .store()
+        .snapshot()
+        .unwrap()
+        .deployments
+        .is_empty());
+}
+
+/// ADR 0018 §7: when another allowed host publishes the profile, the deploy
+/// is accepted and a host that lacks it is recorded refused with the closed
+/// diagnostic `profile_not_published`, never a candidate.
+// T03 T07
+#[tokio::test]
+async fn a_host_lacking_the_profile_is_refused_while_another_has_it() {
+    let (_directory, state, mut config, _) = fixture();
+    let a = publish_host(&state, "host-a", 'e', json!({}));
+    let b = publish_host(&state, "host-b", 'f', json!({}));
+    {
+        // host-b re-publishes with its only profile under another name.
+        let owner = state.lock().unwrap();
+        let mut document: Value = serde_json::from_str(
+            &owner
+                .store()
+                .host_publication(&b)
+                .unwrap()
+                .unwrap()
+                .config_json,
+        )
+        .unwrap();
+        let profile = document["runtime_profiles"]["local"].take();
+        document["runtime_profiles"] = json!({ "sglang": profile });
+        owner
+            .store()
+            .publish_host_configuration(&mllm_store::host_publication::HostPublication {
+                host_id: b.clone(),
+                config_json: document.to_string(),
+                boot_id: "boot-b".into(),
+                fingerprint: mllm_config::remote_resources::policy_fingerprint(&document),
+                received_at_ms: 2000,
+            })
+            .unwrap();
+    }
+    let router = configuration_router(
+        ManagementCredentials::from_trusted_resolver(MANAGEMENT, INFERENCE).unwrap(),
+        Arc::new(SharedConfigurationSource::from_registry(state.clone(), "owner").unwrap()),
+    );
+    config["instances"] = json!(1);
+    config["placement"] = json!({"hosts": ["host-a", "host-b"]});
+    config["devices"] = json!([{"sharing": "shared"}]);
+    for phase in ["cold", "ready", "parking", "wake"] {
+        config["resources"][phase]["devices"] = json!([{"sharing": "shared"}]);
+    }
+    let response = router
+        .oneshot(request(
+            "POST",
+            "/management/v1/deployments",
+            "partial",
+            json!({"config":config,"activate":false}),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = json_response(response).await;
+    assert_eq!(status, 202, "{body}");
+    let id = body["deployment_id"].as_str().unwrap().to_owned();
+    let snapshot = state.lock().unwrap().store().snapshot().unwrap();
+    let deployment = snapshot.deployments.iter().find(|d| d.id == id).unwrap();
+    let hosts: Vec<_> = deployment
+        .hosts
+        .iter()
+        .map(|h| (h.host_id.clone(), h.outcome.clone(), h.diagnostic.clone()))
+        .collect();
+    assert!(hosts.contains(&(a, "resolved".into(), None)), "{hosts:?}");
+    assert!(
+        hosts.contains(&(
+            "host-b".into(),
+            "refused".into(),
+            Some("profile_not_published".into())
+        )),
+        "{hosts:?}"
+    );
+}

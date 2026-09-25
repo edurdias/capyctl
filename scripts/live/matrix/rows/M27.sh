@@ -2,7 +2,7 @@
 # M27 / M31 (T15, T16, T19, T22, T23; W10): request-driven switching on one host
 # under the tight budget (only one of the pair fits), A -> B -> A ... by requests
 # alone, with distinct models (I1 at every step):
-#   roles.sh host-doc host-a tight; roles.sh host-down host-a; roles.sh host-up host-a
+#   roles.sh host-doc a tight; roles.sh host-down a; roles.sh host-up a
 #   run_row.sh M27 --tag s14-s30 -- sa-14 sa-30 1 restart_only   (same engine, A restart_only)
 #   run_row.sh M31 --tag v14-s30 -- va-14 sa-30 3 deep           (cross engine, deep, three cycles)
 #

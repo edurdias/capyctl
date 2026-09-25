@@ -22,6 +22,8 @@ pub mod configuration;
 mod credentials;
 pub mod drain;
 pub mod enrollment;
+// ADR 0018 §4: runtime profile retirement over the ordinary stop path.
+pub mod engines;
 pub mod events;
 pub mod hosts;
 // ADR 0008: the standalone role's embedded installation.

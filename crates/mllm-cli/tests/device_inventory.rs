@@ -28,6 +28,15 @@ fn inventory_json(devices: serde_json::Value) -> String {
     .to_string()
 }
 
+fn named(
+    installation: &EngineInstallation,
+) -> Vec<mllm_controller::engine_provider::NamedInstallation> {
+    vec![mllm_controller::engine_provider::NamedInstallation {
+        profile: "local".into(),
+        installation: installation.clone(),
+    }]
+}
+
 fn installation() -> EngineInstallation {
     EngineInstallation {
         engine: Engine::Sglang,
@@ -60,7 +69,8 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
     assert_eq!(published.host_id, "host-a");
     assert_eq!(published.physical_gpu_uuid.as_deref(), Some(UUID));
 
-    let host = standalone_config::host_policy(&installation(), "env-1", 1 << 40, Some(&published));
+    let host =
+        standalone_config::host_policy(&named(&installation()), "env-1", 1 << 40, Some(&published));
     assert_eq!(host["device_inventory_digest"], DIGEST);
     assert_eq!(host["name"], "host-a");
     assert_eq!(
@@ -80,6 +90,7 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
             1 << 40,
             standalone_config::DEFAULT_REQUEST_DEADLINE,
             true,
+            "local",
         ),
         &host,
     )
@@ -121,7 +132,7 @@ fn a_boot_without_an_inventory_publishes_nothing() {
     }
     // And the published table carries neither field, so the host policy is
     // byte-identical to a host that never observed a device.
-    let host = standalone_config::host_policy(&installation(), "env-1", 1 << 40, None);
+    let host = standalone_config::host_policy(&named(&installation()), "env-1", 1 << 40, None);
     assert!(
         host["device_inventory_digest"].is_null(),
         "no inventory, no digest"
@@ -150,7 +161,8 @@ fn a_multi_device_inventory_publishes_the_digest_but_names_no_device() {
     assert_eq!(published.digest, DIGEST);
     assert_eq!(published.host_id, "host-a");
     assert_eq!(published.physical_gpu_uuid, None);
-    let host = standalone_config::host_policy(&installation(), "env-1", 1 << 40, Some(&published));
+    let host =
+        standalone_config::host_policy(&named(&installation()), "env-1", 1 << 40, Some(&published));
     assert_eq!(host["device_inventory_digest"], DIGEST);
     assert_eq!(host["name"], "host-a");
     assert!(host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"].is_null());

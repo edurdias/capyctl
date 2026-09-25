@@ -10,7 +10,7 @@ tuning lives in each deployment's engine_config (ADR 0014 section 1).
 usage: gen_host_doc.py --device-json FILE --ip IP --run-root DIR --policy normal|tight
                        --sglang-version V --vllm-version V --vllm-venv DIR
                        [--sglang-venv DIR] [--remote-tree DIR] [--models-root DIR]
-                       [--ingress-port 9443] [--managed-runtime] --out FILE
+                       [--ingress-port 9443] [--managed-runtime] [--no-profiles] --out FILE
 """
 
 import argparse
@@ -60,6 +60,9 @@ def main():
     # Release validation: leave runtime_dir out, so the host uses the managed
     # runtime its binary writes to <state_dir>/runtime (docs/operations/install.md).
     parser.add_argument("--managed-runtime", action="store_true")
+    # ADR 0018 (rows ENG1, ENG4): a bare host document for `engine add` rows,
+    # so every published profile in the run comes only from `engines.yaml`.
+    parser.add_argument("--no-profiles", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -113,6 +116,8 @@ def main():
     document = substitute(template, values)
     if args.managed_runtime:
         del document["runtime_dir"]
+    if args.no_profiles:
+        document["runtime_profiles"] = {}
     fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
         json.dump(document, handle, indent=1)

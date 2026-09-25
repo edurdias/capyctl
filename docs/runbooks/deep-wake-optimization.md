@@ -99,7 +99,7 @@ no installed vLLM files or dependencies were changed.
 
 ## Reproduction and evidence
 
-Use the environment in [the environment runbook](spark-vllm-env.md). Run one
+Use the environment in [the environment runbook](vllm-env.md). Run one
 engine per host and confirm the prior process has exited. On host-a:
 
 ```bash

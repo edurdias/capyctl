@@ -19,7 +19,7 @@
 - Only host `host-a` is authorized for live work. Never access `host-b`. Only Task 15 touches the host, through `scripts/live/run-on-spark.sh`, which refuses any other host name.
 - Do not change engine environments, drivers, or reboot hosts: nothing installed on the host is modified. mllm's own `runtime/` directory in this repository is in scope, and Task 7a creates `runtime/mllm_vllm_guard.py` there.
 - Excluded files, never read, edited, formatted, tested or staged: `crates/mllm-cli/tests/live_interactive.rs` and a local Task 2 implementation report. `AGENTS.md` is untracked and not this plan's.
-- One status document: `docs/runbooks/f2-current-status.md`. Hardware evidence goes in `docs/runbooks/spark-live-f2.md` (Task 15 creates it). No progress or continuation files under `docs/`.
+- One status document: `docs/runbooks/f2-current-status.md`. Hardware evidence goes in `docs/runbooks/live-f2.md` (Task 15 creates it). No progress or continuation files under `docs/`.
 - Prose in documents, doc comments and commit messages is normal English. Cite the governing requirement inline, e.g. `// SPEC §13.3: local-only is not unauthenticated`. Tag tests with acceptance-matrix identifiers as a comment line directly above the test attribute, e.g. `// T10`.
 - Never release a reservation, advance an epoch, or replay a dispatch without verified evidence. The `Uncertain` pause in the worker is preserved for every state that cannot be proven.
 - Migrations are forward-only. Never edit `SCHEMA_V1` through `SCHEMA_V13`. This plan adds `SCHEMA_V14`.
@@ -43,7 +43,7 @@ New files:
 - `crates/mllm-controller/src/coordinator/native_failure.rs` — terminate, prove, release, journal, close.
 - `crates/mllm-router/src/forwarders.rs` — per-deployment forwarder source.
 - `crates/mllm-testkit/` — the Fake engine, fake launcher, lifecycle simulation and shared fixtures (Task 13).
-- `crates/mllm-cli/tests/live_vllm.rs`, `scripts/live/run-on-spark.sh`, `docs/runbooks/spark-live-f2.md`.
+- `crates/mllm-cli/tests/live_vllm.rs`, `scripts/live/run-on-spark.sh`, `docs/runbooks/live-f2.md`.
 
 Modified, by responsibility: `mllm-domain/src/completion.rs` (Presence, identity rules); `mllm-adapters/src/traits.rs` (the tool trait), `vllm/args.rs`, `vllm/adapter.rs`, `resolve.rs`; `mllm-launchers/src/{durable.rs, group_observation.rs, process_absence.rs, lib.rs}`; `mllm-store/src/{schema.rs, migrations.rs, lifecycle.rs, lifecycle/completion.rs, ordinary_lifecycle.rs}`; `mllm-config/src/{schema.rs, effective.rs, effective/core.rs, engine_policy.rs}`; `mllm-controller/src/{engine_bindings.rs, coordinator/worker.rs, coordinator_port.rs, port.rs}`; `mllm-router/src/{lib.rs, chat.rs}`; `mllm-cli/src/{roles.rs, standalone_config.rs}`.
 
@@ -1393,7 +1393,7 @@ that amends them in full."
 ### Task 15: The live run on host-a
 
 **Files:**
-- Create: `crates/mllm-cli/tests/live_vllm.rs`, `scripts/live/run-on-spark.sh`, `docs/runbooks/spark-live-f2.md`
+- Create: `crates/mllm-cli/tests/live_vllm.rs`, `scripts/live/run-on-spark.sh`, `docs/runbooks/live-f2.md`
 
 **Interfaces:**
 - Consumes: everything above. Env: `MLLM_LIVE=1`, `MLLM_VLLM_BIN=$HOME/mllm-vllm-venv2/bin/vllm`, `MLLM_MODELS_ROOT=$HOME/models`, `PROTOC=$HOME/.local/bin/protoc`.
@@ -1476,7 +1476,7 @@ first evidence entry, and keep L3's direct-route assertions as written above.
 - [ ] **Step 4: Run, then record**
 
 Run: `bash scripts/live/run-on-spark.sh`
-Expected: eleven scenarios green. On any failure, fix on the branch, re-run; every run appends to `docs/runbooks/spark-live-f2.md`:
+Expected: eleven scenarios green. On any failure, fix on the branch, re-run; every run appends to `docs/runbooks/live-f2.md`:
 
 ```markdown
 ## 2026-MM-DD — S1 run N — <commit>
@@ -1491,7 +1491,7 @@ vLLM control routes keyed by API key: yes/no (see Step 3).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/mllm-cli/tests/live_vllm.rs scripts/live/run-on-spark.sh docs/runbooks/spark-live-f2.md
+git add crates/mllm-cli/tests/live_vllm.rs scripts/live/run-on-spark.sh docs/runbooks/live-f2.md
 git commit -m "test: S1 live run on host-a
 
 Eleven scenarios drive the product path against vLLM 0.29 on the host: launch,
@@ -1515,7 +1515,7 @@ Run: `grep -rhoE "// T[0-9]+" crates --include=*.rs | sort | uniq -c` — expect
 
 - [ ] **Step 2: Runbook**
 
-`docs/runbooks/f2-current-status.md`: S1 entry under A1b with the live results summary and a link to `spark-live-f2.md`; open items: post-launch retry (spec §6), vLLM control-route keying (Task 15 Step 3 result), S1r next. Every status claim says CPU and Fake tests are a pre-check.
+`docs/runbooks/f2-current-status.md`: S1 entry under A1b with the live results summary and a link to `live-f2.md`; open items: post-launch retry (spec §6), vLLM control-route keying (Task 15 Step 3 result), S1r next. Every status claim says CPU and Fake tests are a pre-check.
 
 - [ ] **Step 3: Commit**
 

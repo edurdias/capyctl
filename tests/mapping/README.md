@@ -2,7 +2,7 @@
 
 Every F1 target test id (F1 design §9 / SPEC §18 F1) mapped to its concrete
 test function(s). Test names grepped from the tree (never invented); live-tier
-evidence cites `docs/runbooks/spark-qualification-f1.md` sections.
+evidence cites `docs/runbooks/qualification-f1.md` sections.
 
 | Test | Scenario | Simulator tier (test fns) | Live tier (Spark) |
 |---|---|---|---|
@@ -37,5 +37,5 @@ evidence cites `docs/runbooks/spark-qualification-f1.md` sections.
 
 ## Live-tier ledger
 
-Live claims exist ONLY in `docs/runbooks/spark-qualification-f1.md` and are labeled
+Live claims exist ONLY in `docs/runbooks/qualification-f1.md` and are labeled
 `live-tier (Spark)`. Simulator claims above never substitute for them.

@@ -710,3 +710,49 @@ fn test_ports_avoid_the_ephemeral_range_and_never_repeat() {
     let run = free_ports(4, true);
     assert!(run.windows(2).all(|pair| pair[1] == pair[0] + 1), "{run:?}");
 }
+
+// T37 (ADR 0018 §3): a started host serves an owner-only control socket that
+// answers `list`, and the server has a retirement service installed.
+#[test]
+fn a_started_host_serves_its_control_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = root();
+    let (mut server, server_root, server_config, host_root, host_config) =
+        enrolled_server(temp.path(), "socket-spark");
+    let mut host = Service::start(&host_root, "host", &host_config);
+    hosts(&server_root, &server_config, true, 1);
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&host_config).unwrap()).unwrap();
+    let socket = Path::new(state["state_dir"].as_str().unwrap()).join("control.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let list = || {
+        runtime
+            .block_on(mllm_agent::control_socket::request(
+                &socket,
+                &mllm_agent::control_socket::ControlRequest::List,
+                std::time::Duration::from_secs(5),
+            ))
+            .unwrap()
+    };
+    // The session may still be reconciling when the host is first listed.
+    let mut reply = list();
+    while reply["connected"] != true && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reply = list();
+    }
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["connected"], true, "{reply}");
+    assert_eq!(reply["live_profile_update"], true, "{reply}");
+    host.stop();
+    // The role removes its socket when it stops.
+    assert!(!socket.exists());
+    server.stop();
+}

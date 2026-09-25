@@ -53,6 +53,12 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                 .map_err(|e| named(file, Some(kind), &e))?;
             Value::Null
         }
+        // ADR 0018 §2: `engines.yaml` validates like any other document kind.
+        ConfigKind::Engines => {
+            mllm_config::registration::EnginesFile::parse(file, &text)
+                .map_err(|e| named(file, Some(kind), &e))?;
+            Value::Null
+        }
         ConfigKind::Deployment => {
             let deployment = parse_strict(kind, &text).map_err(|e| named(file, Some(kind), &e))?;
             let instances = mllm_config::instances::parse_instance_spec(&deployment)
@@ -166,6 +172,7 @@ fn detect_kind(text: &str) -> Result<ConfigKind, ConfigError> {
         ConfigKind::Host,
         ConfigKind::Deployment,
         ConfigKind::Standalone,
+        ConfigKind::Engines,
     ];
     let mut failures = Vec::new();
     for kind in kinds {
@@ -179,7 +186,7 @@ fn detect_kind(text: &str) -> Result<ConfigKind, ConfigError> {
         [] => Err(ConfigError::new(
             ConfigErrorCode::SchemaVersion,
             "kind",
-            "document kind is not one of server, host, deployment, standalone",
+            "document kind is not one of server, host, deployment, standalone, engines",
         )),
         [(kind, _)] => Ok(*kind),
         [(_, first), ..] => Err(first.clone()),

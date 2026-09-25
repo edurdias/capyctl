@@ -155,6 +155,10 @@ A host may enroll before engines or checkpoints are installed. Track independent
 
 Host administrators register trusted runtime profiles, permitted devices and directories. The initial release does not silently install engines, execute discovered scripts, or download weights. `doctor host` performs approved non-destructive checks; destructive park/restore verification is an explicit operation.
 
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
+
+Host administrators register runtime profiles with `mllm engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; mllm never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). mllm still installs no engine.
+
 The agent initiates its management connection; the server sends commands over that session. gRPC supports bidirectional streaming and TLS client authentication as protocol building blocks [S8, S9]. Retry with backoff; reconnect after reboot without creating another host record. First-time setup is server-first, but steady-state boot order is not constrained.
 
 ### 4.3 Foreground roles and service operation
@@ -523,6 +527,13 @@ mllm inspect config --role host --effective
 
 # Reclaim materialized model sources no deployment references (ADR 0008).
 mllm prune sources --host-config host.yaml --apply
+
+# Register runtime profiles from an engine already installed (ADR 0018).
+mllm engine detect [--path DIR]
+mllm engine add [PATH] [--name NAME] [--deep-park enabled|disabled] [--drift warn|refuse]
+mllm engine list
+mllm engine remove NAME [--drain]
+mllm list engines --config server.yaml
 ```
 
 `start host` starts the local agent, not a remote machine or power-on action. A client-only installation selects a server context and credential reference. Do not mix action-first commands with the previous `mllm server run` grammar in user documentation.
@@ -530,6 +541,10 @@ mllm prune sources --host-config host.yaml --apply
 `deploy model` without `--wait` returns a deployment ID after durable acceptance. `--wait` waits for the specific accepted target operation, not forever for the deployment to remain ready. Machine-readable JSON and stable error codes are required; exact output layout can be finalized with the CLI tests. List/status commands do not activate models as a side effect.
 
 The management API is the source of semantics for CLI, future UI, and integrations. Required operations cover deployment creation/revision, inspection, lifecycle actions, inventory, invitation/enrollment, events, and effective configuration. Return structured errors such as invalid configuration, unauthorized profile, host unavailable, insufficient resources, queue full, unsupported capability, activation timeout, and unreconciled ownership. Owner decision 2026-09-25: a start that places nothing because no allowed host is eligible for placement (drain-only after version skew, draining, revoked, offline or not reconciled) is refused `host_ineligible` (CLI exit 15), naming each host and why, with the host's and the server's versions for a drain-only host; `capacity_blocked` is reserved for capacity. `start deployment --evict` covers every instance the start activates and plans them together before releasing anyone, never evicting beyond what placement needs; when one instance cannot be placed even with eviction, nothing is released and the refusal (`capacity_blocked`, CLI exit 4) names the instance and each host's need, free and evictable memory. `start deployment --wait` exits 0 only once every instance is ready. Exact HTTP paths and protobuf field numbers are to be frozen in the first implementation plan, not inferred from these command sketches.
+
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
+
+`mllm engine detect|add|list|remove` and `mllm list engines` (§4.2) add nine closed codes to the error vocabulary, each with a stable CLI exit: `engine_not_found` (16, the named or picked path has no `vllm-*`/`sglang-*` `dist-info`), `engine_unsupported` (17, its engine family is not one mllm integrates), `engine_version_failed` (18, the bounded version check failed or timed out), `profile_exists` (19, the name is already registered, declared in the role document, or reserved for a standalone environment profile), `profile_in_use` (20, `engine remove` without `--drain` while a deployment on this machine uses the profile, naming it), `publish_rejected` (21, the running role validated the profile like a startup publication and refused it; the previous approved snapshot is kept), `agent_unreachable` (22, no role is listening on `<state_dir>/control.sock`; `add` still writes `engines.yaml` and the role picks it up at its next start, `remove` writes nothing), `not_interactive` (23, `engine add` needs an operator choice — a name or a `detect` pick — and stdin is not a terminal). A deploy naming a `runtime_profile` that no allowed host publishes is refused at once, nothing stored: `profile_not_published` (HTTP 409, CLI exit 24), naming the profile, each allowed host with the profiles it publishes, and the fix (`mllm engine add <path> --name <profile>` on a host, then deploy again). Exit code 9 stays unused.
 
 ## 15. Configuration model and generated defaults
 
@@ -539,11 +554,16 @@ The management API is the source of semantics for CLI, future UI, and integratio
 |---|---|---|
 | Server YAML | Listeners, authentication, enrollment, state location, scheduler and lifecycle defaults. | Host executable paths, static copies of all enrolled hosts, individual deployment records. |
 | Host YAML | Server identity reference, approved inventory, aggregate boundaries, storage pools, ingress, runtime profiles, supervision. | Model-specific allocations, global routing, private independent swap scheduling. |
+| Engines file (`engines.yaml`) | Runtime profiles registered with `mllm engine add`, beside the role's configuration file; written only by `mllm engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
 | Deployment YAML | Model identity, runtime profile, placement/topology, per-host budgets, cache choice, route, lifecycle overrides. | Agent secrets, executable installation, controller credentials. |
 | Cache-service record | Unique physical allocation, backend identity, client quotas, lifetime and storage policy. | Duplicate per-client charging of the full service. |
 | CLI context | Selected management endpoint and credential reference. | A running service role. |
 
 Operator configuration is not mutable runtime state. Server/agent processes write identities, journals, reservations and operational evidence separately; no continuous rewriting of administrator YAML. Creating a missing configuration during initialization/enrollment is an explicit documented exception.
+
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
+
+The engines file is mllm-owned operational state, not administrator YAML: mllm writes it only when the operator runs `mllm engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# mllm-document-revision: N`. The role's own document is never rewritten.
 
 ### 15.2 No-config behavior
 

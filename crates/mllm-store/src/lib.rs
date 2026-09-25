@@ -23,6 +23,8 @@ pub mod migrations;
 // ADR 0008: declared remote model sources, materialized per host.
 pub mod model_sources;
 pub mod ordinary_lifecycle;
+// ADR 0018 §4: durable profile retirements excluded from placement.
+pub mod profile_retirement;
 pub mod residency;
 pub mod resource_ledger;
 // ADR 0007: resident floors attributed by process identity.

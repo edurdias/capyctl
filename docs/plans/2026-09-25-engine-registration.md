@@ -6517,8 +6517,8 @@ In `host_doc`, pass `${NO_PROFILES:+--no-profiles}` to `gen_host_doc.py`, and ad
 # ENG1 (ADR 0018 §1, §3): engine add of the existing vLLM and SGLang
 # environments on a host running under systemd, published live, then a
 # deployment on each new profile serves:
-#   run_row.sh ENG1 --tag a -- host-a va-4 sa-4
-#   run_row.sh ENG1 --tag 17 -- host-b vb-4 sb-4
+#   run_row.sh ENG1 --tag a -- a va-4 sa-4
+#   run_row.sh ENG1 --tag b -- b vb-4 sb-4
 #
 # Expected:
 #   a  engine detect (no --path) lists both home-level environments
@@ -6630,7 +6630,7 @@ row_main() {
 # ENG3 (ADR 0018 §4): removing a published profile is refused while a
 # deployment uses it, then --drain stops it through the ordinary path and
 # removes the profile only on stop evidence:
-#   run_row.sh ENG3 --tag a -- host-a va-4
+#   run_row.sh ENG3 --tag a -- a va-4
 #
 # Expected:
 #   a  engine remove vllm while the deployment is Ready exits 20 naming it;
@@ -6673,7 +6673,7 @@ row_main() {
 # ENG2 (ADR 0018 §5): standalone with MLLM_VLLM_BIN and MLLM_SGLANG_BIN both
 # set (refused before) publishes local-vllm and local-sglang, and serves a
 # deployment on each in turn:
-#   run_row.sh ENG2 --no-e0 -- host-a
+#   run_row.sh ENG2 --no-e0 -- a
 #
 # Expected:
 #   a  the role starts; engine list shows local-vllm and local-sglang,
@@ -6737,7 +6737,7 @@ row_main() {
 # shellcheck shell=bash
 # ENG4 (ADR 0018 §3, owner decision 2026-09-25): engine add beside an rc.3 agent, and a
 # new agent against an rc.3 server:
-#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- host-b
+#   MLLM_RC3_LOCAL=~/rc3/mllm MLLM_RC3_REMOTE=~/rc3/mllm run_row.sh ENG4 --no-e0 -- b
 #
 # Preconditions (checked, never installed or downloaded): MLLM_RC3_LOCAL
 # (control-host) and MLLM_RC3_REMOTE (on the host) are existing rc.3 binaries whose
@@ -6814,7 +6814,7 @@ row_main() {
 Run: `for r in ENG1 ENG2 ENG3 ENG4; do bash -n scripts/live/matrix/rows/$r.sh || exit 1; done && shellcheck scripts/live/matrix/rows/ENG*.sh scripts/live/matrix/lib.sh scripts/live/matrix/roles.sh && python3 -m py_compile scripts/live/matrix/gen_host_doc.py`
 Expected: no errors (install `shellcheck` locally if missing; skip it only with a note in the commit message).
 
-Run: `scripts/live/matrix/run_row.sh ENG1 --dry-run --tag a -- host-a va-4 sa-4` (and ENG2–ENG4 likewise, ENG4 with `MLLM_RC3_LOCAL=/bin/true MLLM_RC3_REMOTE=/bin/true`)
+Run: `scripts/live/matrix/run_row.sh ENG1 --dry-run --tag a -- a va-4 sa-4` (and ENG2–ENG4 likewise, ENG4 with `MLLM_RC3_LOCAL=/bin/true MLLM_RC3_REMOTE=/bin/true`)
 Expected: each writes `target/live/matrix/dry-run/ENG*/commands.log` and contacts no host.
 
 - [ ] **Step 7: Operator guide.** Add to `docs/operations/install.md` a section:

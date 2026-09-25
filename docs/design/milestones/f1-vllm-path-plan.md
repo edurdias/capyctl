@@ -22,7 +22,7 @@
 - Switch failure: A reopens with window state; B receives structured switch-failed error with bounded re-queue honoring remaining deadlines; failed-switch event recorded.
 - preinitialize: start → readiness validation → park, never displacing live work; fails clearly (unsupported-capability class) when parking is unqualified or policy-denied; simulator-tier until G6 qualification.
 - The inference listener binds loopback/private per host profile with API-key auth; non-loopback binds require TLS; no public bind is a supported F1 configuration (SPEC §15.2).
-- mllm never installs engines or downloads checkpoints (T07); the operator executes `docs/runbooks/spark-vllm-env.md`.
+- mllm never installs engines or downloads checkpoints (T07); the operator executes `docs/runbooks/vllm-env.md`.
 - Every task ends with `cargo test --workspace` green, `cargo clippy --workspace --all-targets -- -D warnings` clean, and a git commit on `master`.
 
 ## File Structure
@@ -37,7 +37,7 @@ crates/
   mllm-domain/src/lifecycle.rs (extend: LifecycleAction here per F0)
   mllm-store/src/{deployments.rs (extend: reservations/generations), migrations.rs (v3)}
   mllm-cli/src/{main.rs, roles.rs, output.rs (extend)}
-docs/runbooks/spark-vllm-env.md                  # operator-executed environment contract
+docs/runbooks/vllm-env.md                  # operator-executed environment contract
 tests/harness/src/lib.rs (extend)                # conformance suite grows
 tests/mapping/README.md (extend)                 # T07..T21 mapping
 ```
@@ -214,7 +214,7 @@ Rules: granted budgets map to vLLM flags with explicit units (`--gpu-memory-util
 ### Task 6: doctor host — real fingerprinting + environment contract + exit code 13
 
 **Files:**
-- Create: `docs/runbooks/spark-vllm-env.md`
+- Create: `docs/runbooks/vllm-env.md`
 - Modify: `crates/mllm-agent/src/{lib.rs, supervision.rs}` (doctor implementation), `crates/mllm-cli/src/{main.rs, output.rs}` (exit code 13 internal), `crates/mllm-cli/src/grammar.rs` (doctor output shape)
 - Test: `crates/mllm-agent/tests/doctor.rs`
 
@@ -386,8 +386,8 @@ Semantics per design §5: single wake join (concurrent requests to B join one ac
 ### Task 16: Spark live qualification — restart-only first (T07, T10, T11, T12, T14, T15, T16 live)
 
 **Files:**
-- Create: `docs/runbooks/spark-qualification-f1.md` (the executed evidence record, filled during execution)
-- Modify: `docs/runbooks/spark-vllm-env.md` (pin `<PINNED_VERSION>` + approved checkpoint from live doctor capture)
+- Create: `docs/runbooks/qualification-f1.md` (the executed evidence record, filled during execution)
+- Modify: `docs/runbooks/vllm-env.md` (pin `<PINNED_VERSION>` + approved checkpoint from live doctor capture)
 
 **Interfaces:**
 - Consumes: everything; `MLLM_SPARK_SSH` env var (git-ignored; e.g. `export MLLM_SPARK_SSH="user@spark-host"`) — never commit connection details.
@@ -404,7 +404,7 @@ Semantics per design §5: single wake join (concurrent requests to B join one ac
 ### Task 17: Park/reload live validation — the core feature (T20, T21 live)
 
 **Files:**
-- Modify: `docs/runbooks/spark-qualification-f1.md` (park/reload section)
+- Modify: `docs/runbooks/qualification-f1.md` (park/reload section)
 
 **Owner decision binding here: park/reload is core F1 functionality — if the pinned build's sleep path misbehaves on the Spark, revise the recipe (adapter flags, vLLM release, platform configuration) and retry. No downgrade, no deferral.**
 
@@ -421,7 +421,7 @@ Semantics per design §5: single wake join (concurrent requests to B join one ac
 - Modify: `tests/mapping/README.md` (extend the table: T07, T10, T11, T12, T14, T15, T16, T17, T18, T19, T20, T21 → exact test fns; live-tier evidence rows → runbook sections)
 - Test: audit only.
 
-- [ ] **Step 1: Grep actual test names** (never invent) and map every F1 target id; live evidence cites `docs/runbooks/spark-qualification-f1.md` sections.
+- [ ] **Step 1: Grep actual test names** (never invent) and map every F1 target id; live evidence cites `docs/runbooks/qualification-f1.md` sections.
 - [ ] **Step 2: `cargo test --workspace` green; `cargo clippy --workspace --all-targets -- -D warnings` clean.**
 - [ ] **Step 3: Commit** `test(mapping): F1 coverage audit — all targeted spec ids claimed`.
 

@@ -1126,9 +1126,12 @@ pub trait EngineBindings: Send + Sync {
     }
 
     /// ADR 0008 (owner decision 2026-09-23): the engine installation the
-    /// embedded host registered at boot, measured again before each Initialize
-    /// for drift. Bindings that keep no registration have none.
-    fn installation(&self) -> Option<Arc<crate::installation_gate::EmbeddedInstallation>> {
+    /// embedded host registered for `work`'s profile, measured again before
+    /// each Initialize for drift. Bindings that keep no registration have none.
+    fn installation(
+        &self,
+        _work: &InitializeWork,
+    ) -> Option<Arc<crate::installation_gate::EmbeddedInstallation>> {
         None
     }
 
@@ -1415,7 +1418,7 @@ impl OwnedCoordinator {
                 };
                 // ADR 0008: outermost, so a drifted installation under
                 // `installation_drift: refuse` is refused before anything else.
-                let engine = match bindings.installation() {
+                let engine = match bindings.installation(work) {
                     Some(installation) => crate::installation_gate::InstallationGate::new(
                         engine,
                         factory_owner.clone(),
