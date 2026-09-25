@@ -29,8 +29,11 @@ fn io(path: &Path, error: impl std::fmt::Display) -> ConfigError {
 
 /// ADR 0018 §2: `dir/x.yaml` → `dir/engines.yaml`.
 pub fn engines_beside(role_document: &Path) -> PathBuf {
+    // A bare relative name (`host.yaml`) has an empty parent, which names the
+    // working directory; say so, so the directory can be opened and synced.
     role_document
         .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .join(ENGINES_FILE)
 }
@@ -267,7 +270,11 @@ pub fn write_engines(
     let text = file.render(revision);
     // SPEC §15.3: validate before side effects.
     EnginesFile::parse(&file.path, &text)?;
-    let dir = file.path.parent().unwrap_or(Path::new("."));
+    let dir = file
+        .path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     // review decision C1: a rewrite keeps the file's owner and mode (the
     // role reads it as its service user; the CLI may be running as root); a
     // new file goes to the lock's named owner, mode 0600.

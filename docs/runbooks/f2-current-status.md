@@ -4,6 +4,37 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## First-run friction from the guide walk — 2026-09-25 (branch `fix/first-run-friction`)
+
+Four fixes before 0.1.0, found by walking the user guides with the real
+binary. Regression tests drive the `mllm` binary (`tests/first_run.rs`,
+`tests/validate_config.rs`); CPU, fake installations and a scripted role and
+management API only, so none of this is qualification. No live run was made.
+
+- **`engine add` with no role running exits 0** (ADR 0018 §3). No control
+  socket, or a stale one refusing connections, means no role runs (the normal
+  first run: standalone refuses to start with no engine). The profile is saved
+  and the command prints `saved to <engines.yaml> (revision N); start mllm
+  (…) to use it` with `published: role_not_running`. A role that is running
+  but does not take or answer the request still exits 22.
+- **`deploy model --activate` waits for the checkpoint digest** (ADR 0014
+  §7). `--activate` (and `start deployment|instance --wait`) poll status while
+  the revision's digest is pending, bounded by the start's Initialize window,
+  then start. Nothing is started if the bound passes. A plain deploy stays
+  asynchronous and names `mllm start deployment <name> --wait`; a start
+  refused `checkpoint_digest_pending` says the same.
+- **`validate config --host` runs deploy's per-host checks** (ADR 0013 §2–3,
+  ADR 0018 §7). It merges the `engines.yaml` beside the host document, and
+  refuses a placement selector the host's labels do not match, a host with no
+  runtime profile, and a profile the host does not declare
+  (`profile_not_published`, exit 24). It also resolves the scoped documents as
+  the server does. The result's `requires_server` lists what only a running
+  server checks.
+- **Relative `--config` and `$MLLM_CONFIG` are made absolute** (ADR 0018 §2)
+  once, before any command or role uses them. A bare `host.yaml` had put
+  `engines.yaml` at an empty parent directory, whose sync failed after the
+  write, so the profile was saved but never published.
+
 ## Context fitted to the KV grant; standalone rendezvous root — 2026-09-25 (branch `fix/context-fit-standalone-rdzv`)
 
 Two owner decisions of 2026-09-25. CPU tests only; live proof on real engines

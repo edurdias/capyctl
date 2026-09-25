@@ -313,6 +313,10 @@ async fn serve_one(stream: tokio::net::UnixStream, handler: Arc<dyn ControlHandl
 
 #[derive(Debug)]
 pub enum ClientError {
+    /// No role is running here: nothing listens on the socket (it does not
+    /// exist, or a stale one refuses the connection). Nothing was asked. This
+    /// is the first run, before any role has started, not a fault.
+    NotRunning(String),
     /// The request never reached a role: nothing was asked.
     Unreachable(String),
     /// review decision I4: the role took the request, then gave no usable
@@ -326,7 +330,7 @@ pub enum ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreachable(m) | Self::Unanswered(m) => f.write_str(m),
+            Self::NotRunning(m) | Self::Unreachable(m) | Self::Unanswered(m) => f.write_str(m),
             Self::TimedOut => f.write_str("the role's socket did not take the request in time"),
         }
     }
@@ -354,9 +358,16 @@ pub async fn request(
     // be acting on it, so a failure is `Unanswered`, never `Unreachable`.
     let sent = std::cell::Cell::new(false);
     let exchange = async {
-        let mut stream = tokio::net::UnixStream::connect(path)
-            .await
-            .map_err(unreachable)?;
+        // No socket, or a stale one nobody listens on: no role is running.
+        let mut stream =
+            tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                        ClientError::NotRunning(format!("{}: {e}", path.display()))
+                    }
+                    _ => unreachable(e),
+                })?;
         let directory_owner = private_directory_owner(path);
         if !matches!(stream.peer_cred(),
             Ok(cred) if server_trusted(own_uid(), cred.uid(), directory_owner))

@@ -44,7 +44,7 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             Value::Null
         }
         ConfigKind::Host => {
-            host_policy_document(&text).map_err(|e| named(file, Some(kind), &e))?;
+            host_policy_document(file).map_err(|e| named(file, Some(kind), &e))?;
             Value::Null
         }
         ConfigKind::Standalone => {
@@ -74,27 +74,75 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             match host {
                 None => Value::Null,
                 Some(host_file) => {
-                    let host_text = read(host_file)?;
-                    let (name, host_document) = host_policy_document(&host_text)
+                    read(host_file)?;
+                    let (name, host_document) = host_policy_document(host_file)
                         .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
-                    // ADR 0013 §2, §3: as the server resolves each allowed
-                    // host: a host outside the allowed set is no candidate,
-                    // unnamed device claims take this host's devices, and the
-                    // per-host recipe carries no deployment-level field.
+                    // ADR 0013 §2, §3, ADR 0018 §7: the checks the server's
+                    // deploy runs against this host's publication, in its
+                    // order (`registry_targets`), so a file validate accepts
+                    // is not refused by deploy for a reason it could name.
+                    // A host outside the allowed set is no candidate.
                     if !instances.placement.allows(&name) {
                         return Err(invalid(format!(
                             "{}: deployment document: its placement does not allow host `{name}`",
                             file.display()
                         )));
                     }
-                    let mut source =
-                        mllm_config::instances::assign_devices(&deployment, &host_document)
-                            .map_err(|e| named(file, Some(kind), &e))?;
-                    if let Some(object) = source.as_object_mut() {
-                        for field in ["instances", "placement", "host"] {
-                            object.remove(field);
-                        }
+                    let labels = mllm_config::instances::host_labels(&host_document)
+                        .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
+                    if !instances.placement.selector_matches(&labels) {
+                        return Err(invalid(format!(
+                            "{}: deployment document: its placement.selector does not match the labels of host `{name}` (deploy refuses it: selector_mismatch)",
+                            file.display()
+                        )));
                     }
+                    let profiles = host_document["runtime_profiles"]
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default();
+                    if profiles.is_empty() {
+                        return Err(invalid(format!(
+                            "{}: host `{name}` declares no runtime profile, in its document or in {}; register one with `mllm engine add` (deploy refuses it: no_runtime_profiles)",
+                            host_file.display(),
+                            mllm_config::registration::engines_beside(host_file).display()
+                        )));
+                    }
+                    let profile = deployment["runtime_profile"].as_str().unwrap_or_default();
+                    if !profiles.contains_key(profile) {
+                        let names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+                        return Err(StructuredError {
+                            code: "profile_not_published",
+                            message: format!(
+                                "{}: deployment document: runtime profile `{profile}` is not declared by host `{name}` (it declares {}); register it with `mllm engine add`, or name one of those",
+                                file.display(),
+                                names.join(", ")
+                            ),
+                        });
+                    }
+                    // Unnamed device claims take this host's devices, and the
+                    // per-host recipe carries no deployment-level field.
+                    let strip = |mut source: Value| {
+                        if let Some(object) = source.as_object_mut() {
+                            for field in ["instances", "placement", "host"] {
+                                object.remove(field);
+                            }
+                        }
+                        source
+                    };
+                    // As the server resolves it: both documents scoped to the
+                    // host's ledger keys, and the host's resource policy
+                    // composed as the current controls (its first publication
+                    // stores exactly these).
+                    let scoped = scoped_resolution(&name, &deployment, &host_document)
+                        .map_err(|e| named(file, Some(kind), &e))?;
+                    resolve_for_acceptance(&strip(scoped.0), &scoped.1)
+                        .map_err(|e| named(file, Some(kind), &e))?;
+                    // The host-local view the operator reads (device and
+                    // domain names as the host document writes them).
+                    let source = strip(
+                        mllm_config::instances::assign_devices(&deployment, &host_document)
+                            .map_err(|e| named(file, Some(kind), &e))?,
+                    );
                     let (effective, provisional) = resolve_for_acceptance(&source, &host_document)
                         .map_err(|e| named(file, Some(kind), &e))?;
                     return Ok(json!({
@@ -102,6 +150,7 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                         "kind": kind.as_str(),
                         "file": file.display().to_string(),
                         "resolved_against": name,
+                        "requires_server": REQUIRES_SERVER,
                         "provisional": provisional,
                         "effective": {
                             "name": effective.name,
@@ -127,12 +176,55 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             }
         }
     };
-    Ok(json!({
+    let mut out = json!({
         "valid": true,
         "kind": kind.as_str(),
         "file": file.display().to_string(),
         "resolved_against": resolved_against,
-    }))
+    });
+    // SPEC §15.3: say plainly what was not checked.
+    if kind == ConfigKind::Deployment {
+        let mut unchecked = vec![
+            "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, devices, resources and timeouts",
+        ];
+        unchecked.extend_from_slice(REQUIRES_SERVER);
+        out["requires_server"] = json!(unchecked);
+    }
+    Ok(out)
+}
+
+/// SPEC §15.3: the deploy checks that need the server's live state, which an
+/// offline validation cannot run. `deploy model` runs them and names any that
+/// refuses.
+const REQUIRES_SERVER: &[&str] = &[
+    "whether each allowed host is enrolled, online and has published (host_unpublished)",
+    "which runtime profiles the host's role accepted and published after measuring each installation (profile_not_published)",
+    "the host's current resource policy as the server stores it (resource_policy_unavailable)",
+    "route and deployment-name conflicts with existing deployments (route_conflict)",
+    "a new checkpoint's digest, measured on the host after acceptance (checkpoint_digest_pending)",
+];
+
+/// ADR 0013 §3: the deployment and host documents exactly as the server
+/// resolves them for a registry host: scoped to the host's ledger keys, with
+/// the host's resource policy composed as the current controls, and unnamed
+/// device claims assigned from the scoped host.
+fn scoped_resolution(
+    name: &str,
+    deployment: &Value,
+    host: &Value,
+) -> Result<(Value, Value), ConfigError> {
+    use mllm_config::effective::{compose_current_resource_controls, normalize_host_policy};
+    use mllm_config::remote_resources::{scope_deployment_document, scope_host_document};
+    let trusted = scope_host_document(name, host)?;
+    let policy = normalize_host_policy(&trusted)?;
+    let host = compose_current_resource_controls(
+        &trusted,
+        &mllm_config::resource_controls::ResourceContext::from_host(&policy),
+        &mllm_config::resource_controls::ResourceControls::from_host(&policy),
+    )?;
+    let command = scope_deployment_document(name, deployment)?;
+    let source = mllm_config::instances::assign_devices(&command, &host)?;
+    Ok((source, host))
 }
 
 /// ADR 0014 §5, §7: acceptance resolves a deployment whose memory is derived
@@ -160,9 +252,12 @@ fn resolve_for_acceptance(
 }
 
 /// The host document as host publication and the agent resolve against it:
-/// the role-local settings removed and the resource policy normalized.
-fn host_policy_document(text: &str) -> Result<(String, Value), ConfigError> {
-    let config = mllm_config::remote_roles::HostConfig::parse(text)?;
+/// merged with the `engines.yaml` beside it (ADR 0018 §2, as the host role
+/// loads it), the role-local settings removed and the resource policy
+/// normalized.
+fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
+    let engines = mllm_config::registration::engines_beside(path);
+    let config = mllm_config::remote_roles::HostConfig::load_with_engines(path, &engines)?;
     let local = mllm_config::remote_resources::local_host_document(&config.document)?;
     mllm_config::effective::normalize_host_policy(&local)?;
     Ok((config.name, local))
