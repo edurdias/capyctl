@@ -235,3 +235,37 @@ fn a_confirmed_retirement_outlives_its_deadline_until_the_profile_is_dropped() {
         .unwrap();
     assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
 }
+
+// T32 T33 (ADR 0018 §4, controller ruling): any accepted publication clears
+// the host's confirmed retirements for profiles it no longer lists, the
+// startup publication as well as a live one. A confirmed retirement survives a
+// host restart only while the startup publication still lists the profile.
+#[test]
+fn a_startup_publication_clears_confirmed_retirements_only_for_dropped_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("s.sqlite3")).unwrap();
+    let host = enrolled(&store);
+    let base = base_document();
+    let mut added = base.clone();
+    added["runtime_profiles"]["vllm"] = vllm_profile();
+    store
+        .publish_host_configuration(&publication(&host, &added))
+        .unwrap();
+    assert!(matches!(
+        store
+            .begin_profile_retirement(&host, "vllm", "k", 1, 10, false)
+            .unwrap(),
+        mllm_store::profile_retirement::RetirementStart::Clear
+    ));
+    // Restart, still listing the profile: the retirement stays confirmed.
+    let mut restarted = publication(&host, &added);
+    restarted.boot_id = "boot-b".into();
+    store.publish_host_configuration(&restarted).unwrap();
+    let (_, state, _) = store.profile_retirement(&host, "vllm").unwrap().unwrap();
+    assert_eq!(state, "confirmed");
+    // Restart without the profile: the retirement is cleared.
+    let mut dropped = publication(&host, &base);
+    dropped.boot_id = "boot-c".into();
+    store.publish_host_configuration(&dropped).unwrap();
+    assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
+}

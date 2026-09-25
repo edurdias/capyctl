@@ -120,6 +120,25 @@ impl Store {
             return Err(StoreError::Conflict);
         }
         tx.execute("INSERT INTO approved_host_publications VALUES(?1,?2,?3,?4,?5) ON CONFLICT(host_id) DO UPDATE SET config_json=excluded.config_json,boot_id=excluded.boot_id,fingerprint=excluded.fingerprint,received_at_ms=excluded.received_at_ms",params![publication.host_id,config.document.to_string(),publication.boot_id,publication.fingerprint,publication.received_at_ms])?;
+        // ADR 0018 §4: any accepted publication, this startup one as well as
+        // a live re-publication, clears the confirmed retirements of profiles
+        // it no longer lists. A confirmed retirement of a profile still
+        // listed stays, so the profile stays out of placement across a host
+        // restart. A retirement still in progress is left to its deadline.
+        let confirmed: Vec<String> = tx
+            .prepare(
+                "SELECT profile FROM profile_retirements WHERE host_id=?1 AND state='confirmed'",
+            )?
+            .query_map([&publication.host_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for profile in confirmed {
+            if config.document["runtime_profiles"].get(&profile).is_none() {
+                tx.execute(
+                    "DELETE FROM profile_retirements WHERE host_id=?1 AND profile=?2",
+                    params![publication.host_id, profile],
+                )?;
+            }
+        }
         if let Some(claims) = claims {
             let mode = match claims {
                 LaunchClaims::PerLaunch => "per_launch",
