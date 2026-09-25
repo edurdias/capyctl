@@ -4,6 +4,35 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Refusal codes and `start --evict --wait` for several instances — 2026-09-25 (branch `fix/refusal-codes-evict-wait`)
+
+Owner decisions 2026-09-25, both implemented; CPU and Fake-engine tests only, not
+live-proven on the Sparks.
+
+- A start that places nothing because no allowed host is eligible (drain-only
+  after version skew, draining, revoked, offline, reconciling) is refused
+  `host_ineligible` (HTTP 503, CLI exit 15), naming each host and why, with the
+  host's and the server's versions for a drain-only host. It was
+  `capacity_blocked`. `start --evict` checks this before releasing anyone.
+- An inference request for an operator-stopped deployment is 409
+  `deployment_stopped` (message names `mllm start deployment <id>`). It was 429
+  `insufficient_resources`. New code, added to SPEC §10 in the same change;
+  `host_ineligible`, the `--evict` coverage and the `--wait` rule are recorded
+  in SPEC §14.
+- `start deployment --evict` plans every instance the start activates before
+  releasing anyone (each against the ledger the earlier ones leave, each victim
+  set minimal) and releases per host. If one instance cannot be placed even with
+  eviction, nothing is released and the refusal names the instance and the
+  host's need, free and evictable memory (`capacity_blocked`, exit 4).
+- `start deployment --wait` succeeds only once every instance has been Ready; an
+  instance not placed before the start's deadline exits 4, a failed launch 13.
+
+Regression tests (each failed on `main` before the fix): management `evict.rs`
+(every replica evicted for, refusal before eviction, `host_ineligible`), router
+`router_core.rs` and CLI `stop_intent.rs` (409 `deployment_stopped`), CLI
+`start_wait_replicas.rs` (partial start exits 4). Pending: a live run of a
+two-instance `start --evict --wait` on a tight Spark and of a start against a
+drain-only host.
 ## A revoked host exits instead of retrying — 2026-09-24 (branch `fix/revoked-host-exit`)
 
 Owner decision 2026-09-24, fixing the rc.3 observation that a revoked host agent
