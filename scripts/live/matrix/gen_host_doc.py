@@ -16,8 +16,8 @@ usage: gen_host_doc.py --device-json FILE --ip IP --run-root DIR --policy normal
 --hf-max-bytes and --approve-speculation (2026-09-25, single-box benchmark)
 opt the host into Hugging Face model sources with that store ceiling (ADR 0008
 amendment) and approve the speculative-decoding options (vLLM
-`--speculative-config`; SGLang `--speculative-draft-model-path` inside the model
-store, ADR 0014 section 8).
+`--speculative-config` and SGLang `--speculative-draft-model-path`, with draft
+models inside the model store; ADR 0014 section 8).
 """
 
 import argparse
@@ -131,6 +131,8 @@ def main():
     if args.approve_speculation:
         if "vllm" in profiles:
             profiles["vllm"]["security"]["approved_options"] = ["--speculative-config"]
+            # A draft model named in --speculative-config must lie here too.
+            profiles["vllm"]["security"]["approved_paths"] = [args.models_root.rstrip("/")]
         if "sglang" in profiles:
             profiles["sglang"]["security"]["approved_options"] = ["--speculative-draft-model-path"]
             profiles["sglang"]["security"]["approved_paths"] = [args.models_root.rstrip("/")]
