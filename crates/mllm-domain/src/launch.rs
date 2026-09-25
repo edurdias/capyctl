@@ -196,6 +196,8 @@ pub struct NativeLaunch {
     inference_credential_ref: String,
     admin_credential_ref: String,
     settings: SglangLaunchSettings,
+    cuda_home: Option<String>,
+    build_env: std::collections::BTreeMap<String, String>,
 }
 impl NativeLaunch {
     /// Internal cross-crate bridge. Call only with a validated persisted store read;
@@ -216,7 +218,31 @@ impl NativeLaunch {
             inference_credential_ref,
             admin_credential_ref,
             settings,
+            cuda_home: None,
+            build_env: std::collections::BTreeMap::new(),
         }
+    }
+    /// SPEC §13.3 amendment (owner decision 2026-09-25): the profile's
+    /// host-approved CUDA toolkit root, for the engine's PATH and `CUDA_HOME`;
+    /// `build_env` holds the profile `env` build-limit overrides
+    /// (`MAX_JOBS`, `FLASHINFER_NVCC_THREADS`).
+    #[doc(hidden)]
+    pub fn with_toolchain(
+        mut self,
+        cuda_home: Option<String>,
+        build_env: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.cuda_home = cuda_home;
+        self.build_env = build_env;
+        self
+    }
+    #[doc(hidden)]
+    pub fn cuda_home(&self) -> Option<&str> {
+        self.cuda_home.as_deref()
+    }
+    #[doc(hidden)]
+    pub fn build_env(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.build_env
     }
     pub fn metadata(&self) -> &NativeLaunchMetadata {
         &self.metadata

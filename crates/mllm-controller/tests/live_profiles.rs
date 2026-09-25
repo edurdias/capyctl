@@ -245,6 +245,7 @@ fn with_vllm(host: &str) -> pb::ReportInventory {
             deep_park: true,
             installation_drift: mllm_config::effective::InstallationDrift::Warn,
             args: vec![],
+            cuda_home: None,
         });
     inventory.approved_host_config_json = document.to_string();
     inventory.policy_fingerprint = mllm_config::remote_resources::policy_fingerprint(&document);

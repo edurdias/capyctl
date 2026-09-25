@@ -46,7 +46,8 @@ const PASS_THROUGH: &[&str] = &[
     "TRANSFORMERS_OFFLINE",
 ];
 
-/// Fixed system tool directories after the engine's own bin.
+/// Fixed system tool directories after the engine's own bin (and the
+/// profile's `<cuda_home>/bin`, when it names one; engine_env.rs).
 const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Every variable a vLLM engine may be started with (SPEC §13.3 / T21). The
@@ -65,6 +66,11 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "PYTHONDONTWRITEBYTECODE",
     "MLLM_ENGINE_LOG",
     "MLLM_EXTRA_APPROVALS",
+    // SPEC §13.3 amendment (owner decisions 2026-09-25): the toolchain and
+    // the JIT build limits (engine_env.rs).
+    "CUDA_HOME",
+    "MAX_JOBS",
+    "FLASHINFER_NVCC_THREADS",
 ];
 
 /// The closed environment one vLLM launch starts with: the rendered variables,
@@ -76,6 +82,7 @@ fn engine_environment(
     key: &str,
     admin: Option<&str>,
     inherited: &dyn Fn(&str) -> Option<String>,
+    toolchain: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = std::collections::BTreeMap::new();
     for name in PASS_THROUGH {
@@ -90,12 +97,15 @@ fn engine_environment(
         env.insert("MLLM_VLLM_ADMIN_KEY".into(), admin.to_string());
     }
     // The engine's runtime PATH carries its own venv bin (the JIT compile step
-    // needs the venv's tools), then fixed system directories only.
-    let path = match &plan.engine_path_extra {
-        Some(extra) => format!("{extra}:{SYSTEM_PATH}"),
-        None => SYSTEM_PATH.to_string(),
-    };
+    // needs the venv's tools), the profile's CUDA bin when it names one, then
+    // fixed system directories only (SPEC §13.3 as amended 2026-09-25).
+    let path = crate::engine_env::tool_path(
+        plan.engine_path_extra.as_deref(),
+        plan.cuda_home.as_deref(),
+        SYSTEM_PATH,
+    );
     env.insert("PATH".into(), path);
+    env.extend(toolchain.iter().map(|(k, v)| (k.clone(), v.clone())));
     // ADR 0012 / T21: no vLLM plugin loads; SPEC §9.1: no bytecode is
     // written beside mllm's checked runtime source.
     env.insert("VLLM_PLUGINS".into(), String::new());
@@ -130,9 +140,22 @@ pub(super) async fn initialize(
     plan.api_key = None;
     let mut cmd =
         render_command(&plan).map_err(|e| RuntimeError::Uncertain(format!("render: {e}")))?;
-    cmd.env = engine_environment(&cmd.env, &plan, &key, adapter.admin_key(), &|name| {
-        std::env::var(name).ok()
-    });
+    // Owner decision 2026-09-25: JIT build jobs follow free memory at launch.
+    let (toolchain, limits) = crate::engine_env::toolchain_environment(
+        plan.cuda_home.as_deref(),
+        &plan.build_env,
+        crate::engine_env::mem_available_bytes(),
+        crate::engine_env::cpu_count(),
+    );
+    eprintln!("{limits} (binding {})", context.binding_id);
+    cmd.env = engine_environment(
+        &cmd.env,
+        &plan,
+        &key,
+        adapter.admin_key(),
+        &|name| std::env::var(name).ok(),
+        &toolchain,
+    );
 
     // The tool is synchronous on purpose (mllm-launchers has no runtime), so every
     // call into it leaves the async threads free.

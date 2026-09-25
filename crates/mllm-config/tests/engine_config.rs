@@ -339,6 +339,57 @@ fn sensitive_options_need_named_host_approval() {
     extra_args_error("vllm", json!(["--reasoning-parser-plug", "x"]));
 }
 
+/// ADR 0014 §8: vLLM `--speculative-config` is a JSON object. With named
+/// approval it is admitted when every key is on the closed list and its draft
+/// `model` lies inside an approved directory; anything else is refused (found
+/// live 2026-09-25: as a plain path option no value could ever be approved).
+// T21
+#[test]
+fn speculative_config_is_admitted_key_by_key() {
+    let approve = |host: &mut Value| {
+        let security = &mut host["runtime_profiles"]["local"]["security"];
+        security["approved_options"] = json!(["--speculative-config"]);
+        security["approved_paths"] = json!(["/srv/models"]);
+    };
+    for config in [
+        r#"{"method":"mtp","num_speculative_tokens":3}"#,
+        r#"{"method":"dflash","model":"/srv/models/draft","num_speculative_tokens":7}"#,
+        r#"{"model":"/srv/models/draft","num_speculative_tokens":2}"#,
+        r#"{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}"#,
+    ] {
+        let (deployment, mut host) =
+            with_extra_args("vllm", json!(["--speculative-config", config]));
+        approve(&mut host);
+        resolve_effective(&deployment, &host).unwrap_or_else(|e| panic!("{config}: {e}"));
+    }
+    // Unapproved by name: refused even without a path.
+    let text = extra_args_error(
+        "vllm",
+        json!(["--speculative-config", r#"{"method":"mtp"}"#]),
+    );
+    assert!(text.contains("approved_options"), "{text}");
+    for config in [
+        r#"{"model":"/etc/draft"}"#,
+        r#"{"model":"/srv/models/../etc"}"#,
+        r#"{"model":"org/repo"}"#,
+        r#"{"model":["/srv/models/draft"]}"#,
+        r#"{"method":"mtp","tokenizer":"/srv/models/t"}"#,
+        r#"{"method":"mtp","draft_model_config":{"x":1}}"#,
+        r#"["/srv/models/draft"]"#,
+        "/srv/models/draft",
+    ] {
+        let (deployment, mut host) =
+            with_extra_args("vllm", json!(["--speculative-config", config]));
+        approve(&mut host);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert!(
+            error.to_string().contains("approved_paths"),
+            "{config}: {error}"
+        );
+        assert!(!error.to_string().contains("/etc"), "{error}");
+    }
+}
+
 /// ADR 0014 §8, SPEC §8.2: sensitive shapes are matched on what the option can
 /// resolve to, not only on the spelling given. Listener, bind, endpoint, IP,
 /// folder and JSON configuration options (a `*-config` value can name paths
@@ -733,4 +784,60 @@ fn sleep_mode_follows_the_host_switch() {
         panic!("vLLM settings");
     };
     assert!(!settings.enable_sleep_mode);
+}
+
+/// SPEC §13.3 amendment (owner decision 2026-09-25): `cuda_home` is an
+/// optional, host-approved profile field (absolute and normalized). It reaches
+/// the effective profile and the recipe fingerprint only when set, so existing
+/// fingerprints do not change.
+// T21 T03
+#[test]
+fn a_profile_cuda_home_is_absolute_and_only_fingerprinted_when_set() {
+    let (deployment, host) = fixture();
+    let plain = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(plain.profile.cuda_home, None);
+    let encoded = serde_json::to_value(&plain.profile).unwrap();
+    assert!(encoded.get("cuda_home").is_none(), "{encoded}");
+
+    let mut with_cuda = host.clone();
+    with_cuda["runtime_profiles"]["local"]["cuda_home"] = json!("/usr/local/cuda-13.0");
+    let resolved = resolve_effective(&deployment, &with_cuda).unwrap();
+    assert_eq!(
+        resolved.profile.cuda_home.as_deref(),
+        Some("/usr/local/cuda-13.0")
+    );
+    assert_ne!(resolved.recipe_fingerprint, plain.recipe_fingerprint);
+
+    for bad in ["usr/local/cuda", "/usr/local/../cuda", ""] {
+        let mut host = host.clone();
+        host["runtime_profiles"]["local"]["cuda_home"] = json!(bad);
+        let error = resolve_effective(&deployment, &host).unwrap_err();
+        assert_eq!(error.path, "runtime_profiles.cuda_home", "{bad}: {error}");
+    }
+}
+
+/// Owner decision 2026-09-25: a profile `env` may override the JIT build
+/// limits with a positive integer; anything else stays refused.
+// T21
+#[test]
+fn profile_env_build_limits_are_positive_integers() {
+    let (deployment, host) = fixture();
+    let mut ok = host.clone();
+    ok["runtime_profiles"]["local"]["env"] =
+        json!({"MAX_JOBS": "4", "FLASHINFER_NVCC_THREADS": "1"});
+    resolve_effective(&deployment, &ok).expect("positive build limits");
+    for (name, value) in [
+        ("MAX_JOBS", "0"),
+        ("MAX_JOBS", "many"),
+        ("FLASHINFER_NVCC_THREADS", "-1"),
+        ("NVCC_APPEND_FLAGS", "-O0"),
+    ] {
+        let mut bad = host.clone();
+        bad["runtime_profiles"]["local"]["env"] = json!({ name: value });
+        let error = resolve_effective(&deployment, &bad).unwrap_err();
+        assert_eq!(
+            error.path, "runtime_profiles.env",
+            "{name}={value}: {error}"
+        );
+    }
 }

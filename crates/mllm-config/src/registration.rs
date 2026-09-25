@@ -349,6 +349,37 @@ pub struct ProfileSpec {
     pub deep_park: bool,
     pub installation_drift: InstallationDrift,
     pub args: Vec<String>,
+    /// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root
+    /// `engine add` detected ([`detect_cuda_home`]); written as `cuda_home`.
+    pub cuda_home: Option<PathBuf>,
+}
+
+/// The CUDA toolkit `mllm engine add` records (SPEC §13.3 amendment, owner
+/// decision 2026-09-25): `CUDA_HOME` when it names an absolute, normalized
+/// directory holding `bin/nvcc`, else `/usr/local/cuda` when it holds
+/// `bin/nvcc`, else none (the engine PATH then stays minimal). The operator
+/// adding the engine is the host administrator approving it, as for the
+/// executable.
+pub fn detect_cuda_home(
+    cuda_home_env: Option<&str>,
+    has_nvcc: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let normalized = |path: &Path| {
+        path.is_absolute()
+            && path.components().all(|c| {
+                matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+    };
+    cuda_home_env
+        .map(|value| PathBuf::from(value.trim_end_matches('/')))
+        .filter(|path| normalized(path) && has_nvcc(&path.join("bin/nvcc")))
+        .or_else(|| {
+            let default = PathBuf::from("/usr/local/cuda");
+            has_nvcc(&default.join("bin/nvcc")).then_some(default)
+        })
 }
 
 /// ADR 0018 §1: the profile `engine add` writes. SPEC §13.3, ADR 0012: every
@@ -365,7 +396,7 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
     if spec.installation_drift == InstallationDrift::Refuse {
         security["installation_drift"] = "refuse".into();
     }
-    serde_json::json!({
+    let mut profile = serde_json::json!({
         "engine": match spec.engine { Engine::Vllm => "vllm", Engine::Sglang => "sglang" },
         "revision": 1,
         "executable": spec.executable.to_string_lossy(),
@@ -374,7 +405,11 @@ pub fn profile_document(spec: &ProfileSpec) -> Value {
         "env": {},
         "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
         "security": security,
-    })
+    });
+    if let Some(cuda_home) = &spec.cuda_home {
+        profile["cuda_home"] = cuda_home.to_string_lossy().into();
+    }
+    profile
 }
 
 /// ADR 0018 §1, SPEC §15.3: a profile is written only if its name is valid

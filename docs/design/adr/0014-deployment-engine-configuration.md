@@ -8,6 +8,8 @@ The SPEC amendments below are applied to `SPEC.md` §8.2 and §16.3.
 **Amends:** `SPEC.md` §8.2 (parameter ownership) and §16.3 (single-host example). It
 implements ADR 0008's "a deployment owns its `engine_config`" and applies ADR 0011's rule
 that mllm validates a recipe's shape and capacity while the user owns whether it works.
+**Amended by:** Amendment A3 below (owner decision 2026-09-25): vLLM
+`--speculative-config` is approved key by key (§8).
 **Unit:** WE of `docs/plans/2026-09-22-two-host-control-plane-plan.md`.
 
 ## Context
@@ -221,7 +223,8 @@ for path values the path is inside `security.approved_paths`:
   media URL fetching domains, tokens for remote hubs.
 
 `trust_remote_code` keeps its existing host switch (`security.trust_remote_code`).
-Options not on any list are ordinary.
+Options not on any list are ordinary. vLLM `--speculative-config` has its own rule
+(Amendment A3).
 
 ### 9. What stays and what goes
 
@@ -353,3 +356,33 @@ cold phase stays the request. The launch plan carries the reserved peak
 it per deployment (with every measurement) and per starting instance. See ADR 0015's
 2026-09-23 amendment for the per-host activation gate. The placeholder factor is not a
 measurement; nothing here is qualified live.
+
+## Amendment A3 — vLLM `--speculative-config` approved key by key (owner decision 2026-09-25)
+
+Found live in the 2026-09-25 single-box benchmark (`docs/benchmarks/2026-09-25-single-box.md`).
+§8 listed `--speculative-config` among the path options. Its value is a JSON object, so no
+value could lie inside `security.approved_paths`. Every vLLM speculative deployment was
+refused at deploy time. The launch-time gate refuses any structured value named as a
+path, so it would have been refused at launch too. The owner accepted the fix below.
+
+The option keeps named approval: `security.approved_options` must list it. When it is
+approved, its value must be a JSON object that meets three conditions:
+
+- every key is on a closed list: `method`, `model`, `num_speculative_tokens`,
+  `draft_tensor_parallel_size`, `prompt_lookup_max`, `prompt_lookup_min`,
+  `draft_sample_method`, `moe_backend`;
+- every value is a string, number or boolean (no nested object or list);
+- the draft `model`, when named, is an absolute path inside
+  `security.approved_paths`, checked lexically at deploy time and, at launch,
+  through every existing symlink (as for path options).
+
+Any other key is refused, for example a tokenizer, a revision, a quantization or a
+nested draft configuration. This closes every path the value could carry. Both gates
+apply the same rule: `engine_policy.rs` (`Sensitivity::SpeculativeConfig`) at deploy
+time, and `runtime/extra_args_policy.py` on the parsed destination at launch. A new key
+that vLLM adds needs this list amended; until then it is refused.
+
+Evidence: `speculative_config_is_admitted_key_by_key` (mllm-config) and
+`test_speculative_config_is_checked_key_by_key` (runtime). These are CPU tests only.
+Live, MTP, DFlash, DFlash2, DSpark and the Gemma 4 assistant ran through this gate on
+vLLM 0.29.0. That is not qualification of any recipe.

@@ -338,6 +338,11 @@ async fn add(
             DriftChoice::Refuse => InstallationDrift::Refuse,
         },
         args: args.to_vec(),
+        // SPEC §13.3 amendment (owner decision 2026-09-25).
+        cuda_home: mllm_config::registration::detect_cuda_home(
+            std::env::var("CUDA_HOME").ok().as_deref(),
+            |nvcc| nvcc.is_file(),
+        ),
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
@@ -346,6 +351,7 @@ async fn add(
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
         "engines_file": target.engines, "revision": revision,
+        "cuda_home": spec.cuda_home,
     });
     match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
         Ok(reply) if reply["ok"] == true => {

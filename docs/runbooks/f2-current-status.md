@@ -4,6 +4,47 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Single-box benchmark through mllm — 2026-09-25 (branch `test/model-benchmark`)
+
+Owner-approved experiment: five models, 256 in / 256 out, one user, vLLM 0.29.0
+on host A and SGLang 0.5.20 on host B, deployed by mllm and requested through
+the router (row M80, bench phase, 1 warmup + 5 measured). Full method, flags,
+results and failures: `docs/benchmarks/2026-09-25-single-box.md`. Evidence:
+`target/live/bench/` on the control-plane host, run `matrix-20260925T125244Z`.
+Not qualification.
+
+- **Live results (decode tok/s, median; baseline → best drafter).** MiniCPM5-2B
+  36 → 85 (DSpark, both engines); Qwen3.6-35B-A3B NVFP4 77 → 126 (vLLM DFlash),
+  85 → 125 (SGLang MTP); Ling-3.0-flash int4 23 → 48 (SGLang DSpark; vLLM not
+  run, needs `trust_remote_code`); Gemma-4-E2B 38 → 96–100 (assistant);
+  Qwen3.8-27B NVFP4 10.5 → 27.6 (DFlash2). mllm path overhead 25–85 ms at first
+  token, 25–55 ms at stream end.
+- **Hugging Face sources worked live** (first use): 17 sources, about 123 GB
+  per host, resumed across three host-role restarts; the Wi-Fi link (about
+  9 MB/s per host) set the pace.
+- **Product fixes, each with CPU regression tests:**
+  - Exercised live: vLLM `--speculative-config` is admitted key by key under
+    host approval, at deploy time and at launch; it was classed as a path, so
+    no vLLM speculation could deploy. Accepted as ADR 0014 Amendment A3, with
+    an "Amended by" note in SPEC §8.2. A source copy already verified on the
+    host is reused by a new deployment; activation had been refused
+    `model_source_pending`.
+  - After the owner's decisions, not run live: vLLM needs `nvcc` on PATH to use
+    FlashInfer. The CUDA PATH that fixed this live is now an optional,
+    host-approved profile field, `cuda_home`: `engine add` detects it, and
+    standalone takes `MLLM_CUDA_HOME` (SPEC §13.3 amendment).
+  - After the owner's decisions, not run live: mllm sets
+    `MAX_JOBS = clamp(floor(MemAvailable / 8 GiB), 1, CPUs)` and
+    `FLASHINFER_NVCC_THREADS=1` at launch, logs the choice, and a profile's
+    `env` may override either one.
+  - After the owner's decisions, not run live: `deploy --activate` and
+    `start --wait` wait for a model source that is still downloading, within
+    the Initialize window.
+- **Still open:** Ling on vLLM needs checkpoint code (`trust_remote_code`),
+  which stayed off. SGLang engine output is only captured with
+  `--debug-engine-logs`. The CUTLASS fused-MoE JIT ran both hosts out of memory
+  once during the run; the new `MAX_JOBS` bound has not been exercised live.
+
 ## First-run friction from the guide walk — 2026-09-25 (branch `fix/first-run-friction`)
 
 Four fixes before 0.1.0, found by walking the user guides with the real

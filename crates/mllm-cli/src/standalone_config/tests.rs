@@ -63,6 +63,7 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         runtime_dir: "/opt/mllm/runtime".into(),
         args: Vec::new(),
         installation_drift: Default::default(),
+        cuda_home: None,
         engine_ports: (8100, 8199),
     }
 }
@@ -103,6 +104,38 @@ fn the_host_declares_exactly_one_engine_installation() {
     assert_eq!(profile["engine"], "vllm");
     assert_eq!(profile["executable"], "/bin/true");
     assert_eq!(profile["build_fingerprint"], "fp-1");
+}
+
+/// SPEC §13.3 amendment (owner decision 2026-09-25): an installation's CUDA
+/// toolkit (`MLLM_CUDA_HOME` for the environment one) is published as the
+/// profile's `cuda_home`; without one the profile names none.
+// T21
+#[test]
+fn an_installation_cuda_home_is_published_only_when_named() {
+    let mut with = installed(Engine::Vllm, "/bin/true");
+    with.cuda_home = Some("/usr/local/cuda".into());
+    let host = host_policy(
+        &[
+            mllm_controller::engine_provider::NamedInstallation {
+                profile: "local-vllm".into(),
+                installation: with,
+            },
+            mllm_controller::engine_provider::NamedInstallation {
+                profile: "local-sglang".into(),
+                installation: installed(Engine::Sglang, "/bin/true"),
+            },
+        ],
+        "env-1",
+        CAPACITY,
+        None,
+    );
+    assert_eq!(
+        host["runtime_profiles"]["local-vllm"]["cuda_home"],
+        "/usr/local/cuda"
+    );
+    assert!(host["runtime_profiles"]["local-sglang"]
+        .get("cuda_home")
+        .is_none());
 }
 
 /// Deep-park paths are the host's decision, not the adapter's (SPEC §9.1, T21), so
@@ -961,6 +994,7 @@ fn registered(executable: &std::path::Path) -> serde_json::Map<String, serde_jso
             deep_park: true,
             installation_drift: mllm_config::effective::InstallationDrift::Warn,
             args: vec![],
+            cuda_home: None,
         });
     [("vllm-patched".to_string(), profile)]
         .into_iter()

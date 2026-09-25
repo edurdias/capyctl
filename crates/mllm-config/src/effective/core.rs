@@ -9,6 +9,7 @@ pub(super) struct NormalizedProfile {
     pub(super) build_fingerprint: String,
     pub(super) args: Vec<String>,
     pub(super) env: BTreeMap<String, String>,
+    pub(super) cuda_home: Option<String>,
     pub(super) security: Security,
     pub(super) log_policy: LogPolicy,
 }
@@ -79,7 +80,7 @@ pub(super) fn normalize_profile(
     validate_profile_env(&raw_profile.env).map_err(|_| {
         invalid(
             "runtime_profiles.env",
-            "environment name is not allowlisted",
+            "environment name is not allowlisted, or a build limit is not a positive integer",
         )
     })?;
     // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
@@ -107,6 +108,23 @@ pub(super) fn normalize_profile(
             "a parking deployment cannot run on a profile that opts out of deep park \
              (deep_park: disabled); use residency: restart_only or remove the opt-out",
         ));
+    }
+    // SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root
+    // is host-approved like the executable: absolute and normalized.
+    if let Some(cuda_home) = &raw_profile.cuda_home {
+        if !Path::new(cuda_home).is_absolute()
+            || Path::new(cuda_home).components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        {
+            return Err(invalid(
+                "runtime_profiles.cuda_home",
+                "must be an absolute, normalized directory",
+            ));
+        }
     }
     for path in &raw_profile.security.approved_paths {
         if !Path::new(path).is_absolute()
@@ -141,6 +159,7 @@ pub(super) fn normalize_profile(
         build_fingerprint: raw_profile.build_fingerprint.clone(),
         args: raw_profile.args.clone(),
         env: raw_profile.env.clone(),
+        cuda_home: raw_profile.cuda_home.clone(),
         security: raw_profile.security.clone(),
         log_policy: LogPolicy {
             max_file_bytes: parse_bytes(&raw_profile.log_policy.max_file_bytes)?,
@@ -532,6 +551,9 @@ pub(super) fn recipe_fingerprint(
         args: &'a [String],
         engine_config: &'a LaunchSettings,
         env: &'a BTreeMap<String, String>,
+        // Absent leaves every existing fingerprint unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cuda_home: Option<&'a str>,
         deep_park: DeepPark,
         trust_remote_code: bool,
         extra_args_policy: ExtraArgsPolicy,
@@ -559,6 +581,7 @@ pub(super) fn recipe_fingerprint(
         args: &profile.args,
         engine_config,
         env: &profile.env,
+        cuda_home: profile.cuda_home.as_deref(),
         deep_park: profile.security.deep_park,
         trust_remote_code: profile.security.trust_remote_code,
         extra_args_policy: profile.security.extra_args,
