@@ -194,3 +194,94 @@ fn the_engines_file_is_strict() {
     .unwrap();
     assert_eq!(ok.revision, 7);
 }
+
+use mllm_config::effective::InstallationDrift;
+use mllm_config::engine_policy::Engine;
+
+fn spec(engine: Engine) -> ProfileSpec {
+    ProfileSpec {
+        engine,
+        executable: match engine {
+            Engine::Vllm => "/home/u/venv/bin/vllm".into(),
+            Engine::Sglang => "/home/u/venv/bin/python3".into(),
+        },
+        build_fingerprint: "0.29.0".into(),
+        deep_park: true,
+        installation_drift: InstallationDrift::Warn,
+        args: vec![],
+    }
+}
+
+// T14 T21: a built profile carries both per-launch key references, deep
+// park as asked, drift only when refused, and passes the resolution rules.
+#[test]
+fn a_built_profile_passes_the_resolution_rules() {
+    for engine in [Engine::Vllm, Engine::Sglang] {
+        let profile = profile_document(&spec(engine));
+        assert_eq!(profile["revision"], 1);
+        assert_eq!(profile["security"]["credential_ref"], "secret://engine-key");
+        assert_eq!(
+            profile["security"]["admin_credential_ref"],
+            "secret://admin-key"
+        );
+        assert_eq!(profile["security"]["deep_park"], "enabled");
+        assert!(profile["security"].get("installation_drift").is_none());
+        check_profile("vllm", &profile).unwrap();
+    }
+    let mut refusing = spec(Engine::Vllm);
+    refusing.installation_drift = InstallationDrift::Refuse;
+    refusing.deep_park = false;
+    let profile = profile_document(&refusing);
+    assert_eq!(profile["security"]["installation_drift"], "refuse");
+    assert_eq!(profile["security"]["deep_park"], "disabled");
+}
+
+// T14: reserved arguments stay reserved; SGLang takes no host-fixed args.
+#[test]
+fn profile_arguments_follow_the_existing_rules() {
+    let mut vllm = spec(Engine::Vllm);
+    vllm.args = vec!["--port".into(), "1".into()];
+    assert!(check_profile("vllm", &profile_document(&vllm)).is_err());
+    vllm.args = vec!["--max-num-seqs".into(), "8".into()];
+    check_profile("vllm", &profile_document(&vllm)).unwrap();
+    let mut sglang = spec(Engine::Sglang);
+    sglang.args = vec!["--mem-fraction-static".into(), "0.5".into()];
+    assert!(check_profile("sglang", &profile_document(&sglang)).is_err());
+}
+
+// T01 T03: names are short lowercase identifiers.
+#[test]
+fn profile_names_are_bounded_identifiers() {
+    for good in ["vllm", "sglang", "vllm-patched", "v2_exl3"] {
+        assert!(valid_profile_name(good), "{good}");
+    }
+    for bad in ["", "Vllm", "-x", "a.b", "a/b", &"x".repeat(65)] {
+        assert!(!valid_profile_name(bad), "{bad}");
+    }
+    assert!(check_profile("Bad Name", &profile_document(&spec(Engine::Vllm))).is_err());
+}
+
+// T22: the verified set; anything else is `custom`.
+#[test]
+fn the_verified_set_marks_custom_builds() {
+    assert!(is_verified(Engine::Vllm, "0.29.0"));
+    assert!(is_verified(Engine::Sglang, "0.5.20"));
+    assert!(!is_verified(Engine::Sglang, "0.5.20+custom"));
+    assert!(!is_verified(Engine::Vllm, "0.5.20"));
+}
+
+// ADR 0018 §3: only a change confined to runtime profiles is live.
+#[test]
+fn profile_only_changes_are_recognised() {
+    let dir = tempfile::tempdir().unwrap();
+    let old: serde_json::Value =
+        serde_json::from_str(&HostConfig::template(&dir.path().join("state"))).unwrap();
+    let mut new = old.clone();
+    new["runtime_profiles"]["vllm"] = profile_document(&spec(Engine::Vllm));
+    assert!(only_profiles_differ(&old, &new));
+    assert_eq!(added_profiles(&old, &new), vec!["vllm".to_string()]);
+    assert_eq!(removed_profiles(&new, &old), vec!["vllm".to_string()]);
+    let mut edited = new.clone();
+    edited["load_report_interval"] = "9s".into();
+    assert!(!only_profiles_differ(&old, &edited));
+}

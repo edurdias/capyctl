@@ -4,6 +4,8 @@
 //! two at load, and a profile name declared in both is refused. Writes hold
 //! `engines.yaml.lock`, go through a temporary file, sync and rename, and
 //! record the revision on the first line (a comment the parser ignores).
+use crate::effective::InstallationDrift;
+use crate::engine_policy::Engine;
 use crate::{parse_strict, ConfigError, ConfigErrorCode, ConfigKind};
 use serde_json::{Map, Value};
 use std::fs::{self, File, OpenOptions};
@@ -219,4 +221,118 @@ pub fn write_engines(
         .and_then(|d| d.sync_all())
         .map_err(|e| io(dir, e))?;
     Ok(revision)
+}
+
+/// ADR 0018 §1: the versions the live matrix qualifies. Any other version is
+/// shown `custom`; nothing is written for it.
+pub const VERIFIED: &[(Engine, &str)] = &[(Engine::Vllm, "0.29.0"), (Engine::Sglang, "0.5.20")];
+
+pub fn is_verified(engine: Engine, version: &str) -> bool {
+    VERIFIED.iter().any(|(e, v)| *e == engine && *v == version)
+}
+
+/// ADR 0018 §5: the profile names standalone gives its environment-variable
+/// installations (`MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN`).
+pub const ENVIRONMENT_PROFILES: &[&str] = &["local", "local-vllm", "local-sglang"];
+
+/// ADR 0018 §1: short lowercase identifiers, safe in a JSON path and a
+/// status table.
+pub fn valid_profile_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_')
+}
+
+/// What `mllm engine add` measured and the operator chose.
+#[derive(Debug, Clone)]
+pub struct ProfileSpec {
+    pub engine: Engine,
+    pub executable: PathBuf,
+    pub build_fingerprint: String,
+    pub deep_park: bool,
+    pub installation_drift: InstallationDrift,
+    pub args: Vec<String>,
+}
+
+/// ADR 0018 §1: the profile `engine add` writes. SPEC §13.3, ADR 0012: every
+/// launch seals an inference key and a separate admin key, so both
+/// references are named (the coordinator resolves them per launch). ADR 0008:
+/// drift is stated only when refused, so a default profile is unchanged.
+pub fn profile_document(spec: &ProfileSpec) -> Value {
+    let mut security = serde_json::json!({
+        "deep_park": if spec.deep_park { "enabled" } else { "disabled" },
+        "trust_remote_code": false,
+        "credential_ref": "secret://engine-key",
+        "admin_credential_ref": "secret://admin-key",
+    });
+    if spec.installation_drift == InstallationDrift::Refuse {
+        security["installation_drift"] = "refuse".into();
+    }
+    serde_json::json!({
+        "engine": match spec.engine { Engine::Vllm => "vllm", Engine::Sglang => "sglang" },
+        "revision": 1,
+        "executable": spec.executable.to_string_lossy(),
+        "build_fingerprint": spec.build_fingerprint,
+        "args": spec.args,
+        "env": {},
+        "log_policy": {"max_file_bytes": "16MiB", "retained_files": 3},
+        "security": security,
+    })
+}
+
+/// ADR 0018 §1, SPEC §15.3: a profile is written only if its name is valid
+/// and it passes the rules deployment resolution applies.
+pub fn check_profile(name: &str, profile: &Value) -> Result<(), ConfigError> {
+    if !valid_profile_name(name) {
+        return Err(ConfigError::new(
+            ConfigErrorCode::UnsupportedCombination,
+            "runtime_profiles",
+            format!("profile name {name:?} must be 1-64 lowercase letters, digits, '-' or '_', starting with a letter or digit"),
+        ));
+    }
+    crate::effective::check_runtime_profile(profile)
+}
+
+fn without_profiles(document: &Value) -> Value {
+    let mut copy = document.clone();
+    if let Some(map) = copy.as_object_mut() {
+        map.remove("runtime_profiles");
+        if let Some(host) = map.get_mut("host").and_then(Value::as_object_mut) {
+            host.remove("runtime_profiles");
+        }
+    }
+    copy
+}
+
+fn profile_names(document: &Value) -> std::collections::BTreeSet<String> {
+    document["runtime_profiles"]
+        .as_object()
+        .or_else(|| document["host"]["runtime_profiles"].as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// ADR 0018 §3: whether `new` differs from `old` in runtime profiles alone.
+pub fn only_profiles_differ(old: &Value, new: &Value) -> bool {
+    without_profiles(old) == without_profiles(new)
+}
+
+/// Profiles in `old` that `new` no longer has.
+pub fn removed_profiles(old: &Value, new: &Value) -> Vec<String> {
+    profile_names(old)
+        .difference(&profile_names(new))
+        .cloned()
+        .collect()
+}
+
+/// Profiles in `new` that `old` did not have.
+pub fn added_profiles(old: &Value, new: &Value) -> Vec<String> {
+    profile_names(new)
+        .difference(&profile_names(old))
+        .cloned()
+        .collect()
 }
