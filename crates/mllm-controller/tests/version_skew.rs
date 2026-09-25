@@ -13,15 +13,17 @@ use mllm_agent::{
     identity::{CertificateAuthority, HostKey},
     identity_storage::IdentityDirectory,
 };
+use mllm_adapters::traits::{RuntimeAction, RuntimeCommand, RuntimeError};
 use mllm_controller::{
     agent_sessions::{gate_refusal, AgentSessions},
+    remote_execution::{self, ReadinessLedger, RemoteLaunchBinding},
     coordinator::ServiceObservation,
     enrollment::EnrollmentAuthority,
     ownership::SharedCoordinatorState,
     OwnedCoordinatorState,
 };
 use mllm_domain::{
-    completion::ProcessIdentity,
+    completion::{ExecutionIdentities, ProcessIdentity, StepExecutionContext, TransitionToken},
     group::{CommandIdentity, MemberKey},
 };
 use mllm_protocol::{
@@ -347,6 +349,69 @@ async fn a_drain_only_host_refuses_start_but_allows_stop() {
     let sent = next_command(&mut stream, Duration::from_secs(5)).await.expect("the probe is sent");
     assert!(matches!(sent.action, Some(pb::execute_member::Action::ProbeOwnedHandle(_))));
     pending.abort();
+    h.server.abort();
+}
+
+// T16 T34: found by the rc.2 live validation (2026-09-24). A park of a Ready
+// engine on a drain-only host is refused before anything is sent, and the
+// coordinator settles it leaving the remote launch's dispatch closed until a
+// fresh probe reopens it. The refusal must therefore forget the launch's
+// readiness proof, so the readiness supervisor sends that probe (a drain-only
+// host still takes probes). With the proof kept, the engine kept running but
+// stayed closed to dispatch until the host reconnected.
+#[tokio::test]
+async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_dispatch() {
+    let h = enrolled().await;
+    let (_send, mut stream) = h.reconciled("", vec![]).await;
+    let MemberAction::LaunchSingle(plan) = launch() else { unreachable!() };
+    let binding_id = plan.binding_id.clone();
+    let incarnation = plan.incarnation.clone();
+    let readiness: ReadinessLedger = Default::default();
+    readiness.lock().unwrap().insert(binding_id.clone(), "proving-session".into());
+    let engine = remote_execution::engine(
+        h.sessions.clone(),
+        h.state.clone(),
+        RemoteLaunchBinding {
+            controller_id: h.authority.controller_id(),
+            host_id: h.host.clone(),
+            member_id: "head".into(),
+            profile_fingerprint: "sglang-0.5.20".into(),
+            launch_command_id: "01K00000000000000000000005".into(),
+            plan,
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+        },
+        readiness.clone(),
+    );
+    let park = RuntimeCommand {
+        action: RuntimeAction::Park,
+        context: StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: "deployment".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "01K00000000000000000000006".into(),
+                step_id: "01K00000000000000000000007".into(),
+            },
+            binding_id: binding_id.clone(),
+            incarnation,
+            issued_at_ms: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 20_000,
+            identities: ExecutionIdentities::Retained(vec![recorded()]),
+            completion_target: None,
+            grant_id: None,
+            launch_settings: None,
+        },
+    };
+    assert_eq!(
+        engine.execute_persisted(&park).await.unwrap_err(),
+        RuntimeError::Refused("host_upgrade_required".into())
+    );
+    assert!(
+        !readiness.lock().unwrap().contains_key(&binding_id),
+        "the refused park must leave the launch to a fresh readiness probe"
+    );
+    assert!(next_command(&mut stream, Duration::from_millis(300)).await.is_none(), "nothing was sent");
     h.server.abort();
 }
 
