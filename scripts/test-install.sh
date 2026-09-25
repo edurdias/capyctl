@@ -18,6 +18,8 @@
 #     SHA256SUMS does not list, a file inside the archive that does not match
 #     the archive's own SHA256SUMS, an unknown --systemd role; none of them
 #     leaves a binary behind;
+#   - no --version while only pre-releases exist: the refusal names GitHub's
+#     latest-release rule and --version, with and without a token;
 #   - --uninstall removes what was installed and keeps state.
 set -euo pipefail
 
@@ -220,6 +222,22 @@ EOF
   else
     pass "$label a rejected token installs nothing"
   fi
+  # Without --version, when the repository has only pre-releases: GitHub's
+  # releases/latest answers 404, and the refusal names that cause and how to
+  # pass a version, not only a private-repository guess.
+  printf '#!/bin/sh\nexit 22\n' >"$fakebin/curl"
+  chmod 0755 "$fakebin/curl"
+  for token in "" secret-token; do
+    fresh_home
+    if out=$(run "$shell" ${token:+GITHUB_TOKEN=$token} -- --repo o/r 2>&1); then
+      fail "$label no --version with only pre-releases: installed anyway"
+    elif grep -qF "skips pre-releases" <<<"$out" && grep -qF -- "--version v0.1.0-rc" <<<"$out" &&
+      { [ -n "$token" ] || grep -qF "gh auth login" <<<"$out"; } && [ ! -e "$home/.local/bin/mllm" ]; then
+      pass "$label no --version with only pre-releases names the cause${token:+ (token)}"
+    else
+      fail "$label no --version with only pre-releases: message '$out'"
+    fi
+  done
   rm -f "$fakebin/curl"
 
   # --- refusals -----------------------------------------------------------------
