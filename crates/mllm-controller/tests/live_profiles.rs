@@ -491,3 +491,142 @@ async fn the_controller_republish_accepts_and_refuses_with_a_reason() {
     assert_eq!(approved(&h), startup.policy_fingerprint);
     h.server.abort();
 }
+
+use mllm_controller::profile_retirement::{ProfileRetirements, RetirementStep};
+
+/// A scripted retirement service: `begin` answers `first`; `poll` answers
+/// `None` `waits` times, then `last`.
+struct Scripted {
+    first: RetirementStep,
+    waits: std::sync::atomic::AtomicUsize,
+    last: RetirementStep,
+    seen: Mutex<Vec<(String, String, String, bool)>>,
+}
+
+impl ProfileRetirements for Scripted {
+    fn begin(&self, host: &str, profile: &str, key: &str, drain: bool) -> RetirementStep {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((host.into(), profile.into(), key.into(), drain));
+        self.first.clone()
+    }
+    fn poll(&self, _: &str, _: &str, _: &str) -> Option<RetirementStep> {
+        if self.waits.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.waits.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        } else {
+            Some(self.last.clone())
+        }
+    }
+}
+
+fn retire(request_id: &str, profile: &str, drain: bool) -> pb::AgentToServer {
+    pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::RetireProfile(pb::RetireProfile {
+            request_id: request_id.into(),
+            profile: profile.into(),
+            drain,
+        })),
+    }
+}
+
+async fn retirement(stream: &mut tonic::Streaming<pb::ServerToAgent>) -> pb::ProfileRetirement {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .msg
+        {
+            Some(server_to_agent::Msg::ProfileRetirement(r)) => return r,
+            Some(server_to_agent::Msg::Heartbeat(_)) => continue,
+            other => panic!("expected ProfileRetirement, got {other:?}"),
+        }
+    }
+}
+
+// T16 T32: in use without drain is refused with the list; with drain the
+// host hears `draining`, then `confirmed` only when the service confirms.
+#[tokio::test]
+async fn a_retirement_answers_in_use_or_drains_then_confirms() {
+    let h = enrolled().await;
+    let service = Arc::new(Scripted {
+        first: RetirementStep::InUse(vec!["q14".into()]),
+        waits: 0.into(),
+        last: RetirementStep::Confirmed,
+        seen: Mutex::new(vec![]),
+    });
+    h.sessions.with_profile_retirements(service.clone());
+    let (send, mut stream) = h.reconciled(BINARY_VERSION, all()).await;
+    send.send(retire("req-1", "local", false)).await.unwrap();
+    let answer = retirement(&mut stream).await;
+    assert_eq!(
+        (answer.request_id.as_str(), answer.outcome.as_str()),
+        ("req-1", "in_use")
+    );
+    assert_eq!(answer.deployments, vec!["q14".to_string()]);
+    assert_eq!(
+        service.seen.lock().unwrap()[0],
+        (
+            h.host.clone(),
+            "local".into(),
+            format!("{}:req-1", h.host),
+            false
+        )
+    );
+
+    let draining = Arc::new(Scripted {
+        first: RetirementStep::Draining(vec!["q14".into()]),
+        waits: 2.into(),
+        last: RetirementStep::Confirmed,
+        seen: Mutex::new(vec![]),
+    });
+    h.sessions.with_profile_retirements(draining);
+    send.send(retire("req-2", "local", true)).await.unwrap();
+    assert_eq!(retirement(&mut stream).await.outcome, "draining");
+    let last = retirement(&mut stream).await;
+    assert_eq!(
+        (last.request_id.as_str(), last.outcome.as_str()),
+        ("req-2", "confirmed")
+    );
+    h.server.abort();
+}
+
+// T32: an unsettled drain answers `holding`, naming what is unsettled.
+#[tokio::test]
+async fn an_unsettled_drain_answers_holding() {
+    let h = enrolled().await;
+    h.sessions.with_profile_retirements(Arc::new(Scripted {
+        first: RetirementStep::Draining(vec!["q14".into()]),
+        waits: 0.into(),
+        last: RetirementStep::Holding(vec!["q14".into()]),
+        seen: Mutex::new(vec![]),
+    }));
+    let (send, mut stream) = h.reconciled(BINARY_VERSION, all()).await;
+    send.send(retire("req-3", "local", true)).await.unwrap();
+    assert_eq!(retirement(&mut stream).await.outcome, "draining");
+    let last = retirement(&mut stream).await;
+    assert_eq!(last.outcome, "holding");
+    assert_eq!(last.deployments, vec!["q14".to_string()]);
+    h.server.abort();
+}
+
+// T37: an invalid profile name, or a server with no retirement service, is
+// refused without ending the session.
+#[tokio::test]
+async fn a_malformed_or_unserved_retirement_is_refused() {
+    let h = enrolled().await;
+    let (send, mut stream) = h.reconciled(BINARY_VERSION, all()).await;
+    send.send(retire("req-4", "local", false)).await.unwrap();
+    let answer = retirement(&mut stream).await;
+    assert_eq!(answer.outcome, "refused");
+    assert!(!answer.reason.is_empty());
+    send.send(retire("req-5", "Not A Name", false))
+        .await
+        .unwrap();
+    assert_eq!(retirement(&mut stream).await.outcome, "refused");
+    assert!(h.sessions.current_session(&h.host).is_some());
+    h.server.abort();
+}

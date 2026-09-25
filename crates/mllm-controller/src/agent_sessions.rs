@@ -406,6 +406,9 @@ pub struct AgentSessions {
     /// SPEC §4.3: suspends dispatch to a draining host's engines before the host
     /// is acknowledged. Installed at wiring; blocking store work.
     drain_hook: Arc<Mutex<Option<DrainHook>>>,
+    /// ADR 0018 §4: retires runtime profiles. Installed at wiring; without
+    /// one, every retirement is refused.
+    retirements: Arc<Mutex<Option<Arc<dyn crate::profile_retirement::ProfileRetirements>>>>,
     /// Owner decision 2026-09-23: suspends dispatch to a host whose heartbeats
     /// went silent, and forgets the readiness its session proved.
     unresponsive_hook: Arc<Mutex<Option<DrainHook>>>,
@@ -441,6 +444,7 @@ impl AgentSessions {
             load: Arc::new(crate::load_table::LoadTable::new()),
             latency: Arc::new(crate::latency_table::LatencyTable::new()),
             drain_hook: Arc::new(Mutex::new(None)),
+            retirements: Arc::new(Mutex::new(None)),
             unresponsive_hook: Arc::new(Mutex::new(None)),
             exit_hook: Arc::new(Mutex::new(None)),
             heartbeat,
@@ -495,6 +499,16 @@ impl AgentSessions {
             *installed = Some(hook);
         }
     }
+    /// ADR 0018 §4: the service that retires runtime profiles. Without one,
+    /// every retirement is refused (`refused`), and nothing is removed.
+    pub fn with_profile_retirements(
+        &self,
+        service: Arc<dyn crate::profile_retirement::ProfileRetirements>,
+    ) {
+        if let Ok(mut installed) = self.retirements.lock() {
+            *installed = Some(service);
+        }
+    }
     /// ADR 0013 §10: the router's read of host-reported engine load. Samples
     /// are routing hints only, never readiness or release evidence.
     pub fn load_table(&self) -> Arc<crate::load_table::LoadTable> {
@@ -513,6 +527,11 @@ impl AgentSessions {
     fn changed(&self) {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+    /// `changed()` for a task that outlives this borrow (ADR 0018 §4 relay).
+    fn clone_change_notifier(&self) -> impl Fn() + Send + 'static {
+        let changes = self.changes.clone();
+        move || changes.send_modify(|generation| *generation = generation.wrapping_add(1))
     }
     /// The host's current authenticated session, only once it has reconciled,
     /// and not while the host is draining (SPEC §4.3): a draining host's session
@@ -1098,6 +1117,17 @@ impl AgentSessions {
                                     after = After::Republish(request.request_id, Box::new(inventory), Box::new(previous));
                                     false
                                 }
+                                // ADR 0018 §4: first phase of removing a published profile,
+                                // only from a host that declared `live_profile_update`.
+                                Some(agent_to_server::Msg::RetireProfile(request))
+                                    if s.view.reconciled && s.capabilities.contains(capabilities::LIVE_PROFILE_UPDATE) =>
+                                {
+                                    if request.request_id.is_empty() || request.request_id.len() > capabilities::MAX_REQUEST_ID {
+                                        return Err(denied());
+                                    }
+                                    after = After::Retire(request);
+                                    false
+                                }
                                 Some(agent_to_server::Msg::ReconcileHistory(page)) if !s.view.reconciled && s.inventory.is_some() => {
                                     if page.records.len() > 256 || s.history.len() + page.records.len() > 4096 { return Err(Status::resource_exhausted("journal reconciliation limit")); }
                                     for record in &page.records {
@@ -1218,6 +1248,56 @@ impl AgentSessions {
                                 }
                                 send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::ProfilesPublished(pb::ProfilesPublished { request_id, accepted, reason })) }).await.map_err(|status| *status)?;
                             }
+                            After::Retire(request) => {
+                                use crate::profile_retirement::{RetirementStep, RETIREMENT_POLL};
+                                let service = self.retirements.lock().ok().and_then(|s| s.clone());
+                                // ADR 0018 §4: the key is stable per request id, so a host
+                                // that retries after a reconnect resumes the same retirement.
+                                let key = format!("{host}:{}", request.request_id);
+                                let step = match service.clone() {
+                                    None => RetirementStep::Refused("this server cannot retire runtime profiles".into()),
+                                    Some(_) if !mllm_config::registration::valid_profile_name(&request.profile) => {
+                                        RetirementStep::Refused("not a valid profile name".into())
+                                    }
+                                    Some(service) => {
+                                        let (named, profile, key, drain) =
+                                            (host.clone(), request.profile.clone(), key.clone(), request.drain);
+                                        // Store work is blocking; off this session's task.
+                                        tokio::task::spawn_blocking(move || service.begin(&named, &profile, &key, drain))
+                                            .await
+                                            .map_err(|_| Status::internal("profile retirement failed"))?
+                                    }
+                                };
+                                if !matches!(step, RetirementStep::Refused(_)) {
+                                    // Placement reads the retirement from here on.
+                                    self.changed();
+                                }
+                                send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::ProfileRetirement(step.to_wire(&request.request_id))) }).await.map_err(|status| *status)?;
+                                if let (RetirementStep::Draining(_), Some(service)) = (&step, service) {
+                                    // Spec design rule 4: the terminal answer waits for stop
+                                    // evidence, off this session's loop. A session that ends
+                                    // stops the relay only; the retirement itself stands until
+                                    // it settles, is retried with the same request id, or expires.
+                                    let (outgoing, named, profile, request_id) =
+                                        (outgoing.clone(), host.clone(), request.profile.clone(), request.request_id.clone());
+                                    let changed = self.clone_change_notifier();
+                                    tokio::spawn(async move {
+                                        loop {
+                                            tokio::time::sleep(RETIREMENT_POLL).await;
+                                            let (service, named, profile, key) = (service.clone(), named.clone(), profile.clone(), key.clone());
+                                            let Ok(polled) = tokio::task::spawn_blocking(move || service.poll(&named, &profile, &key)).await else { return };
+                                            if let Some(terminal) = polled {
+                                                changed();
+                                                let _ = send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::ProfileRetirement(terminal.to_wire(&request_id))) }).await;
+                                                return;
+                                            }
+                                            if outgoing.is_closed() {
+                                                return;
+                                            }
+                                        }
+                                    });
+                                }
+                            }
                             After::Result(result) => {
                                 self.receive_result(&host, &id, *result, received_at).map_err(|status| *status)?;
                             }
@@ -1301,6 +1381,8 @@ enum After {
     Refresh(Box<pb::ReportInventory>, Vec<(String, String, String)>),
     /// ADR 0018 §3: request id, the re-published inventory, the one it replaces.
     Republish(String, Box<pb::ReportInventory>, Box<pb::ReportInventory>),
+    /// ADR 0018 §4: a request to retire a published runtime profile.
+    Retire(pb::RetireProfile),
     Result(Box<pb::MemberExecutionResult>),
     Provision(Box<pb::IngressProvisioned>),
 }
