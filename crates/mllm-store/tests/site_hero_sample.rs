@@ -42,4 +42,20 @@ fn hero_fixture_uses_only_real_snapshot_fields() {
         serde_json::from_str(include_str!("../../../site/src/data/hero-deployments.json")).unwrap();
     assert!(fixture.as_array().is_some_and(|a| a.len() == 3));
     keys_subset(&fixture, &real, "deployments");
+    // The store only ever writes these desired states; parking changes the
+    // observed state. A parked model is DESIRED ready, STATE parked.
+    for d in fixture.as_array().unwrap() {
+        let desired = d["desired_state"].as_str().unwrap();
+        assert!(
+            ["ready", "stopped"].contains(&desired),
+            "{}: desired_state {desired} is never written by the store",
+            d["name"]
+        );
+        let observed = d["observed_state"].as_str().unwrap();
+        assert!(
+            ["ready", "parked", "stopped", "starting", "stopping"].contains(&observed),
+            "{}: observed_state {observed}",
+            d["name"]
+        );
+    }
 }

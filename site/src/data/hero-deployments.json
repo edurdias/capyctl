@@ -1,5 +1,5 @@
 [
   { "name": "coding-small", "kind": "model", "desired_state": "ready", "observed_state": "ready", "desired_instances": 1, "ready_instances": 1, "revision": "3", "instances": [{ "host_id": "h-01" }] },
   { "name": "chat-large", "kind": "model", "desired_state": "ready", "observed_state": "ready", "desired_instances": 1, "ready_instances": 1, "revision": "1", "instances": [{ "host_id": "h-02" }] },
-  { "name": "vision-small", "kind": "model", "desired_state": "parked", "observed_state": "parked", "desired_instances": 1, "ready_instances": 0, "revision": "2", "instances": [{ "host_id": "h-01" }] }
+  { "name": "vision-small", "kind": "model", "desired_state": "ready", "observed_state": "parked", "desired_instances": 1, "ready_instances": 0, "revision": "2", "instances": [{ "host_id": "h-01" }] }
 ]

@@ -24,3 +24,15 @@ test('heroSegments marks only the state word parked, keeping every character', (
   assert.deepEqual(lines[1], [{ text: 'parked-x ', parked: false }, { text: 'parked', parked: true }]);
   assert.ok(lines[2].every((s) => !s.parked));
 });
+
+test('a parked model is still wanted: DESIRED ready, STATE parked', () => {
+  const parked = deployments.find((d) => d.observed_state === 'parked');
+  assert.equal(parked.desired_state, 'ready');
+  for (const d of deployments) assert.ok(['ready', 'stopped'].includes(d.desired_state), d.name);
+});
+
+test('heroOutput reads the block back as a browser shows it', async () => {
+  const { heroOutput } = await import('../scripts/lib/hero-page.mjs');
+  const html = '<pre class="terminal" tabindex="0" aria-label="Example terminal output"><code><span class="prompt">$ </span>mllm list deployments\nNAME   STATE\na&amp;b   <span class="state-parked">parked</span>\n</code></pre>';
+  assert.deepEqual(heroOutput(html), { command: '$ mllm list deployments', output: 'NAME   STATE\na&b   parked\n' });
+});
