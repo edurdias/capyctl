@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "async-trait",
  "libc",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-adapters"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-agent"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-cli"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "axum",
  "clap",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-config"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "hex",
  "mllm-domain",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-controller"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-domain"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "proptest",
  "serde",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-launchers"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "mllm-adapters",
  "mllm-domain",
@@ -1293,7 +1293,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-management"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "axum",
  "futures",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-protocol"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "mllm-config",
  "mllm-domain",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-router"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-scheduler"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "mllm-domain",
  "proptest",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-store"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "chacha20poly1305",
  "hex",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "mllm-testkit"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "async-trait",
  "mllm-adapters",
