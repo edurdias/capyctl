@@ -29,6 +29,13 @@
 # with the commit time (SOURCE_DATE_EPOCH), and gzip omits its own timestamp,
 # so rebuilding the same commit with the same toolchain gives the same archive.
 #
+# The compiler embeds absolute source paths (registry cache, toolchain, the
+# checkout) into the binary's debug and panic-location strings. RUSTFLAGS
+# carries --remap-path-prefix for $CARGO_HOME, the rustup toolchain dir, the
+# checkout and $HOME so two builders (or the same builder in two directories)
+# produce byte-identical output. Any RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS already
+# in the environment is kept; the remap flags are appended.
+#
 # The build must pass scripts/check-release-clean.sh (no test engine in the
 # shipped binary). A dirty worktree is refused unless MLLM_RELEASE_ALLOW_DIRTY=1,
 # in which case BUILDINFO records it. An untracked file under runtime/ counts
@@ -81,6 +88,23 @@ case "$(uname -s)" in
 esac
 name="mllm-${version}-${os}-${arch}"
 target_dir=${CARGO_TARGET_DIR:-target}
+
+# Remap the builder's absolute paths to fixed, portable stand-ins. Order
+# matters: rustc applies the last matching --remap-path-prefix rule, so the
+# broad $HOME rule goes first and the paths nested under it (cargo home,
+# toolchain, checkout) go after so they take precedence over it.
+cargo_home=${CARGO_HOME:-$HOME/.cargo}
+toolchain_dir=$(rustc --print sysroot)
+remap_flags="--remap-path-prefix=$HOME=/home --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$toolchain_dir=/rustc --remap-path-prefix=$root=/mllm"
+if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+  sep=$(printf '\x1f')
+  encoded=$(printf '%s' "$remap_flags" | tr ' ' "$sep")
+  export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${sep}${encoded}"
+elif [ -n "${RUSTFLAGS:-}" ]; then
+  export RUSTFLAGS="${RUSTFLAGS} ${remap_flags}"
+else
+  export RUSTFLAGS="$remap_flags"
+fi
 
 # Release build from the lockfile, then the shipped-binary check (it rebuilds
 # with the same profile, which is a no-op here).

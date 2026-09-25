@@ -15,7 +15,10 @@
 #    runtime is compiled into the binary; no bytecode, no symlinks);
 #    SHA256SUMS and the .sha256 must verify; the binary must be stripped,
 #    report BUILDINFO's version and carry BUILDINFO's runtime manifest.
-# 5. packaging/install.sh against a file:// release holding that tarball
+# 5. No builder-identifying paths in bin/mllm (the builder's $HOME,
+#    $CARGO_HOME or the checkout path), and no machine names or a AGENTS.md
+#    mention in the tracked runtime/*.py sources that build.rs embeds into it.
+# 6. packaging/install.sh against a file:// release holding that tarball
 #    (scripts/test-install.sh).
 #
 # A missing optional tool (shellcheck, systemd-analyze) is reported as
@@ -298,7 +301,57 @@ else
   skip "readelf not found; strip not checked"
 fi
 
-# --- 5. install.sh against this tarball ----------------------------------------
+# --- 5. no builder paths or machine names leaked -----------------------------
+cargo_home_check=${CARGO_HOME:-$HOME/.cargo}
+bin_leaks=()
+for pattern in "$HOME" "$cargo_home_check" "$root"; do
+  [ -n "$pattern" ] || continue
+  if strings "$pkg/bin/mllm" | grep -qF -- "$pattern"; then
+    bin_leaks+=("$pattern")
+  fi
+done
+if [ "${#bin_leaks[@]}" -eq 0 ]; then
+  pass "bin/mllm has no builder \$HOME, \$CARGO_HOME or checkout path"
+else
+  fail "bin/mllm leaks a builder path: ${bin_leaks[*]}"
+fi
+
+# runtime/*.py is not shipped as files (it is compiled into bin/mllm; see the
+# owner/mode check above), so its tracked sources are checked directly for a
+# AGENTS.md mention and, when the lab's host names are known
+# (scripts/live/matrix/hosts.local.env, gitignored, absent outside the lab),
+# for those names too.
+mapfile -t runtime_files < <(git ls-files -- 'runtime/*.py' ':(exclude)runtime/tests' | grep -v '/.*/' || true)
+instruction_file_hits=$(grep -lF 'AGENTS.md' "${runtime_files[@]}" 2>/dev/null || true)
+if [ -z "$instruction_file_hits" ]; then
+  pass "embedded runtime source does not mention AGENTS.md"
+else
+  fail "embedded runtime source mentions AGENTS.md: $instruction_file_hits"
+fi
+
+hosts_env="scripts/live/matrix/hosts.local.env"
+if [ -f "$hosts_env" ]; then
+  # shellcheck source=/dev/null
+  . "$hosts_env"
+  host_leaks=()
+  for var in HOST_A HOST_B CONTROL_HOST HOST_A_ADDR HOST_B_ADDR CONTROL_HOST_ADDR \
+    HOST_A_DIRECT_ADDR HOST_B_DIRECT_ADDR REMOTE_HOME; do
+    val=${!var:-}
+    [ -n "$val" ] || continue
+    if grep -qF -- "$val" "${runtime_files[@]}" 2>/dev/null; then
+      host_leaks+=("$var")
+    fi
+  done
+  if [ "${#host_leaks[@]}" -eq 0 ]; then
+    pass "embedded runtime source does not mention configured lab host identifiers"
+  else
+    fail "embedded runtime source leaks lab host identifiers: ${host_leaks[*]}"
+  fi
+else
+  skip "hosts.local.env not present; cannot check runtime source for lab host identifiers"
+fi
+
+# --- 6. install.sh against this tarball ----------------------------------------
 if scripts/test-install.sh "$tarball" >"$work/test-install.log" 2>&1; then
   pass "install.sh against a file:// release ($(grep -c '^ok:' "$work/test-install.log") checks)"
 else
