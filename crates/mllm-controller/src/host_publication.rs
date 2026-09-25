@@ -113,3 +113,46 @@ pub fn publish(
         .map_err(|_| PublicationError)?;
     Ok(())
 }
+
+/// ADR 0018 §3: a live re-publication, validated like a startup publication
+/// (`HostConfig::parse`, fingerprint), with every added profile checked by
+/// the rules resolution applies, then stored only if runtime profiles alone
+/// changed and every dropped profile's retirement was confirmed. `Err` is
+/// the operator-safe reason; the previous approved document stays.
+pub fn republish(
+    state: &SharedCoordinatorState,
+    host_id: &str,
+    inventory: &ReportInventory,
+    previous: &ReportInventory,
+) -> Result<(), String> {
+    let config = mllm_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
+        .map_err(|e| format!("the document is not a valid host document: {}", e.detail))?;
+    if mllm_config::remote_resources::policy_fingerprint(&config.document)
+        != inventory.policy_fingerprint
+    {
+        return Err("the document does not match its fingerprint".into());
+    }
+    let old = mllm_config::remote_roles::HostConfig::parse(&previous.approved_host_config_json)
+        .map_err(|_| "the approved document could not be read".to_owned())?;
+    for added in mllm_config::registration::added_profiles(&old.document, &config.document) {
+        mllm_config::registration::check_profile(
+            &added,
+            &config.document["runtime_profiles"][&added],
+        )
+        .map_err(|e| format!("profile {added}: {}", e.detail))?;
+    }
+    let publication = mllm_store::host_publication::HostPublication {
+        host_id: host_id.into(),
+        config_json: config.document.to_string(),
+        boot_id: inventory.host_boot_id.clone(),
+        fingerprint: inventory.policy_fingerprint.clone(),
+        received_at_ms: mllm_protocol::now_unix_ms(),
+    };
+    let state = state
+        .lock()
+        .map_err(|_| "the server could not record the publication".to_owned())?;
+    state
+        .store()
+        .republish_host_configuration(&publication, &previous.policy_fingerprint)
+        .map_err(|refusal| refusal.reason())
+}

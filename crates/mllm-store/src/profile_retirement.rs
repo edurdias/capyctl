@@ -329,17 +329,20 @@ impl Store {
     /// ADR 0018 §4 (owner decision 2026-09-25): a retirement abandoned past its
     /// deadline (a server that stopped mid-removal) ends unconfirmed, so it
     /// cannot hold a profile out of placement for ever. Returns what ended.
+    /// Only a retirement still `retiring` is abandoned: a confirmed one stays
+    /// (keeping the profile out of placement) until the host's re-publication
+    /// drops the profile, which clears it (`republish_host_configuration`).
     pub fn expire_profile_retirements(
         &self,
         now_ms: i64,
     ) -> Result<Vec<(String, String)>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let ended: Vec<(String, String)> = tx
-            .prepare("SELECT host_id, profile FROM profile_retirements WHERE deadline_ms<=?1")?
+            .prepare("SELECT host_id, profile FROM profile_retirements WHERE state='retiring' AND deadline_ms<=?1")?
             .query_map([now_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         tx.execute(
-            "DELETE FROM profile_retirements WHERE deadline_ms<=?1",
+            "DELETE FROM profile_retirements WHERE state='retiring' AND deadline_ms<=?1",
             [now_ms],
         )?;
         tx.commit()?;

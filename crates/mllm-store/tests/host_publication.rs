@@ -89,3 +89,149 @@ fn host_publication_survives_reopen_and_revocation_blocks_updates() {
     assert!(store.publish_host_configuration(&publication).is_err());
     assert!(store.host_publication("spark").unwrap().is_none());
 }
+
+fn enrolled(store: &Store) -> String {
+    store
+        .create_host_invitation(&"e".repeat(64), "spark-r", 100, 0)
+        .unwrap();
+    store
+        .redeem_host_invitation(
+            &Redemption {
+                invitation_digest: "e".repeat(64),
+                transaction_id: "tx-r".into(),
+                host_name: "spark-r".into(),
+                key_digest: "c".repeat(64),
+                csr_digest: "d".repeat(64),
+            },
+            1,
+            |host| {
+                Ok(CertificateRecord {
+                    host_id: host.into(),
+                    fingerprint: "f".repeat(64),
+                    certificate_pem: "c".into(),
+                    expires_unix: 500,
+                })
+            },
+        )
+        .unwrap()
+        .host_id
+}
+
+fn publication(host: &str, document: &serde_json::Value) -> HostPublication {
+    HostPublication {
+        host_id: host.into(),
+        config_json: document.to_string(),
+        boot_id: "boot-a".into(),
+        fingerprint: mllm_config::remote_resources::policy_fingerprint(document),
+        received_at_ms: 100,
+    }
+}
+
+fn base_document() -> serde_json::Value {
+    serde_json::from_str(&mllm_config::remote_roles::HostConfig::template(
+        std::path::Path::new("/home/operator/host"),
+    ))
+    .unwrap()
+}
+
+fn vllm_profile() -> serde_json::Value {
+    serde_json::json!({"engine":"vllm","revision":1,"executable":"/v/bin/vllm","build_fingerprint":"0.29.0",
+        "args":[],"env":{},"log_policy":{"max_file_bytes":"16MiB","retained_files":3},
+        "security":{"deep_park":"enabled","trust_remote_code":false,"credential_ref":"secret://engine-key","admin_credential_ref":"secret://admin-key"}})
+}
+
+// T07 T33 (ADR 0018 §3, §4): a live re-publication replaces the approved
+// document only when it changes runtime profiles alone, only over the
+// publication it was based on, and only drops a profile whose retirement the
+// server confirmed; a refusal keeps the previous document.
+#[test]
+fn a_live_republication_changes_profiles_only_and_never_unretired_ones() {
+    use mllm_store::host_publication::RepublishRefusal;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("s.sqlite3")).unwrap();
+    let host = enrolled(&store);
+    let base = base_document();
+    store
+        .publish_host_configuration(&publication(&host, &base))
+        .unwrap();
+    let mut added = base.clone();
+    added["runtime_profiles"]["vllm"] = vllm_profile();
+    let base_fp = mllm_config::remote_resources::policy_fingerprint(&base);
+    store
+        .republish_host_configuration(&publication(&host, &added), &base_fp)
+        .unwrap();
+    assert_eq!(
+        store.host_publication(&host).unwrap().unwrap().config_json,
+        added.to_string()
+    );
+    // Based on a stale publication: refused, nothing changes.
+    assert_eq!(
+        store.republish_host_configuration(&publication(&host, &base), &base_fp),
+        Err(RepublishRefusal::PublicationChanged)
+    );
+    // Anything but profiles: refused.
+    let added_fp = mllm_config::remote_resources::policy_fingerprint(&added);
+    let mut edited = added.clone();
+    // Within the 250ms..5s bound, so the document stays valid.
+    edited["load_report_interval"] = "2s".into();
+    assert_eq!(
+        store.republish_host_configuration(&publication(&host, &edited), &added_fp),
+        Err(RepublishRefusal::NotProfilesOnly)
+    );
+    // Dropping a profile the server did not retire: refused.
+    assert_eq!(
+        store.republish_host_configuration(&publication(&host, &base), &added_fp),
+        Err(RepublishRefusal::NotRetired("vllm".into()))
+    );
+    assert_eq!(
+        store.host_publication(&host).unwrap().unwrap().config_json,
+        added.to_string(),
+        "a refusal keeps the previous approved document"
+    );
+    // After a confirmed retirement: accepted, and the retirement is gone.
+    assert!(matches!(
+        store
+            .begin_profile_retirement(&host, "vllm", "k", 1, 10, false)
+            .unwrap(),
+        mllm_store::profile_retirement::RetirementStart::Clear
+    ));
+    store
+        .republish_host_configuration(&publication(&host, &base), &added_fp)
+        .unwrap();
+    assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
+    assert_eq!(
+        store.host_publication(&host).unwrap().unwrap().config_json,
+        base.to_string()
+    );
+}
+
+// T32 (ADR 0018 §4): a confirmed retirement is not an abandoned one. It
+// outlives its deadline while the host's publication still lists the profile
+// (so placement stays excluded), and the re-publication that drops the
+// profile clears it.
+#[test]
+fn a_confirmed_retirement_outlives_its_deadline_until_the_profile_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("s.sqlite3")).unwrap();
+    let host = enrolled(&store);
+    let base = base_document();
+    let mut added = base.clone();
+    added["runtime_profiles"]["vllm"] = vllm_profile();
+    store
+        .publish_host_configuration(&publication(&host, &added))
+        .unwrap();
+    assert!(matches!(
+        store
+            .begin_profile_retirement(&host, "vllm", "k", 1, 10, false)
+            .unwrap(),
+        mllm_store::profile_retirement::RetirementStart::Clear
+    ));
+    assert!(store.expire_profile_retirements(1_000).unwrap().is_empty());
+    let (_, state, _) = store.profile_retirement(&host, "vllm").unwrap().unwrap();
+    assert_eq!(state, "confirmed");
+    let added_fp = mllm_config::remote_resources::policy_fingerprint(&added);
+    store
+        .republish_host_configuration(&publication(&host, &base), &added_fp)
+        .unwrap();
+    assert!(store.profile_retirement(&host, "vllm").unwrap().is_none());
+}
