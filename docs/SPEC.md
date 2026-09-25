@@ -155,6 +155,10 @@ A host may enroll before engines or checkpoints are installed. Track independent
 
 Host administrators register trusted runtime profiles, permitted devices and directories. The initial release does not silently install engines, execute discovered scripts, or download weights. `doctor host` performs approved non-destructive checks; destructive park/restore verification is an explicit operation.
 
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
+
+Host administrators register runtime profiles with `mllm engine detect`, `add`, `list` and `remove`, the same on a host and in standalone. Registered profiles live in `engines.yaml` beside the role's configuration file and are merged with it at load; mllm never rewrites the role document. Detection reads package metadata only and executes nothing; an installation is executed (bounded version check, installation fingerprint, deep-park probe) only after the operator names or picks it. A registered profile is published on the live control session without restarting the role (capability `live_profile_update`); the server validates it like a startup publication and keeps the previous approved snapshot when it refuses one. A published profile is removed only after the server confirms, in two phases, that no deployment on that host uses it, stopping them through the ordinary stop path when asked and never confirming without stop evidence. A deploy naming a profile no allowed host publishes is refused at once (`profile_not_published`). mllm still installs no engine.
+
 The agent initiates its management connection; the server sends commands over that session. gRPC supports bidirectional streaming and TLS client authentication as protocol building blocks [S8, S9]. Retry with backoff; reconnect after reboot without creating another host record. First-time setup is server-first, but steady-state boot order is not constrained.
 
 ### 4.3 Foreground roles and service operation
@@ -539,11 +543,16 @@ The management API is the source of semantics for CLI, future UI, and integratio
 |---|---|---|
 | Server YAML | Listeners, authentication, enrollment, state location, scheduler and lifecycle defaults. | Host executable paths, static copies of all enrolled hosts, individual deployment records. |
 | Host YAML | Server identity reference, approved inventory, aggregate boundaries, storage pools, ingress, runtime profiles, supervision. | Model-specific allocations, global routing, private independent swap scheduling. |
+| Engines file (`engines.yaml`) | Runtime profiles registered with `mllm engine add`, beside the role's configuration file; written only by `mllm engine add` and `remove`, merged with the role document at load. | Anything else; a profile name the role document also declares. |
 | Deployment YAML | Model identity, runtime profile, placement/topology, per-host budgets, cache choice, route, lifecycle overrides. | Agent secrets, executable installation, controller credentials. |
 | Cache-service record | Unique physical allocation, backend identity, client quotas, lifetime and storage policy. | Duplicate per-client charging of the full service. |
 | CLI context | Selected management endpoint and credential reference. | A running service role. |
 
 Operator configuration is not mutable runtime state. Server/agent processes write identities, journals, reservations and operational evidence separately; no continuous rewriting of administrator YAML. Creating a missing configuration during initialization/enrollment is an explicit documented exception.
+
+> **Amended by [ADR 0018](design/adr/0018-engine-registration.md)** (owner decision 2026-09-25).
+
+The engines file is mllm-owned operational state, not administrator YAML: mllm writes it only when the operator runs `mllm engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# mllm-document-revision: N`. The role's own document is never rewritten.
 
 ### 15.2 No-config behavior
 
