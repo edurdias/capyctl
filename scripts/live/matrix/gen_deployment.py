@@ -48,7 +48,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from gen_budgets import load_models  # noqa: E402
 
-NAME = re.compile(r"^(?P<engine>[vs])(?P<host>a|b)-(?P<model>4|14|27f|27|30)$")
+# Model keys come from models.json (2026-09-25: the single-box benchmark adds
+# mc2, q36, ling, g2, 27b and their drafter variants).
+NAME = re.compile(r"^(?P<engine>[vs])(?P<host>a|b)-(?P<model>[a-z0-9]+)$")
 # Host names and the models root come from the harness environment (lib.sh,
 # from hosts.local.env), so no lab-specific name or path lives here.
 def _env(name):
@@ -80,10 +82,12 @@ def host_ids(path):
 def fixture(name, args, models, ids, checkpoints):
     match = NAME.match(name)
     if not match:
-        sys.exit(f"{name!r} is not <v|s><a|b>-<4|14|27|27f|30>")
+        sys.exit(f"{name!r} is not <v|s><a|b>-<model key>")
     engine = ENGINES[match["engine"]]
     host = HOSTS[match["host"]]
     key = match["model"]
+    if key not in models:
+        sys.exit(f"models.json has no model {key!r}")
     spec = models[key]
     if args.co:
         if "co" not in spec:
@@ -134,6 +138,13 @@ def fixture(name, args, models, ids, checkpoints):
         digest = per_host.get(spec["dir"])
         if digest is None:
             sys.exit(f"checkpoints.json has no digest for {spec['dir']} on {host}")
+    # ADR 0008 amendment 2026-09-24: a model with `hf` declares a pinned Hugging
+    # Face source; the host materializes it under <model store>/sources/ before
+    # the first placement (the host document must allow huggingface sources).
+    if spec.get("hf"):
+        source = {"type": "huggingface", "repo": spec["hf"]["repo"], "revision": spec["hf"]["revision"]}
+    else:
+        source = {"type": "local", "path": f"{MODELS_ROOT}/{spec['dir']}"}
     return {
         "schema_version": 1,
         "kind": "deployment",
@@ -147,7 +158,7 @@ def fixture(name, args, models, ids, checkpoints):
         "recovery": "reconcile",
         "request_deadline": args.request_deadline,
         "model": {
-            "source": {"type": "local", "path": f"{MODELS_ROOT}/{spec['dir']}"},
+            "source": source,
             "content_fingerprint": f"sha256:{digest}" if digest else f"sha256:{spec['dir']}",
             "revision": "r1",
         },

@@ -264,7 +264,7 @@ def pct(values, q):
     return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
 
 
-def dist(values, qs=(50, 95, 99)):
+def dist(values, qs=(50, 90, 95, 99)):
     vals = [v for v in values if v is not None]
     out = {"n": len(vals), "mean": round(sum(vals) / len(vals), 6) if vals else None}
     for q in qs:
@@ -393,8 +393,8 @@ def summarize_cell(measured, words_per_token, t0=None, t1=None):
         "completion_tokens": dist([m["completion_tokens"] for m in good], (50,)),
         "ttft_s": dist([m["ttft_s"] for m in good]),
         "ttlt_s": dist([m["ttlt_s"] for m in good]),
-        "prefill_tps": dist([m["prefill_tps"] for m in good], (50, 95)),
-        "decode_tps": dist([m["decode_tps"] for m in good], (50, 95)),
+        "prefill_tps": dist([m["prefill_tps"] for m in good], (10, 50, 90, 95)),
+        "decode_tps": dist([m["decode_tps"] for m in good], (10, 50, 90, 95)),
         "tpot_s": dist([m["tpot_s"] for m in good]),
         "itl_s": dist(itl),
         "tokens_per_chunk": round(out_tokens / chunks, 3) if chunks else None,

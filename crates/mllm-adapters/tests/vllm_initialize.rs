@@ -437,10 +437,12 @@ async fn the_engine_environment_is_a_closed_allowlist() {
         Some("adm1n")
     );
     assert!(env.contains_key("MLLM_EXTRA_APPROVALS"));
-    // PATH is the engine's own bin and fixed system directories only.
+    // PATH is the engine's own bin and fixed system directories only; the CUDA
+    // toolkit's bin is one of them, since vLLM disables FlashInfer without
+    // `nvcc` on PATH (found live 2026-09-25).
     assert_eq!(
         env.get("PATH").map(String::as_str),
-        Some("/opt/venv/bin:/usr/local/bin:/usr/bin:/bin")
+        Some("/opt/venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin")
     );
 }
 

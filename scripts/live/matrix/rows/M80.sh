@@ -237,6 +237,9 @@ row_main() {
     FIXTURE_VARIANT=bn step deploy-bn timed deploy-bn deploy "$fix" --activate --wait \
       || { step engine-errors engine_errors "$host"; return 1; }
     step owned-bn keep_owned "$dep" ready
+    # Memory the ready engine holds (2026-09-25 benchmark): MemAvailable here
+    # against deploy-bn before it.
+    step pagecache-ready m80_pagecache "$host" ready-bn
     snap ready
     if m80_has bench; then
       m80_sweep "$fix" "$host" "$dep" || rc=1

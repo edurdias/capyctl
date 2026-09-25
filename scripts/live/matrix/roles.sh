@@ -15,9 +15,12 @@
 #   roles.sh fixtures [gen_deployment args]   all <v|s><a|b>-<model> fixtures for this run
 #
 # Hosts: a or b (HOST_A, HOST_B from hosts.local.env). DRY_RUN=1 prints the plan only.
+# Host document options (2026-09-25 benchmark): MLLM_HF_MAX_BYTES=<size> allows
+# Hugging Face model sources; MLLM_APPROVE_SPECULATION=1 approves the speculative
+# options (gen_host_doc.py).
 . "$(dirname "$0")/lib.sh"
 
-usage() { sed -n '2,16p' "$0"; exit 2; }
+usage() { sed -n '2,19p' "$0"; exit 2; }
 
 preflight() {
   local host want
@@ -117,7 +120,8 @@ host_doc() {
   x python3 "$MATRIX_DIR/gen_host_doc.py" --device-json "$RUNSTATE/device-$host.json" --ip "$(host_ip "$host")" \
     --run-root "$RRD" --policy "$policy" --sglang-version "$sgv" --vllm-version "$vv" \
     --vllm-venv "$(vllm_venv "$host")" --sglang-venv "$SGLANG_VENV" --remote-tree "$REMOTE_TREE" \
-    --models-root "$MODELS_ROOT" --ingress-port "$INGRESS_PORT" ${NO_PROFILES:+--no-profiles} --out "$doc"
+    --models-root "$MODELS_ROOT" --ingress-port "$INGRESS_PORT" ${NO_PROFILES:+--no-profiles} \
+    ${MLLM_HF_MAX_BYTES:+--hf-max-bytes "$MLLM_HF_MAX_BYTES"} ${MLLM_APPROVE_SPECULATION:+--approve-speculation} --out "$doc"
   rcopy "$doc" "$host:$RRD/host.yaml"
   rsh "$host" "chmod 600 $RRD/host.yaml"
   save_run_var "POLICY_$(host_short "$host")" "$policy"

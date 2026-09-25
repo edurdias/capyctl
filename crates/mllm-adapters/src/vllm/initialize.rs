@@ -46,8 +46,13 @@ const PASS_THROUGH: &[&str] = &[
     "TRANSFORMERS_OFFLINE",
 ];
 
-/// Fixed system tool directories after the engine's own bin.
-const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+/// Fixed system tool directories after the engine's own bin. The CUDA toolkit's
+/// `bin` (root-owned, fixed) is one of them: vLLM treats FlashInfer as absent
+/// unless `nvcc` is on PATH (no pre-built cubins in the installation), and then
+/// fails at CUDA graph capture with an FP8 KV cache on GB10 (found live,
+/// 2026-09-25 single-box benchmark). SPEC §13.3 still holds: never the
+/// caller's shell PATH.
+const SYSTEM_PATH: &str = "/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin";
 
 /// Every variable a vLLM engine may be started with (SPEC §13.3 / T21). The
 /// launcher clears the agent's environment, so this is all the engine sees.
