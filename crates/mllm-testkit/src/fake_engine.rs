@@ -88,6 +88,21 @@ impl FakeEngine {
         engine
     }
 
+    /// Report `members` as the launched group instead of the fabricated pair.
+    ///
+    /// The coordinator checks that an embedded group is still exactly the
+    /// recorded processes after a park or restore (SPEC §13.2), which only a
+    /// real, live process can satisfy. Nothing is launched or signalled: the
+    /// test owns these processes. Such a Fake also follows the embedded vLLM
+    /// residency contract (Park with no prior Drain, a readiness Probe after a
+    /// wake); a default Fake keeps refusing a Park the coordinator sends.
+    pub fn with_members(self, members: Vec<mllm_domain::completion::ProcessIdentity>) -> Self {
+        if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {
+            state.members_override = Some(members);
+        }
+        self
+    }
+
     /// Fault injection for the opt-in lifecycle runtime.
     pub fn with_fault(self, fault: crate::FakeFault) -> Self {
         if let Some(state) = self.lifecycle.lock().unwrap().as_mut() {

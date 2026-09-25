@@ -165,30 +165,35 @@ pub const DEFAULT_REQUEST_DEADLINE: &str = "900s";
 /// `deep_park` is the host's switch ([`EngineInstallation::deep_park`]). ADR 0012:
 /// deep parking is on by default and a host opts out, so the generated residency
 /// has to follow that switch rather than state a tier the host's profile refuses.
+/// The residency no longer depends on the engine (vLLM sleeps, SGLang uses its
+/// memory saver), so the engine argument does not decide it; it is kept so
+/// callers name the installation the document is generated for.
 pub fn deployment_document(
     name: &str,
     route: &str,
     source: &ModelSource,
-    engine: Engine,
+    _engine: Engine,
     capacity_bytes: i64,
     request_deadline: &str,
     deep_park: bool,
 ) -> Value {
     let share = |percent: i64| format!("{}B", capacity_bytes / 100 * percent);
     let devices = json!([{"id": "gpu0", "sharing": "shared"}]);
-    // ADR 0012: deep parking is on by default and a host opts out. SGLang parks
-    // by mechanism, and engine configuration resolution derives `memory_saver`
-    // from the declared residency (ADR 0014 §4), so a deep-parking host declares
-    // `deep`. SPEC §6.2: restart_only is a first-class residency, not a failure
-    // mode; an opted-out SGLang host declares it, launches without the memory
+    // ADR 0012: deep parking is on by default and a host opts out, and the
+    // generated residency follows that switch for every engine, so standalone
+    // parks exactly as server mode does. SPEC §6.2: a deep-parking host
+    // declares `deep`; engine configuration resolution then derives vLLM's
+    // sleep mode and SGLang's memory saver from the declared residency (ADR
+    // 0014 §4). A restart_only vLLM deployment would launch without sleep mode
+    // and never park, so idle eviction and switching would stop it cold.
+    // SPEC §6.2: restart_only is a first-class residency, not a failure mode;
+    // an opted-out host declares it, launches without sleep mode or the memory
     // saver, and its park is refused `unchanged`. A `deep` deployment on an
-    // opted-out host would be refused at resolution (T21). vLLM stays
-    // restart_only either way; its sleep-mode launch does not need a tier.
-    let residency = match engine {
-        Engine::Sglang if deep_park => "deep",
-        Engine::Sglang => "restart_only",
-        Engine::Vllm => "restart_only",
-    };
+    // opted-out host would be refused at resolution (T21). ADR 0008: a build
+    // whose probe finds deep parking missing refuses the deep launch
+    // `capability_missing:deep_park`, and the host falls back by opting out
+    // (MLLM_DEEP_PARK=off), which declares restart_only here.
+    let residency = if deep_park { "deep" } else { "restart_only" };
     let allocation = |percent: i64, kv: i64| json!([{"domain": DOMAIN, "bytes": share(percent), "host_kv_bytes": share(kv)}]);
     json!({
         "schema_version": 1,

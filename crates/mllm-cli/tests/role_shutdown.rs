@@ -419,7 +419,9 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
         Engine::Vllm,
         capacity,
         request_deadline,
-        true,
+        // The host runs with MLLM_DEEP_PARK=off (ADR 0012 opt-out), so
+        // its generated deployment is restart_only.
+        false,
     );
     let file = installation.root.path().join("deployment.json");
     std::fs::write(&file, document.to_string()).unwrap();

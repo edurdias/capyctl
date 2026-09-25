@@ -86,7 +86,46 @@ pub fn fake_bindings(
     Arc::new(FakeBindings {
         profile: ProfileBindings::new(log_dir, runtime_dir),
         clock,
+        members: None,
     })
+}
+
+/// As [`fake_bindings`], with every Fake reporting `members` as its launched
+/// group ([`FakeEngine::with_members`]), so the coordinator's park and restore
+/// checks that the recorded processes are the ones alive can pass.
+pub fn fake_bindings_with_members(
+    clock: ServiceClock,
+    log_dir: PathBuf,
+    runtime_dir: PathBuf,
+    members: Vec<mllm_domain::completion::ProcessIdentity>,
+) -> Arc<dyn EngineBindings> {
+    Arc::new(FakeBindings {
+        profile: ProfileBindings::new(log_dir, runtime_dir),
+        clock,
+        members: Some(members),
+    })
+}
+
+/// The recorded identity of the live process `pid` under `role`: this boot's
+/// id and the process's start time, as a launcher records them.
+pub fn live_identity(role: &str, pid: u32) -> mllm_domain::completion::ProcessIdentity {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("the boot id is readable")
+        .trim()
+        .to_owned();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("the process is alive");
+    let close = stat.rfind(')').expect("a stat line names its command");
+    let start_ticks = stat[close + 2..]
+        .split_whitespace()
+        .nth(19)
+        .and_then(|field| field.parse().ok())
+        .expect("the stat line carries a start time");
+    mllm_domain::completion::ProcessIdentity {
+        role: role.to_owned(),
+        pid,
+        boot_id,
+        start_ticks,
+    }
 }
 
 /// Process tools for a builder that starts nothing.
@@ -154,6 +193,7 @@ impl EngineProvider for FakeProvider {
 struct FakeBindings {
     profile: ProfileBindings,
     clock: ServiceClock,
+    members: Option<Vec<mllm_domain::completion::ProcessIdentity>>,
 }
 
 impl EngineBindings for FakeBindings {
@@ -172,11 +212,12 @@ impl EngineBindings for FakeBindings {
         _tools: Arc<dyn OwnedProcessLaunch>,
     ) -> Result<Arc<dyn EngineAdapter>, CoordinatorError> {
         let clock = self.clock.clone();
-        Ok(Arc::new(FakeEngine::with_lifecycle_clock(Arc::new(
-            move || {
-                clock()
-                    .map_err(|_| RuntimeError::Uncertain("service observation clock failed".into()))
-            },
-        ))))
+        let engine = FakeEngine::with_lifecycle_clock(Arc::new(move || {
+            clock().map_err(|_| RuntimeError::Uncertain("service observation clock failed".into()))
+        }));
+        Ok(Arc::new(match &self.members {
+            Some(members) => engine.with_members(members.clone()),
+            None => engine,
+        }))
     }
 }
