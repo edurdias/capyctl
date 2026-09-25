@@ -394,6 +394,8 @@ Resolve model aliases to explicit deployments. A deployment with several instanc
 
 Note (2026-09-24): mllm relays tool calls but does not parse them; the engine does. A deployment serves `tool_choice: auto` (and SGLang any tool call) only when its engine is launched with its tool parser through `engine_config.extra_args` with `accept_extra_args: true` (vLLM `--enable-auto-tool-choice --tool-call-parser <name>`, SGLang `--tool-call-parser <name>`). Without one, the engine rejects the request or answers in plain text, and mllm relays that answer. An engine's complete invalid-request answer (HTTP 400, 413 or 422 with a JSON body) is completion evidence: the client receives the engine's status and message as `engine_rejected` and the request's lease closes. Every other engine error status stays uncertain (owner decision, 2026-09-24).
 
+Note (owner decision 2026-09-25): a request for a deployment an operator stopped (`stop deployment`, or `stop instance` on every instance) is refused at once with HTTP 409 and code `deployment_stopped`; the message says an operator stopped it and names `mllm start deployment <id>`. It is not queued and is not a capacity refusal: `insufficient_resources` remains for admission blocked by capacity. The error body keeps the router's shape.
+
 Eviction is planned per host and per instance: B is served by an existing READY instance when one exists; otherwise the planner releases capacity only on the one host that will run B's instance, preferring instances whose deployment keeps serving elsewhere. Steps 3–5 below apply in full when the victim is its deployment's last READY instance (ADR 0013).
 
 A request for B while A owns the pool follows:

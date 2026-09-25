@@ -449,6 +449,9 @@ fn err(code: &str, message: &str) -> (StatusCode, Json<serde_json::Value>) {
             "unsupported" => StatusCode::NOT_IMPLEMENTED,
             "insufficient_resources" => StatusCode::TOO_MANY_REQUESTS,
             "conflict" => StatusCode::CONFLICT,
+            // SPEC §10 (owner decision 2026-09-25): an operator's stop is not
+            // a capacity refusal; waiting does not help, starting it does.
+            "deployment_stopped" => StatusCode::CONFLICT,
             // Still in progress as far as anyone can tell: not a failure the client
             // should read as "nothing happened".
             "activation_uncertain" => StatusCode::SERVICE_UNAVAILABLE,
@@ -476,6 +479,7 @@ pub(crate) fn map_controller(e: mllm_controller::LifecycleFault) -> (StatusCode,
     match e {
         F::NotFound(d) => err("unknown_model", &format!("deployment {d} vanished")),
         F::Blocked(m) => err("insufficient_resources", &format!("admission blocked: {m}")),
+        F::Stopped(m) => err("deployment_stopped", &m),
         F::Conflict(m) => err("conflict", &m),
         // The activation may still be running. Saying it failed would invite a
         // client to treat the deployment as untouched.

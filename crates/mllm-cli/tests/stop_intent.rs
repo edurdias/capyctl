@@ -57,8 +57,14 @@ async fn an_administrative_stop_survives_the_next_inference_request() {
 
     // `auto_activate` is what an arriving request calls. It must refuse.
     match app.controller.auto_activate(&id).await {
-        Err(mllm_controller::LifecycleFault::Blocked(reason)) => {
-            assert!(reason.contains("explicitly stopped"), "{reason}")
+        // SPEC §10 (owner decision 2026-09-25): the operator's stop, with
+        // how to start it again; not a capacity refusal.
+        Err(mllm_controller::LifecycleFault::Stopped(reason)) => {
+            assert!(reason.contains("stopped by an operator"), "{reason}");
+            assert!(
+                reason.contains(&format!("mllm start deployment {id}")),
+                "{reason}"
+            );
         }
         other => panic!("a request must not undo an operator's stop: {other:?}"),
     }
@@ -96,4 +102,45 @@ async fn an_idle_stop_leaves_the_deployment_on_demand_eligible() {
         .auto_activate(&id)
         .await
         .expect("an evicted deployment is still activatable on demand");
+}
+
+// T10 T18 (SPEC §10, owner decision 2026-09-25): an inference request for a
+// deployment the operator stopped is answered 409 `deployment_stopped`, saying
+// the operator stopped it and how to start it. Before, it was 429
+// `insufficient_resources`, which sent clients after capacity that was never
+// the reason. The error body keeps its shape (`code`, `message`).
+#[tokio::test]
+async fn a_request_for_an_operator_stopped_deployment_is_409_deployment_stopped() {
+    let (_dir, app, id) = ready().await;
+    settle(&app, &id, LifecycleAction::Stop, LifecycleState::Stopped).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app.router();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let chat = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {}", app.api_key()))
+        .json(&serde_json::json!({"model": "intent-m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), 409);
+    let body: serde_json::Value = chat.json().await.unwrap();
+    assert_eq!(body["code"], "deployment_stopped", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("stopped by an operator"), "{message}");
+    assert!(
+        message.contains(&format!("mllm start deployment {id}")),
+        "{message}"
+    );
+    assert_eq!(
+        app.store
+            .get_deployment(&id)
+            .unwrap()
+            .unwrap()
+            .observed_state,
+        LifecycleState::Stopped,
+        "the request did not undo the operator's stop"
+    );
+    server.abort();
 }

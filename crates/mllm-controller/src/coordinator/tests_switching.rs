@@ -772,7 +772,7 @@ async fn a_request_for_an_operator_stopped_deployment_evicts_nothing() {
         .unwrap()
         .unwrap_err();
     assert!(
-        matches!(refused, LifecycleFault::Blocked(ref m) if m.contains("explicitly stopped")),
+        matches!(refused, LifecycleFault::Stopped(ref m) if m.contains("stopped by an operator")),
         "{refused:?}"
     );
     assert_eq!(lab.state(&lab.a.deployment_id), "ready");

@@ -2562,12 +2562,13 @@ mod native {
                 LifecycleError::IdempotencyConflict
             ))
         ));
-        // SPEC §6.3: the next inference request does not undo it.
+        // SPEC §6.3: the next inference request does not undo it; it is told
+        // an operator stopped the deployment (owner decision 2026-09-25).
         use crate::port::LifecyclePort;
         let port = crate::coordinator_port::CoordinatorLifecycle::new(w.commands());
         assert!(matches!(
             port.auto_activate(&id).await,
-            Err(crate::fault::LifecycleFault::Blocked(_))
+            Err(crate::fault::LifecycleFault::Stopped(_))
         ));
         // The operator path the CLI reaches reads the same answer.
         let handle = port

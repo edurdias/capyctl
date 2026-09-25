@@ -17,7 +17,7 @@ use mllm_adapters::traits::WorkObservation;
 use mllm_domain::LifecycleState;
 use mllm_store::deployments::{DeploymentRow, OperationRow};
 
-use crate::operations::{Controller, OperationHandle};
+use crate::operations::{Controller, ControllerError, OperationHandle};
 use mllm_domain::LifecycleAction;
 
 /// Where a deployment's running engine can be reached, and as what.
@@ -347,7 +347,14 @@ impl LifecyclePort for Controller {
     async fn auto_activate(&self, deployment: &str) -> Result<OperationHandle, LifecycleFault> {
         Controller::auto_activate(self, deployment)
             .await
-            .map_err(Into::into)
+            .map_err(|error| match error {
+                // SPEC §6.3: a suspended deployment is the operator's stop,
+                // not a failed activation.
+                ControllerError::OperationFailed { ref code, .. } if code == "suspended" => {
+                    crate::fault::operator_stopped(deployment, false)
+                }
+                other => other.into(),
+            })
     }
     async fn request_transition(
         &self,

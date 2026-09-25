@@ -1074,3 +1074,43 @@ async fn a_panicking_activation_answers_its_waiters_and_frees_its_slot() {
     .expect("a fresh wake runs");
     assert_eq!(again, Ok(7));
 }
+
+// T10 T18 (SPEC §10, owner decision 2026-09-25): a request for a deployment
+// an operator stopped is 409 `deployment_stopped`, naming the deployment and
+// how to start it, never 429 `insufficient_resources`.
+#[tokio::test]
+async fn a_request_for_an_operator_stopped_deployment_is_deployment_stopped() {
+    let (router, _s, controller, _f, _deps) = app().await;
+    let id = deploy_ready(&router, &controller, "stopped-chat-m").await;
+    let op = controller
+        .request_transition(&id, mllm_domain::LifecycleAction::Stop)
+        .await
+        .unwrap();
+    controller.wait_terminal(&op).await.unwrap();
+    let res = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("Authorization", "Bearer test-key")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"model": "stopped-chat-m", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 409);
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["code"], "deployment_stopped", "{v}");
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("stopped by an operator"), "{message}");
+    assert!(
+        message.contains(&format!("mllm start deployment {id}")),
+        "{message}"
+    );
+}

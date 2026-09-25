@@ -32,6 +32,12 @@ pub enum LifecycleFault {
     #[error("blocked: {0}")]
     Blocked(String),
 
+    /// SPEC §6.3: an operator stopped the deployment (or every instance of it),
+    /// and inference must not undo that. Not a capacity refusal: nothing is
+    /// queued and waiting does not help; the operator starts it again.
+    #[error("stopped: {0}")]
+    Stopped(String),
+
     /// A revision, generation or idempotency precondition did not hold. The caller
     /// is acting on a view of the world that has moved.
     #[error("conflict: {0}")]
@@ -53,6 +59,22 @@ pub enum LifecycleFault {
     /// nothing about the request was decided.
     #[error("authority unavailable: {0}")]
     Unavailable(String),
+}
+
+/// SPEC §6.3, §10: what a request for a deployment an operator stopped is
+/// told: that the operator stopped it and how to start it again. `instances`
+/// is true when the operator stopped every instance rather than the
+/// deployment.
+pub fn operator_stopped(deployment: &str, instances: bool) -> LifecycleFault {
+    LifecycleFault::Stopped(if instances {
+        format!(
+            "every instance of deployment {deployment} was stopped by an operator; inference does not start it; start it with `mllm start deployment {deployment}` (or `mllm start instance {deployment}/<index>`)"
+        )
+    } else {
+        format!(
+            "deployment {deployment} was stopped by an operator; inference does not start it; start it with `mllm start deployment {deployment}`"
+        )
+    })
 }
 
 impl From<StoreError> for LifecycleFault {
