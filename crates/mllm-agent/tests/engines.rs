@@ -145,3 +145,137 @@ fn the_version_check_is_bounded_and_must_agree() {
         Err(VersionCheckError::Output)
     ));
 }
+
+fn empty_roots(home: &Path) -> ScanRoots {
+    ScanRoots {
+        path_dirs: vec![],
+        home: Some(home.to_path_buf()),
+        xdg_data: Some(home.join(".local/share")),
+        pipx_home: None,
+        conda_roots: vec![home.join("miniconda3")],
+        opt: None,
+        extra: vec![],
+    }
+}
+
+// T07 T37: every documented location is found, and detection runs nothing.
+#[test]
+fn detection_finds_the_documented_locations_and_runs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let marker = dir.path().join("executed");
+    let run_marker = format!("touch {}; echo 0.29.0", marker.display());
+    let venvs = fake_env(&home.join("venvs/a"), &[("vllm", "0.29.0")]);
+    script(&venvs.join("bin/vllm"), &run_marker);
+    let dot = fake_env(&home.join(".venv"), &[("sglang", "0.5.20")]);
+    script(&dot.join("bin/python3"), &run_marker);
+    let conda = fake_env(&home.join("miniconda3/envs/sg"), &[("sglang", "0.5.21")]);
+    script(&conda.join("bin/python3"), &run_marker);
+    let listed = fake_env(&dir.path().join("elsewhere/env"), &[("vllm", "0.30.0")]);
+    script(&listed.join("bin/vllm"), &run_marker);
+    std::fs::create_dir_all(home.join(".conda")).unwrap();
+    std::fs::write(
+        home.join(".conda/environments.txt"),
+        format!("{}\n", listed.display()),
+    )
+    .unwrap();
+    let uv = fake_env(
+        &home.join(".local/share/uv/tools/vllm"),
+        &[("vllm", "0.29.0")],
+    );
+    script(&uv.join("bin/vllm"), &run_marker);
+    let on_path = fake_env(&dir.path().join("pathenv"), &[("vllm", "0.29.0")]);
+    script(&on_path.join("bin/vllm"), &run_marker);
+    let mut roots = empty_roots(&home);
+    roots.path_dirs = vec![on_path.join("bin"), PathBuf::from("/nonexistent/bin")];
+    let found = detect(&roots, &ScanBounds::default());
+    let envs: std::collections::BTreeSet<_> = found.iter().map(|c| c.env.clone()).collect();
+    for env in [&venvs, &dot, &conda, &listed, &uv, &on_path] {
+        assert!(
+            envs.contains(env),
+            "{} missing from {found:?}",
+            env.display()
+        );
+    }
+    let custom: Vec<_> = found
+        .iter()
+        .filter(|c| c.custom)
+        .map(|c| c.version.clone())
+        .collect();
+    assert!(custom.contains(&"0.5.21".to_string()) && custom.contains(&"0.30.0".to_string()));
+    assert!(!marker.exists(), "detection executed an installation");
+}
+
+// T07 T37 (owner decision 2026-09-25): environments directly in the home
+// directory (the Sparks' `~/mllm-vllm-venv2` layout) are found without
+// `--path`, one level deep and only when they carry `pyvenv.cfg`.
+#[test]
+fn home_level_environments_are_found_without_a_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let venv = fake_env(&home.join("mllm-vllm-venv2"), &[("vllm", "0.29.0")]);
+    script(&venv.join("bin/vllm"), "echo 0.29.0");
+    let bare = fake_env(&home.join("not-a-venv"), &[("sglang", "0.5.20")]);
+    std::fs::remove_file(bare.join("pyvenv.cfg")).unwrap();
+    script(&bare.join("bin/python3"), "echo 0.5.20");
+    let deeper = fake_env(&home.join("projects/env"), &[("vllm", "0.29.0")]);
+    script(&deeper.join("bin/vllm"), "echo 0.29.0");
+    let found = detect(&empty_roots(&home), &ScanBounds::default());
+    let envs: Vec<_> = found.iter().map(|c| c.env.clone()).collect();
+    assert!(envs.contains(&venv), "{found:?}");
+    assert!(found.iter().any(|c| c.env == venv && c.source == "home"));
+    assert!(
+        !envs.contains(&bare),
+        "no pyvenv.cfg: not a home-level venv"
+    );
+    assert!(!envs.contains(&deeper), "one level deep only");
+}
+
+// T37: a symlink that resolves outside the scanned root is not followed.
+#[test]
+fn a_symlink_escaping_its_root_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let outside = fake_env(&dir.path().join("outside/env"), &[("vllm", "0.29.0")]);
+    script(&outside.join("bin/vllm"), "echo 0.29.0");
+    std::fs::create_dir_all(home.join("venvs")).unwrap();
+    std::os::unix::fs::symlink(&outside, home.join("venvs/escape")).unwrap();
+    let inside = fake_env(&home.join("venvs/real"), &[("vllm", "0.29.0")]);
+    script(&inside.join("bin/vllm"), "echo 0.29.0");
+    std::os::unix::fs::symlink(&inside, home.join("venvs/alias")).unwrap();
+    let found = detect(&empty_roots(&home), &ScanBounds::default());
+    assert!(
+        found
+            .iter()
+            .all(|c| !c.env.starts_with(dir.path().join("outside"))),
+        "{found:?}"
+    );
+    assert_eq!(
+        found.iter().filter(|c| c.engine == Engine::Vllm).count(),
+        1,
+        "alias deduplicated: {found:?}"
+    );
+}
+
+// T37: the scan is bounded in environments and depth.
+#[test]
+fn the_scan_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let wide = dir.path().join("wide");
+    for i in 0..40 {
+        let env = fake_env(&wide.join(format!("e{i}")), &[("vllm", "0.29.0")]);
+        script(&env.join("bin/vllm"), "echo 0.29.0");
+    }
+    let deep = fake_env(&dir.path().join("deep/a/b/c/d/env"), &[("vllm", "0.29.0")]);
+    script(&deep.join("bin/vllm"), "echo 0.29.0");
+    let mut roots = empty_roots(&dir.path().join("nohome"));
+    roots.extra = vec![wide.clone(), dir.path().join("deep")];
+    let bounds = ScanBounds {
+        max_envs: 10,
+        max_depth: 3,
+        max_dir_entries: 4096,
+    };
+    let found = detect(&roots, &bounds);
+    assert!(found.len() <= 10, "{}", found.len());
+    assert!(found.iter().all(|c| c.env != deep), "depth bound exceeded");
+}

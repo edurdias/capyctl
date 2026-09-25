@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 
 pub mod detect;
 pub mod resolve;
-// Task 5 fills `detect` with items this re-export will carry.
-#[allow(unused_imports)]
 pub use detect::*;
 pub use resolve::*;
 
