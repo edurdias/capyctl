@@ -9,10 +9,14 @@ use mllm_cli::table::{self, HostNames, View};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
-    let invocation = match grammar::parse_invocation(&args) {
+    let mut invocation = match grammar::parse_invocation(&args) {
         Ok(invocation) => invocation,
         Err(err) => return report_cli_error(&err),
     };
+    // ADR 0018 §2: `--config` is resolved against the working directory once,
+    // here, so every command and role names the same absolute document (and
+    // the engines file beside it) whatever it does later.
+    invocation.config = invocation.config.as_deref().map(mllm_cli::engine::absolute);
     // Owner decision 2026-09-25: `--format json` is machine mode, exactly as
     // `--output json` was (and still is): JSON results and JSON errors.
     let format = match invocation.format.as_deref() {
@@ -86,6 +90,13 @@ fn main() -> ExitCode {
         )) {
             Ok(value) => {
                 emit(&value, view, &Default::default());
+                // ADR 0018 §3: `engine add` with no role running says where
+                // the profile was saved and what to run next.
+                if format == OutputFormat::Text {
+                    if let Some(notice) = value["notice"].as_str() {
+                        eprintln!("{notice}");
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -209,6 +220,12 @@ fn main() -> ExitCode {
                 };
                 emit(&value, view, &names);
                 warn_development_controls(&value, format);
+                // ADR 0014 §7: an asynchronous deploy says what starts it.
+                if format == OutputFormat::Text {
+                    if let Some(notice) = value["notice"].as_str() {
+                        eprintln!("{notice}");
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(err) => {

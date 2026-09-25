@@ -198,10 +198,80 @@ fn a_deployment_that_does_not_resolve_on_the_host_is_refused() {
         "--host",
         host.to_str().unwrap(),
     ]);
+    // ADR 0018 §7: deploy refuses a profile the host does not declare with
+    // `profile_not_published`; validate names the same refusal.
+    assert_eq!(code, 24, "{raw}");
+    assert_eq!(value["code"], "profile_not_published", "{raw}");
+    let message = value["message"].as_str().unwrap();
+    assert!(
+        message.contains("not-on-this-host") && message.contains("mllm engine add"),
+        "{raw}"
+    );
+}
+
+// T03 T16 (ADR 0013 §2; found walking the guides 2026-09-25): a placement
+// selector the host's labels do not satisfy is refused by validate, as deploy
+// refuses it (`selector_mismatch`); it used to be accepted.
+#[test]
+fn a_selector_the_host_labels_do_not_match_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = write(
+        dir.path(),
+        "host.yaml",
+        &host_document(dir.path()).to_string(),
+    );
+    let mut doc = deployment_document();
+    doc["placement"] = json!({"selector": {"accelerator": "h100"}});
+    let deployment = write(dir.path(), "deployment.yaml", &doc.to_string());
+    let (code, value, raw) = validate(&[
+        "--file",
+        deployment.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
     assert_eq!(code, 2, "{raw}");
     assert_eq!(value["code"], "invalid_config", "{raw}");
     assert!(
-        value["message"].as_str().unwrap().contains("deployment"),
+        value["message"].as_str().unwrap().contains("selector"),
+        "{raw}"
+    );
+}
+
+// T03 T07 (ADR 0018 §2): a runtime profile registered with `mllm engine add`
+// lives in the engines.yaml beside the host document, where the host role
+// merges it and deploy finds it published; validate resolves against the same
+// merged document instead of refusing the profile as unknown.
+#[test]
+fn a_profile_registered_beside_the_host_document_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = write(
+        dir.path(),
+        "host.yaml",
+        &host_document(dir.path()).to_string(),
+    );
+    let profile = host_document(dir.path())["runtime_profiles"]["local"].clone();
+    write(
+        dir.path(),
+        "engines.yaml",
+        &json!({"schema_version": 1, "kind": "engines",
+            "runtime_profiles": {"registered": profile}})
+        .to_string(),
+    );
+    let mut doc = deployment_document();
+    doc["runtime_profile"] = json!("registered");
+    let deployment = write(dir.path(), "deployment.yaml", &doc.to_string());
+    let (code, value, raw) = validate(&[
+        "--file",
+        deployment.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["valid"], true, "{raw}");
+    // What only a running server can check is named, not implied.
+    let unchecked = value["requires_server"].to_string();
+    assert!(
+        unchecked.contains("host_unpublished") && unchecked.contains("route_conflict"),
         "{raw}"
     );
 }
@@ -219,6 +289,12 @@ fn a_deployment_without_a_host_is_checked_structurally_only() {
     assert_eq!(code, 0, "{raw}");
     assert_eq!(value["valid"], true, "{raw}");
     assert_eq!(value["resolved_against"], Value::Null, "{raw}");
+    // SPEC §15.3: it says what it did not check, and how to check it.
+    let unchecked = value["requires_server"].to_string();
+    assert!(
+        unchecked.contains("--host") && unchecked.contains("profile_not_published"),
+        "{raw}"
+    );
 
     let mut doc = deployment_document();
     doc["instances"] = json!(0);
