@@ -12,6 +12,9 @@ pub mod doctor;
 // SPEC §3.3 / ADR 0001: the runtime helpers compiled into the one binary.
 pub mod embedded_runtime;
 pub mod enrollment;
+// ADR 0018 §3: the owner-only local control socket for engine add, remove
+// and list.
+pub mod control_socket;
 // SPEC §13.2 (W13): exits of owned engine processes, reported to the controller.
 pub mod exits;
 pub mod identity;
