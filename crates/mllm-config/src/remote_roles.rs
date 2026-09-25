@@ -478,6 +478,13 @@ impl HostConfig {
     /// beside it (`engines.yaml`) merged in. The file itself is never
     /// rewritten; a profile name declared in both is refused.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_engines(path, &crate::registration::engines_beside(path))
+    }
+    /// As [`HostConfig::load`], with the engines file named explicitly: the
+    /// role resolves it by the same rule as `mllm engine` (ADR 0018 §2), which
+    /// for a host started without a named document is
+    /// `<config home>/mllm/engines.yaml`, not the file beside it.
+    pub fn load_with_engines(path: &Path, engines: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             ConfigError::new(
                 ConfigErrorCode::Io,
@@ -486,8 +493,7 @@ impl HostConfig {
             )
         })?;
         let mut document = crate::parse_strict(crate::ConfigKind::Host, &text)?;
-        let engines =
-            crate::registration::EnginesFile::load(&crate::registration::engines_beside(path))?;
+        let engines = crate::registration::EnginesFile::load(engines)?;
         crate::registration::merge_into_host(&mut document, &engines)?;
         Self::parse(&document.to_string())
     }

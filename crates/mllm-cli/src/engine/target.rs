@@ -5,7 +5,7 @@
 //! standalone alike, which is where the role looks too.
 use crate::output::StructuredError;
 use mllm_agent::control_socket::SOCKET_NAME;
-use mllm_config::registration::{config_home, engines_path};
+use mllm_config::registration::{config_home, engines_beside, engines_path};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,29 @@ pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
     }
 }
 
+/// ADR 0018 §2 (controller ruling 2026-09-25): the role document a command
+/// names: `--config`, else `$MLLM_CONFIG`. `mllm engine` and the roles (`start
+/// host`, `join host`, `start standalone`) share this rule, so they agree on
+/// the document and on the engines file beside it.
+pub fn named_role_document(
+    explicit: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| env("MLLM_CONFIG").map(PathBuf::from))
+}
+
+/// ADR 0018 §2: a role's engines file: beside its named document, else
+/// `<config home>/mllm/engines.yaml`; `None` when neither `XDG_CONFIG_HOME`
+/// nor `HOME` is set.
+pub fn role_engines(named: Option<&Path>, env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    match named {
+        Some(document) => Some(engines_beside(document)),
+        None => config_home(env).map(|home| engines_path(None, &home)),
+    }
+}
+
 /// The role document: `--config`; else `$MLLM_CONFIG`; else
 /// `<config home>/mllm/host.yaml` if it exists; else
 /// `<state_dir>/config/standalone.yaml`. Both implicit documents present is
@@ -43,9 +66,7 @@ pub fn resolve_target(
 ) -> Result<Target, StructuredError> {
     let home = config_home(env)
         .ok_or_else(|| invalid("neither XDG_CONFIG_HOME nor HOME is set; pass --config"))?;
-    let named = explicit
-        .map(Path::to_path_buf)
-        .or_else(|| env("MLLM_CONFIG").map(PathBuf::from));
+    let named = named_role_document(explicit, env);
     let chosen = match &named {
         Some(path) => path.clone(),
         None => {

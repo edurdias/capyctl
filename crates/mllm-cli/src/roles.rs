@@ -917,13 +917,9 @@ async fn start_standalone_inner(
     // installations and the profiles registered in engines.yaml (beside
     // `--config`, else `<config home>/mllm/engines.yaml`); a name declared in
     // both is refused `profile_exists`. The standalone document is never written.
-    let engines = match config {
-        Some(document) => Some(mllm_config::registration::engines_beside(document)),
-        None => mllm_config::registration::config_home(&|key| {
-            std::env::var(key).ok().filter(|value| !value.is_empty())
-        })
-        .map(|home| mllm_config::registration::engines_path(None, &home)),
-    };
+    let engines = crate::engine::role_engines(config, &|key| {
+        std::env::var(key).ok().filter(|value| !value.is_empty())
+    });
     let registered = match &engines {
         Some(path) => mllm_config::registration::EnginesFile::load(path)?.profiles,
         None => serde_json::Map::new(),

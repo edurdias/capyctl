@@ -180,6 +180,17 @@ fn read_config(path: &Path) -> Result<String, StructuredError> {
     }
     fs::read_to_string(path).map_err(|_| error("Cannot read role configuration"))
 }
+/// The process environment as the role reads it (an empty value is unset).
+fn role_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+/// ADR 0018 §2: a host's engines file, by the same rule as `mllm engine`:
+/// beside the named document, else `<config home>/mllm/engines.yaml`. With
+/// no config home at all it stays beside the document the host loads.
+fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
+    crate::engine::role_engines(named, &role_env)
+        .unwrap_or_else(|| mllm_config::registration::engines_beside(document))
+}
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
 }
@@ -669,9 +680,14 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
 /// dispatch is suspended before it closes ingress anyway.
 const DRAIN_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
-/// `document` is the host.yaml `config` was loaded from (merged with the
-/// engines.yaml beside it); the control handler re-reads both (ADR 0018 §3).
-async fn serve_host(config: HostConfig, document: PathBuf) -> Result<Value, StructuredError> {
+/// `document` is the host.yaml `config` was loaded from, merged with
+/// `engines` (the role's engines.yaml); the control handler re-reads both
+/// (ADR 0018 §3).
+async fn serve_host(
+    config: HostConfig,
+    document: PathBuf,
+    engines: PathBuf,
+) -> Result<Value, StructuredError> {
     // SPEC §3.3 / ADR 0001: an undeclared runtime_dir is the managed copy of
     // the embedded runtime, refreshed before anything can launch from it.
     if !config.runtime_dir_declared {
@@ -853,6 +869,7 @@ async fn serve_host(config: HostConfig, document: PathBuf) -> Result<Value, Stru
         Ok(server) => {
             let handler = mllm_agent::host_control::HostControl::new(
                 document.clone(),
+                engines.clone(),
                 config.clone(),
                 updates.clone(),
                 journal.clone(),
@@ -992,11 +1009,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 "host"
             };
-            let path = invocation
-                .config
-                .clone()
-                .unwrap_or_else(|| implicit(root, label));
-            if invocation.config.is_none()
+            // ADR 0018 §2 (controller ruling 2026-09-25): a host's document is
+            // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`.
+            let named = if *role == Role::Host {
+                crate::engine::named_role_document(invocation.config.as_deref(), &role_env)
+            } else {
+                invocation.config.clone()
+            };
+            let path = named.clone().unwrap_or_else(|| implicit(root, label));
+            if named.is_none()
                 && fs::symlink_metadata(&path)
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
             {
@@ -1021,30 +1042,32 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 )
                 .await
             } else {
-                // ADR 0018 §2: the host document merged with `engines.yaml`
-                // beside it; the file itself was already read above for the
-                // size and existence checks.
+                // ADR 0018 §2: the host document merged with its `engines.yaml`,
+                // resolved by the same rule as `mllm engine`; the document
+                // itself was already read above for the size and existence
+                // checks.
+                let engines = host_engines(named.as_deref(), &path);
                 serve_host(
-                    HostConfig::load(&path).map_err(|e| {
+                    HostConfig::load_with_engines(&path, &engines).map_err(|e| {
                         error(&format!(
                             "Invalid host configuration: {}: {}",
                             e.path, e.detail
                         ))
                     })?,
                     path.clone(),
+                    engines,
                 )
                 .await
             }
         }
         Command::Join { join_file, recover } => {
-            let path = invocation
-                .config
-                .clone()
-                .unwrap_or_else(|| implicit(root, "host"));
+            let named = crate::engine::named_role_document(invocation.config.as_deref(), &role_env);
+            let path = named.clone().unwrap_or_else(|| implicit(root, "host"));
             // ADR 0018 §2: `read_config` keeps the existing size/existence
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
-            let config = HostConfig::load(&path).map_err(|e| {
+            let engines = host_engines(named.as_deref(), &path);
+            let config = HostConfig::load_with_engines(&path, &engines).map_err(|e| {
                 error(&format!(
                     "Invalid host configuration: {}: {}",
                     e.path, e.detail

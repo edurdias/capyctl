@@ -697,7 +697,13 @@ async fn agent(h: &Harness) -> Agent {
     let journal =
         mllm_agent::journal::HostJournal::open(dir.path(), &h.identity.controller_id(), &h.host)
             .unwrap();
-    let control = HostControl::new(document.clone(), config, updates.clone(), journal.clone());
+    let control = HostControl::new(
+        document.clone(),
+        mllm_config::registration::engines_beside(&document),
+        config,
+        updates.clone(),
+        journal.clone(),
+    );
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     // PendingEnrollment is not Clone: the session owns a copy loaded from
     // the harness's identity directory.
@@ -930,7 +936,13 @@ async fn a_removal_without_a_session_writes_nothing() {
     let config = mllm_config::remote_roles::HostConfig::load(&document).unwrap();
     let set = ProfileSet::new(config.clone(), with_vllm("h"));
     let updates = ProfileUpdates::new(HostProfiles::new(set));
-    let control = HostControl::new(document.clone(), config, updates, journal);
+    let control = HostControl::new(
+        document.clone(),
+        mllm_config::registration::engines_beside(&document),
+        config,
+        updates,
+        journal,
+    );
     let reply = control
         .handle(ControlRequest::Remove {
             profile: "vllm".into(),
@@ -962,7 +974,13 @@ async fn a_peer_without_live_updates_gets_the_restart_fallback() {
     )));
     // Connected to a server whose SessionReady listed no capabilities.
     updates.observe_session(Some(&[]));
-    let control = HostControl::new(document.clone(), config, updates.clone(), journal);
+    let control = HostControl::new(
+        document.clone(),
+        mllm_config::registration::engines_beside(&document),
+        config,
+        updates.clone(),
+        journal,
+    );
     add_vllm_to(&document);
     let reply = control.handle(ControlRequest::Add).await;
     assert_eq!(reply["published"], "restart_required", "{reply}");
@@ -1008,7 +1026,13 @@ async fn an_add_without_a_session_waits_for_the_next_one() {
         config.clone(),
         inventory("h"),
     )));
-    let control = HostControl::new(document.clone(), config, updates.clone(), journal);
+    let control = HostControl::new(
+        document.clone(),
+        mllm_config::registration::engines_beside(&document),
+        config,
+        updates.clone(),
+        journal,
+    );
     add_vllm_to(&document);
     let reply = control.handle(ControlRequest::Add).await;
     assert_eq!(reply["published"], "pending_session", "{reply}");

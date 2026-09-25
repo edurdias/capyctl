@@ -8,8 +8,7 @@ use crate::journal::HostJournal;
 use crate::profiles::ProfileSet;
 use crate::session::{ProfileUpdates, PublishOutcome, RetireOutcome};
 use mllm_config::registration::{
-    engines_beside, lock_engines, only_profiles_differ, removed_profiles, write_engines,
-    EnginesFile,
+    lock_engines, only_profiles_differ, removed_profiles, write_engines, EnginesFile,
 };
 use mllm_config::remote_roles::HostConfig;
 use serde_json::{json, Value};
@@ -24,8 +23,11 @@ pub const PUBLISH_BOUND: Duration = Duration::from_secs(30);
 pub const RETIRE_BOUND: Duration = Duration::from_secs(960);
 
 pub struct HostControl {
-    /// The role's host.yaml; its engines file is `engines_beside(document)`.
+    /// The role's host.yaml.
     document: PathBuf,
+    /// The role's engines.yaml, resolved by the same rule as `mllm engine`
+    /// (ADR 0018 §2).
+    engines: PathBuf,
     /// The document the role started with. Only runtime profiles change live.
     running: HostConfig,
     updates: Arc<ProfileUpdates>,
@@ -48,12 +50,14 @@ fn invalid(error: mllm_config::ConfigError) -> Value {
 impl HostControl {
     pub fn new(
         document: PathBuf,
+        engines: PathBuf,
         running: HostConfig,
         updates: Arc<ProfileUpdates>,
         journal: Arc<HostJournal>,
     ) -> Arc<Self> {
         Arc::new(Self {
             document,
+            engines,
             running,
             updates,
             journal,
@@ -63,7 +67,8 @@ impl HostControl {
 
     /// The document on disk, measured against the accepted set's inventory.
     async fn measured(&self) -> Result<ProfileSet, Value> {
-        let config = HostConfig::load(&self.document).map_err(invalid)?;
+        let config =
+            HostConfig::load_with_engines(&self.document, &self.engines).map_err(invalid)?;
         // ADR 0018 §3: everything outside runtime_profiles needs a restart.
         if !only_profiles_differ(&self.running.document, &config.document) {
             return Err(refused(
@@ -140,9 +145,9 @@ impl HostControl {
     }
 
     fn write_without(&self, profile: &str) -> Result<u64, Value> {
-        let path = engines_beside(&self.document);
-        let lock = lock_engines(&path).map_err(|e| refused("internal", e.detail))?;
-        let mut engines = EnginesFile::load(&path).map_err(invalid)?;
+        let path = &self.engines;
+        let lock = lock_engines(path).map_err(|e| refused("internal", e.detail))?;
+        let mut engines = EnginesFile::load(path).map_err(invalid)?;
         engines.profiles.remove(profile);
         write_engines(&engines, &lock, None).map_err(|e| refused("internal", e.detail))
     }
@@ -158,7 +163,7 @@ impl HostControl {
     async fn remove(&self, profile: &str, drain: bool) -> Value {
         // ADR 0018 §2: only what `engine add` registered is removed here; a
         // profile the operator declared in host.yaml stays theirs to edit.
-        match EnginesFile::load(&engines_beside(&self.document)) {
+        match EnginesFile::load(&self.engines) {
             Ok(engines) if engines.profiles.contains_key(profile) => {}
             Ok(_) if self.declared_by_operator(profile) => {
                 return refused(

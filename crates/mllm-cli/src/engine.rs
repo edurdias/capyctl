@@ -2,7 +2,7 @@
 //! standalone. Detection reads metadata only; an installation runs only
 //! after the operator named or picked it.
 mod target;
-pub use target::{resolve_target, RoleKind, Target};
+pub use target::{named_role_document, resolve_target, role_engines, RoleKind, Target};
 
 use crate::grammar::{Command, DeepParkChoice, DriftChoice};
 use crate::output::StructuredError;
