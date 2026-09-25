@@ -3081,7 +3081,9 @@ fn discrete_host(host: &mut Value) {
     host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
 }
 
-/// A deployment whose every phase is charged to the device domain.
+/// A deployment whose every phase is charged to the device domain, with the
+/// engine's host overhead on the system domain beside it (discrete GPU design §3:
+/// explicit resources on a discrete host name both domains).
 fn device_footprint(deployment: &mut Value) {
     deployment["engine_config"]["memory"]["kv_cache"] = json!("256MiB");
     for (phase, bytes) in [
@@ -3091,8 +3093,8 @@ fn device_footprint(deployment: &mut Value) {
         ("parked", "512MiB"),
         ("wake", "2GiB"),
     ] {
-        deployment["resources"][phase]["allocations"] =
-            json!([{"bytes": bytes, "domain": "gpu0", "host_kv_bytes": "0B"}]);
+        deployment["resources"][phase]["allocations"] = json!([{"bytes": bytes, "domain": "gpu0", "host_kv_bytes": "0B"},
+                   {"bytes": "1GiB", "domain": "system", "host_kv_bytes": "0B"}]);
     }
 }
 

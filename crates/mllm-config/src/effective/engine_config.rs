@@ -23,6 +23,17 @@ pub const SGLANG_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 /// whole request, when smaller) while parked.
 pub const PARKED_RESIDUAL_PLACEHOLDER_BYTES: i64 = 2 << 30;
 
+/// Discrete GPU design §3 (ADR 0019): the host RAM an engine process holds outside
+/// the GPU (interpreter, CUDA runtime, tokenizer, pinned staging buffers), charged
+/// on the system domain of a discrete host. A placeholder until a first run
+/// measures the process RSS.
+pub const ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES: i64 = 4 << 30;
+
+/// Discrete GPU design §3: what a parked engine still holds on a discrete GPU
+/// (CUDA context, NCCL and allocator buffers). A placeholder until measured;
+/// `PARKED_RESIDUAL_PLACEHOLDER_BYTES` stays for unified hosts.
+pub const PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES: i64 = 1 << 30;
+
 /// Owner decision 2026-09-23 (startup memory budget): until a deployment
 /// declares `memory.startup` or a first run on a host measures the peak, the
 /// startup reservation is `max(request, weights × STARTUP_WEIGHTS_FACTOR +
@@ -329,13 +340,17 @@ pub fn resolve_startup(
 /// cold is the startup peak (never below the request);
 /// parked is the residual floor placeholder for a parking deployment and zero
 /// for one that restarts. Derivation needs one memory domain for the selected
-/// devices; anything else declares `resources:` explicitly.
+/// devices; anything else declares `resources:` explicitly. On a discrete host
+/// (the selected device's domain is a `device` domain) every phase charges the
+/// device domain and the system domain (discrete GPU design §3).
 pub(super) fn derive_resources(
     request: i64,
     startup: Option<i64>,
     residency: Residency,
     devices: &[DeviceClaim],
     host: &HostPolicy,
+    weights_bytes: Option<i64>,
+    engine: Engine,
 ) -> Result<RecipeFootprints, ConfigError> {
     let mut domains = BTreeSet::new();
     for claim in devices {
@@ -359,6 +374,21 @@ pub(super) fn derive_resources(
                 "the selected devices span several memory domains; declare resources explicitly",
             )),
         };
+    // Owner decision 2026-09-23: admission reserves the startup peak from arm
+    // until Ready (the cold phase, ADR 0007); Ready drops to the request.
+    let cold = startup.map_or(request, |peak| peak.max(request));
+    if host.domains.get(&domain).map(|d| d.memory) == Some(DomainMemory::Device) {
+        return derive_discrete(DiscreteInputs {
+            request,
+            cold,
+            residency,
+            devices,
+            host,
+            device_domain: domain,
+            weights_bytes,
+            engine,
+        });
+    }
     let active = |bytes: i64| PhaseFootprint {
         allocations: vec![Allocation {
             domain: domain.clone(),
@@ -372,9 +402,6 @@ pub(super) fn derive_resources(
     } else {
         0
     };
-    // Owner decision 2026-09-23: admission reserves the startup peak from arm
-    // until Ready (the cold phase, ADR 0007); Ready drops to the request.
-    let cold = startup.map_or(request, |peak| peak.max(request));
     Ok(RecipeFootprints {
         cold: active(cold),
         ready: active(request),
@@ -388,6 +415,101 @@ pub(super) fn derive_resources(
             devices: Vec::new(),
         },
         wake: active(request),
+    })
+}
+
+struct DiscreteInputs<'a> {
+    request: i64,
+    cold: i64,
+    residency: Residency,
+    devices: &'a [DeviceClaim],
+    host: &'a HostPolicy,
+    device_domain: String,
+    weights_bytes: Option<i64>,
+    engine: Engine,
+}
+
+/// Discrete GPU design §3 (ADR 0019): VRAM in the device domain, the engine's host
+/// overhead (and the `host_backed` weights copy) in host RAM, the one `distinct`
+/// system domain. Every phase carries both allocations, `[device, system]`.
+fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, ConfigError> {
+    let DiscreteInputs {
+        request,
+        cold,
+        residency,
+        devices,
+        host,
+        device_domain,
+        weights_bytes,
+        engine,
+    } = inputs;
+    let systems: Vec<&String> = host
+        .domains
+        .iter()
+        .filter(|(_, d)| d.memory == DomainMemory::Distinct)
+        .map(|(name, _)| name)
+        .collect();
+    let [system] = systems.as_slice() else {
+        return Err(invalid(
+            "resource_policy.domains",
+            "missing_system_allocation: a discrete host declares one distinct system domain",
+        ));
+    };
+    // Discrete GPU design §3: the host_backed copy is the checkpoint's weight
+    // bytes. Unknown weights leave nothing to charge, and an uncharged copy is an
+    // overcommit of host RAM, so the tier is refused rather than guessed.
+    let copy = match residency {
+        Residency::HostBacked => weights_bytes.ok_or_else(|| {
+            invalid(
+                "residency",
+                "host_backed_unavailable: the checkpoint's weight size is unknown, so the \
+                 host RAM copy cannot be charged; use deep or restart_only",
+            )
+        })?,
+        _ => 0,
+    };
+    // SGLang's --enable-weights-cpu-backup holds the copy for the engine's life;
+    // vLLM level 1 allocates it only while asleep (discrete GPU design §3).
+    let always = if engine == Engine::Sglang { copy } else { 0 };
+    let overhead = ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
+    let two = |device: i64, system_bytes: i64, devices: Vec<DeviceClaim>| PhaseFootprint {
+        allocations: vec![
+            Allocation {
+                domain: device_domain.clone(),
+                bytes: device,
+                host_kv_bytes: 0,
+            },
+            Allocation {
+                domain: (*system).clone(),
+                bytes: system_bytes,
+                host_kv_bytes: 0,
+            },
+        ],
+        devices,
+    };
+    let add = |a: i64, b: i64| {
+        a.checked_add(b)
+            .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
+    };
+    let steady = add(overhead, always)?;
+    let with_copy = add(overhead, copy)?;
+    let residue = PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES.min(request);
+    // The parked phase is what admission counts against each domain's
+    // parked_limit, so the copy is charged there as parked residue. Parking and
+    // wake are the transitions into and out of it: the copy exists while the
+    // weights move, so both carry it too (a transition is never below the
+    // phases it joins, `mllm_domain::resources::validate_recipe`).
+    let parked = match residency {
+        Residency::RestartOnly => two(0, 0, Vec::new()),
+        Residency::Deep => two(residue, overhead, Vec::new()),
+        Residency::HostBacked => two(residue, with_copy, Vec::new()),
+    };
+    Ok(RecipeFootprints {
+        cold: two(cold, steady, devices.to_vec()),
+        ready: two(request, steady, devices.to_vec()),
+        parking: two(request, with_copy, devices.to_vec()),
+        parked,
+        wake: two(request, with_copy, devices.to_vec()),
     })
 }
 

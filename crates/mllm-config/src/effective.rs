@@ -11,8 +11,9 @@ mod timeouts;
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
 pub use engine_config::{
     default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
-    MemoryInputs, ResolvedMemory, PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES,
-    STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
+    MemoryInputs, ResolvedMemory, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES,
+    PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES, PARKED_RESIDUAL_PLACEHOLDER_BYTES,
+    SGLANG_OVERHEAD_MARGIN_BYTES, STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
 };
 pub use legacy::{
     is_legacy_effective, legacy_engine_config, legacy_retained_deployment,
@@ -893,7 +894,11 @@ pub fn resolve_effective_with_checkpoint(
     let model = core::normalize_model(d.model, Some(&host.model_store))?;
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
+    core::check_single_device(&d.devices, &host)?;
     let declared_resources = d.resources.map(raw_recipe).transpose()?;
+    if let Some(resources) = &declared_resources {
+        core::check_system_allocation(resources, &host)?;
+    }
     let declared_ready_total = declared_resources.as_ref().map(|resources| {
         resources
             .ready
@@ -922,6 +927,8 @@ pub fn resolve_effective_with_checkpoint(
                 d.residency,
                 &d.devices,
                 &host,
+                facts.weights_bytes,
+                profile.engine,
             )?;
             let provenance = match &mut engine_config {
                 LaunchSettings::Vllm(settings) => &mut settings.provenance,

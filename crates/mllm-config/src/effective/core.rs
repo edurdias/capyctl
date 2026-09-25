@@ -419,6 +419,118 @@ fn check_domain_shape(
     Ok(())
 }
 
+/// Discrete GPU design §7: one GPU per model in 0.1.0. On a host with a device
+/// domain, a deployment claiming more than one device is refused before any
+/// phase is resolved. Tensor parallelism has no deployment field to ask for it:
+/// `--tensor-parallel-size` is a reserved engine argument (`engine_policy`), so a
+/// multi-rank launch cannot be declared at all.
+pub(super) fn check_single_device(
+    devices: &[DeviceClaim],
+    host: &HostPolicy,
+) -> Result<(), ConfigError> {
+    let discrete = host
+        .domains
+        .values()
+        .any(|d| d.memory == DomainMemory::Device);
+    if discrete && devices.len() > 1 {
+        return Err(invalid(
+            "devices",
+            "multi_gpu_unsupported: one GPU per model in 0.1.0; tensor-parallel and \
+             multi-device models are planned after 0.1.0",
+        ));
+    }
+    Ok(())
+}
+
+/// Discrete GPU design §3, SPEC §16 (omission is not unlimited): explicit
+/// resources on a discrete host name the system domain wherever they charge a
+/// device domain. A phase that charges a device domain but no `distinct` system
+/// domain would leave the engine's host RAM unaccounted, so it is refused.
+pub(super) fn check_system_allocation(
+    resources: &RecipeFootprints,
+    host: &HostPolicy,
+) -> Result<(), ConfigError> {
+    let memory = |name: &str| host.domains.get(name).map(|d| d.memory);
+    for (name, phase) in [
+        ("cold", &resources.cold),
+        ("ready", &resources.ready),
+        ("parking", &resources.parking),
+        ("parked", &resources.parked),
+        ("wake", &resources.wake),
+    ] {
+        let charges_device = phase
+            .allocations
+            .iter()
+            .any(|a| a.bytes > 0 && memory(&a.domain) == Some(DomainMemory::Device));
+        let names_system = phase
+            .allocations
+            .iter()
+            .any(|a| memory(&a.domain) == Some(DomainMemory::Distinct));
+        if charges_device && !names_system {
+            return Err(invalid(
+                format!("resources.{name}.allocations"),
+                "missing_system_allocation: a phase that charges a device domain also \
+                 names the host's system domain",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Discrete GPU design §3 and §5: the host-RAM tier on a discrete host is allowed
+/// only when the system domain has room for the weights copy. The parked phase
+/// carries the copy on the system domain; if that allocation alone exceeds the
+/// system domain's `parked_limit` or `managed_limit`, no park could ever be
+/// admitted, and every release would silently become a stop. On a unified domain
+/// the tier is refused outright (ADR 0010 decision 5, checked above), and on a
+/// host without a device domain the rule is unchanged.
+fn check_host_backed_room(d: &NormalizedRecipe, host: &HostPolicy) -> Result<(), ConfigError> {
+    if d.residency != Residency::HostBacked {
+        return Ok(());
+    }
+    let parked = &d.resources.parked.allocations;
+    let on_device = parked.iter().any(|a| {
+        host.domains
+            .get(&a.domain)
+            .is_some_and(|p| p.memory == DomainMemory::Device)
+    });
+    if !on_device {
+        return Ok(());
+    }
+    let mut system_charged = false;
+    for a in parked {
+        let Some(policy) = host.domains.get(&a.domain) else {
+            continue;
+        };
+        if policy.memory != DomainMemory::Distinct {
+            continue;
+        }
+        system_charged |= a.bytes > 0;
+        let limit = policy
+            .parked_limit
+            .map_or(policy.managed_limit, |p| p.min(policy.managed_limit));
+        if a.bytes > limit {
+            return Err(invalid(
+                "residency",
+                format!(
+                    "host_backed_unavailable: the parked weights copy needs {} bytes on \
+                     system domain '{}', which holds at most {limit} parked bytes; use deep \
+                     or restart_only",
+                    a.bytes, a.domain
+                ),
+            ));
+        }
+    }
+    if !system_charged {
+        return Err(invalid(
+            "residency",
+            "host_backed_unavailable: the parked phase charges no weights copy on the \
+             system domain",
+        ));
+    }
+    Ok(())
+}
+
 fn domain_phase(
     public: &PhaseFootprint,
     expected: domain::ResourcePhase,
@@ -485,7 +597,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
                 return Err(invalid(
                     "residency",
                     format!(
-                        "host_backed retains weights in host memory, but domain \
+                        "host_backed_unavailable: host_backed retains weights in host memory, but domain \
                          '{}' declares device and host memory as one pool, so it \
                          would free nothing; use deep or restart_only",
                         a.domain
@@ -494,6 +606,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
             }
         }
     }
+    check_host_backed_room(d, host)?;
     if d.request_deadline_ms > host.queue.request_deadline_ms {
         return Err(invalid(
             "request_deadline",
