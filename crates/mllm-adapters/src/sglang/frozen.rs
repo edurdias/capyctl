@@ -19,7 +19,7 @@ pub fn frozen_from_effective(
     admin_ref: String,
 ) -> Result<NativeLaunch, RuntimeError> {
     let profile = &effective.profile;
-    let settings: &SglangLaunchSettings = match (&profile.engine, &effective.engine_config) {
+    let declared: &SglangLaunchSettings = match (&profile.engine, &effective.engine_config) {
         (Engine::Sglang, LaunchSettings::Sglang(settings)) => settings,
         _ => {
             return Err(RuntimeError::Uncertain(
@@ -27,6 +27,13 @@ pub fn frozen_from_effective(
             ));
         }
     };
+    // ADR 0014 §5 (owner decision 2026-09-25): an undeclared context is fitted
+    // to the KV cache grant from the checkpoint's configuration, read here
+    // where the checkpoint is, and rendered as `--context-length`. The digest
+    // below covers the value the entry is given.
+    let mut settings = declared.clone();
+    settings.common.context_length = mllm_config::context_fit::fit_for_effective(effective).tokens;
+    let settings = &settings;
     // SPEC §3: the launch carries exactly one reviewed logical placement. The
     // native startup still resolves and corroborates it independently.
     let [device] = effective.selected_devices.as_slice() else {

@@ -1,6 +1,8 @@
 //! `mllm-config`: strict YAML config loading, schema validation, and
 //! normalized JSON view production.
 
+// ADR 0014 §5 (owner decision 2026-09-25): context fitted to the KV grant.
+pub mod context_fit;
 pub mod defaults;
 pub mod effective;
 pub mod engine_policy;

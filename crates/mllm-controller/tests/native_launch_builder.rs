@@ -80,9 +80,15 @@ fn builder_produces_expected_metadata_for_the_golden_sglang_config() {
     use mllm_adapters::sglang::pinned::NATIVE_SGLANG_CONTRACT;
     let fixture = accepted_work(SGLANG_GOLDEN, |_, _| {});
     let work = &fixture.work;
-    let LaunchSettings::Sglang(settings) = &work.effective().engine_config else {
+    let LaunchSettings::Sglang(declared) = &work.effective().engine_config else {
         panic!("golden fixture must carry SGLang launch settings");
     };
+    // ADR 0014 §5 (owner decision 2026-09-25): the golden deployment declares
+    // no context and its checkpoint has no config.json here, so the launch
+    // carries the fallback context; the digest covers what the entry gets.
+    let mut fitted = declared.clone();
+    fitted.common.context_length = Some(mllm_config::context_fit::FALLBACK_CONTEXT);
+    let settings = &fitted;
     let expected_digest = hex::encode(Sha256::digest(serde_json::to_vec(settings).unwrap()));
     let launch = frozen_from_work(
         work,

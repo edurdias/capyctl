@@ -66,13 +66,43 @@ pub const ENGINE_PORTS_ENV: &str = "MLLM_STANDALONE_ENGINE_PORTS";
 /// SPEC §16.5 default engine port range.
 const DEFAULT_ENGINE_PORTS: (u16, u16) = (8100, 8199);
 
+/// SPEC §8.2 / T21 (owner decision 2026-09-25): the standalone rendezvous
+/// root under the state directory, the same name a host uses.
+const RENDEZVOUS_DIR: &str = "rendezvous";
+
+/// SPEC §8.2 / T21 (owner decision 2026-09-25): create the private rendezvous
+/// root (0700, this user) or refuse one that is not, as a host does; no
+/// permissions are changed. Then remove every directory in it that belongs to
+/// no launch the store still retains: a stopped launch's directory whose
+/// removal a crash interrupted, or one a previous run never recorded.
+fn prepare_rendezvous_root(
+    state_dir: &Path,
+    retained: &std::collections::BTreeSet<String>,
+) -> Result<PathBuf, StartError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let root = state_dir.join(RENDEZVOUS_DIR);
+    match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let private = std::fs::symlink_metadata(&root).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o7777 == 0o700
+    });
+    if !private {
+        return Err(StartError::Setting(format!(
+            "the rendezvous directory `{RENDEZVOUS_DIR}` in the state directory must be a \
+             directory owned by this user with mode 0700; no permissions were changed"
+        )));
+    }
+    mllm_agent::rendezvous::RendezvousRoot::new(root.clone()).sweep(retained);
+    Ok(root)
+}
+
 /// A conservative KV grant for a unified-memory host: the ledger's deployment
 /// budget bounds the engine's pool, and a smaller grant keeps two engines from
 /// overcommitting the domain during a stop-start overlap.
 const DEFAULT_KV_CACHE: &str = "16GiB";
-/// vLLM's startup check requires the model's context to fit the KV pool, and a
-/// modern checkpoint's default context would demand far more than the grant.
-const DEFAULT_ENGINE_ARGS: &str = "--max-model-len 4096";
 /// How long `<engine> --version` is given before the probe is a refusal. A version
 /// print that takes longer than this is not a healthy installation.
 const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -494,9 +524,12 @@ impl EnvEngineProvider {
         // ADR 0014 §1: the installation keeps host-fixed arguments only; engine
         // tuning belongs to the deployment. SGLang's protected entry takes no
         // argument vector (`engine_policy.rs` refuses any on that family).
+        // ADR 0014 §5 (owner decision 2026-09-25): no `--max-model-len`
+        // default; an undeclared context is fitted to the KV grant at launch.
+        // An explicit `MLLM_ENGINE_ARGS` is kept as the host's fixed args.
         let args = match engine {
             Engine::Vllm => env_value(ENGINE_ARGS)
-                .unwrap_or_else(|| DEFAULT_ENGINE_ARGS.to_string())
+                .unwrap_or_default()
                 .split(' ')
                 .filter(|argument| !argument.is_empty())
                 .map(str::to_owned)
@@ -608,8 +641,12 @@ impl EngineProvider for EnvEngineProvider {
         // ADR 0014 §7, Q9: the checkpoint stat cache is private host state,
         // kept beside the logs in the standalone state directory.
         let cache = log_dir.with_file_name("checkpoints");
-        let bindings =
-            ProfileBindings::new(log_dir.clone(), runtime_dir).with_checkpoint_cache(cache);
+        // SPEC §8.2 / T21 (owner decision 2026-09-25): SGLang launches keep
+        // their file rendezvous in the private root the role created at start
+        // (`<state>/rendezvous`, as on a host), never the entry's /tmp fallback.
+        let bindings = ProfileBindings::new(log_dir.clone(), runtime_dir)
+            .with_checkpoint_cache(cache)
+            .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR));
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
         // observation in a private directory beside the logs. One that cannot
         // be made private leaves the source unset, and Park is refused.
@@ -988,6 +1025,17 @@ async fn start_standalone_inner(
     let owner = Arc::new(std::sync::Mutex::new(
         OwnedCoordinatorState::open_with_secrets(&state_dir.join("server"), secrets)?,
     ));
+    // SPEC §8.2 / T21 (owner decision 2026-09-25): the private rendezvous root,
+    // swept of directories no retained launch owns before any launch runs.
+    {
+        let retained = owner
+            .lock()
+            .map_err(|_| StartError::Deploy("ownership mutex poisoned".into()))?
+            .store()
+            .retained_incarnations()
+            .map_err(|error| StartError::Deploy(format!("retained launches: {error}")))?;
+        prepare_rendezvous_root(state_dir, &retained)?;
+    }
     let options = CoordinatorOptions {
         // Spec §4: a cold start reads weights off disk, which this project measured
         // taking a minute on a small model; the protocol bound would give up on a
