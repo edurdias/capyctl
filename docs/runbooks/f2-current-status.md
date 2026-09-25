@@ -4,6 +4,42 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## A revoked host exits instead of retrying — 2026-09-24 (branch `fix/revoked-host-exit`)
+
+Owner decision 2026-09-24, fixing the rc.3 observation that a revoked host agent
+kept retrying its session a few times a minute. The controller now answers a revoked
+certificate's session, and closes its live session, with a typed refusal
+(`PermissionDenied`, exactly `host_certificate_revoked`), but only when the
+certificate presented over mutual TLS is one it revoked (store
+`certificate_revoked`, by fingerprint or with its host); every other failure stays the
+generic refusal. The agent acts on that exact answer alone: `run_session*` return
+`HostRevoked`, and `mllm start host` logs one line (`error [host_revoked]: ...`
+naming `mllm invite host <id> --recover --output FILE` and
+`mllm join host --join-file FILE --recover`) and exits with the new code 14
+(`ExitCode::HOST_REVOKED`). Nothing is stopped or signalled, so engines stay for
+`join --recover` to re-prove (ADR 0016, amended in Consequences). An unreachable or
+restarting server, a version refusal, a generic or look-alike refusal, and an
+impostor endpoint (certificate not from the pinned CA) keep the existing backoff.
+Both host units add 14 to `RestartPreventExitStatus`; `scripts/verify-packaging.sh`
+now checks 2, 3, 5 on every unit and 14 on the host units. The standalone role has no
+enrolled host to revoke, so its units are unchanged. Exit codes are documented in
+`docs/operations/install.md` ("Exit codes the units do not restart").
+
+Tests (T05, T06): store `certificate_revoked_names_only_revoked_certificates`; agent
+`only_the_exact_revocation_refusal_stops_reconnecting`; mTLS integration
+`revocation_closes_the_session_and_refuses_reconnect_and_commands` (the agent now
+returns `HostRevoked`), `only_the_controllers_exact_revocation_answer_stops_the_agent`,
+`an_impostors_revocation_answer_never_reaches_the_agent`; CLI
+`a_revoked_host_exits_with_its_own_code_and_the_recovery_commands`. With the old retry
+behaviour restored, three of the integration tests fail. Local only: core 1007 passed;
+workspace all-targets 1772 passed, 1 ignored (`--test-threads=4`; at the default
+thread count four load-sensitive tests in unchanged code, `mllm-launchers` process
+visibility and `native_vllm` readiness, failed once and pass on rerun); Clippy clean
+with warnings denied; `scripts/verify-packaging.sh` passed (shellcheck not installed,
+skipped); `scripts/test-install.sh` passed. CPU and mTLS tests are not qualification:
+not live-proven. Pending: a live revoke on a Spark under the packaged unit (exit 14,
+unit not restarted, engines alive), then `join --recover` re-proving them.
+
 ## Version skew policy and capability gating — 2026-09-24 (branch `feat/version-skew`)
 
 Owner decision 2026-09-24: a SemVer skew policy between server and hosts (ADR 0017,

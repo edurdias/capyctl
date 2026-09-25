@@ -253,6 +253,21 @@ impl Store {
         }
         read_certificate(&self.conn, fingerprint, now)
     }
+    /// SPEC §4.1, ADR 0016: whether the certificate with `fingerprint` was
+    /// revoked, by its own fingerprint or with its host. Only a certificate
+    /// this controller issued can be revoked; an unknown fingerprint is not.
+    pub fn certificate_revoked(&self, fingerprint: &str) -> Result<bool, StoreError> {
+        if !digest(fingerprint) {
+            return Err(StoreError::Conflict);
+        }
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revoked_host_certificates WHERE fingerprint=?1)
+                 OR EXISTS(SELECT 1 FROM host_certificates c JOIN enrolled_hosts h ON h.host_id=c.host_id
+                           WHERE c.fingerprint=?1 AND h.revoked=1)",
+            [fingerprint],
+            |r| r.get(0),
+        )?)
+    }
     pub fn renew_host_certificate<F>(
         &self,
         fingerprint: &str,

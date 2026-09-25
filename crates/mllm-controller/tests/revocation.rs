@@ -113,7 +113,7 @@ struct Harness {
     fresh: Arc<AtomicUsize>,
     identity: Arc<PendingEnrollment>,
     stop: tokio::sync::watch::Sender<bool>,
-    agent: tokio::task::JoinHandle<Result<(), mllm_agent::session::SessionError>>,
+    agent: tokio::task::JoinHandle<Result<(), mllm_agent::session::HostRevoked>>,
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     address: String,
     _dirs: Vec<tempfile::TempDir>,
@@ -325,7 +325,7 @@ async fn stale_generation_replay_is_refused_end_to_end() {
 // repeated revocation (by id) is an idempotent no-op.
 #[tokio::test]
 async fn revocation_closes_the_session_and_refuses_reconnect_and_commands() {
-    let h = Harness::start().await;
+    let mut h = Harness::start().await;
     let before = h.inspect("inspect-before", 1, Duration::from_secs(10));
     let result = tokio::time::timeout(Duration::from_secs(12), h.sessions.execute(before))
         .await
@@ -354,13 +354,23 @@ async fn revocation_closes_the_session_and_refuses_reconnect_and_commands() {
         .expect("the refused command's observation ends by its deadline");
     assert!(outcome.is_err());
 
-    // The agent keeps retrying with its old certificate; every attempt is
-    // refused, so the host never comes back online.
-    for _ in 0..30 {
-        assert!(!h.online(), "a revoked host reconnected");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    // An explicit fresh connection with the old identity is refused too.
+    // SPEC §4.1, ADR 0016 (owner decision 2026-09-24): the controller told
+    // the agent its certificate is revoked, so the agent stops reconnecting
+    // and returns `HostRevoked` instead of retrying forever. It never came
+    // back online meanwhile.
+    assert!(!h.online(), "a revoked host reconnected");
+    let agent = std::mem::replace(&mut h.agent, tokio::spawn(async { Ok(()) }));
+    let ended = tokio::time::timeout(Duration::from_secs(10), agent)
+        .await
+        .expect("a revoked agent stops reconnecting")
+        .unwrap();
+    assert!(
+        matches!(ended, Err(mllm_agent::session::HostRevoked)),
+        "{ended:?}"
+    );
+    assert!(!h.online(), "a revoked host reconnected");
+    // An explicit fresh connection with the old identity is refused with the
+    // typed revocation answer, which is what the agent acted on.
     let channel = h.identity.control_endpoint(now()).unwrap().connect().await.unwrap();
     let (send, recv) = tokio::sync::mpsc::channel(16);
     send.send(pb::AgentToServer {
@@ -372,10 +382,11 @@ async fn revocation_closes_the_session_and_refuses_reconnect_and_commands() {
     })
     .await
     .unwrap();
-    assert!(AgentControlClient::new(channel)
+    let refusal = AgentControlClient::new(channel)
         .session(ReceiverStream::new(recv))
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(mllm_protocol::is_host_revoked_refusal(&refusal), "{refusal:?}");
     assert_eq!(h.fresh.load(Ordering::SeqCst), 1, "a revoked host executed a command");
     assert_eq!(h.journaled(), vec!["inspect-before".to_owned()]);
 
@@ -458,10 +469,11 @@ async fn a_revoked_host_recovers_its_same_identity_and_the_old_certificate_stays
     let host = h.host.clone();
     let sessions = h.sessions.clone();
     eventually(|| !sessions.inspect(&host).is_some_and(|s| s.online)).await;
-    // The operator stops the revoked host role before re-enrolling it.
-    h.stop.send(true).unwrap();
+    // The revoked host role stops by itself (ADR 0016, owner decision
+    // 2026-09-24); its journal and identity directory stay for recovery.
     let agent = std::mem::replace(&mut h.agent, tokio::spawn(async { Ok(()) }));
-    let _ = tokio::time::timeout(Duration::from_secs(15), agent).await;
+    let ended = tokio::time::timeout(Duration::from_secs(15), agent).await.unwrap().unwrap();
+    assert!(matches!(ended, Err(mllm_agent::session::HostRevoked)), "{ended:?}");
 
     // By id this time; the join file names the host id it re-enrolls.
     let invitation = h.recovery_invitation(&h.host.clone());
@@ -556,4 +568,141 @@ async fn a_revoked_host_recovers_its_same_identity_and_the_old_certificate_stays
     stop.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(15), agent).await;
     h.finish().await;
+}
+
+/// A control endpoint that answers every session with `answer`, to prove what
+/// the agent does with refusals that are not the controller's own.
+struct Refuser {
+    answer: Arc<Mutex<tonic::Status>>,
+    sessions: Arc<AtomicUsize>,
+}
+#[tonic::async_trait]
+impl pb::agent_control_server::AgentControl for Refuser {
+    type SessionStream = ReceiverStream<Result<pb::ServerToAgent, tonic::Status>>;
+    async fn session(
+        &self,
+        _: tonic::Request<tonic::Streaming<pb::AgentToServer>>,
+    ) -> Result<tonic::Response<Self::SessionStream>, tonic::Status> {
+        self.sessions.fetch_add(1, Ordering::SeqCst);
+        Err(self.answer.lock().unwrap().clone())
+    }
+}
+
+/// A host enrolled with a real controller CA whose control address is a
+/// `Refuser` presenting a server certificate from `server_ca` (the real CA,
+/// or an impostor's). Returns the refuser's answer and session count and the
+/// running agent.
+struct Refused {
+    answer: Arc<Mutex<tonic::Status>>,
+    sessions: Arc<AtomicUsize>,
+    stop: tokio::sync::watch::Sender<bool>,
+    agent: tokio::task::JoinHandle<Result<(), mllm_agent::session::HostRevoked>>,
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+impl Refused {
+    async fn start(impostor: bool, answer: tonic::Status) -> Self {
+        let state_dir = directory();
+        let state = Arc::new(Mutex::new(OwnedCoordinatorState::open(state_dir.path()).unwrap()));
+        let ca = CertificateAuthority::generate(now()).unwrap();
+        let ca_pem = ca.certificate_pem().to_owned();
+        let key = HostKey::generate().unwrap();
+        let cert = if impostor {
+            CertificateAuthority::generate(now()).unwrap().issue_server("localhost", &key, now()).unwrap()
+        } else {
+            ca.issue_server("localhost", &key, now()).unwrap()
+        };
+        let authority = Arc::new(EnrollmentAuthority::new(state, ca));
+        let answer = Arc::new(Mutex::new(answer));
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("https://localhost:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(
+            Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new()
+                        .identity(Identity::from_pem(cert.pem, key.private_key_pem()))
+                        .client_ca_root(Certificate::from_pem(&ca_pem)),
+                )
+                .unwrap()
+                .add_service(AgentControlServer::new(Refuser {
+                    answer: answer.clone(),
+                    sessions: sessions.clone(),
+                }))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let storage_dir = directory();
+        let storage = IdentityDirectory::open(storage_dir.path()).unwrap();
+        let invite = authority.invite("spark", 300, now()).unwrap();
+        let invitation = JoinInvitation {
+            version: 1,
+            server_address: address.clone(),
+            control_address: address,
+            server_ca: ca_pem,
+            invitation_id: invite.id,
+            invitation_secret: invite.secret,
+            host_name: invite.host_name,
+            expires_unix: invite.expires_unix,
+            recover_host_id: None,
+        };
+        let mut identity = PendingEnrollment::prepare(&storage, &invitation).unwrap();
+        let request = identity.request(&invitation).unwrap();
+        let certificate = Bootstrap::enroll(authority.as_ref(), tonic::Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        let host = identity.accept_certificate(&storage, certificate, now()).unwrap();
+        let journal_dir = directory();
+        let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let agent = tokio::spawn(async move {
+            mllm_agent::session::run_session(&identity, journal, pb::ReportInventory::default(), shutdown)
+                .await
+        });
+        Self { answer, sessions, stop, agent, server, _dirs: vec![state_dir, storage_dir, journal_dir] }
+    }
+}
+
+// T06 (SPEC §4.1, ADR 0016): only the controller's own, exact revocation
+// answer stops the agent. Over an authentic mutual-TLS channel, a generic
+// refusal and look-alike ("garbled") revocation messages keep the agent
+// retrying with its backoff; once the
+// same channel carries the exact answer, the agent returns `HostRevoked`.
+#[tokio::test]
+async fn only_the_controllers_exact_revocation_answer_stops_the_agent() {
+    let r = Refused::start(false, tonic::Status::permission_denied("host session authorization failed")).await;
+    let sessions = r.sessions.clone();
+    eventually(|| sessions.load(Ordering::SeqCst) >= 2).await;
+    assert!(!r.agent.is_finished(), "a generic refusal stopped the agent");
+    // The next attempt after the switch is answered with the look-alike, and
+    // the one after it proves the agent retried. (The unit tests in
+    // `mllm_agent::session` cover every other look-alike without backoff.)
+    let garbled =
+        tonic::Status::permission_denied(format!("{} ", mllm_protocol::HOST_REVOKED_REFUSAL));
+    *r.answer.lock().unwrap() = garbled.clone();
+    let seen = r.sessions.load(Ordering::SeqCst);
+    let sessions = r.sessions.clone();
+    eventually(|| sessions.load(Ordering::SeqCst) >= seen + 2).await;
+    assert!(!r.agent.is_finished(), "{garbled:?} stopped the agent");
+    *r.answer.lock().unwrap() = mllm_protocol::host_revoked_refusal();
+    let ended = tokio::time::timeout(Duration::from_secs(15), r.agent).await.unwrap().unwrap();
+    assert!(matches!(ended, Err(mllm_agent::session::HostRevoked)), "{ended:?}");
+    drop(r.stop);
+    r.server.abort();
+}
+
+// T05 T06 (SPEC §4.1, ADR 0016): an endpoint that is not the controller (its
+// certificate is not from the CA pinned at enrollment) cannot stop the agent
+// by sending the exact revocation answer: the agent refuses the handshake,
+// never sees the answer, and keeps retrying.
+#[tokio::test]
+async fn an_impostors_revocation_answer_never_reaches_the_agent() {
+    let r = Refused::start(true, mllm_protocol::host_revoked_refusal()).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!r.agent.is_finished(), "an impostor stopped the agent");
+    assert_eq!(r.sessions.load(Ordering::SeqCst), 0, "an impostor was answered a session");
+    r.stop.send(true).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(15), r.agent).await.unwrap().unwrap();
+    assert!(ended.is_ok(), "{ended:?}");
+    r.server.abort();
 }

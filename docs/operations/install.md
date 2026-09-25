@@ -24,6 +24,7 @@ Read this before anything else.
 | `mllm drain host <name>` (server running) | Stopped, with verified cleanup. | Kept, eligible for on-demand activation. |
 | `mllm drain standalone` (standalone running) | Stopped, with verified cleanup. | Kept, eligible for on-demand activation. |
 | `mllm delete deployment <id> --stop` | That deployment's engines stopped. | Deleted. |
+| `mllm revoke host <name>` (the host role exits with code 14, not restarted) | Keep running, owned and charged; dispatch to them is closed. `join host --recover` re-proves them. | Kept. |
 
 A signal (SIGTERM, SIGINT) to any role closes admission, lets admitted
 requests finish within the role document's `shutdown.drain_timeout` (30 s by
@@ -89,6 +90,37 @@ sudo systemctl edit mllm-host
 
 If the timeout expires, systemd kills the mllm process only; engines survive,
 as with any other restart.
+
+### Exit codes the units do not restart
+
+The units restart a role that fails (`Restart=on-failure`) except on exit
+codes that restarting cannot heal (`RestartPreventExitStatus=`). The codes are
+defined in `crates/mllm-cli/src/output.rs`.
+
+| Exit | Meaning | Units | What heals it |
+|---|---|---|---|
+| 2 | Invalid configuration | all | Fix the role document (`mllm validate config`). |
+| 3 | Unauthorized | all | Fix the identity or credentials. |
+| 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`) | all | The newer binary or a restored backup (see "State and migrations"). |
+| 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
+
+**A revoked host (14).** After `mllm revoke host <name|id>`, the controller
+answers the host's control session, over its mutual-TLS channel, that its
+certificate is revoked. The host logs one line and exits with code 14 instead
+of retrying:
+
+```
+error [host_revoked]: Host <host id> is revoked; its engines keep running. To recover the same identity, run `mllm invite host <host id> --recover --output FILE` on the server for a new recovery invitation, then `mllm join host --join-file FILE --recover` on this host, and start the host again
+```
+
+Its engines are neither stopped nor signalled, and its state directory and
+journal are untouched. After `join host --recover` (ADR 0016) and
+`systemctl start mllm-host`, the host reconnects under the same host id and
+each engine is re-proven by a fresh probe, not relaunched. Only that exact,
+authenticated answer from the controller stops the host: an unreachable or
+restarting server, a version refusal and any other refusal keep it
+reconnecting with its backoff. The standalone role has no enrolled host to
+revoke and never exits with 14; the server unit does not either.
 
 ## Release contents
 

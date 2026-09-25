@@ -251,6 +251,21 @@ impl EnrollmentAuthority {
         }
         Ok(record)
     }
+    /// SPEC §4.1, ADR 0016: whether the certificate a peer presented over
+    /// mutual TLS is one this controller revoked. The peer proved it holds the
+    /// certificate's key in the handshake, so telling it the certificate is
+    /// revoked discloses nothing to anyone else. A store that cannot answer
+    /// says no: the refusal stays generic and the host keeps retrying.
+    pub fn certificate_revoked(&self, peer_der: &[u8]) -> bool {
+        if peer_der.is_empty() || peer_der.len() > 65536 {
+            return false;
+        }
+        self.state
+            .lock()
+            .ok()
+            .and_then(|owner| owner.store().certificate_revoked(&digest(peer_der)).ok())
+            .unwrap_or(false)
+    }
     pub fn authorize_peer<T>(
         &self,
         request: &Request<T>,

@@ -26,6 +26,25 @@ pub const COMMAND_ENCODING_VERSION: &str = "1";
 
 pub const SKEW_TOLERANCE_MS: i64 = 30_000;
 
+/// SPEC §4.1, ADR 0016: the exact message of the control-session refusal a
+/// controller sends, with `PermissionDenied`, when the certificate the host
+/// presented over mutual TLS is revoked. The host stops reconnecting only on
+/// this exact answer; any other refusal stays a generic, retried one.
+pub const HOST_REVOKED_REFUSAL: &str = "host_certificate_revoked";
+
+/// The controller's refusal of a revoked host certificate.
+pub fn host_revoked_refusal() -> tonic::Status {
+    tonic::Status::permission_denied(HOST_REVOKED_REFUSAL)
+}
+
+/// SPEC §4.1, ADR 0016: whether `status` is the controller's authoritative
+/// revocation refusal: `PermissionDenied` with exactly
+/// [`HOST_REVOKED_REFUSAL`]. A status that differs in code or in any byte of
+/// its message (a garbled or look-alike reply) is not.
+pub fn is_host_revoked_refusal(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::PermissionDenied && status.message() == HOST_REVOKED_REFUSAL
+}
+
 pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

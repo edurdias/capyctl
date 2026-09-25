@@ -22,6 +22,11 @@ impl ExitCode {
     pub const NO_SAFE_ESTIMATE: Self = Self(12);
     /// Store/I-O/runtime-boot failures: never masquerade as invalid config (F1 design §4).
     pub const INTERNAL: Self = Self(13);
+    /// SPEC §4.1, ADR 0016: the controller answered that this host's
+    /// certificate is revoked. The host role exits instead of reconnecting;
+    /// its engines keep running for `join host --recover` to re-prove. The
+    /// packaged units do not restart on it (`RestartPreventExitStatus`).
+    pub const HOST_REVOKED: Self = Self(14);
 }
 
 impl From<ExitCode> for u8 {
@@ -93,6 +98,10 @@ impl fmt::Display for OperationError {
 /// not to restart: only a newer binary or a restored backup resolves it.
 pub const STORE_FROM_NEWER_VERSION: &str = "store_from_newer_version";
 
+/// SPEC §4.1, ADR 0016: the host role stopped because the controller revoked
+/// its certificate. Exits with [`ExitCode::HOST_REVOKED`].
+pub const HOST_REVOKED: &str = "host_revoked";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredError {
     pub code: &'static str,
@@ -121,6 +130,7 @@ impl StructuredError {
             "activation_timeout" => ExitCode::ACTIVATION_TIMEOUT,
             "topology_unknown" => ExitCode::TOPOLOGY_UNKNOWN,
             "no_safe_estimate" => ExitCode::NO_SAFE_ESTIMATE,
+            HOST_REVOKED => ExitCode::HOST_REVOKED,
             _ => ExitCode::UNSUPPORTED,
         }
     }

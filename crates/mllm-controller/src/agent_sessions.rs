@@ -838,7 +838,7 @@ impl AgentSessions {
         beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result: Result<(), Status> = async {
             loop {
-                self.authority.authorize_certificate(&peer, &host, now()).map_err(|_| denied())?;
+                self.authority.authorize_certificate(&peer, &host, now()).map_err(|_| refused(&self.authority, &peer))?;
                 tokio::select! {
                     _ = cancel.changed() => return Err(denied()),
                     _ = revoked.changed() => {},
@@ -880,7 +880,7 @@ impl AgentSessions {
                         let message = message?.ok_or_else(|| Status::unavailable("host disconnected"))?;
                         // SPEC §13: a result's freshness is judged at receipt.
                         let received_at = mllm_protocol::now_unix_ms();
-                        self.authority.authorize_certificate(&peer, &host, now()).map_err(|_| denied())?;
+                        self.authority.authorize_certificate(&peer, &host, now()).map_err(|_| refused(&self.authority, &peer))?;
                         last_heard = tokio::time::Instant::now();
                         if silent {
                             // Readiness is re-proven by a fresh probe on this
@@ -1128,6 +1128,17 @@ fn with_drain(
 fn denied() -> Status {
     Status::permission_denied("host session authorization failed")
 }
+/// SPEC §4.1, ADR 0016: the refusal of a host whose certificate no longer
+/// authorizes it. Only a certificate this controller revoked, presented over
+/// mutual TLS (so the peer holds its key), gets the typed revocation answer
+/// that stops the host reconnecting; every other failure stays generic.
+fn refused(authority: &EnrollmentAuthority, peer: &[u8]) -> Status {
+    if authority.certificate_revoked(peer) {
+        mllm_protocol::host_revoked_refusal()
+    } else {
+        denied()
+    }
+}
 /// ADR 0017: the typed reason when `status` is a refusal made before a
 /// command was sent (`host_upgrade_required`, `host_capability_missing:<name>`).
 pub fn gate_refusal(status: &Status) -> Option<&str> {
@@ -1149,7 +1160,7 @@ impl AgentControl for AgentSessions {
         let authorized = self
             .authority
             .authorize_peer(&request, "")
-            .map_err(|_| denied())?;
+            .map_err(|_| refused(&self.authority, &peer))?;
         let mut incoming = request.into_inner();
         let connect = tokio::time::timeout(Duration::from_secs(10), incoming.message())
             .await

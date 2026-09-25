@@ -226,7 +226,8 @@ async fn a_prepared_host_is_eligible_only_while_its_reconciled_session_lives() {
     authority.revoke(&host).unwrap();
     eventually(|| sessions.inspect(&host).is_some_and(|s| !s.online)).await;
     assert!(!sessions.inspect(&host).unwrap().eligible);
-    stop.send(true).unwrap();
+    // ADR 0016: the revoked agent may already have stopped by itself.
+    let _ = stop.send(true);
     let _ = task.await;
     server.abort();
 }

@@ -47,9 +47,11 @@ TimeoutStartSec=90s
 
 Restart=on-failure
 RestartSec=5s
-# Invalid configuration (2), unauthorized/revoked identity (3) and unsupported
-# requests (5) do not heal by restarting.
-RestartPreventExitStatus=2 3 5
+# Invalid configuration (2), unauthorized identity (3), unsupported requests
+# (5) and a host the controller revoked (14) do not heal by restarting.
+# SPEC §4.1, ADR 0016: on 14 the agent has stopped reconnecting; KillMode=process
+# leaves its engines running for `mllm join host --recover` to re-prove.
+RestartPreventExitStatus=2 3 5 14
 # An engine the kernel OOM-kills is the host's to reconcile; it must not stop
 # the agent (the default OOMPolicy stops the whole unit).
 OOMPolicy=continue
