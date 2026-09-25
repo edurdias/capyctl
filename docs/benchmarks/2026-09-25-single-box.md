@@ -202,23 +202,33 @@ was observed:
   (SPEC §6.3); `mllm prune sources` is the explicit reclaim.
 - The store layout is `sources/huggingface/<owner>--<name>@<sha>`, not
   `~/models/<name>`. Drafter paths in `extra_args` name the store path.
-- The first deploy of a new source with `--activate --wait` still returns
-  `model_source_pending` at once rather than waiting for the download; the run
-  deployed each source first without activation and started the benchmark
-  deployment once status showed it verified.
+- During the run, the first deploy of a new source with `--activate --wait`
+  returned `model_source_pending` at once rather than waiting for the download.
+  The run therefore deployed each source first without activation, and started
+  the benchmark deployment once status showed it verified. Fixed after the run
+  (product fix 5).
 
 ## Product fixes (this branch)
 
 Each fix has a regression test. The tests are CPU-only and are not
-qualification; each was also exercised live in this run as noted.
+qualification. Fixes 1 to 3 were exercised live in this run, as noted. Fixes 4
+and 5 follow the owner's decisions on the pull request and were made after the
+run, so they were not run live.
 
-1. **vLLM engine PATH lacked the CUDA toolkit** (`crates/mllm-adapters/src/vllm/initialize.rs`).
-   vLLM treats FlashInfer as absent unless `nvcc` is on PATH (the installation
-   has no pre-built cubins). With CUDA graphs on and an FP8 KV cache, vLLM picked
-   the FlashInfer attention backend and then failed at graph capture with
-   "FlashInfer backend is not available". The engine PATH now includes
-   `/usr/local/cuda/bin`, a fixed root-owned directory. Live: Qwen3.8-27B NVFP4
-   on vLLM failed before, served after.
+1. **vLLM engine PATH lacked the CUDA toolkit.** vLLM treats FlashInfer as
+   absent unless `nvcc` is on PATH, because the installation has no pre-built
+   cubins. With CUDA graphs on and an FP8 KV cache, vLLM picked the FlashInfer
+   attention backend and then failed at graph capture ("FlashInfer backend is
+   not available").
+   - During the run, a hard-coded `/usr/local/cuda/bin` on the engine PATH
+     fixed it. Live: Qwen3.8-27B NVFP4 on vLLM failed before, served after.
+   - Owner decision: that was replaced by an optional runtime-profile field,
+     `cuda_home` (SPEC §13.3 amendment), in `engines.yaml`, `host.yaml` or
+     `MLLM_CUDA_HOME` for the standalone environment installation. mllm
+     prepends `<cuda_home>/bin` after the engine's own `bin` and sets
+     `CUDA_HOME`; without it the PATH stays minimal. `mllm engine add` detects
+     it: `CUDA_HOME` if it holds `bin/nvcc`, else `/usr/local/cuda` if it does.
+     The harness passes it with `MLLM_HOST_CUDA_HOME`.
 2. **vLLM `--speculative-config` could never be approved**
    (`crates/mllm-config/src/engine_policy.rs`, `runtime/extra_args_policy.py`).
    It was classed as a filesystem path, and its value is a JSON object, so every
@@ -227,18 +237,35 @@ qualification; each was also exercised live in this run as noted.
    launch. It now has its own check at both gates: named approval, a JSON object
    whose keys are all in a closed list (`method`, `model`,
    `num_speculative_tokens`, `draft_tensor_parallel_size`, `prompt_lookup_max`,
-   `prompt_lookup_min`, `draft_sample_method`), scalar values, and the draft
-   `model` inside an approved directory. Live: every vLLM drafter run below.
+   `prompt_lookup_min`, `draft_sample_method`, `moe_backend`), scalar values,
+   and the draft `model` inside an approved directory. Live: every vLLM
+   drafter run below. The owner accepted it as ADR 0014 Amendment A3.
 3. **A verified source copy was not reused** (`crates/mllm-store/src/model_sources.rs`).
    A new deployment of a model already verified on its host started `pending`,
    so `deploy --activate` was refused `model_source_pending` until the next
    supervisor round trip. A revision now starts verified when a deployment that
    still exists holds the same store key verified on the same host. Live: every
    `-bn` benchmark deployment after 13:57 UTC.
+4. **JIT compile parallelism is bounded** (owner decision). mllm sets
+   `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)`
+   and `FLASHINFER_NVCC_THREADS=1` in both engines' environments, and logs the
+   choice at launch. A profile's `env` may override either one with a positive
+   integer.
+   - `MAX_JOBS` is honoured by FlashInfer's ninja JIT, torch `cpp_extension`
+     and `tvm_ffi`.
+   - `FLASHINFER_NVCC_THREADS` sets the threads inside each FlashInfer `nvcc`;
+     1 is FlashInfer's own default.
+   - vLLM's `NVCC_THREADS` applies only when vLLM itself is built, so mllm does
+     not set it.
+5. **`deploy --activate --wait` waits for a downloading source** (owner
+   decision). `deploy model --activate` and `start --wait` already waited for a
+   pending checkpoint digest. They now also wait while no host holds the
+   declared source verified, within the same Initialize window. A failed source
+   ends the wait.
 
 Harness changes (`scripts/live/matrix`): benchmark models and drafter variants in
 `models.json` (with `hf` sources, `residency`, chained `extends`);
-`gen_host_doc.py --hf-max-bytes` and `--approve-speculation`; p90 in `bench.py`
+`gen_host_doc.py --hf-max-bytes`, `--approve-speculation` and `--cuda-home`; p90 in `bench.py`
 distributions; the stream-end metrics above; a `MemAvailable` sample at Ready in
 M80.
 
@@ -259,10 +286,9 @@ M80.
   (an unquantized MoE) on the same model. The kernel OOM killer took the user
   session with the host role and its tmux; the hosts stayed up and nothing was
   rebooted. The runs switched to the prebuilt Marlin runner (SGLang) and
-  `moe_backend: triton` for the vLLM draft. mllm cannot bound JIT parallelism
-  (`MAX_JOBS`): engine environments pass only an allowlist, and a profile's
-  `env` accepts `RUST_LOG`, `TOKENIZERS_PARALLELISM` and `PYTHONUNBUFFERED`.
-  Recorded as an open gap, not fixed.
+  `moe_backend: triton` for the vLLM draft. mllm could not bound JIT
+  parallelism then; product fix 4 now sets `MAX_JOBS` from free memory. It was
+  not re-run live.
 - **Engine and recipe findings, each fixed in the fixture:** SGLang refuses
   deep parking for the modelopt 27B (`capability_missing:deep_park`; all runs
   use `restart_only`); SGLang's DFlash drafter inherits `modelopt` from the
