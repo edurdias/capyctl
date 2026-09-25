@@ -119,12 +119,15 @@ load_run() {
   else
     die "no run: start one with roles.sh up (or roles.sh server-init)"
   fi
-  LRD=$HOME/mllm-runs/$RUN               # control-host run root (server state, private)
-  RRD=$REMOTE_HOME/mllm-runs/$RUN        # Spark run root (host state, private)
+  LRD=${MLLM_LOCAL_RUN_ROOT:-$HOME/mllm-runs/$RUN}         # control-host run root (server state, private)
+  RRD=${MLLM_REMOTE_RUN_ROOT:-$REMOTE_HOME/mllm-runs/$RUN}  # Spark run root (host state, private)
   SERVER_CFG=$LRD/server.yaml
   SERVER_DB=$LRD/server/srv.sqlite3
-  MLLM=$LRD/mllm                         # the snapshot-built server binary
-  RBIN=$REMOTE_TREE/target/release/mllm  # the snapshot-built host binary
+  # Release validation (MLLM_LOCAL_BIN / MLLM_REMOTE_BIN, e.g. ~/.local/bin/mllm
+  # from install.sh) runs the installed binaries instead of snapshot builds; the
+  # rows then only need the harness scripts under MLLM_REMOTE_TREE.
+  MLLM=${MLLM_LOCAL_BIN:-$LRD/mllm}                          # the server binary
+  RBIN=${MLLM_REMOTE_BIN:-$REMOTE_TREE/target/release/mllm}  # the host binary
 }
 
 save_run_var() { # save_run_var NAME VALUE

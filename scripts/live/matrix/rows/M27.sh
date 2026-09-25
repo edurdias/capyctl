@@ -41,7 +41,9 @@ s=json.load(sys.stdin); print("reservations", json.dumps(s["reservations"]))'
 switch_row() {
   local fa=$1 fb=$2 cycles=${3:-1} residency=${4:-deep} host da db c rc=0
   host=$(fixture_host "$fa")
-  [ "${POLICY_92:-}" = tight ] || dry || { echo "host-a is not on the tight policy"; return 1; }
+  local policy_var
+  policy_var="POLICY_$(host_short "$host")"
+  [ "${!policy_var:-}" = tight ] || dry || { echo "$host is not on the tight policy"; return 1; }
   local va="" mem=()
   # SWITCH_MEMORY_JSON sizes both sides' engine memory so that two small
   # models still cannot share the tight host (the 2026-09-24 q4 smoke used

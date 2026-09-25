@@ -10,7 +10,7 @@ tuning lives in each deployment's engine_config (ADR 0014 section 1).
 usage: gen_host_doc.py --device-json FILE --ip IP --run-root DIR --policy normal|tight
                        --sglang-version V --vllm-version V --vllm-venv DIR
                        [--sglang-venv DIR] [--remote-tree DIR] [--models-root DIR]
-                       [--ingress-port 9443] --out FILE
+                       [--ingress-port 9443] [--managed-runtime] --out FILE
 """
 
 import argparse
@@ -57,6 +57,9 @@ def main():
     parser.add_argument("--remote-tree", default="$HOME/mllm-f2")
     parser.add_argument("--models-root", default="$HOME/models")
     parser.add_argument("--ingress-port", type=int, default=9443)
+    # Release validation: leave runtime_dir out, so the host uses the managed
+    # runtime its binary writes to <state_dir>/runtime (docs/operations/install.md).
+    parser.add_argument("--managed-runtime", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -108,6 +111,8 @@ def main():
         "@MAX_PARKED@": int(budget["max_parked"]),
     }
     document = substitute(template, values)
+    if args.managed_runtime:
+        del document["runtime_dir"]
     fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
         json.dump(document, handle, indent=1)
