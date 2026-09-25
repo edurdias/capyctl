@@ -98,7 +98,9 @@ def fixture(name, args, models, ids, checkpoints):
         sys.exit(f"{host} is not in the hosts listing; enroll it first")
     if not ULID.match(ids[host]) and not ids[host].startswith("01DRYRUN"):
         sys.exit(f"host id {ids[host]!r} is not a ULID")
-    residency = args.residency
+    # A model may pin its residency (2026-09-25 benchmark: restart_only, since
+    # SGLang refuses deep parking for modelopt checkpoints and parking is not measured).
+    residency = spec.get("residency") or args.residency
     if engine == "sglang" and residency != "deep":
         # SGLang's protected entry refuses a launch shape without the memory
         # saver, which only a deep residency derives (found live, standalone template).
@@ -131,7 +133,8 @@ def fixture(name, args, models, ids, checkpoints):
         extra_args = extra_args.get(engine)
     if extra_args:
         config["accept_extra_args"] = True
-        config["extra_args"] = list(extra_args)
+        # Drafter checkpoints are named relative to the host's model store.
+        config["extra_args"] = [a.replace("@MODELS_ROOT@", MODELS_ROOT) for a in extra_args]
     digest = None
     if checkpoints:
         per_host = checkpoints.get(host, {})
