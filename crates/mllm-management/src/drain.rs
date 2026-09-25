@@ -291,10 +291,10 @@ impl DrainState {
 }
 
 /// What a drain issued, across its rounds.
-struct Rounds {
-    operations: Vec<serde_json::Value>,
-    refused: Vec<serde_json::Value>,
-    issued: Vec<String>,
+pub(crate) struct Rounds {
+    pub(crate) operations: Vec<serde_json::Value>,
+    pub(crate) refused: Vec<serde_json::Value>,
+    pub(crate) issued: Vec<String>,
 }
 
 /// The most enumeration rounds one drain runs. A remote host takes no new
@@ -302,10 +302,11 @@ struct Rounds {
 /// so a later round is a safety net that should find nothing new.
 const MAX_ROUNDS: usize = 4;
 
-type Enumerate<'a> = dyn FnMut() -> Result<Vec<DrainCandidate>, ConfigurationFailure> + 'a;
-type StopOne<'a> = dyn FnMut(&DrainCandidate) -> Result<Option<crate::actions::ActionReceipt>, ConfigurationFailure>
+pub(crate) type Enumerate<'a> =
+    dyn FnMut() -> Result<Vec<DrainCandidate>, ConfigurationFailure> + 'a;
+pub(crate) type StopOne<'a> = dyn FnMut(&DrainCandidate) -> Result<Option<crate::actions::ActionReceipt>, ConfigurationFailure>
     + 'a;
-type Mark<'a> = dyn FnMut(&[String]) -> Result<(), ConfigurationFailure> + 'a;
+pub(crate) type Mark<'a> = dyn FnMut(&[String]) -> Result<(), ConfigurationFailure> + 'a;
 
 /// SPEC §4.3, owner decision 4: stop every instance holding a runtime on the
 /// host, recording the durable marker as soon as a Stop exists, then enumerate
@@ -314,7 +315,7 @@ type Mark<'a> = dyn FnMut(&[String]) -> Result<(), ConfigurationFailure> + 'a;
 /// the repeated enumeration stays as a safety net. Each later round stops only
 /// instances no earlier round named, and the marker is extended with their
 /// Stops.
-fn drain_rounds(
+pub(crate) fn drain_rounds(
     enumerate: &mut Enumerate<'_>,
     stop: &mut StopOne<'_>,
     mark: &mut Mark<'_>,

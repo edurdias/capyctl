@@ -12,6 +12,8 @@ pub enum ConfigKind {
     Host,
     Deployment,
     Standalone,
+    /// ADR 0018 §2: the mllm-owned `engines.yaml` beside a role document.
+    Engines,
 }
 
 impl ConfigKind {
@@ -21,6 +23,7 @@ impl ConfigKind {
             ConfigKind::Host => "host",
             ConfigKind::Deployment => "deployment",
             ConfigKind::Standalone => "standalone",
+            ConfigKind::Engines => "engines",
         }
     }
 }
@@ -34,6 +37,7 @@ impl std::str::FromStr for ConfigKind {
             "host" => Ok(ConfigKind::Host),
             "deployment" => Ok(ConfigKind::Deployment),
             "standalone" => Ok(ConfigKind::Standalone),
+            "engines" => Ok(ConfigKind::Engines),
             _ => Err(crate::error::ConfigError::new(
                 crate::error::ConfigErrorCode::SchemaVersion,
                 "kind",
@@ -469,6 +473,15 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("server", FieldSpec::Struct(STANDALONE_SERVER)),
                 ("host", FieldSpec::Struct(STANDALONE_HOST)),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),
+            ],
+        },
+        // ADR 0018 §2: the mllm-owned engines file beside a role document.
+        ConfigKind::Engines => &KindSchema {
+            required: &["schema_version", "kind"],
+            fields: &[
+                ("schema_version", SCALAR),
+                ("kind", SCALAR),
+                ("runtime_profiles", FieldSpec::MapOf(&PROFILE)),
             ],
         },
     }

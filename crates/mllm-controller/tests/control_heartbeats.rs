@@ -392,6 +392,7 @@ impl AgentControl for SilentController {
                                     session_id: format!("session-{number}"),
                                     heartbeat_interval_ms: if ask { 250 } else { 0 },
                                     heartbeat_lost_after_ms: if ask { 3_000 } else { 0 },
+                                    ..Default::default()
                                 })),
                             }))
                             .await;

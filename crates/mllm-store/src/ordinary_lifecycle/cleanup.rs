@@ -644,7 +644,46 @@ fn retained(
     Ok(())
 }
 
+/// SPEC §6: the request deadline the instance's live launch froze, which is the
+/// longest span from acceptance a Stop of that runtime may carry. `None` when the
+/// instance holds no runtime launched through the ordinary path. Shared by the
+/// drain's Stop deadline and the profile retirement's stop window (ADR 0018 §4).
+fn launch_request_deadline_ms(
+    conn: &rusqlite::Connection,
+    deployment: &str,
+    instance: u32,
+) -> Result<Option<i64>, LifecycleError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT s.step_json FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+               JOIN runtime_bindings b ON b.id=s.binding_id
+              WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released'",
+            params![deployment, instance],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let plan: Plan = decode(&raw)?;
+    let e = decode_effective_snapshot(&plan.effective_json)
+        .map_err(|_| LifecycleError::CorruptStoredData)?;
+    Ok(Some(e.request_deadline_ms))
+}
+
 impl crate::Store {
+    /// ADR 0018 §4: the longest span, from acceptance, an ordinary stop of this
+    /// instance's runtime accepts as its deadline (the launch's frozen request
+    /// deadline; a longer one is refused). `None` when the instance holds no
+    /// runtime launched through the ordinary path. A read only.
+    pub fn instance_stop_window_ms(
+        &self,
+        deployment: &str,
+        instance: u32,
+    ) -> Result<Option<i64>, LifecycleError> {
+        launch_request_deadline_ms(&self.conn, deployment, instance)
+    }
+
     /// Observation-only exact history, checked before current worker admission.
     pub fn ordinary_stop_command_receipt(
         &self,
@@ -740,20 +779,12 @@ impl crate::Store {
                 .and_then(|receipt| receipt["deadline_ms"].as_i64())
                 .ok_or(LifecycleError::CorruptStoredData);
         }
-        let launch: Option<String> = tx
-            .query_row(
-                "SELECT s.step_json FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id JOIN runtime_bindings b ON b.id=s.binding_id WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released'",
-                params![deployment, instance],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(raw) = launch else {
-            return Ok(bound);
-        };
-        let plan: Plan = decode(&raw)?;
-        let e = decode_effective_snapshot(&plan.effective_json)
-            .map_err(|_| LifecycleError::CorruptStoredData)?;
-        Ok(bound.min(now.saturating_add(e.request_deadline_ms)))
+        Ok(
+            match launch_request_deadline_ms(&tx, deployment, instance)? {
+                Some(window) => bound.min(now.saturating_add(window)),
+                None => bound,
+            },
+        )
     }
 
     /// Stop for idleness: the deployment stays eligible for on-demand activation.

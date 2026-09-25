@@ -7,8 +7,10 @@
 #   roles.sh server-init | server-up | server-down [SIG]
 #   roles.sh host-init <host> [policy] run dir, `init host`, device probe, versions, host document
 #   roles.sh host-doc <host> <policy>  regenerate and upload the host document (restart the host after)
+#   roles.sh host-doc-bare <host> <policy>   ADR 0018: same, with no runtime_profiles (engine add rows)
 #   roles.sh enroll <host>             invite on control-host, copy the invitation, `join host`
 #   roles.sh host-up <host> [--debug-engine-logs] | host-down <host> [SIG]
+#   roles.sh host-up-systemd <host> | host-down-systemd <host>   ADR 0018 (ENG1): host role in a transient user unit
 #   roles.sh wait-online [timeout]     poll list hosts until both are online and reconciled
 #   roles.sh fixtures [gen_deployment args]   all <v|s><92|17>-<model> fixtures for this run
 #
@@ -37,7 +39,10 @@ server_init() {
   fi
   load_run
   x install -d -m 700 "$LRD"
-  x install -m 755 "$LIVE/build/release/mllm" "$MLLM"
+  # A named binary (MLLM_LOCAL_BIN: an installed release, or ENG4's rc.3 server)
+  # is run as it is; only the run's own copy is replaced by the snapshot build
+  # (found live 2026-09-25: ENG4's rc.3 server binary was overwritten).
+  if [ -z "${MLLM_LOCAL_BIN:-}" ]; then x install -m 755 "$LIVE/build/release/mllm" "$MLLM"; fi
   x env "MLLM_STATE_DIR=$LRD/server" "$MLLM" init server --output "$SERVER_CFG"
   # Bootstrap and control listen on control-host's Tailscale address; management and
   # inference stay on loopback (ServerConfig::parse refuses anything else).
@@ -112,10 +117,15 @@ host_doc() {
   x python3 "$MATRIX_DIR/gen_host_doc.py" --device-json "$RUNSTATE/device-$host.json" --ip "$(host_ip "$host")" \
     --run-root "$RRD" --policy "$policy" --sglang-version "$sgv" --vllm-version "$vv" \
     --vllm-venv "$(vllm_venv "$host")" --sglang-venv "$SGLANG_VENV" --remote-tree "$REMOTE_TREE" \
-    --models-root "$MODELS_ROOT" --ingress-port "$INGRESS_PORT" --out "$doc"
+    --models-root "$MODELS_ROOT" --ingress-port "$INGRESS_PORT" ${NO_PROFILES:+--no-profiles} --out "$doc"
   rcopy "$doc" "$host:$RRD/host.yaml"
   rsh "$host" "chmod 600 $RRD/host.yaml"
   save_run_var "POLICY_$(host_short "$host")" "$policy"
+}
+
+host_doc_bare() { # ADR 0018: a host document with no runtime profiles
+  local host=$1 policy=$2
+  NO_PROFILES=1 host_doc "$host" "$policy"
 }
 
 enroll() {
@@ -134,7 +144,7 @@ enroll() {
 host_up() {
   local host=$1 debug=${2:-}
   load_run
-  rsh "$host" "tmux new-session -d -s mx-host-$RUN $REMOTE_TREE/scripts/live/matrix/role_exec.sh $RRD/host.pid $RRD/host.log $RBIN start host --config $RRD/host.yaml $debug"
+  rsh "$host" "tmux new-session -d -s mx-host-$RUN $REMOTE_TREE/scripts/live/matrix/role_exec.sh $RRD/host.pid $RRD/host.log $(rbin "$host") start host --config $RRD/host.yaml $debug"
 }
 
 host_down() {
@@ -142,6 +152,19 @@ host_down() {
   load_run
   rsh "$host" "python3 $REMOTE_TREE/scripts/live/matrix/signal_owned.py --pidfile $RRD/host.pid --expect 'start host' --signal $sig && \
 read -r pid _ < $RRD/host.pid && for i in \$(seq 1 90); do [ -d /proc/\$pid ] || exit 0; sleep 1; done; echo 'host role still running after 90 s' >&2; exit 1"
+}
+
+host_up_systemd() { # ADR 0018 (ENG1): the host role under a transient user unit
+  local host=$1
+  load_run
+  rsh "$host" "systemd-run --user --unit=mx-host-$RUN --collect --property=KillMode=process --property=UMask=0077 \
+$(rbin "$host") start host --config $RRD/host.yaml"
+}
+
+host_down_systemd() {
+  local host=$1
+  load_run
+  rsh "$host" "systemctl --user stop mx-host-$RUN"
 }
 
 wait_online() {
@@ -193,9 +216,12 @@ case $cmd in
   server-down) server_down "$@" ;;
   host-init) host_init "$@" ;;
   host-doc) [ $# -eq 2 ] || usage; host_doc "$@" ;;
+  host-doc-bare) [ $# -eq 2 ] || usage; host_doc_bare "$@" ;;
   enroll) enroll "$@" ;;
   host-up) host_up "$@" ;;
   host-down) host_down "$@" ;;
+  host-up-systemd) host_up_systemd "$@" ;;
+  host-down-systemd) host_down_systemd "$@" ;;
   wait-online) wait_online "$@" ;;
   fixtures) fixtures "$@" ;;
   *) usage ;;

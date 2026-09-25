@@ -52,6 +52,7 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
         // ADR 0012: the Fake host opts out of deep parking, so its
         // generated deployment is restart_only.
         false,
+        "local",
     );
     let path = dir.path().join("deployment.json");
     std::fs::write(&path, config.to_string()).unwrap();

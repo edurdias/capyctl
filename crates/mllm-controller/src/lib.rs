@@ -14,6 +14,7 @@ pub mod engine_bindings;
 pub mod engine_exit;
 pub mod enrollment;
 pub mod host_publication;
+pub mod profile_retirement;
 // ADR 0008: the embedded host's installation fingerprint and drift.
 pub mod engine_provider;
 pub mod fault;

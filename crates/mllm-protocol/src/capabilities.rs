@@ -53,6 +53,21 @@ pub const PROCESS_RESIDENCY: &str = "process_residency";
 /// ADR 0008 (owner decision 2026-09-23): the installation fields of
 /// `RuntimeProfileStatus`.
 pub const INSTALLATION_FINGERPRINT: &str = "installation_fingerprint";
+/// ADR 0018: PublishProfiles / RetireProfile from the host and
+/// ProfilesPublished / ProfileRetirement from the server. Server-to-host: the
+/// server sends its two messages only to a host that declared it, and a host
+/// sends its two only to a server whose SessionReady lists it.
+pub const LIVE_PROFILE_UPDATE: &str = "live_profile_update";
+
+/// ADR 0018: bounds on the new messages' strings and lists.
+pub const MAX_REQUEST_ID: usize = 64;
+pub const MAX_RETIREMENT_DEPLOYMENTS: usize = 256;
+pub const MAX_REASON: usize = 512;
+
+/// ADR 0018: what this server advertises in `SessionReady.capabilities`.
+pub fn server_capabilities() -> Vec<String> {
+    vec![LIVE_PROFILE_UPDATE.to_owned()]
+}
 
 /// Which way a feature's messages flow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +94,7 @@ pub const CATALOGUE: &[(&str, Direction)] = &[
     (HOST_DRAINING, Direction::HostToServer),
     (PROCESS_RESIDENCY, Direction::HostToServer),
     (INSTALLATION_FINGERPRINT, Direction::HostToServer),
+    (LIVE_PROFILE_UPDATE, Direction::ServerToHost),
 ];
 
 /// What this build's agent declares: it implements every feature it knows.

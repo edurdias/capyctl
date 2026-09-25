@@ -28,6 +28,7 @@ mllm-protocol = { workspace = true }
 tempfile = { workspace = true }
 libc = "0.2"
 sha2 = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 mllm-testkit = { workspace = true }

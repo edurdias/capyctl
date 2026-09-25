@@ -969,6 +969,20 @@ pub fn resolve_effective_with_checkpoint(
     })
 }
 
+/// ADR 0018: one runtime profile checked with the rules deployment resolution
+/// applies (`core::normalize_profile`), before `mllm engine add` writes it. A
+/// parking residency is checked too when the profile allows deep parking, so a
+/// sleep-mode-reserved argument is refused now rather than at the first
+/// deployment (T14, T21).
+pub fn check_runtime_profile(profile: &serde_json::Value) -> Result<(), ConfigError> {
+    let raw: RawProfile = decode(profile, "runtime_profiles")?;
+    core::normalize_profile(&raw, raw.revision, Residency::RestartOnly)?;
+    if raw.security.deep_park.is_enabled() {
+        core::normalize_profile(&raw, raw.revision, Residency::Deep)?;
+    }
+    Ok(())
+}
+
 /// SPEC §7: normalize a declared host policy without selecting or launching a model.
 pub fn normalize_host_policy(host: &serde_json::Value) -> Result<HostPolicy, ConfigError> {
     core::normalize_host(decode_host(host)?)

@@ -65,6 +65,16 @@ impl EnrollmentAuthority {
     ) -> Result<(), EnrollmentError> {
         crate::host_publication::publish(&self.state, host, inventory).map_err(|_| EnrollmentError)
     }
+    /// ADR 0018 §3: a live re-publication from a reconciled session. `Err`
+    /// is the operator-safe reason; the previous approved document stays.
+    pub fn republish_inventory(
+        &self,
+        host: &str,
+        inventory: &mllm_protocol::pb::ReportInventory,
+        previous: &mllm_protocol::pb::ReportInventory,
+    ) -> Result<(), String> {
+        crate::host_publication::republish(&self.state, host, inventory, previous)
+    }
     /// ADR 0008 (owner decision 2026-09-23): journal an installation drift the
     /// host newly reported in its status.
     pub fn record_installation_drift(
@@ -118,6 +128,10 @@ impl EnrollmentAuthority {
         let _ = owner
             .store()
             .expire_host_drain_intents(mllm_protocol::now_unix_ms());
+        // ADR 0018 §4: likewise an abandoned profile retirement.
+        let _ = owner
+            .store()
+            .expire_profile_retirements(mllm_protocol::now_unix_ms());
         owner.store().hosts_with_pending_drain().ok()
     }
     pub fn new(state: SharedCoordinatorState, ca: CertificateAuthority) -> Self {

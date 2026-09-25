@@ -12,6 +12,9 @@ pub mod doctor;
 // SPEC §3.3 / ADR 0001: the runtime helpers compiled into the one binary.
 pub mod embedded_runtime;
 pub mod enrollment;
+// ADR 0018 §3: the owner-only local control socket for engine add, remove
+// and list.
+pub mod control_socket;
 // SPEC §13.2 (W13): exits of owned engine processes, reported to the controller.
 pub mod exits;
 pub mod identity;
@@ -21,6 +24,9 @@ pub mod ingress_identity;
 // ADR 0008 (owner decision 2026-09-23): installation fingerprints and
 // launch-time capability probes, instead of pinned hashes.
 pub mod installation;
+// ADR 0018 §1: resolving a named engine installation and its bounded
+// version check.
+pub mod engines;
 pub mod load;
 pub mod memory;
 // ADR 0007: per-process resident memory, sampled beside availability.
@@ -35,5 +41,10 @@ pub mod sources;
 pub mod journal;
 
 pub mod session;
+
+// ADR 0018 §3: the accepted, pending and previous runtime profile sets.
+pub mod profiles;
+// ADR 0018 §3, §4: the host's answers to engine add, remove and list.
+pub mod host_control;
 
 pub mod native_execution;

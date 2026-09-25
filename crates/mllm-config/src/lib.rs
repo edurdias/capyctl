@@ -8,6 +8,9 @@ pub mod error;
 pub mod instances;
 // ADR 0008: declared model sources and the host's model-source policy.
 pub mod model_source;
+// ADR 0018 §2: `engines.yaml`, the mllm-owned engines file beside the role
+// document, its lock, atomic write, and the merge into the host document.
+pub mod registration;
 pub mod remote_resources;
 pub mod remote_roles;
 pub mod resource_controls;

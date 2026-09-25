@@ -23,6 +23,11 @@ $M/run_row.sh M74 --tag v92-14 -- v92-14  # timeouts.initialize expires, overrid
 $M/run_row.sh M75 --no-e0                 # no engine installation, no boot
 $M/run_row.sh TC --tag s92-4 -- s92-4 '["--tool-call-parser","qwen25"]'   # tool calls need the engine's parser
 $M/run_row.sh REJ --tag v17-4 -- v17-4    # engine 400/413/422 relayed as engine_rejected, leases closed
+$M/run_row.sh ENG1 --tag 92 -- host-a v92-4 s92-4   # ADR 0018: engine add on a systemd host, then serves
+$M/run_row.sh ENG1 --tag 17 -- host-b v17-4 s17-4
+$M/run_row.sh ENG3 --tag 92 -- host-a v92-4         # remove refused in use, then --drain
+$M/run_row.sh ENG2 --no-e0 -- host-a                # standalone, both engines, environment profiles
+$M/run_row.sh ENG4 --no-e0 -- host-b                # rc.3 fallbacks; needs MLLM_RC3_LOCAL/MLLM_RC3_REMOTE
 $M/roles.sh down
 ```
 
@@ -54,6 +59,7 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 | `rows/M48.sh`, `soak.py`, `rows/M49.sh` | Phase G soak (2026-09-24). M48 deploys q4 and q14 fixtures of both engines on both hosts plus the two-instance replica route `qwen3-4b`, with host-b on the tight policy, and runs `soak.py`: a seeded random walk (`SOAK_SEED`, `SOAK_STEPS`, resumable on the deployments it left with `SOAK_RESUME=1 SOAK_FROM_STEP=…` and a new `--tag`) over inference, tool calls, start (with and without `--evict`), stop, park, wake on request, request-driven switching on the tight host (two of its three single-instance deployments Ready, then a request for the third), count-only revisions, instance stop and start, `delete --stop` and redeploy, `drain host`, agent SIGTERM and restart, engine SIGKILL and a short agent SIGSTOP. After every step it waits for the deployments to settle and checks the invariants listed in its docstring (ledger limits, leases, I1 on an 8-token prefix plus one recorded checkpoint digest per model, orphan and GPU processes, state and ledger agreement, identities ended or kept, age of uncertain state). Evidence: `M48/soak/{steps.jsonl,violations.jsonl,summary-*.json,steps/}`. Run it with `KEEP_FAILED=1` so M49 cleans the soak state: `delete --stop` everything, an empty ledger, clean hosts without bytecode, MemAvailable near the pre-soak baseline, then `roles.sh down` with each role logging exit 0 (`role_exec.sh`) |
 | `rows/M53.sh`, `rows/M53D.sh`, `rows/M66.sh`, `rows/SGLMO.sh` | Failure and removal rows (2026-09-24). M53: a switch to a target whose engine refuses an argument fails closed with the incumbent intact; the failed target then stops, starts and fails again, and `delete deployment --stop` removes it. M53D: `delete deployment --stop` on a failed launch leaves no residue. M66: `delete deployment --stop` during a stream that outlasts the drain bound (`M66_PROMPT` overrides the prompt). SGLMO: an SGLang modelopt deployment with `residency: deep` is refused `capability_missing:deep_park` with its `restart_only` hint, and the `restart_only` variant serves and stops clean. M53D and M66 judge cleanup after the delete with `residue_check`: the ledger snapshot holds nothing for the deleted id except its tombstone |
 | `rows/M38.sh`, `rows/M73.sh`, `rows/M74.sh`, `rows/M75.sh`, `proc_probe.py` | The engine gates that replaced `live_vllm.rs`, `live_sglang.rs` and `run-on-spark.sh` (owner decision 2026-09-22): launch failures and recovery (M38), one lifecycle with argv, access and memory checks (M73), the `timeouts.initialize` deadline (M74) and no-engine refusal (M75). `proc_probe.py` reads an owned process's argv (credential values redacted) and named, non-secret environment variables |
+| `rows/ENG1.sh`, `rows/ENG2.sh`, `rows/ENG3.sh`, `rows/ENG4.sh` | ADR 0018 engine registration rows, written and first run live 2026-09-25 (results in the status runbook). ENG1: `engine detect`/`add` of the existing vLLM and SGLang venvs on a host running under a transient systemd user unit (`roles.sh host-doc-bare`, `host-up-systemd`), `host.yaml` unchanged, both new profiles serve and stop clean. ENG2: standalone with `MLLM_VLLM_BIN` and `MLLM_SGLANG_BIN` both set publishes `local-vllm`/`local-sglang`; `engine remove` on one is refused (environment profile); a deployment on each serves; a registered `vllm-reg` serves with a stated context length, and the row records what a deployment without one does. ENG3 (sources ENG1.sh): `engine remove` of a profile in use is refused `profile_in_use`, then `--drain` stops the deployment through the ordinary path and removes it only on stop evidence; a start afterwards is refused, and `engine add` republishes it. ENG4 (sources ENG1.sh): the rc.3 version-skew fallbacks — a new CLI against an rc.3 agent (`agent_unreachable`, `engines.yaml` written but never read by the old agent) and a new agent against an rc.3 server (`published=restart_required`), gated on `MLLM_RC3_LOCAL`/`MLLM_RC3_REMOTE` naming existing rc.3 binaries. Only the existing engine venvs on host-a/host-b are used; no venv is created |
 
 ## Rules the harness keeps
 
@@ -77,6 +83,10 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
   host measures and records the real digest.
 - **A second worktree.** `MLLM_REMOTE_TREE=$HOME/mllm-soak` syncs, builds and runs from its
   own tree on the Sparks, so two worktrees never replace each other's binary.
+- **A per-host binary (ADR 0018, row ENG4).** `MLLM_REMOTE_BIN_92` / `MLLM_REMOTE_BIN_17`
+  override `RBIN` for host-a / host-b only (`rbin <host>` in `lib.sh`), so one host can
+  run an older or newer agent than the rest of the run. `host_up` and `host_up_systemd` (the
+  commands that launch the binary) use it; stopping a role never names it.
 - **Goldens.** The first `i1` for a model in a run captures `model@engine` into
   `target/live/matrix/run/goldens.json`. Run `identity_probe.py distinct` before any
   switching row.

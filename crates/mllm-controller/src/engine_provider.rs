@@ -1,4 +1,4 @@
-//! Where a host's one engine installation comes from.
+//! Where a host's engine installations come from.
 //!
 //! The lifecycle needs three things that are properties of the installation rather
 //! than of any deployment: what the host may publish about the engine it has, how a
@@ -68,6 +68,53 @@ pub enum ProviderError {
     /// says what was expected, because a bare refusal leaves an operator guessing.
     #[error("{0}")]
     NoEngineInstallation(String),
+    /// ADR 0018 §5: an environment-variable profile and a registered one share
+    /// a name. Refused at start rather than letting one shadow the other.
+    #[error("profile {0} is declared twice (an environment variable and engines.yaml); rename the registered one")]
+    ProfileExists(String),
+}
+
+/// ADR 0018 §5: one engine installation under the profile name it publishes.
+#[derive(Debug, Clone)]
+pub struct NamedInstallation {
+    pub profile: String,
+    pub installation: EngineInstallation,
+}
+
+/// ADR 0018 §5: a registered profile (engines.yaml) over the role's settings
+/// (models root, ports, KV default, runtime directory). The profile states the
+/// engine, its executable, its version, its security switches and its args.
+pub fn from_profile(base: &EngineInstallation, profile: &serde_json::Value) -> EngineInstallation {
+    let engine = match profile["engine"].as_str() {
+        Some("sglang") => Engine::Sglang,
+        _ => Engine::Vllm,
+    };
+    EngineInstallation {
+        engine,
+        executable: profile["executable"].as_str().unwrap_or_default().into(),
+        build_fingerprint: profile["build_fingerprint"]
+            .as_str()
+            .unwrap_or("unknown")
+            .into(),
+        // SPEC §9.1 / ADR 0012: deep parking is on unless the profile opts out.
+        deep_park: profile["security"]["deep_park"].as_str() != Some("disabled"),
+        trust_remote_code: profile["security"]["trust_remote_code"] == true,
+        installation_drift: if profile["security"]["installation_drift"].as_str() == Some("refuse")
+        {
+            mllm_config::effective::InstallationDrift::Refuse
+        } else {
+            mllm_config::effective::InstallationDrift::Warn
+        },
+        args: profile["args"]
+            .as_array()
+            .map(|args| {
+                args.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ..base.clone()
+    }
 }
 
 /// Supplies the one engine installation a host offers, and the two seams the
@@ -75,6 +122,30 @@ pub enum ProviderError {
 pub trait EngineProvider: Send + Sync {
     /// What this host has, or a refusal naming what it expected to find.
     fn installation(&self) -> Result<EngineInstallation, ProviderError>;
+
+    /// ADR 0018 §5: every installation this host publishes: the environment's
+    /// (`local`) and the profiles registered in engines.yaml, which reuse its
+    /// role settings. A name declared twice is refused.
+    fn installations(
+        &self,
+        registered: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<NamedInstallation>, ProviderError> {
+        let base = self.installation()?;
+        let mut all = vec![NamedInstallation {
+            profile: "local".into(),
+            installation: base.clone(),
+        }];
+        for (name, profile) in registered {
+            if all.iter().any(|n| &n.profile == name) {
+                return Err(ProviderError::ProfileExists(name.clone()));
+            }
+            all.push(NamedInstallation {
+                profile: name.clone(),
+                installation: from_profile(&base, profile),
+            });
+        }
+        Ok(all)
+    }
 
     /// How a frozen binding becomes an adapter spec. `log_dir` is where each
     /// engine's own output is written and `runtime_dir` holds the guard middleware.

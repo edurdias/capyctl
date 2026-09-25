@@ -29,7 +29,8 @@ After=network-online.target
 Type=simple
 User=mllm
 Group=mllm
-# Without --config the role document is <MLLM_STATE_DIR>/config/standalone.yaml,
+# Without --config (or MLLM_CONFIG, which names the document the same way, as
+# for `mllm engine`) the role document is <MLLM_STATE_DIR>/config/standalone.yaml,
 # generated there on first start, so reinstalling this unit on upgrade never
 # depends on a file the operator has not written. To use an explicit document,
 # override ExecStart= in a drop-in (docs/operations/install.md, "Explicit

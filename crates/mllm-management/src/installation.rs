@@ -1,5 +1,5 @@
 //! ADR 0008 (owner decision 2026-09-23): the standalone role's embedded engine
-//! installation, as registered at boot and as its launches found it since
+//! installations (ADR 0018 §5: one per executable), as registered at boot and as its launches found it since
 //! (`measured`, `unmeasured` or `drifted`). A remote host's installations are
 //! reported through `/management/v1/hosts` instead.
 use crate::{error, ManagementCredentials};
@@ -11,21 +11,21 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use mllm_controller::installation_gate::EmbeddedInstallation;
+use mllm_controller::installation_gate::EmbeddedInstallations;
 use std::sync::Arc;
 
 struct InstallationState {
     credentials: ManagementCredentials,
-    installation: Arc<EmbeddedInstallation>,
+    installations: Arc<EmbeddedInstallations>,
 }
 
 pub fn installation_router(
     credentials: ManagementCredentials,
-    installation: Arc<EmbeddedInstallation>,
+    installations: Arc<EmbeddedInstallations>,
 ) -> Router {
     let state = Arc::new(InstallationState {
         credentials,
-        installation,
+        installations,
     });
     Router::new()
         .route("/management/v1/installation", get(view))
@@ -55,9 +55,13 @@ async fn authenticate(
 }
 
 async fn view(State(state): State<Arc<InstallationState>>) -> Response {
+    // ADR 0018 §5: every installation; `installation` stays the first one, as
+    // the single-installation view always named it.
+    let views = state.installations.views();
     Json(serde_json::json!({
         "api_version": "1",
-        "installation": state.installation.view(),
+        "installation": views.first().cloned().unwrap_or(serde_json::Value::Null),
+        "installations": views,
     }))
     .into_response()
 }

@@ -77,6 +77,7 @@ impl NativeHostExecution {
         effective: &mllm_config::effective::EffectiveDeployment,
         profile: &str,
         installation: &str,
+        installations: &crate::installation::InstallationRegistry,
     ) -> Result<(), &'static str> {
         if effective.residency != Residency::Deep {
             return Ok(());
@@ -84,7 +85,7 @@ impl NativeHostExecution {
         if deep_wake_cannot_reload(effective) {
             return Err("capability_missing:deep_park");
         }
-        let Some(report) = self.installations.capabilities(
+        let Some(report) = installations.capabilities(
             profile,
             installation,
             effective.profile.engine,
@@ -113,10 +114,12 @@ impl NativeHostExecution {
             return Some("capability_missing:deep_park");
         }
         let executable = std::path::Path::new(&effective.profile.executable);
+        // ADR 0018 §4: a running engine's profile never changes (removal waits
+        // for it to stop), so the accepted set's registry describes it.
+        let installations = self.profiles.accepted().installations.clone();
         // A Park never refuses on drift: the running engine loaded its code at
         // launch. The measurement only keys the capability cache.
-        let installation = self
-            .installations
+        let installation = installations
             .verify(
                 profile,
                 effective.profile.engine,
@@ -124,7 +127,7 @@ impl NativeHostExecution {
                 mllm_config::effective::InstallationDrift::Warn,
             )
             .ok()?;
-        let report = self.installations.capabilities(
+        let report = installations.capabilities(
             profile,
             &installation,
             effective.profile.engine,
@@ -186,8 +189,9 @@ impl NativeHostExecution {
         // again. Drift from its registered fingerprint is flagged in status,
         // and refused only when its host policy says `installation_drift:
         // refuse`. Then the internals this launch depends on are probed.
-        let installation = self
-            .installations
+        // ADR 0018 §3: the registry of the document the plan was approved under.
+        let installations = self.installations_for(plan);
+        let installation = installations
             .verify(
                 &plan.profile_name,
                 effective.profile.engine,
@@ -195,8 +199,13 @@ impl NativeHostExecution {
                 effective.profile.security.installation_drift,
             )
             .map_err(refused)?;
-        self.launch_capability(&effective, &plan.profile_name, &installation)
-            .map_err(refused)?;
+        self.launch_capability(
+            &effective,
+            &plan.profile_name,
+            &installation,
+            &installations,
+        )
+        .map_err(refused)?;
         // ADR 0014 §7: refuse before any effect when the checkpoint is not the
         // recorded one (stat check and small-file rehash, full rehash on first
         // placement or any change).

@@ -245,6 +245,25 @@ impl crate::Store {
         )
     }
 
+    /// Whether `key` already names an accepted configuration command of
+    /// `principal` (a create when `target` is `None`, else a replacement of
+    /// `target`). Such a retry is answered from its receipt (or refused as an
+    /// idempotency conflict) by the store, never re-checked against what hosts
+    /// publish now (ADR 0018 §7).
+    pub fn has_configuration_receipt(
+        &self,
+        principal: &str,
+        key: &str,
+        target: Option<&str>,
+    ) -> Result<bool> {
+        let scope = configuration_scope(target);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3)",
+            params![principal, scope, key],
+            |r| r.get(0),
+        )?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accept_stopped_configuration(
         &self,
@@ -282,10 +301,7 @@ impl crate::Store {
         let config =
             mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, raw_config.get())
                 .map_err(ManagedConfigurationError::Rejected)?;
-        let scope = target.map_or_else(
-            || "POST /management/v1/deployments/stopped".to_string(),
-            |id| format!("PUT /management/v1/deployments/{id}/stopped-configuration"),
-        );
+        let scope = configuration_scope(target);
         let kind = if target.is_some() {
             "managed_configuration_replace"
         } else {
@@ -666,6 +682,14 @@ pub(crate) fn validate_revision_history(
         return Err(ManagedConfigurationError::CorruptStoredData);
     }
     Ok(())
+}
+
+/// The idempotency scope of a configuration create (`None`) or replacement.
+fn configuration_scope(target: Option<&str>) -> String {
+    target.map_or_else(
+        || "POST /management/v1/deployments/stopped".to_string(),
+        |id| format!("PUT /management/v1/deployments/{id}/stopped-configuration"),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

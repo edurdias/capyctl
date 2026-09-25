@@ -422,6 +422,7 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
         // The host runs with MLLM_DEEP_PARK=off (ADR 0012 opt-out), so
         // its generated deployment is restart_only.
         false,
+        "local",
     );
     let file = installation.root.path().join("deployment.json");
     std::fs::write(&file, document.to_string()).unwrap();
