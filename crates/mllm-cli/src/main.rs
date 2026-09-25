@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use mllm_cli::grammar::{self, CliError, Command, Role};
 use mllm_cli::output::{self, OutputFormat, StructuredError};
 use mllm_cli::roles;
+use mllm_cli::table::{self, HostNames, View};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -12,11 +13,21 @@ fn main() -> ExitCode {
         Ok(invocation) => invocation,
         Err(err) => return report_cli_error(&err),
     };
-    let format = invocation
-        .output
-        .as_deref()
-        .and_then(OutputFormat::from_flag)
-        .unwrap_or_default();
+    // Owner decision 2026-09-25: `--format json` is machine mode, exactly as
+    // `--output json` was (and still is): JSON results and JSON errors.
+    let format = match invocation.format.as_deref() {
+        Some("json") => OutputFormat::Json,
+        _ => invocation
+            .output
+            .as_deref()
+            .and_then(OutputFormat::from_flag)
+            .unwrap_or_default(),
+    };
+    let json_records = match invocation.format.as_deref() {
+        Some(explicit) => explicit == "json",
+        None => invocation.output.as_deref() == Some("json"),
+    };
+    let view = View::of(&invocation.command).filter(|_| !json_records);
     if mllm_cli::remote_roles::supports(&invocation.command) {
         // SPEC §13.3: only a local startup flag enables full native output.
         // Clear inherited permission before creating runtime threads.
@@ -34,7 +45,7 @@ fn main() -> ExitCode {
             &default_state_dir(),
         )) {
             Ok(value) => {
-                println!("{value}");
+                emit(&value, view, &Default::default());
                 warn_development_controls(&value, format);
                 ExitCode::SUCCESS
             }
@@ -74,7 +85,7 @@ fn main() -> ExitCode {
             &default_state_dir(),
         )) {
             Ok(value) => {
-                println!("{value}");
+                emit(&value, view, &Default::default());
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -187,7 +198,16 @@ fn main() -> ExitCode {
             invocation.wait,
         )) {
             Ok(value) => {
-                println!("{value}");
+                let names = match view {
+                    Some(view) if view.needs_host_names() => {
+                        runtime.block_on(mllm_cli::client::host_names(
+                            &default_state_dir(),
+                            invocation.config.as_deref(),
+                        ))
+                    }
+                    _ => Default::default(),
+                };
+                emit(&value, view, &names);
                 warn_development_controls(&value, format);
                 ExitCode::SUCCESS
             }
@@ -203,6 +223,15 @@ fn main() -> ExitCode {
             output::print_error(&err, format);
             ExitCode::from(roles::NOT_IMPLEMENTED_EXIT.0 as u8)
         }
+    }
+}
+
+/// Owner decision 2026-09-25: a record view prints as a table unless JSON was
+/// asked for; everything else prints its JSON result, as it always has.
+fn emit(value: &serde_json::Value, view: Option<View>, names: &HostNames) {
+    match view {
+        Some(view) => print!("{}", table::render(view, value, names)),
+        None => println!("{value}"),
     }
 }
 

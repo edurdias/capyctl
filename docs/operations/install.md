@@ -445,6 +445,28 @@ User units carry no file-system sandboxing: `ProtectSystem=` and similar need
 privileges the per-user manager lacks (systemd.exec(5)). Prefer the system
 units on shared machines.
 
+## Command output
+
+Commands that read records print an aligned table by default, whether or not
+the output is a terminal: `list hosts`, `list deployments`, `list engines`,
+`status deployment`, `engine list` and `engine detect`. Hosts appear by name
+(by id when they have none), memory in GiB and timeouts in seconds. Nested
+detail (latency distributions, installation fingerprints, development-control
+marks) is only in the JSON.
+
+    $ mllm list engines --config server.yaml
+    HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
+    gpu-box   vllm      vllm     0.11.0    no       enabled     online   qwen3-8b
+    gpu-box   sglang    sglang   0.5.3     no       enabled     online   -
+
+Scripts pass `--format json` (or `--json`): the command then prints its JSON
+result, the same document earlier releases printed, and reports errors as JSON
+on stderr. `--output json` is still accepted and means the same. `--format
+table` asks for the default explicitly. Commands that change something
+(`deploy`, `start`, `stop`, `drain`, `revoke`, `engine add`, ...) and
+`inspect`, `validate` and `prune` print JSON as before. Exit codes do not
+depend on the format.
+
 ## Registering engines
 
 mllm uses engines you install yourself. Register them on the machine that runs them:
@@ -571,9 +593,10 @@ is at worst drain-only until its own upgrade, and its Ready engines keep
 serving. Hosts running a release that predates this policy report no version,
 so after the first server upgrade to a release that has it they are
 drain-only until they are upgraded too. Check the verdicts with
-`mllm list hosts` (`server_version`, and per host `binary_version`,
-`compatibility`, `compatibility_reason`); `mllm status deployment <id>` shows the
-same per allowed host. A host listing a `capabilities_missing` entry that a
+`mllm list hosts` (its `VERSION` and `COMPATIBILITY` columns; with
+`--format json`, `server_version`, and per host `binary_version`,
+`compatibility`, `compatibility_reason`); `mllm status deployment <id>
+--format json` shows the same per allowed host. A host listing a `capabilities_missing` entry that a
 launch needs is left out of placement; the operation it lacks is refused as
 `host_capability_missing:<name>`.
 

@@ -736,3 +736,73 @@ async fn a_rerun_remove_finishes_a_removal_the_file_already_shows() {
     assert_eq!(error.code, "invalid_config", "{}", error.message);
     stop.send(true).unwrap();
 }
+
+fn mllm(home: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mllm"))
+        .env("HOME", home)
+        .env("PATH", "/nonexistent")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("PIPX_HOME")
+        .env_remove("MLLM_CONFIG")
+        .env("MLLM_STATE_DIR", home.join("state"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+// T37, owner decision 2026-09-25: `engine detect` and `engine list` print an
+// aligned table by default; `--format json` prints the JSON result unchanged
+// (the same bytes as `--output json`).
+#[test]
+fn engine_views_print_tables_and_json_on_request() {
+    let dir = private_dir();
+    let env = vllm_env(&dir.path().join("envs/v"), "0.29.0", "0.29.0", &[]);
+    let envs = dir.path().join("envs");
+    let detect = ["engine", "detect", "--path", envs.to_str().unwrap()];
+    let table = mllm(dir.path(), &detect);
+    let json = mllm(dir.path(), &[&detect[..], &["--format", "json"]].concat());
+    assert_eq!(
+        json,
+        mllm(dir.path(), &[&detect[..], &["--output", "json"]].concat())
+    );
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let rows = value["candidates"].as_array().unwrap().len();
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), rows + 1, "{table}");
+    assert!(
+        lines[0].starts_with("ENGINE   VERSION   CUSTOM   ENVIRONMENT"),
+        "{table}"
+    );
+    let env = env.to_string_lossy();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("vllm     0.29.0    ") && l.contains(env.as_ref())),
+        "{table}"
+    );
+
+    let document = host_doc(dir.path());
+    let list = ["engine", "list", "--config", document.to_str().unwrap()];
+    let table = mllm(dir.path(), &list);
+    assert!(
+        table.starts_with(
+            "PROFILE   SOURCE   ENGINE   VERSION   CUSTOM   DEEP PARK   PUBLISHED   DEPLOYMENTS\n"
+        ),
+        "{table}"
+    );
+    let json = mllm(dir.path(), &[&list[..], &["--format", "json"]].concat());
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["agent"], "unreachable", "{json}");
+    assert_eq!(
+        table.lines().count(),
+        value["engines"].as_array().unwrap().len() + 1,
+        "{table}"
+    );
+}

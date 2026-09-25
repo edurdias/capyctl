@@ -4,6 +4,36 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Table output for record views — 2026-09-25 (branch `feat/cli-table-output`)
+
+Owner decision 2026-09-25 (recorded in SPEC §14): like the docker CLI, commands
+that read records print an aligned table by default, terminal or not: `list
+hosts`, `list deployments`, `list engines`, `status deployment` (the
+deployment, then its instances), `engine list` and `engine detect`. Upper-case
+headers, host names resolved from the host inventory (the id when a host has
+none, or the inventory cannot be read), memory in GiB, timeouts in seconds;
+nested detail stays in the JSON. An empty result prints the headers only.
+`--format json` (or `--json`) prints the JSON result byte for byte as before
+and reports errors as JSON, exactly as `--output json` did; `--output json`
+is still accepted. Mutations, `inspect`, `validate`, `prune`, `drain` and
+`revoke` print JSON as before; exit codes are unchanged.
+
+- Rendering: `crates/mllm-cli/src/table.rs` (unit tests: alignment, empty
+  results, host-name resolution and fallback, units, host states, status
+  sections, engine views). Binary tests: `management_cli` (T10: `list
+  deployments` and `status deployment` tables; `--format json`, `--json` and
+  `--output json` print identical bytes), `engine_cli` (T37: `engine detect`
+  and `engine list`), `host_recovery` (`list hosts` names a revoked host).
+- Every CLI test that parses JSON passes `--format json`.
+- Live matrix: every script passes `--format json`. `lib.sh`'s `cli` probes
+  the binary once and translates the flag to `--output json` for a release
+  from before this change (ENG4's rc.3 binaries, release validation).
+- Verified locally: workspace and core suites, clippy with warnings denied,
+  `cargo fmt --check`, `scripts/test-install.sh`, `scripts/verify-packaging.sh`,
+  harness dry-runs of M73, M08 and ENG1 to ENG4 (M54's dry-run fails the same
+  way on `main`). CPU and Fake-engine tests only; no live run, and nothing
+  here qualifies an engine recipe.
+
 ## Engine registration — 2026-09-25 (branch `feat/engine-registration`)
 
 ADR 0018 (amends SPEC §4.2, §15.1): `mllm engine detect|add|list|remove` and

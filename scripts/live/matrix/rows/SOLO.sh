@@ -31,7 +31,7 @@ row_main() {
   step startup-planned startup_of "$dep"
   step plain-start-refused refused start_dep "$dep" || rc=1
   step small-still-ready wait_state "$small" ready 30 || rc=1
-  step evict timed evict cli start deployment "$dep" --evict --output json || rc=1
+  step evict timed evict cli start deployment "$dep" --evict --format json || rc=1
   step small-released wait_state "$small" stopped 600 || rc=1
   step startup-solo startup_of "$dep"
   step ledger-solo python3 "$MATRIX_DIR/ledger.py" snapshot --db "$SERVER_DB"

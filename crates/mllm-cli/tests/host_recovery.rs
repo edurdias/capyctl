@@ -334,7 +334,7 @@ impl Cluster {
         let server = self.start("server", &self.server_state, &self.server_config);
         let deadline = Instant::now() + Duration::from_secs(30);
         while !self
-            .manage(&["list", "hosts", "--output", "json"])
+            .manage(&["list", "hosts", "--format", "json"])
             .status
             .success()
         {
@@ -349,7 +349,7 @@ impl Cluster {
     }
 
     fn hosts(&self) -> Value {
-        self.manage_json(&["list", "hosts", "--output", "json"])
+        self.manage_json(&["list", "hosts", "--format", "json"])
     }
 
     /// Wait until the one host is online and eligible.
@@ -532,7 +532,7 @@ impl Cluster {
     /// Stop the deployment as an operator; the Stop succeeds only on gone
     /// evidence, and everything the deployment held is released.
     fn stop_deployment(&self, id: &str) {
-        let stopped = self.manage_json(&["stop", "deployment", id, "--output", "json"]);
+        let stopped = self.manage_json(&["stop", "deployment", id, "--format", "json"]);
         self.succeeded(stopped["operation_id"].as_str().unwrap());
     }
 }
@@ -588,9 +588,24 @@ async fn a_revoked_host_recovers_its_identity_and_its_engine_is_reproven() {
     );
 
     let old_fingerprint = cluster.certificate_fingerprint();
-    cluster.manage_json(&["revoke", "host", HOST, "--output", "json"]);
+    cluster.manage_json(&["revoke", "host", HOST, "--format", "json"]);
     let listed = cluster.hosts();
     assert_eq!(listed["hosts"][0]["revoked"], true);
+    // Owner decision 2026-09-25: `list hosts` prints a table by default,
+    // naming the host and its standing.
+    let table = cluster.manage(&["list", "hosts"]);
+    assert!(table.status.success());
+    let table = String::from_utf8(table.stdout).unwrap();
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), 2, "{table}");
+    assert!(
+        lines[0].starts_with("NAME            STATE     ELIGIBLE"),
+        "{table}"
+    );
+    assert!(
+        lines[1].starts_with(&format!("{HOST}   revoked   no  ")),
+        "{table}"
+    );
     // SPEC §13.3: dispatch to its engine is closed; the engine keeps running
     // and stays charged.
     cluster.not_served(Duration::from_secs(3)).await;
@@ -721,7 +736,7 @@ async fn a_recovered_host_that_lost_its_journal_settles_engines_only_on_gone_evi
     let engine = cluster.launches();
     assert_eq!(engine.len(), 1);
 
-    cluster.manage_json(&["revoke", "host", &host_id, "--output", "json"]);
+    cluster.manage_json(&["revoke", "host", &host_id, "--format", "json"]);
     host.stop();
     // The host loses its identity files and its whole state, journal included.
     std::fs::remove_file(cluster.identity_dir.join("host-identity.json")).unwrap();
@@ -788,7 +803,7 @@ async fn a_recovered_host_that_lost_its_journal_settles_engines_only_on_gone_evi
     // operator killed them). The pending stop completes once the host is
     // back, on gone evidence the host observes by the recorded identities.
     host.stop();
-    let stopped = cluster.manage_json(&["stop", "deployment", &id, "--output", "json"]);
+    let stopped = cluster.manage_json(&["stop", "deployment", &id, "--format", "json"]);
     let operation = stopped["operation_id"].as_str().unwrap().to_owned();
     assert!(!cluster
         .store()

@@ -32,7 +32,7 @@ fn validate(args: &[&str]) -> (i32, Value, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
         .args(["validate", "config"])
         .args(args)
-        .args(["--output", "json"])
+        .args(["--format", "json"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();

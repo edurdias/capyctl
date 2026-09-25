@@ -89,7 +89,7 @@ async fn start_wait(second: fn(usize) -> Value) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_mllm"))
             .env("MLLM_STATE_DIR", dir.path())
             .env(mllm_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string())
-            .args(["start", "deployment", "pair", "--wait", "--output", "json"])
+            .args(["start", "deployment", "pair", "--wait", "--format", "json"])
             .output()
             .unwrap()
     })

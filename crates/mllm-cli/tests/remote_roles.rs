@@ -200,7 +200,7 @@ fn join_reads_a_relative_invitation_from_the_working_directory() {
             "host.join",
             "--config",
             config.to_str().unwrap(),
-            "--output",
+            "--format",
             "json",
         ])
         .env("MLLM_STATE_DIR", &state)
@@ -315,7 +315,7 @@ fn hosts(root: &Path, config: &Path, online: bool, expected: usize) -> serde_jso
                 "hosts",
                 "--config",
                 config.to_str().unwrap(),
-                "--output",
+                "--format",
                 "json",
             ],
         );
@@ -541,7 +541,7 @@ fn revoke(
         host,
         "--config",
         config.to_str().unwrap(),
-        "--output",
+        "--format",
         "json",
     ];
     if let Some(id) = request_id {

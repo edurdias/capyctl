@@ -14,7 +14,7 @@ row_main() {
   FIXTURE_VARIANT=mx step deploy-a deploy "$a" --activate --wait || return 1
   FIXTURE_VARIANT=mx step deploy-b deploy "$b" --activate --wait || rc=1
   for d in "$a-mx" "$b-mx"; do step "owned-$d" keep_owned "$d" ready; done
-  step models cli list deployments --output json
+  step models cli list deployments --format json
   sel_mark
   step load load --route "$REP_ROUTE" --nonstream 48 --stream 16 --concurrency 16 --max-tokens 64 || rc=1
   step selections sel_count m61 --max-share 0.7 || rc=1

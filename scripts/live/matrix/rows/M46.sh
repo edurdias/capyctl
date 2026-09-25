@@ -8,8 +8,8 @@ row_main() {
   step before host_idle "$host" || return 1
   step deploy-a deploy "$a" || return 1
   step deploy-b deploy "$b" || return 1
-  cli start deployment "$a" --output json >"$EVID/start-a.out" 2>"$EVID/start-a.err" &
-  cli start deployment "$b" --output json >"$EVID/start-b.out" 2>"$EVID/start-b.err" &
+  cli start deployment "$a" --format json >"$EVID/start-a.out" 2>"$EVID/start-a.err" &
+  cli start deployment "$b" --format json >"$EVID/start-b.out" 2>"$EVID/start-b.err" &
   wait
   step start-a cat "$EVID/start-a.out" "$EVID/start-a.err"
   step start-b cat "$EVID/start-b.out" "$EVID/start-b.err"

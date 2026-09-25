@@ -702,19 +702,13 @@ pub async fn execute_with_evict(
     .await
 }
 
-/// SPEC §6.4: as [`execute_with_evict`], with `--wait` for `start deployment`
-/// and `start instance`: the start's operation is observed to its end, and a
-/// failure reports the reason and hint status shows for it.
-pub async fn execute_with_start_options(
-    command: &Command,
+/// The management endpoint, its admin credential and the request journal
+/// root: the server's (`--config`) or the standalone role's.
+fn management_context(
     state_dir: &Path,
     config: Option<&Path>,
-    request_id: Option<&str>,
-    initialize_timeout_ms: Option<i64>,
-    evict: bool,
-    wait_start: bool,
-) -> Result<Value, StructuredError> {
-    let (endpoint, token, journal_root) = if let Some(path) = config {
+) -> Result<(String, String, std::path::PathBuf), StructuredError> {
+    Ok(if let Some(path) = config {
         let config = crate::remote_roles::server_context(Some(path), state_dir)?;
         let (endpoint, token) = crate::remote_roles::management_context(&config)?;
         (endpoint, token, config.state_dir)
@@ -747,7 +741,54 @@ pub async fn execute_with_start_options(
             ),
         };
         (endpoint, token, state_dir.to_owned())
+    })
+}
+
+/// Owner decision 2026-09-25: host names for a table view, from the host
+/// inventory. Best effort: an unreachable or older server, or a role without
+/// an inventory, yields no names and the table shows host ids.
+pub async fn host_names(state_dir: &Path, config: Option<&Path>) -> crate::table::HostNames {
+    let Ok((endpoint, token, _)) = management_context(state_dir, config) else {
+        return Default::default();
     };
+    let Ok(client) = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+    else {
+        return Default::default();
+    };
+    let Ok(response) = client
+        .get(format!("{endpoint}/hosts"))
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
+        return Default::default();
+    };
+    if !response.status().is_success() {
+        return Default::default();
+    }
+    match response.json::<Value>().await {
+        Ok(inventory) => crate::table::host_names(&inventory),
+        Err(_) => Default::default(),
+    }
+}
+
+/// SPEC §6.4: as [`execute_with_evict`], with `--wait` for `start deployment`
+/// and `start instance`: the start's operation is observed to its end, and a
+/// failure reports the reason and hint status shows for it.
+pub async fn execute_with_start_options(
+    command: &Command,
+    state_dir: &Path,
+    config: Option<&Path>,
+    request_id: Option<&str>,
+    initialize_timeout_ms: Option<i64>,
+    evict: bool,
+    wait_start: bool,
+) -> Result<Value, StructuredError> {
+    let (endpoint, token, journal_root) = management_context(state_dir, config)?;
     let mut api = Management {
         client: Client::builder()
             .timeout(Duration::from_secs(30))
