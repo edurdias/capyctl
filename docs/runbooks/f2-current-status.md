@@ -52,6 +52,30 @@ Controller rulings from the plan's decision ledger
   `$MLLM_CONFIG` when `--config` is absent, so a role and `mllm engine` always
   agree on the file.
 
+## Standalone vLLM deep parking — 2026-09-25 (branch `fix/standalone-vllm-deep-park`)
+
+CPU and Fake-engine tests only; not live-proven. The live check (a standalone
+vLLM park and wake on a Spark with rc.4) is pending.
+
+- Defect: the generated standalone deployment declared vLLM `restart_only`
+  whatever the deep-park switch said, so a standalone vLLM deployment launched
+  without sleep mode and never parked; idle eviction and switching stopped it
+  cold. Server mode deep-parks the same engine (live-proven earlier: 77% of its
+  memory released with the same processes). Owner rule: standalone must not
+  differ from server mode.
+- Fix: the template's residency follows the host's switch for every engine
+  (ADR 0012, SPEC §6.2): `deep` when deep parking is on (`MLLM_DEEP_PARK` unset
+  or `on`), `restart_only` when the host opts out. A build whose probe finds deep
+  parking missing is refused `capability_missing:deep_park` by the protected
+  entry, as elsewhere; the host then opts out and gets `restart_only`.
+- Tests: a standalone boot with deep parking on parks its generated vLLM
+  deployment and wakes the same launch (same endpoint, per-launch key and live
+  processes); an opted-out boot's deployment is `restart_only` and its park is
+  refused. The Fake gained an opt-in mode that reports real processes as its
+  group and follows the embedded vLLM residency contract; the default Fake is
+  unchanged. Workspace 1788 passed, 1 ignored; core suite 1012 passed; Clippy
+  clean.
+
 ## Flaky parallel tests and leaked stand-in engines — 2026-09-25 (branch `fix/flaky-parallel-tests`)
 
 CPU-only test fix; nothing here is live-proven or qualifies an engine recipe.

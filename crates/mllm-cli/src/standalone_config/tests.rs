@@ -351,22 +351,63 @@ fn the_published_host_declares_one_memory_pool() {
     );
 }
 
-/// Standalone's deployments stay restart-only until ordinary park exists. The point
-/// of asserting it is that the value is now one of three rather than one of two, so
-/// a later change to a parking tier is a deliberate edit with a test behind it.
+/// ADR 0012, SPEC §6.2: a standalone vLLM deployment on a deep-parking host is
+/// `deep`, as a server-mode one is, so it launches in sleep mode and parks
+/// instead of being stopped cold by idle eviction or a switch. Resolving it
+/// against the published host proves the profile accepts that tier and that
+/// sleep mode is derived from it rather than declared.
+// T21
 #[test]
-fn a_standalone_deployment_is_restart_only() {
+fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
+    let mut installation = installed(Engine::Vllm, "/opt/vllm/bin/vllm");
+    installation.deep_park = true;
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
     let deployment = deployment_document(
         "m",
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        1 << 40,
+        CAPACITY,
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
     );
+    assert_eq!(deployment["residency"], "deep");
+    let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
+        .expect("a deep vLLM deployment resolves on a deep-parking host");
+    assert_eq!(resolved.residency, mllm_config::effective::Residency::Deep);
+    let LaunchSettings::Vllm(settings) = &resolved.engine_config else {
+        panic!("a vLLM installation resolves vLLM settings");
+    };
+    assert!(
+        settings.enable_sleep_mode,
+        "sleep mode follows the deep tier"
+    );
+
+    // SPEC §6.2: the opted-out host declares restart_only and launches without
+    // sleep mode.
+    installation.deep_park = false;
+    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let deployment = deployment_document(
+        "m",
+        "m",
+        &local("/models/m"),
+        Engine::Vllm,
+        CAPACITY,
+        DEFAULT_REQUEST_DEADLINE,
+        false,
+        "local",
+    );
     assert_eq!(deployment["residency"], "restart_only");
+    let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
+        .expect("an opted-out vLLM host's deployment resolves");
+    let LaunchSettings::Vllm(settings) = &resolved.engine_config else {
+        panic!("a vLLM installation resolves vLLM settings");
+    };
+    assert!(
+        !settings.enable_sleep_mode,
+        "no sleep mode without deep parking"
+    );
 }
 
 /// A copy of mllm's runtime modules the way a prepared installation carries
@@ -464,10 +505,11 @@ fn host_policy_from_env_is_complete() {
         resolved.resources.ready.allocations[0].bytes
     );
     assert_eq!(settings.common.kv_cache_dtype, None);
-    // SPEC §9.1 / ADR 0012: an unset `MLLM_DEEP_PARK` leaves deep parking on;
-    // sleep mode is derived, and the restart-only standalone vLLM deployment
-    // never parks, so it gets none (SPEC §6.2).
-    assert!(!settings.enable_sleep_mode);
+    // SPEC §9.1 / ADR 0012: an unset `MLLM_DEEP_PARK` leaves deep parking on,
+    // so the generated vLLM deployment is deep and sleep mode is derived from
+    // it (SPEC §6.2), as in server mode.
+    assert_eq!(resolved.residency, mllm_config::effective::Residency::Deep);
+    assert!(settings.enable_sleep_mode);
     assert_eq!(
         settings.provenance["enable_sleep_mode"],
         SettingSource::Derived
@@ -745,11 +787,13 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
     assert!(matches!(resolved.engine_config, LaunchSettings::Sglang(_)));
 }
 
-/// With deep parking left on, SGLang keeps the deep residency its memory saver
-/// delivers (ADR 0014 §4); vLLM stays restart_only either way (SPEC §6.2).
+/// ADR 0012: the residency follows the host's deep-park switch for every
+/// engine, so standalone and server mode park alike. SGLang keeps the deep
+/// residency its memory saver delivers (ADR 0014 §4) and vLLM the one its
+/// sleep mode delivers; an opted-out host is restart_only (SPEC §6.2).
 // T21
 #[test]
-fn the_residency_follows_the_deep_park_switch_for_sglang_only() {
+fn the_residency_follows_the_deep_park_switch_for_every_engine() {
     let residency = |engine, deep_park| {
         deployment_document(
             "m",
@@ -765,7 +809,7 @@ fn the_residency_follows_the_deep_park_switch_for_sglang_only() {
     };
     assert_eq!(residency(Engine::Sglang, true), "deep");
     assert_eq!(residency(Engine::Sglang, false), "restart_only");
-    assert_eq!(residency(Engine::Vllm, true), "restart_only");
+    assert_eq!(residency(Engine::Vllm, true), "deep");
     assert_eq!(residency(Engine::Vllm, false), "restart_only");
 }
 

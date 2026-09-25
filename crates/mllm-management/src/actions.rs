@@ -158,6 +158,10 @@ impl OwnedActionSource {
     /// still completes only on evidence that the recorded processes are gone.
     ///
     /// ADR 0013 §5: a drain stops the instance on the drained host only.
+    ///
+    /// SPEC §6: `deadline_ms` is the drain's bound; each Stop is lowered to its
+    /// own request-deadline window, so a drain longer than a deployment's
+    /// request deadline still stops it, and a retry replays the same Stop.
     pub(crate) fn drain_stop(
         &self,
         deployment: &str,
@@ -168,7 +172,7 @@ impl OwnedActionSource {
     ) -> Result<Option<ActionReceipt>, ConfigurationFailure> {
         let receipt = self
             .commands
-            .stop_instance(
+            .drain_stop_instance(
                 self.configuration.principal(),
                 deployment,
                 instance,

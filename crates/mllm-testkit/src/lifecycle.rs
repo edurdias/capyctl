@@ -26,6 +26,11 @@ pub(crate) struct LifecycleState {
     request_attempts: u64,
     control_attempts: u64,
     alive: bool,
+    /// The identities an Initialize reports instead of the fixed fabricated
+    /// pair, when a test gives the Fake real processes to stand for its group.
+    /// Such a Fake also follows the embedded vLLM residency contract: Park
+    /// without a prior Drain, and a readiness Probe after a wake.
+    pub(crate) members_override: Option<Vec<ProcessIdentity>>,
 }
 impl LifecycleState {
     pub(crate) fn cleanup(
@@ -256,9 +261,6 @@ impl LifecycleState {
         {
             return Err(RuntimeError::Unsupported);
         }
-        if command.action == RuntimeAction::Probe {
-            return Err(RuntimeError::Unsupported);
-        }
         if command.action != RuntimeAction::Initialize {
             self.members(c)?;
         }
@@ -282,20 +284,22 @@ impl LifecycleState {
                 }
                 self.binding = Some((c.binding_id.clone(), c.incarnation.clone()));
                 self.deployment = Some(c.token.deployment_id.clone());
-                self.members = vec![
-                    ProcessIdentity {
-                        role: "api".into(),
-                        pid: 71,
-                        boot_id: "fake-lifecycle-boot".into(),
-                        start_ticks: 100,
-                    },
-                    ProcessIdentity {
-                        role: "worker-0".into(),
-                        pid: 72,
-                        boot_id: "fake-lifecycle-boot".into(),
-                        start_ticks: 101,
-                    },
-                ];
+                self.members = self.members_override.clone().unwrap_or_else(|| {
+                    vec![
+                        ProcessIdentity {
+                            role: "api".into(),
+                            pid: 71,
+                            boot_id: "fake-lifecycle-boot".into(),
+                            start_ticks: 100,
+                        },
+                        ProcessIdentity {
+                            role: "worker-0".into(),
+                            pid: 72,
+                            boot_id: "fake-lifecycle-boot".into(),
+                            start_ticks: 101,
+                        },
+                    ]
+                });
                 self.allocations = true;
                 self.alive = true;
                 self.weights = true;
@@ -310,7 +314,17 @@ impl LifecycleState {
                 self.quiesced = true;
                 vec![Milestone::Quiesced]
             }
-            RuntimeAction::Park if self.quiesced && self.allocations && !self.unknown_work => {
+            // By default a Park needs a prior Drain, which the coordinator never
+            // sends, so the Fake refuses it (tests rely on that refusal). A Fake
+            // given real members follows the vLLM adapter instead: its Park is
+            // sleep with nothing drained first, since the router drains before
+            // the coordinator parks. Work the Fake cannot account for still
+            // refuses it.
+            RuntimeAction::Park
+                if (self.quiesced || self.members_override.is_some())
+                    && self.allocations
+                    && !self.unknown_work =>
+            {
                 self.allocations = false;
                 self.weights = false;
                 self.cache = false;
@@ -328,6 +342,26 @@ impl LifecycleState {
             RuntimeAction::InvalidateCache if self.allocations && self.weights && !self.cache => {
                 self.cache = true;
                 vec![Milestone::CacheValid]
+            }
+            // SPEC §6.1: after a wake the model is usable only once it answers a
+            // completion, as the vLLM adapter's Probe step proves it.
+            RuntimeAction::Probe
+                if self.members_override.is_some()
+                    && self.allocations
+                    && self.weights
+                    && self.cache =>
+            {
+                let model = format!("candidate-{}", c.token.deployment_id);
+                let body = serde_json::json!({"model":model,"messages":[{"role":"user","content":"Repeat exactly: MLLM_READY_13"}],"temperature":0,"max_tokens":16,"stream":false});
+                let result = self.forward(&body).map_err(|_| {
+                    RuntimeError::Uncertain("Fake wake readiness probe failed".into())
+                })?;
+                if result["choices"][0]["message"]["content"] != "MLLM_READY_13" {
+                    return Err(RuntimeError::Uncertain(
+                        "Fake wake readiness probe failed".into(),
+                    ));
+                }
+                vec![Milestone::ModelUsable]
             }
             _ => return Err(RuntimeError::Unsupported),
         };

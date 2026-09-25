@@ -32,6 +32,33 @@ pub async fn boot(state_dir: &std::path::Path) -> mllm_cli::roles::App {
         state_dir,
         Arc::new(PortedProvider {
             ports: engine_ports(),
+            deep_park: false,
+            members: None,
+        }),
+        test_memory(),
+    )
+    .await
+    .expect("standalone boots")
+}
+
+/// As [`boot`], on a Fake installation whose host leaves deep parking on
+/// (ADR 0012: the product default, `MLLM_DEEP_PARK` unset), with every Fake
+/// reporting `members` as its launched group. The coordinator checks after a
+/// park or restore that the recorded processes are the ones alive (SPEC
+/// §13.2), so a park test hands it real processes it owns. Only the adapter is
+/// the Fake: the generated deployment, its resolution and the coordinator's
+/// park and wake are the product's own. Not qualification of a native recipe
+/// (SPEC §18).
+pub async fn boot_deep_parking(
+    state_dir: &std::path::Path,
+    members: Vec<mllm_domain::completion::ProcessIdentity>,
+) -> mllm_cli::roles::App {
+    mllm_cli::roles::start_standalone_with_memory(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: true,
+            members: Some(members),
         }),
         test_memory(),
     )
@@ -50,6 +77,8 @@ pub async fn boot_configured(
         Some(config),
         Arc::new(PortedProvider {
             ports: engine_ports(),
+            deep_park: false,
+            members: None,
         }),
         test_memory(),
     )
@@ -90,6 +119,10 @@ pub fn engine_ports() -> (u16, u16) {
 /// The testkit's Fake installation on a per-test engine port range.
 struct PortedProvider {
     ports: (u16, u16),
+    /// The host's deep-park switch; the testkit's installation opts out.
+    deep_park: bool,
+    /// Real processes the Fake reports as its launched group, if any.
+    members: Option<Vec<mllm_domain::completion::ProcessIdentity>>,
 }
 
 impl mllm_controller::EngineProvider for PortedProvider {
@@ -98,6 +131,7 @@ impl mllm_controller::EngineProvider for PortedProvider {
     ) -> Result<mllm_controller::EngineInstallation, mllm_controller::ProviderError> {
         let mut installation = mllm_testkit::fake_installation();
         installation.engine_ports = self.ports;
+        installation.deep_park = self.deep_park;
         Ok(installation)
     }
 
@@ -107,7 +141,15 @@ impl mllm_controller::EngineProvider for PortedProvider {
         log_dir: std::path::PathBuf,
         runtime_dir: std::path::PathBuf,
     ) -> Arc<dyn mllm_controller::coordinator::EngineBindings> {
-        mllm_testkit::fake_bindings(clock, log_dir, runtime_dir)
+        match &self.members {
+            Some(members) => mllm_testkit::fake_bindings_with_members(
+                clock,
+                log_dir,
+                runtime_dir,
+                members.clone(),
+            ),
+            None => mllm_testkit::fake_bindings(clock, log_dir, runtime_dir),
+        }
     }
 
     fn tools_factory(&self) -> mllm_controller::coordinator::ToolsFactory {

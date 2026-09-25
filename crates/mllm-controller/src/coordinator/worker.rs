@@ -288,6 +288,15 @@ pub enum CoordinatorCommandError {
     Lifecycle(#[from] LifecycleError),
 }
 
+/// The deadline an instance Stop is accepted with.
+#[derive(Clone, Copy)]
+enum StopDeadline {
+    /// The caller's own deadline, sent as is.
+    Exact(i64),
+    /// SPEC §4.3: an explicit drain's bound, lowered per instance.
+    DrainBound(i64),
+}
+
 impl CoordinatorCommands {
     /// Answer a read against the owned store.
     ///
@@ -465,6 +474,50 @@ impl CoordinatorCommands {
         key: &str,
         requested_deadline_ms: i64,
     ) -> Result<Option<OrdinaryStopReceipt>, CoordinatorCommandError> {
+        self.stop_instance_inner(
+            principal,
+            deployment_id,
+            instance,
+            expected_revision,
+            key,
+            StopDeadline::Exact(requested_deadline_ms),
+        )
+    }
+
+    /// SPEC §4.3: the Stop an explicit drain issues for one instance. The
+    /// drain's `bound_ms` is lowered to the instance's own request-deadline
+    /// window (SPEC §6: no operation's deadline lies beyond it), and a retry
+    /// under the same `key` replays the deadline first accepted
+    /// ([`mllm_store::Store::drain_stop_deadline`]). Otherwise as
+    /// [`CoordinatorCommands::stop_instance`].
+    pub fn drain_stop_instance(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        instance: u32,
+        expected_revision: i64,
+        key: &str,
+        bound_ms: i64,
+    ) -> Result<Option<OrdinaryStopReceipt>, CoordinatorCommandError> {
+        self.stop_instance_inner(
+            principal,
+            deployment_id,
+            instance,
+            expected_revision,
+            key,
+            StopDeadline::DrainBound(bound_ms),
+        )
+    }
+
+    fn stop_instance_inner(
+        &self,
+        principal: &str,
+        deployment_id: &str,
+        instance: u32,
+        expected_revision: i64,
+        key: &str,
+        deadline: StopDeadline,
+    ) -> Result<Option<OrdinaryStopReceipt>, CoordinatorCommandError> {
         let _permit = self
             .shared
             .observers
@@ -483,6 +536,26 @@ impl CoordinatorCommands {
                 self.shared.fail_locked(&owner, error.to_string());
             }
             CoordinatorCommandError::Lifecycle(error)
+        };
+        // Resolved under the ownership lock, so a concurrent retry of the same
+        // drain sees the Stop this one accepts and replays its deadline.
+        let requested_deadline_ms = match deadline {
+            StopDeadline::Exact(deadline) => deadline,
+            StopDeadline::DrainBound(bound) => {
+                let now = (self.shared.clock)()?;
+                owner
+                    .store()
+                    .drain_stop_deadline(
+                        owner.session(),
+                        principal,
+                        deployment_id,
+                        instance,
+                        key,
+                        now,
+                        bound,
+                    )
+                    .map_err(store_error)?
+            }
         };
         if let Some(receipt) = owner
             .store()

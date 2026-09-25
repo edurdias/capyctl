@@ -644,6 +644,33 @@ fn retained(
     Ok(())
 }
 
+/// SPEC §6: the request deadline the instance's live launch froze, which is the
+/// longest span from acceptance a Stop of that runtime may carry. `None` when the
+/// instance holds no runtime launched through the ordinary path. Shared by the
+/// drain's Stop deadline and the profile retirement's stop window (ADR 0018 §4).
+fn launch_request_deadline_ms(
+    conn: &rusqlite::Connection,
+    deployment: &str,
+    instance: u32,
+) -> Result<Option<i64>, LifecycleError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT s.step_json FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+               JOIN runtime_bindings b ON b.id=s.binding_id
+              WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released'",
+            params![deployment, instance],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let plan: Plan = decode(&raw)?;
+    let e = decode_effective_snapshot(&plan.effective_json)
+        .map_err(|_| LifecycleError::CorruptStoredData)?;
+    Ok(Some(e.request_deadline_ms))
+}
+
 impl crate::Store {
     /// ADR 0018 §4: the longest span, from acceptance, an ordinary stop of this
     /// instance's runtime accepts as its deadline (the launch's frozen request
@@ -654,23 +681,7 @@ impl crate::Store {
         deployment: &str,
         instance: u32,
     ) -> Result<Option<i64>, LifecycleError> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT s.step_json FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
-                   JOIN runtime_bindings b ON b.id=s.binding_id
-                  WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released'",
-                params![deployment, instance],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let plan: Plan = decode(&raw)?;
-        let e = decode_effective_snapshot(&plan.effective_json)
-            .map_err(|_| LifecycleError::CorruptStoredData)?;
-        Ok(Some(e.request_deadline_ms))
+        launch_request_deadline_ms(&self.conn, deployment, instance)
     }
 
     /// Observation-only exact history, checked before current worker admission.
@@ -720,6 +731,59 @@ impl crate::Store {
             revision,
             key,
             deadline,
+        )
+    }
+
+    /// SPEC §4.3, §6: the deadline an explicit drain's Stop of one instance
+    /// carries. The operator's drain names one bound for the whole host, but an
+    /// operation's deadline may not lie beyond its request deadline, which the
+    /// instance's launch froze (a Stop past it is refused as a conflict). So the
+    /// Stop takes the earlier of the drain's `bound` and `now` plus that request
+    /// deadline.
+    ///
+    /// SPEC §13: a Stop already accepted under `key` for this instance answers
+    /// with the deadline it was accepted with, so a retried drain sends the
+    /// exact request again and replays its receipt instead of conflicting with
+    /// it. An instance holding no launch keeps the drain's own bound; its stop
+    /// has nothing to stop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drain_stop_deadline(
+        &self,
+        s: &CoordinatorSession,
+        principal: &str,
+        deployment: &str,
+        instance: u32,
+        key: &str,
+        now: i64,
+        bound: i64,
+    ) -> Result<i64, LifecycleError> {
+        if now < 0 || bound <= 0 {
+            return Err(LifecycleError::Invalid);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        check_session(&tx, s)?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT response_json FROM command_receipts WHERE principal_id=?1 AND command_scope=?2 AND idempotency_key=?3",
+                params![principal, instance_scope(deployment, instance), key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = prior {
+            if raw.len() > 1 << 20 {
+                return Err(LifecycleError::CorruptStoredData);
+            }
+            // Both instance Stop receipts (unarmed and cleanup) record it.
+            return serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|receipt| receipt["deadline_ms"].as_i64())
+                .ok_or(LifecycleError::CorruptStoredData);
+        }
+        Ok(
+            match launch_request_deadline_ms(&tx, deployment, instance)? {
+                Some(window) => bound.min(now.saturating_add(window)),
+                None => bound,
+            },
         )
     }
 
