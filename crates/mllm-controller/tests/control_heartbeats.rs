@@ -366,6 +366,8 @@ struct SilentController {
     ask_heartbeats: bool,
     sessions: AtomicUsize,
     beats: Arc<AtomicUsize>,
+    /// Inventory reports whose every domain was unobserved (`-1`).
+    unobserved: Arc<AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -381,6 +383,7 @@ impl AgentControl for SilentController {
         let controller_id = self.controller_id.clone();
         let ask = self.ask_heartbeats;
         let beats = self.beats.clone();
+        let unobserved = self.unobserved.clone();
         tokio::spawn(async move {
             while let Ok(Some(frame)) = incoming.message().await {
                 match frame.msg {
@@ -399,6 +402,12 @@ impl AgentControl for SilentController {
                     }
                     Some(agent_to_server::Msg::Heartbeat(_)) => {
                         beats.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some(agent_to_server::Msg::ReportInventory(inventory))
+                        if !inventory.domains.is_empty()
+                            && inventory.domains.iter().all(|d| d.available_bytes == -1) =>
+                    {
+                        unobserved.fetch_add(1, Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -419,6 +428,18 @@ async fn run_agent_against(
     tokio::task::JoinHandle<()>,
     Dirs,
 ) {
+    run_agent_with(ask_heartbeats, None).await
+}
+
+async fn run_agent_with(
+    ask_heartbeats: bool,
+    execution: Option<Arc<dyn mllm_agent::session::SessionExecution>>,
+) -> (
+    Arc<SilentController>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+    Dirs,
+) {
     let Enrolled {
         authority,
         identity,
@@ -433,6 +454,7 @@ async fn run_agent_against(
         ask_heartbeats,
         sessions: AtomicUsize::new(0),
         beats: Arc::new(AtomicUsize::new(0)),
+        unobserved: Arc::new(AtomicUsize::new(0)),
     });
     let listener = listener.unwrap();
     let service = AgentControlServer::from_arc(controller.clone());
@@ -448,11 +470,12 @@ async fn run_agent_against(
     let journal = HostJournal::open(journal_dir.path(), &identity.controller_id(), &host).unwrap();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let _ = mllm_agent::session::run_session(
+        let _ = mllm_agent::session::run_session_with_execution(
             &identity,
             journal,
             pb::ReportInventory::default(),
             shutdown,
+            execution,
         )
         .await;
     });
@@ -506,6 +529,78 @@ async fn an_agent_keeps_a_quiet_session_with_a_controller_without_heartbeats() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(controller.sessions.load(Ordering::SeqCst), 1);
     assert_eq!(controller.beats.load(Ordering::SeqCst), 0);
+    stop.send(true).unwrap();
+    server.abort();
+}
+
+/// A host whose one device domain is read through the cached GPU sampler, as
+/// the native host reads it, from a collector that hangs until released.
+struct HungGpuHost {
+    gpu: Arc<mllm_agent::gpu_memory::CachedGpuSampler>,
+}
+
+impl mllm_agent::session::SessionExecution for HungGpuHost {
+    fn execute(
+        &self,
+        _session: u64,
+        _command: mllm_protocol::execution::MemberCommand,
+    ) -> mllm_agent::session::ExecutionFuture {
+        Box::pin(async { Err(mllm_agent::session::SessionError) })
+    }
+    fn inventory(&self) -> Option<pb::ReportInventory> {
+        let observed = self
+            .gpu
+            .current()
+            .and_then(|sample| sample.devices.first()?.memory.clone());
+        let (available, capacity) =
+            observed.map_or((-1, -1), |memory| (memory.free_bytes, memory.total_bytes));
+        Some(pb::ReportInventory {
+            domains: vec![pb::DomainObservation {
+                domain_id: "gpu0".into(),
+                kind: "device".into(),
+                observed_bytes: available,
+                available_bytes: available,
+                capacity_bytes: capacity,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+}
+
+// T33 T26 (controller ruling, discrete GPU): device memory is sampled off the
+// session loop. A collector that hangs far longer than the heartbeat period
+// never delays a heartbeat (5 s of silence suspends the host); the device is
+// reported unobserved meanwhile instead of the loop waiting for it.
+#[tokio::test]
+async fn a_hung_gpu_collector_never_delays_heartbeats() {
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    let host = Arc::new(HungGpuHost {
+        gpu: mllm_agent::gpu_memory::CachedGpuSampler::new(Arc::new(move || {
+            gate.lock().unwrap().recv().ok()?;
+            None
+        })),
+    });
+    let (controller, stop, server, _dirs) = run_agent_with(true, Some(host)).await;
+    eventually(Duration::from_secs(5), || {
+        controller.beats.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    let (beats, unobserved) = (
+        controller.beats.load(Ordering::SeqCst),
+        controller.unobserved.load(Ordering::SeqCst),
+    );
+    // Six 250 ms periods while the collector stays hung.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let sent = controller.beats.load(Ordering::SeqCst) - beats;
+    assert!(sent >= 4, "{sent} heartbeats in 1.5 s");
+    assert!(
+        controller.unobserved.load(Ordering::SeqCst) - unobserved >= 2,
+        "the device is reported unobserved while the collector hangs"
+    );
+    assert_eq!(controller.sessions.load(Ordering::SeqCst), 1);
+    release.send(()).unwrap();
     stop.send(true).unwrap();
     server.abort();
 }

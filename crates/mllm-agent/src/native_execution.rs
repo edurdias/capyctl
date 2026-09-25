@@ -107,8 +107,9 @@ pub struct NativeHostExecution {
     /// document states no usable store, which refuses every request.
     sources: Option<Arc<crate::sources::SourceStore>>,
     /// SPEC §7.2 / ADR 0019: where a device domain's memory is read from. It
-    /// runs only when the accepted policy declares a device domain.
-    gpu: Option<Arc<crate::gpu_memory::GpuSampler>>,
+    /// runs only when the accepted policy declares a device domain, off the
+    /// session loop, so a slow collector never delays a heartbeat.
+    gpu: Option<Arc<crate::gpu_memory::CachedGpuSampler>>,
 }
 
 /// How long a pre-admission stands for the locked recheck.
@@ -173,7 +174,7 @@ impl NativeHostExecution {
                     Some(config.state_dir.join("secrets")),
                 )
             });
-        Arc::new(Self {
+        let this = Arc::new(Self {
             sources,
             load,
             journal,
@@ -190,8 +191,22 @@ impl NativeHostExecution {
             residency: None,
             rendezvous: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            gpu: Some(Arc::new(crate::gpu_memory::sample)),
-        })
+            gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
+                crate::gpu_memory::sample,
+            ))),
+        });
+        this.prime_gpu();
+        this
+    }
+
+    /// Start the first device sample on a host that declares a device
+    /// domain, so the session's first inventory is likely to carry it. A
+    /// unified host never runs the collector.
+    fn prime_gpu(&self) {
+        let declared = !device_domains(&self.profiles.accepted().config.document).is_empty();
+        if let Some(gpu) = self.gpu.as_ref().filter(|_| declared) {
+            let _ = gpu.current();
+        }
     }
 
     /// SPEC §13.2: run the slow half of a command's admission outside the
@@ -256,7 +271,8 @@ impl NativeHostExecution {
         mut self: Arc<Self>,
         sampler: Arc<crate::gpu_memory::GpuSampler>,
     ) -> Arc<Self> {
-        Arc::make_mut(&mut self).gpu = Some(sampler);
+        Arc::make_mut(&mut self).gpu = Some(crate::gpu_memory::CachedGpuSampler::new(sampler));
+        self.prime_gpu();
         self
     }
     /// ADR 0018 §3: the host's runtime profile sets, shared with the live
@@ -1518,8 +1534,10 @@ impl SessionExecution for NativeHostExecution {
             .collect();
         if !device.is_empty() {
             // One sample for every device domain, taken only on a host that
-            // declares one. A failed sample leaves every device unobserved.
-            let sample = self.gpu.as_ref().and_then(|sampler| sampler());
+            // declares one. A failed, hung or stale sample leaves every device
+            // unobserved; this refresh runs on the session loop and never
+            // waits for the collector (heartbeats share that loop).
+            let sample = self.gpu.as_ref().and_then(|sampler| sampler.current());
             for i in device {
                 let domain = &mut inventory.domains[i];
                 let observed = devices[&domain.domain_id].and_then(|index| {

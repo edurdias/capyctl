@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The bound on one `nvidia-smi` run.
@@ -68,6 +69,85 @@ impl GpuShapeError {
 }
 
 pub type GpuSampler = dyn Fn() -> Option<GpuSample> + Send + Sync;
+
+/// How often a cached reading is refreshed when it is asked for: the load
+/// report period (D9), the cadence the host already reports at.
+pub const REFRESH: Duration = crate::load::DEFAULT_LOAD_INTERVAL;
+/// A cached sample older than this is not reported: its device is unobserved.
+pub const MAX_AGE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct CacheState {
+    /// When the last collector run finished, and what it found.
+    last: Option<(Instant, Option<GpuSample>)>,
+    running: bool,
+}
+
+/// SPEC §7.2 / ADR 0019: the last GPU sample, refreshed off the caller's
+/// thread. The host session reads device memory from here on every
+/// observation tick, and a collector bounded at [`BOUND`] (or one that hangs)
+/// must never hold that loop: a delayed heartbeat suspends the host (5 s).
+/// A reading never waits; with no fresh sample the device is unobserved,
+/// which closes admission on its domain.
+pub struct CachedGpuSampler {
+    state: Mutex<CacheState>,
+    sample: Arc<GpuSampler>,
+    refresh: Duration,
+    max_age: Duration,
+}
+
+impl CachedGpuSampler {
+    /// A cache over `sample` with the default bounds.
+    pub fn new(sample: Arc<GpuSampler>) -> Arc<Self> {
+        Self::with_bounds(sample, REFRESH, MAX_AGE)
+    }
+
+    /// A cache over `sample`, refreshed when older than `refresh` and
+    /// reported only while younger than `max_age`.
+    pub fn with_bounds(sample: Arc<GpuSampler>, refresh: Duration, max_age: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::default(),
+            sample,
+            refresh,
+            max_age,
+        })
+    }
+
+    /// The latest sample no older than the maximum age. Never blocks: when
+    /// the sample is due, one collector run starts in the background (at
+    /// most one at a time) and a later call reports what it found.
+    pub fn current(self: &Arc<Self>) -> Option<GpuSample> {
+        let mut state = self.state.lock().ok()?;
+        let due = state
+            .last
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= self.refresh);
+        if due && !state.running {
+            state.running = true;
+            let this = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("mllm-gpu-memory".into())
+                .spawn(move || {
+                    // A panicking collector is a failed sample.
+                    let sample =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (this.sample)()))
+                            .ok()
+                            .flatten();
+                    if let Ok(mut state) = this.state.lock() {
+                        state.last = Some((Instant::now(), sample));
+                        state.running = false;
+                    }
+                });
+            if spawned.is_err() {
+                state.running = false;
+            }
+        }
+        match &state.last {
+            Some((at, sample)) if at.elapsed() < self.max_age => sample.clone(),
+            _ => None,
+        }
+    }
+}
 
 /// A MiB field in bytes; `Ok(None)` when the device has no memory of its own.
 fn mib(field: &str) -> Result<Option<i64>, ()> {
@@ -324,5 +404,77 @@ mod tests {
         ] {
             assert!(parse_query_gpu(&bad, 1).is_none(), "refused: {bad:.60}");
         }
+    }
+
+    // T33 T26: reading the cached sample never waits on the collector. A
+    // collector that hangs past the heartbeat period is not waited for: the
+    // reading is unobserved until a sample lands, and a sample that stops
+    // being refreshed ages out to unobserved rather than standing.
+    #[test]
+    fn a_hung_collector_never_blocks_a_reading() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let row = "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 1500, 14876\n";
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let cache = CachedGpuSampler::with_bounds(
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Blocks until the test releases it, far past a heartbeat.
+                gate.lock().unwrap().recv().ok()?;
+                parse_query_gpu(row, 1_000)
+            }),
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+        );
+        let started = Instant::now();
+        assert!(cache.current().is_none(), "nothing sampled yet");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(cache.current().is_none(), "still hung: unobserved");
+        assert!(started.elapsed() < Duration::from_millis(400) + Duration::from_millis(200));
+        // One collector at a time, however often it is asked.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = cache.current();
+        while seen.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            seen = cache.current();
+        }
+        assert_eq!(seen.expect("the sample lands").devices.len(), 1);
+        // The next refresh hangs; the landed sample ages out.
+        std::thread::sleep(Duration::from_millis(500));
+        let asked = Instant::now();
+        assert!(cache.current().is_none(), "a stale sample is unobserved");
+        assert!(asked.elapsed() < Duration::from_millis(50));
+        release.send(()).unwrap();
+    }
+
+    // T26: a failed sample reports unobserved at once, not the one before it.
+    #[test]
+    fn a_failed_sample_replaces_the_last_reading() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let row = "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 1500, 14876\n";
+        let fail = Arc::new(AtomicBool::new(false));
+        let failing = fail.clone();
+        let cache = CachedGpuSampler::with_bounds(
+            Arc::new(move || {
+                (!failing.load(Ordering::SeqCst))
+                    .then(|| parse_query_gpu(row, 1_000))
+                    .flatten()
+            }),
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+        );
+        let until = |want: bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cache.current().is_some() != want {
+                assert!(Instant::now() < deadline, "never became {want}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        until(true);
+        fail.store(true, Ordering::SeqCst);
+        until(false);
     }
 }
