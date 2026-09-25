@@ -1029,11 +1029,22 @@ pub fn resolve_effective_with_checkpoint(
     if let Some(resources) = &declared_resources {
         core::check_system_allocation(resources, &host)?;
     }
+    // ADR 0014 §5: an explicit Ready phase states the memory request. On a
+    // discrete host (controller ruling, discrete GPU design §6) that is the
+    // device allocation alone: the request sizes the engine on the card (vLLM's
+    // utilization, SGLang's static fraction), and the system allocation beside
+    // it is the engine process's host RAM, which the card does not hold.
     let declared_ready_total = declared_resources.as_ref().map(|resources| {
-        resources
-            .ready
-            .allocations
+        let on_device = |domain: &str| {
+            host.domains
+                .get(domain)
+                .is_some_and(|policy| policy.memory == DomainMemory::Device)
+        };
+        let ready = &resources.ready.allocations;
+        let discrete = ready.iter().any(|a| on_device(&a.domain));
+        ready
             .iter()
+            .filter(|a| !discrete || on_device(&a.domain))
             .fold(0_i64, |total, a| total.saturating_add(a.bytes))
     });
     let mut engine_config = engine_config::normalize_engine_config(

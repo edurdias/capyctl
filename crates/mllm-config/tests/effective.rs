@@ -1502,6 +1502,27 @@ fn deployment_with_resources(domain: &str) -> serde_json::Value {
     d
 }
 
+/// The fixture deployment with explicit resources on a discrete host: the card
+/// holds 12 GiB when Ready (room for the 8 GiB checkpoint and the 4 GiB KV
+/// cache, controller ruling: the request is the device allocation), and host
+/// RAM holds `system` in every phase.
+fn deployment_with_discrete_resources(system: &str) -> serde_json::Value {
+    let mut d = deployment_with_resources("gpu0");
+    for (phase, device) in [
+        ("cold", "14GiB"),
+        ("ready", "12GiB"),
+        ("parking", "12GiB"),
+        ("parked", "2GiB"),
+        ("wake", "14GiB"),
+    ] {
+        d["resources"][phase]["allocations"] = serde_json::json!([
+            {"domain": "gpu0", "bytes": device, "host_kv_bytes": "0B"},
+            {"domain": "system", "bytes": system, "host_kv_bytes": "0B"}
+        ]);
+    }
+    d
+}
+
 /// A discrete host with two GPUs, each its own device domain (owner decision 3).
 fn two_gpu_host() -> serde_json::Value {
     let mut h = discrete_host();
@@ -1653,14 +1674,39 @@ fn discrete_refusals_are_typed() {
 // T26: explicit resources naming both domains resolve on a discrete host.
 #[test]
 fn explicit_resources_naming_both_domains_resolve() {
-    let mut d = deployment_with_resources("gpu0");
-    for phase in d["resources"].as_object_mut().unwrap().values_mut() {
-        phase["allocations"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({"domain": "system", "bytes": "4GiB", "host_kv_bytes": "0B"}));
-    }
+    let d = deployment_with_discrete_resources("4GiB");
     resolve(&d, &discrete_host()).expect("both domains named");
+}
+
+// T26 (controller ruling): explicit resources on a discrete host size the engine
+// from the device allocation alone. The memory request is what the engine may
+// use on the card (vLLM's utilization, SGLang's static fraction); the system
+// allocation beside it is host RAM the engine process holds, and adding it
+// would ask the card for memory it does not have.
+#[test]
+fn explicit_discrete_resources_size_the_engine_from_the_device_allocation() {
+    let mut d = deployment_with_discrete_resources("4GiB");
+    let resolved = resolve(&d, &discrete_host()).expect("both domains named");
+    assert_eq!(resolved.engine_config.memory().request_bytes, 12 << 30);
+    assert_eq!(
+        resolved.ready_device_allocation(),
+        Some((Some(0), 12 << 30))
+    );
+    // A declared request must match the device allocation, not the sum.
+    d["engine_config"]["memory"]["request"] = "12GiB".into();
+    resolve(&d, &discrete_host()).expect("the device allocation");
+    d["engine_config"]["memory"]["request"] = "16GiB".into();
+    assert!(resolve(&d, &discrete_host()).is_err());
+    // A unified host keeps the whole Ready total.
+    let (unified, host) = fixture();
+    assert_eq!(
+        resolve_effective(&unified, &host)
+            .unwrap()
+            .engine_config
+            .memory()
+            .request_bytes,
+        8 << 30
+    );
 }
 
 // T26: a discrete host whose policy has no single distinct system domain cannot
@@ -1701,14 +1747,8 @@ fn host_backed_is_refused_when_the_system_domain_has_no_room_for_the_copy() {
     // Deep parks no copy, so the same host takes it.
     resolve(&deployment_with("deep", "vllm", "10GiB"), &h).expect("deep keeps no copy");
     // Explicit resources are held to the same rule.
-    let mut d = deployment_with_resources("gpu0");
+    let mut d = deployment_with_discrete_resources("12GiB");
     d["residency"] = "host_backed".into();
-    for phase in d["resources"].as_object_mut().unwrap().values_mut() {
-        phase["allocations"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({"domain": "system", "bytes": "12GiB", "host_kv_bytes": "0B"}));
-    }
     let e = resolve(&d, &h).unwrap_err();
     assert!(e.detail.starts_with("host_backed_unavailable:"), "{e}");
 }
