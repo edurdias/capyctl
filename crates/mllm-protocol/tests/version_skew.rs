@@ -312,6 +312,7 @@ fn every_post_baseline_field_names_its_capability() {
             INSTANCE_INDEX,
             RESTORE_CHECKPOINT_DIGEST,
             TERMINATE_RECORDED_PROCESSES,
+            LIVE_PROFILE_UPDATE,
         ]
         .contains(name)
         {
@@ -457,4 +458,48 @@ fn a_connect_declaration_is_bounded() {
     assert!(capabilities::declared(&connect)
         .unwrap()
         .contains("future_feature"));
+}
+
+// T34 (ADR 0018 §3): live profile updates are a server-to-host capability
+// that every current agent declares and the server advertises back; the new
+// messages are additive and an absent SessionReady list encodes as before.
+#[test]
+fn live_profile_update_is_declared_both_ways() {
+    use capabilities::*;
+    assert!(CATALOGUE.contains(&(LIVE_PROFILE_UPDATE, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&LIVE_PROFILE_UPDATE.to_owned()));
+    assert_eq!(server_capabilities(), vec![LIVE_PROFILE_UPDATE.to_owned()]);
+    let before = pb::SessionReady {
+        controller_id: "c".into(),
+        session_id: "s".into(),
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    assert_eq!(before.encode_to_vec(), after.encode_to_vec());
+    after.capabilities = server_capabilities();
+    assert!(after.encode_to_vec().len() > before.encode_to_vec().len());
+    let publish = pb::AgentToServer {
+        msg: Some(pb::agent_to_server::Msg::PublishProfiles(
+            pb::PublishProfiles {
+                request_id: "01J00000000000000000000001".into(),
+                inventory: Some(pb::ReportInventory::default()),
+            },
+        )),
+    };
+    let decoded = pb::AgentToServer::decode(publish.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, publish);
+    let retire = pb::ServerToAgent {
+        msg: Some(pb::server_to_agent::Msg::ProfileRetirement(
+            pb::ProfileRetirement {
+                request_id: "r".into(),
+                outcome: "in_use".into(),
+                deployments: vec!["q14".into()],
+                reason: String::new(),
+            },
+        )),
+    };
+    assert_eq!(
+        pb::ServerToAgent::decode(retire.encode_to_vec().as_slice()).unwrap(),
+        retire
+    );
 }

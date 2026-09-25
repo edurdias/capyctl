@@ -1192,7 +1192,7 @@ impl AgentSessions {
                                 eprintln!("host {host} control session {id}: the host sends no heartbeats; a frozen host is detected only when its session is lost");
                                 (0, 0)
                             };
-                            send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::SessionReady(pb::SessionReady { controller_id: self.authority.controller_id(), session_id: id.clone(), heartbeat_interval_ms, heartbeat_lost_after_ms })) }).await.map_err(|status| *status)?;
+                            send_reply(&outgoing, pb::ServerToAgent { msg: Some(server_to_agent::Msg::SessionReady(pb::SessionReady { controller_id: self.authority.controller_id(), session_id: id.clone(), heartbeat_interval_ms, heartbeat_lost_after_ms, capabilities: Vec::new() })) }).await.map_err(|status| *status)?;
                         }
                     }
                 }
