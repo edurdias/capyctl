@@ -1225,6 +1225,7 @@ name = "mllm-config"
 version = "0.1.0-rc.4"
 dependencies = [
  "hex",
+ "libc",
  "mllm-domain",
  "regex",
  "saphyr-parser",

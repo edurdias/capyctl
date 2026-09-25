@@ -15,3 +15,4 @@ mllm-domain = { path = "../mllm-domain" }
 regex = "1"
 saphyr-parser = "0.0.12"
 tempfile = { workspace = true }
+libc = "0.2"

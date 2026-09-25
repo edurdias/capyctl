@@ -987,9 +987,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 )
                 .await
             } else {
-                serve_host(
-                    HostConfig::parse(&source).map_err(|_| error("Invalid host configuration"))?,
-                )
+                // ADR 0018 §2: the host document merged with `engines.yaml`
+                // beside it; the file itself was already read above for the
+                // size and existence checks.
+                serve_host(HostConfig::load(&path).map_err(|e| {
+                    error(&format!(
+                        "Invalid host configuration: {}: {}",
+                        e.path, e.detail
+                    ))
+                })?)
                 .await
             }
         }
@@ -998,8 +1004,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 .config
                 .clone()
                 .unwrap_or_else(|| implicit(root, "host"));
-            let config = HostConfig::parse(&read_config(&path)?)
-                .map_err(|_| error("Invalid host configuration"))?;
+            // ADR 0018 §2: `read_config` keeps the existing size/existence
+            // checks; the host document is loaded merged with `engines.yaml`.
+            read_config(&path)?;
+            let config = HostConfig::load(&path).map_err(|e| {
+                error(&format!(
+                    "Invalid host configuration: {}: {}",
+                    e.path, e.detail
+                ))
+            })?;
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery

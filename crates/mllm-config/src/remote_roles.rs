@@ -474,4 +474,21 @@ impl HostConfig {
         }))
         .expect("serializable role template")
     }
+    /// ADR 0018 §2: the host document at `path` with the engines registered
+    /// beside it (`engines.yaml`) merged in. The file itself is never
+    /// rewritten; a profile name declared in both is refused.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            ConfigError::new(
+                ConfigErrorCode::Io,
+                path.display().to_string(),
+                e.to_string(),
+            )
+        })?;
+        let mut document = crate::parse_strict(crate::ConfigKind::Host, &text)?;
+        let engines =
+            crate::registration::EnginesFile::load(&crate::registration::engines_beside(path))?;
+        crate::registration::merge_into_host(&mut document, &engines)?;
+        Self::parse(&document.to_string())
+    }
 }
