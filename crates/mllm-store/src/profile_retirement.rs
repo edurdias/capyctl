@@ -326,6 +326,25 @@ impl Store {
             .optional()?)
     }
 
+    /// When the retirement under `key` was first written, and its deadline.
+    /// Both are fixed for its life, so a retried retirement derives the same
+    /// stop requests from them.
+    pub fn profile_retirement_span(
+        &self,
+        host: &str,
+        profile: &str,
+        key: &str,
+    ) -> Result<Option<(i64, i64)>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT recorded_at_ms, deadline_ms FROM profile_retirements WHERE host_id=?1 AND profile=?2 AND retire_key=?3",
+                params![host, profile, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// ADR 0018 §4 (owner decision 2026-09-25): a retirement abandoned past its
     /// deadline (a server that stopped mid-removal) ends unconfirmed, so it
     /// cannot hold a profile out of placement for ever. Returns what ended.

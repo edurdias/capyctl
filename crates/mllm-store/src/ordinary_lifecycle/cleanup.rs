@@ -645,6 +645,34 @@ fn retained(
 }
 
 impl crate::Store {
+    /// ADR 0018 §4: the longest span, from acceptance, an ordinary stop of this
+    /// instance's runtime accepts as its deadline (the launch's frozen request
+    /// deadline; a longer one is refused). `None` when the instance holds no
+    /// runtime launched through the ordinary path. A read only.
+    pub fn instance_stop_window_ms(
+        &self,
+        deployment: &str,
+        instance: u32,
+    ) -> Result<Option<i64>, LifecycleError> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT s.step_json FROM lifecycle_steps s JOIN operations o ON o.id=s.operation_id
+                   JOIN runtime_bindings b ON b.id=s.binding_id
+                  WHERE s.deployment_id=?1 AND b.instance_index=?2 AND o.kind='initialize' AND b.state!='released'",
+                params![deployment, instance],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let plan: Plan = decode(&raw)?;
+        let e = decode_effective_snapshot(&plan.effective_json)
+            .map_err(|_| LifecycleError::CorruptStoredData)?;
+        Ok(Some(e.request_deadline_ms))
+    }
+
     /// Observation-only exact history, checked before current worker admission.
     pub fn ordinary_stop_command_receipt(
         &self,
