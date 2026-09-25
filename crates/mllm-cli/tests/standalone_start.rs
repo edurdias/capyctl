@@ -526,3 +526,104 @@ async fn a_model_larger_than_the_card_is_refused_at_deploy() {
         "nothing is stored"
     );
 }
+
+/// Controller ruling (design §3): the KV cache the operator stated with
+/// `MLLM_KV_CACHE_BYTES` is honoured on a discrete host when it fits the card
+/// with the checkpoint, and refused at deploy with the numbers and the
+/// variable when it does not; it is never silently replaced by the template's.
+// T26
+#[tokio::test]
+async fn a_discrete_standalone_honours_a_declared_kv_cache() {
+    let dir = safe_state_dir();
+    let store = store_with_checkpoint(3 << 30);
+    let app = support::try_boot_discrete_with_kv(
+        dir.path(),
+        discrete_card,
+        store.path(),
+        true,
+        Some("2GiB"),
+    )
+    .await
+    .expect("a discrete host boots");
+    let id = app
+        .deploy("m", ModelSource::Local { path: "m".into() })
+        .expect("a 2 GiB KV cache fits the card beside a 3 GiB checkpoint");
+    let effective = app
+        .store
+        .effective_configuration(&id)
+        .unwrap()
+        .expect("the deployment has an effective revision")
+        .effective;
+    assert_eq!(
+        effective["engine_config"]["memory"]["kv_cache_bytes"],
+        2_i64 << 30,
+        "{effective}"
+    );
+    let _ = app.shutdown().await;
+
+    let dir = safe_state_dir();
+    let app = support::try_boot_discrete_with_kv(
+        dir.path(),
+        discrete_card,
+        store.path(),
+        true,
+        Some("14GiB"),
+    )
+    .await
+    .expect("a discrete host boots");
+    let error = app
+        .deploy("m", ModelSource::Local { path: "m".into() })
+        .expect_err("a 14 GiB KV cache does not fit a 16 GB card beside the weights");
+    let text = error.to_string();
+    assert!(text.contains("MLLM_KV_CACHE_BYTES"), "{text}");
+    let structured = mllm_cli::output::StructuredError::from(error);
+    assert_eq!(structured.code, "insufficient_device_memory");
+    assert_eq!(
+        app.store.deployment_count().unwrap(),
+        0,
+        "nothing is stored"
+    );
+}
+
+/// Controller ruling: a Hugging Face source is not refused on a discrete host
+/// for being remote. Standalone decides it exactly as a unified host does, by
+/// the host's own `model_sources` policy (which standalone does not opt in to
+/// today); the sizing never refuses it. On a host that allows the source the
+/// template states the KV cache alone and the revision is sized once the
+/// download is measured (`standalone_config` tests).
+// T26
+#[tokio::test]
+async fn a_discrete_standalone_treats_a_remote_source_as_a_unified_one_does() {
+    let source = || ModelSource::HuggingFace {
+        repo: "org/model".into(),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        files: vec![],
+        token_ref: None,
+    };
+    let outcome = |result: Result<String, mllm_cli::roles::StartError>| {
+        result.map(|_| ()).map_err(|error| {
+            assert!(
+                !error.to_string().contains("sized"),
+                "a remote source is not refused for its size: {error}"
+            );
+            assert!(
+                error.to_string().contains("model_sources"),
+                "only the host's source policy decides: {error}"
+            );
+            mllm_cli::output::StructuredError::from(error).code
+        })
+    };
+    let dir = safe_state_dir();
+    let store = store_with_checkpoint(3 << 30);
+    let discrete = support::try_boot_discrete(dir.path(), discrete_card, store.path(), true)
+        .await
+        .expect("a discrete host boots");
+    let on_discrete = outcome(discrete.deploy("m", source()));
+    let _ = discrete.shutdown().await;
+    let dir = safe_state_dir();
+    let unified = support::try_boot_with_gpu(dir.path(), || None)
+        .await
+        .expect("a host without a GPU boots");
+    let on_unified = outcome(unified.deploy("m", source()));
+    assert_eq!(on_discrete, on_unified);
+}

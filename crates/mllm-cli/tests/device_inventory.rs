@@ -45,6 +45,7 @@ fn installation() -> EngineInstallation {
         executable: "/opt/venv/bin/python3".into(),
         build_fingerprint: "0.5.20".into(),
         engine_config: serde_json::json!({"memory": {"kv_cache": "16GiB"}}),
+        kv_cache_declared: false,
         deep_park: true,
         trust_remote_code: false,
         models_root: "/srv/models".into(),

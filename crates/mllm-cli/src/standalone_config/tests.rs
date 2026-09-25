@@ -57,6 +57,7 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         executable: executable.into(),
         build_fingerprint: "fp-1".into(),
         engine_config: mllm_testkit::vllm_engine_config_json(),
+        kv_cache_declared: false,
         deep_park: false,
         trust_remote_code: false,
         models_root: "/srv/models".into(),
@@ -1242,8 +1243,9 @@ fn a_discrete_template_states_a_request_and_derives_phases() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
         device_total: 16376 << 20,
-        weights_bytes: 8 << 30,
+        weights_bytes: Some(8 << 30),
         system_parked_limit: 15 << 30,
+        kv_cache_bytes: None,
     };
     let doc = deployment_document(
         "a",
@@ -1304,8 +1306,9 @@ fn a_model_larger_than_the_device_is_refused() {
     let memory = TemplateMemory::Device {
         managed_limit: 15 << 30,
         device_total: 16376 << 20,
-        weights_bytes: 16 << 30,
+        weights_bytes: Some(16 << 30),
         system_parked_limit: 15 << 30,
+        kv_cache_bytes: None,
     };
     let error = deployment_document(
         "a",
@@ -1382,8 +1385,9 @@ fn the_discrete_template_resolves_and_fits_the_card() {
             &TemplateMemory::Device {
                 managed_limit: limits.managed_limit,
                 device_total: gpu.total_bytes,
-                weights_bytes: 8 * GIB,
+                weights_bytes: Some(8 * GIB),
                 system_parked_limit: system_parked,
+                kv_cache_bytes: None,
             },
             DEFAULT_REQUEST_DEADLINE,
             deep_park,
@@ -1419,5 +1423,175 @@ fn the_discrete_template_resolves_and_fits_the_card() {
                 }
             }
         }
+    }
+}
+
+fn hugging_face() -> ModelSource {
+    ModelSource::HuggingFace {
+        repo: "org/model".into(),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        files: vec![],
+        token_ref: None,
+    }
+}
+
+/// The discrete host this module publishes for one 16 GB card, opted in to
+/// Hugging Face sources (ADR 0008).
+fn discrete_host_allowing_sources(engine: Engine) -> serde_json::Value {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let mut host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    host["runtime_profiles"]["local"]["engine"] = engine_name(engine).into();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
+    host["model_sources"] = serde_json::json!({"huggingface": "allowed", "max_bytes": "100GiB"});
+    host
+}
+
+fn card_memory(weights_bytes: Option<i64>, kv_cache_bytes: Option<i64>) -> TemplateMemory {
+    let gpu = rtx(0, 16376, 1536).memory.unwrap();
+    TemplateMemory::Device {
+        managed_limit: device_limits(&gpu, MAX_PARKED).managed_limit,
+        device_total: gpu.total_bytes,
+        weights_bytes,
+        system_parked_limit: 61 * GIB / 100 * PARKED_FRACTION,
+        kv_cache_bytes,
+    }
+}
+
+// T26 (controller ruling): a Hugging Face or HTTP source works on a discrete
+// host. Its weights are known only once downloaded, so the template states the
+// KV cache alone and parks deep (a host-RAM copy cannot be sized yet): the
+// revision is accepted provisional and sized from the checkpoint once the
+// download is measured (ADR 0014 §7), never refused for being remote.
+#[test]
+fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
+    for engine in [Engine::Vllm, Engine::Sglang] {
+        let doc = deployment_document(
+            "a",
+            "a",
+            &hugging_face(),
+            engine,
+            &card_memory(None, None),
+            DEFAULT_REQUEST_DEADLINE,
+            true,
+            "local",
+        )
+        .expect("a remote source is not refused");
+        let kv = device_limits(&rtx(0, 16376, 1536).memory.unwrap(), MAX_PARKED).managed_limit / 4;
+        let kv = kv.min(4 * GIB);
+        assert_eq!(
+            doc["engine_config"]["memory"],
+            serde_json::json!({"kv_cache": format!("{kv}B")})
+        );
+        assert_eq!(doc["residency"], "deep");
+        let host = discrete_host_allowing_sources(engine);
+        let (_, chosen) = mllm_config::instances::device_choices(&doc, &host)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the picker has a GPU");
+        // Not materializable before the download: acceptance freezes it
+        // provisional (the placeholder zero weights resolve).
+        let e = mllm_config::effective::resolve_effective(&chosen, &host).unwrap_err();
+        assert_eq!(
+            e.code,
+            mllm_config::ConfigErrorCode::NotMaterializable,
+            "{e}"
+        );
+        let facts = |weights| mllm_config::effective::CheckpointFacts {
+            weights_bytes: Some(weights),
+            ..Default::default()
+        };
+        mllm_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts(0))
+            .expect("the provisional placeholder");
+        // Measured: sized as a local checkpoint of the same weights is.
+        let sized = mllm_config::effective::resolve_effective_with_checkpoint(
+            &chosen,
+            &host,
+            facts(8 * GIB),
+        )
+        .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
+        let (_, device) = sized.ready_device_allocation().expect("on the card");
+        let gpu = rtx(0, 16376, 1536).memory.unwrap();
+        let (local, _) = device_request(
+            engine,
+            8 * GIB,
+            device_limits(&gpu, MAX_PARKED).managed_limit,
+            gpu.total_bytes,
+        );
+        assert_eq!(device, local, "{engine:?}");
+    }
+    // Without deep parking the tier is restart_only, as for a local checkpoint.
+    let doc = deployment_document(
+        "a",
+        "a",
+        &hugging_face(),
+        Engine::Vllm,
+        &card_memory(None, None),
+        DEFAULT_REQUEST_DEADLINE,
+        false,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(doc["residency"], "restart_only");
+}
+
+// T26 (controller ruling): an operator's MLLM_KV_CACHE_BYTES is honoured on a
+// discrete host within the card, and refused with the numbers and the variable
+// when it cannot fit, never silently replaced by the template's own KV cache.
+#[test]
+fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Sglang,
+        &card_memory(Some(8 * GIB), Some(2 * GIB)),
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(
+        doc["engine_config"]["memory"]["kv_cache"],
+        format!("{}B", 2 * GIB)
+    );
+    assert_eq!(
+        doc["engine_config"]["memory"]["request"],
+        format!("{}B", (8 * GIB) / 100 * 110 + 2 * GIB)
+    );
+    // A remote source states the operator's KV cache too.
+    let remote = deployment_document(
+        "a",
+        "a",
+        &hugging_face(),
+        Engine::Sglang,
+        &card_memory(None, Some(2 * GIB)),
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(
+        remote["engine_config"]["memory"],
+        serde_json::json!({"kv_cache": format!("{}B", 2 * GIB)})
+    );
+    // 8 GiB of weights and a 10 GiB KV cache do not fit a 16 GB card; neither
+    // does a KV cache alone larger than what the card's domain manages.
+    for (weights, kv) in [(Some(8 * GIB), 10 * GIB), (None, 16 * GIB)] {
+        let error = deployment_document(
+            "a",
+            "a",
+            &source(),
+            Engine::Sglang,
+            &card_memory(weights, Some(kv)),
+            DEFAULT_REQUEST_DEADLINE,
+            true,
+            "local",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "insufficient_device_memory");
+        let text = error.to_string();
+        assert!(text.contains("MLLM_KV_CACHE_BYTES"), "{text}");
+        assert!(text.contains(&kv.to_string()), "{text}");
     }
 }

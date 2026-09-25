@@ -301,6 +301,7 @@ pub fn deployment_document(
             device_total,
             weights_bytes,
             system_parked_limit,
+            kv_cache_bytes,
         } => {
             return discrete_document(
                 name,
@@ -312,6 +313,7 @@ pub fn deployment_document(
                     device_total,
                     weights_bytes,
                     system_parked_limit,
+                    kv_cache_bytes,
                 },
                 request_deadline,
                 deep_park,
@@ -386,11 +388,19 @@ pub enum TemplateMemory {
         managed_limit: i64,
         /// The card's total memory, which vLLM's floor is a fraction of.
         device_total: i64,
-        /// ADR 0014 §5: the sum of the checkpoint's weight-file sizes.
-        weights_bytes: i64,
+        /// ADR 0014 §5: the sum of the checkpoint's weight-file sizes. `None`
+        /// for a Hugging Face or HTTP source, whose weights are known only once
+        /// downloaded (controller ruling): the template then states the KV
+        /// cache alone and resolution sizes the request once the checkpoint
+        /// digest measures the weights (ADR 0014 §7).
+        weights_bytes: Option<i64>,
         /// What the system domain holds parked: the smaller of its
         /// `parked_limit` and `managed_limit`.
         system_parked_limit: i64,
+        /// The KV cache the operator stated (`MLLM_KV_CACHE_BYTES`), honoured
+        /// within the card or refused (controller ruling). `None`: sized from
+        /// the card.
+        kv_cache_bytes: Option<i64>,
     },
 }
 
@@ -405,13 +415,23 @@ pub enum TemplateError {
          manages; use a smaller or quantized checkpoint"
     )]
     InsufficientDeviceMemory { request: i64, limit: i64 },
+    /// Controller ruling: the KV cache the operator stated cannot fit the card
+    /// with the checkpoint's weights (or alone), so it is refused rather than
+    /// silently replaced.
+    #[error(
+        "insufficient_device_memory: MLLM_KV_CACHE_BYTES asks for a {kv}-byte KV cache, which \
+         makes a device memory request of {request} bytes, above the {limit} bytes the device \
+         domain manages; lower MLLM_KV_CACHE_BYTES or unset it to size the KV cache from the card"
+    )]
+    DeclaredKvCacheTooLarge { kv: i64, request: i64, limit: i64 },
 }
 
 impl TemplateError {
     /// The structured error code the refusal is reported under.
     pub fn code(&self) -> &'static str {
         match self {
-            TemplateError::InsufficientDeviceMemory { .. } => "insufficient_device_memory",
+            TemplateError::InsufficientDeviceMemory { .. }
+            | TemplateError::DeclaredKvCacheTooLarge { .. } => "insufficient_device_memory",
         }
     }
 }
@@ -426,8 +446,24 @@ pub fn device_request(
     managed_limit: i64,
     device_total: i64,
 ) -> (i64, i64) {
+    device_request_with_kv(engine, weights_bytes, managed_limit, device_total, None)
+}
+
+/// The default KV cache of a discrete template: `min(4 GiB, managed_limit / 4)`.
+pub fn default_device_kv(managed_limit: i64) -> i64 {
     const GIB: i64 = 1 << 30;
-    let kv = (4 * GIB).min(managed_limit / 4);
+    (4 * GIB).min(managed_limit / 4)
+}
+
+/// [`device_request`] with the KV cache the operator stated, when stated.
+pub fn device_request_with_kv(
+    engine: Engine,
+    weights_bytes: i64,
+    managed_limit: i64,
+    device_total: i64,
+    kv_cache_bytes: Option<i64>,
+) -> (i64, i64) {
+    let kv = kv_cache_bytes.unwrap_or_else(|| default_device_kv(managed_limit));
     let request = (weights_bytes / 100).saturating_mul(110).saturating_add(kv);
     // Spec §3: vLLM 0.29 with CUDA graphs starts a 4B model on a 16 GB card
     // only at --gpu-memory-utilization >= 0.75.
@@ -470,7 +506,8 @@ pub fn default_residency(deep_park: bool, discrete: Option<(i64, i64)>) -> &'sta
 pub fn discrete_template_memory(
     gpus: &[mllm_agent::gpu_memory::GpuDevice],
     capacity_bytes: i64,
-    weights_bytes: i64,
+    weights_bytes: Option<i64>,
+    kv_cache_bytes: Option<i64>,
 ) -> Option<TemplateMemory> {
     let largest = gpus
         .iter()
@@ -486,14 +523,16 @@ pub fn discrete_template_memory(
         device_total: largest.total_bytes,
         weights_bytes,
         system_parked_limit,
+        kv_cache_bytes,
     })
 }
 
 struct DiscreteTemplate {
     managed_limit: i64,
     device_total: i64,
-    weights_bytes: i64,
+    weights_bytes: Option<i64>,
     system_parked_limit: i64,
+    kv_cache_bytes: Option<i64>,
 }
 
 /// Design §3: the discrete template states the device memory request and omits
@@ -511,25 +550,87 @@ fn discrete_document(
     deep_park: bool,
     profile: &str,
 ) -> Result<Value, TemplateError> {
-    let (request, kv) = device_request(
-        engine,
-        sizing.weights_bytes,
-        sizing.managed_limit,
-        sizing.device_total,
-    );
-    // Spec §3: a request the device domain can never hold is refused at
-    // deploy, with the numbers, before anything is stored.
-    if request > sizing.managed_limit {
-        return Err(TemplateError::InsufficientDeviceMemory {
+    let too_large = |request: i64| match sizing.kv_cache_bytes {
+        Some(kv) => TemplateError::DeclaredKvCacheTooLarge {
+            kv,
             request,
             limit: sizing.managed_limit,
-        });
-    }
-    let residency = default_residency(
-        deep_park,
-        Some((sizing.weights_bytes, sizing.system_parked_limit)),
+        },
+        None => TemplateError::InsufficientDeviceMemory {
+            request,
+            limit: sizing.managed_limit,
+        },
+    };
+    let Some(weights_bytes) = sizing.weights_bytes else {
+        // Controller ruling: a Hugging Face or HTTP source. Its weights are
+        // known only once downloaded, so the template states the KV cache alone
+        // and resolution sizes the request (and the startup peak) from the
+        // weights the checkpoint digest measures: acceptance freezes the
+        // revision provisional until then (ADR 0014 §7). Without the weights
+        // no host-RAM copy can be sized, so it parks deep.
+        let kv = sizing
+            .kv_cache_bytes
+            .unwrap_or_else(|| default_device_kv(sizing.managed_limit));
+        if kv > sizing.managed_limit {
+            return Err(too_large(kv));
+        }
+        let residency = default_residency(deep_park, None);
+        return Ok(discrete_json(
+            name,
+            route,
+            source,
+            profile,
+            residency,
+            request_deadline,
+            json!({"kv_cache": format!("{kv}B")}),
+        ));
+    };
+    let (request, kv) = device_request_with_kv(
+        engine,
+        weights_bytes,
+        sizing.managed_limit,
+        sizing.device_total,
+        sizing.kv_cache_bytes,
     );
-    Ok(json!({
+    // Spec §3: a request the device domain can never hold is refused at
+    // deploy, with the numbers, before anything is stored. A KV cache the
+    // operator stated is named in the refusal (controller ruling).
+    if request > sizing.managed_limit {
+        return Err(too_large(request));
+    }
+    let residency = default_residency(deep_park, Some((weights_bytes, sizing.system_parked_limit)));
+    Ok(discrete_json(
+        name,
+        route,
+        source,
+        profile,
+        residency,
+        request_deadline,
+        json!({
+            "request": format!("{request}B"),
+            "kv_cache": format!("{kv}B"),
+            // Design §3: the device holds the startup peak in the cold phase.
+            // The engine's use of the card is bounded by the fraction mllm
+            // renders from this request, so the device peak is the request; the
+            // unified placeholder (weights x 1.6 plus a margin) models load
+            // buffers in the one pool, which on a discrete host sit in host RAM,
+            // and would size a 4B model beyond a 16 GB card.
+            "startup": format!("{request}B")
+        }),
+    ))
+}
+
+/// The discrete deployment document around its `engine_config.memory` block.
+fn discrete_json(
+    name: &str,
+    route: &str,
+    source: &ModelSource,
+    profile: &str,
+    residency: &str,
+    request_deadline: &str,
+    memory: Value,
+) -> Value {
+    json!({
         "schema_version": 1,
         "kind": "deployment",
         "name": name,
@@ -548,18 +649,8 @@ fn discrete_document(
         // Discrete GPU design §7: no device is pinned; placement picks the GPU.
         // The key is required by the deployment schema.
         "devices": [],
-        "engine_config": {"memory": {
-            "request": format!("{request}B"),
-            "kv_cache": format!("{kv}B"),
-            // Design §3: the device holds the startup peak in the cold phase.
-            // The engine's use of the card is bounded by the fraction mllm
-            // renders from this request, so the device peak is the request; the
-            // unified placeholder (weights x 1.6 plus a margin) models load
-            // buffers in the one pool, which on a discrete host sit in host RAM,
-            // and would size a 4B model beyond a 16 GB card.
-            "startup": format!("{request}B")
-        }}
-    }))
+        "engine_config": {"memory": memory}
+    })
 }
 
 #[cfg(test)]

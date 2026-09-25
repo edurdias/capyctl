@@ -300,6 +300,7 @@ impl App {
                     gpus,
                     self.capacity_bytes,
                     weights,
+                    declared_kv_cache(&first.installation)?,
                 )
                 .ok_or_else(|| StartError::Deploy("the host publishes no GPU".into()))?
             }
@@ -401,27 +402,43 @@ fn device_totals(shape: &HostShape) -> std::collections::BTreeMap<u32, i64> {
 /// A relative path resolves against the model store (spec §7).
 ///
 /// Design §3: a discrete deployment's device request is sized from these
-/// weights, so a checkpoint that cannot be sized here (a remote source not yet
-/// fetched, a path outside the store, a missing directory) is refused rather
-/// than given a guessed request.
-fn checkpoint_weights(models_root: &Path, source: &ModelSource) -> Result<i64, StartError> {
+/// weights, so a local checkpoint that cannot be sized here (a path outside the
+/// store, a missing directory) is refused rather than given a guessed request.
+/// A Hugging Face or HTTP source is not on disk yet: `None`, and the request is
+/// sized once the download is measured (controller ruling, ADR 0014 §7).
+fn checkpoint_weights(models_root: &Path, source: &ModelSource) -> Result<Option<i64>, StartError> {
     let ModelSource::Local { path } = source else {
-        return Err(StartError::Deploy(
-            "a discrete GPU deployment is sized from its checkpoint's weights; standalone \
-             sizes only a local checkpoint in the model store"
-                .into(),
-        ));
+        return Ok(None);
     };
     let checkpoint = models_root.join(path);
     mllm_agent::checkpoint::CheckpointVerifier::in_memory()
         .size(models_root, &checkpoint)
-        .map(|size| size.weights_bytes)
+        .map(|size| Some(size.weights_bytes))
         .map_err(|error| {
             StartError::Deploy(format!(
                 "the checkpoint at {} could not be sized ({error:?}); a discrete GPU \
                  deployment is sized from its weights",
                 checkpoint.display()
             ))
+        })
+}
+
+/// Controller ruling (discrete GPU design §3): the KV cache the operator stated
+/// with `MLLM_KV_CACHE_BYTES`, which a discrete template honours within the
+/// card or refuses. `None` when the installation carries the unified default.
+fn declared_kv_cache(installation: &EngineInstallation) -> Result<Option<i64>, StartError> {
+    if !installation.kv_cache_declared {
+        return Ok(None);
+    }
+    let stated = installation.engine_config["memory"]["kv_cache"]
+        .as_str()
+        .ok_or_else(|| StartError::Setting(format!("{KV_CACHE_BYTES} is not a byte size")))?;
+    mllm_config::effective::parse_bytes(stated)
+        .ok()
+        .filter(|bytes| *bytes > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            StartError::Setting(format!("{KV_CACHE_BYTES} is not a byte size: {stated}"))
         })
 }
 
@@ -605,8 +622,9 @@ impl EnvEngineProvider {
             (None, Some(declared)) => declared,
             (None, None) => probe_fingerprint(&executable)?,
         };
-        let kv_cache_bytes =
-            env_value(KV_CACHE_BYTES).unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
+        let declared_kv = env_value(KV_CACHE_BYTES);
+        let kv_cache_declared = declared_kv.is_some();
+        let kv_cache_bytes = declared_kv.unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
         // ADR 0014 §1: the installation keeps host-fixed arguments only; engine
         // tuning belongs to the deployment. SGLang's protected entry takes no
         // argument vector (`engine_policy.rs` refuses any on that family).
@@ -630,6 +648,7 @@ impl EnvEngineProvider {
             executable,
             build_fingerprint,
             engine_config,
+            kv_cache_declared,
             deep_park,
             trust_remote_code,
             models_root,
@@ -1137,8 +1156,13 @@ async fn start_standalone_inner(
         // first; its resolution states those zero weights.
         let (memory, facts) = match &gpu_shape {
             HostShape::Discrete(gpus) => (
-                crate::standalone_config::discrete_template_memory(gpus, capacity_bytes, 0)
-                    .ok_or_else(|| StartError::Deploy("host policy invalid: no GPU".into()))?,
+                crate::standalone_config::discrete_template_memory(
+                    gpus,
+                    capacity_bytes,
+                    Some(0),
+                    None,
+                )
+                .ok_or_else(|| StartError::Deploy("host policy invalid: no GPU".into()))?,
                 mllm_config::effective::CheckpointFacts {
                     weights_bytes: Some(0),
                     ..Default::default()

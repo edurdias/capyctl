@@ -47,6 +47,7 @@ pub async fn try_boot_on(
             deep_park: false,
             members: None,
             models_root: None,
+            kv_cache: None,
         }),
         test_memory(),
     )
@@ -66,6 +67,7 @@ pub async fn try_boot_with_gpu(
             deep_park: false,
             members: None,
             models_root: None,
+            kv_cache: None,
         }),
         test_memory(),
         Arc::new(gpu),
@@ -81,6 +83,18 @@ pub async fn try_boot_discrete(
     models_root: &std::path::Path,
     deep_park: bool,
 ) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    try_boot_discrete_with_kv(state_dir, gpu, models_root, deep_park, None).await
+}
+
+/// As [`try_boot_discrete`], with the KV cache the operator stated
+/// (`MLLM_KV_CACHE_BYTES`) when `kv_cache` is `Some`.
+pub async fn try_boot_discrete_with_kv(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+    models_root: &std::path::Path,
+    deep_park: bool,
+    kv_cache: Option<&'static str>,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
     mllm_cli::roles::start_standalone_with_gpu(
         state_dir,
         Arc::new(PortedProvider {
@@ -88,6 +102,7 @@ pub async fn try_boot_discrete(
             deep_park,
             members: None,
             models_root: Some(models_root.to_path_buf()),
+            kv_cache,
         }),
         test_memory(),
         Arc::new(gpu),
@@ -114,6 +129,7 @@ pub async fn boot_deep_parking(
             deep_park: true,
             members: Some(members),
             models_root: None,
+            kv_cache: None,
         }),
         test_memory(),
     )
@@ -146,6 +162,7 @@ pub async fn boot_configured_on(
             deep_park: false,
             members: None,
             models_root: None,
+            kv_cache: None,
         }),
         test_memory(),
     )
@@ -193,8 +210,9 @@ pub fn binary_template_memory() -> mllm_cli::standalone_config::TemplateMemory {
             mllm_cli::standalone_config::TemplateMemory::Device {
                 managed_limit: limits.managed_limit,
                 device_total: card.total_bytes,
-                weights_bytes: 0,
+                weights_bytes: Some(0),
                 system_parked_limit: BINARY_TEST_CAPACITY_BYTES / 4,
+                kv_cache_bytes: None,
             }
         }
         _ => mllm_cli::standalone_config::TemplateMemory::Unified {
@@ -230,6 +248,8 @@ struct PortedProvider {
     members: Option<Vec<mllm_domain::completion::ProcessIdentity>>,
     /// The model store, when the test states one.
     models_root: Option<std::path::PathBuf>,
+    /// The KV cache the operator stated (`MLLM_KV_CACHE_BYTES`), if any.
+    kv_cache: Option<&'static str>,
 }
 
 impl mllm_controller::EngineProvider for PortedProvider {
@@ -241,6 +261,10 @@ impl mllm_controller::EngineProvider for PortedProvider {
         installation.deep_park = self.deep_park;
         if let Some(root) = &self.models_root {
             installation.models_root = root.clone();
+        }
+        if let Some(kv) = self.kv_cache {
+            installation.engine_config["memory"]["kv_cache"] = kv.into();
+            installation.kv_cache_declared = true;
         }
         Ok(installation)
     }

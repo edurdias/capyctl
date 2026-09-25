@@ -61,6 +61,7 @@ pub fn fake_installation() -> EngineInstallation {
         executable: PathBuf::from("/bin/true"),
         build_fingerprint: "fake-v1".into(),
         engine_config: crate::vllm_engine_config_json(),
+        kv_cache_declared: false,
         // SPEC §9.1, T21: this test host opts out of deep park; the product
         // default is enabled (owner decision 2026-09-17). Opting out is what keeps
         // a Fake-driven launch from rendering flags no Fake honours.
