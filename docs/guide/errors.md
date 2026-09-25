@@ -2,7 +2,7 @@
 
 Every mllm command exits 0 on success. On failure it prints one line to
 standard error, `error [<code>]: <message>`, and exits with the status below.
-With `--output json` the error is a JSON object with `code` and `message`.
+With `--format json` the error is a JSON object with `code` and `message`.
 
 | Exit | Code | What it means | What to do |
 |---|---|---|---|
