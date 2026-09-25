@@ -419,6 +419,9 @@ async fn the_engine_environment_is_a_closed_allowlist() {
         "PYTHONDONTWRITEBYTECODE",
         "MLLM_ENGINE_LOG",
         "MLLM_EXTRA_APPROVALS",
+        "CUDA_HOME",
+        "MAX_JOBS",
+        "FLASHINFER_NVCC_THREADS",
     ];
     for name in env.keys() {
         assert!(
@@ -437,13 +440,47 @@ async fn the_engine_environment_is_a_closed_allowlist() {
         Some("adm1n")
     );
     assert!(env.contains_key("MLLM_EXTRA_APPROVALS"));
-    // PATH is the engine's own bin and fixed system directories only; the CUDA
-    // toolkit's bin is one of them, since vLLM disables FlashInfer without
-    // `nvcc` on PATH (found live 2026-09-25).
+    // PATH is the engine's own bin and fixed system directories only: no
+    // profile `cuda_home`, no CUDA bin (SPEC §13.3 as amended 2026-09-25).
     assert_eq!(
         env.get("PATH").map(String::as_str),
-        Some("/opt/venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin")
+        Some("/opt/venv/bin:/usr/local/bin:/usr/bin:/bin")
     );
+    assert!(!env.contains_key("CUDA_HOME"));
+    // Owner decision 2026-09-25: the JIT build limits are always set.
+    let jobs: usize = env["MAX_JOBS"].parse().unwrap();
+    assert!(jobs >= 1, "{jobs}");
+    assert_eq!(env["FLASHINFER_NVCC_THREADS"], "1");
+}
+
+/// SPEC §13.3 amendment (owner decision 2026-09-25): a profile's host-approved
+/// `cuda_home` puts `<cuda_home>/bin` after the engine's own bin and sets
+/// `CUDA_HOME` (vLLM treats FlashInfer as absent without `nvcc` on PATH, found
+/// live); a profile `env` build limit overrides the computed one.
+// T21
+#[tokio::test]
+async fn a_profile_cuda_home_and_build_limit_reach_the_engine() {
+    let (_stub, port) = stub_engine("gate-m", 2, "k3y").await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let mut launch = plan(port);
+    launch.cuda_home = Some("/usr/local/cuda-13.0".into());
+    launch.build_env = [("MAX_JOBS".to_string(), "3".to_string())].into();
+    let adapter = adapter(port, Some("k3y"))
+        .with_launch(launch)
+        .with_tools(tool.clone())
+        .with_engine_key("k3y".into());
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    let spawned = tool.spawned.lock().unwrap();
+    let env = &spawned[0].env;
+    assert_eq!(
+        env.get("PATH").map(String::as_str),
+        Some("/opt/venv/bin:/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin")
+    );
+    assert_eq!(env["CUDA_HOME"], "/usr/local/cuda-13.0");
+    assert_eq!(env["MAX_JOBS"], "3");
 }
 
 /// Spec §4 step 4: a process that dies before readiness ends the step with the

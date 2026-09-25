@@ -56,6 +56,10 @@ pub struct EngineInstallation {
     /// installation no longer measures to the fingerprint registered at boot
     /// (`security.installation_drift`, default `warn`).
     pub installation_drift: mllm_config::effective::InstallationDrift,
+    /// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root
+    /// published as the profile's `cuda_home` (`<cuda_home>/bin` joins the
+    /// engine PATH). `None` keeps the minimal PATH.
+    pub cuda_home: Option<PathBuf>,
     /// SPEC §3: the loopback ports this host leases its engines, inclusive
     /// (`resource_policy.endpoint_port_range`). A second role on the same
     /// machine names its own range so their engines never collide.
@@ -113,6 +117,7 @@ pub fn from_profile(base: &EngineInstallation, profile: &serde_json::Value) -> E
                     .collect()
             })
             .unwrap_or_default(),
+        cuda_home: profile["cuda_home"].as_str().map(PathBuf::from),
         ..base.clone()
     }
 }

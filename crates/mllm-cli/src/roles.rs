@@ -50,6 +50,9 @@ pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 /// 0018 §5: both set publish two profiles, `local-vllm` and `local-sglang`.
 const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
 const SGLANG_BIN: &str = "MLLM_SGLANG_BIN";
+/// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root of
+/// the `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` installation (its `cuda_home`).
+const CUDA_HOME_ENV: &str = "MLLM_CUDA_HOME";
 /// The directory model weights live under (Spec §7). Required for the same reason:
 /// a guessed store resolves relative paths somewhere the operator never named.
 const MODELS_ROOT: &str = "MLLM_MODELS_ROOT";
@@ -550,6 +553,9 @@ impl EnvEngineProvider {
             runtime_dir: runtime_dir(engine, deep_park, self.managed_runtime.as_deref())?,
             args,
             installation_drift,
+            // SPEC §13.3 amendment (owner decision 2026-09-25): an environment
+            // installation names its CUDA toolkit explicitly; nothing is detected.
+            cuda_home: env_value(CUDA_HOME_ENV).map(PathBuf::from),
             engine_ports,
         })
     }

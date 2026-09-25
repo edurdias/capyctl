@@ -173,7 +173,11 @@ fn a_copy_verified_on_the_host_is_reused_by_a_new_deployment() {
     }
     let second = deploy(&store, &session, "k2", &second_config, &host);
     assert_eq!(
-        store.model_source(&second.deployment_id, 1, "lab").unwrap().unwrap().state,
+        store
+            .model_source(&second.deployment_id, 1, "lab")
+            .unwrap()
+            .unwrap()
+            .state,
         SourceState::Pending,
         "a copy still pending is not reused"
     );
@@ -194,7 +198,10 @@ fn a_copy_verified_on_the_host_is_reused_by_a_new_deployment() {
         third_config["routes"] = json!(["third"]);
     }
     let third = deploy(&store, &session, "k3", &third_config, &host);
-    let record = store.model_source(&third.deployment_id, 1, "lab").unwrap().unwrap();
+    let record = store
+        .model_source(&third.deployment_id, 1, "lab")
+        .unwrap()
+        .unwrap();
     assert_eq!(record.state, SourceState::Verified);
     assert_eq!((record.bytes_done, record.bytes_total), (100, 100));
     store

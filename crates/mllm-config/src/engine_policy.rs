@@ -262,9 +262,9 @@ fn speculative_config_admitted(value: &str, approved_paths: &[PathBuf]) -> bool 
             return false;
         }
         match (key.as_str(), field) {
-            ("model", serde_json::Value::String(path)) => approved_paths
-                .iter()
-                .any(|root| path_within(path, root)),
+            ("model", serde_json::Value::String(path)) => {
+                approved_paths.iter().any(|root| path_within(path, root))
+            }
             ("model", _) => false,
             (_, serde_json::Value::String(_) | serde_json::Value::Number(_)) => true,
             (_, serde_json::Value::Bool(_)) => true,
@@ -495,7 +495,18 @@ const VLLM_SHAPED: &[&str] = &[
 /// exact name before any abbreviation, so these are what they say they are.
 const ORDINARY_EXACT: &[&str] = &["--reasoning-parser"];
 
-const SAFE_ENV: &[&str] = &["RUST_LOG", "TOKENIZERS_PARALLELISM", "PYTHONUNBUFFERED"];
+const SAFE_ENV: &[&str] = &[
+    "RUST_LOG",
+    "TOKENIZERS_PARALLELISM",
+    "PYTHONUNBUFFERED",
+    // Owner decision 2026-09-25: overrides of the JIT build limits mllm
+    // computes at launch (mllm-adapters engine_env.rs). Positive integers only.
+    "MAX_JOBS",
+    "FLASHINFER_NVCC_THREADS",
+];
+
+/// Profile `env` names whose value must be a positive integer.
+const COUNT_ENV: &[&str] = &["MAX_JOBS", "FLASHINFER_NVCC_THREADS"];
 
 /// ADR 0014 §8, SPEC §8.2: the environment variable carrying the host's
 /// approvals for sensitive extra arguments to the protected entries, which
@@ -932,7 +943,11 @@ pub fn validate_rendered_args(
 }
 
 pub fn validate_profile_env(env: &BTreeMap<String, String>) -> Result<(), String> {
-    env.keys()
-        .find(|name| !SAFE_ENV.contains(&name.as_str()))
-        .map_or(Ok(()), |name| Err(name.clone()))
+    env.iter()
+        .find(|(name, value)| {
+            !SAFE_ENV.contains(&name.as_str())
+                || COUNT_ENV.contains(&name.as_str())
+                    && !value.parse::<u32>().is_ok_and(|count| count >= 1)
+        })
+        .map_or(Ok(()), |(name, _)| Err(name.clone()))
 }

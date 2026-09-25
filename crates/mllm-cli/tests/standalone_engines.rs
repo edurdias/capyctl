@@ -37,6 +37,7 @@ fn register(document: &std::path::Path, name: &str) {
             deep_park: false,
             installation_drift: mllm_config::effective::InstallationDrift::Warn,
             args: vec![],
+            cuda_home: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();

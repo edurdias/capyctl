@@ -288,6 +288,12 @@ pub struct RuntimeProfile {
     /// ADR 0014 §1: host-fixed arguments of the installation.
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// SPEC §13.3 amendment (owner decision 2026-09-25): the host-approved CUDA
+    /// toolkit root. The engine gets `<cuda_home>/bin` on PATH and `CUDA_HOME`;
+    /// without it the engine PATH stays minimal. Omitted from serialization
+    /// when absent, so existing snapshots and fingerprints do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_home: Option<String>,
     pub security: Security,
     pub log_policy: LogPolicy,
 }
@@ -746,6 +752,8 @@ struct RawProfile {
     build_fingerprint: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    cuda_home: Option<String>,
     security: Security,
     log_policy: RawLogPolicy,
 }
@@ -961,6 +969,7 @@ pub fn resolve_effective_with_checkpoint(
             build_fingerprint: profile.build_fingerprint,
             args: profile.args,
             env: profile.env,
+            cuda_home: profile.cuda_home,
             security: profile.security,
             log_policy: profile.log_policy,
         },

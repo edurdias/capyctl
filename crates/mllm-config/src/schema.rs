@@ -308,6 +308,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("args", FieldSpec::Seq(&SCALAR)),
         ("launch_settings", FieldSpec::Moved(LAUNCH_SETTINGS_MOVED)),
         ("env", FieldSpec::MapOf(&SCALAR)),
+        // SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit
+        // the engine's JIT compilers use; `<cuda_home>/bin` joins its PATH.
+        ("cuda_home", SCALAR),
         ("security", FieldSpec::Struct(SECURITY)),
         (
             "log_policy",
