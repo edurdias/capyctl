@@ -190,6 +190,41 @@ async fn add_without_a_running_role_is_agent_unreachable() {
     assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 
+// T02 T07 (controller ruling 2026-09-25): `engine add` before any role has
+// ever started is the first run. On a fresh HOME with no state directory and
+// no role document it creates the state root owner-only, writes engines.yaml
+// where `start standalone` reads it, and reports agent_unreachable.
+#[tokio::test]
+async fn add_on_a_fresh_home_is_the_first_run() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = private_dir();
+    let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let state = home.join(".local/state/mllm");
+    assert!(!state.exists());
+    let home_text = home.to_string_lossy().into_owned();
+    let fresh = move |key: &str| (key == "HOME").then(|| home_text.clone());
+    let error = mllm_cli::engine::execute_in(&add(&env), None, &state, &fresh)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "agent_unreachable", "{}", error.message);
+    let meta = std::fs::metadata(&state).unwrap();
+    assert!(meta.is_dir());
+    assert_eq!(meta.mode() & 0o777, 0o700, "the state root is owner-only");
+    // The probe's scratch directory is gone; nothing else is left behind.
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    let engines = EnginesFile::load(&home.join(".config/mllm/engines.yaml")).unwrap();
+    assert_eq!(engines.revision, 1);
+    assert!(engines.profiles.contains_key("vllm"));
+    // The same command lists it, as not yet seen by a role.
+    let listed = mllm_cli::engine::execute_in(&Command::EngineList, None, &state, &fresh)
+        .await
+        .unwrap();
+    assert_eq!(listed["agent"], "unreachable");
+    assert_eq!(listed["engines"][0]["profile"], "vllm");
+}
+
 // T34 (ADR 0017 fallback): a peer without live_profile_update means restart.
 #[tokio::test]
 async fn add_restart_required_is_success_with_notice() {

@@ -32,8 +32,10 @@ pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
 
 /// The role document: `--config`; else `$MLLM_CONFIG`; else
 /// `<config home>/mllm/host.yaml` if it exists; else
-/// `<state_dir>/config/standalone.yaml` if it exists. Both implicit documents
-/// present is ambiguous and refused.
+/// `<state_dir>/config/standalone.yaml`. Both implicit documents present is
+/// ambiguous and refused. Neither present is the first run (controller ruling
+/// 2026-09-25): standalone, whose document `mllm start standalone` generates,
+/// and whose engines file is the one that start reads.
 pub fn resolve_target(
     explicit: Option<&Path>,
     state_dir: &Path,
@@ -60,9 +62,13 @@ pub fn resolve_target(
                 (Some(host), None) => host,
                 (None, Some(standalone)) => standalone,
                 (None, None) => {
-                    return Err(invalid(
-                        "no host or standalone document found; pass --config",
-                    ))
+                    return Ok(Target {
+                        engines: engines_path(None, &home),
+                        role_document: state_dir.join("config/standalone.yaml"),
+                        kind: RoleKind::Standalone,
+                        socket: state_dir.join(SOCKET_NAME),
+                        state_dir: state_dir.to_path_buf(),
+                    });
                 }
             }
         }

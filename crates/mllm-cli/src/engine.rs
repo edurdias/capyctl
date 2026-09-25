@@ -66,6 +66,17 @@ pub async fn execute(
     state_dir: &Path,
 ) -> Result<Value, StructuredError> {
     let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+    execute_in(command, config, state_dir, &env).await
+}
+
+/// As [`execute`], reading `HOME`, `XDG_CONFIG_HOME` and `MLLM_CONFIG` through
+/// `env` (a test states them instead of changing the process environment).
+pub async fn execute_in(
+    command: &Command,
+    config: Option<&Path>,
+    state_dir: &Path,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+) -> Result<Value, StructuredError> {
     match command {
         Command::EngineDetect { paths } => Ok(detected(paths)),
         Command::EngineAdd {
@@ -75,7 +86,7 @@ pub async fn execute(
             drift,
             args,
         } => {
-            let target = resolve_target(config, state_dir, &env)?;
+            let target = resolve_target(config, state_dir, env)?;
             add(
                 &target,
                 path.as_deref(),
@@ -86,9 +97,9 @@ pub async fn execute(
             )
             .await
         }
-        Command::EngineList => list(&resolve_target(config, state_dir, &env)?).await,
+        Command::EngineList => list(&resolve_target(config, state_dir, env)?).await,
         Command::EngineRemove { name, drain } => {
-            remove(&resolve_target(config, state_dir, &env)?, name, *drain).await
+            remove(&resolve_target(config, state_dir, env)?, name, *drain).await
         }
         _ => Err(error("invalid_config", "not an engine command")),
     }
@@ -173,6 +184,23 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
     let fingerprint = mllm_agent::installation::InstallationMeasurer::new()
         .measure(resolved.engine, &resolved.executable)
         .ok();
+    // Controller ruling 2026-09-25: `engine add` before any role has started
+    // is the first run. The state root the role will use is created
+    // owner-only, as the role creates it, so the probe has somewhere private
+    // to work; engines.yaml is written and the role picks it up at start.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state_dir)
+            .map_err(|e| {
+                error(
+                    "internal",
+                    format!("state directory {}: {e}", state_dir.display()),
+                )
+            })?;
+    }
     let scratch = tempfile::tempdir_in(state_dir)
         .map_err(|e| error("internal", format!("probe directory: {e}")))?;
     let runtime = scratch.path().join("runtime");
@@ -190,8 +218,13 @@ fn register(resolved: &Resolved, state_dir: &Path) -> Result<Registration, Struc
     })
 }
 
-/// The role document, strictly parsed (never written).
+/// The role document, strictly parsed (never written). A standalone document
+/// that does not exist yet (the first run; start generates it) declares
+/// nothing.
 fn role_document(target: &Target) -> Result<Value, StructuredError> {
+    if target.kind == RoleKind::Standalone && !target.role_document.exists() {
+        return Ok(serde_json::json!({}));
+    }
     let text = std::fs::read_to_string(&target.role_document).map_err(|e| {
         error(
             "invalid_config",
