@@ -1075,6 +1075,8 @@ fn a_wake_beside_a_ready_engine_is_credited_its_resident_memory() {
         boot_id: "boot-1".into(),
         start_ticks,
         bytes: gib << 30,
+        device_bytes: 0,
+        host_bytes: 0,
     };
     // Without a sample, or with one naming other processes, nothing is
     // credited and the wake waits, as before.
@@ -1111,6 +1113,14 @@ fn resident_floors_are_bounded_lower_bounds() {
         boot_id: "boot-1".into(),
         start_ticks: 1,
         bytes: gib << 30,
+        device_bytes: 0,
+        host_bytes: 0,
+    };
+    let unified = || {
+        std::collections::BTreeMap::from([(
+            "unified".to_string(),
+            mllm_config::effective::DomainMemory::Unified,
+        )])
     };
     let floors = |available: i64, residents: &[mllm_domain::resources::ProcessResident]| {
         crate::resident_floors::resident_floors(
@@ -1119,6 +1129,7 @@ fn resident_floors_are_bounded_lower_bounds() {
             "someone-else",
             &observation(available),
             residents,
+            &unified(),
         )
         .unwrap()
     };
@@ -1136,12 +1147,97 @@ fn resident_floors_are_bounded_lower_bounds() {
         &s.deployment_id,
         &observation(40),
         &[resident(20, 6)],
+        &unified(),
     )
     .unwrap();
     assert!(own.is_empty());
     // Parking: a run in flight, so no credit.
     lab.park(&s, "park-s", 1_200);
     assert!(floors(40, &[resident(20, 6)]).is_empty());
+}
+
+// T26 / ADR 0007 (M33 regression on discrete hosts): a Ready engine with two
+// allocations is credited on both domains, not skipped: its GPU bytes against
+// the device domain and its anonymous pages against the system domain.
+#[test]
+fn a_two_domain_owner_is_credited_per_domain() {
+    use mllm_config::effective::DomainMemory;
+    use mllm_domain::resources::{Allocation, ProcessResident};
+    use std::collections::BTreeMap;
+    let lab = Lab::new(|_| {});
+    let s = lab.deploy("s", |_| {});
+    lab.ready(&s, 1_000, 20);
+    let mut ledger = lab.store.resource_snapshot().unwrap();
+    let owner = crate::instances::instance_owner_id(&s.deployment_id, 0);
+    ledger.owners.get_mut(&owner).unwrap().allocations = vec![
+        Allocation {
+            domain: "gpu0".into(),
+            bytes: 10 << 30,
+            host_kv_bytes: 0,
+        },
+        Allocation {
+            domain: "system".into(),
+            bytes: 4 << 30,
+            host_kv_bytes: 0,
+        },
+    ];
+    let observation = |domain: &str| MemoryObservation {
+        domain: domain.into(),
+        capacity_bytes: 64 << 30,
+        available_bytes: 32 << 30,
+        sampled_at_ms: 1_100,
+    };
+    let observations = vec![observation("gpu0"), observation("system")];
+    let residents = vec![ProcessResident {
+        pid: 20,
+        boot_id: "boot-1".into(),
+        start_ticks: 1,
+        bytes: (9 << 30) + (3 << 30),
+        device_bytes: 9 << 30,
+        host_bytes: 3 << 30,
+    }];
+    let kinds = BTreeMap::from([
+        ("gpu0".to_string(), DomainMemory::Device),
+        ("system".to_string(), DomainMemory::Distinct),
+    ]);
+    let floors = |observations: &[MemoryObservation],
+                  residents: &[ProcessResident],
+                  kinds: &BTreeMap<String, DomainMemory>| {
+        crate::resident_floors::resident_floors(
+            &lab.store.conn,
+            &ledger,
+            "candidate",
+            observations,
+            residents,
+            kinds,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|f| {
+            assert_eq!(f.owner, owner);
+            (f.domain, f.bytes)
+        })
+        .collect::<BTreeMap<_, _>>()
+    };
+    let by_domain = floors(&observations, &residents, &kinds);
+    assert_eq!(by_domain["gpu0"], 9 << 30);
+    assert_eq!(by_domain["system"], 3 << 30);
+    // Each floor is capped at its own allocation.
+    let mut large = residents.clone();
+    large[0].device_bytes = 12 << 30;
+    large[0].host_bytes = 6 << 30;
+    large[0].bytes = 18 << 30;
+    let capped = floors(&observations, &large, &kinds);
+    assert_eq!(capped["gpu0"], 10 << 30);
+    assert_eq!(capped["system"], 4 << 30);
+    // A domain whose kind the policy does not name is credited nothing (fail
+    // closed); the other domain keeps its floor.
+    let partial = BTreeMap::from([("gpu0".to_string(), DomainMemory::Device)]);
+    let only_gpu = floors(&observations, &residents, &partial);
+    assert_eq!(only_gpu.keys().collect::<Vec<_>>(), ["gpu0"]);
+    // So is a domain without an observation.
+    let only_gpu = floors(&observations[..1], &residents, &kinds);
+    assert_eq!(only_gpu.keys().collect::<Vec<_>>(), ["gpu0"]);
 }
 
 impl Lab {

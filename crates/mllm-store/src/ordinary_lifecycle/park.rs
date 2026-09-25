@@ -1664,6 +1664,7 @@ fn arm(
         &owner,
         context.observations,
         residents,
+        &crate::resident_floors::domain_kinds(&policy.controls),
     )?;
     let context = AdmissionContext {
         resident_floors: &floors,
@@ -2179,12 +2180,18 @@ impl crate::Store {
         )
         .map_err(resource)?;
         let cold = super::startup::cold(&p, &e);
+        // ADR 0019: each domain credited by its kind. A policy that does not
+        // read here credits nothing; the start's own arm judges the policy.
+        let kinds = policy(&tx, &e)
+            .map(|policy| crate::resident_floors::domain_kinds(&policy.controls))
+            .unwrap_or_default();
         let floors = crate::resident_floors::resident_floors(
             &tx,
             &scoped,
             &p.owner(),
             context.observations,
             residents,
+            &kinds,
         )?;
         let context = AdmissionContext {
             resident_floors: &floors,

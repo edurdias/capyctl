@@ -121,6 +121,11 @@ impl DomainView {
                         boot_id: r.boot_id.clone(),
                         start_ticks: r.start_ticks,
                         bytes: r.resident_bytes,
+                        // ADR 0019: the wire carries only the sum until the
+                        // split figures join the protocol; a device or system
+                        // domain is then credited nothing (fail closed).
+                        device_bytes: 0,
+                        host_bytes: 0,
                     })
                     .collect()
             } else {

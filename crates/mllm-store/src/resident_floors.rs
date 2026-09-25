@@ -15,8 +15,17 @@
 //! parked or transitioning owner keeps its full charge. The candidate is
 //! never credited. A domain whose floors would exceed the memory in use
 //! gets none (fail closed), as does anything without a sample.
+//!
+//! ADR 0019: a discrete host holds an engine's weights in a device domain and
+//! its host pages in a system domain, so each allocation of a footprint is
+//! credited from the figure sampled for its own domain's kind: GPU bytes on a
+//! `device` domain, anonymous pages on a `distinct` one, their sum on a
+//! `unified` one. Skipping a multi-domain owner would bring back the double
+//! counting of M33 on every discrete host.
 use std::collections::BTreeMap;
 
+use mllm_config::effective::DomainMemory;
+use mllm_config::resource_controls::ResourceControls;
 use mllm_domain::resources::{
     LedgerSnapshot, MemoryObservation, ProcessResident, ResidentFloor, ResourcePhase,
 };
@@ -30,21 +39,42 @@ struct Identity {
     start_ticks: u64,
 }
 
+/// The memory kind of each domain the host policy `controls` declares.
+pub(crate) fn domain_kinds(controls: &ResourceControls) -> BTreeMap<String, DomainMemory> {
+    controls
+        .domains
+        .iter()
+        .map(|(id, domain)| (id.clone(), domain.memory))
+        .collect()
+}
+
+/// The figure of `resident` that counts against a domain of `kind`.
+fn credited_bytes(resident: &ProcessResident, kind: DomainMemory) -> i64 {
+    match kind {
+        DomainMemory::Device => resident.device_bytes,
+        DomainMemory::Distinct => resident.host_bytes,
+        // ADR 0007: one pool holds both.
+        DomainMemory::Unified => resident.bytes,
+    }
+}
+
 /// The floors `residents` support for the owners `scoped` holds, for an
-/// admission of `candidate` judged against `observations`.
+/// admission of `candidate` judged against `observations`, each allocation
+/// credited by the memory kind `kinds` gives its domain.
 pub(crate) fn resident_floors(
     conn: &Connection,
     scoped: &LedgerSnapshot,
     candidate: &str,
     observations: &[MemoryObservation],
     residents: &[ProcessResident],
+    kinds: &BTreeMap<String, DomainMemory>,
 ) -> rusqlite::Result<Vec<ResidentFloor>> {
     if residents.is_empty() {
         return Ok(Vec::new());
     }
-    let sampled: BTreeMap<(u32, &str, u64), i64> = residents
+    let sampled: BTreeMap<(u32, &str, u64), &ProcessResident> = residents
         .iter()
-        .map(|p| ((p.pid, p.boot_id.as_str(), p.start_ticks), p.bytes))
+        .map(|p| ((p.pid, p.boot_id.as_str(), p.start_ticks), p))
         .collect();
     let rows: Vec<(String, u32, String)> = conn
         .prepare(
@@ -66,30 +96,42 @@ pub(crate) fn resident_floors(
         let Some(footprint) = scoped.owners.get(&owner) else {
             continue;
         };
-        let [allocation] = footprint.allocations.as_slice() else {
-            continue;
-        };
         if footprint.phase != ResourcePhase::Ready {
             continue;
         }
-        let Some(observation) = observations.iter().find(|o| o.domain == allocation.domain) else {
-            continue;
-        };
         let Ok(identities) = serde_json::from_str::<Vec<Identity>>(&identities) else {
             continue;
         };
-        let resident = identities
+        let processes: Vec<&ProcessResident> = identities
             .iter()
-            .filter_map(|i| sampled.get(&(i.pid, i.boot_id.as_str(), i.start_ticks)))
-            .try_fold(0_i64, |sum, bytes| sum.checked_add(*bytes));
-        let bytes = resident.unwrap_or(0).min(allocation.bytes);
-        if bytes > 0 {
-            floors.push(ResidentFloor {
-                owner,
-                domain: allocation.domain.clone(),
-                bytes,
-                sampled_at_ms: observation.sampled_at_ms,
-            });
+            .filter_map(|i| {
+                sampled
+                    .get(&(i.pid, i.boot_id.as_str(), i.start_ticks))
+                    .copied()
+            })
+            .collect();
+        for allocation in &footprint.allocations {
+            let Some(observation) = observations.iter().find(|o| o.domain == allocation.domain)
+            else {
+                continue;
+            };
+            // A domain the policy does not describe has no known source for
+            // its figure: no credit (fail closed).
+            let Some(&kind) = kinds.get(&allocation.domain) else {
+                continue;
+            };
+            let resident = processes
+                .iter()
+                .try_fold(0_i64, |sum, p| sum.checked_add(credited_bytes(p, kind)));
+            let bytes = resident.unwrap_or(0).min(allocation.bytes);
+            if bytes > 0 {
+                floors.push(ResidentFloor {
+                    owner: owner.clone(),
+                    domain: allocation.domain.clone(),
+                    bytes,
+                    sampled_at_ms: observation.sampled_at_ms,
+                });
+            }
         }
     }
     // Never credit more than the domain has in use.

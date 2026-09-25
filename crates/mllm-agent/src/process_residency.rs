@@ -115,11 +115,16 @@ impl ResidencySampler {
             .filter_map(|(pid, gpu_bytes)| {
                 let start_ticks = start_ticks(pid)?;
                 let anonymous = anonymous_resident_bytes(pid)?;
+                // ADR 0019: the two figures stay separate so a discrete host
+                // credits each to its own domain; a unified host credits the
+                // sum (ADR 0007).
                 Some(ProcessResident {
                     pid,
                     boot_id: boot_id.clone(),
                     start_ticks,
                     bytes: gpu_bytes.checked_add(anonymous)?,
+                    device_bytes: gpu_bytes,
+                    host_bytes: anonymous,
                 })
             })
             .collect()
@@ -245,6 +250,14 @@ mod tests {
         assert_eq!(sample[0].pid, me);
         assert_eq!(Some(sample[0].start_ticks), start_ticks(me));
         assert!(sample[0].bytes > 1 << 20, "GPU bytes plus anonymous pages");
+        // ADR 0019: the GPU bytes and the anonymous pages are also reported
+        // apart, for a discrete host's device and system domains.
+        assert_eq!(sample[0].device_bytes, 1 << 20);
+        assert!(sample[0].host_bytes > 0);
+        assert_eq!(
+            sample[0].bytes,
+            sample[0].device_bytes + sample[0].host_bytes
+        );
     }
 
     // T26: `current` never blocks; the first call starts a sample and a later

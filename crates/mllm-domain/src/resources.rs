@@ -55,7 +55,15 @@ pub struct ProcessResident {
     pub pid: u32,
     pub boot_id: String,
     pub start_ticks: u64,
+    /// `device_bytes + host_bytes`: the credit on a unified domain, where
+    /// both come from one pool, and the only figure an older peer reports.
     pub bytes: i64,
+    /// ADR 0019: GPU memory the driver attributes to the process, credited
+    /// against a `device` domain. Zero when the reporter did not split it.
+    pub device_bytes: i64,
+    /// ADR 0019: anonymous resident pages, credited against a `distinct`
+    /// system domain. Zero when the reporter did not split it.
+    pub host_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
