@@ -1,9 +1,9 @@
 # Multi-host engine groups — design
 
-Date: 2026-09-25. Status: draft for owner review. Owner decisions of 2026-09-25 are
-binding and are recorded in "Decisions" below. The items under "Owner check" are
-proposals this design had to make where the decisions leave a choice open; they need
-the owner's confirmation before the plan starts.
+Date: 2026-09-25. Status: owner-decided. The owner's decisions of 2026-09-25 are
+recorded in "Decisions" below. The six design choices those decisions left open were
+settled by the owner on PR #42 the same day and are recorded under "Owner decisions
+on this design".
 
 This is a follow-up milestone after 0.1.0. It must not block 0.1.0: no task changes a
 0.1.0 surface, every protocol addition is a new capability, and a deployment without
@@ -15,48 +15,37 @@ It will be recorded as ADR 0020, amending SPEC §11, §16.4 and §20, ADR 0013
 
 Implementation status: not started.
 
-## Owner check
+## Owner decisions on this design (owner-decided on PR #42, 2026-09-25)
 
-These need an answer before Task 1 of the plan. Each has a recommendation.
-
-1. **Recipe environment variables.** The profile `env` allowlist (`SAFE_ENV` in
-   `crates/mllm-config/src/engine_policy.rs`) admits only five names. The target
-   recipe also needs non-NCCL variables: `MBX_FUSED_DRAFT`, `MBX_PLE_REPLICATE`,
-   `VLLM_MARLIN_USE_ATOMIC_ADD`, `TORCH_NCCL_ASYNC_ERROR_HANDLING` and
-   `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC`. Options: (a) a host-approved list of extra
-   variable names in the profile (`security.approved_env`), written by the host
-   administrator like `executable`; names beginning `NCCL_`, `GLOO_`, `MASTER_` and
-   `VLLM_HOST_IP` stay refused, so mllm and the operator still set no transport;
-   (b) bake the values into the patched build as defaults, so no environment is
-   needed. **Recommendation: (a)**, because (b) hides recipe settings from the
-   effective configuration.
-2. **Addresses are not transport.** Decision 4 says mllm sets no NCCL variable.
-   Decision 3 says to bind to the direct link where the engine allows. This design
-   reads that as: mllm renders `--master-addr` (the head's declared peer address)
-   and `VLLM_HOST_IP` (each host's declared peer address), and nothing named
-   `NCCL_*` or `GLOO_*`. The single-rank loopback pin (`GLOO_SOCKET_IFNAME=lo`,
-   `NCCL_SOCKET_IFNAME=lo`) is not applied to a group launch. **Recommendation:
-   confirm.** If live bring-up shows gloo or NCCL bootstrap choosing Wi-Fi or the
-   tailnet, revisit decision 4 then, with evidence.
-3. **Host-check severity.** Decision 10 says mllm warns or refuses. Proposal: every
-   check warns by default; a host declares `groups.require_rdma: true` to make a
-   missing `/dev/infiniband` or a small memlock limit refuse the launch.
-   **Recommendation: confirm.**
-4. **Group eviction.** A group needs room on every named host. Proposal: the
-   planner computes a victim set on each named host with the existing per-host
-   rules (ADR 0013 decision 8) and evicts only when every host has a valid set; if
-   any host cannot make room, nothing is evicted anywhere (SPEC §11: validate all
-   hosts before evicting). **Recommendation: confirm.**
+1. **Engine environment variables.** Engine settings that exist only as environment
+   variables are declared in YAML or by a CLI flag, at two levels: the engine
+   profile (`env` in `engines.yaml` or `host.yaml`, or `mllm engine add ... --env
+   K=V`, saved in the profile) and the deployment (`engine_config.env`, or `mllm
+   deploy model ... --engine-env K=V`, saved with the deployment). Names are checked
+   against the profile's host-approved list, `approved_env`, which admits globs.
+   mllm-owned names (`NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`) can never be
+   set. Design in §2.1.
+2. **Addresses are not transport.** mllm renders `--master-addr` (the head's
+   declared peer address) and `VLLM_HOST_IP` (each host's declared peer address),
+   and nothing named `NCCL_*` or `GLOO_*`. The single-rank loopback pin
+   (`GLOO_SOCKET_IFNAME=lo`, `NCCL_SOCKET_IFNAME=lo`) is not applied to a group
+   launch. If live bring-up shows gloo or NCCL bootstrap choosing a wireless or
+   overlay interface, decision 4 is revisited then, with evidence.
+3. **Host-check severity.** Every check warns by default; a host declares
+   `groups.require_rdma: true` to make a missing `/dev/infiniband` or a small
+   memlock limit refuse the launch.
+4. **Group eviction.** The planner computes a victim set on each named host with the
+   existing per-host rules (ADR 0013 decision 8) and evicts only when every host has
+   a valid set; if any host cannot make room, nothing is evicted anywhere (SPEC §11:
+   validate all hosts before evicting).
 5. **First-version shape limits.** Groups are `instances: 1` and use one device per
    host (ranks per host = 1). The design and types carry N hosts × k local ranks,
-   but k > 1 and `instances > 1` are refused until a later task. **Recommendation:
-   confirm.** Both limits fit the two-host target.
-6. **Post-wake canary.** Upstream vLLM has reports of garbage output after
-   sleep/wake at TP=2. Proposal: a group wake is complete only after the head's
-   readiness check *and* a short deterministic completion whose tokens match the
-   reference recorded at first readiness. A mismatch fails the wake and restarts
-   the group. It costs one short request per wake. **Recommendation: yes, for
-   groups only.**
+   but k > 1 and `instances > 1` are refused until a later milestone.
+6. **Post-wake canary.** A group wake is complete only after the head's readiness
+   check *and* a short deterministic completion whose tokens match the reference
+   recorded at first readiness. A mismatch fails the wake and restarts the group.
+   It costs one short request per wake, for groups only. Upstream vLLM has reports
+   of wrong output after sleep/wake at TP=2.
 
 ## Problem
 
@@ -125,7 +114,7 @@ through mllm, at about the published average throughput.
   API server. Every other member is a **worker** and runs headless.
 - **Node rank**: the member's position in `placement.hosts` (head = 0). This is the
   engine's `--node-rank`.
-- **Local ranks**: devices one member uses. First version: 1 (owner check 5).
+- **Local ranks**: devices one member uses. First version: 1 (owner design decision 5).
 - **Group plan**: the durable, server-written record of one group incarnation: every
   member, its host, node rank, devices, model path, peer address, the head's service
   port and the rendezvous port.
@@ -182,13 +171,63 @@ resource_policy:
   groups:
     peer_address: "192.0.2.10"           # this host's address on the direct link
     rendezvous_port_range: {start: 25000, end: 25099}   # default
-    require_rdma: false                  # owner check 3
+    require_rdma: false                  # design decision 3
 ```
 
 A host without `groups.peer_address` cannot be named in a group
 (`peer_address_missing`). The agent verifies at start that the address is assigned
 to one of its interfaces and reports it with its inventory; a mismatch refuses group
 launches on that host (`peer_address_not_local`).
+
+### 2.1 Engine environment
+
+Some engine settings exist only as environment variables (the target recipe needs
+`MBX_FUSED_DRAFT`, `MBX_PLE_REPLICATE`, `VLLM_MARLIN_USE_ATOMIC_ADD`,
+`TORCH_NCCL_ASYNC_ERROR_HANDLING` and `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC`). Design
+decision 1 gives them two levels, each declared in YAML or by a CLI flag. This
+applies to every deployment, single-host or group.
+
+| Level | YAML | CLI flag | Saved in |
+|---|---|---|---|
+| Engine profile (host administrator) | `env:` of the profile in `engines.yaml` or `host.yaml` | `mllm engine add ... --env K=V` (repeatable) | the profile |
+| Deployment (deployment operator) | `engine_config.env:` | `mllm deploy model ... --engine-env K=V` (repeatable) | the deployment revision |
+| Approval (host administrator) | `security.approved_env:` of the profile, a list of names or globs | `mllm engine add ... --approve-env GLOB` (repeatable) | the profile |
+
+Rules:
+
+1. **mllm-owned names are never settable**, at either level, whatever
+   `approved_env` says: `NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`, and the
+   names mllm already renders or closes (`PATH`, `LD_*`, `PYTHONPATH`, `CUDA_HOME`,
+   `CUDA_VISIBLE_DEVICES`, `MLLM_*`). A profile or deployment naming one is refused
+   `engine_env_reserved:<name>`, and so is an `approved_env` entry that names or
+   matches only such names.
+2. **Approval.** A deployment's name must match an `approved_env` entry of the
+   profile it resolves against (`engine_env_not_approved:<name>`). A profile's own
+   `env` is written by the host administrator and needs no separate approval, except
+   for rule 1. The existing safe names (`MAX_JOBS`, `FLASHINFER_NVCC_THREADS`,
+   `TOKENIZERS_PARALLELISM`, `PYTHONUNBUFFERED`, `RUST_LOG`) stay allowed at both
+   levels with their existing value rules.
+3. **Globs.** An entry is an upper-case name made of `A`–`Z`, `0`–`9` and `_`,
+   optionally ending in one `*` (for example `MBX_*`). A bare `*` is refused.
+   Matching is exact or prefix; rule 1 is checked on the concrete name, so a glob
+   never admits an owned name.
+4. **Precedence.** The deployment's value overrides the profile's for the same name;
+   the effective configuration shows each variable with its source (`profile` or
+   `deployment`, SPEC §7 provenance).
+5. **One way to say each thing.** `--engine-env K=V` merges into the deployment
+   document before submission; a name given both in the file and by a flag is
+   refused `engine_env_conflict:<name>`. Likewise `engine add --env` with a name the
+   role document's profile already sets.
+6. **Groups.** Every named host resolves the deployment against its own profile; a
+   name not approved on any one host refuses the group deploy. The rendered
+   environment of every member must be equal apart from `VLLM_HOST_IP`.
+7. **Values** are bounded (4 KiB each, 64 names per level), contain no NUL or
+   newline, and are recorded in the effective configuration and the recipe
+   fingerprint. They are not secret storage: status and effective configuration
+   show them.
+8. **Changes.** A deployment env change is a revision (ADR 0013 decision 7, not
+   count-only). A profile env or approval change changes the recipe fingerprint, as
+   any profile change does.
 
 ### 3. Group plan
 
@@ -221,7 +260,7 @@ generation and a new plan.
 - The rendezvous port is allocated in the same transaction from the head's range,
   skipping ports held by any unsettled group plan on that host. Exhausted:
   `rendezvous_ports_exhausted`.
-- If a member does not fit, the planner applies owner check 4: per-host victim sets
+- If a member does not fit, the planner applies design decision 4: per-host victim sets
   on every named host, evicting only when every host can make room.
 - Each member's reservation settles on its own host's evidence only (§7).
 
@@ -293,7 +332,7 @@ live rows set it explicitly.
 | `--host`, `--port`, keys, guard | loopback service port, as single-rank | absent |
 
 Environment: the single-rank closed environment, plus `VLLM_HOST_IP` set to the
-member's own peer address (owner check 2). No `NCCL_*` or `GLOO_*` variable is set
+member's own peer address (design decision 2). No `NCCL_*` or `GLOO_*` variable is set
 or inherited, and the loopback rendezvous pin is not applied. The protected entry
 (`runtime/vllm_entry.py`) gains a group mode: it compares every reserved
 destination it already checks (`nnodes`, `node_rank`, `master_addr`, `master_port`,
@@ -303,7 +342,9 @@ rendered and refuses any drift. The frozen plan's `tensor_parallel_size: 1` pin
 
 The recipe's own flags (`--speculative-config`, `--block-size`, `--kv-cache-memory`
 and so on) are deployment `engine_config`/`extra_args` and host approvals, as for any
-single-rank launch. Recipe variables other than transport come from owner check 1.
+single-rank launch. Recipe variables other than transport are engine environment
+(§2.1): the profile's `env` and the deployment's `engine_config.env`, both checked
+against `approved_env`.
 
 vLLM requires every node to see the model at a path; the plan carries each host's
 own path. If live bring-up shows vLLM requires identical paths across nodes, the
@@ -354,8 +395,8 @@ loopback control endpoint (SPEC §11). Workers never receive a sleep call.
   nothing within the park deadline keeps the full charge and the group is uncertain;
   the planner then stops the group (T20: no blind repeated collective).
 - **Wake.** The head calls `/wake_up`; each host reports resident memory back above
-  the parked bound; the head readiness check passes; and, if owner check 6 is
-  accepted, the post-wake canary matches. Any failure stops the group and relaunches
+  the parked bound; the head readiness check passes; and the post-wake canary
+  matches (design decision 6). Any failure stops the group and relaunches
   under recovery.
 - Parked members stay charged at their parked budget on their own host; the parked
   set bound (`max_parked`) counts a group once per host it occupies.
@@ -430,6 +471,9 @@ act on the group as a unit.
 | `group_profile_mismatch` | deploy, prepare | the profile's build fingerprint differs between hosts, or does not resolve on one |
 | `group_checkpoint_mismatch` | prepare | checkpoint digests differ between hosts |
 | `group_model_path_mismatch` | prepare | only if live bring-up shows vLLM needs identical paths |
+| `engine_env_reserved:<name>` | deploy, engine add, host start | the name is mllm-owned (§2.1 rule 1) |
+| `engine_env_not_approved:<name>` | deploy | no `approved_env` entry of the profile matches (on some named host, for a group) |
+| `engine_env_conflict:<name>` | deploy, engine add | the name is given both in the document and by a flag |
 | `peer_address_missing` | deploy | a named host declares no `groups.peer_address` |
 | `peer_address_not_local` | host start, prepare | the declared address is not on any local interface |
 | `rendezvous_ports_exhausted` | reservation | every port in the head's range is held |
@@ -439,13 +483,13 @@ act on the group as a unit.
 | `host_tuning_missing:<item>` | prepare | the same, on a host with `require_rdma: true` |
 | `group_member_failed` | status | a member exited or failed; carries host and node rank |
 | `group_member_uncertain` | status | a member's host is unreachable; its share stays charged |
-| `group_wake_mismatch` | wake | the post-wake canary differed (owner check 6) |
+| `group_wake_mismatch` | wake | the post-wake canary differed (design decision 6) |
 | `host_capability_missing:engine_groups` | placement | a named host cannot run group members |
 
 Existing codes keep their meaning: `insufficient_space` (download), the
 insufficient-resources family, and `multi_gpu_unsupported` for more than one device
-on one host. CLI exits: deploy-time shape errors use the invalid-configuration exit
-(2); `group_shape_unsupported`, `group_instances_unsupported` and
+on one host. CLI exits: deploy-time shape errors and the `engine_env_*` codes use the
+invalid-configuration exit (2); `group_shape_unsupported`, `group_instances_unsupported` and
 `group_engine_unsupported` use the unsupported exit (5); `rendezvous_ports_exhausted`
 uses the insufficient-resources exit (4). No new exit number.
 
@@ -456,6 +500,10 @@ and the lifecycle; only the live rows show that a native multi-node recipe works
 
 **Deterministic** (tagged with SPEC §20 IDs):
 
+- **T03, T14, T37**: engine environment at both levels, by YAML and by flag;
+  approval globs; owned names refused at every level and through globs; deployment
+  overrides profile with provenance; conflicts between file and flag; group
+  resolution refuses a name unapproved on one host.
 - **T03, T14**: topology parsing and every deploy-time refusal; reserved flags stay
   reserved; effective configuration shows the rendered group flags with provenance.
 - **T27**: two group plans sharing one host reserve all-or-nothing under concurrency,

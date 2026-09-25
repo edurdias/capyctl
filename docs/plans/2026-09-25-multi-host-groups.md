@@ -12,9 +12,9 @@
 
 ## Owner decisions
 
-The thirteen binding decisions of 2026-09-25 are listed in the spec ("Decisions"). The six "Owner check" items at the top of the spec must be answered before Task 1. This plan assumes each recommendation is accepted; where an answer differs, the named task changes:
+The thirteen binding decisions of 2026-09-25 are listed in the spec ("Decisions"). The six design decisions they left open were owner-decided on PR #42 the same day (spec, "Owner decisions on this design"):
 
-1. Recipe environment: host-approved `security.approved_env` (Task 4).
+1. Engine environment variables are declared in YAML (profile `env` in `engines.yaml`/`host.yaml`, deployment `engine_config.env`) or by a CLI flag (`mllm engine add ... --env K=V`, saved in the profile; `mllm deploy model ... --engine-env K=V`, saved with the deployment). Deployment names are checked against the profile's host-approved `approved_env` (globs allowed); mllm-owned names (`NCCL_*`, `GLOO_*`, `MASTER_*`, `VLLM_HOST_IP`) can never be set. Tasks 4a and 4b.
 2. mllm renders `--master-addr` and `VLLM_HOST_IP`, no `NCCL_*`/`GLOO_*` (Tasks 9 and 10).
 3. Host checks warn by default; `groups.require_rdma: true` refuses (Tasks 3 and 8).
 4. Group eviction is all-or-nothing across named hosts (Task 15).
@@ -28,21 +28,22 @@ The thirteen binding decisions of 2026-09-25 are listed in the spec ("Decisions"
 - Tag every new test with its acceptance-matrix ID. IDs used: T03, T14 (configuration), T15, T16, T20, T27, T30, T31, T32 (lifecycle and accounting), T21, T37 (security), T34 (capability gating).
 - Uncertainty keeps accounting: a member is released only on its own host's gone-evidence; an unreachable host's member stays charged and uncertain; the rendezvous port is released only after every member settles.
 - Additive protocol only: no field renumbered, `PROTOCOL_VERSION` stays `"2"`, command encoding version stays `"1"`. New capability: `engine_groups`.
-- mllm renders no `NCCL_*` or `GLOO_*` variable for a group and inherits none; it renders `--master-addr` (head peer address) and `VLLM_HOST_IP` (own peer address). The API server and every control endpoint stay on loopback with the per-launch keys and the key-guard (ADR 0012).
+- mllm-owned environment names (`NCCL_*`, `GLOO_*`, `MASTER_*`, `MLLM_*`, `LD_*`, `VLLM_HOST_IP`, `PATH`, `PYTHONPATH`, `CUDA_HOME`, `CUDA_VISIBLE_DEVICES`) can never be set by a profile or a deployment, by YAML or by flag. mllm renders no `NCCL_*` or `GLOO_*` variable for a group and inherits none; it renders `--master-addr` (head peer address) and `VLLM_HOST_IP` (own peer address). The API server and every control endpoint stay on loopback with the per-launch keys and the key-guard (ADR 0012).
 - mllm never changes sysctls, limits, device permissions or firewalls; it reads them.
 - Rendezvous port range default: `25000`–`25099` inclusive.
-- Closed codes (spec §15): `group_placement_required`, `group_topology_invalid`, `group_shape_unsupported`, `group_instances_unsupported`, `group_engine_unsupported:<engine>`, `group_profile_mismatch`, `group_checkpoint_mismatch`, `group_model_path_mismatch`, `peer_address_missing`, `peer_address_not_local`, `rendezvous_ports_exhausted`, `host_tuning_warning:<item>`, `host_tuning_missing:<item>`, `rendezvous_port_in_use:<port>`, `service_port_in_use:<port>`, `group_member_failed`, `group_member_uncertain`, `group_wake_mismatch`, `host_capability_missing:engine_groups`. Items: `compaction`, `memlock`, `infiniband`. Exits: 2 for deploy-time shape errors, 5 for `group_shape_unsupported`, `group_instances_unsupported`, `group_engine_unsupported`, 4 for `rendezvous_ports_exhausted`. No new exit number.
+- Closed codes (spec §15): `engine_env_reserved:<name>`, `engine_env_not_approved:<name>`, `engine_env_conflict:<name>`, `group_placement_required`, `group_topology_invalid`, `group_shape_unsupported`, `group_instances_unsupported`, `group_engine_unsupported:<engine>`, `group_profile_mismatch`, `group_checkpoint_mismatch`, `group_model_path_mismatch`, `peer_address_missing`, `peer_address_not_local`, `rendezvous_ports_exhausted`, `host_tuning_warning:<item>`, `host_tuning_missing:<item>`, `rendezvous_port_in_use:<port>`, `service_port_in_use:<port>`, `group_member_failed`, `group_member_uncertain`, `group_wake_mismatch`, `host_capability_missing:engine_groups`. Items: `compaction`, `memlock`, `infiniband`. Exits: 2 for deploy-time shape errors and the `engine_env_*` codes, 5 for `group_shape_unsupported`, `group_instances_unsupported`, `group_engine_unsupported`, 4 for `rendezvous_ports_exhausted`. No new exit number.
 - In tracked files, commits and the PR: no machine names, addresses, or home paths. The hosts are "host A" (head) and "host B" (worker); the link is "the direct link". Addresses in examples and tests use the documentation ranges `192.0.2.0/24` and `198.51.100.0/24`. Live addresses come only from the untracked `scripts/live/matrix/hosts.local.env`.
 - CPU and Fake-engine tests are not qualification; the live rows MH1–MH9 are. Say so in every status claim.
 - Verification before every commit: `cargo fmt --all --check`; the core suite `cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management -p harness --all-targets --no-fail-fast --locked -- --test-threads=4`; `cargo test --workspace --all-targets --locked`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; Python helpers: `python3 -m unittest discover -s runtime/tests`.
 
 ## Review Focus
 
-1. **A host listed twice under different spellings, or a host renamed after deploy.** Placement uses host ids; a re-enrolled or recovered host (ADR 0016) must keep its member's owner and never produce two members on one physical host. Pinned in Task 2 (duplicate refusal after normalization) and Task 7 (reservation refuses two members with one host id).
-2. **The head's rendezvous port is already taken by something outside mllm** (a stale engine from before a crash, another tool). Prepare must refuse with the port named and release every reservation, not launch and hang for the whole initialization timeout. Pinned in Task 8.
-3. **A worker host reconnects mid-launch with a restarted agent and an empty journal.** Its member must not be declared gone because the journal is empty; it settles only on recorded identities (ADR 0016), and the group must not relaunch while it is unsettled. Pinned in Task 14.
-4. **Park succeeds on the head's HTTP call but one rank never frees memory** (the documented TP>1 sleep bug class). The group must keep that member's full charge and stop the group, not report PARKED. Pinned in Task 16.
-5. **Two group deployments sharing host B activate at once.** Neither may hold host B's share while waiting for host A; both reservations must be all-or-nothing and one must be refused or queued cleanly. Pinned in Task 7.
+1. **An approval glob written too wide (`V*`, `N*`) or an engine that reads a transport variable under another prefix.** A glob must never admit an mllm-owned name, and a group's members must render equal environments apart from `VLLM_HOST_IP`. Pinned in Task 4a (`owned_names_are_never_settable` with wide globs) and Task 13b (group resolution compares member environments).
+2. **A host listed twice under different spellings, or a host renamed after deploy.** Placement uses host ids; a re-enrolled or recovered host (ADR 0016) must keep its member's owner and never produce two members on one physical host. Pinned in Task 2 (duplicate refusal after normalization) and Task 7 (reservation refuses two members with one host id).
+3. **The head's rendezvous port is already taken by something outside mllm** (a stale engine from before a crash, another tool). Prepare must refuse with the port named and release every reservation, not launch and hang for the whole initialization timeout. Pinned in Task 8.
+4. **A worker host reconnects mid-launch with a restarted agent and an empty journal.** Its member must not be declared gone because the journal is empty; it settles only on recorded identities (ADR 0016), and the group must not relaunch while it is unsettled. Pinned in Task 14.
+5. **Park succeeds on the head's HTTP call but one rank never frees memory** (the documented TP>1 sleep bug class). The group must keep that member's full charge and stop the group, not report PARKED. Pinned in Task 16.
+6. **Two group deployments sharing host B activate at once.** Neither may hold host B's share while waiting for host A; both reservations must be all-or-nothing and one must be refused or queued cleanly. Pinned in Task 7.
 
 ---
 
@@ -53,7 +54,8 @@ The thirteen binding decisions of 2026-09-25 are listed in the spec ("Decisions"
 | `docs/design/adr/0020-multi-host-engine-groups.md` (new), `docs/design/adr/0012-deep-park-default-on.md`, `docs/SPEC.md` | decision record and amendments | 1 |
 | `crates/mllm-config/src/topology.rs` (new), `crates/mllm-config/src/instances.rs`, `crates/mllm-config/src/schema.rs` | `topology`, group placement rules, refusal codes | 2 |
 | `crates/mllm-config/src/groups_policy.rs` (new), `crates/mllm-config/src/schema.rs` | host `resource_policy.groups` | 3 |
-| `crates/mllm-config/src/engine_policy.rs`, `crates/mllm-config/src/schema.rs` | `security.approved_env` | 4 |
+| `crates/mllm-config/src/engine_env.rs` (new), `engine_policy.rs`, `schema.rs`, `effective/*`, `crates/mllm-adapters/src/engine_env.rs` | engine environment at two levels, approvals, provenance, launch environment | 4a |
+| `crates/mllm-cli/src/grammar.rs`, `engine.rs`, `client.rs`, `crates/mllm-config/src/registration.rs` | `--env`, `--approve-env`, `--engine-env` | 4b |
 | `crates/mllm-domain/src/group.rs` | N-member `GroupPlan`, `MemberRole` | 5 |
 | `crates/mllm-protocol/proto/mllm/management/v1/management.proto`, `crates/mllm-protocol/src/execution.rs`, `crates/mllm-protocol/src/capabilities.rs` | wire fields, `engine_groups` | 6 |
 | `crates/mllm-store/src/groups.rs` (new), `crates/mllm-store/src/instances.rs`, `crates/mllm-store/src/migrations.rs`, `crates/mllm-store/src/resource_ledger.rs` | group plans, member owners, all-or-nothing reservation, ports | 7 |
@@ -81,14 +83,14 @@ Task 13 is split in two (13a weights, 13b activation) because a reviewer can acc
 - Create: `docs/design/adr/0020-multi-host-engine-groups.md`
 - Modify: `docs/design/adr/0012-deep-park-default-on.md` (append "Amendment 2026-09-25: peer exposure of engine groups")
 - Modify: `docs/design/adr/0013-deployment-instances-and-placement.md` (decision 1: point the multi-host refusal at ADR 0020)
-- Modify: `docs/SPEC.md` §11, §16.4 (replace `placement.head` with "first host is the head"; delete "Multi-host group placement is not yet specified"), §20 (add live rows MH1–MH8 below the table)
+- Modify: `docs/SPEC.md` §13.3 (engine environment: a profile's `env` and a deployment's `engine_config.env`, names approved by `approved_env`, mllm-owned names never settable), §15 (the new fields and flags), §11, §16.4 (replace `placement.head` with "first host is the head"; delete "Multi-host group placement is not yet specified"), §20 (add live rows MH1–MH8 below the table)
 - Modify: `docs/specs/2026-09-25-discrete-gpu-and-network-endpoint-design.md` §7 (note that `tensor_parallel > 1` with a multi-host topology is governed by ADR 0020)
 - Modify: `AGENTS.md` and its mirrored working-agreement file, hard constraints (one bullet: group peer transport is unauthenticated and on every interface during a run, per ADR 0012 amendment)
 
 **Interfaces:**
 - Produces: the section numbers code cites: ADR 0020 §1 vocabulary, §2 configuration, §3 group plan, §4 reservations, §5 preparation and weights, §6 fan-out, §7 readiness, §8 rendering, §9 stop and failure, §10 park and wake, §11 host checks, §12 ports and exposure, §13 capability. They mirror the spec's §1–§13 one to one.
 
-- [ ] **Step 1: Write ADR 0020.** Status "Accepted (owner decisions 2026-09-25)". Sections: Context (spec "Problem"), Decision (the thirteen owner decisions verbatim, then §1–§13 condensed from the spec, each a short paragraph), Honest scope ("CPU and Fake-engine tests are not qualification; MH1–MH8 are"), Consequences (ADR 0013 refusal lifted only for named-host groups; `multi_gpu_unsupported` unchanged for one host; profile `approved_env`; new capability).
+- [ ] **Step 1: Write ADR 0020.** Status "Accepted (owner decisions 2026-09-25)". Sections: Context (spec "Problem"), Decision (the thirteen owner decisions verbatim, then §1–§13 condensed from the spec, each a short paragraph), Honest scope ("CPU and Fake-engine tests are not qualification; MH1–MH8 are"), Consequences (ADR 0013 refusal lifted only for named-host groups; `multi_gpu_unsupported` unchanged for one host; engine environment at profile and deployment level with `approved_env`, amending SPEC §13.3's closed environment; new capability).
 
 - [ ] **Step 2: Write the ADR 0012 amendment.** Text to append:
 
@@ -467,50 +469,248 @@ git commit -m "feat(config): host groups policy: peer address, rendezvous range,
 
 ---
 
-### Task 4: Host-approved recipe environment (`security.approved_env`)
+### Task 4a: Engine environment in configuration: profile `env`, deployment `engine_config.env`, `approved_env`
 
 **Files:**
-- Modify: `crates/mllm-config/src/engine_policy.rs` (`validate_profile_env` takes the approved list), `crates/mllm-config/src/schema.rs` (`SECURITY` gains `approved_env`), `crates/mllm-config/src/effective/core.rs` (pass the list)
-- Test: `crates/mllm-config/src/engine_policy.rs` unit tests
+- Create: `crates/mllm-config/src/engine_env.rs`
+- Modify: `crates/mllm-config/src/engine_policy.rs` (`validate_profile_env` delegates to `engine_env`), `crates/mllm-config/src/schema.rs` (profile `SECURITY` gains `approved_env: Seq(SCALAR)`; deployment `ENGINE_CONFIG` gains `env: MapOf(SCALAR)`), `crates/mllm-config/src/effective/core.rs` and `effective/engine_config.rs` (merge, provenance, fingerprint), `crates/mllm-adapters/src/engine_env.rs` (the launch environment takes the resolved engine environment, not only the build overrides), `crates/mllm-config/src/lib.rs`
+- Test: `crates/mllm-config/tests/engine_env.rs`, `crates/mllm-adapters/src/engine_env.rs` unit tests
 
 **Interfaces:**
-- Produces: `pub fn validate_profile_env(env: &BTreeMap<String, String>, approved: &[String]) -> Result<(), String>`; `pub const NEVER_APPROVABLE_PREFIXES: &[&str] = &["NCCL_", "GLOO_", "MASTER_", "MLLM_"];` and `pub const NEVER_APPROVABLE: &[&str] = &["VLLM_HOST_IP", "PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "CUDA_VISIBLE_DEVICES", "CUDA_HOME"];`
+- Produces (in `mllm_config::engine_env`):
+  - `pub const OWNED_PREFIXES: &[&str] = &["NCCL_", "GLOO_", "MASTER_", "MLLM_", "LD_"];`
+  - `pub const OWNED_NAMES: &[&str] = &["VLLM_HOST_IP", "PATH", "PYTHONPATH", "CUDA_HOME", "CUDA_VISIBLE_DEVICES"];`
+  - `pub fn is_owned(name: &str) -> bool`.
+  - `pub struct ApprovedEnv(Vec<String>)` with `pub fn parse(entries: &[String]) -> Result<ApprovedEnv, EnvRefusal>` and `pub fn admits(&self, name: &str) -> bool` (exact, or prefix for an entry ending in `*`).
+  - `pub enum EnvSource { Profile, Deployment }`.
+  - `pub struct ResolvedEnv { pub vars: BTreeMap<String, (String, EnvSource)> }` with `pub fn values(&self) -> BTreeMap<String, String>`.
+  - `pub fn resolve_engine_env(profile_env: &BTreeMap<String, String>, approved: &ApprovedEnv, deployment_env: &BTreeMap<String, String>) -> Result<ResolvedEnv, EnvRefusal>`.
+  - `pub enum EnvRefusal { Reserved(String), NotApproved(String), Invalid(String) }` with `code()` → `engine_env_reserved:<name>`, `engine_env_not_approved:<name>`, and for `Invalid` the invalid-configuration detail naming the entry.
+  - The existing safe names (`SAFE_ENV`, `COUNT_ENV`) keep their rules at both levels without approval.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-// T37: a profile may set a variable only when the host approved its name.
-#[test]
-fn approved_env_admits_only_listed_names() {
-    let env = BTreeMap::from([("MBX_FUSED_DRAFT".to_owned(), "1".to_owned())]);
-    assert!(validate_profile_env(&env, &[]).is_err());
-    assert!(validate_profile_env(&env, &["MBX_FUSED_DRAFT".to_owned()]).is_ok());
+// crates/mllm-config/tests/engine_env.rs
+use mllm_config::engine_env::*;
+use std::collections::BTreeMap;
+
+fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+fn approved(entries: &[&str]) -> ApprovedEnv {
+    ApprovedEnv::parse(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>()).unwrap()
 }
 
-// T21, T37: transport, rendezvous and loader variables can never be approved.
+// T37: a deployment name must match an approval; globs match by prefix.
 #[test]
-fn transport_and_loader_names_are_never_approvable() {
+fn deployment_names_need_an_approval() {
+    let a = approved(&["MBX_*", "VLLM_MARLIN_USE_ATOMIC_ADD"]);
+    assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MBX_FUSED_DRAFT", "1")])).is_ok());
+    assert!(resolve_engine_env(&map(&[]), &a, &map(&[("VLLM_MARLIN_USE_ATOMIC_ADD", "1")])).is_ok());
+    let err = resolve_engine_env(&map(&[]), &a, &map(&[("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "180")])).unwrap_err();
+    assert_eq!(err.code(), "engine_env_not_approved:TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC");
+}
+
+// T37: the profile's own env is host-authored and needs no approval.
+#[test]
+fn profile_env_needs_no_approval() {
+    let r = resolve_engine_env(&map(&[("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")]), &approved(&[]), &map(&[])).unwrap();
+    assert_eq!(r.vars["TORCH_NCCL_ASYNC_ERROR_HANDLING"].1, EnvSource::Profile);
+}
+
+// T21, T37: mllm-owned names are refused at both levels, even when a glob would match.
+#[test]
+fn owned_names_are_never_settable() {
+    let a = approved(&["N*", "G*", "M*", "V*"]);
     for name in ["NCCL_IB_HCA", "GLOO_SOCKET_IFNAME", "MASTER_ADDR", "VLLM_HOST_IP",
-                 "LD_PRELOAD", "PATH", "MLLM_ENGINE_KEY"] {
-        let env = BTreeMap::from([(name.to_owned(), "x".to_owned())]);
-        assert!(validate_profile_env(&env, &[name.to_owned()]).is_err(), "{name}");
+                 "MLLM_ENGINE_KEY", "LD_PRELOAD", "PATH", "CUDA_VISIBLE_DEVICES"] {
+        let e = resolve_engine_env(&map(&[]), &a, &map(&[(name, "x")])).unwrap_err();
+        assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
+        let e = resolve_engine_env(&map(&[(name, "x")]), &a, &map(&[])).unwrap_err();
+        assert_eq!(e.code(), format!("engine_env_reserved:{name}"));
     }
+}
+
+// T03: approval entries are validated; a bare glob and owned-only entries are refused.
+#[test]
+fn approval_entries_are_validated() {
+    for bad in ["*", "mbx_*", "MBX_**", "A*B", "NCCL_*", "VLLM_HOST_IP", ""] {
+        assert!(ApprovedEnv::parse(&[bad.to_string()]).is_err(), "{bad}");
+    }
+    assert!(ApprovedEnv::parse(&(0..65).map(|i| format!("V{i}")).collect::<Vec<_>>()).is_err());
+}
+
+// T14: the deployment overrides the profile for one name, with provenance.
+#[test]
+fn deployment_overrides_profile_with_provenance() {
+    let r = resolve_engine_env(&map(&[("MBX_PLE_REPLICATE", "1")]), &approved(&["MBX_*"]),
+        &map(&[("MBX_PLE_REPLICATE", "0")])).unwrap();
+    assert_eq!(r.vars["MBX_PLE_REPLICATE"], ("0".to_string(), EnvSource::Deployment));
+}
+
+// T03: values are bounded and single-line; the safe names keep their rules.
+#[test]
+fn values_are_bounded_and_safe_names_keep_rules() {
+    let a = approved(&["MBX_*"]);
+    assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MBX_X", "a\nb")])).is_err());
+    assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MBX_X", &"x".repeat(4097))])).is_err());
+    assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MAX_JOBS", "4")])).is_ok());
+    assert!(resolve_engine_env(&map(&[]), &a, &map(&[("MAX_JOBS", "0")])).is_err());
 }
 ```
 
-Also add a host-document test in `crates/mllm-config/tests/effective.rs`: a profile with `security.approved_env: ["NCCL_DEBUG"]` fails resolution naming `security.approved_env`.
+Add to `crates/mllm-config/tests/effective.rs`:
 
-- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p mllm-config engine_policy` — expected: arity error.
+```rust
+// T14, T39: a profile and deployment without env resolve with an unchanged recipe fingerprint;
+// a deployment env shows in the effective configuration with its source.
+#[test]
+fn engine_env_is_in_the_effective_configuration() {
+    let (host, deployment) = lab_host_and_deployment(); // existing fixtures in this file
+    let before = resolve_effective(&deployment, &host).unwrap();
+    let host = with_profile_security(&host, json!({"approved_env": ["MBX_*"]}));
+    let deployment = with_engine_config(&deployment, json!({"env": {"MBX_FUSED_DRAFT": "1"}}));
+    let after = resolve_effective(&deployment, &host).unwrap();
+    assert_eq!(after.engine_env()["MBX_FUSED_DRAFT"], ("1".into(), EnvSource::Deployment));
+    assert_ne!(before.recipe_fingerprint(), after.recipe_fingerprint());
+}
+```
 
-- [ ] **Step 3: Implement.** `validate_profile_env` admits a name when it is in `SAFE_ENV` or in `approved`; `approved` itself is validated at resolution (upper-case identifier, ≤ 64 entries, not in `NEVER_APPROVABLE`, no `NEVER_APPROVABLE_PREFIXES` prefix). `COUNT_ENV` still applies. Record `approved_env` in the effective profile so the recipe fingerprint changes only when the list is non-empty (`skip_serializing_if = "Vec::is_empty"`).
+Use the file's real fixture and accessor names (search `fn resolve_effective` and the recipe-fingerprint accessor in `crates/mllm-config/src/effective.rs`); add `with_profile_security` and `with_engine_config` helpers beside the existing ones.
 
-- [ ] **Step 4: Run the tests.** Run: `cargo test -p mllm-config` — expected: PASS; existing profiles' fingerprints unchanged.
+Add to `crates/mllm-adapters/src/engine_env.rs` tests:
+
+```rust
+// T37: the launch environment carries the resolved engine environment; mllm's own
+// values (PATH, MAX_JOBS computed, CUDA_HOME) are applied after it and win.
+#[test]
+fn launch_environment_includes_resolved_engine_env() {
+    let resolved = BTreeMap::from([("MBX_FUSED_DRAFT".to_owned(), "1".to_owned())]);
+    let env = launch_environment(&resolved, Some("/opt/venv/bin/vllm"), None, 8 << 30, 4);
+    assert_eq!(env["MBX_FUSED_DRAFT"], "1");
+    assert!(env["PATH"].starts_with("/opt/venv/bin"));
+}
+```
+
+`launch_environment` is the function this task extracts from the existing `toolchain_environment` call sites so the engine environment and mllm's values are assembled in one place; its parameters are the resolved engine environment, the engine binary, `cuda_home`, available memory and CPU count.
+
+- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p mllm-config --test engine_env && cargo test -p mllm-adapters engine_env` — expected: unresolved module and function.
+
+- [ ] **Step 3: Implement.** `engine_env.rs` holds the rules of spec §2.1 (1–4, 7). `validate_profile_env` becomes a thin wrapper over the profile half of `resolve_engine_env` so host-document validation and engine registration keep one rule set. Resolution reads the profile's `security.approved_env` and the deployment's `engine_config.env`, stores the `ResolvedEnv` in the effective configuration (serialized only when non-empty, so every existing effective configuration and fingerprint is byte-identical), and hands `values()` to the adapters. The deployment document's top-level `env` stays refused (`Struct(NO_FIELDS)`). Comments cite `// ADR 0020 §2.1 (owner design decision 1)`.
+
+- [ ] **Step 4: Run the tests.** Run: `cargo test -p mllm-config && cargo test -p mllm-adapters` — expected: PASS; existing fingerprints unchanged.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/mllm-config
-git commit -m "feat(config): host-approved recipe environment names, transport names never approvable (ADR 0020 owner check 1)"
+git add crates/mllm-config crates/mllm-adapters
+git commit -m "feat(config): engine environment at profile and deployment level with host approvals (ADR 0020 §2.1)"
+```
+
+---
+
+### Task 4b: Engine environment by CLI flag: `engine add --env/--approve-env`, `deploy model --engine-env`
+
+**Files:**
+- Modify: `crates/mllm-cli/src/grammar.rs` (`EngineArgs::Add` gains `--env K=V` and `--approve-env GLOB`, both repeatable; `DeployArgs::Model` gains `--engine-env K=V`, repeatable; `Command::Deploy` carries `engine_env: Vec<(String, String)>`), `crates/mllm-config/src/registration.rs` (`ProfileSpec` gains `env` and `approved_env`; `profile_document` writes them), `crates/mllm-cli/src/engine.rs` (`add`), `crates/mllm-cli/src/client.rs` (merge into the submitted deployment document)
+- Test: `crates/mllm-cli/tests/engine_env_flags.rs`, `crates/mllm-config/src/registration.rs` unit tests
+
+**Interfaces:**
+- Consumes: `resolve_engine_env`, `ApprovedEnv::parse`, `is_owned`, `EnvRefusal` (Task 4a).
+- Produces:
+  - `pub fn parse_env_flag(raw: &str) -> Result<(String, String), String>` in `grammar.rs` (splits on the first `=`; empty name or missing `=` is a usage error).
+  - `pub fn merge_engine_env(document: &mut Value, flags: &[(String, String)]) -> Result<(), EnvRefusal>` in `client.rs`: writes `engine_config.env.<K>` into the document before submission; a name already in the file, or given twice by flag, is `engine_env_conflict:<name>`; an owned name is `engine_env_reserved:<name>` before anything is sent.
+  - `ProfileSpec { .., env: BTreeMap<String, String>, approved_env: Vec<String> }`; `profile_document` writes `"env"` and, when non-empty, `security.approved_env`.
+  - `EnvRefusal::Conflict(String)` added in Task 4a's enum, code `engine_env_conflict:<name>`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// crates/mllm-cli/tests/engine_env_flags.rs
+use mllm_cli::client::merge_engine_env;
+use serde_json::json;
+
+// T14: --engine-env is saved with the deployment under engine_config.env.
+#[test]
+fn engine_env_flags_merge_into_the_document() {
+    let mut doc = json!({"kind": "deployment", "engine_config": {"context_length": 8192}});
+    merge_engine_env(&mut doc, &[("MBX_FUSED_DRAFT".into(), "1".into())]).unwrap();
+    assert_eq!(doc["engine_config"]["env"]["MBX_FUSED_DRAFT"], "1");
+    assert_eq!(doc["engine_config"]["context_length"], 8192);
+}
+
+// T03: a name in both the file and a flag, or twice by flag, is a conflict.
+#[test]
+fn file_and_flag_conflict() {
+    let mut doc = json!({"engine_config": {"env": {"MBX_FUSED_DRAFT": "0"}}});
+    let err = merge_engine_env(&mut doc, &[("MBX_FUSED_DRAFT".into(), "1".into())]).unwrap_err();
+    assert_eq!(err.code(), "engine_env_conflict:MBX_FUSED_DRAFT");
+    let mut doc = json!({});
+    let twice = [("A_B".into(), "1".into()), ("A_B".into(), "2".into())];
+    assert_eq!(merge_engine_env(&mut doc, &twice).unwrap_err().code(), "engine_env_conflict:A_B");
+}
+
+// T21: an owned name by flag is refused before anything is sent.
+#[test]
+fn owned_name_by_flag_is_refused_locally() {
+    let mut doc = json!({});
+    let err = merge_engine_env(&mut doc, &[("NCCL_IB_HCA".into(), "x".into())]).unwrap_err();
+    assert_eq!(err.code(), "engine_env_reserved:NCCL_IB_HCA");
+}
+
+// T01: the flags parse as K=V and are repeatable.
+#[test]
+fn flags_parse() {
+    let cli = parse(&["mllm", "deploy", "model", "--file", "d.yaml",
+                      "--engine-env", "MBX_A=1", "--engine-env", "MBX_B=x=y"]);
+    assert_eq!(cli.engine_env(), [("MBX_A".into(), "1".into()), ("MBX_B".into(), "x=y".into())]);
+    assert!(try_parse(&["mllm", "deploy", "model", "--engine-env", "NOEQUALS"]).is_err());
+    let add = parse(&["mllm", "engine", "add", "/opt/venv", "--name", "p",
+                      "--env", "TORCH_NCCL_ASYNC_ERROR_HANDLING=1", "--approve-env", "MBX_*"]);
+    assert_eq!(add.approve_env(), ["MBX_*"]);
+}
+```
+
+In `registration.rs` tests:
+
+```rust
+// T14: engine add --env/--approve-env are saved in the profile and checked like YAML.
+#[test]
+fn profile_document_saves_env_and_approvals() {
+    let mut spec = sample_spec();
+    spec.env = BTreeMap::from([("TORCH_NCCL_ASYNC_ERROR_HANDLING".into(), "1".into())]);
+    spec.approved_env = vec!["MBX_*".into()];
+    let doc = profile_document(&spec);
+    assert_eq!(doc["env"]["TORCH_NCCL_ASYNC_ERROR_HANDLING"], "1");
+    assert_eq!(doc["security"]["approved_env"], json!(["MBX_*"]));
+    assert!(check_profile("p", &doc).is_ok());
+    spec.env.insert("NCCL_DEBUG".into(), "INFO".into());
+    assert!(check_profile("p", &profile_document(&spec)).unwrap_err().to_string().contains("engine_env_reserved:NCCL_DEBUG"));
+}
+
+// T39: a profile added without the flags is written exactly as before.
+#[test]
+fn profile_without_flags_is_unchanged() {
+    let doc = profile_document(&sample_spec());
+    assert_eq!(doc["env"], json!({}));
+    assert!(doc["security"].get("approved_env").is_none());
+}
+```
+
+`parse`, `try_parse`, `engine_env()` and `approve_env()` are thin test helpers over the grammar's clap parser (search `fn parse_args` in `crates/mllm-cli/src/grammar.rs` tests); `sample_spec()` is the existing registration test fixture.
+
+- [ ] **Step 2: Run to verify failure.** Run: `cargo test -p mllm-cli --test engine_env_flags && cargo test -p mllm-config registration` — expected: unresolved flags and fields.
+
+- [ ] **Step 3: Implement.** Grammar: `#[arg(long = "engine-env", value_name = "K=V", value_parser = parse_env_flag)] engine_env: Vec<(String, String)>` on `DeployArgs::Model` (works with `--revision`: the flags merge into the revised document, so an env change is a new revision), and `#[arg(long = "env", value_name = "K=V", value_parser = parse_env_flag)] env` plus `#[arg(long = "approve-env", value_name = "GLOB")] approve_env: Vec<String>` on engine `Add`. `engine add` refuses a name the role document's profile already sets (`engine_env_conflict:<name>`), then writes through `write_engines` as today (live reload unchanged). Help text states that the values are shown in status and are not secret storage. Comments cite `// ADR 0020 §2.1`.
+
+- [ ] **Step 4: Run the tests.** Run: `cargo test -p mllm-cli && cargo test -p mllm-config` — expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/mllm-cli crates/mllm-config
+git commit -m "feat(cli): engine environment by flag on engine add and deploy model (ADR 0020 §2.1)"
 ```
 
 ---
@@ -1314,6 +1514,20 @@ async fn host_without_capability_is_refused() {
     assert_eq!(world.commands_sent_to("host-b"), 0);
 }
 
+// T14, T37 (design decision 1): a deployment env name unapproved on one named host refuses the group,
+// and every member renders the same engine environment apart from VLLM_HOST_IP.
+#[tokio::test]
+async fn group_engine_env_is_approved_everywhere_and_equal() {
+    let world = GroupWorld::two_hosts().approved_env("host-a", &["MBX_*"]);
+    let err = world.try_deploy_group_with_env("g", &["host-a", "host-b"], &[("MBX_FUSED_DRAFT", "1")]).await.unwrap_err();
+    assert_eq!(err.code(), "engine_env_not_approved:MBX_FUSED_DRAFT");
+    let world = GroupWorld::two_hosts().approved_env("host-a", &["MBX_*"]).approved_env("host-b", &["MBX_*"]);
+    world.deploy_group_with_env("g", &["host-a", "host-b"], &[("MBX_FUSED_DRAFT", "1")]).await;
+    let (a, b) = (world.launch_env("host-a"), world.launch_env("host-b"));
+    let strip = |mut e: std::collections::BTreeMap<String, String>| { e.remove("VLLM_HOST_IP"); e };
+    assert_eq!(strip(a), strip(b));
+}
+
 // T14: deploy resolves on every named host; one mismatched build refuses the group.
 #[tokio::test]
 async fn profile_mismatch_refuses_deploy() {
@@ -1453,7 +1667,7 @@ git commit -m "feat(controller): whole-group stop on rank failure, per-host sett
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-// T16, T27 (owner check 4): if one named host cannot make room, nothing is evicted anywhere.
+// T16, T27 (design decision 4): if one named host cannot make room, nothing is evicted anywhere.
 #[test]
 fn eviction_is_all_or_nothing_across_hosts() {
     let views = views(&[("host-a", free(10), &[victim("x", 80)]), ("host-b", free(10), &[])]);
@@ -1548,7 +1762,7 @@ async fn silent_member_keeps_full_charge() {
     assert_eq!(world.status("g").await.member(1).state, "uncertain");
 }
 
-// T20 (owner check 6): a wake whose canary differs stops the group.
+// T20 (design decision 6): a wake whose canary differs stops the group.
 #[tokio::test]
 async fn wake_canary_mismatch_stops_the_group() {
     let world = GroupWorld::ready_two_host_group("g").await;
@@ -1671,7 +1885,7 @@ git commit -m "test(live): multi-host group rows MH1-MH6 on two hosts with a sto
 - Create: `scripts/live/matrix/rows/MH7.sh`, `MH8.sh`
 - Modify: `docs/benchmarks/` (new `2026-MM-DD-two-host-flash-next.md` on the day it runs), `docs/runbooks/f2-current-status.md`
 
-Prerequisites: the patched vLLM 0.30 rebuilt as a new venv on each host from the published recipe's patch set (decision 1; no existing environment changes), registered with `mllm engine add <env> --name vllm-030-patched` on both hosts with equal build fingerprints; the recipe's non-transport variables in `security.approved_env` and `env` (Task 4); the hibrid48 checkpoint downloaded on both hosts through mllm (Task 13a; about 105 GB each).
+Prerequisites: the patched vLLM 0.30 rebuilt as a new venv on each host from the published recipe's patch set (decision 1; no existing environment changes), registered with `mllm engine add <env> --name vllm-030-patched` on both hosts with equal build fingerprints; the recipe's non-transport variables set through `mllm engine add ... --env K=V --approve-env 'MBX_*'` on both hosts, or the deployment's `engine_config.env` (Tasks 4a and 4b); the hibrid48 checkpoint downloaded on both hosts through mllm (Task 13a; about 105 GB each).
 
 - [ ] **Step 1: Write MH7.** Deploy with the recipe's flags as `engine_config`/`extra_args` (`--speculative-config` MTP K=5, `--block-size 1632`, `--kv-cache-memory`, `--max-num-seqs 64`, `--max-num-batched-tokens 8192`, `--moe-backend marlin`, `--load-format fastsafetensors`, `--async-scheduling`, `--enable-prefix-caching`, the parsers), `timeouts.initialize: 1800s`. Run `bench.py` through the router at concurrency 1, 2, 4, 8, 16, 32, 64, three runs each, reporting average and peak tok/s and TTFT, plus the RDMA counters.
 
@@ -1742,7 +1956,7 @@ git commit -m "feat(sglang): restart-only multi-host groups (ADR 0020 §8, decis
 
 ## Self-review notes
 
-- Spec coverage: §2 config → Tasks 2, 3, 4; §3 plan → 5; §4 reservations and ports → 7, 15; §5 preparation and weights → 8, 13a; §6 fan-out → 11, 13b; §7 readiness → 13b; §8 rendering → 9, 10, 20; §9 stop and failure → 14; §10 park and wake → 16; §11 host checks → 8; §12 exposure → 1, 9, 10, 17; §13 capability → 6; §14 status → 17; §15 codes → 2, 7, 8, 13a, 13b, 16, 17; §16 testing → every task plus 18, 19, 20; ADR 0020 and the ADR 0012 amendment → 1.
+- Spec coverage: §2 config → Tasks 2, 3; §2.1 engine environment → 4a, 4b; §3 plan → 5; §4 reservations and ports → 7, 15; §5 preparation and weights → 8, 13a; §6 fan-out → 11, 13b; §7 readiness → 13b; §8 rendering → 9, 10, 20; §9 stop and failure → 14; §10 park and wake → 16; §11 host checks → 8; §12 exposure → 1, 9, 10, 17; §13 capability → 6; §14 status → 17; §15 codes → 2, 7, 8, 13a, 13b, 16, 17; §16 testing → every task plus 18, 19, 20; ADR 0020 and the ADR 0012 amendment → 1.
 - Added during review: `rendezvous_port_in_use:<port>` and `service_port_in_use:<port>` (Prepare refusals for Review Focus 2) are in the spec's §15 table.
-- Type names used across tasks: `GroupShape`/`Topology` (config, Task 2) are distinct from `GroupTopology` (domain, Task 5); Task 13b converts one to the other. `member_owner_id`, `GroupReservation`, `GroupSettlement`, `MemberGone` (7) are used by 13b, 14, 16. `VllmGroupArgs` (9) is used by 11.
+- Type names used across tasks: `GroupShape`/`Topology` (config, Task 2) are distinct from `GroupTopology` (domain, Task 5); Task 13b converts one to the other. `member_owner_id`, `GroupReservation`, `GroupSettlement`, `MemberGone` (7) are used by 13b, 14, 16. `VllmGroupArgs` (9) is used by 11. `resolve_engine_env`, `ApprovedEnv`, `EnvRefusal` (4a) are used by 4b; Task 11's member rendering takes the resolved environment and adds only `VLLM_HOST_IP`.
 - CPU and Fake-engine tests are not qualification; MH1–MH9 are.
