@@ -142,6 +142,67 @@ struct RawSglangFields {
     tokenizer_workers: Option<u32>,
 }
 
+/// Controller ruling (discrete GPU design §3): how a memory request derived from
+/// the checkpoint's weights is sized when the deployment's phases derive on a
+/// device domain (a discrete GPU). Absent everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DeviceSizing {
+    /// The device domain's managed limit: a request above it can never place.
+    pub(super) managed_limit: i64,
+    /// The card as the host policy declares it: managed limit plus free
+    /// reserve (what the standalone host policy publishes as the card's total).
+    pub(super) declared_total: i64,
+}
+
+/// Design §3: a device request is `weights x 1.10 + kv`, and vLLM's at least
+/// 0.75 of the card (vLLM 0.29 with CUDA graphs does not start a 4B model on a
+/// 16 GB card below `--gpu-memory-utilization 0.75`). Unknown weights are not
+/// materializable yet: acceptance freezes the revision provisional and the
+/// checkpoint digest re-resolves it with the measured weights (ADR 0014 §7),
+/// which is how a Hugging Face or HTTP source is sized once downloaded. `None`
+/// without a declared KV cache (resolution then asks for one).
+fn device_request_from_weights(
+    device: DeviceSizing,
+    engine: Engine,
+    weights: Option<i64>,
+    kv_cache: Option<i64>,
+) -> Result<Option<i64>, ConfigError> {
+    let Some(kv) = kv_cache else {
+        return Ok(None);
+    };
+    let weights = weights.ok_or_else(|| {
+        ConfigError::new(
+            ConfigErrorCode::NotMaterializable,
+            "engine_config.memory.request",
+            "cannot size the device request: the checkpoint's weight size is not known yet \
+             (ADR 0014 §5, §7); it is sized once the checkpoint is measured",
+        )
+    })?;
+    // The standalone template's own arithmetic (`device_request`), so a
+    // remote checkpoint sizes exactly as a local one of the same weights.
+    let request = (weights / 100)
+        .checked_mul(110)
+        .and_then(|scaled| scaled.checked_add(kv))
+        .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
+    let floor = match engine {
+        Engine::Vllm => device.declared_total / 100 * 75,
+        Engine::Sglang => 0,
+    };
+    let request = request.max(floor);
+    if request > device.managed_limit {
+        return Err(invalid(
+            "engine_config.memory.request",
+            format!(
+                "insufficient_device_memory: the deployment needs a device memory request of \
+                 {request} bytes (weights x 1.10 plus the KV cache), above the {} bytes the \
+                 device domain manages; use a smaller or quantized checkpoint",
+                device.managed_limit
+            ),
+        ));
+    }
+    Ok(Some(request))
+}
+
 /// Everything besides the block itself that resolution needs.
 pub(super) struct EngineInputs<'a> {
     pub(super) engine: Engine,
@@ -152,6 +213,8 @@ pub(super) struct EngineInputs<'a> {
     /// The Ready phase total of an explicit `resources:` block, if declared.
     pub(super) declared_ready_total: Option<i64>,
     pub(super) facts: CheckpointFacts,
+    /// The device domain the phases derive on, when it is a discrete GPU's.
+    pub(super) device: Option<DeviceSizing>,
 }
 
 /// ADR 0014 §5 (P2) inputs, all in bytes.
@@ -677,13 +740,25 @@ pub(super) fn normalize_engine_config(
     }
 
     let raw_memory = raw.memory.clone().unwrap_or_default();
+    let declared_request = raw_memory.request.as_deref().map(parse_bytes).transpose()?;
+    let kv_cache = raw_memory
+        .kv_cache
+        .as_deref()
+        .map(parse_bytes)
+        .transpose()?;
+    let mut declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
+    // Controller ruling (discrete GPU design §3): a request derived from the
+    // weights on a device domain is sized for the card, not with the unified
+    // placeholder margin, which would not fit a small card.
+    let device_request = match (inputs.device, declared_request, inputs.declared_ready_total) {
+        (Some(device), None, None) => {
+            device_request_from_weights(device, engine, inputs.facts.weights_bytes, kv_cache)?
+        }
+        _ => None,
+    };
     let (mut memory, memory_provenance) = resolve_memory(MemoryInputs {
-        request: raw_memory.request.as_deref().map(parse_bytes).transpose()?,
-        kv_cache: raw_memory
-            .kv_cache
-            .as_deref()
-            .map(parse_bytes)
-            .transpose()?,
+        request: device_request.or(declared_request),
+        kv_cache,
         declared_ready_total: inputs.declared_ready_total,
         weights: inputs.facts.weights_bytes,
         margin: overhead_margin(engine),
@@ -692,7 +767,15 @@ pub(super) fn normalize_engine_config(
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
-    let declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
+    if let Some(request) = device_request {
+        provenance.insert("memory.request".into(), SettingSource::Derived);
+        // Design §3: the engine's use of the card is bounded by the fraction
+        // mllm renders from this request, so the device peak is the request.
+        if declared_startup.is_none() {
+            declared_startup = Some(request);
+            provenance.insert("memory.startup".into(), SettingSource::Derived);
+        }
+    }
     let (startup, startup_source) = resolve_startup(
         declared_startup,
         &memory,

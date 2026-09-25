@@ -442,6 +442,24 @@ pub(super) fn check_single_device(
     Ok(())
 }
 
+/// Controller ruling (discrete GPU design §3): the device domain a deployment
+/// without explicit resources derives its phases on, when it is a discrete
+/// GPU's. `None` on a unified host or when the selected devices do not name
+/// exactly one device domain (derivation refuses that shape on its own).
+pub(super) fn derived_device_sizing(
+    devices: &[DeviceClaim],
+    host: &HostPolicy,
+) -> Option<super::engine_config::DeviceSizing> {
+    let [claim] = devices else {
+        return None;
+    };
+    let domain = host.domains.get(&host.devices.get(&claim.id)?.domain)?;
+    (domain.memory == DomainMemory::Device).then(|| super::engine_config::DeviceSizing {
+        managed_limit: domain.managed_limit,
+        declared_total: domain.managed_limit.saturating_add(domain.free_reserve),
+    })
+}
+
 /// Discrete GPU design §3, SPEC §16 (omission is not unlimited): explicit
 /// resources on a discrete host name the system domain wherever they charge a
 /// device domain. A phase that charges a device domain but no `distinct` system

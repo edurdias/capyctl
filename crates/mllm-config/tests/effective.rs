@@ -1540,6 +1540,15 @@ fn resolve(
     deployment: &serde_json::Value,
     host: &serde_json::Value,
 ) -> Result<mllm_config::effective::EffectiveDeployment, mllm_config::ConfigError> {
+    resolve_weighing(deployment, host, Some(8 * GIB))
+}
+
+/// [`resolve`] with the checkpoint's weights stated (`None`: not yet measured).
+fn resolve_weighing(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    weights_bytes: Option<i64>,
+) -> Result<mllm_config::effective::EffectiveDeployment, mllm_config::ConfigError> {
     let mut host = host.clone();
     let mut sglang = host.clone();
     sglang_profile(&mut sglang);
@@ -1549,7 +1558,7 @@ fn resolve(
         deployment,
         &host,
         CheckpointFacts {
-            weights_bytes: Some(8 * GIB),
+            weights_bytes,
             ..CheckpointFacts::default()
         },
     )
@@ -1706,6 +1715,53 @@ fn explicit_discrete_resources_size_the_engine_from_the_device_allocation() {
             .memory()
             .request_bytes,
         8 << 30
+    );
+}
+
+// T26 (controller ruling): a deployment that states only its KV cache on a
+// discrete host (a Hugging Face or HTTP source, whose weights are known only
+// once downloaded) is not materializable until the checkpoint digest measures
+// the weights, which is what lets acceptance freeze it provisional (ADR 0014
+// §7). Once measured, it is sized as the standalone template sizes a local
+// checkpoint (design §3): weights x 1.10 plus the KV cache, at least 0.75 of the
+// card for vLLM, with the startup peak on the card equal to the request. A
+// request the device domain can never hold is refused with its code.
+#[test]
+fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
+    let kv_only = |engine: &str| {
+        let mut d = deployment_with("deep", engine, "1GiB");
+        d["engine_config"] = serde_json::json!({"memory": {"kv_cache": "1GiB"}});
+        d
+    };
+    for engine in ["vllm", "sglang"] {
+        let e = resolve_weighing(&kv_only(engine), &discrete_host(), None).unwrap_err();
+        assert_eq!(e.code, ConfigErrorCode::NotMaterializable, "{e}");
+        assert!(e.path.starts_with("engine_config.memory"), "{e}");
+        // Acceptance's placeholder: zero weights resolve to the KV cache
+        // (vLLM: its floor), a bound nothing reserves until re-resolved.
+        resolve_weighing(&kv_only(engine), &discrete_host(), Some(0)).expect("placeholder");
+    }
+    // SGLang: 8 GiB of weights x 1.10 plus 1 GiB of KV.
+    let sglang = resolve(&kv_only("sglang"), &discrete_host()).unwrap();
+    let request = 8 * GIB / 100 * 110 + GIB;
+    assert_eq!(sglang.engine_config.memory().request_bytes, request);
+    assert_eq!(sglang.engine_config.memory().startup_bytes, Some(request));
+    assert_eq!(sglang.ready_device_allocation(), Some((Some(0), request)));
+    assert_eq!(phase(&sglang.resources.cold)[0], ("gpu0".into(), request));
+    // vLLM: at least 0.75 of the card the device domain declares (managed
+    // limit plus free reserve, 16 GiB here).
+    let vllm = resolve(&kv_only("vllm"), &discrete_host()).unwrap();
+    let floor = 16 * GIB / 100 * 75;
+    assert_eq!(vllm.engine_config.memory().request_bytes, floor);
+    assert_eq!(vllm.engine_config.memory().startup_bytes, Some(floor));
+    // 14 GiB of weights: 16.4 GiB, beyond the 14.5 GiB the card's domain manages.
+    let e = resolve_weighing(&kv_only("sglang"), &discrete_host(), Some(14 * GIB)).unwrap_err();
+    assert!(e.detail.starts_with("insufficient_device_memory:"), "{e}");
+    // A unified host keeps the placeholder margin.
+    let unified = resolve(&kv_only("sglang"), &host()).unwrap();
+    assert_eq!(
+        unified.engine_config.memory().request_bytes,
+        8 * GIB + GIB + mllm_config::effective::overhead_margin(Engine::Sglang)
     );
 }
 

@@ -1057,6 +1057,10 @@ pub fn resolve_effective_with_checkpoint(
             checkpoint_root: model.resolved_path.as_deref().map(Path::new),
             declared_ready_total,
             facts,
+            device: match &declared_resources {
+                Some(_) => None,
+                None => core::derived_device_sizing(&d.devices, &host),
+            },
         },
     )?;
     let resources = match declared_resources {
