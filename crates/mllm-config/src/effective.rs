@@ -580,7 +580,55 @@ impl EffectiveDeployment {
             None => unpinned(),
         }
     }
+
+    /// Discrete GPU design §6 (ADR 0019): the device domain this deployment's
+    /// Ready footprint charges, as the driver index of the GPU the domain names
+    /// (`gpuN`) and the bytes the Ready phase holds there. `None` on a unified
+    /// or host-only footprint. A device domain whose device is not a `gpuN` id
+    /// has no index (`Some((None, bytes))`): no sample can name it.
+    pub fn ready_device_allocation(&self) -> Option<(Option<u32>, i64)> {
+        self.resources
+            .ready
+            .allocations
+            .iter()
+            .find_map(|allocation| {
+                let domain = self.host.domains.get(&allocation.domain)?;
+                (domain.memory == DomainMemory::Device).then(|| {
+                    (
+                        domain.device.as_deref().and_then(gpu_index),
+                        allocation.bytes,
+                    )
+                })
+            })
+    }
+
+    /// Discrete GPU design §6: state the observed total of the card a launch on
+    /// a device domain runs on, in this launch's own copy of the settings.
+    /// `totals` maps a driver index to the card's total bytes (a GPU sample).
+    /// A deployment that charges no device domain is left unchanged; one whose
+    /// card the sample does not report is [`DeviceTotalUnknown`]: sizing it
+    /// against anything else would size the engine against the wrong memory.
+    pub fn with_device_total(
+        mut self,
+        totals: impl Fn(u32) -> Option<i64>,
+    ) -> Result<Self, DeviceTotalUnknown> {
+        let Some((index, _)) = self.ready_device_allocation() else {
+            return Ok(self);
+        };
+        let total = index
+            .and_then(totals)
+            .filter(|total| *total > 0)
+            .ok_or(DeviceTotalUnknown)?;
+        self.engine_config.memory_mut().device_total_bytes = Some(total);
+        Ok(self)
+    }
 }
+
+/// Discrete GPU design §6: a launch on a device domain whose card total was not
+/// observed. The launch is refused rather than sized against host memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the total memory of the GPU this launch runs on was not observed")]
+pub struct DeviceTotalUnknown;
 
 /// The driver index a `gpuN` device id names; `None` for any other id.
 fn gpu_index(device_id: &str) -> Option<u32> {

@@ -22,8 +22,28 @@ pub fn frozen_from_work(
     inference_ref: String,
     admin_ref: String,
 ) -> Result<NativeLaunch, CoordinatorError> {
-    mllm_adapters::sglang::frozen_from_effective(
+    frozen_for_launch(
+        work,
         work.effective(),
+        served_name,
+        inference_ref,
+        admin_ref,
+    )
+}
+
+/// [`frozen_from_work`] with the launch's own copy of the frozen effective
+/// configuration: on a discrete device it states the card's total (discrete
+/// GPU design §6), which is a property of the host launching it, never of the
+/// revision.
+pub fn frozen_for_launch(
+    work: &InitializeWork,
+    effective: &mllm_config::effective::EffectiveDeployment,
+    served_name: String,
+    inference_ref: String,
+    admin_ref: String,
+) -> Result<NativeLaunch, CoordinatorError> {
+    mllm_adapters::sglang::frozen_from_effective(
+        effective,
         work.binding_id(),
         work.incarnation(),
         work.endpoint(),

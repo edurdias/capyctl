@@ -269,7 +269,8 @@ impl NativeHostExecution {
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Result<(), LaunchVerdict> {
-        self.admit_launch(command, plan)?;
+        // Outside the journal's locks: the GPU is sampled now.
+        self.admit_launch(command, plan, super::GpuReading::Now)?;
         let claimed = self
             .journal
             .claimed_launches(&command.identity.command_id)

@@ -287,6 +287,7 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             margin_bytes: inputs.margin,
             weights_bytes: inputs.weights,
             startup_bytes: None,
+            device_total_bytes: None,
         },
         derived,
     ))

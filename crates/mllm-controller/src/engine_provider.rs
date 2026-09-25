@@ -156,6 +156,20 @@ pub trait EngineProvider: Send + Sync {
         runtime_dir: PathBuf,
     ) -> Arc<dyn EngineBindings>;
 
+    /// [`Self::bindings`] for a host whose discrete GPUs have these totals, by
+    /// driver index (discrete GPU design §6): an engine on a device domain is
+    /// sized against its card's total. A provider whose bindings size nothing
+    /// against a card keeps the default.
+    fn bindings_for_devices(
+        &self,
+        clock: ServiceClock,
+        log_dir: PathBuf,
+        runtime_dir: PathBuf,
+        _device_totals: std::collections::BTreeMap<u32, i64>,
+    ) -> Arc<dyn EngineBindings> {
+        self.bindings(clock, log_dir, runtime_dir)
+    }
+
     /// The process tools a launch is given, built per launch around the
     /// association that records its API identity (Spec §3).
     fn tools_factory(&self) -> ToolsFactory;

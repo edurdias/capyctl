@@ -384,6 +384,18 @@ pub enum StartError {
     Template(crate::standalone_config::TemplateError),
 }
 
+/// Discrete GPU design §6: each discrete GPU's total memory by driver index,
+/// from the boot sample. Empty on a unified host or one without a GPU.
+fn device_totals(shape: &HostShape) -> std::collections::BTreeMap<u32, i64> {
+    match shape {
+        HostShape::Discrete(gpus) => gpus
+            .iter()
+            .filter_map(|gpu| Some((gpu.index, gpu.memory.as_ref()?.total_bytes)))
+            .collect(),
+        HostShape::Unified | HostShape::NoGpu => Default::default(),
+    }
+}
+
 /// ADR 0014 §5: the sum of a local checkpoint's weight-file sizes, sized with
 /// the same bounded, confined walk the digest uses (a stat per file, no hash).
 /// A relative path resolves against the model store (spec §7).
@@ -708,9 +720,19 @@ impl EngineProvider for EnvEngineProvider {
 
     fn bindings(
         &self,
+        clock: ServiceClock,
+        log_dir: PathBuf,
+        runtime_dir: PathBuf,
+    ) -> Arc<dyn EngineBindings> {
+        self.bindings_for_devices(clock, log_dir, runtime_dir, Default::default())
+    }
+
+    fn bindings_for_devices(
+        &self,
         _clock: ServiceClock,
         log_dir: PathBuf,
         runtime_dir: PathBuf,
+        device_totals: std::collections::BTreeMap<u32, i64>,
     ) -> Arc<dyn EngineBindings> {
         // ADR 0014 §7, Q9: the checkpoint stat cache is private host state,
         // kept beside the logs in the standalone state directory.
@@ -719,6 +741,7 @@ impl EngineProvider for EnvEngineProvider {
         // their file rendezvous in the private root the role created at start
         // (`<state>/rendezvous`, as on a host), never the entry's /tmp fallback.
         let bindings = ProfileBindings::new(log_dir.clone(), runtime_dir)
+            .with_device_totals(device_totals)
             .with_checkpoint_cache(cache)
             .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR));
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
@@ -1208,10 +1231,13 @@ async fn start_standalone_inner(
     };
     let bindings: Arc<dyn EngineBindings> =
         Arc::new(mllm_controller::installation_gate::InstalledBindings::new(
-            provider.bindings(
+            // Discrete GPU design §6: engines on a device domain are sized
+            // against the total of the card the boot sample observed.
+            provider.bindings_for_devices(
                 system_clock(),
                 state_dir.join("logs"),
                 installation.runtime_dir.clone(),
+                device_totals(&gpu_shape),
             ),
             embedded.installations(),
         ));

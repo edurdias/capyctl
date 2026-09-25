@@ -134,6 +134,19 @@ impl std::fmt::Debug for PlanInputVllm {
     }
 }
 
+/// Discrete GPU design §6 (ADR 0019): the `--gpu-memory-utilization` percent of
+/// a launch on a discrete device, the device request's share of the card's
+/// total rounded up to a whole percent. vLLM checks at start that this share
+/// of the card is free; the planner and the launch check already made that
+/// room. At least 75: vLLM 0.29 with CUDA graphs does not start a 4B model on a
+/// 16 GB card below 0.75 (design §3, observed on the discrete-GPU laptop host).
+/// At most 99: vLLM refuses a whole card.
+pub fn device_utilization_pct(request: i64, device_total: i64) -> u8 {
+    let total = device_total.max(1);
+    let pct = request.max(0).saturating_mul(100).saturating_add(total - 1) / total;
+    pct.clamp(75, 99) as u8
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GrantedBudget {
     pub kv_cache_bytes: Option<i64>,

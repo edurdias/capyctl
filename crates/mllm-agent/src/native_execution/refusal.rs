@@ -9,7 +9,7 @@
 //! claim was taken. A refused launch reports `completed` with no claim; a
 //! refused Park or Restore reports its launch `unchanged` (SPEC §§9.1, 10).
 //! The reason is one closed category (`mllm_protocol::execution::POLICY_REFUSALS`).
-use super::NativeHostExecution;
+use super::{GpuReading, NativeHostExecution};
 use crate::{checkpoint::CheckpointError, journal::JournalError, session::SessionError};
 use mllm_config::effective::{DomainMemory, Residency};
 use mllm_protocol::{
@@ -131,6 +131,23 @@ pub fn admit_memory_with(
     Ok(())
 }
 
+/// Whether any allocation of `effective`'s starting footprint lands on a device
+/// domain, which is read from the GPU (discrete GPU design §4).
+pub(crate) fn charges_device(effective: &mllm_config::effective::EffectiveDeployment) -> bool {
+    effective
+        .resources
+        .cold
+        .allocations
+        .iter()
+        .any(|allocation| {
+            effective
+                .host
+                .domains
+                .get(&allocation.domain)
+                .is_some_and(|limit| limit.memory == DomainMemory::Device)
+        })
+}
+
 impl NativeHostExecution {
     /// ADR 0008 (owner decision 2026-09-23): refuse a launch whose declared
     /// residency depends on a capability the installation's launch-time probe
@@ -219,6 +236,7 @@ impl NativeHostExecution {
         &self,
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
+        reading: GpuReading,
     ) -> Result<(), LaunchVerdict> {
         if self.pre_admitted(command) {
             let refused = LaunchVerdict::Refused;
@@ -228,9 +246,9 @@ impl NativeHostExecution {
                 crate::runtime_integrity::launch_required_files(&effective),
             )
             .map_err(|_| refused("runtime_integrity"))?;
-            return self.admit_memory(&effective);
+            return self.admit_memory(&effective, command, reading);
         }
-        self.admit_launch_full(command, plan)
+        self.admit_launch_full(command, plan, reading)
     }
 
     /// The whole admission of one reserved launch; provisioning and
@@ -239,6 +257,7 @@ impl NativeHostExecution {
         &self,
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
+        reading: GpuReading,
     ) -> Result<(), LaunchVerdict> {
         let refused = LaunchVerdict::Refused;
         let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
@@ -277,31 +296,27 @@ impl NativeHostExecution {
         // placement or any change).
         self.verify_checkpoint(&effective, plan)
             .map_err(|error| refused(checkpoint_refusal(error)))?;
-        self.admit_memory(&effective)
+        self.admit_memory(&effective, command, reading)
     }
 
     /// The memory half of admission: every allocation of the launch's starting
     /// footprint fits its own domain with that domain's free reserve kept
-    /// ([`admit_memory_with`]). Host memory is read as before; the GPU is
-    /// sampled afresh, and only when some allocation lands on a device domain.
+    /// ([`admit_memory_with`]). Host memory is read as before. The GPU is read
+    /// only when some allocation lands on a device domain: sampled afresh
+    /// outside the journal's locks, and under them the sample the command took
+    /// just before the lock ([`GpuReading`]); never a collector run under a lock.
     fn admit_memory(
         &self,
         effective: &mllm_config::effective::EffectiveDeployment,
+        command: &MemberCommand,
+        reading: GpuReading,
     ) -> Result<(), LaunchVerdict> {
         let host = crate::memory::read_host_memory().map_err(|_| LaunchVerdict::Uncertain)?;
-        let on_device = effective
-            .resources
-            .cold
-            .allocations
-            .iter()
-            .any(|allocation| {
-                effective
-                    .host
-                    .domains
-                    .get(&allocation.domain)
-                    .is_some_and(|limit| limit.memory == DomainMemory::Device)
-            });
-        let gpu = if on_device { self.fresh_gpu() } else { None };
+        let gpu = if charges_device(effective) {
+            self.gpu_for(command, reading)
+        } else {
+            None
+        };
         admit_memory_with(effective, &host, gpu.as_ref())
     }
 

@@ -32,6 +32,13 @@ impl LaunchSettings {
         }
     }
 
+    pub fn memory_mut(&mut self) -> &mut MemoryRequest {
+        match self {
+            Self::Vllm(settings) => &mut settings.memory,
+            Self::Sglang(settings) => &mut settings.memory,
+        }
+    }
+
     pub fn extra_args(&self) -> &[String] {
         match self {
             Self::Vllm(settings) => &settings.extra_args,
@@ -104,6 +111,13 @@ pub struct MemoryRequest {
     /// before the budget existed (its cold phase is the request).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_bytes: Option<i64>,
+    /// Discrete GPU design §6 (ADR 0019): the total memory of the GPU a launch
+    /// on a device domain runs on, as the host observed it for that launch.
+    /// Never part of a resolved configuration: resolution leaves it `None`, and
+    /// only the host that launches fills it in its own copy, so SGLang's static
+    /// fraction and vLLM's `--gpu-memory-utilization` are fractions of the card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_total_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

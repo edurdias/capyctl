@@ -31,6 +31,11 @@ pub struct ProfileBindings {
     /// launches keep their file rendezvous in, as on a host. Without one the
     /// entry falls back to its own temporary directory.
     rendezvous: Option<mllm_agent::rendezvous::RendezvousRoot>,
+    /// Discrete GPU design §6 (ADR 0019): the total memory of each discrete
+    /// GPU on this host, by driver index, as sampled at boot. An engine on a
+    /// device domain is sized against its card's total; a card's total does not
+    /// change while the host runs.
+    device_totals: std::collections::BTreeMap<u32, i64>,
 }
 
 impl ProfileBindings {
@@ -50,7 +55,28 @@ impl ProfileBindings {
             ),
             saver: None,
             rendezvous: None,
+            device_totals: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Discrete GPU design §6: the total memory of each discrete GPU by driver
+    /// index. Without it a launch on a device domain is refused rather than
+    /// sized against the wrong memory.
+    pub fn with_device_totals(mut self, totals: std::collections::BTreeMap<u32, i64>) -> Self {
+        self.device_totals = totals;
+        self
+    }
+
+    /// This launch's own copy of the frozen effective configuration, stating the
+    /// total of the card it runs on when it runs on a device domain.
+    fn sized(
+        &self,
+        work: &InitializeWork,
+    ) -> Result<mllm_config::effective::EffectiveDeployment, CoordinatorError> {
+        work.effective()
+            .clone()
+            .with_device_total(|index| self.device_totals.get(&index).copied())
+            .map_err(|error| CoordinatorError::Service(error.to_string()))
     }
 
     /// SPEC §8.2 / T21 (owner decision 2026-09-25): SGLang launches keep their
@@ -102,7 +128,11 @@ impl ProfileBindings {
     /// configuration and the binding's own leased endpoint (Spec §3). Nothing here
     /// is read from the environment: a plan that differed from what the deployment
     /// was admitted against would be a runtime nobody reviewed.
-    fn vllm_plan(&self, work: &InitializeWork) -> Result<PlanInputVllm, CoordinatorError> {
+    fn vllm_plan(
+        &self,
+        work: &InitializeWork,
+        effective: &mllm_config::effective::EffectiveDeployment,
+    ) -> Result<PlanInputVllm, CoordinatorError> {
         let endpoint = crate::port::engine_url(work.endpoint()).ok_or_else(|| {
             Self::refuse(format!("endpoint names no address: {}", work.endpoint()))
         })?;
@@ -112,7 +142,7 @@ impl ProfileBindings {
         // Spec §3: the one shared builder the remote host agent also renders
         // through, so the embedded and remote recipes cannot drift apart.
         mllm_adapters::vllm::plan_from_effective(
-            work.effective(),
+            effective,
             port,
             self.log_dir
                 .join(&work.fence().deployment_id)
@@ -174,7 +204,8 @@ impl EngineBindings for ProfileBindings {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| effective.name.clone()),
-                    launch: Some(self.vllm_plan(work)?),
+                    // Discrete GPU design §6: sized against the card's total.
+                    launch: Some(self.vllm_plan(work, &self.sized(work)?)?),
                     // SPEC §13.3: local-only is not unauthenticated. One fresh key
                     // per launch, hex so it survives an environment variable; the
                     // driver factory seals it under the binding before the builder
@@ -204,8 +235,10 @@ impl EngineBindings for ProfileBindings {
                 let served_name = effective.routes.first().cloned().ok_or_else(|| {
                     CoordinatorError::Service("the deployment serves no route".into())
                 })?;
-                let frozen = Box::new(crate::native_launch::frozen_from_work(
+                // Discrete GPU design §6: sized against the card's total.
+                let frozen = Box::new(crate::native_launch::frozen_for_launch(
                     work,
+                    &self.sized(work)?,
                     served_name,
                     inference_ref.clone(),
                     admin_ref.clone(),

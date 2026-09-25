@@ -1858,3 +1858,100 @@ async fn a_gpu_that_cannot_be_pinned_refuses_the_launch() {
     refused_launch(&host.executor, host.session, &launch).await;
     assert!(fixture.record().is_none(), "no engine was started");
 }
+
+/// One 16 GB discrete card (`gpu0`, a device domain) beside host RAM
+/// (`system`), and a restart-only deployment holding 12 GiB of the card and a
+/// little host RAM in every active phase.
+fn discrete_fixture() -> Fixture {
+    let mut fixture = Fixture::build(Some(false), true, |_, deployment| {
+        let both = |device: &str, system: &str| {
+            json!([
+                {"domain": "gpu0", "bytes": device, "host_kv_bytes": "0B"},
+                {"domain": "system", "bytes": system, "host_kv_bytes": "0B"}
+            ])
+        };
+        for phase in ["cold", "ready", "parking", "wake"] {
+            deployment["resources"][phase]["allocations"] = both("12GiB", "64MiB");
+        }
+        deployment["resources"]["parked"]["allocations"] = both("0B", "0B");
+    });
+    // The strict remote-role schema learns `device` with the remote device
+    // capability; the agent resolves from the approved document it is handed.
+    fixture.config.document["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "1GiB", "free_reserve": "16MiB",
+                   "parked_limit": "256MiB", "host_kv_limit": "64MiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    fixture.config.document["resource_policy"]["devices"] =
+        json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    fixture
+}
+
+/// SPEC §13.2, §7.2 (controller ruling, discrete GPU design §4, §6): the GPU
+/// collector is bounded at seconds, so a launch samples the card before the
+/// journal is locked and never while holding it; the locked rechecks read that
+/// sample. A slow sampler that looks at the journal from inside its own run
+/// always finds both locks free. The engine is sized from the same sample:
+/// its utilization is the device request's share of the card (12 GiB of
+/// 16376 MiB rounds up to 0.76), with the grant's KV bytes.
+// T26 T16 T13
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fixture = discrete_fixture();
+    let mut host = host(&fixture);
+    let journal = host.journal.clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let locked = Arc::new(AtomicUsize::new(0));
+    let (counted, seen) = (runs.clone(), locked.clone());
+    let sampler: Arc<mllm_agent::gpu_memory::GpuSampler> = Arc::new(move || {
+        if !journal.locks_free() {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        counted.fetch_add(1, Ordering::SeqCst);
+        mllm_agent::gpu_memory::parse_query_gpu(
+            "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 0, 16376\n",
+            now_ms(),
+        )
+    });
+    host.executor = host.executor.clone().with_gpu_sampler(sampler);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the discrete card");
+    // The locked rechecks (acceptance, the durable attempt, the spawn) read
+    // the device from a sample: without one the device is unobserved and the
+    // launch would be uncertain, never ready.
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    assert!(runs.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        locked.load(Ordering::SeqCst),
+        0,
+        "a sample ran under a lock"
+    );
+    let record = fixture.record().expect("the engine recorded its launch");
+    let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--gpu-memory-utilization", "0.76"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--kv-cache-memory-bytes", "67108864"]),
+        "{argv:?}"
+    );
+    // Discrete GPU design §7: the discrete card is pinned by its index.
+    assert_eq!(record["cuda_visible_devices"], "0");
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}

@@ -259,3 +259,66 @@ fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
         (Some(CudaNamespace::PciIndex(0)), Some("0".to_string()))
     );
 }
+
+/// The golden deployment on a discrete host: one 16 GB card (`gpu0`, a device
+/// domain) beside host RAM (`system`), its phases derived from a 12 GiB device
+/// request.
+fn discrete_effective() -> EffectiveDeployment {
+    let (mut deployment, mut host) = fixture();
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "30GiB", "free_reserve": "12GiB",
+                   "parked_limit": "15GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let object = deployment.as_object_mut().unwrap();
+    object.remove("resources");
+    deployment["engine_config"]["memory"] =
+        json!({"request": "12GiB", "kv_cache": "4GiB", "startup": "12GiB"});
+    resolve_effective(&deployment, &host).unwrap()
+}
+
+/// Discrete GPU design §6 (ADR 0019): on a device domain the utilization vLLM
+/// checks at start is the device request's share of the observed card, not
+/// the unified gate, and the KV bytes are the grant's. A launch whose card
+/// total was not observed is refused before a plan exists.
+// T26
+#[test]
+fn a_discrete_plan_sizes_utilization_from_the_device_request() {
+    let effective = discrete_effective();
+    assert_eq!(
+        effective.ready_device_allocation(),
+        Some((Some(0), 12 << 30))
+    );
+    // Without the card's total the plan keeps the gate; the launch paths
+    // refuse such a launch before building it (`with_device_total`).
+    let gated = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(
+        gated.granted.gpu_utilization_pct,
+        Some(mllm_adapters::vllm::GPU_UTILIZATION_GATE_PCT)
+    );
+    assert!(effective.clone().with_device_total(|_| None).is_err());
+    assert!(effective
+        .clone()
+        .with_device_total(|index| (index == 1).then_some(16376 << 20))
+        .is_err());
+    let sized = effective
+        .with_device_total(|index| (index == 0).then_some(16376 << 20))
+        .unwrap();
+    let plan = plan_from_effective(&sized, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(plan.granted.gpu_utilization_pct, Some(76));
+    assert_eq!(plan.granted.kv_cache_bytes, Some(4 << 30));
+    let argv = render_command(&plan).unwrap().argv;
+    assert!(argv
+        .windows(2)
+        .any(|w| w == ["--gpu-memory-utilization", "0.76"]));
+    // A unified deployment is never given a device total.
+    let unified = effective_with_deep_park_disabled();
+    let same = unified.clone().with_device_total(|_| Some(1)).unwrap();
+    assert_eq!(same.engine_config.memory().device_total_bytes, None);
+}
+
+fn effective_with_deep_park_disabled() -> EffectiveDeployment {
+    effective("disabled")
+}

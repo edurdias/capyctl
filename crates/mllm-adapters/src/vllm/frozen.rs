@@ -12,7 +12,7 @@ use mllm_config::effective::EffectiveDeployment;
 use mllm_domain::launch::{LaunchSettings, VllmLaunchSettings};
 
 use crate::policy::ParkPolicy;
-use crate::vllm::args::{GrantedBudget, PlanInputVllm};
+use crate::vllm::args::{device_utilization_pct, GrantedBudget, PlanInputVllm};
 
 /// Reserved (ADR 0014 §3): the gate vLLM checks free memory against at start.
 /// Explicit KV bytes size the pool, so the gate only has to pass.
@@ -66,6 +66,23 @@ pub fn park_policy(effective: &EffectiveDeployment) -> ParkPolicy {
         ParkPolicy::Enabled
     } else {
         ParkPolicy::Disabled
+    }
+}
+
+/// Discrete GPU design §6 (ADR 0019): on a device domain vLLM's utilization is
+/// the device request's share of the card the launching host observed
+/// ([`device_utilization_pct`]); vLLM checks at start that this share is free.
+/// Everywhere else, and before a host has stated the card's total (a plan built
+/// to check authority, not to launch), the low unified gate. A launch on a
+/// device domain states the total first (`EffectiveDeployment::with_device_total`)
+/// or is refused.
+fn utilization_pct(effective: &EffectiveDeployment, settings: &VllmLaunchSettings) -> u8 {
+    match (
+        effective.ready_device_allocation(),
+        settings.memory.device_total_bytes,
+    ) {
+        (Some((_, request)), Some(total)) => device_utilization_pct(request, total),
+        _ => GPU_UTILIZATION_GATE_PCT,
     }
 }
 
@@ -134,12 +151,12 @@ pub fn plan_from_effective(
         cpu_offload_bytes: 0,
         // ADR 0014 §5: the KV cache is the deployment's declared or derived
         // value, already bounded by the memory request admission reserves.
-        // The utilization gate stays low because the explicit KV bytes size
-        // the pool, and the gate must pass while a previous deployment's
-        // memory is still being released.
+        // On a unified domain the utilization gate stays low because the
+        // explicit KV bytes size the pool, and the gate must pass while a
+        // previous deployment's memory is still being released.
         granted: GrantedBudget {
             kv_cache_bytes: Some(settings.memory.kv_cache_bytes),
-            gpu_utilization_pct: Some(GPU_UTILIZATION_GATE_PCT),
+            gpu_utilization_pct: Some(utilization_pct(effective, settings)),
             swap_space_bytes: None,
         },
         engine_args,

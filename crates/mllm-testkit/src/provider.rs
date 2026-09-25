@@ -84,10 +84,21 @@ pub fn fake_bindings(
     runtime_dir: PathBuf,
 ) -> Arc<dyn EngineBindings> {
     Arc::new(FakeBindings {
-        profile: ProfileBindings::new(log_dir, runtime_dir),
+        profile: ProfileBindings::new(log_dir, runtime_dir).with_device_totals(fake_cards()),
         clock,
         members: None,
     })
+}
+
+/// The card total every discrete GPU a Fake "runs on" states (16 GB), so the
+/// product's plan for a launch on a device domain builds (discrete GPU design
+/// §6). The Fake runs on no card; the total only has to be a card's.
+pub const FAKE_CARD_BYTES: i64 = 16376 << 20;
+
+/// [`FAKE_CARD_BYTES`] for the driver indices a test host names (`gpu0` to
+/// `gpu7`).
+fn fake_cards() -> std::collections::BTreeMap<u32, i64> {
+    (0..8).map(|index| (index, FAKE_CARD_BYTES)).collect()
 }
 
 /// As [`fake_bindings`], with every Fake reporting `members` as its launched
@@ -100,7 +111,7 @@ pub fn fake_bindings_with_members(
     members: Vec<mllm_domain::completion::ProcessIdentity>,
 ) -> Arc<dyn EngineBindings> {
     Arc::new(FakeBindings {
-        profile: ProfileBindings::new(log_dir, runtime_dir),
+        profile: ProfileBindings::new(log_dir, runtime_dir).with_device_totals(fake_cards()),
         clock,
         members: Some(members),
     })

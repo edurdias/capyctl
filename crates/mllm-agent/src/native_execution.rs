@@ -45,6 +45,7 @@ pub use saver_source::{EnrolledSaver, LaunchSglangObserver};
 // SPEC §13 (WE3 limit 1): pre-effect policy refusals are terminal results.
 mod refusal;
 // Discrete GPU design §4: the launch check the switch planner agrees with.
+use refusal::charges_device;
 pub use refusal::{admit_memory_with, LaunchVerdict};
 // SPEC §§3.1, 7.3 (per-launch claims): host-side co-residence admission.
 mod coresidence;
@@ -111,6 +112,33 @@ pub struct NativeHostExecution {
     /// runs only when the accepted policy declares a device domain, off the
     /// session loop, so a slow collector never delays a heartbeat.
     gpu: Option<Arc<crate::gpu_memory::CachedGpuSampler>>,
+    /// SPEC §13.2, §7.2 (controller ruling, discrete GPU design §4): the GPU
+    /// sample each launch took just before the journal was locked, keyed by the
+    /// command's canonical digest. A collector run is bounded at seconds, so it
+    /// never runs under the journal's locks; the locked recheck reads this.
+    lock_samples: Arc<Mutex<std::collections::HashMap<[u8; 32], LockSample>>>,
+}
+
+/// A GPU sample taken for one command before the journal was locked, and when.
+type LockSample = (std::time::Instant, Option<crate::gpu_memory::GpuSample>);
+
+/// How long a sample taken before the lock stands for the locked recheck. A
+/// launch's last check runs when the engine is spawned, after its durable
+/// attempt began; an older sample leaves the device unobserved.
+const LOCK_SAMPLE_TTL: Duration = Duration::from_secs(60);
+/// A sample this recent is reused instead of running the collector again.
+const LOCK_SAMPLE_REUSE: Duration = Duration::from_secs(1);
+
+/// Where the memory half of a launch's admission reads the GPU from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuReading {
+    /// Outside the journal's locks: sample the card now (bounded), and keep
+    /// the sample for the locked recheck of the same command.
+    Now,
+    /// Under the journal's locks: the sample this command took just before the
+    /// lock. Never a collector run: a slow `nvidia-smi` would stall every
+    /// other host operation for its whole bound.
+    BeforeLock,
 }
 
 /// How long a pre-admission stands for the locked recheck.
@@ -192,6 +220,7 @@ impl NativeHostExecution {
             residency: None,
             rendezvous: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            lock_samples: Arc::new(Mutex::new(std::collections::HashMap::new())),
             gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
                 crate::gpu_memory::sample,
             ))),
@@ -219,6 +248,64 @@ impl NativeHostExecution {
         self.gpu.as_ref().and_then(|sampler| sampler.fresh())
     }
 
+    /// The GPU sample a launch's memory check reads ([`GpuReading`]). Outside
+    /// the journal's locks the card is sampled now and the sample kept for the
+    /// command's locked recheck; under the locks only that kept sample is read.
+    pub(crate) fn gpu_for(
+        &self,
+        command: &MemberCommand,
+        reading: GpuReading,
+    ) -> Option<crate::gpu_memory::GpuSample> {
+        let key = command.canonical_digest();
+        match reading {
+            GpuReading::Now => {
+                let sample = self.fresh_gpu();
+                if let Ok(mut samples) = self.lock_samples.lock() {
+                    samples.retain(|_, (at, _)| at.elapsed() < LOCK_SAMPLE_TTL);
+                    if samples.len() < MAX_PRE_ADMISSIONS {
+                        samples.insert(key, (std::time::Instant::now(), sample.clone()));
+                    }
+                }
+                sample
+            }
+            GpuReading::BeforeLock => self.lock_samples.lock().ok().and_then(|samples| {
+                samples
+                    .get(&key)
+                    .filter(|(at, _)| at.elapsed() < LOCK_SAMPLE_TTL)
+                    .and_then(|(_, sample)| sample.clone())
+            }),
+        }
+    }
+
+    /// SPEC §13.2 (controller ruling): sample the GPU for `command` before the
+    /// journal is locked, so the locked recheck and the launch it admits read a
+    /// sample taken moments ago without running the collector under the lock.
+    /// A sample taken within the last second for the same command (its
+    /// pre-admission just now) is reused. `None` when the launch charges no
+    /// device domain, or when the card is unobserved.
+    pub(crate) fn sample_before_lock(
+        &self,
+        command: &MemberCommand,
+    ) -> Option<crate::gpu_memory::GpuSample> {
+        if !matches!(command.action, MemberAction::LaunchSingle(_)) {
+            return None;
+        }
+        let effective = self.resolve(command).ok()?;
+        if !charges_device(&effective) {
+            return None;
+        }
+        let key = command.canonical_digest();
+        if let Some(recent) = self.lock_samples.lock().ok().and_then(|samples| {
+            samples
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < LOCK_SAMPLE_REUSE)
+                .map(|(_, sample)| sample.clone())
+        }) {
+            return recent;
+        }
+        self.gpu_for(command, GpuReading::Now)
+    }
+
     /// SPEC §13.2: run the slow half of a command's admission outside the
     /// journal's locks. A launch runs its whole admission; a Park runs the
     /// installation measurement and capability probe its tier depends on. A
@@ -228,7 +315,9 @@ impl NativeHostExecution {
             return Ok(());
         }
         match &command.action {
-            MemberAction::LaunchSingle(plan) => self.admit_launch_full(command, plan)?,
+            MemberAction::LaunchSingle(plan) => {
+                self.admit_launch_full(command, plan, GpuReading::Now)?
+            }
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
                 let owner = self
                     .journal
@@ -813,7 +902,21 @@ impl NativeHostExecution {
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Result<(), LaunchError> {
-        let effective = self.resolve(command).map_err(|_| SessionError)?;
+        // SPEC §13.2 (controller ruling): the durable attempt and the spawn
+        // recheck admission under the journal's locks; the GPU is sampled for
+        // them now, before either lock is taken.
+        let host = self.clone();
+        let sampled = command.clone();
+        let sample = tokio::task::spawn_blocking(move || host.sample_before_lock(&sampled))
+            .await
+            .map_err(|_| SessionError)?;
+        // Discrete GPU design §6: an engine on a device domain is sized against
+        // the card's total, read from the same sample its launch check reads.
+        let effective = self
+            .resolve(command)
+            .map_err(|_| SessionError)?
+            .with_device_total(|index| device_total(sample.as_ref(), index))
+            .map_err(|_| SessionError)?;
         let scope = self.scope(command).map_err(|_| SessionError)?;
         let keys = self
             .identities
@@ -992,9 +1095,15 @@ impl NativeHostExecution {
         {
             let host = self.clone();
             let admitted = command.clone();
-            match tokio::task::spawn_blocking(move || host.pre_admit(&admitted))
-                .await
-                .map_err(|_| SessionError)?
+            // SPEC §13.2 (controller ruling): the GPU is sampled here, before
+            // the journal is locked; the locked recheck reads this sample.
+            match tokio::task::spawn_blocking(move || {
+                host.pre_admit(&admitted)?;
+                host.sample_before_lock(&admitted);
+                Ok(())
+            })
+            .await
+            .map_err(|_| SessionError)?
             {
                 Ok(()) => {}
                 Err(LaunchVerdict::Refused(_)) => return self.refused_launch(&command).await,
@@ -1305,7 +1414,9 @@ impl LocalExecutionPolicy for NativeHostExecution {
             MemberAction::LaunchSingle(plan) if command.identity.expected_state == "reserved" => {
                 // ADR 0014 §7, SPEC §13: checkpoint, pool shape and memory, the
                 // same admission provisioning runs and reports when refused.
-                Ok(self.admit_launch(command, plan)?)
+                // This runs under the journal's locks, so the GPU is read from
+                // the sample taken just before them (`sample_before_lock`).
+                Ok(self.admit_launch(command, plan, GpuReading::BeforeLock)?)
             }
             MemberAction::Terminate { .. } if command.identity.expected_state == "retained" => {
                 Ok(())
@@ -1591,6 +1702,17 @@ impl SessionExecution for NativeHostExecution {
 /// index its `gpuN` device names (`None`: a device id with no index, which is
 /// never observed). A document whose policy does not resolve declares none, so
 /// its domains are refreshed as before.
+/// The total memory of GPU `index` in `sample`, when the sample reports it.
+fn device_total(sample: Option<&crate::gpu_memory::GpuSample>, index: u32) -> Option<i64> {
+    sample?
+        .devices
+        .iter()
+        .find(|device| device.index == index)?
+        .memory
+        .as_ref()
+        .map(|memory| memory.total_bytes)
+}
+
 fn device_domains(document: &serde_json::Value) -> std::collections::BTreeMap<String, Option<u32>> {
     mllm_config::remote_resources::local_host_document(document)
         .ok()
@@ -2520,7 +2642,7 @@ mod tests {
                 panic!("a launch");
             };
             assert_eq!(
-                executor.admit_launch(&launch, &plan),
+                executor.admit_launch(&launch, &plan, GpuReading::Now),
                 Err(LaunchVerdict::Refused(expected)),
                 "{policy_value:?}"
             );
@@ -2577,7 +2699,7 @@ mod tests {
             .installations
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(
-            executor.admit_launch(&owner, &plan),
+            executor.admit_launch(&owner, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("capability_missing:deep_park"))
         );
 
@@ -2621,7 +2743,7 @@ mod tests {
             .installations
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(
-            restart.admit_launch(&launch, &plan),
+            restart.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
     }
@@ -2650,7 +2772,7 @@ mod tests {
                 panic!("a launch");
             };
             assert_eq!(
-                executor.admit_launch(&owner, &plan),
+                executor.admit_launch(&owner, &plan, GpuReading::Now),
                 Err(LaunchVerdict::Refused("capability_missing:deep_park")),
                 "{quantization}"
             );
@@ -2689,7 +2811,7 @@ mod tests {
             panic!("a launch");
         };
         assert_eq!(
-            restart.admit_launch(&launch, &plan),
+            restart.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
 
@@ -2704,7 +2826,7 @@ mod tests {
             panic!("a launch");
         };
         assert_eq!(
-            vllm.admit_launch(&launch, &plan),
+            vllm.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
     }
