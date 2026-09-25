@@ -8,8 +8,8 @@ use crate::schema::{
     SCHEMA_V1, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
     SCHEMA_V17, SCHEMA_V18, SCHEMA_V19, SCHEMA_V2, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
     SCHEMA_V24, SCHEMA_V25, SCHEMA_V26, SCHEMA_V27, SCHEMA_V28, SCHEMA_V29, SCHEMA_V3, SCHEMA_V30,
-    SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
-    SCHEMA_V8, SCHEMA_V9,
+    SCHEMA_V31, SCHEMA_V32, SCHEMA_V33, SCHEMA_V34, SCHEMA_V35, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+    SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
 };
 
 /// One entry per version; `MIGRATIONS[0]` is version 1.
@@ -40,7 +40,8 @@ pub const MIGRATIONS: &[&str] = &[
     // ADR 0008: materialization state of declared remote model sources.
     SCHEMA_V33,
     // ADR 0017: each host's declared version, capabilities and skew verdict.
-    SCHEMA_V34,
+    SCHEMA_V34, // ADR 0018 §4: durable profile retirements and their stops.
+    SCHEMA_V35,
 ];
 
 /// The newest schema version this binary knows how to read and write.
@@ -567,6 +568,67 @@ mod tests {
                 []
             )
             .is_err());
+    }
+
+    /// ADR 0018 §4: v35 adds profile retirements to an existing v34 store in
+    /// place. The v34 host version rows are carried across, the new tables
+    /// enforce their bounds, and a retirement's stops go with it.
+    // T33
+    #[test]
+    fn v35_adds_profile_retirements_and_keeps_v34_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(34).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version) VALUES(?1)",
+                [(index + 1) as i64],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO enrolled_hosts(host_id,host_name,key_digest,revoked) VALUES('lab','lab','key',0);
+             INSERT INTO host_versions VALUES('lab','0.4.0','supported','','[]',7);
+             INSERT INTO operations(id,kind,state) VALUES('op','ordinary_cleanup','running');",
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 35);
+        let kept: (String, i64) = conn
+            .query_row(
+                "SELECT binary_version,recorded_at_ms FROM host_versions WHERE host_id='lab'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("0.4.0".into(), 7));
+        conn.execute_batch(
+            "INSERT INTO profile_retirements VALUES('lab','local','k','retiring',8,9);
+             INSERT INTO profile_retirement_stops VALUES('lab','local','op');",
+        )
+        .unwrap();
+        for bad in [
+            "INSERT INTO profile_retirements VALUES('','p','k','retiring',8,9)",
+            "INSERT INTO profile_retirements VALUES('lab','p','k','gone',8,9)",
+            "INSERT INTO profile_retirements VALUES('lab','p','k','retiring',8,7)",
+            "INSERT INTO profile_retirement_stops VALUES('lab','absent','op')",
+            "INSERT INTO profile_retirement_stops VALUES('lab','local','no-such-op')",
+        ] {
+            assert!(conn.execute(bad, []).is_err(), "{bad}");
+        }
+        conn.execute("DELETE FROM profile_retirements", []).unwrap();
+        let stops: i64 = conn
+            .query_row("SELECT COUNT(*) FROM profile_retirement_stops", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stops, 0, "a retirement's stops are removed with it");
     }
 
     /// ADR 0011: the qualification tables are dropped. A v12 store with rows in the

@@ -118,6 +118,10 @@ impl EnrollmentAuthority {
         let _ = owner
             .store()
             .expire_host_drain_intents(mllm_protocol::now_unix_ms());
+        // ADR 0018 §4: likewise an abandoned profile retirement.
+        let _ = owner
+            .store()
+            .expire_profile_retirements(mllm_protocol::now_unix_ms());
         owner.store().hosts_with_pending_drain().ok()
     }
     pub fn new(state: SharedCoordinatorState, ca: CertificateAuthority) -> Self {

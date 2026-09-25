@@ -87,19 +87,25 @@ pub(super) fn candidates(
     eligible: Eligible<'_>,
     reclaim_parked: bool,
 ) -> Result<Vec<HostCandidate>, LifecycleError> {
-    let hosts: Vec<(String, String)> = tx
+    // ADR 0018 §4: each host's row also names the runtime profile the
+    // revision resolved with there, so a retiring profile is excluded below.
+    let hosts: Vec<(String, String, Option<String>)> = tx
         .prepare(
-            "SELECT host_id,effective_json FROM host_effective_revisions
-              WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved' ORDER BY host_id",
+            "SELECT h.host_id, h.effective_json,
+                    COALESCE(json_extract(h.source_json,'$.runtime_profile'),
+                             (SELECT json_extract(s.config_json,'$.runtime_profile') FROM managed_configuration_sources s
+                               WHERE s.deployment_id=h.deployment_id AND s.revision=h.revision))
+               FROM host_effective_revisions h
+              WHERE h.deployment_id=?1 AND h.revision=?2 AND h.outcome='resolved' ORDER BY h.host_id",
         )?
         .query_map(params![deployment_id, revision], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<Result<_, _>>()?;
     let ledger = read_snapshot(tx).map_err(resource)?;
     let pending = pending_charges(tx)?;
     let mut candidates = Vec::new();
-    for (host, raw) in hosts {
+    for (host, raw, profile) in hosts {
         let e = decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
         let Some(policy) = read_selected_policy(tx, &e.host.name).map_err(resource)? else {
             continue;
@@ -189,7 +195,16 @@ pub(super) fn candidates(
         candidates.push(HostCandidate {
             occupied,
             whole_host,
-            eligible: eligible.is_none_or(|set| set.contains(&host)),
+            // ADR 0018 §4: nor while the deployment's profile is retiring on
+            // this host, or absent from the host's current approved document.
+            // Exclusion only: nothing already placed is stopped or released.
+            eligible: eligible.is_none_or(|set| set.contains(&host))
+                && match &profile {
+                    Some(profile) => {
+                        crate::profile_retirement::profile_placeable(tx, &host, profile)?
+                    }
+                    None => true,
+                },
             host_id: host,
             instances_here,
             footprint,
