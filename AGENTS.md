@@ -60,7 +60,7 @@ cargo test -p mllm-adapters -p mllm-store -p mllm-controller -p mllm-management 
 ```
 
 Also run `cargo test --workspace --all-targets --locked`. Clippy must pass with
-warnings denied across those crates. Installer changes also run
+warnings denied across those crates. Formatting must pass: `cargo fmt --all --check`. Installer changes also run
 `scripts/test-install.sh`; packaging changes run `scripts/verify-packaging.sh`.
 
 One owned-state test spawns a child process that reports a nested summary; the
