@@ -95,7 +95,7 @@ struct Harness {
     identity: PendingEnrollment,
     host: String,
     server: tokio::task::JoinHandle<()>,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
 async fn enrolled() -> Harness {
@@ -156,7 +156,7 @@ async fn enrolled() -> Harness {
         identity,
         host,
         server,
-        _dirs: (state_dir, storage_dir),
+        dirs: (state_dir, storage_dir),
     }
 }
 
@@ -656,4 +656,374 @@ async fn an_invalid_profile_name_is_refused_with_a_service_installed() {
     assert!(service.seen.lock().unwrap().is_empty());
     assert!(h.sessions.current_session(&h.host).is_some());
     h.server.abort();
+}
+
+use mllm_agent::control_socket::{ControlHandler, ControlRequest};
+use mllm_agent::host_control::HostControl;
+use mllm_agent::profiles::{HostProfiles, ProfileSet};
+use mllm_agent::session::{run_session_with_updates, ProfileUpdates};
+use mllm_config::registration::EnginesFile;
+
+/// A running agent session with live updates, its host document on disk, and
+/// the control handler over both.
+struct Agent {
+    updates: Arc<ProfileUpdates>,
+    control: Arc<HostControl>,
+    document: std::path::PathBuf,
+    stop: tokio::sync::watch::Sender<bool>,
+    session: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl Agent {
+    /// Stop the session and wait for it, so nothing outlives the test.
+    async fn stop(self) {
+        self.stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), self.session)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+async fn agent(h: &Harness) -> Agent {
+    let dir = directory();
+    let document = dir.path().join("host.yaml");
+    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    let config =
+        mllm_config::remote_roles::HostConfig::parse(&prepared_document().to_string()).unwrap();
+    let profiles = HostProfiles::new(ProfileSet::new(config.clone(), inventory(&h.host)));
+    let updates = ProfileUpdates::new(profiles);
+    let journal =
+        mllm_agent::journal::HostJournal::open(dir.path(), &h.identity.controller_id(), &h.host)
+            .unwrap();
+    let control = HostControl::new(document.clone(), config, updates.clone(), journal.clone());
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    // PendingEnrollment is not Clone: the session owns a copy loaded from
+    // the harness's identity directory.
+    let identity =
+        PendingEnrollment::load(&IdentityDirectory::open(h.dirs.1.path()).unwrap()).unwrap();
+    let (inv, u) = (inventory(&h.host), updates.clone());
+    let session = tokio::spawn(async move {
+        let _ =
+            run_session_with_updates(&identity, journal, inv, shutdown, None, None, Some(u)).await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !updates.connected() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    Agent {
+        updates,
+        control,
+        document,
+        stop,
+        session,
+        _dir: dir,
+    }
+}
+
+/// `engine add`'s write: `vllm` into the engines file beside `document`.
+fn add_vllm_to(document: &std::path::Path) {
+    use mllm_config::registration::{engines_beside, lock_engines, write_engines};
+    let path = engines_beside(document);
+    let lock = lock_engines(&path).unwrap();
+    let mut engines = EnginesFile::load(&path).unwrap();
+    let with: Value = serde_json::from_str(&with_vllm("x").approved_host_config_json).unwrap();
+    engines
+        .profiles
+        .insert("vllm".into(), with["runtime_profiles"]["vllm"].clone());
+    write_engines(&engines, &lock, Some(&prepared_document())).unwrap();
+}
+
+fn approved_fingerprint(h: &Harness) -> String {
+    h.state
+        .lock()
+        .unwrap()
+        .store()
+        .host_publication(&h.host)
+        .unwrap()
+        .unwrap()
+        .fingerprint
+}
+
+// T07 T34: an added profile is published live and promoted on acceptance.
+#[tokio::test]
+async fn an_added_profile_is_published_and_promoted() {
+    let h = enrolled().await;
+    let a = agent(&h).await;
+    add_vllm_to(&a.document);
+    let host_before = std::fs::read(&a.document).unwrap();
+    let reply = a.control.handle(ControlRequest::Add).await;
+    assert_eq!(reply["published"], "published", "{reply}");
+    assert!(a
+        .updates
+        .profiles()
+        .accepted()
+        .config
+        .profiles
+        .contains_key("vllm"));
+    assert_eq!(
+        std::fs::read(&a.document).unwrap(),
+        host_before,
+        "host.yaml is never rewritten"
+    );
+    let approved = h
+        .state
+        .lock()
+        .unwrap()
+        .store()
+        .host_publication(&h.host)
+        .unwrap()
+        .unwrap();
+    assert!(approved.config_json.contains("\"vllm\""));
+    // Nothing changed since: not published again.
+    assert_eq!(
+        a.control.handle(ControlRequest::Add).await["published"],
+        "unchanged"
+    );
+    // `list` reports the session, the capability and the accepted profile.
+    let list = a.control.handle(ControlRequest::List).await;
+    assert_eq!(list["ok"], true, "{list}");
+    assert_eq!(list["connected"], true);
+    assert_eq!(list["live_profile_update"], true);
+    assert_eq!(list["accepted"]["vllm"]["engine"], "vllm", "{list}");
+    a.stop().await;
+    h.server.abort();
+}
+
+// T03 (Review Focus 1): an edit outside runtime_profiles is not published live.
+#[tokio::test]
+async fn a_reload_refuses_a_document_changed_outside_profiles() {
+    let h = enrolled().await;
+    let a = agent(&h).await;
+    let mut doc: Value = prepared_document();
+    // Within the 250ms..5s bound, so the document itself stays valid.
+    doc["load_report_interval"] = json!("2s");
+    std::fs::write(&a.document, doc.to_string()).unwrap();
+    let before = approved_fingerprint(&h);
+    let reply = a.control.handle(ControlRequest::Add).await;
+    assert_eq!(reply["ok"], false);
+    assert_eq!(reply["code"], "publish_rejected");
+    assert!(
+        reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("restart the role"),
+        "{reply}"
+    );
+    assert!(!a.updates.profiles().publishing());
+    assert_eq!(approved_fingerprint(&h), before);
+    a.stop().await;
+    h.server.abort();
+}
+
+// T16: a published profile is removed only after the server confirms; the
+// engines file is rewritten (host.yaml never) and the removal published.
+#[tokio::test]
+async fn a_confirmed_removal_rewrites_and_publishes() {
+    let h = enrolled().await;
+    h.sessions.with_profile_retirements(Arc::new(Scripted {
+        first: RetirementStep::Confirmed,
+        waits: 0.into(),
+        last: RetirementStep::Confirmed,
+        seen: Mutex::new(vec![]),
+    }));
+    let a = agent(&h).await;
+    add_vllm_to(&a.document);
+    assert_eq!(
+        a.control.handle(ControlRequest::Add).await["published"],
+        "published"
+    );
+    let host_before = std::fs::read(&a.document).unwrap();
+    // The scripted service confirms without the store row the publication
+    // transaction needs; write it as StoreRetirements would.
+    h.state
+        .lock()
+        .unwrap()
+        .store()
+        .begin_profile_retirement(&h.host, "vllm", "k", 1, i64::MAX / 2, false)
+        .unwrap();
+    let reply = a
+        .control
+        .handle(ControlRequest::Remove {
+            profile: "vllm".into(),
+            drain: false,
+        })
+        .await;
+    assert_eq!(reply["removed"], "vllm", "{reply}");
+    assert_eq!(reply["published"], "published", "{reply}");
+    let engines =
+        EnginesFile::load(&mllm_config::registration::engines_beside(&a.document)).unwrap();
+    assert!(!engines.profiles.contains_key("vllm"));
+    assert_eq!(engines.revision, 2);
+    assert_eq!(std::fs::read(&a.document).unwrap(), host_before);
+    assert!(!a
+        .updates
+        .profiles()
+        .accepted()
+        .config
+        .profiles
+        .contains_key("vllm"));
+    a.stop().await;
+    h.server.abort();
+}
+
+// T16 T32: removal while in use writes nothing.
+#[tokio::test]
+async fn a_removal_in_use_writes_nothing() {
+    let h = enrolled().await;
+    h.sessions.with_profile_retirements(Arc::new(Scripted {
+        first: RetirementStep::InUse(vec!["q14".into()]),
+        waits: 0.into(),
+        last: RetirementStep::Confirmed,
+        seen: Mutex::new(vec![]),
+    }));
+    let a = agent(&h).await;
+    add_vllm_to(&a.document);
+    assert_eq!(
+        a.control.handle(ControlRequest::Add).await["published"],
+        "published"
+    );
+    let engines = mllm_config::registration::engines_beside(&a.document);
+    let before = std::fs::read(&engines).unwrap();
+    let reply = a
+        .control
+        .handle(ControlRequest::Remove {
+            profile: "vllm".into(),
+            drain: false,
+        })
+        .await;
+    assert_eq!(reply["code"], "profile_in_use", "{reply}");
+    assert_eq!(reply["deployments"], json!(["q14"]));
+    assert_eq!(std::fs::read(&engines).unwrap(), before);
+    assert!(a
+        .updates
+        .profiles()
+        .accepted()
+        .config
+        .profiles
+        .contains_key("vllm"));
+    // A profile declared in host.yaml is the operator's: never removed here.
+    let theirs = a
+        .control
+        .handle(ControlRequest::Remove {
+            profile: "local".into(),
+            drain: false,
+        })
+        .await;
+    assert_eq!(theirs["code"], "invalid_config", "{theirs}");
+    a.stop().await;
+    h.server.abort();
+}
+
+// Owner decision 2026-09-25: without a session, a published profile is not removed.
+#[tokio::test]
+async fn a_removal_without_a_session_writes_nothing() {
+    let dir = directory();
+    let document = dir.path().join("host.yaml");
+    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    let journal = mllm_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
+    add_vllm_to(&document);
+    let config = mllm_config::remote_roles::HostConfig::load(&document).unwrap();
+    let set = ProfileSet::new(config.clone(), with_vllm("h"));
+    let updates = ProfileUpdates::new(HostProfiles::new(set));
+    let control = HostControl::new(document.clone(), config, updates, journal);
+    let reply = control
+        .handle(ControlRequest::Remove {
+            profile: "vllm".into(),
+            drain: true,
+        })
+        .await;
+    assert_eq!(reply["code"], "agent_unreachable", "{reply}");
+    assert!(
+        EnginesFile::load(&mllm_config::registration::engines_beside(&document))
+            .unwrap()
+            .profiles
+            .contains_key("vllm")
+    );
+}
+
+// T34 (ADR 0017, 0018 §3): a server that does not advertise
+// live_profile_update gets no PublishProfiles or RetireProfile. `add` says a
+// restart publishes the change; a published profile is not removed.
+#[tokio::test]
+async fn a_peer_without_live_updates_gets_the_restart_fallback() {
+    let dir = directory();
+    let document = dir.path().join("host.yaml");
+    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    let journal = mllm_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
+    let config = mllm_config::remote_roles::HostConfig::load(&document).unwrap();
+    let updates = ProfileUpdates::new(HostProfiles::new(ProfileSet::new(
+        config.clone(),
+        inventory("h"),
+    )));
+    // Connected to a server whose SessionReady listed no capabilities.
+    updates.observe_session(Some(&[]));
+    let control = HostControl::new(document.clone(), config, updates.clone(), journal);
+    add_vllm_to(&document);
+    let reply = control.handle(ControlRequest::Add).await;
+    assert_eq!(reply["published"], "restart_required", "{reply}");
+    assert!(!updates.profiles().publishing());
+    assert!(!updates
+        .profiles()
+        .accepted()
+        .config
+        .profiles
+        .contains_key("vllm"));
+    // Pretend the profile was published at start (as after a restart).
+    let loaded = mllm_config::remote_roles::HostConfig::load(&document).unwrap();
+    updates
+        .profiles()
+        .replace(ProfileSet::new(loaded, with_vllm("h")));
+    let engines = mllm_config::registration::engines_beside(&document);
+    let before = std::fs::read(&engines).unwrap();
+    let reply = control
+        .handle(ControlRequest::Remove {
+            profile: "vllm".into(),
+            drain: false,
+        })
+        .await;
+    assert_eq!(reply["code"], "publish_rejected", "{reply}");
+    assert!(
+        reply["message"].as_str().unwrap().contains("restart"),
+        "{reply}"
+    );
+    assert_eq!(std::fs::read(&engines).unwrap(), before);
+}
+
+// T07 T34 (ADR 0018 §3): without a session an added profile becomes the
+// accepted set, which the next session publishes; a document that drops a
+// published profile is never accepted that way (owner decision 2026-09-25).
+#[tokio::test]
+async fn an_add_without_a_session_waits_for_the_next_one() {
+    let dir = directory();
+    let document = dir.path().join("host.yaml");
+    std::fs::write(&document, prepared_document().to_string()).unwrap();
+    let journal = mllm_agent::journal::HostJournal::open(dir.path(), "c", "h").unwrap();
+    let config = mllm_config::remote_roles::HostConfig::load(&document).unwrap();
+    let updates = ProfileUpdates::new(HostProfiles::new(ProfileSet::new(
+        config.clone(),
+        inventory("h"),
+    )));
+    let control = HostControl::new(document.clone(), config, updates.clone(), journal);
+    add_vllm_to(&document);
+    let reply = control.handle(ControlRequest::Add).await;
+    assert_eq!(reply["published"], "pending_session", "{reply}");
+    let accepted = updates.profiles().accepted();
+    assert!(accepted.config.profiles.contains_key("vllm"));
+    assert!(!updates.profiles().publishing());
+    // The engines file loses `vllm` behind the role's back: not accepted.
+    let engines = mllm_config::registration::engines_beside(&document);
+    std::fs::remove_file(&engines).unwrap();
+    let reply = control.handle(ControlRequest::Add).await;
+    assert_eq!(reply["code"], "agent_unreachable", "{reply}");
+    assert!(updates
+        .profiles()
+        .accepted()
+        .config
+        .profiles
+        .contains_key("vllm"));
 }

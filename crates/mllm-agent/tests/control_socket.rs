@@ -248,3 +248,34 @@ async fn hold_silent_connections(
     }
     held
 }
+
+// T37 (ADR 0018 §3): the socket is bound only inside a directory owned by
+// this user with mode 0700; anything wider is refused and nothing is created.
+#[tokio::test]
+async fn a_socket_outside_a_private_directory_is_refused() {
+    let dir = private_dir();
+    for mode in [0o755, 0o750, 0o701, 0o1700] {
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let refused = ControlServer::bind(&path);
+        assert!(
+            matches!(refused, Err(ControlError::UnsafeDirectory(_))),
+            "{mode:o}: {:?}",
+            refused.as_ref().err()
+        );
+        assert!(std::fs::symlink_metadata(&path).is_err(), "{mode:o}");
+    }
+    // A symlink to a private directory is not the directory.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let target = dir.path().join("real");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(matches!(
+        ControlServer::bind(&link.join(SOCKET_NAME)),
+        Err(ControlError::UnsafeDirectory(_))
+    ));
+    // 0700 binds.
+    ControlServer::bind(&target.join(SOCKET_NAME)).unwrap();
+}

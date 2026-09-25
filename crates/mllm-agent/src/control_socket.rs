@@ -91,6 +91,8 @@ pub enum ControlError {
     PathTooLong(PathBuf),
     InUse(PathBuf),
     Occupied(PathBuf),
+    /// The directory holding the socket is not this user's, mode 0700.
+    UnsafeDirectory(PathBuf),
     Io(String),
 }
 
@@ -106,6 +108,11 @@ impl std::fmt::Display for ControlError {
             Self::Occupied(p) => write!(
                 f,
                 "{} exists and is not a socket owned by this user; it was left untouched",
+                p.display()
+            ),
+            Self::UnsafeDirectory(p) => write!(
+                f,
+                "{} must be a directory owned by this user with mode 0700; the socket was not bound",
                 p.display()
             ),
             Self::Io(e) => write!(f, "{e}"),
@@ -129,7 +136,8 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    /// Bind `path`. A stale socket (ours, and refusing connections) is
+    /// Bind `path`, refused unless its directory is this user's with mode
+    /// 0700. A stale socket (ours, and refusing connections) is
     /// replaced; a live one, a socket of another user, a symlink or any other
     /// file is refused and left alone.
     pub fn bind(path: &Path) -> Result<Self, ControlError> {
@@ -137,6 +145,19 @@ impl ControlServer {
             return Err(ControlError::PathTooLong(path.to_path_buf()));
         }
         let io = |e: std::io::Error| ControlError::Io(format!("{}: {e}", path.display()));
+        // ADR 0018 §3: the socket lives only inside the role's private state
+        // directory: owned by the user running mllm, mode 0700, not a link.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| ControlError::UnsafeDirectory(path.to_path_buf()))?;
+        match std::fs::symlink_metadata(parent) {
+            Ok(meta)
+                if meta.file_type().is_dir()
+                    && meta.uid() == own_uid()
+                    && meta.mode() & 0o7777 == 0o700 => {}
+            _ => return Err(ControlError::UnsafeDirectory(parent.to_path_buf())),
+        }
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 // symlink_metadata never follows a link, so a symlink here is
