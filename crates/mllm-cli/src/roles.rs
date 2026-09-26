@@ -432,15 +432,69 @@ pub fn effective_inference_address(
     Ok(inference_override(listen)?.unwrap_or(document_bind))
 }
 
+/// Final review I8: where a role records the management address it serves
+/// on this run, under its own owner-only state directory, so client commands
+/// find a role started with `--management-listen`.
+pub fn recorded_management_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("run").join("management-address")
+}
+
+/// Record the management address a role serves on (`<state>/run`, 0700; the
+/// file 0600, replaced atomically). A failure is reported, never fatal: a
+/// client still finds the role by `MLLM_MANAGEMENT_ADDR` or its document.
+pub fn record_management_address(state_dir: &Path, address: std::net::SocketAddr) {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let path = recorded_management_path(state_dir);
+    let written = (|| -> std::io::Result<()> {
+        let dir = path.parent().expect("a parent");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let temporary = dir.join(".management-address.tmp");
+        let _ = std::fs::remove_file(&temporary);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        writeln!(file, "{address}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = written {
+        eprintln!(
+            "warning: could not record the management address in {} ({error}); clients \
+             find it through MLLM_MANAGEMENT_ADDR or the role document",
+            path.display()
+        );
+    }
+}
+
+/// The management address a role under `state_dir` recorded, when it is a
+/// loopback address (SPEC §16.5: management never leaves loopback, so a
+/// recorded value that is not one is ignored).
+pub fn recorded_management_address(state_dir: &Path) -> Option<std::net::SocketAddr> {
+    let text = std::fs::read_to_string(recorded_management_path(state_dir)).ok()?;
+    mllm_config::standalone::management_address(text.trim())
+}
+
 /// Owner decision 2026-09-25: the management address a client command uses
 /// for the standalone role under `state_dir`: `MLLM_MANAGEMENT_ADDR` (or its
 /// deprecated alias), else `server.listeners.management.bind` of the
 /// standalone document under the state root with this environment's
-/// `MLLM_SET__…` overrides, else `127.0.0.1:7443`. A `--management-listen`
-/// the role was started with is not visible here; a client of such a role
-/// names the same address with the variable.
+/// `MLLM_SET__…` overrides, else `127.0.0.1:7443`. Between the variable and
+/// the document: the address the role recorded when it started
+/// ([`recorded_management_address`]), so a role started with
+/// `--management-listen` is found without the variable.
 pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::SocketAddr, StartError> {
     if let Some(address) = management_override(None)? {
+        return Ok(address);
+    }
+    // Final review I8: the address the role serves on this run, which a
+    // `--management-listen` start recorded.
+    if let Some(address) = recorded_management_address(state_dir) {
         return Ok(address);
     }
     let document = state_dir.join("config").join("standalone.yaml");

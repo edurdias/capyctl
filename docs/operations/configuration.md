@@ -35,7 +35,7 @@ refused: an opt-out that was mistyped must not be read as "on".
 |---|---|---|---|---|---|
 | Role document | (none) | `--config <file>` | `MLLM_CONFIG` | `<state root>/config/<role>.yaml` | server, host, standalone, `mllm engine` |
 | State root | `state_dir` at the top of a standalone document named by `--config` or `MLLM_CONFIG` | `--state-dir <dir>` | `MLLM_STATE_DIR` | `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm` | every command |
-| Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | as the state root | as the state root | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
+| Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | `--state-dir <dir>` | `MLLM_STATE_DIR` | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
 | Registered engines file | (none) | `--config` (the file beside it) | `MLLM_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/mllm/engines.yaml` | host, standalone, `mllm engine` |
 
 The role document cannot name itself, so it has no YAML form. The state root
@@ -43,7 +43,11 @@ is where mllm looks for the implicit role document, so its YAML form is read
 only from a standalone document named with `--config` or `MLLM_CONFIG` (a
 relative path resolves against the document's directory). A server or host
 document's `state_dir` is where that role keeps its state; `init server` and
-`init host` write it from the state root. A standalone document may state
+`init host` write it from the state root, so for the implicit document
+`--state-dir` and `MLLM_STATE_DIR` name it. A document named with `--config`
+whose `state_dir` disagrees with a `--state-dir` or `MLLM_STATE_DIR` the same
+start also names is refused, so a run never moves a role's identity and state
+silently. `join host` takes `--set` like `start host`. A standalone document may state
 `server.state_dir` and `host.state_dir` only as `<state root>/server` and
 `<state root>/host`. Client commands (`mllm status`, `mllm deploy`, ...) find a
 standalone role's credentials under the state root, so they need the same
@@ -55,8 +59,8 @@ standalone role's credentials under the state root, so they need the same
 |---|---|---|---|---|---|
 | Inference address | `listeners.inference.bind` (server); `server.listeners.inference.bind` (standalone) | `--listen <addr:port>` | `MLLM_INFERENCE_ADDR` (`MLLM_STANDALONE_INFERENCE_ADDR` still read, with a warning) | `0.0.0.0:8443` | server, standalone |
 | Inference API key required | `listeners.inference.authentication: api_key\|none` (server; `server.` prefix in standalone) | `--no-inference-auth` | `MLLM_INFERENCE_AUTH=none` | `api_key` | server, standalone |
-| Standalone management address | `server.listeners.management.bind` | `--management-listen <addr:port>` | `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` still read, with a warning) | `127.0.0.1:7443` | standalone and its client commands |
-| Server management, bootstrap and control listeners | `listeners.management`, `listeners.bootstrap`, `listeners.control` | (none) | (none) | `127.0.0.1:7443`, `:7444`, `:7445` | server |
+| Management address | `listeners.management.bind` (server); `server.listeners.management.bind` (standalone) | `--management-listen <addr:port>` | `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` still read, with a warning) | `127.0.0.1:7443` | server, standalone, and their client commands |
+| Server bootstrap and control listeners | `listeners.bootstrap`, `listeners.control` | (none) | (none) | `127.0.0.1:7444`, `:7445` | server |
 
 The inference listener serves every interface by default and requires the
 API key; [network access](network-access.md) covers narrowing it, the key,
@@ -65,15 +69,15 @@ reverse proxy. A server or standalone document that still states the old
 default `127.0.0.1:8443` is updated once on the first start of 0.1.0
 ([install](install.md#upgrading-to-010)).
 
-The standalone management address stays on loopback in every form (any port).
-Client commands (`mllm status`, `mllm deploy`, ...) find it from
-`MLLM_MANAGEMENT_ADDR`, else from `server.listeners.management.bind` in the
-standalone document under the state root, else the default. They do not see a
-`--management-listen` given to the role, so a role started with that flag
-needs the same address in `MLLM_MANAGEMENT_ADDR` for its clients. The
-server's other listeners carry TLS identities and enrollment addresses that
-must agree with each other, so they are stated together in the document (or
-with `--set`).
+The management address stays on loopback in every form (any port). A host
+has no management listener. Each start records the address it serves on in
+`<state directory>/run/management-address` (owner-only), and client commands
+(`mllm status`, `mllm deploy`, ...) find it from `MLLM_MANAGEMENT_ADDR`, else
+that record, else the role document, else the default, so a role started
+with `--management-listen` needs nothing more for its clients. The server's
+bootstrap and control listeners carry TLS identities and enrollment
+addresses that must agree with each other, so they are stated together in
+the document (or with `--set`).
 
 ## Models and downloads
 

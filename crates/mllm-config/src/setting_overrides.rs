@@ -550,8 +550,9 @@ enum Scope {
     /// A server setting: top level in a server document, under `server:` in a
     /// standalone one.
     Server,
-    /// A standalone setting, top level.
-    Standalone,
+    /// Final review I8: a top-level setting every role document states
+    /// alike (the state directory).
+    Role,
 }
 
 /// Every setting with a named flag or variable: its path in its block, its
@@ -677,18 +678,16 @@ const NAMED_FORMS: &[(&str, Scope, &str, &str)] = &[
         "--no-inference-auth",
         "MLLM_INFERENCE_AUTH",
     ),
+    // Final review I8 (owner rule: standalone is a server and a host in one
+    // process): the management address is named alike on the server and in
+    // standalone, and so is the state directory on every role.
     (
-        "server.listeners.management.bind",
-        Scope::Standalone,
+        "listeners.management.bind",
+        Scope::Server,
         "--management-listen",
         "MLLM_MANAGEMENT_ADDR",
     ),
-    (
-        "state_dir",
-        Scope::Standalone,
-        "--state-dir",
-        "MLLM_STATE_DIR",
-    ),
+    ("state_dir", Scope::Role, "--state-dir", "MLLM_STATE_DIR"),
 ];
 
 /// The full path of a named setting in a `kind` document, or `None` when
@@ -700,7 +699,9 @@ fn named_path(kind: ConfigKind, path: &str, scope: Scope) -> Option<String> {
         }
         (ConfigKind::Standalone, Scope::Host) => Some(format!("host.{path}")),
         (ConfigKind::Standalone, Scope::Server) => Some(format!("server.{path}")),
-        (ConfigKind::Standalone, Scope::Standalone) => Some(path.to_owned()),
+        (ConfigKind::Server | ConfigKind::Host | ConfigKind::Standalone, Scope::Role) => {
+            Some(path.to_owned())
+        }
         _ => None,
     }
 }
@@ -722,9 +723,10 @@ pub struct NamedLayer {
     pub inference_bind: Option<String>,
     /// `--no-inference-auth` (`none`) / `MLLM_INFERENCE_AUTH`.
     pub inference_auth: Option<String>,
-    /// `--management-listen` / `MLLM_MANAGEMENT_ADDR` (standalone).
+    /// `--management-listen` / `MLLM_MANAGEMENT_ADDR` (server and standalone).
     pub management_bind: Option<String>,
-    /// `--state-dir` / `MLLM_STATE_DIR` (the standalone state root).
+    /// `--state-dir` / `MLLM_STATE_DIR` (the state root; a server's or
+    /// host's own state directory).
     pub state_dir: Option<std::path::PathBuf>,
 }
 
@@ -819,7 +821,7 @@ impl NamedLayer {
                 self.inference_auth.clone().map(Value::String),
             ),
             (
-                "server.listeners.management.bind",
+                "listeners.management.bind",
                 self.management_bind.clone().map(Value::String),
             ),
             ("state_dir", path_text(&self.state_dir)),

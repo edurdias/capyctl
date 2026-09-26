@@ -819,12 +819,43 @@ fn generic_overrides_and_config_show_parse() {
             "{bad}"
         );
     }
+    // Final review I8: the server takes `--management-listen` too, with the
+    // same loopback rule.
+    let i = parse_invocation([
+        "mllm",
+        "start",
+        "server",
+        "--management-listen",
+        "127.0.0.1:7543",
+    ])
+    .unwrap();
+    assert_eq!(i.management_listen, Some("127.0.0.1:7543".parse().unwrap()));
     assert!(parse_invocation([
         "mllm",
         "start",
         "server",
         "--management-listen",
-        "127.0.0.1:1"
+        "0.0.0.0:7543"
     ])
     .is_err());
+    assert!(parse_invocation([
+        "mllm",
+        "start",
+        "host",
+        "--management-listen",
+        "127.0.0.1:7543"
+    ])
+    .is_err());
+    // `join host --set` applies the host document's overrides as `start host`.
+    let i = parse_invocation([
+        "mllm",
+        "join",
+        "host",
+        "--join-file",
+        "/tmp/j",
+        "--set",
+        "load_report_interval=2s",
+    ])
+    .unwrap();
+    assert_eq!(i.sets, ["load_report_interval=2s"]);
 }

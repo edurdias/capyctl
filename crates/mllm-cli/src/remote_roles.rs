@@ -192,6 +192,37 @@ fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
     crate::engine::role_engines(named, &role_env)
         .unwrap_or_else(|| mllm_config::registration::engines_beside(document))
 }
+/// Final review I8 (every setting three ways): a server's or host's state
+/// directory is its document's `state_dir`, located by the state root
+/// (`--state-dir`, else `MLLM_STATE_DIR`) when the document is the implicit
+/// one. A named document whose `state_dir` disagrees with a state root the
+/// invocation also names is refused, so a run never moves a role's identity
+/// and state silently.
+fn check_state_root(
+    invocation: &Invocation,
+    named_document: bool,
+    state_dir: &Path,
+) -> Result<(), StructuredError> {
+    let named_root = invocation.state_dir.clone().or_else(|| {
+        std::env::var_os("MLLM_STATE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    });
+    match named_root {
+        Some(root)
+            if named_document
+                && crate::engine::absolute(&root) != crate::engine::absolute(state_dir) =>
+        {
+            Err(error(&format!(
+                "the role document's state_dir {} disagrees with the state root {} named by \
+                 --state-dir or MLLM_STATE_DIR; name one of them, or make them the same",
+                state_dir.display(),
+                root.display()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
 }
@@ -283,8 +314,15 @@ fn load_credentials(config: &ServerConfig) -> Result<Credentials, StructuredErro
 pub(crate) fn management_context(
     config: &ServerConfig,
 ) -> Result<(String, String), StructuredError> {
+    // Final review I8: `MLLM_MANAGEMENT_ADDR`, else the address the server
+    // recorded when it started (a `--management-listen` start), else the
+    // document's, as for standalone.
+    let address = crate::roles::management_override(None)
+        .map_err(|e| error(&e.to_string()))?
+        .or_else(|| crate::roles::recorded_management_address(&config.state_dir))
+        .unwrap_or(config.management);
     Ok((
-        format!("http://{}/management/v1", config.management),
+        format!("http://{address}/management/v1"),
         load_credentials(config)?.admin_token,
     ))
 }
@@ -576,6 +614,7 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
         .map_err(|_| unavailable())?;
+    crate::roles::record_management_address(&config.state_dir, config.management);
     // Design §9: said out loud before the listener accepts connections.
     crate::exposure::warn_if_exposed(config.inference, config.inference_auth);
     let inference_listener = tokio::net::TcpListener::bind(config.inference)
@@ -1191,6 +1230,20 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     config.inference_auth,
                     invocation.no_inference_auth,
                 )?;
+                // Final review I8: `--management-listen` >
+                // MLLM_MANAGEMENT_ADDR > the document, as for standalone.
+                if let Some(address) =
+                    crate::roles::management_override(invocation.management_listen)
+                        .map_err(|e| error(&e.to_string()))?
+                {
+                    config = config.with_management(address).map_err(|_| {
+                        error(&format!(
+                            "management address {address} collides with another server listener \
+                             or is not a loopback address with a non-zero port"
+                        ))
+                    })?;
+                }
+                check_state_root(invocation, named.is_some(), &config.state_dir)?;
                 serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,
@@ -1205,18 +1258,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 }) {
                     eprintln!("{warning}");
                 }
-                serve_host(
-                    load_host(
-                        &path,
-                        &engines,
-                        &invocation.model_overrides,
-                        &invocation.engine_overrides,
-                        &overrides,
-                    )?,
-                    path.clone(),
-                    engines,
-                )
-                .await
+                let host = load_host(
+                    &path,
+                    &engines,
+                    &invocation.model_overrides,
+                    &invocation.engine_overrides,
+                    &overrides,
+                )?;
+                check_state_root(invocation, named.is_some(), &host.state_dir)?;
+                serve_host(host, path.clone(), engines).await
             }
         }
         Command::Join { join_file, recover } => {
@@ -1226,11 +1276,12 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
             let engines = host_engines(named.as_deref(), &path);
-            // Owner decision 2026-09-25: the environment's generic overrides
-            // apply here as at `start host`, so both find the same identity.
+            // Owner decision 2026-09-25: the generic overrides apply here as
+            // at `start host` (final review I8: `join host --set` too), so
+            // both find the same identity.
             let overrides = mllm_config::setting_overrides::SettingOverrides::from_process(
                 mllm_config::ConfigKind::Host,
-                &[],
+                &invocation.sets,
             )
             .map_err(|e| {
                 error(&format!(
@@ -1380,10 +1431,7 @@ pub async fn management_request(
         .build()
         .map_err(|_| unavailable())?;
     let mut request = client
-        .request(
-            method,
-            format!("http://{}/management/v1{path}", config.management),
-        )
+        .request(method, format!("{}{path}", management_context(config)?.0))
         .bearer_auth(credentials.admin_token);
     if let Some(body) = body {
         request = request.json(&body);

@@ -1862,3 +1862,104 @@ fn the_ready_lines_name_the_credentials_file_never_the_key() {
     let key = stored["api_key"].as_str().unwrap();
     assert!(!banner.to_string().contains(key), "{banner}");
 }
+
+/// T03 (final review I8, owner rule: every setting three ways, standalone is
+/// a server and a host in one process): the server's management address is
+/// `--management-listen` > `MLLM_MANAGEMENT_ADDR` > the document, as for
+/// standalone; the role records the address it serves on, so a client
+/// command finds a role started with the flag without the variable; and a
+/// named document whose state_dir disagrees with a named state root is
+/// refused instead of moving the role's state.
+#[test]
+fn the_server_management_address_and_state_root_follow_the_shared_rule() {
+    let (_root, state, config) = server_installation(&format!("127.0.0.1:{}", free_port()));
+    let banner = |line: &str| line.contains("\"role\":\"server\"");
+    let flag = format!("127.0.0.1:{}", free_port());
+    let environment = format!("127.0.0.1:{}", free_port());
+    let start = || {
+        let mut command = server_command(&state);
+        command.args(["start", "server", "--config", config.to_str().unwrap()]);
+        command
+    };
+    let mut command = start();
+    command
+        .args(["--management-listen", &flag])
+        .env("MLLM_MANAGEMENT_ADDR", &environment);
+    let role = Role::spawn(&mut command);
+    let line = role.expect_line(banner, Duration::from_secs(60));
+    let banner_value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(banner_value["management"], flag.as_str(), "{line}");
+    assert_eq!(
+        std::fs::read_to_string(state.join("run/management-address"))
+            .unwrap()
+            .trim(),
+        flag
+    );
+    // A client with no variable finds it through the recorded address.
+    let listed = server_command(&state)
+        .env_remove("MLLM_MANAGEMENT_ADDR")
+        .args([
+            "list",
+            "hosts",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+
+    // The variable over the document.
+    let mut command = start();
+    command.env("MLLM_MANAGEMENT_ADDR", &environment);
+    let (line, _) = run_until_ready(&mut command, banner);
+    let banner_value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(banner_value["management"], environment.as_str(), "{line}");
+
+    // A state root that disagrees with the named document is refused.
+    let elsewhere = state.parent().unwrap().join("elsewhere");
+    let refused = server_command(&elsewhere)
+        .args(["start", "server", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains("disagrees with the state root"), "{said}");
+}
+
+/// T03 (final review I8): a standalone role started with
+/// `--management-listen` is found by a client command that names neither
+/// the flag nor the variable, through the address the role recorded.
+#[test]
+fn a_client_finds_a_standalone_started_with_management_listen() {
+    let installation = Installation::new();
+    let other = format!("127.0.0.1:{}", free_port());
+    let mut command = installation.command();
+    command.args(["start", "standalone", "--management-listen", &other]);
+    let role = Role::spawn(&mut command);
+    role.expect_line(
+        |line| line.starts_with("standalone ready"),
+        Duration::from_secs(60),
+    );
+    let listed = installation
+        .command()
+        .env_remove("MLLM_MANAGEMENT_ADDR")
+        .args(["list", "deployments", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+}

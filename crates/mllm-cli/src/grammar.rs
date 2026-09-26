@@ -335,6 +335,10 @@ enum CliCommand {
         join_file: PathBuf,
         #[arg(long)]
         recover: bool,
+        // Final review I8: the host document's `--set` overrides, as
+        // `start host` applies them, so both find the same identity.
+        #[command(flatten)]
+        overrides: SetArgs,
     },
     List {
         #[command(subcommand)]
@@ -641,6 +645,11 @@ enum StartTarget {
         /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
         #[arg(long)]
         no_inference_auth: bool,
+        /// Serve the management API on this loopback address for this run
+        /// (default 127.0.0.1:7443). Wins over MLLM_MANAGEMENT_ADDR and
+        /// listeners.management.bind.
+        #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
+        management_listen: Option<SocketAddr>,
         #[command(flatten)]
         overrides: SetArgs,
     },
@@ -1189,6 +1198,7 @@ where
                 | StartTarget::Host { overrides, .. }
                 | StartTarget::Standalone { overrides, .. },
         } => overrides.sets.clone(),
+        CliCommand::Join { overrides, .. } => overrides.sets.clone(),
         CliCommand::Validate {
             resource: ValidateArgs::Config { sets, .. },
         }
@@ -1197,11 +1207,17 @@ where
         } => sets.clone(),
         _ => Vec::new(),
     };
+    // Final review I8: `--management-listen` on both roles that serve the
+    // management API (a host has none).
     let management_listen = match &cli.command {
         CliCommand::Start {
-            target: StartTarget::Standalone {
-                management_listen, ..
-            },
+            target:
+                StartTarget::Standalone {
+                    management_listen, ..
+                }
+                | StartTarget::Server {
+                    management_listen, ..
+                },
         } => *management_listen,
         _ => None,
     };

@@ -411,6 +411,16 @@ impl ServerConfig {
     /// address follows the document's rule
     /// ([`crate::standalone::inference_address`]) and must not collide with
     /// another listener.
+    /// Final review I8: the management listener this run serves on
+    /// (`--management-listen` or `MLLM_MANAGEMENT_ADDR`), a loopback address
+    /// with a non-zero port that no other server listener shares.
+    pub fn with_management(mut self, address: SocketAddr) -> Result<Self, ConfigError> {
+        crate::standalone::management_address(&address.to_string())
+            .ok_or_else(|| invalid("listeners"))?;
+        distinct_listeners(&[address, self.inference, self.bootstrap, self.control])?;
+        self.management = address;
+        Ok(self)
+    }
     pub fn with_inference(mut self, address: SocketAddr) -> Result<Self, ConfigError> {
         crate::standalone::inference_address(&address.to_string())
             .ok_or_else(|| invalid("listeners"))?;

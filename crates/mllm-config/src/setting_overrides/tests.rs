@@ -273,3 +273,23 @@ fn the_setting_paths_of_each_role() {
     assert!(standalone.contains(&"host.local_engine.cuda_home".to_owned()));
     assert!(standalone.contains(&"server.listeners.management.bind".to_owned()));
 }
+
+// T03 (final review I8, owner rule: standalone is a server and a host in one
+// process): the management address and the state directory have the same
+// named flag and variable on every role that has them.
+#[test]
+fn management_address_and_state_dir_are_named_alike_on_every_role() {
+    let management = Some(("--management-listen", "MLLM_MANAGEMENT_ADDR"));
+    assert_eq!(
+        named_forms(ConfigKind::Server, "listeners.management.bind"),
+        management
+    );
+    assert_eq!(
+        named_forms(ConfigKind::Standalone, "server.listeners.management.bind"),
+        management
+    );
+    let state = Some(("--state-dir", "MLLM_STATE_DIR"));
+    for kind in [ConfigKind::Server, ConfigKind::Host, ConfigKind::Standalone] {
+        assert_eq!(named_forms(kind, "state_dir"), state, "{kind:?}");
+    }
+}

@@ -413,6 +413,7 @@ async fn serve_standalone(
     let management = tokio::net::TcpListener::bind(management_address)
         .await
         .map_err(roles::StartError::from)?;
+    roles::record_management_address(state_dir, management_address);
     let admission = shutdown::Admission::new();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut inference = tokio::spawn(shutdown::serve(
