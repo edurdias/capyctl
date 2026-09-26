@@ -348,20 +348,14 @@ systemctl enable --now mllm-server
 
 `init` creates the server identity and credentials under the state directory
 (owner-only); it prints file locations, never secrets. Client commands on the
-server machine run as the service user. Save the server once as that user's
-current context, and they need no further flags:
+server machine run as the service user and need no `--config`: the running
+server records the document it was started with, and they use it (see
+[Which role a command uses](configuration.md#which-role-a-command-uses)):
 
 ```bash
-sudo -u mllm mllm context add server --server 127.0.0.1:7443 \
-  --key-file /var/lib/mllm/server/identity/server-credentials.json
-sudo -u mllm mllm context use server
 sudo -u mllm mllm list hosts
+sudo -u mllm mllm invite host gpu-box --output gpu-box.join
 ```
-
-The context stores a copy of the admin token owner-only under the service
-user's `~/.config/mllm/contexts/`. Without a context, a client command finds
-the role whose state is under its state root (`MLLM_STATE_DIR`), as described
-in [Management contexts](configuration.md#management-contexts).
 
 ### Host
 
@@ -673,8 +667,10 @@ version check, the installation fingerprint and the deep-park probe), writes
 the profile into `engines.yaml`, and asks the running role to publish it
 without a restart. mllm never rewrites `host.yaml` or `standalone.yaml`.
 `engines.yaml` sits beside the role's configuration file (`--config
-dir/host.yaml` means `dir/engines.yaml`); without `--config` it is
-`~/.config/mllm/engines.yaml`, for a host and for standalone alike. The role
+dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
+it sits beside the document the host was started with (the host records it),
+and otherwise it is `~/.config/mllm/engines.yaml`, for a host and for
+standalone alike. The role
 merges it with its own document at start; a profile name declared in both is
 refused. Its first line records its revision (`# mllm-document-revision: N`).
 The running role listens on `<state_dir>/control.sock` (mode 0600; only the
@@ -734,11 +730,11 @@ creates a new one (and its lock) owned by the role's service user (the owner of
 the host's `state_dir`, `mllm`), mode 0600, so the role can read it. It talks to
 the role over `<state_dir>/control.sock`, which serves root as well as the
 service user. Root also runs the named installation's version check and
-deep-park probe, so name only an installation you trust. Keep the `--config`:
-`mllm engine`, `mllm list engines`, and the role itself all resolve
-`engines.yaml` by the same rule (`--config`, then `$MLLM_CONFIG`, then
-`~/.config/mllm/engines.yaml`), and without it root's `~/.config` is a
-different file than the one the role reads. The packaged standalone unit
+deep-park probe, so name only an installation you trust. Keep the `--config`
+here: a command finds the role running on the machine through the state root
+of the user who runs it, and root's is not the service user's, so without it
+root's `~/.config/mllm/engines.yaml` is a different file than the one the role
+reads. Run as the service user, `mllm engine` finds the host without it. The packaged standalone unit
 starts without `--config`, so its `engines.yaml` is the service user's
 `/var/lib/mllm/.config/mllm/engines.yaml`, which the service user can write:
 `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm engine add …`.

@@ -1291,6 +1291,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                         ))
                     })?;
                 }
+                // Owner decision 2026-09-26: client commands run later on
+                // this machine without --config find this server.
+                crate::local_role::record_document(root, "server", named.as_deref());
                 serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,
@@ -1317,6 +1320,10 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(dir) = state_dir_override(invocation, &host.state_dir) {
                     host = host.with_state_dir(dir);
                 }
+                // Owner decision 2026-09-26: a command run later on this
+                // machine without --config (`mllm engine`, `config show`)
+                // finds this host's document.
+                crate::local_role::record_document(root, "host", named.as_deref());
                 serve_host(host, path.clone(), engines).await
             }
         }
@@ -1381,6 +1388,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     .map_err(|_| error("Invitation conflicts with the retained host identity"))?
             };
             let host_id = pending.enroll(&storage, &invitation, now()).await.map_err(|_| error("Enrollment failed; retain identity and retry the same invitation transaction"))?;
+            crate::local_role::record_document(root, "host", named.as_deref());
             if *recover {
                 // ADR 0016: the same host id, a new certificate; engines the
                 // server recorded reopen only after a fresh probe.
@@ -1399,7 +1407,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     "Invitation output already exists; nothing was overwritten",
                 ));
             }
-            let target = crate::context::resolve(root, invocation.config.as_deref())?;
+            let target = crate::local_role::resolve(root, invocation.config.as_deref())?;
             // ADR 0016: a recovery invitation is shorter-lived than an
             // ordinary one, and only a recovery request carries `recover`, so
             // an ordinary request keeps its exact earlier shape.
@@ -1436,7 +1444,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             resource: Resource::Host,
             ..
         } => {
-            let target = crate::context::resolve(root, invocation.config.as_deref())?;
+            let target = crate::local_role::resolve(root, invocation.config.as_deref())?;
             let result = management_call(
                 &target.endpoint,
                 &target.token,
@@ -1463,7 +1471,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             resource: ListResource::Engines,
         } => {
             // ADR 0018: every host's published profiles, from the server.
-            let target = crate::context::resolve(root, invocation.config.as_deref())?;
+            let target = crate::local_role::resolve(root, invocation.config.as_deref())?;
             management_call(
                 &target.endpoint,
                 &target.token,
@@ -1508,7 +1516,7 @@ pub(crate) fn server_admin_token(identity_dir: &Path) -> Result<String, Structur
 }
 
 /// One management request to `endpoint` with the admin `token`, whichever
-/// role or saved context named them.
+/// role named them.
 pub async fn management_call(
     endpoint: &str,
     token: &str,

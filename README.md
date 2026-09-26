@@ -175,10 +175,12 @@ mllm join host --join-file gpu-box.join --config host.yaml
 mllm start host --config host.yaml
 ```
 
-Back on the server machine, deploy through the server. Client commands find
-the server (or standalone role) running on this machine by themselves; to
-manage it from another machine, save it as a context (`mllm context add`, see
-[`docs/operations/configuration.md`](docs/operations/configuration.md#management-contexts)).
+Back on the server machine, deploy through the server. A command run on a
+machine uses the role running there, with no `--config`: on the server machine
+the server, on a standalone machine the standalone role. On a host machine the
+host's own commands (`mllm engine`, `mllm config show`) use the host, and a
+command that needs the server says to run it on the server (see
+[`docs/operations/configuration.md`](docs/operations/configuration.md#which-role-a-command-uses)).
 
 ```bash
 mllm list hosts

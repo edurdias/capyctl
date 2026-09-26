@@ -70,7 +70,7 @@ pub async fn execute(
 ) -> Result<Value, StructuredError> {
     let (endpoint, token, path_host, journal_root) = match host {
         Some(host) => {
-            let target = crate::context::resolve(state_dir, config)?;
+            let target = crate::local_role::resolve(state_dir, config)?;
             (
                 target.endpoint,
                 target.token,

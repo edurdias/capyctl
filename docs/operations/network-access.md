@@ -151,9 +151,8 @@ Open only port 443 to the internet, never 8443.
 
 - **Management.** The management API (deploy, start, stop, status) stays on
   loopback with its own admin token, on every role and in every release. Manage
-  a machine remotely with `ssh` and the local `mllm` commands, or forward its
-  management port over SSH and save the forwarded address as a context
-  ([Management contexts](configuration.md#management-contexts)). A server's
+  a machine remotely with `ssh` and the local `mllm` commands, which use the
+  role running there. A server's
   bootstrap and control listeners keep mutual TLS for enrolled hosts.
 - **Engines.** vLLM and SGLang listen on loopback ports only, each with a key
   generated for that launch and checked by mllm's guard (ADR 0012). The router
