@@ -20,6 +20,9 @@ fn main() -> ExitCode {
     // Owner rule 2026-09-25: the state root, `--state-dir` > `MLLM_STATE_DIR`
     // > the per-user default, resolved once for every command.
     let state_root = state_root(&invocation);
+    // Owner decision 2026-09-26: `--context` names the management API client
+    // commands use (over MLLM_CONTEXT and the current saved context).
+    mllm_cli::context::set_flag(invocation.context.clone());
     // Owner decision 2026-09-25: `--format json` is machine mode, exactly as
     // `--output json` was (and still is): JSON results and JSON errors.
     let format = match invocation.format.as_deref() {
@@ -235,6 +238,30 @@ fn main() -> ExitCode {
                 } else {
                     print!("{}", mllm_cli::settings::render_table(&value));
                 }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
+    // Owner decision 2026-09-26: saved management contexts.
+    if matches!(
+        invocation.command,
+        Command::ContextAdd { .. }
+            | Command::ContextUse { .. }
+            | Command::ContextList
+            | Command::ContextRemove { .. }
+            | Command::ContextShow
+    ) {
+        return match mllm_cli::context::execute(
+            &invocation.command,
+            &state_root,
+            invocation.config.as_deref(),
+        ) {
+            Ok(value) => {
+                emit(&value, view, &Default::default());
                 ExitCode::SUCCESS
             }
             Err(err) => {

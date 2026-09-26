@@ -850,39 +850,11 @@ fn management_context(
     state_dir: &Path,
     config: Option<&Path>,
 ) -> Result<(String, String, std::path::PathBuf), StructuredError> {
-    Ok(if let Some(path) = config {
-        let config = crate::remote_roles::server_context(Some(path), state_dir)?;
-        let (endpoint, token) = crate::remote_roles::management_context(&config)?;
-        (endpoint, token, config.state_dir)
-    } else {
-        let credentials =
-            std::fs::read_to_string(state_dir.join("identity/credentials")).map_err(|_| {
-                error(
-                    "invalid_config",
-                    "Standalone management credentials are unavailable",
-                )
-            })?;
-        let token = credentials
-            .lines()
-            .find_map(|line| line.strip_prefix("admin_token: "))
-            .ok_or_else(|| {
-                error(
-                    "invalid_config",
-                    "Standalone management credential is missing",
-                )
-            })?
-            .to_owned();
-        // SPEC §16.5: the standalone management listener, at its loopback
-        // default unless this run names another loopback address.
-        // Owner decision 2026-09-25: MLLM_MANAGEMENT_ADDR, else the
-        // standalone document's management bind, else the default.
-        let endpoint = format!(
-            "http://{}/management/v1",
-            crate::roles::standalone_management_address(state_dir)
-                .map_err(|failure| error("invalid_config", failure.to_string()))?
-        );
-        (endpoint, token, state_dir.to_owned())
-    })
+    // Owner decision 2026-09-26: `--config` or `--context`, else
+    // MLLM_CONTEXT, else the current saved context, else the role running
+    // on this machine.
+    let target = crate::context::resolve(state_dir, config)?;
+    Ok((target.endpoint, target.token, target.journal_root))
 }
 
 /// Owner decision 2026-09-25: host names for a table view, from the host

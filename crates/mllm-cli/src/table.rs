@@ -30,6 +30,8 @@ pub enum View {
     LocalEngines,
     /// `engine detect`
     Detected,
+    /// `context list`: the saved management contexts.
+    Contexts,
 }
 
 impl View {
@@ -45,6 +47,7 @@ impl View {
             Command::Status { .. } => Some(View::Status),
             Command::EngineList => Some(View::LocalEngines),
             Command::EngineDetect { .. } => Some(View::Detected),
+            Command::ContextList => Some(View::Contexts),
             _ => None,
         }
     }
@@ -79,6 +82,7 @@ pub fn render(view: View, value: &Value, names: &HostNames) -> String {
         View::Status => status(value, names),
         View::LocalEngines => local_engines(value),
         View::Detected => detected(value),
+        View::Contexts => contexts(value),
     }
 }
 
@@ -407,6 +411,23 @@ fn status(value: &Value, names: &HostNames) -> String {
         &instances,
     ));
     out
+}
+
+/// `context list`: one row per saved context, the current one marked `*`.
+fn contexts(value: &Value) -> String {
+    let rows: Vec<Vec<String>> = value["contexts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            vec![
+                if c["current"] == true { "*" } else { "" }.into(),
+                text(&c["name"]),
+                text(&c["server"]),
+            ]
+        })
+        .collect();
+    table(&["CURRENT", "NAME", "SERVER"], &rows)
 }
 
 fn engines(value: &Value) -> String {

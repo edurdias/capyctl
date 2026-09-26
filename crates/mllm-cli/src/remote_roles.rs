@@ -1399,7 +1399,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     "Invitation output already exists; nothing was overwritten",
                 ));
             }
-            let config = server_context(invocation.config.as_deref(), root)?;
+            let target = crate::context::resolve(root, invocation.config.as_deref())?;
             // ADR 0016: a recovery invitation is shorter-lived than an
             // ordinary one, and only a recovery request carries `recover`, so
             // an ordinary request keeps its exact earlier shape.
@@ -1408,8 +1408,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 json!({"host_name":name,"lifetime_seconds":3600})
             };
-            let result = management_request(
-                &config,
+            let result = management_call(
+                &target.endpoint,
+                &target.token,
                 reqwest::Method::POST,
                 "/host-invitations",
                 Some(body),
@@ -1435,8 +1436,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             resource: Resource::Host,
             ..
         } => {
-            let config = server_context(invocation.config.as_deref(), root)?;
-            let result = management_request(&config, reqwest::Method::GET, "/hosts", None).await?;
+            let target = crate::context::resolve(root, invocation.config.as_deref())?;
+            let result = management_call(
+                &target.endpoint,
+                &target.token,
+                reqwest::Method::GET,
+                "/hosts",
+                None,
+            )
+            .await?;
             if let Command::Inspect { id: Some(id), .. } = &invocation.command {
                 result["hosts"]
                     .as_array()
@@ -1455,8 +1463,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             resource: ListResource::Engines,
         } => {
             // ADR 0018: every host's published profiles, from the server.
-            let config = server_context(invocation.config.as_deref(), root)?;
-            management_request(&config, reqwest::Method::GET, "/engines", None).await
+            let target = crate::context::resolve(root, invocation.config.as_deref())?;
+            management_call(
+                &target.endpoint,
+                &target.token,
+                reqwest::Method::GET,
+                "/engines",
+                None,
+            )
+            .await
         }
         _ => Err(error("Unsupported remote role command")),
     }
@@ -1478,7 +1493,29 @@ pub async fn management_request(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, StructuredError> {
-    let credentials = load_credentials(config)?;
+    let (endpoint, token) = management_context(config)?;
+    management_call(&endpoint, &token, method, path, body).await
+}
+
+/// Owner decision 2026-09-26: the admin token in a server's identity
+/// directory (`server-credentials.json`, owner-only).
+pub(crate) fn server_admin_token(identity_dir: &Path) -> Result<String, StructuredError> {
+    let c: Credentials = serde_json::from_slice(&private_read(
+        &identity_dir.join("server-credentials.json"),
+    )?)
+    .map_err(|_| unavailable())?;
+    Ok(c.admin_token)
+}
+
+/// One management request to `endpoint` with the admin `token`, whichever
+/// role or saved context named them.
+pub async fn management_call(
+    endpoint: &str,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, StructuredError> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -1486,8 +1523,8 @@ pub async fn management_request(
         .build()
         .map_err(|_| unavailable())?;
     let mut request = client
-        .request(method, format!("{}{path}", management_context(config)?.0))
-        .bearer_auth(credentials.admin_token);
+        .request(method, format!("{endpoint}{path}"))
+        .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }

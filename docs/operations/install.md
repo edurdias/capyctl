@@ -40,7 +40,7 @@ first, then stop the unit:
 
 ```bash
 # Remote host: from the server, as the service user.
-sudo -u mllm mllm drain host gpu-box --config /etc/mllm/server.yaml
+sudo -u mllm mllm drain host gpu-box
 sudo systemctl stop mllm-host           # on gpu-box
 
 # Standalone.
@@ -348,8 +348,20 @@ systemctl enable --now mllm-server
 
 `init` creates the server identity and credentials under the state directory
 (owner-only); it prints file locations, never secrets. Client commands on the
-server machine run as the service user with the same document, for example
-`sudo -u mllm mllm list hosts --config /etc/mllm/server.yaml`.
+server machine run as the service user. Save the server once as that user's
+current context, and they need no further flags:
+
+```bash
+sudo -u mllm mllm context add server --server 127.0.0.1:7443 \
+  --key-file /var/lib/mllm/server/identity/server-credentials.json
+sudo -u mllm mllm context use server
+sudo -u mllm mllm list hosts
+```
+
+The context stores a copy of the admin token owner-only under the service
+user's `~/.config/mllm/contexts/`. Without a context, a client command finds
+the role whose state is under its state root (`MLLM_STATE_DIR`), as described
+in [Management contexts](configuration.md#management-contexts).
 
 ### Host
 
@@ -628,7 +640,7 @@ the output is a terminal: `list hosts`, `list deployments`, `list engines`,
 detail (latency distributions, installation fingerprints, development-control
 marks) is only in the JSON.
 
-    $ mllm list engines --config server.yaml
+    $ mllm list engines
     HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
     gpu-box   vllm      vllm     0.11.0    no       enabled     online   qwen3-8b
     gpu-box   sglang    sglang   0.5.3     no       enabled     online   -
@@ -650,7 +662,7 @@ mllm uses engines you install yourself. Register them on the machine that runs t
     mllm engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     mllm engine list
     mllm engine remove vllm [--drain]
-    mllm list engines --config server.yaml # on the server: every host's engines
+    mllm list engines                      # on the server: every host's engines
 
 `detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,
 `~/.virtualenvs`, uv and pipx tool environments, `/opt`, and any venv directly
