@@ -731,7 +731,7 @@ fn check_host_device_policy(
 /// models directory and model-source policy resolved (owner decision
 /// 2026-09-25: `flags` > `MLLM_MODELS_ROOT` / `MLLM_MODEL_SOURCES` /
 /// `MLLM_MODEL_SOURCES_MAX` > the document > `~/models`, sources allowed with
-/// a 500 GiB ceiling in `<state_dir>/models/sources`).
+/// a 500 GiB ceiling in `<model_store>/sources`).
 fn load_host(
     path: &Path,
     engines: &Path,

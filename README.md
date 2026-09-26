@@ -73,7 +73,7 @@ The first start writes its role document and credentials under
 name another directory with `--models-root`, `MLLM_MODELS_ROOT` or
 `host.model_store.path`. A deployment may also name a Hugging Face or HTTP
 source pinned to a commit or digest: mllm downloads it into
-`~/.local/state/mllm/models/sources`, checking free disk space first and
+`~/models/sources`, checking free disk space first and
 capping all downloads at 500 GiB (`--model-sources disabled` or
 `MLLM_MODEL_SOURCES=disabled` turns downloads off; `--model-sources-max` or
 `MLLM_MODEL_SOURCES_MAX` changes the cap). In another shell, write a

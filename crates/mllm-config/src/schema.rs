@@ -192,7 +192,8 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     ]);
     // ADR 0008 (owner decision 2026-09-25): remote model sources are allowed
     // by default; a host states `denied` (or `disabled`) to turn one off.
-    // `path` names the sources store (default `<state_dir>/models`).
+    // `path` names the sources store (default: the models directory, so
+    // downloads live in `<model_store>/sources`).
     const MODEL_SOURCES: FieldSpec = FieldSpec::Struct(&[
         ("huggingface", SCALAR),
         ("http", SCALAR),

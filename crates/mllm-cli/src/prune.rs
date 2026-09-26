@@ -22,35 +22,33 @@ fn error(code: &'static str, message: impl Into<String>) -> StructuredError {
     }
 }
 
-/// The sources store a host document names (ADR 0008; owner decision
-/// 2026-09-25): `model_sources.path`, else `<state_dir>/models` as the host
-/// role resolves it (`mllm_config::model_settings`), else, for a document
-/// that states neither, its `model_store.path`.
+/// The sources store a host document names (ADR 0008; owner ruling
+/// 2026-09-25), resolved by the host role's rule
+/// (`mllm_config::model_settings`): `model_sources.path`, else the models
+/// directory (`model_store.path`, else `MLLM_MODELS_ROOT`, else `~/models`),
+/// under which downloads live in `sources/`.
 fn model_store(host_config: &Path) -> Result<std::path::PathBuf, StructuredError> {
+    use mllm_config::model_settings::{default_models_root, resolve, ModelOverrides};
     let text = std::fs::read_to_string(host_config)
         .map_err(|_| error("invalid_config", "Cannot read the host configuration"))?;
     let host = mllm_config::parse_strict(mllm_config::ConfigKind::Host, &text)
         .map_err(|e| error("invalid_config", format!("Invalid host configuration: {e}")))?;
-    let absolute = |value: &Value| {
-        value
-            .as_str()
-            .map(std::path::PathBuf::from)
-            .filter(|path| path.is_absolute())
+    let invalid = |e: mllm_config::ConfigError| {
+        error(
+            "invalid_config",
+            format!("Invalid host configuration: {}: {}", e.path, e.detail),
+        )
     };
-    let store = absolute(&host["model_sources"]["path"])
-        .or_else(|| {
-            absolute(&host["state_dir"])
-                .map(|state| state.join(mllm_config::model_settings::SOURCES_STORE_DIR))
-        })
-        .or_else(|| absolute(&host["model_store"]["path"]))
-        .ok_or_else(|| {
-            error(
-                "invalid_config",
-                "The host configuration names no absolute sources store, state directory \
-                 or model store",
-            )
-        })?;
-    Ok(store)
+    let env = ModelOverrides::from_process_env().map_err(invalid)?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let settings = resolve(
+        &host,
+        &ModelOverrides::default(),
+        &env,
+        default_models_root(home.as_deref()).as_deref(),
+    )
+    .map_err(invalid)?;
+    Ok(settings.policy.root(&settings.models_root).to_path_buf())
 }
 
 /// The referenced store keys, from a `GET /management/v1/model-sources` body.
@@ -182,20 +180,21 @@ mod tests {
         assert_eq!(applied["removed_bytes"], 3);
         assert!(!store.join("sources/http/bbb").exists());
         assert!(store.join("sources/http/aaa").is_dir());
-        // Owner decision 2026-09-25: a host with a state directory keeps
-        // downloads in `<state_dir>/models`; a stated path wins.
-        let with_state = root.path().join("with-state.yaml");
+        // Owner ruling 2026-09-25: with no `model_sources.path`, downloads
+        // live under the models directory; a stated path wins.
+        let with_store = root.path().join("with-store.yaml");
         std::fs::write(
-            &with_state,
+            &with_store,
             format!(
-                "schema_version: 1\nkind: host\nname: h\nstate_dir: {}\n",
-                root.path().join("state").display()
+                "schema_version: 1\nkind: host\nname: h\nstate_dir: {}\nmodel_store:\n  path: {}\n",
+                root.path().join("state").display(),
+                root.path().join("models").display()
             ),
         )
         .unwrap();
         assert_eq!(
-            model_store(&with_state).unwrap(),
-            root.path().join("state/models")
+            model_store(&with_store).unwrap(),
+            root.path().join("models")
         );
         let stated = root.path().join("stated.yaml");
         std::fs::write(

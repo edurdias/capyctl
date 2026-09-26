@@ -328,7 +328,6 @@ pub fn check_honoured(
     if host.get("model_store").is_some() || host.get("model_sources").is_some() {
         crate::model_settings::resolve(
             host,
-            &root,
             &Default::default(),
             &Default::default(),
             Some(Path::new("/")),

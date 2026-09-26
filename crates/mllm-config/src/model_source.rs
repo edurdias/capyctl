@@ -476,8 +476,8 @@ pub struct ModelSourcePolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub huggingface_endpoint: Option<String>,
     /// The absolute directory downloads live under (`<path>/sources/...`).
-    /// `None` keeps them in the model store, as before the sources store had
-    /// a directory of its own; the roles state `<state_dir>/models`.
+    /// `None` keeps them in the model store (`<model_store>/sources`), the
+    /// default (owner ruling 2026-09-25), so existing copies are reused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<std::path::PathBuf>,
 }

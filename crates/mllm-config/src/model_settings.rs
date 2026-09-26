@@ -15,8 +15,10 @@
 //!   ceiling with `--model-sources-max`, `MLLM_MODEL_SOURCES_MAX`, or
 //!   `model_sources.max_bytes`. An explicit `denied` (or `disabled`) in the
 //!   document wins over the default.
-//! - Downloads live in their own store, `<state_dir>/models/sources`, unless
-//!   the document names another with `model_sources.path`.
+//! - Downloads live under the models directory, `<model_store>/sources`
+//!   (e.g. `~/models/sources`), so copies downloaded before an upgrade are
+//!   reused; `model_sources.path` names another directory (downloads then
+//!   live in `<path>/sources`).
 //!
 //! Precedence, for every setting: CLI flag > environment > YAML > default.
 //! The resolved values are written into the host document before it is
@@ -38,10 +40,6 @@ pub const MODEL_SOURCES_ENV: &str = "MLLM_MODEL_SOURCES";
 pub const MODEL_SOURCES_MAX_ENV: &str = "MLLM_MODEL_SOURCES_MAX";
 /// The models directory under the home directory when nothing names one.
 pub const DEFAULT_MODELS_DIR: &str = "models";
-/// The directory under a role's state directory that holds the sources store
-/// (`<state_dir>/models/sources`).
-pub const SOURCES_STORE_DIR: &str = "models";
-
 fn refuse(path: &str, detail: impl Into<String>) -> ConfigError {
     ConfigError::new(ConfigErrorCode::UnsupportedCombination, path, detail)
 }
@@ -131,20 +129,19 @@ pub struct ModelSettings {
     /// The models directory (`model_store.path`).
     pub models_root: PathBuf,
     pub root_source: RootSource,
-    /// The `model_sources` block the host publishes, with the sources store
-    /// always named.
+    /// The `model_sources` block the host publishes. Its `path` is stated
+    /// only when a layer named one; unstated, downloads live under the
+    /// models directory (`<model_store>/sources`).
     pub sources: RawModelSources,
     /// Its normalized form.
     pub policy: ModelSourcePolicy,
 }
 
 /// Resolve both settings for a host whose document block is `stated` (the
-/// host document, or a standalone document's `host:` block) and whose state
-/// directory is `state_dir`. `default_root` is the models directory when no
+/// host document, or a standalone document's `host:` block). `default_root` is the models directory when no
 /// layer names one (`~/models`, [`default_models_root`]).
 pub fn resolve(
     stated: &Value,
-    state_dir: &Path,
     flag: &ModelOverrides,
     env: &ModelOverrides,
     default_root: Option<&Path>,
@@ -195,14 +192,10 @@ pub fn resolve(
     if let Some(max) = flag.sources_max.as_ref().or(env.sources_max.as_ref()) {
         sources.max_bytes = Some(max.clone());
     }
-    if sources.path.is_none() {
-        sources.path = Some(
-            state_dir
-                .join(SOURCES_STORE_DIR)
-                .to_string_lossy()
-                .into_owned(),
-        );
-    }
+    // Owner ruling 2026-09-25: with no `model_sources.path`, downloads stay
+    // in `<model_store>/sources` (ModelSourcePolicy::root), the layout every
+    // earlier release used, so an existing verified copy is reused rather
+    // than downloaded again.
     let policy = ModelSourcePolicy::from_raw(Some(sources.clone()))?;
     Ok(ModelSettings {
         models_root,
@@ -224,12 +217,11 @@ impl ModelSettings {
 /// [`resolve`] a host document's own settings and write them back into it.
 pub fn apply(
     document: &mut Value,
-    state_dir: &Path,
     flag: &ModelOverrides,
     env: &ModelOverrides,
     default_root: Option<&Path>,
 ) -> Result<ModelSettings, ConfigError> {
-    let settings = resolve(document, state_dir, flag, env, default_root)?;
+    let settings = resolve(document, flag, env, default_root)?;
     settings.write_into(document);
     Ok(settings)
 }
@@ -256,13 +248,13 @@ mod tests {
     }
 
     // T14 (owner decision 2026-09-25): with nothing stated, models live in
-    // ~/models, downloads in <state_dir>/models/sources, and both remote
+    // ~/models, downloads in ~/models/sources (owner ruling: the layout
+    // earlier releases used, so existing copies are reused), and both remote
     // kinds are allowed with the 500 GiB ceiling.
     #[test]
     fn nothing_stated_resolves_the_defaults() {
         let settings = resolve(
             &json!({}),
-            Path::new("/state"),
             &ModelOverrides::default(),
             &ModelOverrides::default(),
             home().as_deref(),
@@ -275,12 +267,13 @@ mod tests {
         assert_eq!(settings.policy.max_bytes, Some(DEFAULT_SOURCES_MAX_BYTES));
         assert_eq!(
             settings.policy.root(&settings.models_root),
-            Path::new("/state/models")
+            Path::new("/home/user/models")
         );
+        assert_eq!(settings.policy.path, None);
         let mut document = json!({"name": "h"});
         settings.write_into(&mut document);
         assert_eq!(document["model_store"]["path"], "/home/user/models");
-        assert_eq!(document["model_sources"], json!({"path": "/state/models"}));
+        assert_eq!(document["model_sources"], json!({}));
     }
 
     // T14 T03 (owner rule 2026-09-25): CLI flag > environment > YAML > default
@@ -295,8 +288,7 @@ mod tests {
         let env = env_layer(&[(MODELS_ROOT_ENV, "/env/models")]).unwrap();
         let none = ModelOverrides::default();
         let root = |flag: &ModelOverrides, env: &ModelOverrides, document: &Value| {
-            let settings =
-                resolve(document, Path::new("/s"), flag, env, home().as_deref()).unwrap();
+            let settings = resolve(document, flag, env, home().as_deref()).unwrap();
             (settings.models_root, settings.root_source)
         };
         assert_eq!(
@@ -316,19 +308,12 @@ mod tests {
             ("/home/user/models".into(), RootSource::Default)
         );
         // No home and nothing stated: a clear refusal, never a guess.
-        let error = resolve(&json!({}), Path::new("/s"), &none, &none, None).unwrap_err();
+        let error = resolve(&json!({}), &none, &none, None).unwrap_err();
         assert_eq!(error.code, ConfigErrorCode::MissingRequired);
         assert!(error.detail.contains(MODELS_ROOT_ENV), "{error}");
         // A relative document path is refused; a relative variable is made
         // absolute against the working directory.
-        assert!(resolve(
-            &json!({"model_store": {"path": "rel"}}),
-            Path::new("/s"),
-            &none,
-            &none,
-            None
-        )
-        .is_err());
+        assert!(resolve(&json!({"model_store": {"path": "rel"}}), &none, &none, None).is_err());
         assert!(env_layer(&[(MODELS_ROOT_ENV, "rel/models")])
             .unwrap()
             .models_root
@@ -344,7 +329,7 @@ mod tests {
         let disabled = json!({"model_sources": {"huggingface": "denied", "http": "disabled"}});
         let none = ModelOverrides::default();
         let policy = |flag: &ModelOverrides, env: &ModelOverrides, document: &Value| {
-            resolve(document, Path::new("/s"), flag, env, home().as_deref())
+            resolve(document, flag, env, home().as_deref())
                 .unwrap()
                 .policy
         };
@@ -385,7 +370,7 @@ mod tests {
         );
         // A stated sources store is kept.
         let stated = json!({"model_sources": {"path": "/data/downloads"}});
-        let settings = resolve(&stated, Path::new("/s"), &none, &none, home().as_deref()).unwrap();
+        let settings = resolve(&stated, &none, &none, home().as_deref()).unwrap();
         assert_eq!(
             settings.policy.root(&settings.models_root),
             Path::new("/data/downloads")

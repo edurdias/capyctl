@@ -229,14 +229,15 @@ server plus one host):
   `--model-sources-max`, `MLLM_MODEL_SOURCES_MAX` or `model_sources.max_bytes`.
   Precedence is flag > environment > document > default
   (`mllm_config::model_settings`).
-- **Sources store.** Downloads live in `<state_dir>/models/sources` unless
-  `model_sources.path` names another directory; the model store keeps the
-  operator's own checkpoints. A downloaded checkpoint is contained by, and its
-  digest measured against, the sources store. The role writes the resolved
-  `model_store.path` and `model_sources` (including `path`) into the host
-  document it publishes, so the server resolves a revision against exactly what
-  the host enforces. A document that states neither keeps the earlier layout
-  (`<model_store>/sources`).
+- **Sources store.** Downloads live in `<model_store>/sources` (for example
+  `~/models/sources`), the layout earlier releases used, so a verified copy
+  downloaded before an upgrade is reused rather than fetched again (owner
+  ruling 2026-09-25). `model_sources.path` names another directory, and
+  downloads then live in `<path>/sources`. A downloaded checkpoint is contained
+  by, and its digest measured against, the sources store. The role writes the
+  resolved `model_store.path` and `model_sources` into the host document it
+  publishes, so the server resolves a revision against exactly what the host
+  enforces.
 - **Disk check.** A reservation also leaves 1 GiB free on the filesystem
   (`insufficient_space` otherwise), besides the `max_bytes` ceiling
   (`too_large`).

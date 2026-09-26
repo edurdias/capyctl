@@ -406,7 +406,8 @@ fn server_inference_authentication_may_be_none() {
 // T14 T03 (owner decisions 2026-09-25): an enrolled host behaves as the
 // standalone one does. With nothing stated its models live in ~/models,
 // Hugging Face and HTTP sources are allowed with the 500 GiB ceiling, and
-// downloads go to <state_dir>/models/sources; the resolved values are in the
+// downloads go to ~/models/sources (owner ruling: the models directory, so
+// earlier copies are reused); the resolved values are in the
 // document the host publishes. An explicit `disabled` stays disabled, and a
 // flag or variable wins over the document.
 #[test]
@@ -445,7 +446,7 @@ fn a_server_host_allows_model_sources_by_default() {
     assert_eq!(defaults.model_sources.max_bytes, Some(500 << 30));
     assert_eq!(
         defaults.model_sources.root(&defaults.model_store),
-        root.join("models")
+        home.join("models")
     );
     // A stated store is kept; with the template's layout (`<state_dir>/models`)
     // downloads land where they always did.

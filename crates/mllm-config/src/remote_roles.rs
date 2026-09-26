@@ -505,7 +505,7 @@ impl HostConfig {
     /// Owner decision 2026-09-25: state the host's models directory and
     /// model-source policy in its document, resolved by the shared rule
     /// (`crate::model_settings`, flag > environment > document > default:
-    /// `~/models` from `home`, downloads under `<state_dir>/models`), so the
+    /// `~/models` from `home`, downloads under `<model_store>/sources`), so the
     /// document the host publishes is the one it enforces.
     pub fn with_models(
         mut self,
@@ -515,7 +515,6 @@ impl HostConfig {
     ) -> Result<Self, ConfigError> {
         crate::model_settings::apply(
             &mut self.document,
-            &self.state_dir,
             flags,
             env,
             crate::model_settings::default_models_root(home).as_deref(),

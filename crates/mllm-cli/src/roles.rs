@@ -1230,7 +1230,6 @@ pub fn listener_migration(
 /// named directory must already exist.
 fn standalone_models(
     stated_host: &serde_json::Value,
-    state_dir: &Path,
     named: &[NamedInstallation],
     flags: &ModelOverrides,
 ) -> Result<mllm_config::model_settings::ModelSettings, StartError> {
@@ -1242,10 +1241,8 @@ fn standalone_models(
         .map(|first| first.installation.models_root.clone())
         .filter(|root| !root.as_os_str().is_empty());
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let state_dir = std::path::absolute(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
     let settings = resolve(
         stated_host,
-        &state_dir,
         flags,
         &env,
         default_models_root(home.as_deref()).as_deref(),
@@ -1393,7 +1390,7 @@ async fn start_standalone_inner(
     let mut named = provider.installations(&registered)?;
     // Owner decision 2026-09-25 (standalone is a server plus one host): the
     // models directory and the model-source policy, by the rule a host uses.
-    let models = standalone_models(&stated_host, state_dir, &named, flags)?;
+    let models = standalone_models(&stated_host, &named, flags)?;
     for n in &mut named {
         n.installation.models_root = models.models_root.clone();
     }
@@ -1572,7 +1569,7 @@ async fn start_standalone_inner(
     }
     // ADR 0008 (owner decision 2026-09-25): declared remote sources are
     // materialized by the embedded host into its sources store
-    // (`<state_dir>/models/sources` unless `host.model_sources.path` names
+    // (`<model_store>/sources` unless `host.model_sources.path` names
     // another), exactly as an enrolled host does; activation and the
     // checkpoint digest wait for the verified copy (ADR 0014 §7).
     {

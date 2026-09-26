@@ -1,8 +1,9 @@
 //! Owner decisions 2026-09-25: standalone keeps models in `~/models` unless
 //! `--models-root`, `MLLM_MODELS_ROOT` or `host.model_store.path` names
 //! another, and it downloads declared Hugging Face and HTTP sources by
-//! default into `<state_dir>/models/sources`, exactly as an enrolled host
-//! does (standalone is a server plus one host).
+//! default into `~/models/sources` (owner ruling: under the models
+//! directory, so copies from earlier releases are reused), exactly as an
+//! enrolled host does (standalone is a server plus one host).
 //!
 //! These tests set `HOME` and the model variables, so they live in their own
 //! binary and run one at a time. No test reaches the network: downloads are
@@ -102,7 +103,7 @@ fn document(state: &Path, host: &str) -> PathBuf {
 
 // T14 T03 (owner decision 2026-09-25): standalone starts without
 // MLLM_MODELS_ROOT. The models directory is ~/models (created), downloads
-// are allowed with the 500 GiB ceiling into <state_dir>/models/sources.
+// are allowed with the 500 GiB ceiling into ~/models/sources.
 #[tokio::test]
 async fn standalone_starts_without_a_models_root_and_uses_home_models() {
     let _serial = SERIAL.lock().await;
@@ -126,10 +127,7 @@ async fn standalone_starts_without_a_models_root_and_uses_home_models() {
     assert_eq!(policy.model_sources.huggingface, SourceSwitch::Allowed);
     assert_eq!(policy.model_sources.http, SourceSwitch::Allowed);
     assert_eq!(policy.model_sources.max_bytes, Some(500 << 30));
-    assert_eq!(
-        policy.model_sources.root(&policy.model_store),
-        std::path::absolute(state.path()).unwrap().join("models")
-    );
+    assert_eq!(policy.model_sources.root(&policy.model_store), models);
     let _ = app.shutdown().await;
 }
 
@@ -296,7 +294,7 @@ async fn an_explicitly_disabled_source_is_refused() {
 }
 
 // T14 T34 (ADR 0008, owner decision 2026-09-25): the embedded host
-// materializes a declared source into <state_dir>/models/sources, as an
+// materializes a declared source into ~/models/sources, as an
 // enrolled host does; the revision resolves to that copy, which the
 // checkpoint digest measures (ADR 0014 §7) once the Fake-free role runs it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -356,12 +354,10 @@ async fn the_embedded_host_downloads_into_the_sources_store() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let copy = std::path::absolute(state.path())
-        .unwrap()
-        .join(format!("models/sources/http/{sha}/w.bin"));
+    let copy = home.path().join(format!("models/sources/http/{sha}/w.bin"));
     assert_eq!(std::fs::read(&copy).unwrap(), weights);
     // The revision loads from that copy, and its checkpoint is contained in
-    // the sources store, not the models directory.
+    // the sources store under the models directory.
     let pending = app.store.pending_model_sources().unwrap();
     assert!(pending.is_empty(), "{pending:?}");
     let host = app.host_document();
@@ -374,8 +370,77 @@ async fn the_embedded_host_downloads_into_the_sources_store() {
         .expect("the copy measures inside the sources store");
     assert_eq!(measured.manifest.weights_bytes, weights.len() as i64);
     assert!(
-        !home.path().join("models/sources").exists(),
-        "downloads stay out of the models directory"
+        !state.path().join("models").exists(),
+        "downloads stay out of the state directory"
     );
+    let _ = app.shutdown().await;
+}
+
+// T14 T34 (ADR 0008, owner ruling 2026-09-25): a verified Hugging Face copy
+// already in <model_store>/sources, as an earlier release left it, is reused
+// after the upgrade: the source is verified from the existing copy, and
+// nothing is fetched (the origin is one nothing listens on).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_existing_download_in_the_models_directory_is_reused() {
+    let _serial = SERIAL.lock().await;
+    let home = fake_home();
+    let state = state_in(home.path());
+    let source = hugging_face();
+    let key = source.store_key().unwrap();
+    assert_eq!(
+        key,
+        "sources/huggingface/org--model@0123456789abcdef0123456789abcdef01234567"
+    );
+    let models = home.path().join("models");
+    let copy = models.join(&key);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("config.json"), b"{}").unwrap();
+    std::fs::write(copy.join("model.safetensors"), vec![1_u8; 64]).unwrap();
+    // The store's verified marker, as the earlier release committed it.
+    let id: String = sha2::Sha256::digest(key.as_bytes())[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let markers = models.join("sources/.mllm");
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::write(
+        markers.join(format!("{id}.verified")),
+        serde_json::json!({"key": key, "state": "verified", "bytes": 66, "files": 2}).to_string(),
+    )
+    .unwrap();
+    let app = support::boot_with_models(
+        state.path(),
+        None,
+        unnamed(),
+        &ModelOverrides::default(),
+        None,
+        no_gpu,
+    )
+    .await
+    .expect("standalone starts");
+    let id = app
+        .deploy("m", source)
+        .expect("a Hugging Face source is allowed by default");
+    let revision = app.store.current_revision(&id).unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = app.store.model_sources(&id, revision).unwrap();
+        if records
+            .iter()
+            .any(|record| record.state == SourceState::Verified)
+        {
+            break;
+        }
+        assert!(
+            records
+                .iter()
+                .all(|record| record.state != SourceState::Failed),
+            "the existing copy was not reused: {records:?}"
+        );
+        assert!(Instant::now() < deadline, "not verified: {records:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!markers.join("partial").exists(), "no download was started");
+    assert!(!state.path().join("models").exists());
     let _ = app.shutdown().await;
 }

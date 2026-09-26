@@ -441,7 +441,7 @@ document, or the `host:` block of the standalone document), then the default.
 | Models directory (relative model paths resolve here) | `--models-root <dir>` | `MLLM_MODELS_ROOT` | `model_store.path` | `~/models` |
 | Hugging Face and HTTP downloads | `--model-sources allowed\|disabled` | `MLLM_MODEL_SOURCES` | `model_sources.huggingface`, `model_sources.http` | `allowed` |
 | Cap on all downloaded models | `--model-sources-max <size>` | `MLLM_MODEL_SOURCES_MAX` | `model_sources.max_bytes` | `500GiB` |
-| Where downloads are kept | | | `model_sources.path` | `<state_dir>/models` |
+| Where downloads are kept | | | `model_sources.path` | the models directory (`~/models/sources`) |
 
 A deployment that names a pinned Hugging Face revision or an HTTP URL with its
 SHA-256 is downloaded by the host it is placed on, into
