@@ -16,6 +16,8 @@ pub mod prune;
 pub mod remote_roles;
 pub mod revoke;
 pub mod roles;
+// Owner decision 2026-09-25: the generic `--set` / `MLLM_SET__…` overrides.
+pub mod settings;
 pub mod shutdown;
 pub mod standalone_config;
 // ADR 0018 §5: standalone's engine add, remove and list.

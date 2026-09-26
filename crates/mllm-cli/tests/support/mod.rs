@@ -206,6 +206,30 @@ pub async fn boot_with_models(
     .await
 }
 
+/// Owner decision 2026-09-25: boot with the role document `config` (if any)
+/// and this run's generic overrides (`--set`, `MLLM_SET__…`).
+pub async fn boot_with_overrides(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+    overrides: &mllm_cli::roles::SettingOverrides,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_configured_with_overrides(
+        state_dir,
+        config,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
+        }),
+        test_memory(),
+        overrides,
+    )
+    .await
+}
+
 /// The explicit host capacity every standalone test boots with: 32 GiB, all
 /// of it free. Standalone derives its limits and the default deployment's
 /// footprints from the observed capacity and admits against observed free

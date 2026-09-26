@@ -24,6 +24,7 @@ use mllm_config::engine_policy::Engine;
 use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 pub use mllm_config::model_settings::ModelOverrides;
 use mllm_config::schema::ConfigKind;
+pub use mllm_config::setting_overrides::SettingOverrides;
 use mllm_controller::coordinator::{
     CoordinatorOptions, EngineBindings, OwnedCoordinator, ServiceClock, ServiceObservation as _,
     ToolsFactory,
@@ -161,6 +162,9 @@ pub struct App {
     /// Design §9: the document's `server.listeners.inference.bind`, or the
     /// `0.0.0.0:8443` default when it states none.
     inference_bind: std::net::SocketAddr,
+    /// Owner decision 2026-09-25: the document's
+    /// `server.listeners.management.bind`, or `127.0.0.1:7443`.
+    management_bind: std::net::SocketAddr,
     /// ADR 0019, design §9: what this start's one-time listener migration did.
     listener_migration: Migration,
     /// Design §9: the document's `server.listeners.inference.authentication`
@@ -192,6 +196,13 @@ impl App {
     /// ([`effective_inference_address`]).
     pub fn inference_bind(&self) -> std::net::SocketAddr {
         self.inference_bind
+    }
+
+    /// Owner decision 2026-09-25: the management bind the standalone document
+    /// states (default `127.0.0.1:7443`), unless `--management-listen` or
+    /// `MLLM_MANAGEMENT_ADDR` overrides it ([`management_override`]).
+    pub fn management_bind(&self) -> std::net::SocketAddr {
+        self.management_bind
     }
 
     /// ADR 0019, design §9: what this start's one-time migration of the old
@@ -296,23 +307,63 @@ pub const INFERENCE_ADDR_ENV: &str = "MLLM_INFERENCE_ADDR";
 /// The standalone-only name [`INFERENCE_ADDR_ENV`] replaces. Still read, after
 /// it, with a deprecation warning.
 pub const DEPRECATED_INFERENCE_ADDR_ENV: &str = "MLLM_STANDALONE_INFERENCE_ADDR";
-pub const MANAGEMENT_ADDR_ENV: &str = "MLLM_STANDALONE_MANAGEMENT_ADDR";
+/// Owner decision 2026-09-25: the standalone management address for one
+/// run, for the role and its client commands alike (loopback only).
+pub const MANAGEMENT_ADDR_ENV: &str = "MLLM_MANAGEMENT_ADDR";
+/// The standalone-only name [`MANAGEMENT_ADDR_ENV`] replaces. Still read,
+/// after it, with a deprecation warning.
+pub const DEPRECATED_MANAGEMENT_ADDR_ENV: &str = "MLLM_STANDALONE_MANAGEMENT_ADDR";
 
-fn loopback_address(variable: &str, default: &str) -> Result<std::net::SocketAddr, StartError> {
-    let text = match std::env::var_os(variable) {
-        None => default.to_owned(),
-        Some(value) => value
-            .into_string()
-            .map_err(|_| StartError::Setting(format!("{variable} is not valid text")))?,
+/// SPEC §16.5, owner decision 2026-09-25: the run-time override of the
+/// standalone management bind, if any: `--management-listen`, then
+/// `MLLM_MANAGEMENT_ADDR`, then the deprecated
+/// `MLLM_STANDALONE_MANAGEMENT_ADDR`. Each must be a loopback address with a
+/// non-zero port; a bad one is refused with its name.
+pub fn management_override(
+    flag: Option<std::net::SocketAddr>,
+) -> Result<Option<std::net::SocketAddr>, StartError> {
+    use mllm_config::standalone::management_address;
+    if let Some(address) = flag {
+        return management_address(&address.to_string())
+            .map(Some)
+            .ok_or_else(|| {
+                StartError::Setting(format!(
+                    "--management-listen {address} must be a loopback address with a non-zero port"
+                ))
+            });
+    }
+    let (variable, value) = match std::env::var_os(MANAGEMENT_ADDR_ENV) {
+        Some(value) => (MANAGEMENT_ADDR_ENV, value),
+        None => match std::env::var_os(DEPRECATED_MANAGEMENT_ADDR_ENV) {
+            Some(value) => (DEPRECATED_MANAGEMENT_ADDR_ENV, value),
+            None => return Ok(None),
+        },
     };
-    text.parse::<std::net::SocketAddr>()
+    value
+        .into_string()
         .ok()
-        .filter(|address| address.ip().is_loopback() && address.port() != 0)
+        .and_then(|text| management_address(&text))
+        .map(Some)
         .ok_or_else(|| {
             StartError::Setting(format!(
-                "{variable} must be a loopback address with a port, e.g. 127.0.0.1:8443"
+                "{variable} must be a loopback address with a port, e.g. 127.0.0.1:7443"
             ))
         })
+}
+
+/// The warning a role prints once at start when the deprecated
+/// `MLLM_STANDALONE_MANAGEMENT_ADDR` is set, or `None`.
+pub fn deprecated_management_env_warning(flag: Option<std::net::SocketAddr>) -> Option<String> {
+    std::env::var_os(DEPRECATED_MANAGEMENT_ADDR_ENV)?;
+    let ignored = flag.is_some() || std::env::var_os(MANAGEMENT_ADDR_ENV).is_some();
+    Some(format!(
+        "warning: {DEPRECATED_MANAGEMENT_ADDR_ENV} is deprecated; use {MANAGEMENT_ADDR_ENV}{}",
+        if ignored {
+            " (ignored for this run: --management-listen or MLLM_MANAGEMENT_ADDR is set)"
+        } else {
+            ""
+        }
+    ))
 }
 
 /// Design §9: the run-time override of the inference bind, if any, for the
@@ -381,8 +432,41 @@ pub fn effective_inference_address(
     Ok(inference_override(listen)?.unwrap_or(document_bind))
 }
 
-pub fn standalone_management_address() -> Result<std::net::SocketAddr, StartError> {
-    loopback_address(MANAGEMENT_ADDR_ENV, "127.0.0.1:7443")
+/// Owner decision 2026-09-25: the management address a client command uses
+/// for the standalone role under `state_dir`: `MLLM_MANAGEMENT_ADDR` (or its
+/// deprecated alias), else `server.listeners.management.bind` of the
+/// standalone document under the state root with this environment's
+/// `MLLM_SET__…` overrides, else `127.0.0.1:7443`. A `--management-listen`
+/// the role was started with is not visible here; a client of such a role
+/// names the same address with the variable.
+pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::SocketAddr, StartError> {
+    if let Some(address) = management_override(None)? {
+        return Ok(address);
+    }
+    let document = state_dir.join("config").join("standalone.yaml");
+    let text = match std::fs::read_to_string(&document) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(mllm_config::standalone::DEFAULT_MANAGEMENT_BIND
+                .parse()
+                .expect("valid default"))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let refused = |error: mllm_config::ConfigError| {
+        StartError::Setting(format!(
+            "{}: {}",
+            document.display(),
+            crate::settings::describe(&error)
+        ))
+    };
+    let overrides =
+        mllm_config::setting_overrides::SettingOverrides::from_process(ConfigKind::Standalone, &[])
+            .map_err(refused)?;
+    let parsed = mllm_config::parse_document(&text)
+        .and_then(|parsed| overrides.apply_and_validate(parsed))
+        .map_err(refused)?;
+    mllm_config::standalone::management_bind(&parsed).map_err(refused)
 }
 
 impl App {
@@ -1086,6 +1170,26 @@ pub async fn start_standalone_with_settings(
     flags: &ModelOverrides,
     engines: &EngineOverrides,
 ) -> Result<App, StartError> {
+    start_standalone_with_overrides(
+        state_dir,
+        config,
+        flags,
+        engines,
+        &SettingOverrides::none(ConfigKind::Standalone),
+    )
+    .await
+}
+
+/// As [`start_standalone_with_settings`], with this run's generic overrides
+/// (owner decision 2026-09-25: `--set` > `MLLM_SET__…` > the document),
+/// applied to the standalone document before it is validated.
+pub async fn start_standalone_with_overrides(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+    engines: &EngineOverrides,
+    overrides: &SettingOverrides,
+) -> Result<App, StartError> {
     start_standalone_inner(
         state_dir,
         config,
@@ -1099,6 +1203,7 @@ pub async fn start_standalone_with_settings(
         // publishes the unified shape, exactly as before.
         Arc::new(mllm_agent::gpu_memory::sample),
         flags,
+        overrides,
     )
     .await
 }
@@ -1120,6 +1225,7 @@ pub async fn start_standalone_with(
         crate::host_observation::proc_meminfo(),
         no_gpu(),
         &ModelOverrides::default(),
+        &no_overrides(),
     )
     .await
 }
@@ -1140,6 +1246,7 @@ pub async fn start_standalone_with_memory(
         memory,
         no_gpu(),
         &ModelOverrides::default(),
+        &no_overrides(),
     )
     .await
 }
@@ -1159,6 +1266,7 @@ pub async fn start_standalone_with_gpu(
         memory,
         gpu,
         &ModelOverrides::default(),
+        &no_overrides(),
     )
     .await
 }
@@ -1183,6 +1291,7 @@ pub async fn start_standalone_configured(
         memory,
         no_gpu(),
         &ModelOverrides::default(),
+        &no_overrides(),
     )
     .await
 }
@@ -1197,7 +1306,42 @@ pub async fn start_standalone_configured_with_models(
     gpu: Arc<GpuSampler>,
     flags: &ModelOverrides,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, config, provider, memory, gpu, flags).await
+    start_standalone_inner(
+        state_dir,
+        config,
+        provider,
+        memory,
+        gpu,
+        flags,
+        &no_overrides(),
+    )
+    .await
+}
+
+/// As [`start_standalone_configured`], with generic overrides (owner decision
+/// 2026-09-25: `--set` > `MLLM_SET__…` > the document).
+pub async fn start_standalone_configured_with_overrides(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    overrides: &SettingOverrides,
+) -> Result<App, StartError> {
+    start_standalone_inner(
+        state_dir,
+        config,
+        provider,
+        memory,
+        no_gpu(),
+        &ModelOverrides::default(),
+        overrides,
+    )
+    .await
+}
+
+/// No generic override.
+fn no_overrides() -> SettingOverrides {
+    SettingOverrides::none(ConfigKind::Standalone)
 }
 
 /// ADR 0019, design §9: run the one-time migration of the role `document`
@@ -1269,6 +1413,7 @@ async fn start_standalone_inner(
     memory: crate::host_observation::MemoryReader,
     gpu: Arc<GpuSampler>,
     flags: &ModelOverrides,
+    overrides: &SettingOverrides,
 ) -> Result<App, StartError> {
     // Fail-closed credentials (SPEC §15.2, design §9): the generated api key
     // lives in the protected credentials file. There is no constant fallback:
@@ -1285,6 +1430,7 @@ async fn start_standalone_inner(
         timing_header,
         config_notices,
         inference_bind,
+        management_bind,
         inference_auth,
         listener_migration,
         stated_host,
@@ -1297,10 +1443,20 @@ async fn start_standalone_inner(
         let config_dir = absolute(path.parent().unwrap_or(Path::new(".")));
         let load = || -> Result<_, StartError> {
             let text = std::fs::read_to_string(&path)?;
-            let document =
-                mllm_config::parse_strict(ConfigKind::Standalone, &text).map_err(|error| {
-                    StartError::Deploy(format!("standalone configuration: {error}"))
-                })?;
+            let invalid = |error: mllm_config::ConfigError| {
+                StartError::Deploy(format!(
+                    "standalone configuration: {}",
+                    overrides.annotate(error)
+                ))
+            };
+            // Owner decision 2026-09-25: the generic overrides are applied to
+            // the document before it is validated, exactly as if it stated
+            // them. The one-time listener migration reads the file's own bind.
+            let raw = mllm_config::parse_document(&text).map_err(invalid)?;
+            let file_bind = raw["server"]["listeners"]["inference"]["bind"]
+                .as_str()
+                .map(str::to_owned);
+            let document = overrides.apply_and_validate(raw).map_err(invalid)?;
             // SPEC §15.3: a value this role would silently ignore (another state
             // directory or listener, TLS, a model store, profiles, numeric limits)
             // is refused before any side effect.
@@ -1311,21 +1467,17 @@ async fn start_standalone_inner(
                 &config_dir,
                 &absolute(state_dir),
             )
-            .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
-            Ok((document, ignored))
+            .map_err(invalid)?;
+            Ok((document, ignored, file_bind))
         };
-        let (mut document, mut ignored) = load()?;
+        let (mut document, mut ignored, file_bind) = load()?;
         // ADR 0019, design §9: a document still stating the old loopback
         // default is migrated to 0.0.0.0:8443 once, after it has been accepted
         // and before its listeners are read. A refused document is never
         // touched.
-        let migration = listener_migration(
-            &path,
-            state_dir,
-            document["server"]["listeners"]["inference"]["bind"].as_str(),
-        );
+        let migration = listener_migration(&path, state_dir, file_bind.as_deref());
         if matches!(migration, Migration::Rewritten { .. }) {
-            (document, ignored) = load()?;
+            (document, ignored, _) = load()?;
         }
         (
             mllm_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
@@ -1339,11 +1491,19 @@ async fn start_standalone_inner(
             // Design §9: validated by `check_honoured` above. A document the
             // migration could not rewrite still serves on the new default.
             match migration {
-                Migration::BindOnly { .. } => NEW_INFERENCE_DEFAULT.parse().expect("valid default"),
+                Migration::BindOnly { .. }
+                    if overrides.get("server.listeners.inference.bind").is_none() =>
+                {
+                    NEW_INFERENCE_DEFAULT.parse().expect("valid default")
+                }
                 _ => mllm_config::standalone::inference_bind(&document).map_err(|error| {
                     StartError::Deploy(format!("standalone configuration: {error}"))
                 })?,
             },
+            // Owner decision 2026-09-25: validated by `check_honoured` above.
+            mllm_config::standalone::management_bind(&document).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
             // Design §9: `server.listeners.inference.authentication`
             // (`api_key` unless the document states `none`). The flag and
             // MLLM_INFERENCE_AUTH are applied by the caller for this run.
@@ -1824,6 +1984,7 @@ async fn start_standalone_inner(
         config_notices,
         listener_migration,
         inference_bind,
+        management_bind,
         inference_auth,
         inference_listener,
     })

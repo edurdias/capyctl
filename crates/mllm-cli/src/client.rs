@@ -12,8 +12,6 @@ use std::{path::Path, time::Duration};
 // SPEC §6.3 (W6): `delete deployment --stop`.
 mod delete;
 
-const ENDPOINT: &str = "http://127.0.0.1:7443/management/v1";
-
 /// ADR 0014 amendment A1: the window used only against a server whose status
 /// does not report the deployment's timeouts (the previous fixed window).
 const LEGACY_WINDOW_MS: i64 = 900_000;
@@ -831,14 +829,13 @@ fn management_context(
             .to_owned();
         // SPEC §16.5: the standalone management listener, at its loopback
         // default unless this run names another loopback address.
-        let endpoint = match std::env::var_os(crate::roles::MANAGEMENT_ADDR_ENV) {
-            None => ENDPOINT.to_owned(),
-            Some(_) => format!(
-                "http://{}/management/v1",
-                crate::roles::standalone_management_address()
-                    .map_err(|failure| error("invalid_config", failure.to_string()))?
-            ),
-        };
+        // Owner decision 2026-09-25: MLLM_MANAGEMENT_ADDR, else the
+        // standalone document's management bind, else the default.
+        let endpoint = format!(
+            "http://{}/management/v1",
+            crate::roles::standalone_management_address(state_dir)
+                .map_err(|failure| error("invalid_config", failure.to_string()))?
+        );
         (endpoint, token, state_dir.to_owned())
     })
 }

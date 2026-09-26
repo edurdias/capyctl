@@ -284,7 +284,7 @@ impl Installation {
             .env("MLLM_DEEP_PARK", "off")
             .env("MLLM_INFERENCE_ADDR", &self.inference)
             .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
-            .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
+            .env("MLLM_MANAGEMENT_ADDR", &self.management)
             .env("MLLM_ENGINE_PORTS", &self.engines);
         command
     }

@@ -741,8 +741,10 @@ fn load_host(
     engines: &Path,
     flags: &mllm_config::model_settings::ModelOverrides,
     engine_flags: &mllm_config::engine_settings::EngineOverrides,
+    overrides: &mllm_config::setting_overrides::SettingOverrides,
 ) -> Result<HostConfig, StructuredError> {
     let invalid = |e: mllm_config::ConfigError| {
+        let e = overrides.annotate(e);
         error(&format!(
             "Invalid host configuration: {}: {}",
             e.path, e.detail
@@ -752,7 +754,7 @@ fn load_host(
     let engine_env =
         mllm_config::engine_settings::EngineOverrides::from_process_env().map_err(invalid)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    HostConfig::load_with_engines(path, engines)
+    HostConfig::load_with_overrides(path, engines, overrides)
         .and_then(|config| config.with_models(flags, &env, home.as_deref()))
         .and_then(|config| {
             config.with_engines(engine_flags, &engine_env, &crate::roles::engine_version)
@@ -1077,6 +1079,26 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`; owner
             // rule 2026-09-25: the server's too, so the setting has its two
             // run-time forms for every role.
+            // Owner decision 2026-09-25: this run's generic overrides
+            // (`--set` > `MLLM_SET__…` > the document); a named flag or
+            // variable of the same setting must agree with them. Checked
+            // before anything is created.
+            let kind = if *role == Role::Server {
+                mllm_config::ConfigKind::Server
+            } else {
+                mllm_config::ConfigKind::Host
+            };
+            let overrides = crate::settings::role_overrides(
+                kind,
+                &invocation.sets,
+                &crate::settings::flag_layer(invocation),
+            )
+            .map_err(|e| {
+                error(&format!(
+                    "Invalid {label} configuration: {}",
+                    crate::settings::describe(&e)
+                ))
+            })?;
             let named = crate::engine::named_role_document(invocation.config.as_deref(), &role_env);
             let path = named.clone().unwrap_or_else(|| implicit(root, label));
             if named.is_none()
@@ -1110,25 +1132,44 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 {
                     eprintln!("{warning}");
                 }
+                let invalid = |e: mllm_config::ConfigError| {
+                    error(&format!(
+                        "Invalid server configuration: {}",
+                        crate::settings::describe(&overrides.annotate(e))
+                    ))
+                };
                 let parse = |source: &str| {
-                    ServerConfig::parse(source).map_err(|_| error("Invalid server configuration"))
+                    let document = mllm_config::parse_document(source)
+                        .and_then(|document| overrides.apply_and_validate(document))
+                        .map_err(invalid)?;
+                    ServerConfig::parse(&document.to_string()).map_err(invalid)
                 };
                 let mut config = parse(&source)?;
                 // ADR 0019, design §9: the old loopback default moves to
                 // 0.0.0.0:8443 once, after the document has been accepted.
+                // The migration reads the file's own bind, not an override.
+                let file_bind = mllm_config::parse_document(&source)
+                    .ok()
+                    .and_then(|document| {
+                        document["listeners"]["inference"]["bind"]
+                            .as_str()
+                            .map(str::to_owned)
+                    });
                 let document_bind = match crate::roles::listener_migration(
                     &path,
                     &config.state_dir,
-                    Some(&config.inference.to_string()),
+                    file_bind.as_deref(),
                 ) {
                     Migration::Rewritten { .. } => {
                         config = parse(&read_config(&path)?)?;
                         config.inference
                     }
-                    Migration::BindOnly { .. } => {
+                    Migration::BindOnly { .. }
+                        if overrides.get("listeners.inference.bind").is_none() =>
+                    {
                         NEW_INFERENCE_DEFAULT.parse().expect("valid default")
                     }
-                    Migration::NotNeeded => config.inference,
+                    Migration::BindOnly { .. } | Migration::NotNeeded => config.inference,
                 };
                 // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document,
                 // by the rule the standalone role uses, and never onto another
@@ -1167,6 +1208,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                         &engines,
                         &invocation.model_overrides,
                         &invocation.engine_overrides,
+                        &overrides,
                     )?,
                     path.clone(),
                     engines,
@@ -1181,7 +1223,25 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
             let engines = host_engines(named.as_deref(), &path);
-            let config = load_host(&path, &engines, &Default::default(), &Default::default())?;
+            // Owner decision 2026-09-25: the environment's generic overrides
+            // apply here as at `start host`, so both find the same identity.
+            let overrides = mllm_config::setting_overrides::SettingOverrides::from_process(
+                mllm_config::ConfigKind::Host,
+                &[],
+            )
+            .map_err(|e| {
+                error(&format!(
+                    "Invalid host configuration: {}",
+                    crate::settings::describe(&e)
+                ))
+            })?;
+            let config = load_host(
+                &path,
+                &engines,
+                &Default::default(),
+                &Default::default(),
+                &overrides,
+            )?;
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery

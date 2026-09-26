@@ -132,9 +132,17 @@ pub enum Command {
     },
     /// SPEC §14 / §15.3: offline validation of one configuration document.
     /// `host` is the host role document a deployment is resolved against.
+    /// Owner decision 2026-09-25: `sets` are its `--set` overrides.
     Validate {
         file: PathBuf,
         host: Option<PathBuf>,
+        sets: Vec<String>,
+    },
+    /// Owner decision 2026-09-25: the effective configuration of a role, each
+    /// value with its source.
+    ConfigShow {
+        role: Option<Role>,
+        sets: Vec<String>,
     },
     /// SPEC §4.3: explicit draining of a host's deployments, distinct from an
     /// ordinary role restart. `None` is the standalone role's embedded host.
@@ -243,6 +251,7 @@ impl Command {
                 format!("delete deployment {deployment}{tail}")
             }
             Command::Validate { file, .. } => format!("validate config --file {}", file.display()),
+            Command::ConfigShow { .. } => "config show".into(),
             Command::Drain {
                 host: Some(host), ..
             } => format!("drain host {host}"),
@@ -289,6 +298,9 @@ struct Cli {
     command: CliCommand,
 }
 
+// Parsed once per process; the role starts carry every setting flag, and
+// boxing a clap subcommand buys nothing here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum CliCommand {
     Start {
@@ -365,6 +377,11 @@ enum CliCommand {
     Validate {
         #[command(subcommand)]
         resource: ValidateArgs,
+    },
+    /// The effective configuration of a role.
+    Config {
+        #[command(subcommand)]
+        action: ConfigArgs,
     },
     /// Stop every engine on a host with verified cleanup; its deployments stay
     /// eligible for on-demand activation. Signalling a role never does this.
@@ -563,6 +580,18 @@ struct RoleSettingsArgs {
     cuda_home: Option<PathBuf>,
 }
 
+/// Owner decision 2026-09-25: the generic override of any YAML setting of the
+/// role document, on the role starts.
+#[derive(Debug, Clone, PartialEq, Eq, Default, clap::Args)]
+struct SetArgs {
+    /// Set any setting of the role document for this run, by its YAML path
+    /// (repeatable), e.g. --set shutdown.drain_timeout=45s. Wins over
+    /// MLLM_SET__<PATH> and the document; a setting that also has a named
+    /// flag or variable must agree with it. Secrets cannot be set here.
+    #[arg(long = "set", value_name = "PATH=VALUE", value_parser = parse_set)]
+    sets: Vec<String>,
+}
+
 impl RoleSettingsArgs {
     fn models(&self) -> mllm_config::model_settings::ModelOverrides {
         mllm_config::model_settings::ModelOverrides {
@@ -609,6 +638,8 @@ enum StartTarget {
         /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
         #[arg(long)]
         no_inference_auth: bool,
+        #[command(flatten)]
+        overrides: SetArgs,
     },
     Host {
         /// Retain full native engine logs in private files (may contain secrets).
@@ -616,6 +647,8 @@ enum StartTarget {
         debug_engine_logs: bool,
         #[command(flatten)]
         settings: RoleSettingsArgs,
+        #[command(flatten)]
+        overrides: SetArgs,
     },
     Standalone {
         /// Retain full native engine logs in private files (may contain secrets).
@@ -639,6 +672,13 @@ enum StartTarget {
         /// 16GiB). Wins over MLLM_KV_CACHE_BYTES and host.local_engine.kv_cache.
         #[arg(long, value_name = "SIZE", value_parser = parse_kv_cache)]
         kv_cache: Option<String>,
+        /// Serve the management API on this loopback address for this run
+        /// (default 127.0.0.1:7443). Wins over MLLM_MANAGEMENT_ADDR and
+        /// server.listeners.management.bind.
+        #[arg(long, value_name = "ADDR:PORT", value_parser = parse_management_listen)]
+        management_listen: Option<SocketAddr>,
+        #[command(flatten)]
+        overrides: SetArgs,
     },
     Deployment {
         deployment: String,
@@ -786,6 +826,27 @@ enum ValidateArgs {
         /// The host document a deployment file is resolved against.
         #[arg(long, value_name = "FILE")]
         host: Option<PathBuf>,
+        /// Validate a role document with this setting changed, as `start`
+        /// would (repeatable), e.g. --set shutdown.drain_timeout=45s.
+        #[arg(long = "set", value_name = "PATH=VALUE", value_parser = parse_set)]
+        sets: Vec<String>,
+    },
+}
+
+/// Owner decision 2026-09-25: `mllm config show`.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+enum ConfigArgs {
+    /// Print the effective configuration of a role with each value's source
+    /// (default, yaml, env, flag or set). The role document is --config (or
+    /// MLLM_CONFIG), else the role's document under the state root.
+    Show {
+        /// The role: server, host or standalone (default: the kind of the
+        /// named document, else standalone).
+        #[arg(long, value_name = "ROLE", value_parser = parse_role)]
+        role: Option<Role>,
+        /// Show the configuration with this setting changed (repeatable).
+        #[arg(long = "set", value_name = "PATH=VALUE", value_parser = parse_set)]
+        sets: Vec<String>,
     },
 }
 
@@ -911,8 +972,11 @@ impl From<CliCommand> for Command {
                 DeleteArgs::Deployment { deployment, stop } => Command::Delete { deployment, stop },
             },
             CliCommand::Validate { resource } => match resource {
-                ValidateArgs::Config { file, host } => Command::Validate { file, host },
+                ValidateArgs::Config { file, host, sets } => Command::Validate { file, host, sets },
             },
+            CliCommand::Config {
+                action: ConfigArgs::Show { role, sets },
+            } => Command::ConfigShow { role, sets },
             CliCommand::Drain { resource } => match resource {
                 DrainArgs::Host { host, wait } => Command::Drain {
                     host: Some(host),
@@ -997,6 +1061,12 @@ pub struct Invocation {
     /// Owner rule 2026-09-25: `--state-dir`, the state root (wins over
     /// `MLLM_STATE_DIR`).
     pub state_dir: Option<PathBuf>,
+    /// Owner decision 2026-09-25: the `--set path=value` overrides of a role
+    /// start, `validate config` or `config show`.
+    pub sets: Vec<String>,
+    /// Owner decision 2026-09-25: `--management-listen` on `start
+    /// standalone`.
+    pub management_listen: Option<SocketAddr>,
 }
 
 pub fn parse_invocation<I, T>(args: I) -> Result<Invocation, CliError>
@@ -1083,6 +1153,31 @@ where
         } => (settings.models(), settings.engines(None)),
         _ => Default::default(),
     };
+    // Owner decision 2026-09-25: `--set` on the role starts, `validate
+    // config` and `config show`.
+    let sets = match &cli.command {
+        CliCommand::Start {
+            target:
+                StartTarget::Server { overrides, .. }
+                | StartTarget::Host { overrides, .. }
+                | StartTarget::Standalone { overrides, .. },
+        } => overrides.sets.clone(),
+        CliCommand::Validate {
+            resource: ValidateArgs::Config { sets, .. },
+        }
+        | CliCommand::Config {
+            action: ConfigArgs::Show { sets, .. },
+        } => sets.clone(),
+        _ => Vec::new(),
+    };
+    let management_listen = match &cli.command {
+        CliCommand::Start {
+            target: StartTarget::Standalone {
+                management_listen, ..
+            },
+        } => *management_listen,
+        _ => None,
+    };
     let evict = matches!(
         &cli.command,
         CliCommand::Start {
@@ -1155,6 +1250,8 @@ where
         model_overrides,
         engine_overrides,
         state_dir: cli.state_dir.map(|dir| crate::engine::absolute(&dir)),
+        sets,
+        management_listen,
     })
 }
 
@@ -1229,6 +1326,33 @@ fn parse_listen(text: &str) -> Result<SocketAddr, String> {
         "must be an address and port such as 0.0.0.0:8443, 127.0.0.1:8443 or [::]:8443 \
          (non-zero port, not multicast)"
             .to_owned()
+    })
+}
+
+/// Owner decision 2026-09-25: `--set path=value`; the path is resolved
+/// against the role's schema when the role document's kind is known.
+fn parse_set(text: &str) -> Result<String, String> {
+    match text.split_once('=') {
+        Some((path, value)) if !path.is_empty() && !value.is_empty() => Ok(text.to_owned()),
+        _ => Err("must be path.to.key=value, e.g. shutdown.drain_timeout=45s".to_owned()),
+    }
+}
+
+/// `--role server|host|standalone` on `config show`.
+fn parse_role(text: &str) -> Result<Role, String> {
+    match text {
+        "server" => Ok(Role::Server),
+        "host" => Ok(Role::Host),
+        "standalone" => Ok(Role::Standalone),
+        _ => Err("must be server, host or standalone".to_owned()),
+    }
+}
+
+/// Owner decision 2026-09-25: `--management-listen`, a loopback address with
+/// a non-zero port (SPEC §16.5: management never leaves loopback).
+fn parse_management_listen(text: &str) -> Result<SocketAddr, String> {
+    mllm_config::standalone::management_address(text).ok_or_else(|| {
+        "must be a loopback address and port such as 127.0.0.1:7443 (non-zero port)".to_owned()
     })
 }
 

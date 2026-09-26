@@ -235,13 +235,13 @@ fn request_identity_is_canonicalized() {
 fn validate_config_file() {
     let c = parse(["mllm", "validate", "config", "--file", "host.yaml"]).unwrap();
     assert!(
-        matches!(c, Command::Validate{file, host: None} if file == std::path::Path::new("host.yaml"))
+        matches!(c, Command::Validate{file, host: None, ..} if file == std::path::Path::new("host.yaml"))
     );
     let c = parse([
         "mllm", "validate", "config", "--file", "d.yaml", "--host", "h.yaml",
     ])
     .unwrap();
-    assert!(matches!(c, Command::Validate{file, host: Some(host)}
+    assert!(matches!(c, Command::Validate{file, host: Some(host), ..}
         if file == std::path::Path::new("d.yaml") && host == std::path::Path::new("h.yaml")));
 }
 
@@ -751,4 +751,80 @@ fn engine_flags_are_parsed_on_start_standalone_and_host() {
         ]),
         Ok(Command::Deploy { hf_endpoint: Some(endpoint), .. }) if endpoint == "http://127.0.0.1:9"
     ));
+}
+
+// T03 (owner decision 2026-09-25): `--set path=value` (repeatable) on every
+// role start, `validate config` and `config show`; `--management-listen` on
+// `start standalone` (loopback only).
+#[test]
+fn generic_overrides_and_config_show_parse() {
+    for role in ["server", "host", "standalone"] {
+        let i = parse_invocation([
+            "mllm",
+            "start",
+            role,
+            "--set",
+            "shutdown.drain_timeout=45s",
+            "--set",
+            "a.b=c=d",
+        ])
+        .unwrap();
+        assert_eq!(
+            i.sets,
+            vec!["shutdown.drain_timeout=45s", "a.b=c=d"],
+            "{role}"
+        );
+        for bad in ["novalue", "=x", "a.b="] {
+            assert!(
+                parse_invocation(["mllm", "start", role, "--set", bad]).is_err(),
+                "{role} {bad}"
+            );
+        }
+    }
+    let i = parse_invocation([
+        "mllm", "validate", "config", "--file", "s.yaml", "--set", "name=x",
+    ])
+    .unwrap();
+    assert!(matches!(&i.command, Command::Validate { sets, .. } if sets == &["name=x"]));
+    assert_eq!(i.sets, vec!["name=x"]);
+    let i = parse_invocation([
+        "mllm",
+        "config",
+        "show",
+        "--role",
+        "host",
+        "--set",
+        "load_report_interval=2s",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        &i.command,
+        Command::ConfigShow { role: Some(Role::Host), sets } if sets == &["load_report_interval=2s"]
+    ));
+    assert!(parse_invocation(["mllm", "config", "show", "--role", "engine"]).is_err());
+    assert!(parse_invocation(["mllm", "list", "hosts", "--set", "a=b"]).is_err());
+    let i = parse_invocation([
+        "mllm",
+        "start",
+        "standalone",
+        "--management-listen",
+        "127.0.0.1:7543",
+    ])
+    .unwrap();
+    assert_eq!(i.management_listen, Some("127.0.0.1:7543".parse().unwrap()));
+    for bad in ["0.0.0.0:7543", "127.0.0.1:0", "localhost"] {
+        assert!(
+            parse_invocation(["mllm", "start", "standalone", "--management-listen", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(parse_invocation([
+        "mllm",
+        "start",
+        "server",
+        "--management-listen",
+        "127.0.0.1:1"
+    ])
+    .is_err());
 }

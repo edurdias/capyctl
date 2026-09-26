@@ -234,7 +234,7 @@ impl Installation {
             .env("MLLM_DEEP_PARK", "off")
             .env("MLLM_INFERENCE_ADDR", &self.inference)
             .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
-            .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
+            .env("MLLM_MANAGEMENT_ADDR", &self.management)
             .env("MLLM_ENGINE_PORTS", &self.engines);
         command
     }
@@ -865,16 +865,21 @@ fn a_non_loopback_standalone_listener_is_refused() {
     let installation = Installation::new();
     // A port free now: a regressed refusal would otherwise bind a fixed
     // public port, and serve until the bound below fails the test.
-    let out = output_within(
-        installation.command().args(["start", "standalone"]).env(
-            "MLLM_STANDALONE_MANAGEMENT_ADDR",
-            format!("0.0.0.0:{}", free_port()),
-        ),
-        REFUSAL_BOUND,
-    );
-    assert!(!out.status.success());
-    let said = String::from_utf8_lossy(&out.stderr);
-    assert!(said.contains("MLLM_STANDALONE_MANAGEMENT_ADDR"), "{said}");
+    // Owner decision 2026-09-25: MLLM_MANAGEMENT_ADDR, and the deprecated
+    // MLLM_STANDALONE_MANAGEMENT_ADDR when it is the one set.
+    for variable in ["MLLM_MANAGEMENT_ADDR", "MLLM_STANDALONE_MANAGEMENT_ADDR"] {
+        let out = output_within(
+            installation
+                .command()
+                .args(["start", "standalone"])
+                .env_remove("MLLM_MANAGEMENT_ADDR")
+                .env(variable, format!("0.0.0.0:{}", free_port())),
+            REFUSAL_BOUND,
+        );
+        assert!(!out.status.success());
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains(variable), "{said}");
+    }
     for variable in ["MLLM_INFERENCE_ADDR", "MLLM_STANDALONE_INFERENCE_ADDR"] {
         let out = output_within(
             installation
@@ -1792,4 +1797,35 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
         store.pending_dispatches(&deployment_id).unwrap().is_empty(),
         "request leases left behind"
     );
+}
+
+/// T03 (owner decision 2026-09-25): a standalone start honours the generic
+/// overrides of a document-only setting, `--set` over `MLLM_SET__…` over the
+/// document: the drain bound it reports at shutdown is the overridden one.
+/// Fake engine only; not qualification (SPEC §18).
+#[test]
+fn a_standalone_start_takes_its_drain_bound_from_set_then_env_then_document() {
+    let installation = Installation::new();
+    let standalone = |line: &str| line.starts_with("standalone ready");
+    let bound_after = |command: &mut Command| {
+        let role = Role::spawn(command);
+        role.expect_line(standalone, Duration::from_secs(60));
+        role.signal();
+        let (status, report) = role.exit(Duration::from_secs(30));
+        assert!(status.success(), "{status:?}");
+        report["drain_bound_secs"].clone()
+    };
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    assert_eq!(bound_after(&mut command), json!(30));
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env("MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT", "6s");
+    assert_eq!(bound_after(&mut command), json!(6));
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone", "--set", "shutdown.drain_timeout=7s"])
+        .env("MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT", "6s");
+    assert_eq!(bound_after(&mut command), json!(7));
 }

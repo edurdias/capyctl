@@ -14,6 +14,10 @@
 //!   when `--host` names a host document, the effective resolution the host
 //!   agent performs before launch.
 //!
+//! Owner decision 2026-09-25: `--set path=value` (and `MLLM_SET__…` in the
+//! environment) change a role document's settings before these checks, as the
+//! role start applies them, and the result lists the overrides applied.
+//!
 //! Nothing is written, created, or contacted: the command reads the named files
 //! and reports.
 
@@ -28,10 +32,38 @@ use crate::output::StructuredError;
 const MAX_BYTES: u64 = 1024 * 1024;
 
 pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, StructuredError> {
+    validate_config_with(file, host, &[])
+}
+
+/// As [`validate_config`], with `--set` overrides (`sets`) and the
+/// environment's `MLLM_SET__…` applied to a role document first.
+pub fn validate_config_with(
+    file: &Path,
+    host: Option<&Path>,
+    sets: &[String],
+) -> Result<Value, StructuredError> {
     // Owner decision 2026-09-25: a `~/` model path means this user's home, as
     // `deploy model --file` reads it.
     let text = crate::deployment_file::with_home_expanded(&read(file)?);
     let kind = detect_kind(&text).map_err(|e| named(file, None, &e))?;
+    let overrides = mllm_config::setting_overrides::SettingOverrides::from_process(kind, sets)
+        .map_err(|e| named(file, Some(kind), &e))?;
+    // Owner decision 2026-09-25: the role document with the overrides
+    // applied, validated exactly as the start validates it.
+    let overridden = |text: &str| -> Result<String, StructuredError> {
+        if overrides.is_empty() {
+            return Ok(text.to_owned());
+        }
+        mllm_config::parse_document(text)
+            .and_then(|document| overrides.apply_and_validate(document))
+            .map(|document| document.to_string())
+            .map_err(|e| named(file, Some(kind), &e))
+    };
+    let applied: Vec<Value> = overrides
+        .effective()
+        .into_iter()
+        .map(|item| json!({"path": item.path, "value": item.value, "source": item.source.as_str()}))
+        .collect();
     if host.is_some() && kind != ConfigKind::Deployment {
         return Err(invalid(format!(
             "{}: --host applies only to a deployment document, not a {} document",
@@ -41,16 +73,18 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
     }
     let resolved_against = match kind {
         ConfigKind::Server => {
-            mllm_config::remote_roles::ServerConfig::parse(&text)
-                .map_err(|e| named(file, Some(kind), &e))?;
+            mllm_config::remote_roles::ServerConfig::parse(&overridden(&text)?)
+                .map_err(|e| named(file, Some(kind), &overrides.annotate(e)))?;
             Value::Null
         }
         ConfigKind::Host => {
-            host_policy_document(file).map_err(|e| named(file, Some(kind), &e))?;
+            host_policy_document(file, &overrides)
+                .map_err(|e| named(file, Some(kind), &overrides.annotate(e)))?;
             Value::Null
         }
         ConfigKind::Standalone => {
-            let document = parse_strict(kind, &text).map_err(|e| named(file, Some(kind), &e))?;
+            let document =
+                parse_strict(kind, &overridden(&text)?).map_err(|e| named(file, Some(kind), &e))?;
             mllm_config::remote_roles::drain_timeout(&document)
                 .map_err(|e| named(file, Some(kind), &e))?;
             Value::Null
@@ -94,8 +128,11 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                 }
                 Some(host_file) => {
                     read(host_file)?;
-                    let (name, host_document) = host_policy_document(host_file)
-                        .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
+                    let (name, host_document) = host_policy_document(
+                        host_file,
+                        &mllm_config::setting_overrides::SettingOverrides::none(ConfigKind::Host),
+                    )
+                    .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
                     // ADR 0013 §2, §3, ADR 0018 §7: the checks the server's
                     // deploy runs against this host's publication, in its
                     // order (`registry_targets`), so a file validate accepts
@@ -210,12 +247,15 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             }
         }
     };
-    let out = json!({
+    let mut out = json!({
         "valid": true,
         "kind": kind.as_str(),
         "file": file.display().to_string(),
         "resolved_against": resolved_against,
     });
+    if !applied.is_empty() {
+        out["overrides"] = Value::Array(applied);
+    }
     Ok(out)
 }
 
@@ -281,26 +321,30 @@ fn resolve_for_acceptance(
 /// merged with the `engines.yaml` beside it (ADR 0018 §2, as the host role
 /// loads it), the role-local settings removed and the resource policy
 /// normalized.
-fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
+fn host_policy_document(
+    path: &Path,
+    overrides: &mllm_config::setting_overrides::SettingOverrides,
+) -> Result<(String, Value), ConfigError> {
     let engines = mllm_config::registration::engines_beside(path);
     // Owner decision 2026-09-25: the models directory and the model-source
     // policy as the host role resolves them (without its run's flags).
-    let config = mllm_config::remote_roles::HostConfig::load_with_engines(path, &engines)?
-        .with_models(
-            &Default::default(),
-            &mllm_config::model_settings::ModelOverrides::from_process_env()?,
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .as_deref(),
-        )?
-        // Owner rule 2026-09-25: the engine settings too (`local_engine` and
-        // its variables). Validation never runs an engine, so an unstated
-        // fingerprint is a placeholder here; the role reads the real one.
-        .with_engines(
-            &Default::default(),
-            &mllm_config::engine_settings::EngineOverrides::from_process_env()?,
-            &|_| Ok("unknown (validate does not run the engine)".into()),
-        )?;
+    let config =
+        mllm_config::remote_roles::HostConfig::load_with_overrides(path, &engines, overrides)?
+            .with_models(
+                &Default::default(),
+                &mllm_config::model_settings::ModelOverrides::from_process_env()?,
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+            )?
+            // Owner rule 2026-09-25: the engine settings too (`local_engine` and
+            // its variables). Validation never runs an engine, so an unstated
+            // fingerprint is a placeholder here; the role reads the real one.
+            .with_engines(
+                &Default::default(),
+                &mllm_config::engine_settings::EngineOverrides::from_process_env()?,
+                &|_| Ok("unknown (validate does not run the engine)".into()),
+            )?;
     let local = mllm_config::remote_resources::local_host_document(&config.document)?;
     mllm_config::effective::normalize_host_policy(&local)?;
     Ok((config.name, local))
