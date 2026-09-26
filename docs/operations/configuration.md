@@ -43,11 +43,11 @@ is where mllm looks for the implicit role document, so its YAML form is read
 only from a standalone document named with `--config` or `MLLM_CONFIG` (a
 relative path resolves against the document's directory). A server or host
 document's `state_dir` is where that role keeps its state; `init server` and
-`init host` write it from the state root, so for the implicit document
-`--state-dir` and `MLLM_STATE_DIR` name it. A document named with `--config`
-whose `state_dir` disagrees with a `--state-dir` or `MLLM_STATE_DIR` the same
-start also names is refused, so a run never moves a role's identity and state
-silently. `join host` takes `--set` like `start host`. A standalone document may state
+`init host` write it from the state root. As for standalone, `--state-dir`
+wins over `MLLM_STATE_DIR`, which wins over the document's `state_dir`; when
+one of them overrides the document, the role uses it (its identity under
+`<state dir>/identity`) and prints one notice naming what it overrode.
+`join host` follows the same rule and takes `--set` like `start host`. A standalone document may state
 `server.state_dir` and `host.state_dir` only as `<state root>/server` and
 `<state root>/host`. Client commands (`mllm status`, `mllm deploy`, ...) find a
 standalone role's credentials under the state root, so they need the same

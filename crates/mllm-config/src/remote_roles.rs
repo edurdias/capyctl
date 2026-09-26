@@ -411,6 +411,14 @@ impl ServerConfig {
     /// address follows the document's rule
     /// ([`crate::standalone::inference_address`]) and must not collide with
     /// another listener.
+    /// Final review I8-bis: the state directory this run uses when
+    /// `--state-dir` or `MLLM_STATE_DIR` overrides the document's, with the
+    /// identity directory it implies (`<state_dir>/identity`).
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.identity_dir = state_dir.join("identity");
+        self.state_dir = state_dir;
+        self
+    }
     /// Final review I8: the management listener this run serves on
     /// (`--management-listen` or `MLLM_MANAGEMENT_ADDR`), a loopback address
     /// with a non-zero port that no other server listener shares.
@@ -444,6 +452,20 @@ impl ServerConfig {
     }
 }
 impl HostConfig {
+    /// Final review I8-bis: as [`ServerConfig::with_state_dir`]. A runtime
+    /// directory the document does not name follows the state directory, and
+    /// the held document states the directories this run uses.
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.identity_dir = state_dir.join("identity");
+        if !self.runtime_dir_declared {
+            self.runtime_dir = state_dir.join("runtime");
+        }
+        self.document["state_dir"] = Value::String(state_dir.to_string_lossy().into_owned());
+        self.document["identity_dir"] =
+            Value::String(self.identity_dir.to_string_lossy().into_owned());
+        self.state_dir = state_dir;
+        self
+    }
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
         let document = parse_strict(ConfigKind::Host, source)?;
         let state_dir = path(&document, "state_dir")?;

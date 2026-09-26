@@ -192,36 +192,31 @@ fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
     crate::engine::role_engines(named, &role_env)
         .unwrap_or_else(|| mllm_config::registration::engines_beside(document))
 }
-/// Final review I8 (every setting three ways): a server's or host's state
-/// directory is its document's `state_dir`, located by the state root
-/// (`--state-dir`, else `MLLM_STATE_DIR`) when the document is the implicit
-/// one. A named document whose `state_dir` disagrees with a state root the
-/// invocation also names is refused, so a run never moves a role's identity
-/// and state silently.
-fn check_state_root(
-    invocation: &Invocation,
-    named_document: bool,
-    state_dir: &Path,
-) -> Result<(), StructuredError> {
-    let named_root = invocation.state_dir.clone().or_else(|| {
-        std::env::var_os("MLLM_STATE_DIR")
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from)
-    });
-    match named_root {
-        Some(root)
-            if named_document
-                && crate::engine::absolute(&root) != crate::engine::absolute(state_dir) =>
-        {
-            Err(error(&format!(
-                "the role document's state_dir {} disagrees with the state root {} named by \
-                 --state-dir or MLLM_STATE_DIR; name one of them, or make them the same",
-                state_dir.display(),
-                root.display()
-            )))
-        }
-        _ => Ok(()),
+/// Final review I8-bis (every setting three ways, standalone's precedence): a
+/// server's or host's state directory is `--state-dir`, else
+/// `MLLM_STATE_DIR`, else the document's `state_dir`. When a named form
+/// overrides the document, the winner is used and one notice names the
+/// overridden value. `None` when the document's own directory stands.
+fn state_dir_override(invocation: &Invocation, document_state_dir: &Path) -> Option<PathBuf> {
+    let (winner, source) = match invocation.state_dir.clone() {
+        Some(dir) => (dir, "--state-dir"),
+        None => (
+            std::env::var_os("MLLM_STATE_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)?,
+            "MLLM_STATE_DIR",
+        ),
+    };
+    let winner = crate::engine::absolute(&winner);
+    if winner == crate::engine::absolute(document_state_dir) {
+        return None;
     }
+    eprintln!(
+        "notice: state directory {} from {source} overrides the document's state_dir {}",
+        winner.display(),
+        document_state_dir.display()
+    );
+    Some(winner)
 }
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
@@ -1187,6 +1182,12 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     ServerConfig::parse(&document.to_string()).map_err(invalid)
                 };
                 let mut config = parse(&source)?;
+                // Final review I8-bis: `--state-dir` > MLLM_STATE_DIR > the
+                // document, before anything reads the state directory.
+                let state_dir = state_dir_override(invocation, &config.state_dir);
+                if let Some(dir) = &state_dir {
+                    config = config.with_state_dir(dir.clone());
+                }
                 // ADR 0019, design §9: the old loopback default moves to
                 // 0.0.0.0:8443 once, after the document has been accepted.
                 // The migration reads the file's own bind, not an override.
@@ -1204,6 +1205,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 ) {
                     Migration::Rewritten { .. } => {
                         config = parse(&read_config(&path)?)?;
+                        if let Some(dir) = &state_dir {
+                            config = config.with_state_dir(dir.clone());
+                        }
                         config.inference
                     }
                     Migration::BindOnly { .. }
@@ -1243,7 +1247,6 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                         ))
                     })?;
                 }
-                check_state_root(invocation, named.is_some(), &config.state_dir)?;
                 serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,
@@ -1258,14 +1261,18 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 }) {
                     eprintln!("{warning}");
                 }
-                let host = load_host(
+                let mut host = load_host(
                     &path,
                     &engines,
                     &invocation.model_overrides,
                     &invocation.engine_overrides,
                     &overrides,
                 )?;
-                check_state_root(invocation, named.is_some(), &host.state_dir)?;
+                // Final review I8-bis: `--state-dir` > MLLM_STATE_DIR > the
+                // document.
+                if let Some(dir) = state_dir_override(invocation, &host.state_dir) {
+                    host = host.with_state_dir(dir);
+                }
                 serve_host(host, path.clone(), engines).await
             }
         }
@@ -1289,13 +1296,17 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     crate::settings::describe(&e)
                 ))
             })?;
-            let config = load_host(
+            let mut config = load_host(
                 &path,
                 &engines,
                 &Default::default(),
                 &Default::default(),
                 &overrides,
             )?;
+            // Final review I8-bis: the identity `start host` will use.
+            if let Some(dir) = state_dir_override(invocation, &config.state_dir) {
+                config = config.with_state_dir(dir);
+            }
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery

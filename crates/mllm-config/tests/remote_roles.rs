@@ -588,3 +588,27 @@ fn a_host_states_its_engine_settings_three_ways() {
         .with_engines(&none, &none, &|_| Ok("fp".into()))
         .is_err());
 }
+
+// T03 (final review I8-bis): a state directory named by `--state-dir` or
+// `MLLM_STATE_DIR` replaces the document's for the run, with the identity
+// directory and the managed runtime directory it implies.
+#[test]
+fn a_named_state_directory_moves_identity_and_runtime_with_it() {
+    let root = std::path::Path::new("/srv/mllm/host");
+    let host = mllm_config::remote_roles::HostConfig::parse(
+        &mllm_config::remote_roles::HostConfig::template(root),
+    )
+    .unwrap();
+    let other = std::path::PathBuf::from("/srv/mllm/other");
+    let moved = host.with_state_dir(other.clone());
+    assert_eq!(moved.state_dir, other);
+    assert_eq!(moved.identity_dir, other.join("identity"));
+    assert_eq!(moved.runtime_dir, other.join("runtime"));
+    assert_eq!(moved.document["state_dir"], "/srv/mllm/other");
+    let server = mllm_config::remote_roles::ServerConfig::parse(
+        &mllm_config::remote_roles::ServerConfig::template(root),
+    )
+    .unwrap()
+    .with_state_dir(other.clone());
+    assert_eq!(server.identity_dir, other.join("identity"));
+}

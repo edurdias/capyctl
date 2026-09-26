@@ -1923,15 +1923,51 @@ fn the_server_management_address_and_state_root_follow_the_shared_rule() {
     let banner_value: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(banner_value["management"], environment.as_str(), "{line}");
 
-    // A state root that disagrees with the named document is refused.
-    let elsewhere = state.parent().unwrap().join("elsewhere");
-    let refused = server_command(&elsewhere)
-        .args(["start", "server", "--config", config.to_str().unwrap()])
-        .output()
+    // Final review I8-bis: `--state-dir` > MLLM_STATE_DIR > the document's
+    // state_dir, as for standalone. The winner is used and one notice names
+    // what it overrides; nothing is refused.
+    let other = state.parent().unwrap().join("other");
+    let copied = std::process::Command::new("cp")
+        .args(["-a", state.to_str().unwrap(), other.to_str().unwrap()])
+        .status()
         .unwrap();
-    assert!(!refused.status.success());
-    let said = String::from_utf8_lossy(&refused.stderr);
-    assert!(said.contains("disagrees with the state root"), "{said}");
+    assert!(copied.success());
+    let _ = std::fs::remove_file(other.join("run/management-address"));
+    let started = |command: &mut std::process::Command| {
+        let (line, said) = run_until_ready(command, banner);
+        let banner: Value = serde_json::from_str(&line).unwrap();
+        (banner["state_dir"].as_str().unwrap().to_owned(), said)
+    };
+    // The variable over the document.
+    let mut command = server_command(&other);
+    command.args(["start", "server", "--config", config.to_str().unwrap()]);
+    let (used, said) = started(&mut command);
+    assert_eq!(std::path::Path::new(&used), other.as_path());
+    assert_eq!(
+        said.matches("overrides the document's state_dir").count(),
+        1,
+        "{said}"
+    );
+    assert!(said.contains("from MLLM_STATE_DIR"), "{said}");
+    // The flag over the variable.
+    let mut command = server_command(&state);
+    command.args([
+        "start",
+        "server",
+        "--config",
+        config.to_str().unwrap(),
+        "--state-dir",
+        other.to_str().unwrap(),
+    ]);
+    let (used, said) = started(&mut command);
+    assert_eq!(std::path::Path::new(&used), other.as_path());
+    assert!(said.contains("from --state-dir"), "{said}");
+    // The same directory as the document: no notice.
+    let mut command = server_command(&state);
+    command.args(["start", "server", "--config", config.to_str().unwrap()]);
+    let (used, said) = started(&mut command);
+    assert_eq!(std::path::Path::new(&used), state.as_path());
+    assert!(!said.contains("overrides the document"), "{said}");
 }
 
 /// T03 (final review I8): a standalone role started with
