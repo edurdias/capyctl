@@ -284,7 +284,66 @@ pub fn for_host(deployment: &Value, host: &Value) -> Result<Value, ConfigError> 
             object.insert("devices".into(), json!([claim]));
         }
     }
+    fill_device_sharing(&mut result, host);
     Ok(result)
+}
+
+/// ADR 0019 (final review I9): the short pin form `devices: [{id: gpu1}]`
+/// takes the sharing `host` states for that device, in the deployment's
+/// claims and in any `resources` phase that names it. A stated sharing is
+/// kept. Applied wherever a document meets its host, before anything reads
+/// its claims.
+pub fn fill_device_sharing(deployment: &mut Value, host: &Value) {
+    let Some(object) = deployment.as_object_mut() else {
+        return;
+    };
+    let sharing_of = |id: &str| device_sharing(host, id);
+    if let Some(claims) = object.get_mut("devices").and_then(Value::as_array_mut) {
+        fill_sharing(claims, &sharing_of);
+    }
+    if let Some(phases) = object.get_mut("resources").and_then(Value::as_object_mut) {
+        for phase in phases.values_mut() {
+            if let Some(claims) = phase.get_mut("devices").and_then(Value::as_array_mut) {
+                fill_sharing(claims, &sharing_of);
+            }
+        }
+    }
+}
+
+/// The sharing the host states for device `id` (its own, else the policy's
+/// `device_sharing`, else exclusive), or `None` for a device it does not have.
+fn device_sharing(host: &Value, id: &str) -> Option<String> {
+    let policy = &host["resource_policy"];
+    let device = policy["devices"].get(id)?;
+    Some(
+        device["sharing"]
+            .as_str()
+            .or_else(|| policy["device_sharing"].as_str())
+            .unwrap_or("exclusive")
+            .to_owned(),
+    )
+}
+
+/// Give every named claim without `sharing` the host's sharing for it. A
+/// claim naming a device the host does not have is left for resolution to
+/// refuse by name.
+fn fill_sharing(claims: &mut [Value], sharing_of: &dyn Fn(&str) -> Option<String>) {
+    for claim in claims {
+        let Some(object) = claim.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("sharing") {
+            continue;
+        }
+        let Some(sharing) = object
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(sharing_of)
+        else {
+            continue;
+        };
+        object.insert("sharing".into(), json!(sharing));
+    }
 }
 
 /// The device an undeclared deployment takes: the lowest driver index

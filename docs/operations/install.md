@@ -551,8 +551,11 @@ fewest need to go. A stopped instance returns to its last GPU when it fits
 there. To pin a GPU, name it in the deployment:
 
 ```yaml
-devices: [{id: gpu1, sharing: shared}]
+devices: [{id: gpu1}]
 ```
+
+The claim takes the sharing the host states for that GPU; add
+`sharing: exclusive` (or `shared`) to state it yourself.
 
 `gpuN` is the driver's index at start (`nvidia-smi -L`). The engine is started
 with only that GPU visible: `CUDA_VISIBLE_DEVICES` set to the GPU's UUID, or to

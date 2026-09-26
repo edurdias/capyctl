@@ -1840,3 +1840,26 @@ fn two_device_claims_are_refused_before_derivation() {
     let e = resolve(&two, &two_gpu_host()).unwrap_err();
     assert!(e.detail.starts_with("multi_gpu_unsupported:"), "{e}");
 }
+
+// T26 (final review I9, ADR 0019 pin form): `devices: [{id: gpu0}]` pins the
+// GPU and takes the sharing the host states for it; before, the claim failed
+// to parse without `sharing`.
+#[test]
+fn the_short_pin_form_takes_the_hosts_sharing() {
+    let mut d = deployment_with("deep", "vllm", "10GiB");
+    d["devices"] = serde_json::json!([{"id": "gpu0"}]);
+    let r = resolve(&d, &discrete_host()).expect("the short pin form resolves");
+    assert_eq!(r.selected_devices.len(), 1);
+    assert_eq!(r.selected_devices[0].id, "gpu0");
+    assert_eq!(
+        r.selected_devices[0].sharing,
+        mllm_config::effective::Sharing::Shared
+    );
+    // A stated sharing is kept.
+    d["devices"] = serde_json::json!([{"id": "gpu0", "sharing": "exclusive"}]);
+    let r = resolve(&d, &discrete_host()).unwrap();
+    assert_eq!(
+        r.selected_devices[0].sharing,
+        mllm_config::effective::Sharing::Exclusive
+    );
+}

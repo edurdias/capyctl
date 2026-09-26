@@ -346,7 +346,12 @@ impl crate::Store {
         let mut single_error = None;
         for host in &ordered {
             let attempt = (|| {
-                let command = scoped_source(host, &config)?;
+                let mut command = scoped_source(host, &config)?;
+                // ADR 0019: `devices: [{id: gpu1}]` takes this host's sharing.
+                mllm_config::deployment_defaults::fill_device_sharing(
+                    &mut command,
+                    &host.trusted_host,
+                );
                 // ADR 0019 (discrete GPU design §7): a deployment that pins
                 // no device is resolved once per GPU of a discrete host, and
                 // placement picks the GPU. The host's own resolution is the

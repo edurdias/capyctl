@@ -793,7 +793,10 @@ fn options(t: &Gpus, id: &str) -> (Vec<String>, Option<String>) {
 fn a_gpu_too_small_for_the_model_is_excluded_not_the_host() {
     let t = gpus("10GiB");
     let id = t.deploy(json!({"instances": 1}));
-    assert_eq!(options(&t, &id), (vec!["gpu1".to_string()], Some("gpu1".into())));
+    assert_eq!(
+        options(&t, &id),
+        (vec!["gpu1".to_string()], Some("gpu1".into()))
+    );
     t.start(&id, "start", StartScope::All);
     let planned = t.planned(&id);
     assert_eq!(planned.len(), 1);
@@ -810,7 +813,11 @@ fn a_measured_checkpoint_drops_only_the_gpus_it_does_not_fit() {
     let id = t.deploy(json!({"instances": 1, "engine_config": {"memory": {"kv_cache": "4GiB"}}}));
     let revision = t.store.current_revision(&id).unwrap().unwrap();
     assert!(
-        t.store.checkpoint_digest(&id, revision).unwrap().unwrap().provisional,
+        t.store
+            .checkpoint_digest(&id, revision)
+            .unwrap()
+            .unwrap()
+            .provisional,
         "sized once measured"
     );
     let (devices, _) = options(&t, &id);
@@ -834,5 +841,29 @@ fn a_measured_checkpoint_drops_only_the_gpus_it_does_not_fit() {
         ),
         "{outcome:?}"
     );
-    assert_eq!(options(&t, &id), (vec!["gpu1".to_string()], Some("gpu1".into())));
+    assert_eq!(
+        options(&t, &id),
+        (vec!["gpu1".to_string()], Some("gpu1".into()))
+    );
+}
+
+// T27 (final review I9): the short pin form `devices: [{id: gpu1}]` is
+// accepted (the sharing is the host's for that GPU) and places on gpu1.
+#[test]
+fn the_short_pin_form_is_accepted_and_placed_on_its_gpu() {
+    let t = two_gpus();
+    let id = t.deploy(json!({"instances": 1, "devices": [{"id": "gpu1"}]}));
+    t.start(&id, "start", StartScope::All);
+    let planned = t.planned(&id);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].2, "gpu1");
+    let sharing: String = t
+        .sql
+        .query_row(
+            "SELECT json_extract(effective_json,'$.selected_devices[0].sharing') FROM effective_revisions WHERE deployment_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sharing, "shared");
 }

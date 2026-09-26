@@ -51,7 +51,7 @@ cards, as well as on unified-memory machines like the GB10.
   checkpoints cannot park yet; deploy them `restart_only`.
 - **mllm picks the GPU.** On a machine with several GPUs, each model goes on the
   GPU with room, evicting only on that GPU when needed. Pin one with
-  `devices: [{id: gpu1, sharing: shared}]`. One GPU per model in 0.1.0: a
+  `devices: [{id: gpu1}]` (the GPU's sharing is the host's unless stated). One GPU per model in 0.1.0: a
   deployment naming two GPUs, or tensor parallelism, is refused
   (`multi_gpu_unsupported`).
 - **Sizing from the checkpoint.** A deployment that states no memory asks the card

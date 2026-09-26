@@ -202,6 +202,31 @@ async fn a_minimal_file_deploys_on_standalone() {
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
+    // T26 (final review I9): the short pin form in a file deploys, with the
+    // host's sharing for the pinned GPU.
+    let pinned = dir.path().join("pinned.yaml");
+    std::fs::write(
+        &pinned,
+        "name: pinned\nengine: vllm\nmodel: ~/models/mini\ndevices: [{id: gpu0}]\n",
+    )
+    .unwrap();
+    json_of(&mllm(
+        dir.path(),
+        home.path(),
+        &["deploy", "model", "--file", pinned.to_str().unwrap()],
+        &management,
+    ));
+    let inspected = json_of(&mllm(
+        dir.path(),
+        home.path(),
+        &["inspect", "deployment", "pinned", "--effective-config"],
+        &management,
+    ));
+    assert_eq!(
+        inspected["effective"]["selected_devices"],
+        json!([{"id": "gpu0", "sharing": "shared"}]),
+        "{inspected}"
+    );
     server.abort();
     let _ = app.shutdown().await;
 }
