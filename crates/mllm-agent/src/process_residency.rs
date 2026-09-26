@@ -102,6 +102,18 @@ impl ResidencySampler {
         }
     }
 
+    /// Take one sample now, on this thread, and keep it as the latest for
+    /// [`Self::current`]. For a caller that asks rarely (an admission attempt
+    /// every few tens of seconds), for which a cached sample is always past
+    /// [`MAX_AGE`] (found live on a 16 GB discrete GPU).
+    pub fn sample_fresh(&self) -> Vec<ProcessResident> {
+        let sample = self.sample_now();
+        if let Ok(mut state) = self.state.lock() {
+            state.last = Some((Instant::now(), sample.clone()));
+        }
+        sample
+    }
+
     /// Take one sample now, on this thread.
     pub fn sample_now(&self) -> Vec<ProcessResident> {
         let Some(gpu) = (self.collect)() else {
@@ -208,14 +220,25 @@ fn start_ticks(pid: u32) -> Option<u64> {
         .and_then(|field| field.parse().ok())
 }
 
-/// `RssAnon` of /proc/<pid>/status, in bytes: resident pages no page-cache
-/// reclaim can return to the host's availability.
+/// `RssAnon` plus `RssShmem` of /proc/<pid>/status, in bytes: resident pages
+/// no page-cache reclaim can return to the host's availability. Pinned host
+/// memory (a `host_backed` weights copy) is shared memory, not anonymous:
+/// found live on a 16 GB discrete GPU, vLLM's parked copy of Qwen3-4B was
+/// 11.2 GB of `RssShmem` beside 1.9 GB of `RssAnon`, and stayed after the wake.
 fn anonymous_resident_bytes(pid: u32) -> Option<i64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let line = status.lines().find(|line| line.starts_with("RssAnon:"))?;
-    let mut words = line["RssAnon:".len()..].split_whitespace();
-    let kib: i64 = words.next()?.parse().ok()?;
-    (words.next() == Some("kB") && kib >= 0).then(|| kib.checked_mul(1024))?
+    parse_resident_host_bytes(&status)
+}
+
+/// The `RssAnon` and `RssShmem` lines of a /proc/<pid>/status text, summed.
+fn parse_resident_host_bytes(status: &str) -> Option<i64> {
+    let field = |name: &str| -> Option<i64> {
+        let line = status.lines().find(|line| line.starts_with(name))?;
+        let mut words = line[name.len()..].split_whitespace();
+        let kib: i64 = words.next()?.parse().ok()?;
+        (words.next() == Some("kB") && kib >= 0).then(|| kib.checked_mul(1024))?
+    };
+    field("RssAnon:")?.checked_add(field("RssShmem:")?)
 }
 
 #[cfg(test)]
@@ -234,6 +257,23 @@ mod tests {
         for bad in ["x, 1", "1, x", "1", "0, 5", "1, -5"] {
             assert!(parse_compute_apps(bad).is_none(), "{bad}");
         }
+    }
+
+    // T26: the host figure is anonymous plus shared resident memory (a
+    // pinned host_backed copy is shared memory); a status without either line
+    // gives none.
+    #[test]
+    fn host_bytes_count_anonymous_and_shared_pages() {
+        let status = "Name:\tVLLM::EngineCore\nRssAnon:\t 1828364 kB\nRssFile:\t  611900 kB\nRssShmem:\t10971276 kB\n";
+        assert_eq!(
+            parse_resident_host_bytes(status),
+            Some((1_828_364 + 10_971_276) * 1024)
+        );
+        assert_eq!(parse_resident_host_bytes("RssAnon:\t 1 kB\n"), None);
+        assert_eq!(
+            parse_resident_host_bytes("RssAnon:\t x kB\nRssShmem:\t 1 kB\n"),
+            None
+        );
     }
 
     // T26: a sample is bound to the process identity: this process's own pid

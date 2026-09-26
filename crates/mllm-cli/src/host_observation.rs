@@ -205,10 +205,17 @@ impl ServiceObservation for HostMemoryObservation {
         let residency = self.residency.clone();
         Box::pin(async move {
             // Availability first, then the processes still alive (ADR 0007).
+            // A sample taken for this observation: admission asks rarely, so
+            // a cached one would be past its age bound (found live on a 16 GB
+            // discrete GPU). The collector is a bounded process, so it runs
+            // off the async thread.
             let observed = observed.await?;
-            let residents = residency
-                .map(|sampler| sampler.current())
-                .unwrap_or_default();
+            let residents = match residency {
+                Some(sampler) => tokio::task::spawn_blocking(move || sampler.sample_fresh())
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
             Ok((observed, residents))
         })
     }
@@ -331,6 +338,28 @@ mod tests {
             },
             swap_used_bytes: 0,
         }
+    }
+
+    // T26 T27 (ADR 0007): found live on the 16 GB discrete-GPU laptop host.
+    // Admission asks for residents once per attempt (tens of seconds apart),
+    // so a cached sample was always older than its 5 s bound and none was
+    // reported: a parked model's pinned copy went uncredited and a start
+    // beside it neither fitted nor reclaimed it. Each observation now carries
+    // a sample taken for it.
+    #[tokio::test]
+    async fn every_observation_carries_a_fresh_resident_sample() {
+        let me = std::process::id();
+        let sampler = mllm_agent::process_residency::ResidencySampler::with_collector(
+            std::sync::Arc::new(move || Some(vec![(me, 1 << 20)])),
+        );
+        let observation =
+            HostMemoryObservation::new(["unified".to_string()]).with_process_residency(sampler);
+        let (_, residents) = observation
+            .observe_with_residents("host".into())
+            .await
+            .expect("this host can read its own memory");
+        assert_eq!(residents.len(), 1, "the first observation already has one");
+        assert_eq!(residents[0].pid, me);
     }
 
     const DISCRETE_ROW: &str =
