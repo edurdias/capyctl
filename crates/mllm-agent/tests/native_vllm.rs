@@ -213,6 +213,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
+/// A loopback port for one stand-in engine, below the kernel's ephemeral
+/// range and never handed out twice by this binary.
+///
+/// Final review M19: the port was taken from `127.0.0.1:0`, the ephemeral
+/// range, and released before the engine bound it; under a parallel run an
+/// outbound connection could take it as its local port first, the stand-in
+/// failed to bind and exited before readiness, and whichever test owned it
+/// failed (1 run in 4 to 10).
+fn engine_port() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    const LOW: u16 = 20_000;
+    let high = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse::<u16>().ok())
+        .filter(|low| *low > LOW + 1_000)
+        .unwrap_or(32_768);
+    let mut taken = TAKEN.lock().unwrap_or_else(|error| error.into_inner());
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    let mut port = LOW + (hasher.finish() % u64::from(high - LOW)) as u16;
+    for _ in 0..u32::from(high - LOW) {
+        if !taken.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            taken.push(port);
+            return port;
+        }
+        port = if port + 1 >= high { LOW } else { port + 1 };
+    }
+    panic!("no free loopback port below the ephemeral range");
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     port: u16,
@@ -239,11 +270,7 @@ impl Fixture {
         let deep_park = switch.unwrap_or(true);
         let root = directory();
         let path = root.path();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = engine_port();
         let bin = path.join("venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let engine = bin.join("vllm");
