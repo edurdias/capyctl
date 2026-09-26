@@ -75,8 +75,8 @@ mllm deploy model --file other-model.yaml
 ```
 
 ```text
-Request identity: 01M3FQEMBJ7WQBDMQ15ZWBD7W6 (reuse --request-id 01M3FQEMBJ7WQBDMQ15ZWBD7W6 to recover this command)
-{"api_version":"1","checkpoint_digest":"pending","deployment_id":"01M3FQEMC25J8DBR0N2DVZYXEV","joined":false,"notice":"the checkpoint digest of other-model is being measured; `mllm start deployment other-model --wait` waits for it and starts the deployment","operation_id":"01M3FQEMC219NVYGCC71TVJ6Y7","revision":"1"}
+Request identity: 01M3G1GYBCV1NDBHBFMMVFVTC8 (reuse --request-id 01M3G1GYBCV1NDBHBFMMVFVTC8 to recover this command)
+{"api_version":"1","checkpoint_digest":"pending","deployment_id":"01M3G1GYBSHR0B1HZ0NSN8SHAV","joined":false,"notice":"the checkpoint digest of other-model is being measured; `mllm start deployment other-model --wait` waits for it and starts the deployment","operation_id":"01M3G1GYBSGCYJSVXBJKW8A797","revision":"1"}
 the checkpoint digest of other-model is being measured; `mllm start deployment other-model --wait` waits for it and starts the deployment
 ```
 
@@ -109,7 +109,18 @@ INSTANCE   HOST      STATE   LIFECYCLE   DEVICES   LAST ERROR
 0          gpu-box   ready   active      gpu0      -
 ```
 
-`STARTUP` is the memory mllm set aside to start the model. While parking is
+`STARTUP` is the memory mllm set aside to start the model. When a start fails,
+`LAST OPERATION` says so and the instance's `LAST ERROR` gives the reason:
+
+```text
+NAME           KIND    DESIRED   STATE    READY   REVISION   STARTUP    INITIALIZE   LAST OPERATION
+broken-model   model   ready     failed   0/1     1          17.2 GiB   130s         initialize failed (launch_failed)
+
+INSTANCE   HOST      STATE    LIFECYCLE   DEVICES   LAST ERROR
+0          gpu-box   failed   active      gpu0      launch_failed: launch failed: engine launch failed: the engine exited before readiness
+```
+
+[Exit codes and errors](errors.md#troubleshooting) says where to look next. While parking is
 on, these commands also print a warning that the engine runs with its sleep
 controls enabled. Those controls listen on loopback only. Add
 `--format json` to any list or status command for the full record.
@@ -122,14 +133,29 @@ mllm start deployment my-model --wait       # starts it again
 mllm delete deployment my-model --stop      # stops it and removes it
 ```
 
-`stop` returns once the stop is accepted. Wait until `mllm list deployments`
-shows `stopped` before you start it again; a start while the engine is still
-going away is refused (`runtime_retained`).
+`stop` returns once the stop is accepted, while the engine is still going
+away. A `start` right after it is refused, exit status 25, and nothing is
+started:
+
+```text
+$ mllm start deployment my-model
+Request identity: 01M3G1N0Y60S71RYDD2GXYHX6A (reuse --request-id 01M3G1N0Y60S71RYDD2GXYHX6A to recover this command)
+error [still_stopping]: my-model is still stopping; nothing was started. Retry in a moment, or run `mllm start deployment my-model --wait`, which waits for the stop to finish and then starts
+```
+
+With `--wait`, `start` waits for the stop to finish, starts the model and
+returns when it answers, printing the deployment's record:
+
+```text
+$ mllm start deployment my-model --wait
+Request identity: 01M3G1N10C2WRXX2C7EA9SKBVX (reuse --request-id 01M3G1N10C2WRXX2C7EA9SKBVX to recover this command)
+Waiting for the stop of my-model to finish (at most 130s)
+```
 
 A request for a stopped deployment is refused; it does not start it:
 
 ```text
-{"code":"deployment_stopped","message":"deployment 01M3FQEMC25J8DBR0N2DVZYXEV was stopped by an operator; inference does not start it; start it with `mllm start deployment 01M3FQEMC25J8DBR0N2DVZYXEV`"}
+{"code":"deployment_stopped","message":"deployment 01M3G1GYBSHR0B1HZ0NSN8SHAV was stopped by an operator; inference does not start it; start it with `mllm start deployment 01M3G1GYBSHR0B1HZ0NSN8SHAV`"}
 ```
 
 Deleting never touches the model files.
@@ -142,8 +168,8 @@ mllm deploy model --file my-model.yaml --revision 1
 ```
 
 ```text
-Request identity: 01M3FQF59H8SDGT4DCDWTTR77B (reuse --request-id 01M3FQF59H8SDGT4DCDWTTR77B to recover this command)
-{"api_version":"1","checkpoint_digest":"pending","deployment_id":"01M3FQEE238THV698Y20FHNEXF","joined":false,"operation_id":"01M3FQF5AHV57TXGMQK5JM7QGV","revision":"2"}
+Request identity: 01M3G1HC5ZC1Z26JGCH1XGXWNE (reuse --request-id 01M3G1HC5ZC1Z26JGCH1XGXWNE to recover this command)
+{"api_version":"1","checkpoint_digest":"pending","deployment_id":"01M3G1GRJFFPV3RMHA70FGS1N2","joined":false,"operation_id":"01M3G1HC72X39XABS4YS1RJXY3","revision":"2"}
 ```
 
 A change restarts the model's engine; changing only the instance count does

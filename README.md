@@ -152,7 +152,7 @@ mllm init host --output host.yaml
 mllm validate config --file host.yaml
 mllm join host --join-file gpu-box.join --config host.yaml
 mllm start host --config host.yaml
-mllm engine add ~/venvs/vllm --config host.yaml   # in another shell
+mllm engine add ~/venvs/vllm   # in another shell
 ```
 
 Back on the server machine, deploy through the server. A command run on a

@@ -41,8 +41,9 @@ That output is from a first run, before mllm was started: the engine is saved
 and used from the first start. If mllm is running, it uses the engine at once
 and prints `"published":"published"`, as below.
 
-On a GPU machine that runs a host, add `--config` with the host's file, as
-the host was started with: `mllm engine add ~/venvs/vllm --config ~/host.yaml`.
+On a GPU machine that runs a host, the same command adds the engine to the
+host: the host records the file it was started with, and the engine commands
+use it.
 
 ## Custom builds
 
@@ -77,8 +78,7 @@ vllm-nightly   engines.yaml   vllm     0.30.0rc1   yes      enabled     publishe
 ```
 
 `PUBLISHED` shows whether the running mllm uses it (`unknown` while mllm is
-not running). On a server, `mllm list engines --config ~/server.yaml` lists
-every host's engines.
+not running). On a server, `mllm list engines` lists every host's engines.
 
 ```bash
 mllm engine remove vllm-nightly
@@ -95,7 +95,9 @@ running.
 ## System services
 
 When mllm runs as a system service, run the engine commands with `sudo` and
-the service's configuration file, so they change the file the service reads:
+the service's configuration file. This is the one place to name it: `sudo`
+runs the command as root, which does not see the service's own records, and
+`--config` makes it change the file the service reads:
 
 ```bash
 sudo mllm engine add /opt/vllm --config /etc/mllm/host.yaml

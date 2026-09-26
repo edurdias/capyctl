@@ -53,8 +53,8 @@ mllm start deployment other-model --evict
 ```
 
 ```text
-Request identity: 01M3FQEMCRX6ZMRVTDBHC21DAM (reuse --request-id 01M3FQEMCRX6ZMRVTDBHC21DAM to recover this command)
-{"api_version":"1","deployment_id":"01M3FQEMC25J8DBR0N2DVZYXEV","joined":false,"operation_id":"01M3FQEPFG6PWPPHA9BB5DJ5EK","revision":"1","switch_id":"01M3FQEMH2RMGGNAHF15KEGY62","victims":["01M3FQEE238THV698Y20FHNEXF/0"]}
+Request identity: 01M3G1GYCCN6XJJ8BG2SBE8EJ7 (reuse --request-id 01M3G1GYCCN6XJJ8BG2SBE8EJ7 to recover this command)
+{"api_version":"1","deployment_id":"01M3G1GYBSHR0B1HZ0NSN8SHAV","joined":false,"operation_id":"01M3G1H0EYSMZWGXKK46RWXBEH","revision":"1","switch_id":"01M3G1GYJ3RZYHBGNPVX44RGHR","victims":["01M3G1GRJFFPV3RMHA70FGS1N2/0"]}
 ```
 
 `victims` names what it parked: instance 0 of `my-model`.

@@ -72,7 +72,7 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
 ```
 
 From another computer, use this machine's address instead of `127.0.0.1`,

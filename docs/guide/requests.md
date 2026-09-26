@@ -42,7 +42,7 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Hello! How can I help you today?","role":"assistant"}}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion"}
 ```
 
 The answer text comes from your model; this one is an example.
@@ -58,23 +58,23 @@ curl -s http://127.0.0.1:8443/v1/chat/completions \
 ```
 
 ```text
-data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":"Hello!"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":"Hello!"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" How"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" How"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" can"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" can"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" I"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" I"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" help"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" help"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" you"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" you"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"content":" today?"},"finish_reason":null,"index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"content":" today?"},"finish_reason":null,"index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1790455529,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":1790466091,"id":"chatcmpl-1","model":"my-model","object":"chat.completion.chunk"}
 
 data: [DONE]
 ```

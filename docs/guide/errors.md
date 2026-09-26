@@ -37,15 +37,18 @@ With `--format json` the error is a JSON object with `code` and `message`.
 | 22 | `agent_unreachable` | mllm on this machine is running but did not answer an engine command. | Retry; if the message says the outcome is unknown, run `mllm engine list` first. |
 | 23 | `not_interactive` | `mllm engine add` without a path needs a terminal to pick one. | Name the installation. |
 | 24 | `profile_not_published` | No allowed host offers the engine profile the deployment names; nothing was stored. | Register the engine on a host with `mllm engine add <path> --name <profile>`, then deploy again. |
+| 25 | `still_stopping` | A `start` came right after a `stop`, before the engine finished going away; nothing was started. | Retry in a moment, or run `mllm start deployment <name> --wait`, which waits for the stop and then starts. |
 
 The systemd units restart mllm when it fails, except on exits a restart cannot
 fix: 2, 3 and 5, and 14 for a host.
 
 ## Troubleshooting
 
-**A model does not start.** `mllm status deployment <name>` shows the reason
-in `LAST OPERATION`, for example `initialize failed (launch_failed)`. The
-instance's `LAST ERROR` column may still show `-`. The engine's own output is
+**A model does not start.** `mllm status deployment <name>` shows it in
+`LAST OPERATION`, for example `initialize failed (launch_failed)`, and the
+instance's `LAST ERROR` column gives the reason, for example
+`launch_failed: launch failed: engine launch failed: the engine exited before readiness`.
+The engine's own output is
 not kept by default, because it may contain secrets. To see it, restart mllm
 with `--debug-engine-logs` and start the model again; each launch then writes
 `~/.local/state/mllm/logs/<deployment id>/<launch id>.log` (under the host's

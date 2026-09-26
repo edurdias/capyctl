@@ -112,7 +112,9 @@ function sanitize(text) {
   // The sandbox serves inference on loopback; a real start serves it on
   // every interface, the default the guide shows.
   t = t.replaceAll('inference listener 127.0.0.1:18443', 'inference listener 0.0.0.0:8443')
-    .replaceAll('"inference":"127.0.0.1:38443"', '"inference":"0.0.0.0:8443"');
+    .replaceAll('"inference":"127.0.0.1:38443"', '"inference":"0.0.0.0:8443"')
+    // The host's ingress is the private address the guide's host.yaml names.
+    .replaceAll('ingress listener 127.0.0.1:38444', 'ingress listener 100.64.0.21:8444');
   for (const [from, to] of Object.entries(PORTS)) t = t.replaceAll(`:${from}`, `:${to}`);
   t = t.replace(new RegExp(`\\b${hostname()}\\b`, 'g'), 'gpu-box');
   return realign(t);
@@ -139,7 +141,7 @@ function realign(text) {
 function run(name, label, command, extra = {}) {
   let text;
   try {
-    text = execFileSync('sh', ['-c', `cd "$HOME" && ${command} 2>&1`], { env: env(name, extra), encoding: 'utf8', timeout: 90_000 });
+    text = execFileSync('sh', ['-c', `cd "$HOME" && { ${command}; } 2>&1`], { env: env(name, extra), encoding: 'utf8', timeout: 90_000 });
   } catch (e) {
     text = `${e.stdout ?? ''}[exit ${e.status}]\n`;
   }
@@ -167,10 +169,10 @@ function stop(child) { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* a
 
 
 // A file the guide shows, as a ```yaml title="<name>" block of a page.
-function guideBlock(page, name) {
+function guideBlock(page, name, lang = 'yaml') {
   const text = readFileSync(join(here, '..', '..', '..', 'docs', 'guide', page), 'utf8');
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const m = text.match(new RegExp('```yaml title="' + escaped + '"\\n([\\s\\S]*?)```'));
+  const m = text.match(new RegExp('```' + lang + ' title="' + escaped + '"\\n([\\s\\S]*?)```'));
   if (!m) throw new Error(`${page} shows no ${name}`);
   return m[1];
 }
@@ -254,14 +256,24 @@ print()
   run('one', 'stopped request', curlChat(18443, 'other-model'));
   run('one', 'delete', 'mllm delete deployment other-model --stop');
   run('one', 'list after delete', 'mllm list deployments');
-  run('one', 'stop my-model', 'mllm stop deployment my-model > /dev/null; echo exit $?');
-  await sleep(4000);
-  run('one', 'start my-model', 'mllm start deployment my-model --wait > /dev/null; echo exit $?');
+  // A start right after a stop: refused while the stop finishes (exit 25);
+  // with --wait it waits for the stop, then starts.
+  run('one', 'stop my-model', 'mllm stop deployment my-model');
+  run('one', 'start right after stop', 'mllm start deployment my-model; echo exit $?');
+  run('one', 'start my-model', 'mllm start deployment my-model --wait');
   writeFileSync(join(h, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B', 'residency: deep\n'));
   run('one', 'update', 'mllm deploy model --file my-model.yaml --revision 1');
   await sleep(6000);
   run('one', 'list after update', 'mllm list deployments');
   run('one', 'delete my-model', 'mllm delete deployment my-model --stop > /dev/null; echo exit $?');
+  // A launch that fails: an engine whose process exits before it is ready.
+  fakeVllm(h, 'vllm-broken', '0.29.0');
+  writeFileSync(join(h, 'venvs/vllm-broken/bin/python3'), readFileSync(join(h, 'venvs/vllm-broken/bin/python3'), 'utf8')
+    .replace(/exec \/usr\/bin\/python3 [^\n]*"\$@";;/, 'echo "engine failed" >&2; exit 1;;'));
+  run('one', 'engine add broken', 'mllm engine add ~/venvs/vllm-broken --name vllm-broken > /dev/null; echo exit $?');
+  writeFileSync(join(h, 'broken-model.yaml'), deployment('broken-model', 'Qwen3-4B').replace('engine: vllm', 'engine: vllm-broken'));
+  run('one', 'deploy broken', 'mllm deploy model --file broken-model.yaml --activate --wait > /dev/null; echo exit $?');
+  run('one', 'status broken', 'mllm status deployment broken-model');
 }
 
 async function severalMachines() {
@@ -270,34 +282,38 @@ async function severalMachines() {
   fakeVllm(g, 'vllm', '0.29.0');
   checkpoint(g, 'Qwen3-4B');
   run('server', 'init server', 'mllm init server --output server.yaml');
-  // The server and host files are the ones the guide shows, moved onto
-  // loopback ports and the sandbox home.
+  // The server file is the one the guide shows, moved onto loopback ports
+  // and the sandbox home.
   writeFileSync(join(s, 'server.yaml'), guideBlock('several-machines.md', 'server.yaml')
     .replaceAll('/home/me', s).replaceAll('127.0.0.1:7443', '127.0.0.1:37443').replaceAll('0.0.0.0:8443', '127.0.0.1:38443')
     .replaceAll('100.64.0.10:7444', '127.0.0.1:37444').replaceAll('100.64.0.10:7445', '127.0.0.1:37445'));
   const server = background('server', 'start server', 'mllm start server --config ~/server.yaml');
   await server(6000);
-  run('server', 'invite', 'mllm invite host gpu-box --output gpu-box.join --config ~/server.yaml');
+  run('server', 'invite', 'mllm invite host gpu-box --output gpu-box.join');
   cpSync(join(s, 'gpu-box.join'), join(g, 'gpu-box.join'));
   run('gpu-box', 'init host', 'mllm init host --output host.yaml');
-  const hostFile = (block) => guideBlock('several-machines.md', block)
-    .replaceAll('/home/me', g).replaceAll('100.64.0.21:8444', '127.0.0.1:38444');
-  writeFileSync(join(g, 'host-unified.yaml'), hostFile('host.yaml (unified memory)'));
-  run('gpu-box', 'validate unified host', 'mllm validate config --file ~/host-unified.yaml');
-  writeFileSync(join(g, 'host.yaml'), hostFile('host.yaml'));
+  // The two edits the guide asks for: the name and the ingress, moved onto
+  // a loopback port.
+  const doc = JSON.parse(readFileSync(join(g, 'host.yaml'), 'utf8'));
+  const edits = JSON.parse(guideBlock('several-machines.md', 'host.yaml (the two changes)', 'json'));
+  Object.assign(doc, edits);
+  doc.ingress.address = 'http://127.0.0.1:38444';
+  doc.ingress.bind = '127.0.0.1:38444';
+  writeFileSync(join(g, 'host.yaml'), JSON.stringify(doc, null, 2) + '\n');
   run('gpu-box', 'validate host', 'mllm validate config --file ~/host.yaml');
   run('gpu-box', 'join', 'mllm join host --join-file gpu-box.join --config ~/host.yaml');
   const host = background('gpu-box', 'start host', 'mllm start host --config ~/host.yaml');
   await host(8000);
-  run('gpu-box', 'engine add on host', 'mllm engine add ~/venvs/vllm --config ~/host.yaml');
+  run('gpu-box', 'engine add on host', 'mllm engine add ~/venvs/vllm');
+  run('gpu-box', 'server command on host', 'mllm list deployments');
   await sleep(2000);
-  run('server', 'list hosts', 'mllm list hosts --config ~/server.yaml');
-  run('server', 'list engines', 'mllm list engines --config ~/server.yaml');
+  run('server', 'list hosts', 'mllm list hosts');
+  run('server', 'list engines', 'mllm list engines');
   writeFileSync(join(s, 'my-model.yaml'), deployment('my-model', 'Qwen3-4B'));
-  run('server', 'deploy on host', 'mllm deploy model --file my-model.yaml --activate --wait --config ~/server.yaml > /dev/null; echo exit $?');
-  run('server', 'list on server', 'mllm list deployments --config ~/server.yaml');
+  run('server', 'deploy on host', 'mllm deploy model --file my-model.yaml --activate --wait > /dev/null; echo exit $?');
+  run('server', 'list on server', 'mllm list deployments');
   run('server', 'request on server', curlChat(38443, 'my-model', false, SERVER_KEY));
-  run('server', 'park on server', 'mllm park deployment my-model --config ~/server.yaml > /dev/null; sleep 3; mllm list deployments --config ~/server.yaml');
+  run('server', 'park on server', 'mllm park deployment my-model > /dev/null; sleep 3; mllm list deployments');
 }
 
 try {
