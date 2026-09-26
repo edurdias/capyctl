@@ -994,6 +994,9 @@ fn the_standalone_inference_address_follows_flag_then_environment_then_document(
         line.rsplit("inference listener ")
             .next()
             .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
             .trim_end_matches(')')
             .to_owned()
     };
