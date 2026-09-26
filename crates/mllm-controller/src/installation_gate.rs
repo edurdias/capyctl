@@ -85,6 +85,10 @@ impl EmbeddedInstallation {
         let [profile] = profiles;
         let mut view = serde_json::json!({
             "profile": self.profile,
+            // Final review M10: which installation a deployment runs on is
+            // matched by its executable (the effective configuration names
+            // it); the management API is loopback and admin-only.
+            "executable": self.executable.to_string_lossy(),
             "version": profile.installation_version,
             "digest": profile.installation_digest,
             "state": profile.installation_state,

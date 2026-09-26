@@ -21,6 +21,7 @@ fn host() -> HostPolicy {
                 host_kv_limit: Some(40),
                 parked_limit: Some(50),
                 memory: DomainMemory::Distinct,
+                device: None,
             },
         )]),
         devices: BTreeMap::from([(
@@ -1260,4 +1261,298 @@ fn a_republished_remote_policy_with_changed_limits_is_applied() {
         (tight_again.controls.max_parked, tight_again.revision),
         (1, back.revision + 1)
     );
+}
+
+// T26: an existing unified stored policy keeps its bytes (no `device` key), so
+// its identity and digest do not change (ADR 0019).
+#[test]
+fn a_unified_stored_domain_serializes_as_before() {
+    let stored = StoredDomain {
+        managed_limit: 1,
+        free_reserve: 1,
+        host_kv_limit: None,
+        parked_limit: None,
+        memory: "unified".into(),
+        device: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&stored).unwrap(),
+        r#"{"managed_limit":1,"free_reserve":1,"host_kv_limit":null,"parked_limit":null,"memory":"unified"}"#
+    );
+    let device = StoredDomain {
+        memory: "device".into(),
+        device: Some("gpu0".into()),
+        ..stored
+    };
+    assert!(serde_json::to_string(&device)
+        .unwrap()
+        .ends_with(r#""memory":"device","device":"gpu0"}"#));
+}
+
+fn discrete_host() -> HostPolicy {
+    let mut h = host();
+    h.domains.insert(
+        "gpu0".into(),
+        DomainPolicy {
+            managed_limit: 60,
+            free_reserve: 10,
+            host_kv_limit: None,
+            parked_limit: Some(10),
+            memory: DomainMemory::Device,
+            device: Some("gpu0".into()),
+        },
+    );
+    h.devices.get_mut("gpu0").unwrap().domain = "gpu0".into();
+    h
+}
+
+fn discrete_observations() -> Vec<MemoryObservation> {
+    let mut all = observations();
+    all.push(MemoryObservation {
+        domain: "gpu0".into(),
+        capacity_bytes: 80,
+        available_bytes: 70,
+        sampled_at_ms: 10_000,
+    });
+    all
+}
+
+// T26: a device domain and its device survive the stored policy round trip.
+#[test]
+fn a_device_domain_round_trips_through_the_store() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &discrete_host(), &discrete_observations(), 11_000)
+        .unwrap();
+    let snapshot = store.resource_policy("host-a").unwrap().unwrap();
+    let gpu = &snapshot.controls.domains["gpu0"];
+    assert_eq!(gpu.memory, DomainMemory::Device);
+    assert_eq!(gpu.device.as_deref(), Some("gpu0"));
+    assert_eq!(snapshot.controls.domains["system"].device, None);
+}
+
+// T26: which device a device domain holds is a hardware fact like `memory`; an
+// update may not rebind it.
+#[test]
+fn update_rejects_rebinding_a_device_domain_as_a_revision_conflict() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &discrete_host(), &discrete_observations(), 11_000)
+        .unwrap();
+    let mut rebound = ResourceControls::from_host(&discrete_host());
+    rebound.domains.get_mut("gpu0").unwrap().device = Some("gpu1".into());
+    assert!(matches!(
+        store.update_resource_policy(
+            &session,
+            "alice",
+            "host-a",
+            1,
+            "rebind",
+            &rebound,
+            &discrete_observations(),
+            11_000,
+        ),
+        Err(ResourcePolicyError::RevisionConflict)
+    ));
+    assert_eq!(store.resource_snapshot().unwrap().epoch, 1);
+}
+
+/// The single `unified` domain a 0.1.0-rc.4 standalone recorded for a
+/// discrete-GPU machine.
+fn unified_host() -> HostPolicy {
+    let mut h = host();
+    let mut unified = h.domains.remove("system").unwrap();
+    unified.memory = DomainMemory::Unified;
+    h.domains.insert("unified".into(), unified);
+    h.devices.get_mut("gpu0").unwrap().domain = "unified".into();
+    h
+}
+
+fn unified_observations() -> Vec<MemoryObservation> {
+    vec![MemoryObservation {
+        domain: "unified".into(),
+        ..observations()[0].clone()
+    }]
+}
+
+fn charge(store: &crate::Store, owner: &str, domain: &str) {
+    store.conn.execute("INSERT INTO deployments(id,name,kind,route_model_id,desired_state,admission_enabled,suspended,current_generation,schema_version) VALUES(?1,?1,'model',NULL,'running',1,0,1,1)", [owner]).unwrap();
+    let footprint =
+        serde_json::json!({"version":1,"phase":"ready","allocations":[[domain,30,0]],"devices":[]})
+            .to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO resource_owners(owner_id,footprint_json,deployment_id) VALUES(?1,?2,?1)",
+            params![owner, footprint],
+        )
+        .unwrap();
+}
+
+// T26 (ADR 0019, upgrade of a generated policy): a generated unified policy
+// for a machine now read as discrete is replaced in one transaction when no
+// owner is charged under it: new revision, new domains, re-registered ledger
+// keys, an advanced epoch and a journaled migration. The import that follows
+// sees the migrated policy as current.
+#[test]
+fn a_generated_policy_whose_machine_changed_shape_is_migrated() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &unified_host(), &unified_observations(), 11_000)
+        .unwrap();
+    // Before the fix this start was a bare revision conflict.
+    assert!(matches!(
+        store.import_resource_policy(&session, &discrete_host(), &discrete_observations(), 11_000),
+        Err(ResourcePolicyError::RevisionConflict)
+    ));
+    let migrated = store
+        .migrate_generated_resource_policy(
+            &session,
+            &discrete_host(),
+            &discrete_observations(),
+            11_000,
+        )
+        .unwrap();
+    assert_eq!(
+        migrated,
+        GeneratedPolicyMigration::Migrated {
+            previous_domains: vec!["unified".into()],
+            current_domains: vec!["gpu0".into(), "system".into()],
+            previous_revision: 1,
+            revision: 2,
+            epoch: 2,
+        }
+    );
+    let policy = store.resource_policy("host-a").unwrap().unwrap();
+    assert_eq!(policy.revision, 2);
+    assert_eq!(policy.context, ResourceContext::from_host(&discrete_host()));
+    let keys: Vec<String> = store
+        .conn
+        .prepare("SELECT kind||':'||ledger_key FROM host_resource_keys ORDER BY 1")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(keys, ["device:gpu0", "domain:gpu0", "domain:system"]);
+    let kind: String = store
+        .conn
+        .query_row(
+            "SELECT kind FROM management_events ORDER BY sequence DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "host_resource_policy_migrated");
+    let imported = store
+        .import_resource_policy(&session, &discrete_host(), &discrete_observations(), 11_000)
+        .unwrap();
+    assert_eq!((imported.revision, imported.changed), (2, false));
+    // A second start is not a second migration: the notice is one-time.
+    assert_eq!(
+        store
+            .migrate_generated_resource_policy(
+                &session,
+                &discrete_host(),
+                &discrete_observations(),
+                11_000,
+            )
+            .unwrap(),
+        GeneratedPolicyMigration::NotNeeded
+    );
+}
+
+// T26 (SPEC §7, §13.2): an owner still charged under the previous policy is
+// never released on the observation alone. The migration changes nothing and
+// names the owner, whose charge stays exactly as it was until an ordinary Stop
+// proves it gone.
+#[test]
+fn a_generated_policy_is_not_migrated_while_an_owner_is_charged_under_it() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_resource_policy(&session, &unified_host(), &unified_observations(), 11_000)
+        .unwrap();
+    charge(&store, "held", "unified");
+    let before = store.resource_snapshot().unwrap();
+    let outcome = store
+        .migrate_generated_resource_policy(
+            &session,
+            &discrete_host(),
+            &discrete_observations(),
+            11_000,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        GeneratedPolicyMigration::ChargesRemain {
+            previous_domains: vec!["unified".into()],
+            current_domains: vec!["gpu0".into(), "system".into()],
+            charges: vec![PreviousPolicyCharge {
+                owner_id: "held".into(),
+                deployment_id: "held".into(),
+                domains: vec!["unified".into()],
+            }],
+        }
+    );
+    assert_eq!(store.resource_snapshot().unwrap(), before);
+    let policy = store.resource_policy("host-a").unwrap().unwrap();
+    assert_eq!(
+        (policy.revision, policy.context),
+        (1, ResourceContext::from_host(&unified_host()))
+    );
+    // Once the Stop released it, the migration proceeds.
+    store
+        .conn
+        .execute("DELETE FROM resource_owners WHERE owner_id='held'", [])
+        .unwrap();
+    assert!(matches!(
+        store.migrate_generated_resource_policy(
+            &session,
+            &discrete_host(),
+            &discrete_observations(),
+            11_000,
+        ),
+        Ok(GeneratedPolicyMigration::Migrated { revision: 2, .. })
+    ));
+}
+
+// T26 (ADR 0019): an enrolled host's policy is hand-written and is never
+// replaced; a changed shape is refused with what differs and what to do,
+// instead of a bare revision conflict.
+#[test]
+fn a_hand_written_host_policy_with_a_changed_shape_is_refused_with_instructions() {
+    let store = crate::Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    store
+        .import_remote_resource_policy(
+            &session,
+            "host-b",
+            &unified_host(),
+            &unified_observations(),
+            11_000,
+        )
+        .unwrap();
+    let error = store
+        .import_remote_resource_policy(
+            &session,
+            "host-b",
+            &discrete_host(),
+            &discrete_observations(),
+            11_000,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, ResourcePolicyError::ShapeChanged { .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("[gpu0, system]"), "{message}");
+    assert!(message.contains("recorded [unified]"), "{message}");
+    assert!(message.contains("hand-written"), "{message}");
+    let policy = store.resource_policy("host-b").unwrap().unwrap();
+    assert_eq!(policy.revision, 1);
 }

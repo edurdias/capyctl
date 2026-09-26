@@ -305,6 +305,14 @@ fn frozen_launch(port: u16) -> NativeLaunch {
 /// The same launch with the host policy's service-authorized physical UUID,
 /// which is what the guarded launcher sets the child's CUDA namespace from.
 fn frozen_launch_with_device(port: u16, physical_gpu_uuid: Option<&str>) -> NativeLaunch {
+    frozen_launch_pinned(port, physical_gpu_uuid, None)
+}
+
+fn frozen_launch_pinned(
+    port: u16,
+    physical_gpu_uuid: Option<&str>,
+    cuda_pci_index: Option<u32>,
+) -> NativeLaunch {
     NativeLaunch::from_frozen_store(
         NativeLaunchMetadata {
             engine: "sglang".into(),
@@ -322,6 +330,7 @@ fn frozen_launch_with_device(port: u16, physical_gpu_uuid: Option<&str>) -> Nati
                 device_id: "gpu0".into(),
                 memory_domain: "uma".into(),
                 physical_gpu_uuid: physical_gpu_uuid.map(str::to_owned),
+                cuda_pci_index,
             },
         },
         CHECKPOINT.into(),
@@ -886,6 +895,11 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
             spawned[0].env["PATH"],
             format!("{}:/usr/bin:/bin", engine_bin.display())
         );
+        // Owner decision 2026-09-25: no profile CUDA home, no CUDA_HOME; the
+        // JIT build limits are always set.
+        assert!(!spawned[0].env.contains_key("CUDA_HOME"));
+        assert!(spawned[0].env["MAX_JOBS"].parse::<usize>().unwrap() >= 1);
+        assert_eq!(spawned[0].env["FLASHINFER_NVCC_THREADS"], "1");
         assert_eq!(
             spawned[0]
                 .env
@@ -940,6 +954,56 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
     std::fs::remove_file(&log).ok();
 }
 
+/// Discrete GPU design §7 (review decision): a GPU the host published no
+/// UUID for, on a host with a choice of GPU, is pinned by its index in PCI bus
+/// order; the child never inherits every GPU. A published UUID wins.
+// T27 T21
+#[tokio::test]
+async fn the_guarded_launcher_pins_an_unpublished_gpu_by_its_pci_index() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let cuda = |env: &std::collections::BTreeMap<String, String>| {
+        env.iter()
+            .filter(|(name, _)| name.starts_with("CUDA_"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>()
+    };
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let adapter = equipped(
+        frozen_launch_pinned(port, None, Some(1)),
+        tool.clone(),
+        &log,
+    );
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        cuda(&tool.spawned.lock().unwrap()[0].env),
+        [
+            ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+            ("CUDA_VISIBLE_DEVICES".to_string(), "1".to_string())
+        ]
+    );
+    let uuid = "GPU-1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let adapter = equipped(
+        frozen_launch_pinned(port, Some(uuid), None),
+        tool.clone(),
+        &log,
+    );
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        cuda(&tool.spawned.lock().unwrap()[0].env),
+        [("CUDA_VISIBLE_DEVICES".to_string(), uuid.to_string())]
+    );
+    std::fs::remove_file(&log).ok();
+}
+
 /// SPEC §8.2 / T21 (found live 2026-09-23): the host-named rendezvous directory
 /// reaches the entry as `MLLM_RENDEZVOUS_DIR`; without one none is set and the
 /// entry makes its own.
@@ -968,4 +1032,36 @@ async fn a_host_named_rendezvous_directory_reaches_the_entry() {
             named
         );
     }
+}
+
+/// SPEC §13.3 amendment (owner decision 2026-09-25): a profile's host-approved
+/// `cuda_home` puts `<cuda_home>/bin` after the engine's own bin and sets
+/// `CUDA_HOME`; a profile `env` build limit overrides the computed one.
+// T21 T22
+#[tokio::test]
+async fn a_profile_cuda_home_and_build_limit_reach_the_sglang_engine() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let launch = frozen_launch(port).with_toolchain(
+        Some("/usr/local/cuda-13.0".into()),
+        [("FLASHINFER_NVCC_THREADS".to_string(), "2".to_string())].into(),
+    );
+    let adapter = equipped(launch, tool.clone(), &log);
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    let spawned = tool.spawned.lock().unwrap();
+    let engine_bin = std::path::Path::new(&spawned[0].argv[0]).parent().unwrap();
+    assert_eq!(
+        spawned[0].env["PATH"],
+        format!(
+            "{}:/usr/local/cuda-13.0/bin:/usr/bin:/bin",
+            engine_bin.display()
+        )
+    );
+    assert_eq!(spawned[0].env["CUDA_HOME"], "/usr/local/cuda-13.0");
+    assert_eq!(spawned[0].env["FLASHINFER_NVCC_THREADS"], "2");
 }

@@ -6,6 +6,7 @@
 //! and then asks for the reload. The standalone document is never written.
 //! Nothing here reaches an engine.
 use mllm_agent::control_socket::{ControlHandler, ControlRequest};
+use mllm_config::model_settings::ModelSettings;
 use mllm_config::registration::{check_profile, EnginesFile, ENVIRONMENT_PROFILES};
 use mllm_controller::coordinator::CoordinatorCommands;
 use mllm_controller::engine_provider::{EngineProvider, NamedInstallation, ProviderError};
@@ -18,6 +19,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::device_inventory::InventoryPublication;
+use mllm_agent::gpu_memory::HostShape;
+
+/// `named` with the resolved models directory: a provider's fresh
+/// installations name none of their own (owner decision 2026-09-25).
+fn with_models(
+    mut named: Vec<NamedInstallation>,
+    models: &ModelSettings,
+) -> Vec<NamedInstallation> {
+    for n in &mut named {
+        n.installation.models_root = models.models_root.clone();
+    }
+    named
+}
 
 /// What the embedded host publishes, and how to rebuild it.
 pub struct EmbeddedHost {
@@ -29,6 +43,11 @@ pub struct EmbeddedHost {
     environment_fingerprint: String,
     capacity_bytes: i64,
     inventory: Option<InventoryPublication>,
+    /// The GPU shape sampled at boot (design §1), which decides the domains.
+    shape: HostShape,
+    /// The models directory and model-source policy resolved at boot (owner
+    /// decision 2026-09-25), stated in every document and installation.
+    models: ModelSettings,
 }
 
 impl EmbeddedHost {
@@ -39,13 +58,18 @@ impl EmbeddedHost {
         environment_fingerprint: String,
         capacity_bytes: i64,
         inventory: Option<InventoryPublication>,
+        shape: HostShape,
+        models: ModelSettings,
     ) -> Arc<Self> {
-        let document = crate::standalone_config::host_policy(
+        let named = with_models(named, &models);
+        let mut document = crate::standalone_config::host_policy(
             &named,
             &environment_fingerprint,
             capacity_bytes,
             inventory.as_ref(),
+            &shape,
         );
+        models.write_into(&mut document);
         let installations = EmbeddedInstallations::new();
         for n in &named {
             installations.register(
@@ -61,6 +85,8 @@ impl EmbeddedHost {
             environment_fingerprint,
             capacity_bytes,
             inventory,
+            shape,
+            models,
         })
     }
 
@@ -96,17 +122,21 @@ impl EmbeddedHost {
 
     /// The document `named` would publish.
     fn document_for(&self, named: &[NamedInstallation]) -> Value {
-        crate::standalone_config::host_policy(
+        let mut document = crate::standalone_config::host_policy(
             named,
             &self.environment_fingerprint,
             self.capacity_bytes,
             self.inventory.as_ref(),
-        )
+            &self.shape,
+        );
+        self.models.write_into(&mut document);
+        document
     }
 
     /// Swap in `named`: the installation registry first (so a launch on a new
     /// profile is measured), then the host document. Blocking.
     pub fn replace(&self, named: Vec<NamedInstallation>) -> Result<(), String> {
+        let named = with_models(named, &self.models);
         let document = self.document_for(&named);
         for n in &named {
             self.installations.register(
@@ -348,7 +378,7 @@ impl StandaloneControl {
         if ENVIRONMENT_PROFILES.contains(&profile) {
             return refused(
                 "invalid_config",
-                format!("{profile} comes from MLLM_VLLM_BIN / MLLM_SGLANG_BIN; unset it and restart the role"),
+                format!("{profile} comes from the role's own installation (--vllm-bin / --sglang-bin, MLLM_VLLM_BIN / MLLM_SGLANG_BIN or host.local_engine); unset it and restart the role"),
             );
         }
         // The role keeps at least one engine: refused before anything is retired.

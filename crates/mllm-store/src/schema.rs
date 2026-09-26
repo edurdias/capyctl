@@ -877,6 +877,28 @@ CREATE TABLE IF NOT EXISTS embedded_host_publications(
 );
 "#;
 
+/// v37 (ADR 0019, discrete GPU design §7): mllm picks the GPU on a multi-GPU
+/// host. A deployment that pins no device is resolved once per GPU of such a
+/// host; each resolution is kept here, beside the host's own row (which stays
+/// the lowest-index GPU's, so every reader of `host_effective_revisions` keeps
+/// its meaning). `deployment_instances.device` records the GPU an instance was
+/// placed on, the preference a stopped instance keeps (ADR 0013 §4); it is
+/// added by the data step (`crate::instances::migrate_v37`), which checks
+/// what exists so the step is idempotent. Additive and forward-only.
+pub const SCHEMA_V37: &str = r#"
+CREATE TABLE IF NOT EXISTS host_device_effective_revisions(
+  deployment_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision>0),
+  host_id TEXT NOT NULL,
+  device TEXT NOT NULL CHECK(length(device) BETWEEN 1 AND 128),
+  effective_json TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  source_json TEXT NOT NULL CHECK(json_valid(source_json)),
+  PRIMARY KEY(deployment_id,revision,host_id,device),
+  FOREIGN KEY(deployment_id,revision,host_id) REFERENCES host_effective_revisions(deployment_id,revision,host_id)
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

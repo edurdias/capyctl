@@ -39,8 +39,13 @@ use std::{
 };
 
 /// One saver read, connect through response (the scheduler answers at its
-/// next safe point).
-const OBSERVE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// next safe point). The protocol's largest bound: found live 2026-09-26, a
+/// busy SGLang scheduler on a discrete-GPU laptop answered in 1.0-1.6 s.
+const OBSERVE_TIMEOUT: Duration = Duration::from_millis(2000);
+/// A read has no effect, so one that misses its bound is made again with a
+/// fresh request id (SPEC §9.2: only a whole, bound answer is evidence; a
+/// missing one is never guessed). Bounded well inside any step deadline.
+const OBSERVE_ATTEMPTS: usize = 3;
 const MAX_RECORD_BYTES: u64 = 4096;
 const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
 const PRELOAD_PREFIX: &str = "torch_memory_saver_hook_mode_preload";
@@ -234,7 +239,7 @@ impl SaverResidency for EnrolledSaver {
             &scope.binding_id,
             &scope.incarnation,
         );
-        let facts = NativeObservationClient::new(
+        let client = NativeObservationClient::new(
             self.dir.join(&record.socket),
             scope.binding_id.clone(),
             scope.incarnation.clone(),
@@ -242,9 +247,11 @@ impl SaverResidency for EnrolledSaver {
             record.library_sha256.clone(),
         )
         .map_err(|_| unavailable("client"))?
-        .with_key(key)
-        .observe(OBSERVE_TIMEOUT)
-        .map_err(|_| unavailable("observe"))?;
+        .with_key(key);
+        let facts = (1..OBSERVE_ATTEMPTS)
+            .find_map(|_| client.observe(OBSERVE_TIMEOUT).ok())
+            .map_or_else(|| client.observe(OBSERVE_TIMEOUT), Ok)
+            .map_err(|_| unavailable("observe"))?;
         // The recipe is one device (TP=1): a spread map cannot prove per-rank
         // release or restoration.
         let devices = facts

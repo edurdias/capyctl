@@ -8,8 +8,10 @@
 //! closed parse and what the published table states, never about a real GPU.
 //! Nothing here qualifies a native engine recipe (SPEC §18).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, GpuSample, HostShape};
 use mllm_cli::device_inventory::{collect_with, is_physical_uuid};
 use mllm_cli::standalone_config;
 use mllm_config::engine_policy::Engine;
@@ -43,12 +45,14 @@ fn installation() -> EngineInstallation {
         executable: "/opt/venv/bin/python3".into(),
         build_fingerprint: "0.5.20".into(),
         engine_config: serde_json::json!({"memory": {"kv_cache": "16GiB"}}),
+        kv_cache_declared: false,
         deep_park: true,
         trust_remote_code: false,
         models_root: "/srv/models".into(),
         runtime_dir: "/opt/mllm/runtime".into(),
         args: Vec::new(),
         installation_drift: Default::default(),
+        cuda_home: None,
         engine_ports: (8100, 8199),
     }
 }
@@ -58,7 +62,7 @@ fn installation() -> EngineInstallation {
 /// device's physical UUID on the device entry.
 #[test]
 fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
-    let published = collect_with(Path::new("/any"), &|_root| {
+    let published = collect_with(Path::new("/any"), None, &|_root| {
         Ok(inventory_json(serde_json::json!([
             {"physical_gpu_uuid": UUID, "pci_address": "000f:01:00.0",
              "device_minor": 0, "vendor_id": "0x10de", "device_id": "0x2e12"}
@@ -67,10 +71,18 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
     .expect("a well-formed inventory publishes");
     assert_eq!(published.digest, DIGEST);
     assert_eq!(published.host_id, "host-a");
-    assert_eq!(published.physical_gpu_uuid.as_deref(), Some(UUID));
+    assert_eq!(
+        published.physical_gpu_uuids,
+        BTreeMap::from([(0, UUID.to_owned())])
+    );
 
-    let host =
-        standalone_config::host_policy(&named(&installation()), "env-1", 1 << 40, Some(&published));
+    let host = standalone_config::host_policy(
+        &named(&installation()),
+        "env-1",
+        1 << 40,
+        Some(&published),
+        &HostShape::Unified,
+    );
     assert_eq!(host["device_inventory_digest"], DIGEST);
     assert_eq!(host["name"], "host-a");
     assert_eq!(
@@ -87,11 +99,14 @@ fn a_boot_with_an_inventory_publishes_the_digest_and_the_single_devices_uuid() {
                 path: "/srv/models/m".into(),
             },
             Engine::Sglang,
-            1 << 40,
+            &mllm_cli::standalone_config::TemplateMemory::Unified {
+                capacity_bytes: 1 << 40,
+            },
             standalone_config::DEFAULT_REQUEST_DEADLINE,
             true,
             "local",
-        ),
+        )
+        .expect("the unified template"),
         &host,
     )
     .expect("the published host resolves with its placement evidence");
@@ -121,7 +136,7 @@ fn a_boot_without_an_inventory_publishes_nothing() {
         ]))),
     ];
     for outcome in outcomes {
-        let published = collect_with(Path::new("/any"), &|_root| match &outcome {
+        let published = collect_with(Path::new("/any"), None, &|_root| match &outcome {
             Ok(text) => Ok(text.clone()),
             Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
         });
@@ -132,7 +147,13 @@ fn a_boot_without_an_inventory_publishes_nothing() {
     }
     // And the published table carries neither field, so the host policy is
     // byte-identical to a host that never observed a device.
-    let host = standalone_config::host_policy(&named(&installation()), "env-1", 1 << 40, None);
+    let host = standalone_config::host_policy(
+        &named(&installation()),
+        "env-1",
+        1 << 40,
+        None,
+        &HostShape::NoGpu,
+    );
     assert!(
         host["device_inventory_digest"].is_null(),
         "no inventory, no digest"
@@ -143,12 +164,13 @@ fn a_boot_without_an_inventory_publishes_nothing() {
     );
 }
 
-/// More than one device is a placement choice a boot does not make by itself:
-/// the digest is published (the inventory is real), the UUID is not, and an
-/// SGLang deployment then fails placement closed at the native gate.
+/// Without an `nvidia-smi` sample more than one device cannot be keyed by the
+/// driver index its `gpuN` entry names: the digest is published (the inventory
+/// is real), no UUID is, and an SGLang deployment then fails placement closed
+/// at the native gate.
 #[test]
 fn a_multi_device_inventory_publishes_the_digest_but_names_no_device() {
-    let published = collect_with(Path::new("/any"), &|_root| {
+    let published = collect_with(Path::new("/any"), None, &|_root| {
         Ok(inventory_json(serde_json::json!([
             {"physical_gpu_uuid": UUID, "pci_address": "000f:01:00.0",
              "device_minor": 0, "vendor_id": "0x10de", "device_id": "0x2e12"},
@@ -160,9 +182,14 @@ fn a_multi_device_inventory_publishes_the_digest_but_names_no_device() {
     .expect("a real inventory publishes its digest");
     assert_eq!(published.digest, DIGEST);
     assert_eq!(published.host_id, "host-a");
-    assert_eq!(published.physical_gpu_uuid, None);
-    let host =
-        standalone_config::host_policy(&named(&installation()), "env-1", 1 << 40, Some(&published));
+    assert!(published.physical_gpu_uuids.is_empty());
+    let host = standalone_config::host_policy(
+        &named(&installation()),
+        "env-1",
+        1 << 40,
+        Some(&published),
+        &HostShape::Unified,
+    );
     assert_eq!(host["device_inventory_digest"], DIGEST);
     assert_eq!(host["name"], "host-a");
     assert!(host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"].is_null());
@@ -184,5 +211,219 @@ fn the_uuid_shape_refuses_what_the_collector_refuses() {
         "0",
     ] {
         assert!(!is_physical_uuid(bad), "{bad} is not a physical UUID");
+    }
+}
+
+const OTHER_UUID: &str = "GPU-11111111-2222-3333-4444-555555555555";
+
+fn two_devices() -> String {
+    inventory_json(serde_json::json!([
+        {"physical_gpu_uuid": UUID, "pci_address": "0000:01:00.0",
+         "device_minor": 0, "vendor_id": "0x10de", "device_id": "0x2684"},
+        {"physical_gpu_uuid": OTHER_UUID, "pci_address": "0000:02:00.0",
+         "device_minor": 1, "vendor_id": "0x10de", "device_id": "0x2684"}
+    ]))
+}
+
+/// `nvidia-smi`'s view of a device: its index, UUID and eight-digit,
+/// upper-case PCI domain.
+fn smi(index: u32, uuid: &str, bus: u32) -> GpuDevice {
+    GpuDevice {
+        index,
+        uuid: uuid.into(),
+        pci_bus_id: format!("00000000:{bus:02X}:00.0"),
+        name: "RTX".into(),
+        memory: Some(GpuMemory {
+            total_bytes: 24 << 30,
+            used_bytes: 0,
+            free_bytes: 24 << 30,
+        }),
+    }
+}
+
+fn sample(devices: Vec<GpuDevice>) -> GpuSample {
+    GpuSample {
+        devices,
+        sampled_at_ms: 1,
+    }
+}
+
+// T26 (design §7): two GPUs publish both UUIDs, each keyed by the driver
+// index its `gpuN` entry names, and the digest is the inventory's own.
+#[test]
+fn a_two_device_inventory_publishes_both_uuids_and_the_same_digest() {
+    // The driver index need not follow PCI order: the key is `nvidia-smi`'s.
+    let observed = sample(vec![smi(0, OTHER_UUID, 2), smi(1, UUID, 1)]);
+    let published = collect_with(Path::new("/any"), Some(&observed), &|_root| {
+        Ok(two_devices())
+    })
+    .expect("a corroborated inventory publishes");
+    assert_eq!(published.digest, DIGEST);
+    assert_eq!(
+        published.physical_gpu_uuids,
+        BTreeMap::from([(0, OTHER_UUID.to_owned()), (1, UUID.to_owned())])
+    );
+    let unsampled = collect_with(Path::new("/any"), None, &|_root| Ok(two_devices())).unwrap();
+    assert_eq!(
+        unsampled.digest, published.digest,
+        "the digest does not change"
+    );
+
+    let host = standalone_config::host_policy(
+        &named(&installation()),
+        "env-1",
+        1 << 40,
+        Some(&published),
+        &HostShape::Discrete(observed.devices.clone()),
+    );
+    assert_eq!(host["device_inventory_digest"], DIGEST);
+    let devices = &host["resource_policy"]["devices"];
+    assert_eq!(devices["gpu0"]["physical_gpu_uuid"], OTHER_UUID);
+    assert_eq!(devices["gpu1"]["physical_gpu_uuid"], UUID);
+}
+
+// T26 (design §1): the inventory and `nvidia-smi` must name the same UUID at
+// the same PCI address, one for one; any disagreement publishes no UUIDs while
+// the digest is still published.
+#[test]
+fn a_disagreeing_gpu_sample_publishes_no_uuids() {
+    let disagreements = [
+        // A UUID differs at one address.
+        sample(vec![
+            smi(0, UUID, 1),
+            smi(1, UUID.replace('9', "8").as_str(), 2),
+        ]),
+        // An address the inventory did not observe.
+        sample(vec![smi(0, UUID, 1), smi(1, OTHER_UUID, 3)]),
+        // A device the inventory did not observe.
+        sample(vec![smi(0, UUID, 1)]),
+        // Swapped addresses.
+        sample(vec![smi(0, UUID, 2), smi(1, OTHER_UUID, 1)]),
+    ];
+    for observed in disagreements {
+        let published = collect_with(Path::new("/any"), Some(&observed), &|_root| {
+            Ok(two_devices())
+        })
+        .expect("the inventory itself is well formed");
+        assert_eq!(published.digest, DIGEST);
+        assert!(
+            published.physical_gpu_uuids.is_empty(),
+            "a disagreement publishes no UUIDs: {observed:?}"
+        );
+    }
+}
+
+// T26: a unified host whose one device `nvidia-smi` also sees publishes the
+// same `gpu0` UUID as before.
+#[test]
+fn a_sampled_single_device_publishes_gpu0_identically() {
+    let single = || {
+        Ok(inventory_json(serde_json::json!([
+            {"physical_gpu_uuid": UUID, "pci_address": "000f:01:00.0",
+             "device_minor": 0, "vendor_id": "0x10de", "device_id": "0x2e12"}
+        ])))
+    };
+    let integrated = GpuDevice {
+        index: 0,
+        uuid: UUID.into(),
+        pci_bus_id: "0000000F:01:00.0".into(),
+        name: "GB10".into(),
+        memory: None,
+    };
+    let sampled = collect_with(
+        Path::new("/any"),
+        Some(&sample(vec![integrated])),
+        &|_root| single(),
+    )
+    .unwrap();
+    let unsampled = collect_with(Path::new("/any"), None, &|_root| single()).unwrap();
+    assert_eq!(sampled, unsampled);
+    let document = |published| {
+        standalone_config::host_policy(
+            &named(&installation()),
+            "env-1",
+            1 << 40,
+            Some(published),
+            &HostShape::Unified,
+        )
+    };
+    assert_eq!(document(&sampled), document(&unsampled));
+    assert_eq!(
+        document(&sampled)["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"],
+        UUID
+    );
+}
+
+// T26 (design §1, carried must-do): on a unified host (GB10) whose one device
+// `nvidia-smi` reports at another PCI address, or under another UUID, than the
+// inventory collector, no UUID is published, but the host is not broken: the
+// digest is still published, its policy still resolves a deployment, and a
+// vLLM launch keeps the agent's own device namespace (a lone unified device
+// is never pinned), exactly as on a host that published no UUID.
+#[test]
+fn a_unified_host_whose_sample_disagrees_publishes_no_uuid_and_still_resolves() {
+    let single = || {
+        Ok(inventory_json(serde_json::json!([
+            {"physical_gpu_uuid": UUID, "pci_address": "000f:01:00.0",
+             "device_minor": 0, "vendor_id": "0x10de", "device_id": "0x2e12"}
+        ])))
+    };
+    let integrated = |uuid: &str, bus: &str| GpuDevice {
+        index: 0,
+        uuid: uuid.into(),
+        pci_bus_id: bus.into(),
+        name: "GB10".into(),
+        memory: None,
+    };
+    for disagreeing in [
+        integrated(UUID, "00000000:01:00.0"),
+        integrated(OTHER_UUID, "0000000F:01:00.0"),
+    ] {
+        let observed = sample(vec![disagreeing]);
+        assert_eq!(
+            mllm_agent::gpu_memory::shape(Some(&observed)),
+            Ok(HostShape::Unified)
+        );
+        let published = collect_with(Path::new("/any"), Some(&observed), &|_root| single())
+            .expect("the inventory itself is well formed");
+        assert_eq!(published.digest, DIGEST);
+        assert!(published.physical_gpu_uuids.is_empty(), "{observed:?}");
+        let host = standalone_config::host_policy(
+            &named(&installation()),
+            "env-1",
+            1 << 40,
+            Some(&published),
+            &HostShape::Unified,
+        );
+        assert_eq!(host["device_inventory_digest"], DIGEST);
+        assert!(host["resource_policy"]["devices"]["gpu0"]["physical_gpu_uuid"].is_null());
+        let mut vllm = installation();
+        vllm.engine = Engine::Vllm;
+        let effective = mllm_config::effective::resolve_effective(
+            &standalone_config::deployment_document(
+                "m",
+                "m",
+                &mllm_config::effective::ModelSource::Local {
+                    path: "/srv/models/m".into(),
+                },
+                Engine::Vllm,
+                &mllm_cli::standalone_config::TemplateMemory::Unified {
+                    capacity_bytes: 1 << 40,
+                },
+                standalone_config::DEFAULT_REQUEST_DEADLINE,
+                true,
+                "local",
+            )
+            .expect("the unified template"),
+            &standalone_config::host_policy(
+                &named(&vllm),
+                "env-1",
+                1 << 40,
+                Some(&published),
+                &HostShape::Unified,
+            ),
+        )
+        .expect("the host without a UUID still resolves");
+        assert_eq!(effective.cuda_namespace(), Ok(None));
     }
 }

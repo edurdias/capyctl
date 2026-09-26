@@ -1,5 +1,7 @@
 //! ADR 0018: `mllm engine` against fake environments and a scripted role
 //! socket. CPU tests only; they are not qualification.
+mod support;
+
 use mllm_agent::control_socket::{ControlHandler, ControlRequest, ControlServer};
 use mllm_cli::engine::{execute, resolve_target};
 use mllm_cli::grammar::{Command, DeepParkChoice, DriftChoice};
@@ -175,25 +177,30 @@ async fn add_reports_a_rejected_publication() {
     assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 
-// ADR 0018 §3: without a running role engines.yaml is written and the
-// command says the profile takes effect at the next start.
+// ADR 0018 §3 (owner decision 2026-09-25): without a running role
+// engines.yaml is written and the command succeeds, saying the profile takes
+// effect when the role starts.
 #[tokio::test]
-async fn add_without_a_running_role_is_agent_unreachable() {
+async fn add_without_a_running_role_saves_and_succeeds() {
     let dir = private_dir();
     let env = vllm_env(&dir.path().join("v"), "0.29.0", "0.29.0", &[]);
     let document = host_doc(dir.path());
-    let error = execute(&add(&env), Some(&document), dir.path())
+    let out = execute(&add(&env), Some(&document), dir.path())
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "agent_unreachable");
-    assert!(error.message.contains("revision 1"), "{}", error.message);
+        .unwrap();
+    assert_eq!(out["published"], "role_not_running");
+    let notice = out["notice"].as_str().unwrap();
+    assert!(
+        notice.contains("revision 1") && notice.contains("mllm start host"),
+        "{notice}"
+    );
     assert!(engines_of(&document).profiles.contains_key("vllm"));
 }
 
 // T02 T07 (review decision 2026-09-25): `engine add` before any role has
 // ever started is the first run. On a fresh HOME with no state directory and
 // no role document it creates the state root owner-only, writes engines.yaml
-// where `start standalone` reads it, and reports agent_unreachable.
+// where `start standalone` reads it, and succeeds with a notice.
 #[tokio::test]
 async fn add_on_a_fresh_home_is_the_first_run() {
     use std::os::unix::fs::MetadataExt;
@@ -205,10 +212,10 @@ async fn add_on_a_fresh_home_is_the_first_run() {
     assert!(!state.exists());
     let home_text = home.to_string_lossy().into_owned();
     let fresh = move |key: &str| (key == "HOME").then(|| home_text.clone());
-    let error = mllm_cli::engine::execute_in(&add(&env), None, &state, &fresh)
+    let out = mllm_cli::engine::execute_in(&add(&env), None, &state, &fresh)
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "agent_unreachable", "{}", error.message);
+        .unwrap();
+    assert_eq!(out["published"], "role_not_running", "{out}");
     let meta = std::fs::metadata(&state).unwrap();
     assert!(meta.is_dir());
     assert_eq!(meta.mode() & 0o777, 0o700, "the state root is owner-only");
@@ -738,7 +745,7 @@ async fn a_rerun_remove_finishes_a_removal_the_file_already_shows() {
 }
 
 fn mllm(home: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .env("HOME", home)
         .env("PATH", "/nonexistent")
         .env_remove("XDG_DATA_HOME")

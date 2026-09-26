@@ -313,6 +313,7 @@ fn every_post_baseline_field_names_its_capability() {
             RESTORE_CHECKPOINT_DIGEST,
             TERMINATE_RECORDED_PROCESSES,
             LIVE_PROFILE_UPDATE,
+            DEVICE_MEMORY_DOMAINS,
         ]
         .contains(name)
         {
@@ -501,5 +502,66 @@ fn live_profile_update_is_declared_both_ways() {
     assert_eq!(
         pb::ServerToAgent::decode(retire.encode_to_vec().as_slice()).unwrap(),
         retire
+    );
+}
+
+// T34 T26 (ADR 0019, discrete GPU design §8): device memory domains are one
+// capability every current agent declares. Its fields are additive: an
+// observation or resident without them encodes exactly as an older host's,
+// and one with them decodes back unchanged. It is not a placement
+// requirement, so a unified host without it stays placeable.
+#[test]
+fn device_memory_domains_is_one_additive_capability() {
+    use capabilities::*;
+    assert_eq!(DEVICE_MEMORY_DOMAINS, "device_memory_domains");
+    assert!(CATALOGUE.contains(&(DEVICE_MEMORY_DOMAINS, Direction::ServerToHost)));
+    assert!(agent_capabilities().contains(&DEVICE_MEMORY_DOMAINS.to_owned()));
+    assert!(!PLACEMENT_REQUIRED.contains(&DEVICE_MEMORY_DOMAINS));
+    assert!(is_gate_refusal(&missing(DEVICE_MEMORY_DOMAINS)));
+    assert_eq!(
+        missing(DEVICE_MEMORY_DOMAINS),
+        "host_capability_missing:device_memory_domains"
+    );
+
+    let older = pb::DomainObservation {
+        domain_id: "unified".into(),
+        kind: "system".into(),
+        capacity_bytes: 128 << 30,
+        available_bytes: 100 << 30,
+        residents: vec![pb::ProcessResidency {
+            pid: 7,
+            boot_id: "b".into(),
+            start_ticks: 9,
+            resident_bytes: 3 << 30,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut same = older.clone();
+    same.device_id.clear();
+    same.residents[0].device_bytes = 0;
+    same.residents[0].host_bytes = 0;
+    assert_eq!(older.encode_to_vec(), same.encode_to_vec());
+
+    let device = pb::DomainObservation {
+        domain_id: "gpu0".into(),
+        kind: "device".into(),
+        device_id: "gpu0".into(),
+        capacity_bytes: 16376 << 20,
+        available_bytes: 14000 << 20,
+        ..Default::default()
+    };
+    let decoded = pb::DomainObservation::decode(device.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded, device);
+    let split = pb::ProcessResidency {
+        device_bytes: 2 << 30,
+        host_bytes: 1 << 30,
+        resident_bytes: 3 << 30,
+        ..older.residents[0].clone()
+    };
+    assert!(split.encode_to_vec().len() > older.residents[0].encode_to_vec().len());
+    assert_eq!(
+        pb::ProcessResidency::decode(split.encode_to_vec().as_slice()).unwrap(),
+        split
     );
 }

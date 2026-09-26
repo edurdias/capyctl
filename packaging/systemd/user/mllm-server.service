@@ -11,7 +11,7 @@
 # SIGTERM closes admission, lets admitted requests finish within the server
 # document's `shutdown.drain_timeout`, and exits. Deployments are not deleted
 # and engines on the hosts keep running; the next start reconciles them
-# (crates/mllm-cli/src/shutdown.rs, owner decision P3). Stopping a host's
+# (crates/mllm-cli/src/shutdown.rs, decided 2026-09-22). Stopping a host's
 # engines is the explicit `mllm drain host <name>`, run while this server is up.
 #
 # There is deliberately no ExecStop= that drains: a package upgrade or a

@@ -12,10 +12,13 @@
 //! before anything is journaled or started.
 use super::{refusal::LaunchVerdict, NativeHostExecution};
 use crate::journal::{ClaimPhase, ClaimedLaunch};
-use mllm_config::effective::{DomainPolicy, PhaseFootprint, RecipeFootprints, Sharing};
+use mllm_config::effective::{
+    DomainMemory, DomainPolicy, PhaseFootprint, RecipeFootprints, Sharing,
+};
 use mllm_protocol::execution::{MemberAction, MemberCommand, SingleLaunchPlan};
+use std::collections::BTreeMap;
 
-/// What one launch is charged on this host's single memory domain.
+/// What one launch is charged on one of this host's memory domains.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Charge {
     pub bytes: i64,
@@ -139,7 +142,35 @@ pub(super) fn fits(
             .host_kv_limit
             .is_some_and(|max| host_kv.is_none_or(|kv| kv > max))
     {
-        return Err("insufficient_memory");
+        return Err(shortage(limit));
+    }
+    Ok(())
+}
+
+/// The closed refusal for a domain that cannot hold a charge: a GPU's own
+/// memory is named apart from host memory (discrete GPU design §4).
+fn shortage(limit: &DomainPolicy) -> &'static str {
+    match limit.memory {
+        DomainMemory::Device => "insufficient_device_memory",
+        DomainMemory::Unified | DomainMemory::Distinct => "insufficient_memory",
+    }
+}
+
+/// SPEC §§3.1, 7.3, discrete GPU design §4: [`fits`] on every memory domain
+/// the host declares, each with its own budget. `new` is the launch's charge
+/// on a domain and `others` every claim's; a domain a footprint does not
+/// touch is charged nothing there. The switch planner judges the same
+/// domains, so the two agree on a discrete host.
+pub(super) fn fits_every_domain(
+    domains: &BTreeMap<String, DomainPolicy>,
+    new: impl Fn(&str) -> Charge,
+    others: impl Fn(&str, &DomainPolicy) -> Vec<Charge>,
+) -> Result<(), &'static str> {
+    if domains.is_empty() {
+        return Err("unauthorized");
+    }
+    for (domain, limit) in domains {
+        fits(&new(domain), &others(domain, limit), limit)?;
     }
     Ok(())
 }
@@ -159,16 +190,19 @@ impl NativeHostExecution {
             return Ok(());
         }
         let effective = self.resolve(command).map_err(|_| refused("unauthorized"))?;
-        let [(domain, limit)] = effective.host.domains.iter().collect::<Vec<_>>()[..] else {
-            return Err(refused("unauthorized"));
-        };
-        let new = charge(
-            &effective.resources,
-            ClaimPhase::Starting,
-            domain,
-            Some(plan.service_port),
-        );
-        fits(&new, &self.claim_charges(claimed, domain, limit), limit).map_err(refused)
+        fits_every_domain(
+            &effective.host.domains,
+            |domain| {
+                charge(
+                    &effective.resources,
+                    ClaimPhase::Starting,
+                    domain,
+                    Some(plan.service_port),
+                )
+            },
+            |domain, limit| self.claim_charges(claimed, domain, limit),
+        )
+        .map_err(refused)
     }
 
     /// SPEC §§3.1, 7.3, 9.1: admit waking `owner` (a parked launch this host
@@ -188,11 +222,12 @@ impl NativeHostExecution {
         let effective = self
             .resolve_retained(owner)
             .map_err(|_| refused("unauthorized"))?;
-        let [(domain, limit)] = effective.host.domains.iter().collect::<Vec<_>>()[..] else {
-            return Err(refused("unauthorized"));
-        };
-        let woken = wake_charge(&effective.resources, domain);
-        fits(&woken, &self.claim_charges(claimed, domain, limit), limit).map_err(refused)
+        fits_every_domain(
+            &effective.host.domains,
+            |domain| wake_charge(&effective.resources, domain),
+            |domain, limit| self.claim_charges(claimed, domain, limit),
+        )
+        .map_err(refused)
     }
 
     /// What every retained claim is charged on `domain`, by its durable phase.
@@ -234,7 +269,8 @@ impl NativeHostExecution {
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Result<(), LaunchVerdict> {
-        self.admit_launch(command, plan)?;
+        // Outside the journal's locks: the GPU is sampled now.
+        self.admit_launch(command, plan, super::GpuReading::Now)?;
         let claimed = self
             .journal
             .claimed_launches(&command.identity.command_id)
@@ -246,7 +282,7 @@ impl NativeHostExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mllm_config::effective::{Allocation, DeviceClaim, DomainMemory};
+    use mllm_config::effective::{Allocation, DeviceClaim};
 
     const MIB: i64 = 1 << 20;
 
@@ -281,6 +317,7 @@ mod tests {
             host_kv_limit: None,
             parked_limit: None,
             memory: DomainMemory::Unified,
+            device: None,
         }
     }
 
@@ -398,5 +435,72 @@ mod tests {
         assert_eq!(fits(&next, std::slice::from_ref(&shared), &roomy), Ok(()));
         next.port = Some(1);
         assert_eq!(fits(&next, &[shared], &roomy), Err("port_conflict"));
+    }
+
+    // Discrete GPU design §4: on a discrete host each launch is charged on the
+    // GPU and on host RAM, and co-residence is judged on every domain. A
+    // parked launch's residue leaves room on the card; a ready one does not,
+    // and the refusal names the device. Before, any host with more than one
+    // domain refused every launch beside a claim `unauthorized`.
+    // T24 T26 T16
+    #[test]
+    fn co_residence_is_judged_on_every_domain() {
+        const GIB: i64 = 1 << 30;
+        let two = |device: i64, system: i64| PhaseFootprint {
+            allocations: vec![
+                Allocation {
+                    domain: "gpu0".into(),
+                    bytes: device,
+                    host_kv_bytes: 0,
+                },
+                Allocation {
+                    domain: "system".into(),
+                    bytes: system,
+                    host_kv_bytes: 0,
+                },
+            ],
+            devices: vec![DeviceClaim {
+                id: "gpu0".into(),
+                sharing: Sharing::Shared,
+            }],
+        };
+        let model = RecipeFootprints {
+            cold: two(9 * GIB, 4 * GIB),
+            ready: two(9 * GIB, 4 * GIB),
+            parking: two(9 * GIB, 4 * GIB),
+            parked: two(GIB, 4 * GIB),
+            wake: two(9 * GIB, 4 * GIB),
+        };
+        let mut device = limit(15 * GIB);
+        device.memory = DomainMemory::Device;
+        device.device = Some("gpu0".into());
+        let mut system = limit(30 * GIB);
+        system.memory = DomainMemory::Distinct;
+        let domains: std::collections::BTreeMap<String, DomainPolicy> =
+            [("gpu0".to_string(), device), ("system".to_string(), system)].into();
+        let model = &model;
+        let new = |domain: &str| charge(model, ClaimPhase::Starting, domain, Some(30001));
+        let beside = |phase| {
+            move |domain: &str, _: &DomainPolicy| vec![charge(model, phase, domain, Some(30000))]
+        };
+        assert_eq!(
+            fits_every_domain(&domains, new, beside(ClaimPhase::Parked)),
+            Ok(())
+        );
+        assert_eq!(
+            fits_every_domain(&domains, new, beside(ClaimPhase::Ready)),
+            Err("insufficient_device_memory")
+        );
+        // Host RAM binds too: the system domain is its own budget.
+        let mut tight = domains.clone();
+        tight.get_mut("system").unwrap().managed_limit = 8 * GIB - 1;
+        assert_eq!(
+            fits_every_domain(&tight, new, beside(ClaimPhase::Parked)),
+            Err("insufficient_memory")
+        );
+        assert_eq!(
+            fits_every_domain(&Default::default(), new, beside(ClaimPhase::Parked)),
+            Err("unauthorized")
+        );
     }
 }

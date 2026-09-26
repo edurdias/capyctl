@@ -1,6 +1,10 @@
-//! SPEC §§9.1, 10, 13.2: vLLM's persisted residency steps for a deep park.
+//! SPEC §§9.1, 10, 13.2: vLLM's persisted residency steps for a park.
 //!
-//! A level-2 park discards weights and KV while the process group stays owned.
+//! A level-2 (`deep`) park discards weights and KV while the process group
+//! stays owned. A level-1 (`host_backed`, discrete GPU design §5) park copies
+//! the weights to pinned host RAM and drops KV; its `Park` calls
+//! `POST /sleep?level=1`, and its `ReloadWeights` makes no engine call (the
+//! weights wake already copied them back), so the step sequence is the same.
 //! Restoration follows SPEC §9.1 in order, one persisted step each, so every
 //! step carries its own evidence and a failure names where it stopped:
 //!
@@ -29,9 +33,15 @@ use crate::vllm::{
 };
 use mllm_domain::completion::{EffectObservation, ExecutionIdentities, Milestone};
 
-/// The deep park level. `host_backed` (level 1) is refused on unified pools by
-/// resolution (ADR 0010 decision 5) and is not driven here.
-const DEEP_LEVEL: u8 = 2;
+/// ADR 0010, ADR 0019: the park level follows the deployment's declared
+/// residency, fixed at launch; it is never chosen at park time. `host_backed`
+/// is refused on unified pools by resolution (ADR 0010 decision 5), so level 1
+/// runs only where device and host memory are distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkLevel {
+    HostBacked = 1,
+    Deep = 2,
+}
 
 fn now_ms() -> Result<i64, RuntimeError> {
     std::time::SystemTime::now()
@@ -112,7 +122,7 @@ async fn step(
     };
     let fact = match command.action {
         RuntimeAction::Park => {
-            http.sleep(DEEP_LEVEL)
+            http.sleep(adapter.park_level() as u8)
                 .await
                 .map_err(|e| uncertain("sleep", e))?;
             // The acknowledgement alone is not the post-condition.
@@ -135,11 +145,20 @@ async fn step(
             Milestone::AllocationsRestored
         }
         RuntimeAction::ReloadWeights => {
-            // Collective control, invoked exactly once through the lead (SPEC §11).
-            http.collective_rpc()
-                .await
-                .map_err(|e| uncertain("reload_weights", e))?;
-            Milestone::WeightsUsable
+            if adapter.park_level() == ParkLevel::HostBacked {
+                // Level 1 kept the weights in pinned host RAM and the weights
+                // wake copied them back: there is nothing to reload (vLLM
+                // sleep mode docs; discrete GPU design §5). The fresh probe
+                // after the last step still proves the model usable.
+                Milestone::WeightsUsable
+            } else {
+                // Collective control, invoked exactly once through the lead
+                // (SPEC §11).
+                http.collective_rpc()
+                    .await
+                    .map_err(|e| uncertain("reload_weights", e))?;
+                Milestone::WeightsUsable
+            }
         }
         RuntimeAction::InvalidateCache => {
             http.wake_tag(WakeTag::KvCache)

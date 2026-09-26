@@ -16,7 +16,7 @@
 #                            per OS/architecture supplies every role). mllm's
 #                            Python runtime helpers are compiled into it and
 #                            written to <state_dir>/runtime at role start
-#                            (owner decision 2026-09-24; SPEC §3.3).
+#                            (decided 2026-09-24; SPEC §3.3).
 #   packaging/systemd/       system and user service units (SPEC §4.3)
 #   docs/examples/           example role and deployment documents
 #   docs/operations/install.md
@@ -136,7 +136,12 @@ copy_tracked() {
 # The runtime helpers are not shipped as files: they are compiled into
 # bin/mllm (crates/mllm-agent/build.rs) and materialized owner-only at role
 # start (crates/mllm-agent/src/embedded_runtime.rs).
-copy_tracked 0644 packaging/systemd docs/examples docs/operations/install.md
+# The operator guides ship together: install.md links configuration.md and
+# network-access.md, and the units point at configuration.md (final review
+# I12); scripts/verify-packaging.sh checks every relative link resolves.
+copy_tracked 0644 packaging/systemd docs/examples docs/operations/install.md \
+  docs/operations/configuration.md docs/operations/network-access.md \
+  docs/operations/release-notes-0.1.0.md
 
 if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l \) -print -quit | grep -q .; then
   echo "staged tree contains bytecode or symlinks" >&2

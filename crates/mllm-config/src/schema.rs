@@ -138,6 +138,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ),
             ]),
         ),
+        // Owner rule 2026-09-25: the engines' port range, as on a host.
+        (
+            "endpoint_port_range",
+            FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
+        ),
     ];
     const DEVICE: FieldSpec = FieldSpec::Struct(&[("id", SCALAR), ("sharing", SCALAR)]);
     const ALLOCATION: FieldSpec = FieldSpec::Struct(&[
@@ -190,13 +195,20 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             FieldSpec::Struct(&[("url", SCALAR), ("sha256", SCALAR), ("archive", SCALAR)]),
         ),
     ]);
-    // ADR 0008: remote model sources are denied unless the host opts in.
+    // ADR 0008 (owner decision 2026-09-25): remote model sources are allowed
+    // by default; a host states `denied` (or `disabled`) to turn one off.
+    // `path` names the sources store (default: the models directory, so
+    // downloads live in `<model_store>/sources`).
     const MODEL_SOURCES: FieldSpec = FieldSpec::Struct(&[
         ("huggingface", SCALAR),
         ("http", SCALAR),
         ("max_bytes", BYTES),
         ("allowed_hosts", FieldSpec::Seq(&SCALAR)),
         ("huggingface_endpoint", SCALAR),
+        ("path", SCALAR),
+        // Owner rule 2026-09-25: the protected file holding the host's
+        // Hugging Face token (a secret is a file or a variable, never a flag).
+        ("huggingface_token_file", SCALAR),
     ]);
     const MODEL: &[(&str, FieldSpec)] = &[
         // Spec §7: `path` predates `source` and still means a local source.
@@ -208,12 +220,30 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     // Spec §7: the directory a host keeps model weights under. A host states it
     // once; a deployment's relative local path is resolved against it.
     const MODEL_STORE: FieldSpec = FieldSpec::RequiredStruct(&[("path", SCALAR)]);
+    // Owner rule 2026-09-25 (`crate::engine_settings`): the role's own engine
+    // installation, the YAML form of `--vllm-bin` / `MLLM_VLLM_BIN` and the
+    // rest; published as the runtime profile `local`.
+    const LOCAL_ENGINE: FieldSpec = FieldSpec::Struct(&[
+        ("vllm", SCALAR),
+        ("sglang", SCALAR),
+        ("build_fingerprint", SCALAR),
+        ("args", FieldSpec::Seq(&SCALAR)),
+        ("kv_cache", BYTES),
+        ("deep_park", SCALAR),
+        ("trust_remote_code", SCALAR),
+        ("installation_drift", SCALAR),
+        // SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit
+        // of the role's own installation, published as its `cuda_home`.
+        ("cuda_home", SCALAR),
+    ]);
     const DOMAIN: FieldSpec = FieldSpec::Struct(&[
         ("managed_limit", BYTES),
         ("free_reserve", BYTES),
         ("host_kv_limit", BYTES),
         ("parked_limit", BYTES),
         ("memory", SCALAR),
+        // ADR 0019: the device a `device` domain's memory belongs to.
+        ("device", SCALAR),
     ]);
     const HOST_DEVICE: FieldSpec = FieldSpec::Struct(&[
         ("domain", SCALAR),
@@ -308,6 +338,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("args", FieldSpec::Seq(&SCALAR)),
         ("launch_settings", FieldSpec::Moved(LAUNCH_SETTINGS_MOVED)),
         ("env", FieldSpec::MapOf(&SCALAR)),
+        // SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit
+        // the engine's JIT compilers use; `<cuda_home>/bin` joins its PATH.
+        ("cuda_home", SCALAR),
         ("security", FieldSpec::Struct(SECURITY)),
         (
             "log_policy",
@@ -338,9 +371,14 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("name", SCALAR),
         ("state_dir", SCALAR),
         ("connection", SCALAR),
-        // Spec §7: allowed here so a standalone document can carry the store the
-        // host block is translated into; the generated default does not set one yet.
+        // Owner decision 2026-09-25: the models directory (default
+        // `~/models`) and the model-source policy, as on a host.
         ("model_store", MODEL_STORE),
+        ("model_sources", MODEL_SOURCES),
+        // Owner rule 2026-09-25: the engine installation and the runtime
+        // directory, as on a host.
+        ("local_engine", LOCAL_ENGINE),
+        ("runtime_dir", SCALAR),
         ("resource_policy", FieldSpec::Struct(RESOURCE_POLICY)),
         // Emitted empty by the generator; empty allowlist accepts `{}`
         // only until profile shapes are specified.
@@ -389,10 +427,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
             ],
         },
         ConfigKind::Host => &KindSchema {
-            // Spec §7: the model store is required, not defaulted. Guessing a
-            // directory would make a relative model path resolve somewhere the
-            // operator never named.
-            required: &["schema_version", "kind", "name", "model_store"],
+            // Owner decision 2026-09-25: the model store defaults to
+            // `~/models` (or `--models-root`, `MLLM_MODELS_ROOT`); the role
+            // states the resolved directory in the document it publishes.
+            required: &["schema_version", "kind", "name"],
             fields: &[
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
@@ -402,6 +440,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("state_dir", SCALAR),
                 ("identity_dir", SCALAR),
                 ("runtime_dir", SCALAR),
+                ("local_engine", LOCAL_ENGINE),
                 (
                     "ingress",
                     FieldSpec::Struct(&[
@@ -470,6 +509,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("schema_version", SCALAR),
                 ("kind", SCALAR),
                 ("name", SCALAR),
+                // Owner decision 2026-09-25: the state root, as `--state-dir`
+                // and `MLLM_STATE_DIR` name it (they win over it).
+                ("state_dir", SCALAR),
                 ("server", FieldSpec::Struct(STANDALONE_SERVER)),
                 ("host", FieldSpec::Struct(STANDALONE_HOST)),
                 ("shutdown", FieldSpec::Struct(SHUTDOWN)),

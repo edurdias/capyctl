@@ -197,7 +197,10 @@ message ReportInventory {
 }
 message DomainObservation {
   string domain_id = 1;        // stable local identity
-  string kind = 2;             // system | device_memory | filesystem | remote_storage
+  // system | device | device_memory | filesystem | remote_storage. `device`
+  // (ADR 0019, capability `device_memory_domains`): a discrete GPU's own
+  // memory, read from that GPU, never from host RAM.
+  string kind = 2;
   int64  observed_bytes = 3;   // -1 = unknown (closes admission upstream)
   int64  observed_at_unix = 4;
   int64 capacity_bytes = 5;
@@ -208,12 +211,24 @@ message DomainObservation {
   // server credits it to an owner only by matching the identity of a runtime
   // it recorded, and only as a lower bound. Empty from an older host.
   repeated ProcessResidency residents = 8;
+  // ADR 0019 (additive, capability `device_memory_domains`): the device a
+  // `device` domain reads, by its host-local id (`gpuN`). Empty otherwise.
+  string device_id = 9;
 }
 message ProcessResidency {
   uint32 pid = 1;
   string boot_id = 2;
   uint64 start_ticks = 3;
+  // `device_bytes + host_bytes`: the credit on a unified domain, and the only
+  // figure an older host reports.
   int64 resident_bytes = 4;
+  // ADR 0019 (additive, capability `device_memory_domains`): the GPU memory
+  // the driver attributes to the process (credited on a `device` domain) and
+  // its anonymous resident pages (credited on a `distinct` system domain).
+  // Both 0 from an older host: such a host's residents credit a unified
+  // domain only, through `resident_bytes`.
+  int64 device_bytes = 5;
+  int64 host_bytes = 6;
 }
 message RuntimeProfileStatus {
   string name = 1;

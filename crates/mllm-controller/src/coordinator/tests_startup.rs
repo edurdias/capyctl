@@ -5,6 +5,10 @@
 //! availability source. Nothing here runs or qualifies a native engine, and
 //! the peaks are the script's, not measurements of any model.
 use super::*;
+
+/// The engine's CUDA context and graphs, charged beside the request on every
+/// host shape (re-review parity rule).
+const OVERHEAD: i64 = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
 use mllm_domain::resources::PhaseFootprint;
 use std::sync::atomic::AtomicI64;
 
@@ -431,7 +435,7 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     // The placeholder: weights unknown, so the startup peak is the request.
     assert_eq!(
         footprint(&owner, &fence.deployment_id).unwrap().allocations[0].bytes,
-        8 * GIB
+        8 * GIB + OVERHEAD
     );
     // The engine's load drops availability by 12 GiB, then it settles.
     available.store(baseline - 12 * GIB, Ordering::SeqCst);
@@ -456,7 +460,7 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     assert_eq!(peak(&sql), Some(12 * GIB));
     let held = footprint(&owner, &fence.deployment_id).unwrap();
     assert_eq!(held.phase, ResourcePhase::Ready);
-    assert_eq!(held.allocations[0].bytes, 8 * GIB);
+    assert_eq!(held.allocations[0].bytes, 8 * GIB + OVERHEAD);
 
     // Stop, then start again through placement: the measured peak is reused.
     available.store(baseline, Ordering::SeqCst);
@@ -489,7 +493,7 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     assert_eq!(instance["provenance"], "measured");
     let deployment = serde_json::to_value(status.startup.as_ref().unwrap()).unwrap();
     assert_eq!(deployment["provenance"], "default");
-    assert_eq!(deployment["bytes"], 8 * GIB);
+    assert_eq!(deployment["bytes"], 8 * GIB + OVERHEAD);
     assert_eq!(deployment["measured"][0]["peak_bytes"], 12 * GIB);
     again.release.add_permits(1);
     until("the second start to reach Ready", || {
@@ -499,7 +503,7 @@ async fn a_measured_startup_peak_is_recorded_and_reused() {
     .await;
     assert_eq!(
         footprint(&owner, &fence.deployment_id).unwrap().allocations[0].bytes,
-        8 * GIB
+        8 * GIB + OVERHEAD
     );
     assert_eq!(w.status(), WorkerStatus::Running);
     w.shutdown().await.unwrap();
@@ -669,7 +673,7 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     assert!(footprint(&owner, &id).is_none());
     let before = serde_json::to_value(status(&owner).startup.unwrap()).unwrap();
     assert_eq!(before["provenance"], "default");
-    assert_eq!(before["bytes"], 40 * GIB);
+    assert_eq!(before["bytes"], 40 * GIB + OVERHEAD);
 
     // Alone on the host it starts and holds the whole managed limit.
     let stop = w.stop("owner", &fence, "stop-small", 60_000).unwrap();
@@ -698,7 +702,7 @@ async fn an_unmeasured_model_above_the_managed_limit_starts_alone_and_is_measure
     .await;
     assert_eq!(
         footprint(&owner, &id).unwrap().allocations[0].bytes,
-        32 * GIB
+        32 * GIB + OVERHEAD
     );
     let sql = rusqlite::Connection::open(dir.path().join("srv.sqlite3")).unwrap();
     let peak = |sql: &rusqlite::Connection| -> Option<i64> {
@@ -789,7 +793,7 @@ async fn weights_sized_while_the_digest_is_pending_trigger_the_solo_first_start(
             .unwrap();
         serde_json::to_value(d.startup.unwrap()).unwrap()
     };
-    assert_eq!(startup(&owner)["bytes"], 30 * GIB);
+    assert_eq!(startup(&owner)["bytes"], 30 * GIB + OVERHEAD);
     // The host sized 24 GiB of weights; the digest itself is still pending.
     {
         let o = owner.lock().unwrap();

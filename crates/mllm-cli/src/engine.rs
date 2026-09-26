@@ -2,7 +2,7 @@
 //! standalone. Detection reads metadata only; an installation runs only
 //! after the operator named or picked it.
 mod target;
-pub use target::{named_role_document, resolve_target, role_engines, RoleKind, Target};
+pub use target::{absolute, named_role_document, resolve_target, role_engines, RoleKind, Target};
 
 use crate::grammar::{Command, DeepParkChoice, DriftChoice};
 use crate::output::StructuredError;
@@ -246,6 +246,14 @@ fn role_document(target: &Target) -> Result<Value, StructuredError> {
 }
 
 /// Profiles the operator declared in the role document itself.
+/// Whether `name` is registered in engines.yaml or declared in the role
+/// document (an older host may have registered a profile named `local`).
+fn registered_or_declared(target: &Target, name: &str) -> Result<bool, StructuredError> {
+    let engines =
+        EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
+    Ok(engines.profiles.contains_key(name) || declared_by_operator(target)?.contains_key(name))
+}
+
 fn declared_by_operator(
     target: &Target,
 ) -> Result<serde_json::Map<String, Value>, StructuredError> {
@@ -301,8 +309,10 @@ async fn add(
             format!("profile name {name:?} must be lowercase letters, digits, '-' or '_'"),
         ));
     }
-    if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the MLLM_VLLM_BIN / MLLM_SGLANG_BIN installation; use --name")));
+    // Owner rule 2026-09-25: on a host as in standalone, these names are the
+    // role's own installation (`local_engine`, `--vllm-bin`, `MLLM_VLLM_BIN`).
+    if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin, MLLM_VLLM_BIN / MLLM_SGLANG_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
     let existing =
@@ -338,6 +348,11 @@ async fn add(
             DriftChoice::Refuse => InstallationDrift::Refuse,
         },
         args: args.to_vec(),
+        // SPEC §13.3 amendment (owner decision 2026-09-25).
+        cuda_home: mllm_config::registration::detect_cuda_home(
+            std::env::var("CUDA_HOME").ok().as_deref(),
+            |nvcc| nvcc.is_file(),
+        ),
     };
     let revision = write_profile(target, &name, &spec)?;
     let mut out = json!({
@@ -346,6 +361,7 @@ async fn add(
         "fingerprint": registration.fingerprint.map(|f| json!({"version": f.version, "digest": f.digest})),
         "deep_park": if deep { "enabled" } else { "disabled" }, "deep_park_probe": probe,
         "engines_file": target.engines, "revision": revision,
+        "cuda_home": spec.cuda_home,
     });
     match request(&target.socket, &ControlRequest::Add, ADD_REPLY).await {
         Ok(reply) if reply["ok"] == true => {
@@ -359,6 +375,25 @@ async fn add(
                 reply["message"].as_str().unwrap_or("refused")
             ),
         )),
+        // Owner decision 2026-09-25 (first-run walk): no role is running,
+        // which is the normal first run (standalone refuses to start with no
+        // engine). The profile is saved and the role publishes it when it
+        // starts, so this is a success with a notice, not an error. SPEC §8,
+        // ADR 0018 §3.
+        Err(ClientError::NotRunning(_)) => {
+            out["published"] = json!("role_not_running");
+            out["notice"] = json!(format!(
+                "saved to {} (revision {revision}); start mllm (`{}`) to use it",
+                target.engines.display(),
+                match target.kind {
+                    RoleKind::Standalone => "mllm start standalone",
+                    RoleKind::Host => "mllm start host",
+                }
+            ));
+            Ok(out)
+        }
+        // A role is there but did not take or answer the request: that is a
+        // fault the operator must look at.
         Err(e) => Err(error(
             "agent_unreachable",
             format!(
@@ -446,9 +481,9 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
 /// resumes the same retirement (review decision I1), so a crash between the
 /// confirmation and the write is finished by running remove again.
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
-    if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name) {
+    if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from MLLM_VLLM_BIN / MLLM_SGLANG_BIN; unset the variable and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin, MLLM_VLLM_BIN / MLLM_SGLANG_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     let engines =

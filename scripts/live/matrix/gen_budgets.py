@@ -39,13 +39,18 @@ ANCHOR = "27f"  # D5 catalog anchor, qwen3.8-27b-nvfp4
 def load_models(measured_path=None):
     with open(os.path.join(HERE, "models.json")) as handle:
         catalog = json.load(handle)
-    models = {}
-    for key, spec in catalog["models"].items():
-        if "extends" in spec:
-            merged = dict(catalog["models"][spec["extends"]])
-            merged.update({k: v for k, v in spec.items() if k != "extends"})
-            spec = merged
-        models[key] = dict(spec)
+    def resolve(key, seen=()):
+        # `extends` chains (2026-09-25: 27bm extends 27b, which extends 27f).
+        if key in seen:
+            sys.exit(f"models.json: extends cycle through {key}")
+        spec = catalog["models"][key]
+        if "extends" not in spec:
+            return dict(spec)
+        merged = resolve(spec["extends"], seen + (key,))
+        merged.update({k: v for k, v in spec.items() if k != "extends"})
+        return merged
+
+    models = {key: resolve(key) for key in catalog["models"]}
     if measured_path:
         with open(measured_path) as handle:
             measured = json.load(handle)

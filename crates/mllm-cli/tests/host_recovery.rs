@@ -123,7 +123,7 @@ fn alive(pid: i32) -> bool {
 }
 
 fn command(state: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .env("MLLM_STATE_DIR", state)
         .env_remove("MLLM_VLLM_BIN")

@@ -29,7 +29,7 @@ pub use fake_launcher::FakeLauncher;
 pub use lifecycle::FakeFault;
 pub use provider::{
     fake_bindings, fake_bindings_with_members, fake_installation, fake_provider,
-    fake_tools_factory, live_identity, spawn_fake_coordinator,
+    fake_tools_factory, live_identity, spawn_fake_coordinator, NO_NETWORK_ORIGIN,
 };
 pub use scripted_tool::ScriptedTool;
 
@@ -53,6 +53,8 @@ pub fn vllm_launch_settings() -> LaunchSettings {
             margin_bytes: 8 << 30,
             weights_bytes: None,
             startup_bytes: None,
+            device_total_bytes: None,
+            overhead_bytes: None,
         },
         block_size_tokens: None,
         max_num_batched_tokens: None,
@@ -84,6 +86,8 @@ pub fn sglang_launch_settings() -> SglangLaunchSettings {
             margin_bytes: 8 << 30,
             weights_bytes: None,
             startup_bytes: None,
+            device_total_bytes: None,
+            overhead_bytes: None,
         },
         max_total_tokens: None,
         chunked_prefill_size: None,

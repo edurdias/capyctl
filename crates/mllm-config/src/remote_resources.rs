@@ -44,6 +44,11 @@ pub fn scope_host_document(host_id: &str, raw: &Value) -> Result<Value, ConfigEr
             if kind == "devices" {
                 let local = value["domain"].as_str().ok_or_else(invalid)?;
                 value["domain"] = ledger_key(host_id, "domain", local).into();
+            } else if let Some(device) = value.get("device").filter(|d| !d.is_null()) {
+                // ADR 0019: a device domain names its device, which is scoped
+                // with every other device id so the pair still matches.
+                let local = device.as_str().ok_or_else(invalid)?;
+                value["device"] = ledger_key(host_id, "device", local).into();
             }
             target.insert(
                 ledger_key(

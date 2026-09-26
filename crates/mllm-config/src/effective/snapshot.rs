@@ -69,6 +69,18 @@ pub(super) fn snapshot_inputs(
         "request_deadline": quantity(&value["request_deadline_ms"], "ms")?,
         "engine_config": engine_config,
     });
+    // Owner decision 2026-09-25: a residency mllm chose is chosen again from
+    // the same host and facts (or from newly measured weights on a
+    // re-resolution), and the exact-equality check below proves the claim.
+    if value["engine_config"]["provenance"]
+        .get("residency")
+        .is_some()
+    {
+        deployment
+            .as_object_mut()
+            .expect("deployment is an object")
+            .remove("residency");
+    }
     // ADR 0014 §5: derived phases are re-derived rather than declared, so the
     // exact-equality check below proves the snapshot's claim.
     if resources_derived {
@@ -263,6 +275,9 @@ pub(super) fn declared_engine_config(
             // Owner decision 2026-09-23: a snapshot frozen before the startup
             // budget re-resolves with its cold phase equal to the request.
             legacy_startup: memory.get("startup_bytes").is_none(),
+            // Re-review parity rule: a snapshot frozen before the engine's
+            // CUDA context was charged re-derives without it.
+            legacy_overhead: memory.get("overhead_bytes").is_none(),
         },
     ))
 }

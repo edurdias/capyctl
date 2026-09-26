@@ -4,6 +4,9 @@ This guide covers installing a release with `install.sh`, running each role
 under systemd, upgrading, and rolling back. mllm is one executable per OS and
 architecture; each role runs in the foreground under a service manager.
 
+Every setting mllm reads, with its YAML field, flag and environment variable,
+is listed in the [settings reference](configuration.md).
+
 ## Restart is not drain
 
 Read this before anything else.
@@ -94,7 +97,8 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 |---|---|---|---|
 | 2 | Invalid configuration | all | Fix the role document (`mllm validate config`). |
 | 3 | Unauthorized | all | Fix the identity or credentials. |
-| 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`) | all | The newer binary or a restored backup (see "State and migrations"). |
+| 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`) or has no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, or wait for the GPU to be observed. |
+| 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
 | 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `mllm engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `mllm engine detect --path DIR`. |
@@ -103,7 +107,7 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 | 19 | The profile name is taken (`profile_exists`) | none | Use `--name`, or remove the existing profile first. |
 | 20 | Removal or replacement would affect the listed deployments (`profile_in_use`) | none | Stop them, or rerun with `--drain`. |
 | 21 | The server refused the re-published document (`publish_rejected`); its reason follows | none | Fix what the reason names. The profile stays in `engines.yaml`, shown as not published. |
-| 22 | The role's control socket did not answer (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role starts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
+| 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 | 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
 
@@ -176,8 +180,18 @@ tarball and the installer locally.
 
 ## Installing with install.sh
 
-The project site serves the installer; each release also publishes a copy
-beside its tarballs. It downloads the release from GitHub with `curl`:
+Release candidates are published as pre-releases on the GitHub Releases page
+of the private repository `edurdias/mllm` (decided
+2026-09-24; the repository opens later). Two things follow:
+
+- **You need a credential.** Run `gh auth login` first (preferred), or export
+  `GITHUB_TOKEN` with read access to the repository. Without one, neither the
+  download of `install.sh` nor the installer itself can reach the release.
+- **You must pass `--version`.** GitHub's "latest release" never resolves to a
+  pre-release or a draft, so while only release candidates exist the
+  installer cannot find one on its own. Name it, for example
+  `--version v0.1.0-rc.4` (the leading `v` is optional). Without it the
+  installer stops and says so.
 
 ```bash
 # As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
@@ -342,6 +356,7 @@ sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/host \
 install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/host.yaml
 # Edit /etc/mllm/host.yaml: name, model_store, ingress, resource_policy,
 # runtime_profiles (see docs/examples/host.yaml). Leave runtime_dir out.
+# model_store and model_sources are optional (see "Models and downloads").
 mllm validate config --file /etc/mllm/host.yaml
 
 # Enroll with an invitation created on the server (`mllm invite host`).
@@ -358,12 +373,16 @@ from a directory you maintain yourself.
 Without `--config`, `mllm start standalone` loads its role document from
 `<MLLM_STATE_DIR>/config/standalone.yaml`, generating it (and the protected
 credentials) on first start, and writes the managed runtime to
-`<MLLM_STATE_DIR>/runtime`. Its engine installation always comes from the
-environment. Put that environment in `/etc/mllm/standalone.env`:
+`<MLLM_STATE_DIR>/runtime`. Its engine installation comes from a flag, the
+environment or the document's `host.local_engine` (see the
+[settings reference](configuration.md#engine-installation)); with the
+packaged unit the environment is simplest. Put it in
+`/etc/mllm/standalone.env`:
 
 ```bash
 # /etc/mllm/standalone.env (root:mllm 0640)
 MLLM_VLLM_BIN=/opt/vllm/bin/vllm
+# Optional: models are in ~/models of the service user unless named here.
 MLLM_MODELS_ROOT=/srv/models
 ```
 
@@ -372,8 +391,8 @@ systemctl enable --now mllm-standalone
 ```
 
 The unit sets `MLLM_STATE_DIR=/var/lib/mllm/standalone`. Operator commands must
-use the same state directory (and the same `MLLM_STANDALONE_MANAGEMENT_ADDR`,
-if set): `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm status deployment <id>`.
+use the same state directory (and the same `MLLM_MANAGEMENT_ADDR`, if the unit
+moves the management listener with the variable rather than the document): `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm status deployment <id>`.
 `MLLM_RUNTIME_DIR` (development) makes standalone run from that directory
 instead of the managed one.
 
@@ -393,9 +412,12 @@ Where each setting comes from, highest precedence first:
 |---|---|
 | Role document | `--config <file>`, else `$MLLM_CONFIG`, else `<state root>/config/standalone.yaml`, else generated there. |
 | Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_CONFIG_HOME/mllm/engines.yaml` (`~/.config/mllm/engines.yaml`). `mllm engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
-| State root | `MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
-| Listener addresses | `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR` for one run (loopback only), else `127.0.0.1:8443` / `127.0.0.1:7443`. The document may state only those defaults. |
-| Engine installation | The environment only (`MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN`, `MLLM_MODELS_ROOT`, ...). |
+| State root | `--state-dir`, else `MLLM_STATE_DIR`, else the top-level `state_dir` of the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
+| Listener addresses | Inference: `--listen`, else `MLLM_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `--management-listen`, else `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` is still read, with a warning), else `server.listeners.management.bind`, else `127.0.0.1:7443`; loopback only. |
+| Engine installation | `--vllm-bin` / `--sglang-bin` and the other engine flags, else `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` and the other variables, else `host.local_engine`, `host.runtime_dir` and `host.resource_policy.endpoint_port_range`; plus engines registered with `mllm engine add`. See the [settings reference](configuration.md#engine-installation). |
+| Models directory | `--models-root`, else `MLLM_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
+| Model downloads | `--model-sources` / `--model-sources-max`, else `MLLM_MODEL_SOURCES` / `MLLM_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
+| Any other setting of the document | `--set <path>=<value>`, else `MLLM_SET__<PATH>`, else the document, else its default. `mllm config show` prints every effective value and where it came from. See the [settings reference](configuration.md#any-setting-by-its-path). |
 | Drain bound, switching, observability | The role document in use. |
 
 The packaged units start standalone without `--config`, so an upgrade that
@@ -412,6 +434,36 @@ systemctl edit mllm-standalone
 #   ExecStart=mllm start standalone --config /etc/mllm/standalone.yaml
 systemctl restart mllm-standalone
 ```
+
+### Models and downloads
+
+Standalone and enrolled hosts resolve the same two settings by the same rule,
+highest precedence first: the flag on `mllm start standalone` or
+`mllm start host`, then the environment, then the YAML document (the host
+document, or the `host:` block of the standalone document), then the default.
+
+| Setting | Flag | Variable | YAML | Default |
+|---|---|---|---|---|
+| Models directory (relative model paths resolve here) | `--models-root <dir>` | `MLLM_MODELS_ROOT` | `model_store.path` | `~/models` |
+| Hugging Face and HTTP downloads | `--model-sources allowed\|disabled` | `MLLM_MODEL_SOURCES` | `model_sources.huggingface`, `model_sources.http` | `allowed` |
+| Cap on all downloaded models | `--model-sources-max <size>` | `MLLM_MODEL_SOURCES_MAX` | `model_sources.max_bytes` | `500GiB` |
+| Where downloads are kept | `--model-sources-path <dir>` | `MLLM_MODEL_SOURCES_PATH` | `model_sources.path` | the models directory (`~/models/sources`) |
+| Hugging Face endpoint | `--hf-endpoint <url>` | `MLLM_HF_ENDPOINT`, else `HF_ENDPOINT` | `model_sources.huggingface_endpoint` | `https://huggingface.co` |
+| Hugging Face token for a source that names none (never a flag) | | `MLLM_HF_TOKEN`, else `HF_TOKEN` | `model_sources.huggingface_token_file` | none |
+
+A deployment that names a pinned Hugging Face revision or an HTTP URL with its
+SHA-256 is downloaded by the host it is placed on, into
+`<downloads>/sources/...`, verified, and then started like a local checkpoint;
+`deploy model --activate --wait` waits for the download. Before a byte is
+written the host reserves the download's full size against the cap and against
+the free space of the filesystem, keeping 1 GiB free; a download that does not
+fit is refused (`too_large` or `insufficient_space`, shown by
+`mllm status deployment`). A document that states `huggingface: disabled` (or
+`denied`) keeps that kind off; `allowed_hosts` and `huggingface_endpoint` still
+narrow where downloads may come from. The role writes the values it resolved
+into the host document it publishes, so the server plans against exactly what
+the host enforces. `mllm prune sources --host-config <host.yaml>` reclaims
+downloads no deployment references.
 
 ### User services
 
@@ -446,6 +498,119 @@ wrote under `~/.config/mllm` back out, and reinstall. Observed with systemd
 User units carry no file-system sandboxing: `ProtectSystem=` and similar need
 privileges the per-user manager lacks (systemd.exec(5)). Prefer the system
 units on shared machines.
+
+## Discrete NVIDIA GPUs
+
+mllm runs on machines whose GPU has its own memory (a GeForce, RTX or data
+center card) as well as on unified-memory machines such as the GB10, where the
+GPU and the CPU share one pool. The rules are in
+ADR 0019 (`docs/design/adr/0019-discrete-gpu-and-network-endpoint.md` in the source repository).
+
+**Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
+(or `/bin/nvidia-smi`), which every driver package installs. mllm runs it with
+a cleared environment and a 3 s bound to read each GPU's index, UUID, PCI
+address and memory; it needs no other library. A machine that mixes an
+integrated and a discrete GPU is refused at start (`unsupported_gpu_topology`,
+exit 5).
+
+**What standalone detects.** At start, standalone reads `nvidia-smi`. A GPU
+that reports no memory of its own is integrated, and the machine keeps the
+single `unified` domain. Otherwise it publishes two kinds of memory domain:
+
+| Domain | Memory | Managed limit | Free reserve | Parked limit |
+|---|---|---|---|---|
+| `system` (`memory: distinct`) | host RAM | 50 % of RAM | 20 % of RAM | 25 % of RAM (host-KV 10 %) |
+| `gpuN` (`memory: device`), one per GPU | the card | total − reserve | the larger of 1 GiB and 8 % of the card | the smaller of 8 GiB and 25 % of the card |
+
+The reserve on the card leaves room for a desktop session on a workstation
+GPU. Memory other programs already hold on the card lowers what mllm sees as
+available; it is never hidden. An enrolled host states the same shape in its
+document ([`examples/host-discrete.yaml`](../examples/host-discrete.yaml)), and
+the host refuses to start if a `device` domain does not match the GPU it
+observes (`device_policy_mismatch`, exit 2).
+
+**Both domains are charged.** Every deployment on a discrete GPU is charged on
+the card (weights, KV cache, and the engine's CUDA context and graphs, 1.25 GiB
+until measured) and in host RAM (the engine process itself, 4 GiB until
+measured). A deployment that states no memory is sized from its checkpoint:
+`weights × 1.10` plus a KV cache of `min(4 GiB, 25 % of the card's managed
+limit)`. A vLLM deployment asks for at least 75 % of the card, because vLLM
+0.29 with CUDA graphs does not start a 4B model on a 16 GB card below
+`--gpu-memory-utilization 0.75`; for the same reason vLLM needs a card of
+about 10 GiB or more. On a smaller card the host still starts, and each vLLM
+deployment is refused with `insufficient_device_memory` and its numbers. A deployment that lists `resources:` itself must
+name the `system` domain as well as the GPU's (`missing_system_allocation`
+otherwise); leaving them out and letting mllm derive them is the portable form.
+
+**One GPU per model; mllm picks it.** On a machine with several GPUs, each GPU
+is its own domain. mllm places a new instance on the GPU where it fits with the
+most room, and when none has room it parks or stops models on the GPU where the
+fewest need to go. A stopped instance returns to its last GPU when it fits
+there. To pin a GPU, name it in the deployment:
+
+```yaml
+devices: [{id: gpu1}]
+```
+
+The claim takes the sharing the host states for that GPU; add
+`sharing: exclusive` (or `shared`) to state it yourself.
+
+`gpuN` is the driver's index at start (`nvidia-smi -L`). The engine is started
+with only that GPU visible: `CUDA_VISIBLE_DEVICES` set to the GPU's UUID, or to
+its index with `CUDA_DEVICE_ORDER=PCI_BUS_ID` when no UUID is known. A
+deployment that names two GPUs, or asks for tensor parallelism, is refused
+(`multi_gpu_unsupported`, exit 5): one GPU per model in 0.1.0. An instance
+started through a path that does not place it runs on the lowest-index GPU.
+
+**Residency tiers.** A deployment parks in one of three ways (its
+`residency`):
+
+| Tier | Park | Wake | Host RAM while parked |
+|---|---|---|---|
+| `host_backed` | the weights are copied to pinned host RAM | copied back to the card | the weights copy |
+| `deep` | the weights are dropped | reloaded from disk | the engine process only |
+| `restart_only` | never parks: the engine is stopped | a cold start | none |
+
+`host_backed` is the default on a discrete GPU, because a wake from host RAM is
+several times faster than a reload from disk. mllm chooses it when the copy
+plus the engine process fits the `system` domain's parked limit, and `deep`
+otherwise (also while a downloaded model's size is not known yet);
+`restart_only` when the engine's deep parking is off. The copy is charged in
+host RAM at 1.5 times the weights (pinned memory is rounded up; vLLM 0.29
+measured 1.37 times), for the engine's whole life: SGLang keeps its backup,
+and vLLM keeps the pinned memory after a wake. When a model must make room and
+its copy no longer fits in host RAM (or a `deep` model's parked residue no
+longer fits on the card beside the model being started), it is stopped rather
+than parked, and the switch record says `released: stopped (no room to park)`; a park the switch
+planned that host memory cannot take when it is sent (other programs hold the
+RAM) is refused and the model is stopped instead. An engine build without parking support
+refuses a `host_backed` or `deep` launch with `capability_missing:deep_park`,
+and so does an SGLang ModelOpt (NVFP4) checkpoint: its wake is not proven yet,
+so choose `restart_only` for it. On a unified machine `host_backed` is refused
+(`host_backed_unavailable`, exit 5): the copy would come out of the same
+memory it is supposed to free.
+
+**`insufficient_device_memory`** (exit 4) means the GPU cannot hold the
+deployment's card allocation plus its reserve: at deploy, when the size mllm
+derived from the checkpoint is larger than the card's managed limit, or at
+launch, when the card has less free memory than the allocation needs (another
+program may be holding it). Use a smaller or quantized checkpoint, a smaller KV
+cache, or free the card. **`device_unobserved`** (exit 4) means `nvidia-smi`
+gave no fresh reading for that GPU; nothing new starts on it until it does, and
+running models keep their accounting.
+
+An enrolled host with a discrete GPU needs this release on both the server
+and the host. The host declares the capability `device_memory_domains`; the
+server never places a deployment charged on a GPU's domain on a host that does
+not, and reports `host_capability_missing:device_memory_domains` instead.
+Unified-memory hosts need nothing new.
+
+## Network access
+
+The inference endpoint listens on `0.0.0.0:8443` and requires the API key.
+[Network access](network-access.md) shows where the key is, how to narrow the
+address to loopback or a Tailscale address, how to turn the key off (and why
+not to), and how to put a TLS reverse proxy in front for the internet.
 
 ## Command output
 
@@ -518,6 +683,23 @@ In standalone, `MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN` alone gives the profile
 `local`; both give `local-vllm` and `local-sglang`. Profiles you add coexist
 with them.
 
+**CUDA toolkit and compile jobs.** Engines compile some GPU kernels the first
+time they start. `mllm engine add` records the CUDA toolkit as the profile's
+`cuda_home`: `CUDA_HOME` if it holds `bin/nvcc`, otherwise `/usr/local/cuda`
+if that holds it. For the role's own installation (`--vllm-bin`,
+`MLLM_VLLM_BIN` or `local_engine`, on a host or standalone), state it with
+`--cuda-home`, `MLLM_CUDA_HOME` or `local_engine.cuda_home`; nothing is
+detected for it. The engine then gets `<cuda_home>/bin` on its PATH and
+`CUDA_HOME` set; vLLM uses FlashInfer only when `nvcc` is found. Without
+`cuda_home`, the engine PATH has only the engine's own `bin` and the system
+directories.
+
+Each compile job can take several GB. mllm sets `MAX_JOBS` to the free memory
+at launch divided by 8 GiB, at most the CPU count, and
+`FLASHINFER_NVCC_THREADS=1`. The host log prints the chosen value at every
+launch. To choose other limits, put `MAX_JOBS` or `FLASHINFER_NVCC_THREADS`
+(positive integers) in the profile's `env`.
+
 **With the system units, run `mllm engine` as root with the unit's
 `--config`.** The host unit reads `/etc/mllm/host.yaml`, so its `engines.yaml`
 is `/etc/mllm/engines.yaml`. `/etc/mllm` is root's (mode 0750, group `mllm`),
@@ -543,11 +725,19 @@ starts without `--config`, so its `engines.yaml` is the service user's
 `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm engine add …`.
 
 `engine add` also works before any role has ever started — the first-run path
-of adding an engine, then starting the role for the first time. It creates the
-state directory the role will use (owner-only, mode 0700) if it does not exist
-yet, writes `engines.yaml`, and reports `agent_unreachable`, since nothing is
-listening to publish it live; the profile takes effect at the role's first
-start.
+of adding an engine, then starting the role for the first time (standalone
+refuses to start with no engine). It creates the state directory the role will
+use (owner-only, mode 0700) if it does not exist yet, writes `engines.yaml`, and
+exits 0 with `published: role_not_running` and the line `saved to
+<engines.yaml> (revision N); start mllm (…) to use it`: no role is running (no
+control socket, or a stale one nobody listens on), so the profile takes effect
+at the role's first start. Only a role that is running but does not take or
+answer the request exits 22 (`agent_unreachable`).
+
+`--config` and `$MLLM_CONFIG` may be relative: every command and role resolves
+them against its working directory first, so `mllm engine add … --config
+host.yaml` run beside `host.yaml` writes the `engines.yaml` next to it and asks
+the running role to publish it.
 
 ## Hardening in the units
 
@@ -635,6 +825,51 @@ After a restart, check that each deployment is back to its prior state
 (`mllm status deployment <id>`). If one is not, read its status reason before
 acting on it.
 
+### Upgrading to 0.1.0
+
+The inference endpoint now listens on all interfaces, `0.0.0.0:8443`, and
+still requires the API key. At the first start of 0.1.0, a server or
+standalone document whose inference bind is exactly `127.0.0.1:8443` (the
+default earlier releases generated) is updated once to `0.0.0.0:8443`. The
+original is kept beside it as `<file>.pre-0.1.0`, with the same mode, and the
+start prints:
+
+```
+NOTICE: mllm 0.1.0 serves inference on all interfaces: 0.0.0.0:8443 (was 127.0.0.1:8443).
+The API key is still required. Configuration updated: <path> (previous copy: <path>.pre-0.1.0).
+To keep inference local, start with --listen 127.0.0.1:8443 or set listeners.inference.bind.
+```
+
+The marker `<state dir>/migrations/inference-bind-v1` records that this ran, so
+it never runs again; any other address, and the authentication setting, are
+never touched. A document the role cannot rewrite (a read-only `/etc/mllm`,
+for example, or one where the address appears more than once) is left
+unchanged; the role serves on `0.0.0.0:8443` and prints
+`config_migration_failed` with the line to edit. The migration then stays
+pending: every later start that still finds `127.0.0.1:8443` in the unchanged
+document serves on `0.0.0.0:8443` again and prints the warning, until the
+document states another address (or can be rewritten). The system units mount
+`/etc` read-only, so a server whose document is `/etc/mllm/server.yaml` takes
+this path; to keep it local, set another address there or start with
+`--listen 127.0.0.1:8443`.
+
+To narrow the address again, pick one:
+
+- keep inference on the machine: `--listen 127.0.0.1:8443`, or
+  `MLLM_INFERENCE_ADDR=127.0.0.1:8443` in the unit's `.env` file, or
+  `listeners.inference.bind: "127.0.0.1:8443"` in the document (under
+  `server:` in standalone);
+- limit it to your tailnet: the same, with the machine's Tailscale address
+  (`tailscale ip -4`).
+
+See [Network access](network-access.md) for the client key and a TLS reverse
+proxy. Two other defaults changed in 0.1.0 for every host and standalone:
+Hugging Face and HTTP model downloads are allowed (500 GiB cap, see "Models and
+downloads"), and relative model paths resolve under `~/models` unless the
+document or `MLLM_MODELS_ROOT` names a models directory. On a discrete GPU,
+deployments that state no residency now default to `host_backed` (see
+"Discrete NVIDIA GPUs").
+
 ## Rollback
 
 ```bash
@@ -671,5 +906,6 @@ know. So:
   requires re-enrollment, not a copied directory.
 
 Role documents under `/etc/mllm` are operator configuration; mllm never
-rewrites them. Validate them with the new binary
+rewrites them, with one exception: the one-time inference listener update
+described in "Upgrading to 0.1.0". Validate them with the new binary
 (`mllm validate config`) before restarting.

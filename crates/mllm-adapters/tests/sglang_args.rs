@@ -37,6 +37,7 @@ fn metadata(index: u16) -> NativeLaunchMetadata {
             device_id: "gpu0".into(),
             memory_domain: "uma".into(),
             physical_gpu_uuid: None,
+            cuda_pci_index: None,
         },
     }
 }
@@ -485,4 +486,33 @@ fn launcher_descriptors_must_be_distinct_nonstandard_and_exact_native_integers()
         )
         .unwrap();
     assert_eq!(command.argv[6], "2147483647");
+}
+
+/// Discrete GPU design §6 (ADR 0014 open issue 2): on a discrete device the
+/// entry sizes `mem_fraction_static` against the card's total, which the
+/// launching host states. The total rides the closed settings only when it is
+/// known, so a unified launch renders exactly as before. The static pool is
+/// the weights and the KV cache: design §3 sizes a device request as
+/// `weights x 1.10 + kv`, so the margin is a tenth of the weights share, not
+/// the unified placeholder that would leave the weights no room on a card.
+// T26
+#[test]
+fn a_device_total_rides_the_settings_only_when_known() {
+    let mut config = settings();
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config.clone())).unwrap();
+    let memory = public_args(&launch)["settings"]["memory"].clone();
+    assert!(memory.get("device_total_bytes").is_none(), "{memory}");
+    assert_eq!(memory["margin_bytes"].as_i64(), Some(8 << 30));
+    config.memory.device_total_bytes = Some(16376 << 20);
+    let launch = SglangLaunch::from_frozen(&frozen(metadata(1), config)).unwrap();
+    let memory = public_args(&launch)["settings"]["memory"].clone();
+    assert_eq!(memory["device_total_bytes"], 16376i64 << 20);
+    // Request 16 GiB, KV 4 GiB: weights x 1.10 = 12 GiB, margin 12 GiB / 11.
+    let margin = (12i64 << 30) / 11;
+    assert_eq!(memory["margin_bytes"].as_i64(), Some(margin));
+    assert_eq!(memory["static_bytes"].as_i64(), Some((16 << 30) - margin));
+    // A total that is not a card's is refused, not rendered.
+    let mut config = settings();
+    config.memory.device_total_bytes = Some(0);
+    assert!(SglangLaunch::from_frozen(&frozen(metadata(1), config)).is_err());
 }

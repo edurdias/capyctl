@@ -522,6 +522,14 @@ impl HostJournal {
         }
         Ok(())
     }
+    /// Whether neither of the journal's locks is held at this moment. SPEC
+    /// §13.2: slow work (a GPU collector run, checkpoint hashing) runs outside
+    /// them; tests observe that from the slow work itself. Not an admission
+    /// input: the answer is stale as soon as it is returned.
+    #[doc(hidden)]
+    pub fn locks_free(&self) -> bool {
+        self.transition.try_lock().is_ok() && self.db.try_lock().is_ok()
+    }
     /// Call only after authenticated enrollment/session authorization and remote
     /// reconciliation. Every new stream fences all prior stream capabilities.
     pub fn connect(&self) -> Result<u64, JournalError> {

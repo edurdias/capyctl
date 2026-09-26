@@ -37,6 +37,7 @@ fn register(document: &std::path::Path, name: &str) {
             deep_park: false,
             installation_drift: mllm_config::effective::InstallationDrift::Warn,
             args: vec![],
+            cuda_home: None,
         }),
     );
     write_engines(&engines, &lock, None).unwrap();
@@ -77,11 +78,14 @@ async fn deploy(
             path: format!("/models/{name}"),
         },
         mllm_config::engine_policy::Engine::Vllm,
-        support::TEST_CAPACITY_BYTES,
+        &mllm_cli::standalone_config::TemplateMemory::Unified {
+            capacity_bytes: support::TEST_CAPACITY_BYTES,
+        },
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
         false,
         profile,
-    );
+    )
+    .expect("the unified template");
     let response = reqwest::Client::new()
         .post(format!("http://{address}/management/v1/deployments"))
         .bearer_auth(admin)

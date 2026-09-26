@@ -12,8 +12,6 @@ use std::{path::Path, time::Duration};
 // SPEC §6.3 (W6): `delete deployment --stop`.
 mod delete;
 
-const ENDPOINT: &str = "http://127.0.0.1:7443/management/v1";
-
 /// ADR 0014 amendment A1: the window used only against a server whose status
 /// does not report the deployment's timeouts (the previous fixed window).
 const LEGACY_WINDOW_MS: i64 = 900_000;
@@ -346,6 +344,86 @@ impl Management {
         }
     }
 
+    /// ADR 0014 §7 (WE3): a new checkpoint's digest is measured by a host
+    /// after the deploy is accepted, and activation waits for it
+    /// (`checkpoint_digest_pending`). `deploy model --activate` and `start
+    /// --wait` wait here for that measurement instead of being refused, so one
+    /// command starts a new checkpoint (found walking the guides 2026-09-25).
+    /// The wait is bounded by the start's own Initialize window (the
+    /// conservative pending value, or `--initialize-timeout`); nothing is
+    /// started if it expires. A digest that is recorded, mismatched or absent
+    /// ends the wait at once, and the start that follows decides. ADR 0008:
+    /// a declared remote source that is still downloading is waited for the
+    /// same way, within the same bound (owner decision 2026-09-25).
+    async fn await_activation_inputs(&self, id: &str) -> Result<(), StructuredError> {
+        let mut until: Option<(tokio::time::Instant, i64)> = None;
+        let mut backoff = FIRST_BACKOFF;
+        loop {
+            let snapshot = match self.exchange(Method::GET, "/snapshot", None).await {
+                Ok((status, snapshot)) if status.is_success() => snapshot,
+                // SPEC §6.4: a transient status failure is retried within the bound.
+                Ok((status, value))
+                    if until.is_some()
+                        && (matches!(status.as_u16(), 429 | 502 | 503 | 504)
+                            || value["error"]["retryable"] == true) =>
+                {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                Ok((status, value)) => return Err(refusal(status, &value)),
+                Err(failure) => return Err(failure),
+            };
+            backoff = FIRST_BACKOFF;
+            let current = deployment(&snapshot, id)?;
+            let digest = &current["checkpoint_digest"];
+            let digest_pending = digest["state"] == "pending" && digest["provisional"] == true;
+            // ADR 0008 (owner decision 2026-09-25): a declared remote source is
+            // waited for the same way; found live, `--activate --wait` was
+            // refused `model_source_pending` while the download ran.
+            let source_pending = model_source_pending(current);
+            if !digest_pending && !source_pending {
+                return Ok(());
+            }
+            let (deadline, window_ms) = match until {
+                Some(bound) => bound,
+                None => {
+                    let window_ms = window(current, "start", self.initialize_timeout_ms)?;
+                    let name = current["name"].as_str().unwrap_or(id);
+                    let what = if source_pending {
+                        format!("the model source of {name} to be downloaded and verified")
+                    } else {
+                        format!("the checkpoint digest of {name} to be measured")
+                    };
+                    eprintln!("Waiting for {what} (at most {}s)", window_ms / 1000);
+                    let bound = (
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(u64::try_from(window_ms).unwrap_or(0)),
+                        window_ms,
+                    );
+                    until = Some(bound);
+                    bound
+                }
+            };
+            if tokio::time::Instant::now() >= deadline {
+                let name = current["name"].as_str().unwrap_or(id);
+                let message = if source_pending {
+                    format!(
+                        "model_source_pending: the model source of {name} was still being downloaded after {}s; nothing was started. `mllm status deployment {name}` shows its progress; run `mllm start deployment {name} --wait` again once it is verified",
+                        window_ms / 1000
+                    )
+                } else {
+                    format!(
+                        "checkpoint_digest_pending: the checkpoint digest of {name} was still being measured after {}s; nothing was started. `mllm status deployment {name}` shows it; run `mllm start deployment {name} --wait` again once it is recorded",
+                        window_ms / 1000
+                    )
+                };
+                return Err(error("activation_timeout", message));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     async fn wait(&self, receipt: Value, deadline_ms: i64) -> Result<Value, StructuredError> {
         let operation = receipt["operation_id"]
             .as_str()
@@ -630,11 +708,30 @@ pub(crate) fn refusal(status: reqwest::StatusCode, value: &Value) -> StructuredE
     let message = value["error"]["message"]
         .as_str()
         .unwrap_or("Management command rejected");
+    // ADR 0014 §7: a start without `--wait` stays asynchronous; the refusal
+    // says which command waits for the measurement.
+    let message = if server == "checkpoint_digest_pending" || server == "model_source_pending" {
+        format!("{message}; run the start again with --wait (`mllm start deployment <name> --wait`), which waits for the measurement and then starts")
+    } else {
+        message.to_owned()
+    };
     if server.is_empty() {
         error(code, message)
     } else {
         error(code, format!("{server}: {message}"))
     }
+}
+
+/// ADR 0008: whether activation still waits for a declared remote source: no
+/// host holds a verified copy and some attempt is not failed. A failed source
+/// ends the wait, and the start that follows reports it (`model_source_failed`).
+fn model_source_pending(deployment: &Value) -> bool {
+    let Some(sources) = deployment["model_sources"].as_array() else {
+        return false;
+    };
+    !sources.is_empty()
+        && !sources.iter().any(|source| source["state"] == "verified")
+        && sources.iter().any(|source| source["state"] != "failed")
 }
 
 fn deployment<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value, StructuredError> {
@@ -732,14 +829,13 @@ fn management_context(
             .to_owned();
         // SPEC §16.5: the standalone management listener, at its loopback
         // default unless this run names another loopback address.
-        let endpoint = match std::env::var_os(crate::roles::MANAGEMENT_ADDR_ENV) {
-            None => ENDPOINT.to_owned(),
-            Some(_) => format!(
-                "http://{}/management/v1",
-                crate::roles::standalone_management_address()
-                    .map_err(|failure| error("invalid_config", failure.to_string()))?
-            ),
-        };
+        // Owner decision 2026-09-25: MLLM_MANAGEMENT_ADDR, else the
+        // standalone document's management bind, else the default.
+        let endpoint = format!(
+            "http://{}/management/v1",
+            crate::roles::standalone_management_address(state_dir)
+                .map_err(|failure| error("invalid_config", failure.to_string()))?
+        );
         (endpoint, token, state_dir.to_owned())
     })
 }
@@ -807,12 +903,14 @@ pub async fn execute_with_start_options(
         Command::Deploy {
             file: Some(file),
             revision: Some(expected),
+            hf_endpoint,
             ..
         } => {
             // SPEC §14: an explicit, revision-aware update of the deployment
             // the file names. The server refuses a stale revision
             // (`revision_conflict`) and replays an exact retry by request id.
-            let config = read_deployment_file(file)?;
+            let config =
+                read_deployment_file(file, hf_endpoint.as_deref(), state_dir, config).await?;
             let name = config["name"]
                 .as_str()
                 .ok_or_else(|| error("invalid_config", "Deployment file names no deployment"))?
@@ -857,8 +955,10 @@ pub async fn execute_with_start_options(
             activate,
             wait,
             revision: None,
+            hf_endpoint,
         } => {
-            let config = read_deployment_file(file)?;
+            let config =
+                read_deployment_file(file, hf_endpoint.as_deref(), state_dir, config).await?;
             api.begin_request(
                 &journal_root,
                 request_id,
@@ -875,11 +975,21 @@ pub async fn execute_with_start_options(
                 )
                 .await?;
             if !activate {
+                // ADR 0014 §7: the deploy stays asynchronous; say what starts it.
+                let mut receipt = receipt;
+                if receipt["checkpoint_digest"] == "pending" {
+                    let name = config["name"].as_str().unwrap_or("<name>");
+                    receipt["notice"] = json!(format!(
+                        "the checkpoint digest of {name} is being measured; `mllm start deployment {name} --wait` waits for it and starts the deployment"
+                    ));
+                }
                 return Ok(receipt);
             }
             let id = receipt["deployment_id"]
                 .as_str()
                 .ok_or_else(|| error("internal", "Missing deployment identity"))?;
+            // ADR 0014 §7: `--activate` waits for a new checkpoint's digest.
+            api.await_activation_inputs(id).await?;
             let (action, deadline) = api.action(id, "start").await?;
             if *wait {
                 api.wait_all(action, deadline).await
@@ -914,6 +1024,10 @@ pub async fn execute_with_start_options(
                     evict && action == "start",
                 ),
             )?;
+            // ADR 0014 §7: `start --wait` waits for a new checkpoint's digest.
+            if api.wait_start && action == "start" {
+                api.await_activation_inputs(id).await?;
+            }
             let (receipt, deadline) = api.action(id, action).await?;
             if api.wait_start && action == "start" {
                 return api.wait_all(receipt, deadline).await;
@@ -966,6 +1080,10 @@ pub async fn execute_with_start_options(
                     evict && action == "start",
                 ),
             )?;
+            // ADR 0014 §7: `start --wait` waits for a new checkpoint's digest.
+            if api.wait_start && action == "start" {
+                api.await_activation_inputs(id).await?;
+            }
             let (receipt, deadline) = api.action_on(id, action, Some(*instance)).await?;
             if api.wait_start && action == "start" {
                 return api.wait(receipt, deadline).await;
@@ -987,7 +1105,36 @@ pub async fn execute_with_start_options(
             // not report one leaves the view as it was.
             if let Ok((status, body)) = api.exchange(Method::GET, "/installation", None).await {
                 if status.is_success() && body["installation"].is_object() {
-                    view["installation"] = body["installation"].clone();
+                    // Final review M10 (found live): the installation this
+                    // deployment runs on, matched by the executable its
+                    // effective configuration names, not the host's first.
+                    let executable = match view["id"].as_str() {
+                        Some(deployment_id) => api
+                            .exchange(
+                                Method::GET,
+                                &format!("/deployments/{deployment_id}/effective-config"),
+                                None,
+                            )
+                            .await
+                            .ok()
+                            .filter(|(status, _)| status.is_success())
+                            .and_then(|(_, effective)| {
+                                effective["effective"]["profile"]["executable"]
+                                    .as_str()
+                                    .map(str::to_owned)
+                            }),
+                        None => None,
+                    };
+                    view["installation"] = installation_of(&body, executable.as_deref());
+                }
+            }
+            // Design §9: the inference listener's bind and authentication,
+            // so status repeats the start warning. A server that does not
+            // report one leaves the view as it was.
+            if let Ok((status, body)) = api.exchange(Method::GET, "/inference-listener", None).await
+            {
+                if status.is_success() && body["inference_listener"].is_object() {
+                    view["inference_listener"] = body["inference_listener"].clone();
                 }
             }
             // SPEC §17 (M80): the deployment's latency distributions (router,
@@ -1035,21 +1182,36 @@ pub async fn execute_with_start_options(
     }
 }
 
-/// A deployment document from `--file`, bounded and strictly parsed.
-fn read_deployment_file(file: &std::path::Path) -> Result<Value, StructuredError> {
-    use std::io::Read;
-    let source = std::fs::File::open(file)
-        .map_err(|_| error("invalid_config", "Cannot read deployment file"))?;
-    let mut contents = String::new();
-    source
-        .take(1024 * 1024 + 1)
-        .read_to_string(&mut contents)
-        .map_err(|_| error("invalid_config", "Cannot read deployment file"))?;
-    if contents.len() > 1024 * 1024 {
-        return Err(error("invalid_config", "Deployment file is too large"));
-    }
-    mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &contents)
-        .map_err(|err| error("invalid_config", err.to_string()))
+/// Final review M10: the installation a deployment runs on, from the
+/// embedded host's `/installation` view: the one whose executable its
+/// effective configuration names, else (an older server, or an unknown
+/// executable) the view's first installation as before.
+pub fn installation_of(view: &Value, executable: Option<&str>) -> Value {
+    executable
+        .and_then(|executable| {
+            view["installations"]
+                .as_array()?
+                .iter()
+                .find(|installation| installation["executable"].as_str() == Some(executable))
+                .cloned()
+        })
+        .unwrap_or_else(|| view["installation"].clone())
+}
+
+/// A deployment document from `--file`, bounded and strictly parsed, with
+/// the defaults a minimal file leaves out (owner decision 2026-09-25,
+/// `crate::deployment_file`).
+async fn read_deployment_file(
+    file: &std::path::Path,
+    hf_endpoint: Option<&str>,
+    state_dir: &Path,
+    config: Option<&Path>,
+) -> Result<Value, StructuredError> {
+    // Owner rule 2026-09-25: `--hf-endpoint` > `MLLM_HF_ENDPOINT` >
+    // `HF_ENDPOINT` > the role document's `model_sources.huggingface_endpoint`
+    // > Hugging Face.
+    let endpoint = crate::deployment_file::pin_endpoint(hf_endpoint, state_dir, config)?;
+    crate::deployment_file::prepare(&crate::deployment_file::read_text(file)?, &endpoint).await
 }
 
 /// SPEC §17 (M80): the latency view query for a resolved deployment view, by

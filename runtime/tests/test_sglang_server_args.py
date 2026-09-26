@@ -419,5 +419,24 @@ class MappingTests(LaunchFixture, unittest.TestCase):
         self.assertIsInstance(parser, argparse.ArgumentParser)
 
 
+
+class DiscreteBaselineTest(unittest.TestCase):
+    # T26 / ADR 0014 open issue 2: on a discrete device the fraction is of the card.
+    def test_device_total_is_the_baseline(self):
+        memory = {"device_total_bytes": 16376 * 2**20}
+        self.assertEqual(mapping.available_bytes_for(memory), 16376 * 2**20)
+        self.assertEqual(mapping.static_fraction(8 * 2**30, 16 * 2**30), 0.5)
+
+    def test_unified_keeps_memavailable(self):
+        with mock.patch.object(mapping, "available_memory_bytes", return_value=100):
+            self.assertEqual(mapping.available_bytes_for({}), 100)
+
+    def test_bad_device_total_is_refused(self):
+        for bad in (0, -1, "16", 2**63, True, 16.0):
+            with self.subTest(bad=bad):
+                with self.assertRaises(mapping.ServerArgsError):
+                    mapping.available_bytes_for({"device_total_bytes": bad})
+
+
 if __name__ == "__main__":
     unittest.main()

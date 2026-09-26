@@ -413,3 +413,75 @@ fn two_proposals_cannot_spend_one_epoch() {
         Err(ResourceError::StaleObservation)
     );
 }
+
+// T16 T26: found live on the 16 GB discrete-GPU laptop host. After a
+// host_backed park, host RAM sat below the system domain's free reserve, and
+// a wake of another model (which releases its own host copy there) was held
+// until its deadline. A domain on which the candidate adds nothing beyond
+// what its own processes hold is not judged on free memory: refusing it
+// cannot restore the reserve. The managed limit still applies.
+#[test]
+fn a_domain_the_candidate_adds_nothing_to_is_not_judged_on_free_memory() {
+    let f = |phase, bytes| PhaseFootprint {
+        phase,
+        allocations: vec![Allocation {
+            domain: "system".into(),
+            bytes,
+            host_kv_bytes: 0,
+        }],
+        devices: vec![],
+    };
+    let state = LedgerSnapshot {
+        epoch: 1,
+        owners: [
+            ("a".into(), f(ResourcePhase::Parked, 20)),
+            ("b".into(), f(ResourcePhase::Parked, 30)),
+        ]
+        .into(),
+    };
+    // 10 free, below the 16 reserve.
+    let obs = [MemoryObservation {
+        domain: "system".into(),
+        capacity_bytes: 128,
+        available_bytes: 10,
+        sampled_at_ms: 100,
+    }];
+    let limits = [MemoryLimit {
+        domain: "system".into(),
+        managed_bytes: 96,
+        free_reserve_bytes: 16,
+        host_kv_bytes: None,
+        parked_bytes: None,
+    }];
+    let floors = [ResidentFloor {
+        owner: "a".into(),
+        domain: "system".into(),
+        bytes: 20,
+        sampled_at_ms: 100,
+    }];
+    let context = AdmissionContext::new(&obs, &limits, 101, 60, 4).with_resident_floors(&floors);
+    assert_eq!(
+        admit_phase(&state, "a", &f(ResourcePhase::Wake, 12), context),
+        Ok(())
+    );
+    // One byte beyond its own floor is judged as before.
+    assert_eq!(
+        admit_phase(&state, "a", &f(ResourcePhase::Wake, 21), context),
+        Err(ResourceError::Insufficient)
+    );
+    // Without the floor it is judged as before.
+    assert_eq!(
+        admit_phase(
+            &state,
+            "a",
+            &f(ResourcePhase::Wake, 12),
+            AdmissionContext::new(&obs, &limits, 101, 60, 4)
+        ),
+        Err(ResourceError::Insufficient)
+    );
+    // The managed limit still applies: 30 + 67 > 96.
+    assert_eq!(
+        admit_phase(&state, "a", &f(ResourcePhase::Wake, 67), context),
+        Err(ResourceError::Insufficient)
+    );
+}

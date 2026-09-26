@@ -34,6 +34,12 @@ pub(crate) fn invalid(message: impl Into<String>) -> StructuredError {
 /// names: `--config`, else `$MLLM_CONFIG`. `mllm engine` and the roles (`start
 /// host`, `join host`, `start standalone`) share this rule, so they agree on
 /// the document and on the engines file beside it.
+///
+/// The path is made absolute against the working directory before use (found
+/// walking the guides 2026-09-25: a relative `--config host.yaml` put the
+/// engines file at a bare `engines.yaml`, so its write failed after the
+/// rename and the profile was saved but never published). Every consumer
+/// then names the same file whatever directory it later works from.
 pub fn named_role_document(
     explicit: Option<&Path>,
     env: &dyn Fn(&str) -> Option<String>,
@@ -41,6 +47,15 @@ pub fn named_role_document(
     explicit
         .map(Path::to_path_buf)
         .or_else(|| env("MLLM_CONFIG").map(PathBuf::from))
+        .map(|path| absolute(&path))
+}
+
+/// `path` made absolute against the working directory (lexically; symbolic
+/// links are kept, so a document's own directory stays where it is named).
+/// A path that cannot be made absolute is returned unchanged, and the read
+/// that follows reports it.
+pub fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// ADR 0018 §2: a role's engines file: beside its named document, else

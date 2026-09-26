@@ -1208,3 +1208,40 @@ async fn a_request_for_an_operator_stopped_deployment_is_deployment_stopped() {
         "{message}"
     );
 }
+
+// T37 (design §9, review focus 4): a keyed router, whatever address it is
+// bound on, refuses a missing or wrong key on every inference route.
+#[tokio::test]
+async fn every_inference_route_needs_the_key() {
+    let (router, _s, _c, _f, _deps) = app().await;
+    for (method, path) in [("GET", "/v1/models"), ("POST", "/v1/chat/completions")] {
+        let call = |header: Option<&str>| {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(value) = header {
+                request = request.header("Authorization", value);
+            }
+            let body = if method == "POST" {
+                axum::body::Body::from(
+                    serde_json::json!({"model": "nothing", "messages": []}).to_string(),
+                )
+            } else {
+                axum::body::Body::empty()
+            };
+            router.clone().oneshot(request.body(body).unwrap())
+        };
+        for header in [
+            None,
+            Some("Bearer wrong"),
+            Some("Basic test-key"),
+            Some("Bearer mllm-local"),
+        ] {
+            let status = call(header).await.unwrap().status();
+            assert_eq!(status, 401, "{method} {path} {header:?}");
+        }
+        let status = call(Some("Bearer test-key")).await.unwrap().status();
+        assert_ne!(status, 401, "{method} {path}");
+    }
+}

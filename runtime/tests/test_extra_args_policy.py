@@ -80,6 +80,29 @@ class CheckTests(unittest.TestCase):
             policy.check("vllm", {"chat_template": "/tmp/chat.jinja"}, approvals(),
                          "/srv/models/m")
 
+    # T21: vLLM `--speculative-config` is an object: admitted only with named
+    # approval, every key on the closed list and the draft model inside an
+    # approved directory (found live 2026-09-25: as a plain path it never passed).
+    def test_speculative_config_is_checked_key_by_key(self):
+        ok = approvals(["--speculative-config"], ["/srv/models"])
+        policy.check("vllm", {"speculative_config": {"method": "mtp", "num_speculative_tokens": 3}},
+                     ok, "/srv/models/m")
+        policy.check("vllm", {"speculative_config": {"method": "dflash", "model": "/srv/models/d",
+                                                     "num_speculative_tokens": 7}}, ok, "/srv/models/m")
+        policy.check("vllm", {"speculative_config": '{"model": "/srv/models/d"}'}, ok, "/srv/models/m")
+        policy.check("vllm", {"speculative_config": {"method": "mtp", "moe_backend": "triton"}}, ok,
+                     "/srv/models/m")
+        for value in ({"method": "mtp"},):
+            with self.assertRaises(policy.Refused):
+                policy.check("vllm", {"speculative_config": value}, approvals(paths=["/srv/models"]),
+                             "/srv/models/m")
+        for value in ({"model": "/etc/d"}, {"model": "/srv/models/../etc"}, {"model": "org/repo"},
+                      {"model": ["/srv/models/d"]}, {"method": "mtp", "tokenizer": "/srv/models/t"},
+                      {"method": "mtp", "draft_model_config": {"x": 1}}, ["/srv/models/d"], "not json"):
+            with self.subTest(value=value):
+                with self.assertRaises(policy.Refused):
+                    policy.check("vllm", {"speculative_config": value}, ok, "/srv/models/m")
+
     # T21: code-loading shapes (a class, a plugin, a loader) need approval
     # whatever their name, e.g. vLLM `--scheduler-cls`, `--io-processor-plugin`
     # and SGLang `--custom-weight-loader`.

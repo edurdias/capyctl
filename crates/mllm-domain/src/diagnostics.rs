@@ -15,7 +15,7 @@ pub const MAX_REASON_BYTES: usize = 512;
 const HINTS: &[(&str, &str)] = &[
     (
         "capability_missing:deep_park",
-        "this engine installation lacks what deep parking needs; declare residency restart_only, or use a build that provides it",
+        "this engine installation lacks what parking (deep or host_backed) needs; declare residency restart_only, or use a build that provides it",
     ),
     (
         "capability_missing:core",
@@ -44,6 +44,16 @@ const HINTS: &[(&str, &str)] = &[
     (
         "insufficient_memory",
         "the host cannot hold the launch now; stop or park another deployment there, or lower the deployment's memory request",
+    ),
+    (
+        "insufficient_device_memory",
+        "the GPU cannot hold the launch now; stop or park another deployment on that GPU, or lower the deployment's device memory request",
+    ),
+    // ADR 0019 (final review M4): a device domain without a fresh reading
+    // closes admission on it.
+    (
+        "device_unobserved",
+        "the GPU could not be read, so nothing is admitted on it; check that nvidia-smi runs and lists the GPU on that host",
     ),
     (
         "no_host_fits",
@@ -164,6 +174,16 @@ pub fn public_reason(evidence: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T26 (ADR 0019, final review M4): an unobserved GPU is classified and
+    // carries an operator hint naming what to check.
+    #[test]
+    fn an_unobserved_gpu_has_a_hint() {
+        let reason = "admission closed on gpu0: device_unobserved (no fresh GPU sample)";
+        assert_eq!(classify(None, reason), Some("device_unobserved"));
+        let hint = operator_hint("device_unobserved").unwrap();
+        assert!(hint.contains("nvidia-smi"), "{hint}");
+    }
 
     // T08 T29 (SPEC §6.4): a status reader sees the reason, never a log tail,
     // the journal's own prefix, or the coordinator's wrapper.

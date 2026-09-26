@@ -67,8 +67,19 @@ impl HostControl {
 
     /// The document on disk, measured against the accepted set's inventory.
     async fn measured(&self) -> Result<ProfileSet, Value> {
-        let config =
-            HostConfig::load_with_engines(&self.document, &self.engines).map_err(invalid)?;
+        // Owner decision 2026-09-25: the generic overrides the host started
+        // with apply to the reloaded document too.
+        let loaded =
+            HostConfig::load_with_overrides(&self.document, &self.engines, &self.running.overrides)
+                .map_err(invalid)?;
+        // Owner decisions 2026-09-25: the models directory, the model-source
+        // policy and the engine settings (runtime directory, port range and
+        // the `local_engine` profiles) were resolved at start (flags,
+        // environment, document, defaults) and change only with a restart,
+        // like every setting outside runtime_profiles.
+        let mut document = loaded.document;
+        mllm_config::engine_settings::carry_start_settings(&self.running.document, &mut document);
+        let config = HostConfig::parse(&document.to_string()).map_err(invalid)?;
         // ADR 0018 §3: everything outside runtime_profiles needs a restart.
         if !only_profiles_differ(&self.running.document, &config.document) {
             return Err(refused(

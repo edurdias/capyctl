@@ -282,8 +282,27 @@ impl CoordinatorLifecycle {
     /// instead of the router's: two arrivals that saw the same state produce the same
     /// key and collapse, while an arrival that saw a later generation is asking about
     /// a different runtime and gets its own operation.
-    fn activation_key(deployment: &str, revision: i64, generation: i64) -> String {
-        format!("auto-activate:{deployment}:{revision}:{generation}")
+    ///
+    /// Found live on a 16 GB discrete GPU: a failed launch leaves the
+    /// generation unchanged, so the key also names the deployment's latest
+    /// operation (as [`Self::wake_key`] does). Without it every later request
+    /// derived the failed attempt's key and was refused as a different command.
+    fn activation_key(
+        deployment: &str,
+        revision: i64,
+        generation: i64,
+        latest_operation: &str,
+    ) -> String {
+        format!("auto-activate:{deployment}:{revision}:{generation}:{latest_operation}")
+    }
+
+    /// The deployment's latest operation id, for [`Self::activation_key`].
+    fn latest_operation(&self, deployment: &str) -> Result<String, LifecycleFault> {
+        Ok(self
+            .commands
+            .read(|store| store.latest_operation(deployment))?
+            .map(|operation| operation.id)
+            .unwrap_or_default())
     }
 
     /// W5: a wake's idempotency key. A parked instance keeps its generation, so
@@ -534,7 +553,12 @@ impl CoordinatorLifecycle {
         row: &DeploymentRow,
         revision: i64,
     ) -> Result<Activation, LifecycleFault> {
-        let key = Self::activation_key(deployment, revision, row.current_generation);
+        let key = Self::activation_key(
+            deployment,
+            revision,
+            row.current_generation,
+            &self.latest_operation(deployment)?,
+        );
         // Owner decision Q5, ADR 0013 §4 (W5): a parked instance is restored in
         // place, on the host it parked on, before anything starts cold; a
         // restore in flight is joined (T15).
@@ -578,6 +602,24 @@ impl CoordinatorLifecycle {
             operation_id: mllm_domain::OperationId(receipt.operation_id().to_string()),
             deployment_id: deployment.to_string(),
         }))
+    }
+
+    /// Whether the deployment's current revision waits for its checkpoint
+    /// digest before it can be sized (ADR 0014 §7: provisional and pending).
+    fn measuring_checkpoint(&self, deployment: &str) -> Result<bool, LifecycleFault> {
+        self.commands.read(|store| {
+            let Some(revision) = store.current_revision(deployment)? else {
+                return Ok(false);
+            };
+            Ok(store
+                .checkpoint_digest(deployment, revision)
+                .ok()
+                .flatten()
+                .is_some_and(|record| {
+                    record.provisional
+                        && record.state == mllm_store::checkpoint_digests::DigestState::Pending
+                }))
+        })
     }
 
     fn unsupported(what: &str) -> LifecycleFault {
@@ -883,6 +925,17 @@ impl LifecyclePort for CoordinatorLifecycle {
                 }
                 RequestView::Idle => {}
             }
+            // Final review M11 (found live on the discrete-GPU laptop host): a
+            // revision sized from a checkpoint not yet measured cannot be
+            // placed or started until its digest is recorded (ADR 0014 §7).
+            // Answering that as "no room could be made" (429) sent clients
+            // looking for capacity; it is starting, and a retry succeeds.
+            if self.measuring_checkpoint(deployment)? {
+                return Err(LifecycleFault::Unavailable(format!(
+                    "deployment {deployment} is starting: its checkpoint is being measured \
+                     before it can be sized; retry shortly"
+                )));
+            }
             if round >= rounds {
                 return Err(LifecycleFault::Blocked(format!(
                     "no room could be made for deployment {deployment} after {rounds} switch round(s)"
@@ -970,7 +1023,12 @@ impl LifecyclePort for CoordinatorLifecycle {
                     .ok_or_else(|| LifecycleFault::NotFound(deployment.to_string()))?;
                 let key = format!(
                     "start:{}",
-                    Self::activation_key(deployment, revision, row.current_generation)
+                    Self::activation_key(
+                        deployment,
+                        revision,
+                        row.current_generation,
+                        &self.latest_operation(deployment)?
+                    )
                 );
                 let deadline = lifecycle_deadline(&self.commands, deployment, false)?;
                 // SPEC §6.3 (W5): "Restore if parked, initialize if stopped."

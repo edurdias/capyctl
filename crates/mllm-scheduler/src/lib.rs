@@ -1,5 +1,7 @@
 pub mod admission;
 pub mod auto;
+// ADR 0019 (discrete GPU design §7): the GPU an instance runs on.
+pub mod device_choice;
 pub mod ledger;
 pub mod placement;
 pub mod residency;

@@ -400,7 +400,7 @@ async fn measure_locally(
     checkpoints: Arc<CheckpointVerifier>,
     effective: &mllm_config::effective::EffectiveDeployment,
 ) -> Result<mllm_agent::checkpoint::Verification, MeasureError> {
-    let store = effective.host.model_store.clone();
+    let store = effective.checkpoint_store().to_path_buf();
     let checkpoint = effective
         .model
         .require_resolved_path()
@@ -429,7 +429,7 @@ impl DigestSource for LocalDigests {
     fn size(&self, pending: PendingDigest) -> SizeFuture {
         let checkpoints = self.checkpoints.clone();
         Box::pin(async move {
-            let store = pending.effective.host.model_store.clone();
+            let store = pending.effective.checkpoint_store().to_path_buf();
             let checkpoint = pending
                 .effective
                 .model

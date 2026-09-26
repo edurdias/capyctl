@@ -3,7 +3,9 @@ enrollment record, over a synthetic saver map the test flips through stdin.
 
 argv: repo-root observation-dir binding incarnation admin-key library-path
 stdin: `release` (every allocation unmapped), `resume` (every allocation mapped),
-`partial` (weights unmapped, cache mapped), `exit`; each is acknowledged `ok`.
+`partial` (weights unmapped, cache mapped), `stall` (the next read answers only
+after 2.5 s, past the client's bound, as a busy scheduler did live), `exit`;
+each is acknowledged `ok`.
 No engine, GPU or saver library is loaded; never qualification.
 """
 import hashlib
@@ -25,7 +27,7 @@ directory, binding, incarnation, admin, library = sys.argv[2:7]
 owner = _process_identity(os.getpid())
 with open(library, "rb") as stream:
     digest = hashlib.sha256(stream.read()).hexdigest()
-state = {"weights": True, "kv_cache": True}
+state = {"weights": True, "kv_cache": True, "stall": False}
 lock = threading.Lock()
 
 
@@ -39,6 +41,8 @@ class Bridge:
     def request(self, request_id, *, timeout_ms):
         with lock:
             groups = (group("kv_cache"), group("weights"))
+            self.ready_at = time.monotonic() + (2.5 if state["stall"] else 0)
+            state["stall"] = False
         now = time.monotonic_ns()
         observation = SchedulerSaverObservation(
             owner, LoadedSaverLibrary(digest, 1, 2, 3, 4, 5), "preload",
@@ -47,10 +51,14 @@ class Bridge:
                                         "observed", observation)
 
     def poll(self, request_id):
-        return self.result
+        return self.result if time.monotonic() >= self.ready_at else None
 
     def cancel(self, request_id):
-        pass
+        # A cancelled read settles uncertain, as the scheduler bridge does.
+        now = time.monotonic_ns()
+        self.result = ObservationResult(binding, incarnation, request_id, owner, now, now,
+                                        "uncertain", None)
+        self.ready_at = 0
 
 
 server = SchedulerObservationServer.start(
@@ -74,6 +82,8 @@ try:
                 state.update(weights=False, kv_cache=False)
             elif command == "resume":
                 state.update(weights=True, kv_cache=True)
+            elif command == "stall":
+                state["stall"] = True
             elif command == "partial":
                 state.update(weights=False, kv_cache=True)
         print("ok", flush=True)

@@ -113,3 +113,30 @@ fn a_frozen_snapshot_re_resolves_with_the_recorded_weights() {
     )
     .is_err());
 }
+
+// T14 (ADR 0008, owner decision 2026-09-25): a downloaded checkpoint is
+// located in, and contained by, the host's sources store; a local one by its
+// model store.
+#[test]
+fn a_downloaded_checkpoint_is_located_in_the_sources_store() {
+    let (mut deployment, mut host) = fixture();
+    let store = host["model_store"]["path"].as_str().unwrap().to_owned();
+    host["model_sources"] = json!({"path": "/state/models"});
+    deployment["model"].as_object_mut().unwrap().remove("path");
+    let sha = "a".repeat(64);
+    deployment["model"]["source"] =
+        json!({"http": {"url": "https://example.test/w.bin", "sha256": sha}});
+    let location = checkpoint_location(&deployment, &host).unwrap();
+    assert_eq!(location.model_store, std::path::Path::new("/state/models"));
+    assert_eq!(
+        location.checkpoint,
+        std::path::Path::new(&format!("/state/models/sources/http/{sha}"))
+    );
+    deployment["model"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source");
+    deployment["model"]["path"] = json!("toy");
+    let local = checkpoint_location(&deployment, &host).unwrap();
+    assert_eq!(local.model_store, std::path::Path::new(&store));
+}

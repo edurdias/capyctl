@@ -8,6 +8,8 @@ The SPEC amendments below are applied to `SPEC.md` §8.2 and §16.3.
 **Amends:** `SPEC.md` §8.2 (parameter ownership) and §16.3 (single-host example). It
 implements ADR 0008's "a deployment owns its `engine_config`" and applies ADR 0011's rule
 that mllm validates a recipe's shape and capacity while the user owns whether it works.
+**Amended by:** Amendment A3 below (owner decision 2026-09-25): vLLM
+`--speculative-config` is approved key by key (§8).
 **Unit:** WE of `docs/plans/2026-09-22-two-host-control-plane-plan.md`.
 
 ## Context
@@ -221,7 +223,8 @@ for path values the path is inside `security.approved_paths`:
   media URL fetching domains, tokens for remote hubs.
 
 `trust_remote_code` keeps its existing host switch (`security.trust_remote_code`).
-Options not on any list are ordinary.
+Options not on any list are ordinary. vLLM `--speculative-config` has its own rule
+(Amendment A3).
 
 ### 9. What stays and what goes
 
@@ -353,3 +356,95 @@ cold phase stays the request. The launch plan carries the reserved peak
 it per deployment (with every measurement) and per starting instance. See ADR 0015's
 2026-09-23 amendment for the per-host activation gate. The placeholder factor is not a
 measurement; nothing here is qualified live.
+
+## Amendment A3 — vLLM `--speculative-config` approved key by key (owner decision 2026-09-25)
+
+Found live in the 2026-09-25 single-box benchmark (`docs/benchmarks/2026-09-25-single-box.md`).
+§8 listed `--speculative-config` among the path options. Its value is a JSON object, so no
+value could lie inside `security.approved_paths`. Every vLLM speculative deployment was
+refused at deploy time. The launch-time gate refuses any structured value named as a
+path, so it would have been refused at launch too. The owner accepted the fix below.
+
+The option keeps named approval: `security.approved_options` must list it. When it is
+approved, its value must be a JSON object that meets three conditions:
+
+- every key is on a closed list: `method`, `model`, `num_speculative_tokens`,
+  `draft_tensor_parallel_size`, `prompt_lookup_max`, `prompt_lookup_min`,
+  `draft_sample_method`, `moe_backend`;
+- every value is a string, number or boolean (no nested object or list);
+- the draft `model`, when named, is an absolute path inside
+  `security.approved_paths`, checked lexically at deploy time and, at launch,
+  through every existing symlink (as for path options).
+
+Any other key is refused, for example a tokenizer, a revision, a quantization or a
+nested draft configuration. This closes every path the value could carry. Both gates
+apply the same rule: `engine_policy.rs` (`Sensitivity::SpeculativeConfig`) at deploy
+time, and `runtime/extra_args_policy.py` on the parsed destination at launch. A new key
+that vLLM adds needs this list amended; until then it is refused.
+
+Evidence: `speculative_config_is_admitted_key_by_key` (mllm-config) and
+`test_speculative_config_is_checked_key_by_key` (runtime). These are CPU tests only.
+Live, MTP, DFlash, DFlash2, DSpark and the Gemma 4 assistant ran through this gate on
+vLLM 0.29.0. That is not qualification of any recipe.
+
+## Amendment A4 — the minimal deployment file (owner decision 2026-09-25)
+
+A deployment document needs three fields:
+
+```yaml
+name: my-model
+engine: vllm                 # the runtime profile; `runtime_profile` stays the long form
+model: Qwen3-4B              # or an absolute path, ~/models/Qwen3-4B, or {hf: owner/repo[@commit]}
+```
+
+Every other field is optional and, when stated, means exactly what it meant before; a
+full document resolves byte for byte as it did. Absent fields are defaulted in shared
+code (`mllm_config::deployment_defaults`), the same for server deployments and
+standalone (a server plus one host):
+
+- **From the document alone**, inside the strict deployment parse, so the CLI, the
+  management API, the store and the agent read the same completed document:
+  `schema_version: 1`, `kind: deployment`, `routes: [<name>]`,
+  `runtime_profile: <engine>`, `recipe: standard`, `recovery: reconcile`,
+  `model.revision: "1"`, and `model.content_fingerprint: measured`. That value is a
+  label, not a digest: mllm measures the checkpoint's digest on the host (§7) and
+  records it. A stated `sha256:<64 hex>` stays an expectation the measurement must
+  match (a different measurement is recorded `mismatch`).
+- **Model shorthands.** `model: <path>` is a local path: relative to the host's models
+  directory, or absolute. A leading `~/` is expanded by the CLI against the home of
+  the user who runs it; a document that still carries one is refused.
+  `model: {hf: owner/repo@<commit>}` is a pinned Hugging Face source (ADR 0008).
+  Without a commit (or with a branch or tag after `@`), `mllm deploy model --file`
+  pins it to the commit the reference names now, asking the Hugging Face API at
+  `HF_ENDPOINT` (default `https://huggingface.co`), so the server only ever stores a
+  pinned source. `mllm validate config` never contacts the network and refuses an
+  unpinned reference with the way to pin it. Private repositories are pinned by hand.
+- **From the host**, where the deployment becomes one host's document
+  (`instances::assign_devices`, which acceptance and `validate config --host` run):
+  an engine family name (`vllm`, `sglang`) that is not a profile name stands for the
+  host's one profile of that family (standalone publishes its installation as
+  `local`); `runtime_profile_revision` is the revision the host publishes; `devices`
+  is the lowest-index GPU with the sharing the host states. On a host whose GPUs are
+  device domains, acceptance resolves an undeclared deployment once per GPU and
+  placement picks one (discrete GPU design §7); the default is the host's own row.
+- **From the host and the checkpoint**, at resolution: `residency` is `restart_only`
+  when the profile opted out of deep parking (ADR 0012), `deep` on a unified host,
+  and on a discrete host `host_backed` when the weights plus the engine's host
+  overhead fit what the system domain holds parked, otherwise `deep` (discrete GPU
+  design §5). A deployment that states no memory and no `resources` gets
+  `memory.kv_cache = min(4 GiB, managed_limit / 4)` of the domain it runs in, and its
+  request derives from the weights (§5), sized for the card on a discrete host (the
+  standalone template's rule). Both are named `mllm default` in the engine
+  configuration's provenance (`residency`, `memory.kv_cache`), so a provisional
+  revision re-resolved with the measured weights chooses them again (§7) and a
+  snapshot of it decodes exactly.
+
+`mllm validate config` prints the completed document (`document`); with `--host` it
+prints the host's document and the resolved profile revision, devices, residency,
+memory and provenance. SPEC §16 notes that its examples state every field and that
+three are required.
+
+Consequences: a minimal deployment is always provisional at acceptance, since its
+request derives from weights not yet measured, and activation waits for the digest
+(`checkpoint_digest_pending`). Tests are CPU and Fake-engine tests; nothing here
+qualifies an engine recipe.

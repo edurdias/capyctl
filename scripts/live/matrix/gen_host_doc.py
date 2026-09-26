@@ -10,7 +10,16 @@ tuning lives in each deployment's engine_config (ADR 0014 section 1).
 usage: gen_host_doc.py --device-json FILE --ip IP --run-root DIR --policy normal|tight
                        --sglang-version V --vllm-version V --vllm-venv DIR
                        [--sglang-venv DIR] [--remote-tree DIR] [--models-root DIR]
-                       [--ingress-port 9443] [--managed-runtime] [--no-profiles] --out FILE
+                       [--ingress-port 9443] [--managed-runtime] [--no-profiles]
+                       [--hf-max-bytes SIZE] [--approve-speculation] [--cuda-home DIR] --out FILE
+
+--hf-max-bytes and --approve-speculation (2026-09-25, single-box benchmark)
+opt the host into Hugging Face model sources with that store ceiling (ADR 0008
+amendment) and approve the speculative-decoding options (vLLM
+`--speculative-config` and SGLang `--speculative-draft-model-path`, with draft
+models inside the model store; ADR 0014 section 8). --cuda-home sets every
+profile's `cuda_home` (SPEC section 13.3 as amended 2026-09-25: `<dir>/bin` joins
+the engine PATH; vLLM needs `nvcc` there for FlashInfer).
 """
 
 import argparse
@@ -63,6 +72,9 @@ def main():
     # ADR 0018 (rows ENG1, ENG4): a bare host document for `engine add` rows,
     # so every published profile in the run comes only from `engines.yaml`.
     parser.add_argument("--no-profiles", action="store_true")
+    parser.add_argument("--hf-max-bytes")
+    parser.add_argument("--approve-speculation", action="store_true")
+    parser.add_argument("--cuda-home")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -116,6 +128,20 @@ def main():
     document = substitute(template, values)
     if args.managed_runtime:
         del document["runtime_dir"]
+    if args.hf_max_bytes:
+        document["model_sources"] = {"huggingface": "allowed", "max_bytes": args.hf_max_bytes}
+    profiles = document["runtime_profiles"]
+    if args.approve_speculation:
+        if "vllm" in profiles:
+            profiles["vllm"]["security"]["approved_options"] = ["--speculative-config"]
+            # A draft model named in --speculative-config must lie here too.
+            profiles["vllm"]["security"]["approved_paths"] = [args.models_root.rstrip("/")]
+        if "sglang" in profiles:
+            profiles["sglang"]["security"]["approved_options"] = ["--speculative-draft-model-path"]
+            profiles["sglang"]["security"]["approved_paths"] = [args.models_root.rstrip("/")]
+    if args.cuda_home:
+        for profile in profiles.values():
+            profile["cuda_home"] = args.cuda_home.rstrip("/")
     if args.no_profiles:
         document["runtime_profiles"] = {}
     fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

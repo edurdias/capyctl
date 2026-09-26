@@ -7,7 +7,7 @@
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
-use mllm_agent::sources::{prune, reason, SourceStatus, SourceStore};
+use mllm_agent::sources::{prune, reason, SourceStatus, SourceStore, FREE_SPACE_RESERVE};
 use mllm_config::effective::{ModelSourcePolicy, SourceSwitch};
 use mllm_config::model_source::{Archive, ModelSource};
 use sha1::Digest as _;
@@ -260,6 +260,8 @@ fn policy(max_bytes: i64) -> ModelSourcePolicy {
         max_bytes: Some(max_bytes),
         allowed_hosts: vec![],
         huggingface_endpoint: Some("https://hub.example.test".into()),
+        path: None,
+        huggingface_token_file: None,
     }
 }
 
@@ -330,12 +332,29 @@ async fn fixture() -> Fixture {
 
 impl Fixture {
     fn source_store(&self, max_bytes: i64) -> Arc<SourceStore> {
-        SourceStore::with_loopback_origin(
+        self.source_store_with(policy(max_bytes), &[])
+    }
+
+    /// A store under `policy` whose default-token variables are exactly `env`
+    /// (never the test process's own).
+    fn source_store_with(
+        &self,
+        policy: ModelSourcePolicy,
+        env: &[(&'static str, &'static str)],
+    ) -> Arc<SourceStore> {
+        let store = SourceStore::with_loopback_origin(
             &self.store,
-            policy(max_bytes),
+            policy,
             Some(self.secrets.clone()),
             &self.origin,
-        )
+        );
+        let env = env.to_vec();
+        store.set_environment(Arc::new(move |key| {
+            env.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }));
+        store
     }
     fn requests(&self, needle: &str) -> Vec<(String, Option<String>, Option<String>)> {
         self.hub
@@ -521,17 +540,16 @@ async fn size_over_limit_is_refused_before_download() {
     assert_eq!(failure.reason, reason::SIZE_UNKNOWN);
 }
 
-// T14 (ADR 0008): remote sources are denied unless the host opts in; a
-// denied request reaches no origin.
+// T14 (ADR 0008, owner decision 2026-09-25): a host that turns remote
+// sources off keeps them off, and a denied request reaches no origin.
 #[tokio::test]
-async fn host_policy_denies_remote_sources() {
+async fn host_policy_denies_remote_sources_it_turned_off() {
     let f = fixture().await;
-    let store = SourceStore::with_loopback_origin(
-        &f.store,
-        ModelSourcePolicy::default(),
-        Some(f.secrets.clone()),
-        &f.origin,
-    );
+    let mut off = policy(1 << 30);
+    off.huggingface = SourceSwitch::Denied;
+    off.http = SourceSwitch::Denied;
+    let store =
+        SourceStore::with_loopback_origin(&f.store, off, Some(f.secrets.clone()), &f.origin);
     for source in [hf(vec![], false), http("x.bin", b"x", Archive::None)] {
         match store.request(&source) {
             SourceStatus::Failed(failure) => assert_eq!(failure.reason, reason::DENIED),
@@ -548,6 +566,39 @@ async fn host_policy_denies_remote_sources() {
     assert!(
         f.hub.lock().unwrap().log.is_empty(),
         "no origin was contacted"
+    );
+}
+
+// T14 (SPEC §7.3, owner decision 2026-09-25): a download that would leave
+// less than the free-space reserve on the filesystem is refused
+// `insufficient_space` before any byte is written; the default policy (500
+// GiB ceiling) materializes one that fits.
+#[tokio::test]
+async fn a_download_that_would_fill_the_disk_is_refused() {
+    let f = fixture().await;
+    let payload = vec![7_u8; 4_000];
+    f.hub.lock().unwrap().payloads.insert(
+        "w.bin".into(),
+        Payload {
+            bytes: payload.clone(),
+            cut_after_once: None,
+            chunked: false,
+            delay: None,
+        },
+    );
+    let source = http("w.bin", &payload, Archive::None);
+    let store =
+        SourceStore::with_loopback_origin(&f.store, ModelSourcePolicy::default(), None, &f.origin);
+    let needed = payload.len() as u64 + FREE_SPACE_RESERVE;
+    store.set_free_bytes_for_test(Some(needed - 1));
+    let failure = store.materialize(&source).await.unwrap_err();
+    assert_eq!(failure.reason, reason::INSUFFICIENT_SPACE);
+    assert!(f.state_files(".reservation").is_empty());
+    assert!(f.requests("/files/").len() <= 1, "sized, never streamed");
+    store.set_free_bytes_for_test(Some(needed));
+    assert_eq!(
+        store.materialize(&source).await.unwrap(),
+        payload.len() as u64
     );
 }
 
@@ -686,6 +737,73 @@ async fn secret_token_is_never_logged_or_persisted() {
     let failure = store.materialize(&other).await.unwrap_err();
     assert_eq!(failure.reason, reason::SECRET_UNAVAILABLE);
     assert!(!lines.lock().unwrap().join("\n").contains(TOKEN));
+}
+
+// T14 T37 (owner rule 2026-09-25: a secret is a variable or a protected file,
+// never a CLI flag): a source that names no token uses the host's default one,
+// `MLLM_HF_TOKEN` over `HF_TOKEN` over `model_sources.huggingface_token_file`;
+// a token file others can read is refused, and with none the fetch carries
+// no token.
+#[tokio::test]
+async fn a_default_token_comes_from_the_environment_or_the_token_file() {
+    let token_file = |f: &Fixture| {
+        let mut policy = policy(1 << 30);
+        policy.huggingface_token_file = Some(f.secrets.join("hf-token"));
+        policy
+    };
+    type Case = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        bool,
+        Result<(), &'static str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "mllm variable",
+            &[("MLLM_HF_TOKEN", TOKEN), ("HF_TOKEN", "wrong")],
+            true,
+            Ok(()),
+        ),
+        ("tools variable", &[("HF_TOKEN", TOKEN)], false, Ok(())),
+        (
+            "variable over file",
+            &[("MLLM_HF_TOKEN", "wrong")],
+            true,
+            Err(reason::UNAUTHORIZED),
+        ),
+        ("file", &[], true, Ok(())),
+        ("nothing", &[], false, Err(reason::UNAUTHORIZED)),
+    ];
+    for (name, env, file, expected) in cases {
+        let f = fixture().await;
+        f.hub.lock().unwrap().require_token = true;
+        let policy = if file {
+            token_file(&f)
+        } else {
+            policy(1 << 30)
+        };
+        let store = f.source_store_with(policy, env);
+        let outcome = store
+            .materialize(&hf(vec![], false))
+            .await
+            .map(|_| ())
+            .map_err(|failure| failure.reason);
+        assert_eq!(outcome, expected, "{name}");
+    }
+    // A token file others can read is refused, not used.
+    let f = fixture().await;
+    f.hub.lock().unwrap().require_token = true;
+    std::fs::set_permissions(
+        f.secrets.join("hf-token"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let failure = f
+        .source_store_with(token_file(&f), &[])
+        .materialize(&hf(vec![], false))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, reason::SECRET_UNAVAILABLE);
 }
 
 // T14 (ADR 0008): a tar payload is verified as a whole, then extracted.

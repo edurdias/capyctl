@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use mllm_store::events::SwitchPhase;
 use mllm_store::ordinary_lifecycle::switching::{
-    StartStep, StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchVictim,
+    StartStep, StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchRelease, SwitchVictim,
 };
 
 use crate::coordinator::CoordinatorCommands;
@@ -382,7 +382,7 @@ impl Switcher {
     async fn start_rooms(self: &Arc<Self>, target: &str) -> Result<Vec<Room>, NoRoom> {
         let steps = match self
             .commands
-            .plan_start_switch(target, &self.protected())
+            .plan_start_switch(target, &self.protected(), &Default::default())
             .map_err(fault)?
         {
             StartSwitchPlan::Steps(steps) => steps,
@@ -419,10 +419,12 @@ impl Switcher {
             turns.insert(host.clone(), self.turn(host).lock_owned().await);
         }
         // The plan again under the turns: an earlier group may have changed
-        // a host meanwhile.
+        // a host meanwhile. Final review I4: with each host's fresh
+        // observation, so a park its memory cannot take is planned a stop.
+        let observed = self.commands.observe_for_planning(hosts.clone()).await;
         let steps = match self
             .commands
-            .plan_start_switch(target, &self.protected())
+            .plan_start_switch(target, &self.protected(), &observed)
             .map_err(fault)?
         {
             StartSwitchPlan::Steps(steps) => steps,
@@ -531,7 +533,13 @@ impl Switcher {
     ) -> Result<Option<Room>, NoRoom> {
         let plan = self
             .commands
-            .plan_switch(target, only, explicit, &self.protected())
+            .plan_switch(
+                target,
+                only,
+                explicit,
+                &self.protected(),
+                &Default::default(),
+            )
             .map_err(fault)?;
         let host = match plan {
             SwitchPlan::FitsNow => return Ok(None),
@@ -551,9 +559,12 @@ impl Switcher {
         };
         // SPEC §10: the oldest waiting group first. Turns are FIFO.
         let turn = self.turn(&host).lock_owned().await;
+        // Final review I4: planned again with the host's fresh observation,
+        // so a park its memory cannot take now is planned as a stop.
+        let observed = self.commands.observe_for_planning([host.clone()]).await;
         let plan = self
             .commands
-            .plan_switch(target, only, explicit, &self.protected())
+            .plan_switch(target, only, explicit, &self.protected(), &observed)
             .map_err(fault)?;
         match plan {
             SwitchPlan::FitsNow => Ok(Some(Room {
@@ -814,15 +825,7 @@ impl Switcher {
             victims,
             &operations
                 .iter()
-                .map(|(v, r)| {
-                    format!(
-                        "{}/{} {} ({})",
-                        v.deployment_id,
-                        v.instance,
-                        if r.parked { "parked" } else { "stopped" },
-                        r.operation_id
-                    )
-                })
+                .map(|(v, r)| release_line(v, r))
                 .collect::<Vec<_>>()
                 .join(", "),
             explicit,
@@ -907,6 +910,28 @@ impl Drop for Active {
 /// Owner decision 2026-09-25: an explicit start one of whose instances fits
 /// nowhere even with eviction; the closed code leads, so management keeps
 /// classing it as a capacity block, and each host's shortfall follows.
+/// Discrete GPU design §5: the status line for one released victim says
+/// whether it parked or stopped, and names a victim that parks but stopped
+/// because its parked footprint did not fit the host after the switch. That
+/// can be host RAM (a `host_backed` copy) or the card (a `deep` residue beside
+/// the waiting instance), so the line names neither (found live 2026-09-26: a
+/// `deep` victim on a full card was reported "host RAM full").
+fn release_line(v: &SwitchVictim, r: &SwitchRelease) -> String {
+    format!(
+        "{}/{} released: {} ({})",
+        v.deployment_id,
+        v.instance,
+        if r.parked {
+            "parked"
+        } else if v.park_does_not_fit {
+            "stopped (no room to park)"
+        } else {
+            "stopped"
+        },
+        r.operation_id
+    )
+}
+
 fn start_capacity(target: &str, instance: u32, code: &str, detail: &str) -> LifecycleFault {
     LifecycleFault::Blocked(format!(
         "{code}: instance {instance} of deployment {target} cannot be placed even with eviction: {detail}; nothing was released"
@@ -917,4 +942,40 @@ fn capacity(target: &str, code: &str) -> LifecycleFault {
     LifecycleFault::Blocked(format!(
         "deployment {target} fits on no allowed host even after releasing every eligible READY instance ({code})"
     ))
+}
+
+#[cfg(test)]
+mod release_line_tests {
+    use super::*;
+
+    // Discrete GPU design §5: the status line names which release happened.
+    // T27
+    #[test]
+    fn the_status_line_names_park_stop_and_a_copy_that_did_not_fit() {
+        let victim = |park_does_not_fit| SwitchVictim {
+            deployment_id: "d".into(),
+            instance: 0,
+            generation: 1,
+            parks: false,
+            park_does_not_fit,
+            last_ready: false,
+            serves_elsewhere: false,
+        };
+        let release = |parked| SwitchRelease {
+            operation_id: "op".into(),
+            parked,
+        };
+        assert_eq!(
+            release_line(&victim(false), &release(true)),
+            "d/0 released: parked (op)"
+        );
+        assert_eq!(
+            release_line(&victim(true), &release(false)),
+            "d/0 released: stopped (no room to park) (op)"
+        );
+        assert_eq!(
+            release_line(&victim(false), &release(false)),
+            "d/0 released: stopped (op)"
+        );
+    }
 }

@@ -764,11 +764,15 @@ pub const CHECKPOINT_REFUSALS: &[&str] = &[
 /// `capability_missing:deep_park`: a launch declared `deep`, or a Park, needs
 /// internals the installation's launch-time probe found missing (declare
 /// `restart_only` instead); `capability_missing:core`: the installation lacks
-/// an interface every launch needs.
+/// an interface every launch needs. Discrete GPU design §4:
+/// `insufficient_device_memory`: a GPU's own memory domain cannot hold the
+/// launch's allocation there with its free reserve kept, now or beside every
+/// claimed launch.
 pub const POLICY_REFUSALS: &[&str] = &[
     "checkpoint_mismatch",
     "checkpoint_unverified",
     "insufficient_memory",
+    "insufficient_device_memory",
     "residency_tier",
     "runtime_integrity",
     "unauthorized",

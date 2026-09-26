@@ -763,6 +763,138 @@ fn the_executor_advertises_per_launch_claims() {
     );
 }
 
+/// SPEC §7.2 / ADR 0019: on a discrete host the inventory refresh reads host
+/// memory for the system domain and the GPU for the device domain. A device
+/// the sample does not report is published as unknown (`-1`), which closes
+/// admission on it upstream; host RAM never stands in for VRAM.
+// T26 T29
+#[test]
+fn the_inventory_refreshes_a_device_domain_from_the_gpu() {
+    let fixture = Fixture::new("1GiB");
+    let mut document = fixture.config.document.clone();
+    document["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "1GiB", "free_reserve": "16MiB",
+                   "parked_limit": "256MiB", "host_kv_limit": "64MiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    document["resource_policy"]["devices"] =
+        json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    // The strict remote-role schema learns `device` with the remote device
+    // capability; the refresh reads the approved document it is handed.
+    let mut config = fixture.config.clone();
+    config.document = document;
+    let path = fixture.root.path();
+    let execution = |gpu: Arc<mllm_agent::gpu_memory::GpuSampler>, n: &str| {
+        let journal = HostJournal::open(
+            &private(&path.join(format!("journal-{n}"))),
+            "controller",
+            "host",
+        )
+        .unwrap();
+        let unknown = |domain: &str| pb::DomainObservation {
+            domain_id: domain.into(),
+            kind: "system".into(),
+            observed_bytes: -1,
+            capacity_bytes: -1,
+            available_bytes: -1,
+            ..Default::default()
+        };
+        NativeHostExecution::new(
+            journal,
+            Ingress::new().unwrap(),
+            IngressIdentities::new(
+                IdentityDirectory::open(&private(&path.join(format!("ingress-identity-{n}"))))
+                    .unwrap(),
+            ),
+            config.clone(),
+            "host".into(),
+            "controller".into(),
+            config.runtime_dir.clone(),
+            private(&path.join(format!("logs-{n}"))),
+            pb::ReportInventory {
+                domains: vec![unknown("gpu0"), unknown("system")],
+                ..Default::default()
+            },
+        )
+        .with_gpu_sampler(gpu)
+    };
+    let sample = mllm_agent::gpu_memory::parse_query_gpu(
+        "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 1536, 14840\n",
+        11_000,
+    );
+    let domain = |inventory: &pb::ReportInventory, id: &str| {
+        inventory
+            .domains
+            .iter()
+            .find(|d| d.domain_id == id)
+            .cloned()
+            .unwrap()
+    };
+
+    // The sample is taken off the caller's thread; a later refresh reports it.
+    let observed = execution(Arc::new(move || sample.clone()), "observed");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let inventory = loop {
+        let inventory = observed
+            .inventory()
+            .expect("a system and a device domain are refreshed");
+        if domain(&inventory, "gpu0").capacity_bytes > 0 || std::time::Instant::now() > deadline {
+            break inventory;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let gpu = domain(&inventory, "gpu0");
+    assert_eq!(gpu.capacity_bytes, 16376 << 20);
+    assert_eq!(gpu.available_bytes, 14840 << 20);
+    assert_eq!(gpu.observed_bytes, 14840 << 20);
+    assert_eq!(gpu.observed_at_unix_ms, 11_000);
+    assert_eq!(gpu.observed_at_unix, 11);
+    let system = domain(&inventory, "system");
+    assert!(system.capacity_bytes > 0, "host RAM is read from meminfo");
+    assert_ne!(system.capacity_bytes, gpu.capacity_bytes);
+
+    let unobserved = execution(Arc::new(|| None), "unobserved");
+    unobserved.inventory();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let inventory = unobserved
+        .inventory()
+        .expect("the system domain is still refreshed");
+    let gpu = domain(&inventory, "gpu0");
+    assert_eq!(
+        (gpu.capacity_bytes, gpu.available_bytes, gpu.observed_bytes),
+        (-1, -1, -1),
+        "an unobserved device is published as unknown"
+    );
+    assert!(domain(&inventory, "system").capacity_bytes > 0);
+
+    // T33: a collector that hangs far past the heartbeat period never holds
+    // the refresh (it runs on the session loop): each refresh returns at
+    // once, the device unobserved and the system domain still read.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let hung = execution(
+        Arc::new(move || {
+            gate.lock().unwrap().recv().ok()?;
+            None
+        }),
+        "hung",
+    );
+    for _ in 0..3 {
+        let asked = std::time::Instant::now();
+        let inventory = hung.inventory().expect("the system domain is refreshed");
+        assert!(
+            asked.elapsed() < std::time::Duration::from_millis(200),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(domain(&inventory, "gpu0").available_bytes, -1);
+        assert!(domain(&inventory, "system").capacity_bytes > 0);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    release.send(()).unwrap();
+}
+
 /// SPEC §8.2 / T21 (found live 2026-09-23): a signalled SGLang stop never runs
 /// the entry's exit handlers, so its file rendezvous outlived the launch in
 /// `/tmp`. The host names the directory inside its private root and removes it

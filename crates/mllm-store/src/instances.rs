@@ -86,6 +86,17 @@ fn has_column(tx: &Transaction<'_>, table: &str, column: &str) -> rusqlite::Resu
     Ok(names.iter().any(|name| name == column))
 }
 
+/// Schema v37 data step (ADR 0019, discrete GPU design §7): the GPU an
+/// instance was placed on, NULL on a host without a GPU choice. Idempotent.
+pub(crate) fn migrate_v37(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !has_column(tx, "deployment_instances", "device")? {
+        tx.execute_batch(
+            "ALTER TABLE deployment_instances ADD COLUMN device TEXT CHECK(device IS NULL OR length(device) BETWEEN 1 AND 128);",
+        )?;
+    }
+    Ok(())
+}
+
 const INSTANCE_COLUMN: &str = "instance_index INTEGER NOT NULL DEFAULT 0 CHECK(instance_index>=0)";
 
 const HOST_NAME: &str = "CASE WHEN json_valid(e.effective_json) AND json_type(e.effective_json,'$.host.name')='text' THEN json_extract(e.effective_json,'$.host.name') END";
@@ -371,6 +382,19 @@ pub(crate) struct ResolvedHost {
     pub(crate) fingerprint: String,
     /// The deployment document scoped to this host.
     pub(crate) source_json: String,
+    /// ADR 0019 (discrete GPU design §7): the revision resolved once per GPU
+    /// of a multi-GPU host, when the deployment pins no device; empty
+    /// otherwise. The host's own row above is the first of them.
+    pub(crate) devices: Vec<DeviceResolution>,
+}
+
+/// One GPU's resolution of a revision on a multi-GPU host.
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceResolution {
+    pub(crate) device: String,
+    pub(crate) effective_json: String,
+    pub(crate) fingerprint: String,
+    pub(crate) source_json: String,
 }
 
 /// A revision accepted while the deployment runs (ADR 0013 §7, Q8).
@@ -491,6 +515,12 @@ pub(crate) fn record_accepted_revision(
             "INSERT INTO host_effective_revisions(deployment_id,revision,host_id,outcome,effective_json,fingerprint,source_json) VALUES(?1,?2,?3,'resolved',?4,?5,?6)",
             params![deployment_id, revision, host.host_id, host.effective_json, host.fingerprint, host.source_json],
         )?;
+        for choice in &host.devices {
+            tx.execute(
+                "INSERT INTO host_device_effective_revisions(deployment_id,revision,host_id,device,effective_json,fingerprint,source_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![deployment_id, revision, host.host_id, choice.device, choice.effective_json, choice.fingerprint, choice.source_json],
+            )?;
+        }
     }
     for refusal in refused {
         if resolved.iter().any(|h| h.host_id == refusal.host_id) {

@@ -565,7 +565,7 @@ impl ConfigurationSource for SharedConfigurationSource {
                 let (ConfigurationCommand::Create { config_json }
                 | ConfigurationCommand::Replace { config_json, .. }) = &command;
                 if !retry {
-                    require_published(config_json, vec![(id.clone(), profile_names(&document))])?;
+                    require_published(config_json, vec![(id.clone(), document.clone())])?;
                 }
                 let host = mllm_config::effective::compose_current_resource_controls(
                     &document,
@@ -683,11 +683,10 @@ fn registry_targets(
             .host_publication(selector)
             .map_err(|_| ConfigurationFailure::Internal)?;
         any_published |= publication.is_some();
-        let names = publication
+        let document = publication
             .and_then(|publication| serde_json::from_str::<Value>(&publication.config_json).ok())
-            .map(|document| profile_names(&document))
-            .unwrap_or_default();
-        published.push((selector.clone(), names));
+            .unwrap_or(Value::Null);
+        published.push((selector.clone(), document));
     }
     let profile = if fail_fast && any_published {
         Some(require_published(config_json, published)?)
@@ -740,11 +739,12 @@ fn registry_targets(
             continue;
         }
         // ADR 0018 §7: another allowed host publishes the profile; this one
-        // does not, so it is recorded refused with its reason.
-        if profile
-            .as_ref()
-            .is_some_and(|profile| original["runtime_profiles"].get(profile).is_none())
-        {
+        // does not, so it is recorded refused with its reason. Owner decision
+        // 2026-09-25: an engine family (`engine: vllm`) names the host's one
+        // profile of that family.
+        if profile.as_ref().is_some_and(|profile| {
+            mllm_config::deployment_defaults::profile_on_host(profile, &original).is_none()
+        }) {
             single = Some(refuse(
                 ConfigurationFailure::HostPolicyDenied,
                 "profile_not_published",
@@ -810,23 +810,29 @@ fn registry_targets(
 }
 
 /// ADR 0018 §7: the runtime profile the deployment names, when some host in
-/// `published` (host, profiles it publishes) carries it; otherwise the whole
-/// deploy is refused `profile_not_published`.
+/// `published` (host, its published document) carries it (owner decision
+/// 2026-09-25: by name, or as the host's one profile of an engine family);
+/// otherwise the whole deploy is refused `profile_not_published`.
 fn require_published(
     config_json: &str,
-    published: Vec<(String, Vec<String>)>,
+    published: Vec<(String, Value)>,
 ) -> Result<String, ConfigurationFailure> {
     let config = mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, config_json)?;
     let profile = config["runtime_profile"]
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    if published.iter().any(|(_, names)| names.contains(&profile)) {
+    if published.iter().any(|(_, document)| {
+        mllm_config::deployment_defaults::profile_on_host(&profile, document).is_some()
+    }) {
         Ok(profile)
     } else {
         Err(ConfigurationFailure::ProfileNotPublished {
             profile,
-            hosts: published,
+            hosts: published
+                .into_iter()
+                .map(|(host, document)| (host, profile_names(&document)))
+                .collect(),
         })
     }
 }

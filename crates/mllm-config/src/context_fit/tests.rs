@@ -19,6 +19,7 @@ fn inputs(kv: i64) -> FitInputs<'static> {
         kv_cache_dtype: None,
         dtype: None,
         block_tokens: None,
+        reserved_blocks: 0,
     }
 }
 
@@ -181,4 +182,35 @@ fn the_configuration_is_read_from_the_checkpoint() {
     assert_eq!(read_model_config(dir.path()).unwrap(), dense());
     std::fs::write(dir.path().join("config.json"), "not json").unwrap();
     assert!(read_model_config(dir.path()).is_err());
+}
+
+// T14: vLLM keeps part of its KV pool for itself (a null block, and its pool
+// rounding), so a context fitted to the exact grant is refused at start.
+// Found live on the discrete-GPU laptop host: Qwen3-4B (36 layers, 8 KV heads
+// of 128, bfloat16) with a 3949440534-byte grant was fitted to 26768 tokens,
+// and vLLM 0.29 refused it ("estimated maximum model length is 26752").
+#[test]
+fn a_vllm_fit_leaves_the_engines_reserved_blocks() {
+    let qwen3_4b = json!({
+        "num_hidden_layers": 36, "num_attention_heads": 32, "num_key_value_heads": 8,
+        "head_dim": 128, "hidden_size": 2560, "max_position_embeddings": 262144,
+        "torch_dtype": "bfloat16",
+    });
+    let mut vllm = inputs(3_949_440_534);
+    assert_eq!(fit_context(vllm, Ok(&qwen3_4b)).tokens, Some(26768));
+    vllm.reserved_blocks = VLLM_RESERVED_BLOCKS;
+    let fit = fit_context(vllm, Ok(&qwen3_4b));
+    assert_eq!(fit.tokens, Some(26752));
+    assert_eq!(fit.source, ContextSource::Fitted);
+    // The model's own maximum still caps a large grant unchanged.
+    let mut large = inputs(64 * GIB);
+    large.reserved_blocks = VLLM_RESERVED_BLOCKS;
+    assert_eq!(fit_context(large, Ok(&dense())).tokens, Some(32768));
+    // A grant of no more than the reserved blocks cannot be fitted.
+    let mut tiny = inputs(16 * 512 * 1024 + 1000);
+    tiny.reserved_blocks = VLLM_RESERVED_BLOCKS;
+    assert_eq!(
+        fit_context(tiny, Ok(&dense())).source,
+        ContextSource::Fallback
+    );
 }

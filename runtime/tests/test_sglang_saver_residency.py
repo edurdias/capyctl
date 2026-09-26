@@ -112,9 +112,73 @@ class Fakes:
         mock.patch.object(saver, "_library", return_value=self.library).start()
         self.driver = Driver()
 
-    def observe(self):
+    def observe(self, weight_restore="disk_reload"):
         return residency.observe_scheduler_saver(self.scheduler, expected_owner=self.owner,
-                                                 build=self.build, driver=self.driver)
+                                                 build=self.build, driver=self.driver,
+                                                 weight_restore=weight_restore)
+
+
+def host_backed_pools(weights_backup=True, kv_backup=False):
+    """The pools a host_backed launch allocates: weights in a CPU-backup region."""
+    return {
+        ("weights", weights_backup, False, "pinned" if weights_backup else "", 0):
+            MemPool([segment(0x1000_0000, 4096)]),
+        ("kv_cache", kv_backup, False, "pinned" if kv_backup else "", 0):
+            MemPool([segment(0x3000_0000, 16384)]),
+    }
+
+
+class HostBackedResidencyTests(unittest.TestCase):
+    # T22 / ADR 0019: the weights region's CPU backup is accepted only for a
+    # launch that declared `cpu_backup`; the kv_cache region never has one.
+    def test_backup_accepted_for_host_backed(self):
+        fakes = Fakes(self, pools=host_backed_pools(),
+                      args=ServerArgs(enable_weights_cpu_backup=True))
+        groups = {group.tag: group for group in fakes.observe("cpu_backup").allocations.groups}
+        self.assertEqual(groups["weights"].mapped_bytes, 4096)
+        self.assertEqual(groups["kv_cache"].mapped_bytes, 16384)
+
+    def test_backup_refused_for_deep(self):
+        fakes = Fakes(self, pools=host_backed_pools(),
+                      args=ServerArgs(enable_weights_cpu_backup=True))
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("disk_reload")
+        self.assertEqual(caught.exception.code, "configuration_mismatch")
+        fakes = Fakes(self, pools=host_backed_pools())
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("disk_reload")
+        self.assertEqual(caught.exception.code, "unsupported")
+
+    def test_missing_backup_refused_for_host_backed(self):
+        fakes = Fakes(self, args=ServerArgs())
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("cpu_backup")
+        self.assertEqual(caught.exception.code, "configuration_mismatch")
+        fakes = Fakes(self, pools=host_backed_pools(weights_backup=False),
+                      args=ServerArgs(enable_weights_cpu_backup=True))
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("cpu_backup")
+        self.assertEqual(caught.exception.code, "unsupported")
+
+    def test_draft_and_kv_cache_backup_always_refused(self):
+        fakes = Fakes(self, pools=host_backed_pools(),
+                      args=ServerArgs(enable_weights_cpu_backup=True,
+                                      enable_draft_weights_cpu_backup=True))
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("cpu_backup")
+        self.assertEqual(caught.exception.code, "configuration_mismatch")
+        fakes = Fakes(self, pools=host_backed_pools(kv_backup=True),
+                      args=ServerArgs(enable_weights_cpu_backup=True))
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("cpu_backup")
+        self.assertEqual(caught.exception.code, "unsupported")
+
+    def test_unknown_backup_backend_refused(self):
+        pools = {("weights", True, False, "disk", 0): MemPool([segment(0x1000_0000, 4096)])}
+        fakes = Fakes(self, pools=pools, args=ServerArgs(enable_weights_cpu_backup=True))
+        with self.assertRaises(saver.SaverBindingError) as caught:
+            fakes.observe("cpu_backup")
+        self.assertEqual(caught.exception.code, "unsupported")
 
 
 class SaverResidencyTests(unittest.TestCase):

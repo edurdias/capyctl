@@ -10,7 +10,6 @@ mod support;
 use axum::{routing, Json, Router};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -86,7 +85,7 @@ async fn start_wait(second: fn(usize) -> Value) -> std::process::Output {
     let address = management(second).await;
     let dir = state_dir();
     tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_mllm"))
+        support::mllm()
             .env("MLLM_STATE_DIR", dir.path())
             .env(mllm_cli::roles::MANAGEMENT_ADDR_ENV, address.to_string())
             .args(["start", "deployment", "pair", "--wait", "--format", "json"])

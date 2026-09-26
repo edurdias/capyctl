@@ -4,10 +4,20 @@
 //! native engine recipe (SPEC §18).
 mod support;
 
+/// The binary under test (`support::mllm`), told the management address this
+/// test serves on, which the test sets as `MLLM_MANAGEMENT_ADDR` in its own
+/// environment (the isolation drops the developer's `MLLM_*` variables).
+fn mllm() -> std::process::Command {
+    let mut command = support::mllm();
+    if let Ok(address) = std::env::var(mllm_cli::roles::MANAGEMENT_ADDR_ENV) {
+        command.env(mllm_cli::roles::MANAGEMENT_ADDR_ENV, address);
+    }
+    command
+}
+
 use mllm_cli::grammar::{parse_invocation, Command, LifecycleAction};
 use mllm_config::effective::{Engine, ModelSource};
 use serde_json::Value;
-use std::process::Command as Process;
 
 // T10: the flag parses on both start forms, defaults off, and is refused
 // anywhere else; help names it.
@@ -52,7 +62,7 @@ fn evict_is_a_start_flag_only() {
 }
 
 fn cli(state: &std::path::Path, args: &[&str]) -> Value {
-    let result = Process::new(env!("CARGO_BIN_EXE_mllm"))
+    let result = mllm()
         .env("MLLM_STATE_DIR", state)
         .args(args)
         .output()
@@ -87,13 +97,16 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         Engine::Vllm,
         // The capacity the app was booted with (`support::test_memory`), not
         // this machine's: the deployment must be sized against the same host.
-        support::TEST_CAPACITY_BYTES,
+        &mllm_cli::standalone_config::TemplateMemory::Unified {
+            capacity_bytes: support::TEST_CAPACITY_BYTES,
+        },
         mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
         // ADR 0012: the Fake host opts out of deep parking, so its
         // generated deployment is restart_only.
         false,
         "local",
-    );
+    )
+    .expect("the unified template");
     let path = dir.path().join("deployment.json");
     std::fs::write(&path, config.to_string()).unwrap();
     let deployed = cli(
@@ -132,7 +145,7 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         "{journaled}"
     );
     // A different intent under the same request id is refused.
-    let reused = Process::new(env!("CARGO_BIN_EXE_mllm"))
+    let reused = mllm()
         .env("MLLM_STATE_DIR", dir.path())
         .args(["start", "deployment", &id, "--request-id", &request])
         .output()

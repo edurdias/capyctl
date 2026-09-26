@@ -223,6 +223,10 @@ Any uncertain state -> RECONCILING -> verified state or FAILED
 
 A deployment declares exactly one residency — `restart_only`, `host_backed`, or `deep` — and there is no runtime ladder between them: the deployment states the tier it wants, and resolution either confirms the profile and host can deliver it or fails closed. `auto`, which formerly selected a tier at run time, is withdrawn (ADR 0010): a running SGLang engine cannot switch tiers, since its park flags are startup-only, and on the hardware in hand the choice is forced by the host's declared memory topology before launch anyway, so a runtime ladder would have nothing to choose between. `deep_required` is likewise withdrawn, because a declared `deep` residency already fails validation when deep parking is unavailable, by construction. `restart_only` prohibits sleep calls. Live verification of a tier does not override an operator's security restrictions. `host_backed` is refused at configuration time, not at first park, on a host domain declared to have device and host memory as one physical pool, since retaining a weight backup there would free nothing.
 
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+`host_backed` is supported on hosts whose device memory is distinct from host RAM; it is the default there. A deployment that states no residency gets `host_backed` on a discrete-GPU host when its weights copy plus the engine's host overhead fits the system domain's parked room, `deep` when it does not or while the weights are unknown, `deep` on a unified host, and `restart_only` when its profile opted out of deep parking. The copy is charged on the system domain and bounded by its `parked_limit`; a switch victim whose copy would not fit is stopped, never parked `deep` in its place. A `host_backed` launch on a build without parking support is refused `capability_missing:deep_park`.
+
 ### 6.3 Command semantics
 
 | Action | Required semantics |
@@ -276,6 +280,10 @@ Map allocations to physical domains before totaling them. On a unified-memory ho
 A host-wide managed ceiling includes weights, active KV, private offload buffers, workspaces, parked residue, engine processes, and separately managed service allocations. Host-KV and parked limits are sub-limits, not additional capacity. Category sets may overlap; the physical total uses the union of uniquely owned allocations, never a naive sum of every label or metric.
 
 Track system/agent/router overhead and external workloads through the configured safety reserve and live pressure measurements. Available-memory counters and RSS can overlap or include reclaimable page cache; do not invent precise free capacity from incompatible measurements. Unknown topology or unreconciled usage closes unsafe admission.
+
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+On a discrete-GPU host each GPU's memory is a `device` domain observed from the device; host RAM is a `distinct` system domain. A deployment's derived budget charges both. A device domain without a fresh observation closes admission on that domain (`device_unobserved`) and keeps every reservation charged. One GPU serves one model; mllm picks the GPU unless the deployment pins one.
 
 ### 7.3 Reservation lifecycle
 
@@ -340,7 +348,7 @@ mllm controls or validates device assignment, process ownership, bind addresses,
 
 Preserve the original engine's supported arguments where possible. Do not place every new kernel flag into the generic control-plane schema. `inspect deployment --effective-config` exposes the resolved command and provenance with secrets redacted.
 
-A deployment's `engine_config` carries typed common parameters per engine family and, only when the deployment sets `accept_extra_args: true` and host policy allows it, ordinary engine arguments passed through unchanged. Reserved settings are refused at deployment and verified again after the engine's own parser resolves them. Code-loading, path, listener and egress options require the host installation to approve them by name. A checkpoint is identified by a content digest recorded when the deployment is accepted and re-verified before every launch and wake (ADR 0014).
+A deployment's `engine_config` carries typed common parameters per engine family and, only when the deployment sets `accept_extra_args: true` and host policy allows it, ordinary engine arguments passed through unchanged. Reserved settings are refused at deployment and verified again after the engine's own parser resolves them. Code-loading, path, listener and egress options require the host installation to approve them by name. *Amended by ADR 0014 Amendment A3 (owner decision 2026-09-25):* vLLM `--speculative-config` is approved by name and then admitted key by key: a closed key list, scalar values, and a draft model inside the approved paths. A checkpoint is identified by a content digest recorded when the deployment is accepted and re-verified before every launch and wake (ADR 0014).
 
 ### 8.3 Adapter operations
 
@@ -483,7 +491,11 @@ Run agents with the least privilege needed for their approved processes. Arbitra
 
 Allowlist normalized methods and paths, strip/replace internal routing headers, verify trusted upstream destinations, bound resource-amplifying requests, and prevent public access to administrative RPCs. Remote control and ingress use distinct authenticated identities/roles; do not pass end-user API secrets to unrelated upstream services. Local-only does not mean unauthenticated by default.
 
-Protect credentials, journals, checkpoint permissions, and sensitive cache directories. mllm's own runtime helper files (the runtime directory, its modules and the protected entry) and the directories on the way to them MUST be owned by root or the service user, never writable by other, and writable by group only through the owning user's private group; a group whose membership cannot be established is refused (owner decisions 2026-09-22 and 2026-09-23). mllm's private state (identity, credentials, lock files, observation sockets) admits no group write at all. Engine installation files are governed by §8.1, not by this rule. Do not log prompts by default. Record lifecycle commands and failures with secrets redacted. An explicit local development flag, `start standalone --debug-engine-logs`, may retain full native engine output in private owner-only log files. It defaults off, is not persisted, and does not relax launch or plugin checks. Raw development logs may contain secrets and MUST NOT be included in management responses or lifecycle journals. Revocation closes control sessions and prevents new work; terminating existing workloads on revocation follows explicit administrative policy.
+Protect credentials, journals, checkpoint permissions, and sensitive cache directories. mllm's own runtime helper files (the runtime directory, its modules and the protected entry) and the directories on the way to them MUST be owned by root or the service user, never writable by other, and writable by group only through the owning user's private group; a group whose membership cannot be established is refused (owner decisions 2026-09-22 and 2026-09-23). mllm's private state (identity, credentials, lock files, observation sockets) admits no group write at all. Engine installation files are governed by §8.1, not by this rule. *Amended 2026-09-25 (owner decision):* an engine's environment is closed. Its PATH is the installation's own `bin`, then fixed system directories, never the caller's shell PATH. A runtime profile may name a host-approved CUDA toolkit root, `cuda_home`, approved like `executable`. The host administrator writes it, or `mllm engine add` detects it from `CUDA_HOME`, else from `/usr/local/cuda` when it holds `bin/nvcc`; standalone environment installations take `MLLM_CUDA_HOME`. When `cuda_home` is set, mllm puts `<cuda_home>/bin` right after the installation's `bin` and sets `CUDA_HOME`; without it the PATH stays minimal. mllm also bounds JIT compile parallelism in the engine environment. It sets `MAX_JOBS` to `clamp(floor(MemAvailable at launch / 8 GiB), 1, CPU count)` and `FLASHINFER_NVCC_THREADS` to 1. A profile's `env` may override either one with a positive integer, and the host log records the chosen value at every launch. Do not log prompts by default. Record lifecycle commands and failures with secrets redacted. An explicit local development flag, `start standalone --debug-engine-logs`, may retain full native engine output in private owner-only log files. It defaults off, is not persisted, and does not relax launch or plugin checks. Raw development logs may contain secrets and MUST NOT be included in management responses or lifecycle journals. Revocation closes control sessions and prevents new work; terminating existing workloads on revocation follows explicit administrative policy.
+
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+The inference listener may be reachable from the network. It requires the API key by default; turning the key off (`authentication: none`, `--no-inference-auth` or `MLLM_INFERENCE_AUTH=none`) prints a warning at start when the bind is not loopback, and there is no constant or fallback key. The router's allowlists, header stripping and amplification bounds apply on every bind. The management listener, engine listeners and the key-guard protections keep their loopback rules.
 
 ## 14. Action-first CLI and interfaces
 
@@ -565,6 +577,10 @@ Operator configuration is not mutable runtime state. Server/agent processes writ
 
 The engines file is mllm-owned operational state, not administrator YAML: mllm writes it only when the operator runs `mllm engine add` or `remove`, under a lock and atomically, with its revision in the first-line comment `# mllm-document-revision: N`. The role's own document is never rewritten.
 
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+One sanctioned rewrite: the one-time migration of the old loopback inference default (ADR 0019). A server or standalone document whose inference bind is exactly `127.0.0.1:8443` is rewritten once to `0.0.0.0:8443`, atomically, with the original kept as `<file>.pre-0.1.0`, a marker under the state directory and a notice; no other value is changed and it never runs twice.
+
 ### 15.2 No-config behavior
 
 | Situation | Behavior |
@@ -581,6 +597,10 @@ Creation must be atomic and owner-protected, with no clobber on concurrent start
 
 Defaults: local-only listeners with authentication; no public binding, no arbitrary script execution, no automatic engine installation/download, no large host-cache reservation or persistent storage writes until a deployment enables them. Discover inventory but do not execute detected engines merely because they are on PATH. Online enrollment is possible before any profile is eligible.
 
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+Defaults: the inference listener binds all interfaces (`0.0.0.0:8443`) and requires the API key; `authentication: none` is an explicit opt-out that warns at start when the bind is not loopback. Management listeners stay loopback-only. (Model downloads from Hugging Face and HTTP sources are allowed by default within a bounded store, per the ADR 0008 amendment of 2026-09-25; engines are still never installed automatically.)
+
 `auto` budgets must resolve to finite, versioned, inspectable allocations before launch. Establish a deterministic conservative headroom policy in the implementation ADR; its exact tuned numbers are not inferred from example YAML. Missing recipe estimates require an explicit estimate or controlled verification under a safe reservation, not unbounded startup. If a safe estimate cannot be established, block with a useful diagnostic. This specification does not authorize forced model loading merely to make a generated default appear turnkey.
 
 Material default changes affect new deployments only unless an explicit update is requested. Persist effective values, source/provenance, schema version, and profile revisions with each deployment. Hard constraints compose by intersection; exceeding a host ceiling is an error or queue condition, not silent shrinking.
@@ -594,6 +614,8 @@ Validate syntax/schema before side effects. Resolve paths and fingerprints local
 ## 16. Illustrative configuration examples
 
 The matching files are included under `examples/`. They are parseable schema sketches, not runnable installations or measured resource recipes. Host names refer to the planned lab; network addresses and all byte/time values are examples. No certificate files, secrets, engine binaries, or checkpoints are included.
+
+A deployment document needs only `name`, `engine` (its runtime profile) and `model`; every other deployment field below is optional and defaulted from the document, the host and the checkpoint when absent (ADR 0014 amendment A4). The examples state every field to show the schema.
 
 The canonical examples use `memory.system` for the host's system physical domain: unified CPU/GPU capacity on a Spark, host RAM only on a discrete-GPU system. A discrete-GPU schema also needs per-device `device_memory` phase budgets; omission must not be interpreted as unlimited VRAM. The first schema ADR should preserve this distinction.
 
@@ -714,6 +736,31 @@ logging:
 
 This example opts out of development engine controls explicitly, so a profile needing vLLM development endpoints cannot deep-park under it: a `deep` residency fails resolution and `restart_only` is required. Omitting the setting enables deep parking (ADR 0012).
 
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+On a discrete-GPU host the resource policy declares host RAM as a `distinct` system domain and each GPU as a `device` domain that names its device (the full document is `examples/host-discrete.yaml`):
+
+```yaml
+resource_policy:
+  domains:
+    system:
+      memory: distinct          # host RAM only
+      managed_limit: "24GiB"
+      free_reserve: "8GiB"
+      parked_limit: "12GiB"      # parked residue in host RAM, host_backed copies included
+      host_kv_limit: "4GiB"      # host-KV offload budget
+    gpu0:
+      memory: device
+      device: gpu0               # the device whose memory this is
+      managed_limit: "14848MiB"
+      free_reserve: "1536MiB"
+      parked_limit: "2GiB"       # CUDA context left by parked engines
+  devices:
+    gpu0: {domain: gpu0, sharing: shared}
+```
+
+`host_kv_limit` is refused on a device domain, a device domain maps exactly its own device, and a unified domain is never combined with a device domain (`unsupported_gpu_topology`). The agent refuses to start when a device domain does not match the observed GPU (`device_policy_mismatch`).
+
 ### 16.3 Single-host deployment: allocations and cache choice
 
 ```yaml
@@ -827,6 +874,10 @@ host:
 
 Relative paths in this example resolve against the configuration file, not an arbitrary current working directory. An actual auto-generated file uses appropriate per-user absolute paths. No model is started and no inference runtime is executed by this shape. The standalone listeners serve plain HTTP on loopback, so the shape has no `tls` block and a standalone document that states one is refused (§15.3). Older generators wrote `server.tls: {mode: managed, identity_dir: <state root>/identity}`; a block equal to exactly that value is accepted so existing installations keep starting, reported at boot as ignored, and never rewritten (R13). Any other `server.tls` value is refused with its path. An embedded host cannot also specify a remote `server.url`. Numeric `auto` values require resolution before a deployment is admitted.
 
+> **Amended by [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md)** (owner decision 2026-09-25).
+
+The generated shape states `inference.bind: "0.0.0.0:8443"` (with `authentication: api_key`). The sentence above that standalone listeners "serve plain HTTP on loopback" now reads: standalone listeners serve plain HTTP; use a private network or a TLS reverse proxy. The management listener stays on loopback.
+
 ## 17. Observability and benchmark evidence
 
 Record operation/generation IDs, state transitions, participant states, reservation decisions, cleanup evidence, queue depth/bytes, activation progress, and failures. Status must distinguish configured capacity, granted reservation, observed use, and unknown observations. Protect high-cardinality metrics from unbounded user input.
@@ -905,7 +956,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T23 | Peak activation versus steady state | Candidate blocked when transient demand exceeds the available budget. |
 | T24 | Retained private host caches: 9 + 8 > 16 GiB | Admission blocked until supported reclamation is verified. |
 | T25 | Shared cache ownership | Physical service counted once; clients subject to their quotas; one client cannot stop all users. |
-| T26 | Unified versus discrete memory | No double-counted unified RAM and no missing per-device VRAM limits. |
+| T26 | Unified versus discrete memory | No double-counted unified RAM and no missing per-device VRAM limits, and device-domain observation, derived device and system budgets, and a switch on a small card (ADR 0019). |
 | T27 | Overlapping GPU sets / shared host RAM | Exclusive assignment and aggregate limits both enforced without deadlock. |
 | T28 | Disk retention and shared filesystem | Stopped engines retain charged cache data; quotas/free reserve cover all writers. |
 | T29 | Unknown/external memory pressure | No invented capacity; local agent can reject a stale server plan. |
@@ -916,7 +967,7 @@ Every requirement below needs an automated test where feasible; real-engine and 
 | T34 | Old command/session replay | Stale generations rejected; ambiguous effects reconciled. A newer host is refused ("upgrade the server first"), an older-than-N-1 or unversioned host is drain-only, and a command needing a capability the host did not declare is refused typed and never sent (ADR 0017). |
 | T35 | KV persistence across park and restart | Observed hit/miss behavior correct; incompatible data never reused. |
 | T36 | Required versus optional cache outage | Required blocks; optional uses declared fallback, not improvised live reconfiguration. |
-| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. mllm's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). |
+| T37 | Security boundaries | Method/path and destination allowlists, credential redaction, no remote shell privilege escalation. mllm's runtime helpers follow the owner-only rule (group write only through the owner's private group); its private state admits no group write; engine installations get no permission rule (§13.3). A non-loopback inference bind without a key warns; no constant key (ADR 0019). |
 | T38 | Server crash with live inference | Honest request failure semantics; no exactly-once/resumable stream claim. |
 | T39 | Numerical default change and replay | Existing deployment retains its pinned effective contract until explicit update. |
 | T40 | Performance comparison | Reproducible phase/TTFT distributions with cache conditions and pinned profiles; no unsupported speedup claim. |
@@ -928,6 +979,10 @@ The first real-hardware proof is two managed deployments sharing one exclusive p
 ### Changes from revision 0.1
 
 Added standalone/remote role boundaries, per-host agents and head-only ingress, explicit deployment/attachment ownership, action-first CLI, control-plane deployment with durable IDs, host invitation enrollment, native/custom runtime contracts, aggregate resource-owner accounting, shared-cache capacity, default generation, and a traceable acceptance matrix. Replaced the previous combined host/deployment resource configuration. Remote control is now a first-class designed interface, with live verification staged in delivery.
+
+### Later amendments
+
+- 2026-09-25, [ADR 0019](design/adr/0019-discrete-gpu-and-network-endpoint.md): discrete NVIDIA GPUs as `device` memory domains with the host-RAM park tier, one GPU per model picked by mllm, and the inference listener on all interfaces behind its key (§6.2, §7.2, §13.3, §15.1, §15.2, §16.2, §16.5, T26, T37).
 
 ### Sources
 

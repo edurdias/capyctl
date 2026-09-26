@@ -9,6 +9,7 @@ pub(super) struct NormalizedProfile {
     pub(super) build_fingerprint: String,
     pub(super) args: Vec<String>,
     pub(super) env: BTreeMap<String, String>,
+    pub(super) cuda_home: Option<String>,
     pub(super) security: Security,
     pub(super) log_policy: LogPolicy,
 }
@@ -79,7 +80,7 @@ pub(super) fn normalize_profile(
     validate_profile_env(&raw_profile.env).map_err(|_| {
         invalid(
             "runtime_profiles.env",
-            "environment name is not allowlisted",
+            "environment name is not allowlisted, or a build limit is not a positive integer",
         )
     })?;
     // Spec §3: `--trust-remote-code` makes the engine execute Python that arrived
@@ -107,6 +108,23 @@ pub(super) fn normalize_profile(
             "a parking deployment cannot run on a profile that opts out of deep park \
              (deep_park: disabled); use residency: restart_only or remove the opt-out",
         ));
+    }
+    // SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root
+    // is host-approved like the executable: absolute and normalized.
+    if let Some(cuda_home) = &raw_profile.cuda_home {
+        if !Path::new(cuda_home).is_absolute()
+            || Path::new(cuda_home).components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        {
+            return Err(invalid(
+                "runtime_profiles.cuda_home",
+                "must be an absolute, normalized directory",
+            ));
+        }
     }
     for path in &raw_profile.security.approved_paths {
         if !Path::new(path).is_absolute()
@@ -141,6 +159,7 @@ pub(super) fn normalize_profile(
         build_fingerprint: raw_profile.build_fingerprint.clone(),
         args: raw_profile.args.clone(),
         env: raw_profile.env.clone(),
+        cuda_home: raw_profile.cuda_home.clone(),
         security: raw_profile.security.clone(),
         log_policy: LogPolicy {
             max_file_bytes: parse_bytes(&raw_profile.log_policy.max_file_bytes)?,
@@ -161,9 +180,13 @@ pub(super) fn normalize_profile(
 /// That is deliberate: the operator writing the host file decides where weights
 /// may live, and confining paths to the store would stop a host from serving a
 /// checkpoint it already has elsewhere.
+/// `store` anchors a relative local path; a remote source resolves under
+/// `sources` (the host's sources store, owner decision 2026-09-25), which is
+/// the model store when the host names none.
 pub(super) fn normalize_model(
     raw: RawModel,
     store: Option<&Path>,
+    sources: Option<&Path>,
 ) -> Result<ModelIdentity, ConfigError> {
     let source = match (raw.path, raw.source) {
         (Some(_), Some(_)) => {
@@ -198,7 +221,8 @@ pub(super) fn normalize_model(
         (remote, Some(store)) => remote
             .store_key()
             .map(|key| {
-                store
+                sources
+                    .unwrap_or(store)
                     .join(key)
                     .to_str()
                     .map(str::to_owned)
@@ -264,6 +288,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             host_kv_limit: raw.host_kv_limit.as_deref().map(parse_bytes).transpose()?,
             parked_limit: raw.parked_limit.as_deref().map(parse_bytes).transpose()?,
             memory: raw.memory,
+            device: raw.device,
         };
         domains.insert(name, value);
     }
@@ -330,6 +355,7 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
             }
         }
     }
+    check_domain_shape(&domains, &h.resource_policy.devices)?;
     let host = HostPolicy {
         name: h.name,
         hardware_fingerprint: h.hardware_fingerprint,
@@ -348,6 +374,236 @@ pub(super) fn normalize_host(h: HostInput) -> Result<HostPolicy, ConfigError> {
     };
     ResourceControls::from_host(&host).validate(&ResourceContext::from_host(&host))?;
     Ok(host)
+}
+
+/// ADR 0019, SPEC §7.2: a discrete GPU's memory is its own domain. A `device`
+/// domain names exactly one device, that device maps to it and no other does, and
+/// it carries no `host_kv_limit` (host-KV lives in host RAM). A host declares at
+/// most one `unified` domain and never mixes one with a `device` domain.
+fn check_domain_shape(
+    domains: &BTreeMap<String, DomainPolicy>,
+    devices: &BTreeMap<String, DevicePolicy>,
+) -> Result<(), ConfigError> {
+    let path = "resource_policy.domains";
+    let unified = domains
+        .values()
+        .filter(|d| d.memory == DomainMemory::Unified)
+        .count();
+    let device = domains
+        .values()
+        .filter(|d| d.memory == DomainMemory::Device)
+        .count();
+    if unified > 1 || (unified == 1 && device > 0) {
+        return Err(invalid(
+            path,
+            "unsupported_gpu_topology: a unified domain cannot be combined with another unified or a device domain",
+        ));
+    }
+    for (name, domain) in domains {
+        let here = format!("{path}.{name}");
+        match (domain.memory, domain.device.as_deref()) {
+            (DomainMemory::Device, Some(id)) => {
+                if domain.host_kv_limit.is_some() {
+                    return Err(invalid(
+                        &here,
+                        "device_policy_mismatch: host_kv_limit belongs to the system domain",
+                    ));
+                }
+                if devices.get(id).map(|d| d.domain.as_str()) != Some(name.as_str()) {
+                    return Err(invalid(
+                        &here,
+                        "device_policy_mismatch: the named device must map to this domain",
+                    ));
+                }
+                if devices
+                    .iter()
+                    .any(|(other, d)| other != id && d.domain == *name)
+                {
+                    return Err(invalid(
+                        &here,
+                        "device_policy_mismatch: only its own device may map to a device domain",
+                    ));
+                }
+            }
+            (DomainMemory::Device, None) => {
+                return Err(invalid(
+                    &here,
+                    "device_policy_mismatch: a device domain names its device",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(invalid(
+                    &here,
+                    "device_policy_mismatch: only a device domain names a device",
+                ));
+            }
+            (_, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Discrete GPU design §7: one GPU per model in 0.1.0. On a host with a device
+/// domain, a deployment claiming more than one device is refused before any
+/// phase is resolved. Tensor parallelism has no deployment field to ask for it:
+/// `--tensor-parallel-size` is a reserved engine argument (`engine_policy`), so a
+/// multi-rank launch cannot be declared at all.
+pub(super) fn check_single_device(
+    devices: &[DeviceClaim],
+    host: &HostPolicy,
+) -> Result<(), ConfigError> {
+    let discrete = host
+        .domains
+        .values()
+        .any(|d| d.memory == DomainMemory::Device);
+    if discrete && devices.len() > 1 {
+        return Err(invalid(
+            "devices",
+            "multi_gpu_unsupported: one GPU per model in 0.1.0; tensor-parallel and \
+             multi-device models are planned after 0.1.0",
+        ));
+    }
+    Ok(())
+}
+
+/// Review decision (discrete GPU design §3): the device domain a deployment
+/// without explicit resources derives its phases on, when it is a discrete
+/// GPU's. `None` on a unified host or when the selected devices do not name
+/// exactly one device domain (derivation refuses that shape on its own).
+pub(super) fn derived_device_sizing(
+    devices: &[DeviceClaim],
+    host: &HostPolicy,
+) -> Option<super::engine_config::DeviceSizing> {
+    let [claim] = devices else {
+        return None;
+    };
+    let domain = host.domains.get(&host.devices.get(&claim.id)?.domain)?;
+    (domain.memory == DomainMemory::Device).then(|| super::engine_config::DeviceSizing {
+        managed_limit: domain.managed_limit,
+        declared_total: domain.managed_limit.saturating_add(domain.free_reserve),
+    })
+}
+
+/// Owner decision 2026-09-25: the memory domain the selected devices share,
+/// when they name exactly one (the domain a derived deployment runs in).
+pub(super) fn single_domain<'a>(
+    devices: &[DeviceClaim],
+    host: &'a HostPolicy,
+) -> Option<&'a DomainPolicy> {
+    let mut domains = devices
+        .iter()
+        .map(|claim| host.devices.get(&claim.id).map(|device| &device.domain));
+    let first = domains.next()??;
+    domains
+        .all(|domain| domain == Some(first))
+        .then(|| host.domains.get(first))
+        .flatten()
+}
+
+/// Discrete GPU design §5 (Task 6's `host_backed_unavailable` bound): what
+/// the one `distinct` system domain holds parked, the smaller of its parked
+/// and managed limits. Zero when the host has no single system domain.
+pub(super) fn system_parked_limit(host: &HostPolicy) -> i64 {
+    let mut systems = host
+        .domains
+        .values()
+        .filter(|domain| domain.memory == DomainMemory::Distinct);
+    match (systems.next(), systems.next()) {
+        (Some(system), None) => system
+            .parked_limit
+            .unwrap_or(system.managed_limit)
+            .min(system.managed_limit),
+        _ => 0,
+    }
+}
+
+/// Discrete GPU design §3, SPEC §16 (omission is not unlimited): explicit
+/// resources on a discrete host name the system domain wherever they charge a
+/// device domain. A phase that charges a device domain but no `distinct` system
+/// domain would leave the engine's host RAM unaccounted, so it is refused.
+pub(super) fn check_system_allocation(
+    resources: &RecipeFootprints,
+    host: &HostPolicy,
+) -> Result<(), ConfigError> {
+    let memory = |name: &str| host.domains.get(name).map(|d| d.memory);
+    for (name, phase) in [
+        ("cold", &resources.cold),
+        ("ready", &resources.ready),
+        ("parking", &resources.parking),
+        ("parked", &resources.parked),
+        ("wake", &resources.wake),
+    ] {
+        let charges_device = phase
+            .allocations
+            .iter()
+            .any(|a| a.bytes > 0 && memory(&a.domain) == Some(DomainMemory::Device));
+        let names_system = phase
+            .allocations
+            .iter()
+            .any(|a| memory(&a.domain) == Some(DomainMemory::Distinct));
+        if charges_device && !names_system {
+            return Err(invalid(
+                format!("resources.{name}.allocations"),
+                "missing_system_allocation: a phase that charges a device domain also \
+                 names the host's system domain",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Discrete GPU design §3 and §5: the host-RAM tier on a discrete host is allowed
+/// only when the system domain has room for the weights copy. The parked phase
+/// carries the copy on the system domain; if that allocation alone exceeds the
+/// system domain's `parked_limit` or `managed_limit`, no park could ever be
+/// admitted, and every release would silently become a stop. On a unified domain
+/// the tier is refused outright (ADR 0010 decision 5, checked above), and on a
+/// host without a device domain the rule is unchanged.
+fn check_host_backed_room(d: &NormalizedRecipe, host: &HostPolicy) -> Result<(), ConfigError> {
+    if d.residency != Residency::HostBacked {
+        return Ok(());
+    }
+    let parked = &d.resources.parked.allocations;
+    let on_device = parked.iter().any(|a| {
+        host.domains
+            .get(&a.domain)
+            .is_some_and(|p| p.memory == DomainMemory::Device)
+    });
+    if !on_device {
+        return Ok(());
+    }
+    let mut system_charged = false;
+    for a in parked {
+        let Some(policy) = host.domains.get(&a.domain) else {
+            continue;
+        };
+        if policy.memory != DomainMemory::Distinct {
+            continue;
+        }
+        system_charged |= a.bytes > 0;
+        let limit = policy
+            .parked_limit
+            .map_or(policy.managed_limit, |p| p.min(policy.managed_limit));
+        if a.bytes > limit {
+            return Err(invalid(
+                "residency",
+                format!(
+                    "host_backed_unavailable: the parked weights copy needs {} bytes on \
+                     system domain '{}', which holds at most {limit} parked bytes; use deep \
+                     or restart_only",
+                    a.bytes, a.domain
+                ),
+            ));
+        }
+    }
+    if !system_charged {
+        return Err(invalid(
+            "residency",
+            "host_backed_unavailable: the parked phase charges no weights copy on the \
+             system domain",
+        ));
+    }
+    Ok(())
 }
 
 fn domain_phase(
@@ -416,7 +672,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
                 return Err(invalid(
                     "residency",
                     format!(
-                        "host_backed retains weights in host memory, but domain \
+                        "host_backed_unavailable: host_backed retains weights in host memory, but domain \
                          '{}' declares device and host memory as one pool, so it \
                          would free nothing; use deep or restart_only",
                         a.domain
@@ -425,6 +681,7 @@ pub(super) fn validate_recipe(d: &NormalizedRecipe, host: &HostPolicy) -> Result
             }
         }
     }
+    check_host_backed_room(d, host)?;
     if d.request_deadline_ms > host.queue.request_deadline_ms {
         return Err(invalid(
             "request_deadline",
@@ -532,6 +789,9 @@ pub(super) fn recipe_fingerprint(
         args: &'a [String],
         engine_config: &'a LaunchSettings,
         env: &'a BTreeMap<String, String>,
+        // Absent leaves every existing fingerprint unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cuda_home: Option<&'a str>,
         deep_park: DeepPark,
         trust_remote_code: bool,
         extra_args_policy: ExtraArgsPolicy,
@@ -559,6 +819,7 @@ pub(super) fn recipe_fingerprint(
         args: &profile.args,
         engine_config,
         env: &profile.env,
+        cuda_home: profile.cuda_home.as_deref(),
         deep_park: profile.security.deep_park,
         trust_remote_code: profile.security.trust_remote_code,
         extra_args_policy: profile.security.extra_args,

@@ -23,6 +23,42 @@ pub const SGLANG_OVERHEAD_MARGIN_BYTES: i64 = 8 << 30;
 /// whole request, when smaller) while parked.
 pub const PARKED_RESIDUAL_PLACEHOLDER_BYTES: i64 = 2 << 30;
 
+/// Discrete GPU design §3 (ADR 0019): the host RAM an engine process holds outside
+/// the GPU (interpreter, CUDA runtime, tokenizer, pinned staging buffers), charged
+/// on the system domain of a discrete host. A placeholder until a first run
+/// measures the process RSS.
+pub const ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES: i64 = 4 << 30;
+
+/// Discrete GPU design §3: what a parked engine still holds on a discrete GPU
+/// (CUDA context, NCCL and allocator buffers). A placeholder until measured;
+/// `PARKED_RESIDUAL_PLACEHOLDER_BYTES` stays for unified hosts.
+pub const PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES: i64 = 1 << 30;
+
+/// ADR 0019 (discrete GPU design §3): the device memory an engine holds beyond
+/// its memory request (the CUDA context and the CUDA graphs it captures after
+/// sizing its KV cache), charged on the device domain, or the unified pool, in
+/// every active phase: one rule on every host shape.
+/// Measured live on a 16 GB discrete GPU with vLLM 0.29: a 12.0 GiB request
+/// held 13.2 GiB of the card, 1.2 GiB beyond it. SGLang's static memory
+/// fraction likewise leaves its graphs outside it, so one rule charges both
+/// engines. A placeholder (1.25 GiB) until the measured device peak replaces
+/// it.
+pub const ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES: i64 = 5 << 28;
+
+/// Discrete GPU design §3: the host RAM a `host_backed` copy of `weights`
+/// bytes takes. The copy is pinned host memory, which PyTorch's pinned
+/// allocator rounds up per tensor. Measured live on a 16 GB discrete GPU with
+/// vLLM 0.29: about 1.37 times the weights (11.1 GB for 8.04 GB of Qwen3-4B,
+/// 4.2 GB for 3.09 GB of Qwen2.5-1.5B), so the placeholder charges 1.5 times
+/// until a first park measures it.
+pub const HOST_BACKED_COPY_FACTOR: (i64, i64) = (3, 2);
+
+/// The `host_backed` copy of `weights` bytes, as charged in host RAM.
+pub fn host_backed_copy_bytes(weights: i64) -> i64 {
+    let (numerator, denominator) = HOST_BACKED_COPY_FACTOR;
+    weights.saturating_mul(numerator) / denominator
+}
+
 /// Owner decision 2026-09-23 (startup memory budget): until a deployment
 /// declares `memory.startup` or a first run on a host measures the peak, the
 /// startup reservation is `max(request, weights × STARTUP_WEIGHTS_FACTOR +
@@ -67,6 +103,10 @@ pub struct CheckpointFacts {
     /// startup peak; it is re-resolved exactly as it was, with a cold phase
     /// equal to the request. Never set for a new resolution.
     pub legacy_startup: bool,
+    /// A snapshot frozen before the engine's CUDA context and graphs were
+    /// charged records no `overhead_bytes`; it re-resolves exactly as it was,
+    /// without them. Never set for a new resolution.
+    pub legacy_overhead: bool,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -100,6 +140,21 @@ pub(super) struct RawEngineConfig {
     extra_args: Option<Vec<String>>,
 }
 
+impl RawEngineConfig {
+    /// Whether the block states a memory request or a KV cache.
+    pub(super) fn states_memory(&self) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|memory| memory.request.is_some() || memory.kv_cache.is_some())
+    }
+
+    /// Owner decision 2026-09-25: state the default KV cache, in bytes, for a
+    /// deployment that states no memory (`deployment_defaults::default_kv_cache`).
+    pub(super) fn default_kv_cache(&mut self, bytes: i64) {
+        self.memory.get_or_insert_with(RawMemory::default).kv_cache = Some(format!("{bytes}B"));
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMemory {
@@ -131,6 +186,69 @@ struct RawSglangFields {
     tokenizer_workers: Option<u32>,
 }
 
+/// Review decision (discrete GPU design §3): how a memory request derived from
+/// the checkpoint's weights is sized when the deployment's phases derive on a
+/// device domain (a discrete GPU). Absent everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DeviceSizing {
+    /// The device domain's managed limit: a request above it can never place.
+    pub(super) managed_limit: i64,
+    /// The card as the host policy declares it: managed limit plus free
+    /// reserve (what the standalone host policy publishes as the card's total).
+    pub(super) declared_total: i64,
+}
+
+/// Design §3: a device request is `weights x 1.10 + kv`, and vLLM's at least
+/// 0.75 of the card (vLLM 0.29 with CUDA graphs does not start a 4B model on a
+/// 16 GB card below `--gpu-memory-utilization 0.75`). Unknown weights are not
+/// materializable yet: acceptance freezes the revision provisional and the
+/// checkpoint digest re-resolves it with the measured weights (ADR 0014 §7),
+/// which is how a Hugging Face or HTTP source is sized once downloaded. `None`
+/// without a declared KV cache (resolution then asks for one).
+fn device_request_from_weights(
+    device: DeviceSizing,
+    engine: Engine,
+    weights: Option<i64>,
+    kv_cache: Option<i64>,
+) -> Result<Option<i64>, ConfigError> {
+    let Some(kv) = kv_cache else {
+        return Ok(None);
+    };
+    let weights = weights.ok_or_else(|| {
+        ConfigError::new(
+            ConfigErrorCode::NotMaterializable,
+            "engine_config.memory.request",
+            "cannot size the device request: the checkpoint's weight size is not known yet \
+             (ADR 0014 §5, §7); it is sized once the checkpoint is measured",
+        )
+    })?;
+    // The standalone template's own arithmetic (`device_request`), so a
+    // remote checkpoint sizes exactly as a local one of the same weights.
+    let request = (weights / 100)
+        .checked_mul(110)
+        .and_then(|scaled| scaled.checked_add(kv))
+        .ok_or_else(|| invalid("engine_config.memory", "memory arithmetic overflows"))?;
+    let floor = match engine {
+        Engine::Vllm => device.declared_total / 100 * 75,
+        Engine::Sglang => 0,
+    };
+    let request = request.max(floor);
+    let charged = request.saturating_add(ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES);
+    if charged > device.managed_limit {
+        return Err(invalid(
+            "engine_config.memory.request",
+            format!(
+                "insufficient_device_memory: the deployment needs {charged} bytes of device \
+                 memory (a request of {request} bytes, weights x 1.10 plus the KV cache, and \
+                 the engine's CUDA context and graphs), above the {} bytes the device domain \
+                 manages; use a smaller or quantized checkpoint",
+                device.managed_limit
+            ),
+        ));
+    }
+    Ok(Some(request))
+}
+
 /// Everything besides the block itself that resolution needs.
 pub(super) struct EngineInputs<'a> {
     pub(super) engine: Engine,
@@ -141,6 +259,8 @@ pub(super) struct EngineInputs<'a> {
     /// The Ready phase total of an explicit `resources:` block, if declared.
     pub(super) declared_ready_total: Option<i64>,
     pub(super) facts: CheckpointFacts,
+    /// The device domain the phases derive on, when it is a discrete GPU's.
+    pub(super) device: Option<DeviceSizing>,
 }
 
 /// ADR 0014 §5 (P2) inputs, all in bytes.
@@ -276,6 +396,8 @@ pub fn resolve_memory(inputs: MemoryInputs) -> Result<ResolvedMemory, ConfigErro
             margin_bytes: inputs.margin,
             weights_bytes: inputs.weights,
             startup_bytes: None,
+            device_total_bytes: None,
+            overhead_bytes: None,
         },
         derived,
     ))
@@ -329,13 +451,17 @@ pub fn resolve_startup(
 /// cold is the startup peak (never below the request);
 /// parked is the residual floor placeholder for a parking deployment and zero
 /// for one that restarts. Derivation needs one memory domain for the selected
-/// devices; anything else declares `resources:` explicitly.
+/// devices; anything else declares `resources:` explicitly. On a discrete host
+/// (the selected device's domain is a `device` domain) every phase charges the
+/// device domain and the system domain (discrete GPU design §3).
 pub(super) fn derive_resources(
     request: i64,
     startup: Option<i64>,
     residency: Residency,
     devices: &[DeviceClaim],
     host: &HostPolicy,
+    weights_bytes: Option<i64>,
+    overhead: i64,
 ) -> Result<RecipeFootprints, ConfigError> {
     let mut domains = BTreeSet::new();
     for claim in devices {
@@ -359,6 +485,30 @@ pub(super) fn derive_resources(
                 "the selected devices span several memory domains; declare resources explicitly",
             )),
         };
+    // Owner decision 2026-09-23: admission reserves the startup peak from arm
+    // until Ready (the cold phase, ADR 0007); Ready drops to the request.
+    let cold = startup.map_or(request, |peak| peak.max(request));
+    if host.domains.get(&domain).map(|d| d.memory) == Some(DomainMemory::Device) {
+        return derive_discrete(DiscreteInputs {
+            request,
+            cold,
+            residency,
+            devices,
+            host,
+            device_domain: domain,
+            weights_bytes,
+            overhead,
+        });
+    }
+    // Re-review (parity rule): the engine's CUDA context and graphs sit
+    // outside its request in a unified pool as on a card, so the pool is
+    // charged them too, by the rule `derive_discrete` applies.
+    let on_pool = |bytes: i64| {
+        bytes
+            .checked_add(overhead)
+            .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
+    };
+    let (request_charge, cold) = (on_pool(request)?, on_pool(cold)?);
     let active = |bytes: i64| PhaseFootprint {
         allocations: vec![Allocation {
             domain: domain.clone(),
@@ -372,13 +522,10 @@ pub(super) fn derive_resources(
     } else {
         0
     };
-    // Owner decision 2026-09-23: admission reserves the startup peak from arm
-    // until Ready (the cold phase, ADR 0007); Ready drops to the request.
-    let cold = startup.map_or(request, |peak| peak.max(request));
     Ok(RecipeFootprints {
         cold: active(cold),
-        ready: active(request),
-        parking: active(request),
+        ready: active(request_charge),
+        parking: active(request_charge),
         parked: PhaseFootprint {
             allocations: vec![Allocation {
                 domain: domain.clone(),
@@ -387,7 +534,135 @@ pub(super) fn derive_resources(
             }],
             devices: Vec::new(),
         },
-        wake: active(request),
+        wake: active(request_charge),
+    })
+}
+
+struct DiscreteInputs<'a> {
+    request: i64,
+    cold: i64,
+    residency: Residency,
+    devices: &'a [DeviceClaim],
+    host: &'a HostPolicy,
+    device_domain: String,
+    weights_bytes: Option<i64>,
+    overhead: i64,
+}
+
+/// Discrete GPU design §3 (ADR 0019): VRAM in the device domain, the engine's host
+/// overhead (and the `host_backed` weights copy) in host RAM, the one `distinct`
+/// system domain. Every phase carries both allocations, `[device, system]`.
+fn derive_discrete(inputs: DiscreteInputs<'_>) -> Result<RecipeFootprints, ConfigError> {
+    let DiscreteInputs {
+        request,
+        cold,
+        residency,
+        devices,
+        host,
+        device_domain,
+        weights_bytes,
+        overhead: context_overhead,
+    } = inputs;
+    let systems: Vec<&String> = host
+        .domains
+        .iter()
+        .filter(|(_, d)| d.memory == DomainMemory::Distinct)
+        .map(|(name, _)| name)
+        .collect();
+    let [system] = systems.as_slice() else {
+        return Err(invalid(
+            "resource_policy.domains",
+            "missing_system_allocation: a discrete host declares one distinct system domain",
+        ));
+    };
+    // Discrete GPU design §3: the host_backed copy is the checkpoint's weight
+    // bytes. Unknown weights leave nothing to charge, and an uncharged copy is an
+    // overcommit of host RAM, so the footprint is not materializable until the
+    // checkpoint digest measures them (ADR 0014 §5, §7): acceptance freezes it
+    // provisional and re-resolves it with the measured weights, exactly as a
+    // memory request derived from the weights.
+    let copy = match residency {
+        Residency::HostBacked => weights_bytes.map(host_backed_copy_bytes).ok_or_else(|| {
+            ConfigError::new(
+                ConfigErrorCode::NotMaterializable,
+                "engine_config.memory",
+                "cannot charge the host_backed weights copy: the checkpoint's weight size \
+                 is not known yet (ADR 0014 §5, §7)",
+            )
+        })?,
+        _ => 0,
+    };
+    // SGLang's --enable-weights-cpu-backup holds the copy for the engine's
+    // life. So does vLLM 0.29 in practice: level 1 frees its backup tensors on
+    // wake, but PyTorch's pinned allocator keeps the memory cached (measured
+    // live on a 16 GB discrete GPU: the process's shared memory stayed at the
+    // copy's size after the wake), so both are charged it in every phase.
+    let always = copy;
+    let overhead = ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
+    // The engine holds its CUDA context and graphs on the card beside the
+    // request (measured live: 13.2 GiB held against a 12.0 GiB request), so
+    // the device domain is charged both, and planner, admission and the
+    // launch check judge the same figure.
+    let on_card = |bytes: i64| {
+        bytes
+            .checked_add(context_overhead)
+            .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
+    };
+    let active = on_card(request)?;
+    let cold = on_card(cold)?;
+    if let Some(limit) = host
+        .domains
+        .get(&device_domain)
+        .map(|domain| domain.managed_limit)
+        .filter(|limit| active > *limit)
+    {
+        return Err(invalid(
+            "engine_config.memory.request",
+            format!(
+                "insufficient_device_memory: the deployment needs {active} bytes of device \
+                 memory (a request of {request} bytes and the engine's CUDA context and \
+                 graphs), above the {limit} bytes the device domain manages"
+            ),
+        ));
+    }
+    let two = |device: i64, system_bytes: i64, devices: Vec<DeviceClaim>| PhaseFootprint {
+        allocations: vec![
+            Allocation {
+                domain: device_domain.clone(),
+                bytes: device,
+                host_kv_bytes: 0,
+            },
+            Allocation {
+                domain: (*system).clone(),
+                bytes: system_bytes,
+                host_kv_bytes: 0,
+            },
+        ],
+        devices,
+    };
+    let add = |a: i64, b: i64| {
+        a.checked_add(b)
+            .ok_or_else(|| invalid("resources", "memory arithmetic overflows"))
+    };
+    let steady = add(overhead, always)?;
+    let with_copy = add(overhead, copy)?;
+    let residue = PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES.min(request);
+    // The parked phase is what admission counts against each domain's
+    // parked_limit, so the copy is charged there as parked residue. Parking and
+    // wake are the transitions into and out of it: the copy exists while the
+    // weights move, so both carry it too (a transition is never below the
+    // phases it joins, `mllm_domain::resources::validate_recipe`).
+    let parked = match residency {
+        Residency::RestartOnly => two(0, 0, Vec::new()),
+        Residency::Deep => two(residue, overhead, Vec::new()),
+        Residency::HostBacked => two(residue, with_copy, Vec::new()),
+    };
+    Ok(RecipeFootprints {
+        cold: two(cold, steady, devices.to_vec()),
+        ready: two(active, steady, devices.to_vec()),
+        parking: two(active, with_copy, devices.to_vec()),
+        parked,
+        wake: two(active, with_copy, devices.to_vec()),
     })
 }
 
@@ -550,13 +825,25 @@ pub(super) fn normalize_engine_config(
     }
 
     let raw_memory = raw.memory.clone().unwrap_or_default();
+    let declared_request = raw_memory.request.as_deref().map(parse_bytes).transpose()?;
+    let kv_cache = raw_memory
+        .kv_cache
+        .as_deref()
+        .map(parse_bytes)
+        .transpose()?;
+    let mut declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
+    // Review decision (discrete GPU design §3): a request derived from the
+    // weights on a device domain is sized for the card, not with the unified
+    // placeholder margin, which would not fit a small card.
+    let device_request = match (inputs.device, declared_request, inputs.declared_ready_total) {
+        (Some(device), None, None) => {
+            device_request_from_weights(device, engine, inputs.facts.weights_bytes, kv_cache)?
+        }
+        _ => None,
+    };
     let (mut memory, memory_provenance) = resolve_memory(MemoryInputs {
-        request: raw_memory.request.as_deref().map(parse_bytes).transpose()?,
-        kv_cache: raw_memory
-            .kv_cache
-            .as_deref()
-            .map(parse_bytes)
-            .transpose()?,
+        request: device_request.or(declared_request),
+        kv_cache,
         declared_ready_total: inputs.declared_ready_total,
         weights: inputs.facts.weights_bytes,
         margin: overhead_margin(engine),
@@ -565,7 +852,15 @@ pub(super) fn normalize_engine_config(
         .into_iter()
         .map(|(field, source)| (field.to_owned(), source))
         .collect();
-    let declared_startup = raw_memory.startup.as_deref().map(parse_bytes).transpose()?;
+    if let Some(request) = device_request {
+        provenance.insert("memory.request".into(), SettingSource::Derived);
+        // Design §3: the engine's use of the card is bounded by the fraction
+        // mllm renders from this request, so the device peak is the request.
+        if declared_startup.is_none() {
+            declared_startup = Some(request);
+            provenance.insert("memory.startup".into(), SettingSource::Derived);
+        }
+    }
     let (startup, startup_source) = resolve_startup(
         declared_startup,
         &memory,

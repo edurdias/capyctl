@@ -12,6 +12,45 @@ import types
 import unittest
 from unittest import mock
 
+from runtime import sglang_saver_binding
+
+
+# The recipe's valid ServerArgs values for a launch without a weights backup.
+BASE_VALUES = dict(enable_memory_saver=True, enable_weights_cpu_backup=False,
+                   enable_draft_weights_cpu_backup=False)
+
+
+class HostBackedBindingTest(unittest.TestCase):
+    # T22 / ADR 0019: the weights backup is accepted only when the launch asked for it.
+    def test_backup_accepted_for_host_backed(self):
+        values = dict(BASE_VALUES, enable_weights_cpu_backup=True)
+        sglang_saver_binding.check_values(values, weight_restore="cpu_backup")
+
+    def test_no_backup_accepted_for_deep(self):
+        sglang_saver_binding.check_values(dict(BASE_VALUES), weight_restore="disk_reload")
+
+    def test_backup_refused_for_deep(self):
+        values = dict(BASE_VALUES, enable_weights_cpu_backup=True)
+        with self.assertRaises(sglang_saver_binding.SaverBindingError):
+            sglang_saver_binding.check_values(values, weight_restore="disk_reload")
+
+    def test_missing_backup_refused_for_host_backed(self):
+        with self.assertRaises(sglang_saver_binding.SaverBindingError):
+            sglang_saver_binding.check_values(dict(BASE_VALUES), weight_restore="cpu_backup")
+
+    def test_draft_backup_always_refused(self):
+        values = dict(BASE_VALUES, enable_weights_cpu_backup=True, enable_draft_weights_cpu_backup=True)
+        with self.assertRaises(sglang_saver_binding.SaverBindingError):
+            sglang_saver_binding.check_values(values, weight_restore="cpu_backup")
+
+    def test_unknown_restore_and_disabled_saver_refused(self):
+        for values, restore in ((dict(BASE_VALUES), "cpu"), (dict(BASE_VALUES), None),
+                                (dict(BASE_VALUES, enable_memory_saver=False), "disk_reload")):
+            with self.subTest(restore=restore):
+                with self.assertRaises(sglang_saver_binding.SaverBindingError) as caught:
+                    sglang_saver_binding.check_values(values, weight_restore=restore)
+                self.assertEqual(caught.exception.code, "configuration_mismatch")
+
 
 class SaverBindingTests(unittest.TestCase):
     @classmethod
@@ -89,9 +128,10 @@ uint32_t tms_snapshot_v1(uint32_t version, uint32_t size,
         self.build = self.binding.TrustedSaverBuild(str(self.path), self.digest, "preload")
 
     def observe(self, **kwargs):
+        extra = {"weight_restore": kwargs["weight_restore"]} if "weight_restore" in kwargs else {}
         return self.binding.observe_scheduler_saver(
             self.scheduler, expected_owner=kwargs.get("owner", self.owner),
-            build=kwargs.get("build", self.build))
+            build=kwargs.get("build", self.build), **extra)
 
     def test_existing_singleton_observes_real_export_and_owner(self):
         with mock.patch.object(ctypes, "CDLL", side_effect=AssertionError("must not load")):
@@ -135,6 +175,19 @@ uint32_t tms_snapshot_v1(uint32_t version, uint32_t size,
             with self.assertRaisesRegex(self.binding.SaverBindingError, code):
                 self.observe()
 
+    # T22 / ADR 0019: a host_backed launch observes its weights backup; the
+    # same snapshot is still refused for a launch that declared a disk reload.
+    def test_weights_backup_observed_only_for_a_host_backed_launch(self):
+        self.args.enable_weights_cpu_backup = True
+        self.library.fixture_mode(1)
+        result = self.observe(weight_restore="cpu_backup")
+        self.assertEqual(result.allocations.groups[0].backup_enabled_count, 1)
+        with self.assertRaisesRegex(self.binding.SaverBindingError, "configuration_mismatch"):
+            self.observe()
+        self.args.enable_weights_cpu_backup = False
+        with self.assertRaisesRegex(self.binding.SaverBindingError, "configuration_mismatch"):
+            self.observe(weight_restore="cpu_backup")
+
     def test_empty_snapshot_retains_only_scoped_facts(self):
         self.library.fixture_mode(3)
         result = self.observe()
@@ -156,26 +209,43 @@ uint32_t tms_snapshot_v1(uint32_t version, uint32_t size,
             with self.assertRaises(self.binding.SaverBindingError):
                 self.observe(build=replace(self.build, **{key: value}))
 
-    def test_writable_loaded_backing_file_rejected(self):
+    # T21 T37 (SPEC §8.1, ADR 0008): the saver library is an engine file, and
+    # engine files get no permission rule. A writable library is observed
+    # with one warning in the engine log; the digest still binds the loaded
+    # inode, so a changed library is refused as a mismatch.
+    def test_writable_loaded_backing_file_is_observed_with_a_warning(self):
+        import io
+        self.binding._WARNED.clear()
         self.path.chmod(0o522)
         try:
-            with self.assertRaises(self.binding.SaverBindingError):
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+                self.assertEqual(self.observe().library.sha256, self.digest)
                 self.observe()
+            lines = [line for line in log.getvalue().splitlines() if line]
+            self.assertEqual(lines, ['{"event":"mllm_saver_library_permissions",'
+                                     '"problem":"writable_by_other","action":"warned"}'])
+            self.assertNotIn(str(self.path), log.getvalue())
         finally:
             self.path.chmod(0o500)
 
-    # T21 T37: owner decision 2026-09-23. The reviewed saver build follows the
-    # owner-only rule: group write is trusted only under the owner's private
-    # group; under a shared group it is refused.
-    def test_group_writable_library_follows_the_owner_only_rule(self):
+    # T21 T37: found live on the discrete-GPU laptop host (DG3): a
+    # group-writable SGLang environment whose account database cannot prove
+    # the group private refused every park (`unsafe_library`). Decided
+    # 2026-09-25: the permission check warns instead of refusing.
+    def test_group_writable_library_warns_instead_of_refusing(self):
+        import io
         from runtime import owner_only
+        self.binding._WARNED.clear()
         self.path.chmod(0o570)
         try:
             with mock.patch.object(owner_only, "system_private_group", return_value=True):
                 self.assertEqual(self.observe().library.sha256, self.digest)
-            with mock.patch.object(owner_only, "system_private_group", return_value=False):
-                with self.assertRaisesRegex(self.binding.SaverBindingError, "unsafe_library"):
-                    self.observe()
+            for verdict, problem in ((False, "writable_by_shared_group"),
+                                     (None, "group_undetermined")):
+                with mock.patch.object(owner_only, "system_private_group", return_value=verdict), \
+                        mock.patch("sys.stderr", new_callable=io.StringIO) as log:
+                    self.assertEqual(self.observe().library.sha256, self.digest)
+                self.assertIn(f'"problem":"{problem}"', log.getvalue())
         finally:
             self.path.chmod(0o500)
 

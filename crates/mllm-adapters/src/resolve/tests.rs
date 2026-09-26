@@ -12,6 +12,7 @@ fn vllm() -> AdapterSpec {
         launch: None,
         engine_key: None,
         admin_key: None,
+        residency: mllm_config::effective::Residency::Deep,
     }
 }
 

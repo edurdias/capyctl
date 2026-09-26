@@ -92,7 +92,7 @@ pub async fn execute(
                     )
                 })?
                 .to_owned();
-            let address = crate::roles::standalone_management_address()
+            let address = crate::roles::standalone_management_address(state_dir)
                 .map_err(|failure| error("invalid_config", failure.to_string()))?;
             (
                 format!("http://{address}/management/v1"),

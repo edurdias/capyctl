@@ -8,15 +8,21 @@ quickstart are in the repository [`README.md`](../README.md).
 
 | Document | Contents |
 |---|---|
-| [`operations/install.md`](operations/install.md) | Release assets and `install.sh`, systemd units per role, file locations, restart versus drain, exit codes, upgrade and rollback. |
-| [`examples/server.yaml`](examples/server.yaml) | Server role document: loopback management and inference listeners, networked enrollment and control listeners. |
+| [`operations/install.md`](operations/install.md) | Release assets and `install.sh`, systemd units per role, file locations, restart versus drain, exit codes, discrete NVIDIA GPUs, upgrade (including to 0.1.0) and rollback. |
+| [`operations/configuration.md`](operations/configuration.md) | Every setting with its YAML field, flag and environment variable, `--set` and `mllm config show`. |
+| [`operations/network-access.md`](operations/network-access.md) | Reaching the inference endpoint from other machines: the API key, narrowing to loopback or a Tailscale address, turning the key off, a TLS reverse proxy. |
+| [`operations/release-notes-0.1.0.md`](operations/release-notes-0.1.0.md) | Draft release notes for 0.1.0. |
+| [`examples/server.yaml`](examples/server.yaml) | Server role document: loopback management, inference on all interfaces behind the API key, networked enrollment and control listeners. |
 | [`examples/host.yaml`](examples/host.yaml) | Host role document: private ingress, unified-memory resource policy, placement labels, and vLLM and SGLang installations. |
+| [`examples/host-discrete.yaml`](examples/host-discrete.yaml) | Host role document for a discrete-GPU host (one 24 GB NVIDIA card): a `system` host-RAM domain and a `gpu0` device domain. |
 | [`examples/standalone.yaml`](examples/standalone.yaml) | Standalone role document (embedded server and host on one machine), in the shape `mllm start standalone` generates. |
+| [`examples/deployment-minimal.yaml`](examples/deployment-minimal.yaml) | The smallest deployment: `name`, `engine` and `model`, everything else defaulted. |
 | [`examples/deployment-single.yaml`](examples/deployment-single.yaml) | vLLM deployment on one host, with `engine_config` and `timeouts`. |
 | [`examples/deployment-multinode.yaml`](examples/deployment-multinode.yaml) | SGLang deployment of two instances spread over two hosts (`instances`, `placement`). |
 
-Every example passes `mllm validate config`, and the deployments also resolve
-against `examples/host.yaml`; `crates/mllm-cli/tests/validate_config.rs` checks
+Every example passes `mllm validate config`, the deployments also resolve
+against `examples/host.yaml`, and the minimal one against
+`examples/host-discrete.yaml`; `crates/mllm-cli/tests/validate_config.rs` checks
 this. Host names, addresses, paths, fingerprints, byte budgets and durations
 are placeholders. The examples show the schema; they are not tested engine
 recipes, and passing validation does not mean an engine will start with them.

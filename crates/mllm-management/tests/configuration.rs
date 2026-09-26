@@ -1274,11 +1274,12 @@ fn effective_view_redacts_secret_argument_values() {
 }
 
 /// ADR 0008: a deployment declaring a remote source is refused on a host that
-/// did not opt in (`model_source_denied` names why), accepted on one that did,
-/// and its store key is listed as referenced for `mllm prune sources`.
+/// turned its kind off (`model_source_denied` names why), accepted on one that
+/// allows it (the default since the owner decision of 2026-09-25), and its
+/// store key is listed as referenced for `mllm prune sources`.
 // T14
 #[tokio::test]
-async fn remote_sources_need_host_opt_in_and_are_listed_as_referenced() {
+async fn remote_sources_follow_the_host_policy_and_are_listed_as_referenced() {
     let sha = "0123456789abcdef0123456789abcdef01234567";
     let (_directory, state, mut config, mut host) = fixture();
     let model = config["model"].as_object_mut().unwrap();
@@ -1287,6 +1288,7 @@ async fn remote_sources_need_host_opt_in_and_are_listed_as_referenced() {
         "source".into(),
         json!({"huggingface": {"repo": "Qwen/Qwen3-4B", "revision": sha}}),
     );
+    host["model_sources"] = json!({"huggingface": "disabled"});
     let refused = app(state.clone(), host.clone())
         .oneshot(request(
             "POST",
@@ -1305,7 +1307,8 @@ async fn remote_sources_need_host_opt_in_and_are_listed_as_referenced() {
         "{message}"
     );
 
-    host["model_sources"] = json!({"huggingface": "allowed", "max_bytes": "100GiB"});
+    // Unstated, the default allows it.
+    host.as_object_mut().unwrap().remove("model_sources");
     let router = app(state, host);
     let created = router
         .clone()

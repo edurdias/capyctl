@@ -776,6 +776,7 @@ mod host_scoped {
                     host_kv_limit: None,
                     parked_limit: None,
                     memory: DomainMemory::Distinct,
+                    device: None,
                 },
             )]),
             devices: BTreeMap::from([(

@@ -117,7 +117,7 @@ fn python3() -> PathBuf {
         .expect("python3 on PATH for the fake engine")
 }
 
-/// A per-installation engine port range (`MLLM_STANDALONE_ENGINE_PORTS`):
+/// A per-installation engine port range (`MLLM_ENGINE_PORTS`):
 /// four consecutive loopback ports free when chosen, below the ephemeral
 /// range (`support::process::free_ports`). The 8100 default would make every
 /// standalone fake engine in parallel tests bind the same port.
@@ -272,7 +272,7 @@ impl Installation {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+        let mut command = support::mllm();
         command
             .env("MLLM_STATE_DIR", self.state())
             .env("MLLM_VLLM_BIN", self.root.path().join("engine/vllm"))
@@ -282,9 +282,10 @@ impl Installation {
             .env("MLLM_ENGINE_FINGERPRINT", "fake-vllm-w13")
             .env("MLLM_KV_CACHE_BYTES", "64MiB")
             .env("MLLM_DEEP_PARK", "off")
-            .env("MLLM_STANDALONE_INFERENCE_ADDR", &self.inference)
-            .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
-            .env("MLLM_STANDALONE_ENGINE_PORTS", &self.engines);
+            .env("MLLM_INFERENCE_ADDR", &self.inference)
+            .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
+            .env("MLLM_MANAGEMENT_ADDR", &self.management)
+            .env("MLLM_ENGINE_PORTS", &self.engines);
         command
     }
 
@@ -342,9 +343,9 @@ impl Installation {
     }
 
     fn deploy(&self) -> String {
-        // Sized from an explicit capacity, not this machine's (see
-        // `support::BINARY_TEST_CAPACITY_BYTES`).
-        let capacity = support::BINARY_TEST_CAPACITY_BYTES;
+        // Sized for the shape the binary publishes on this machine, from an
+        // explicit capacity rather than this machine's (see
+        // `support::binary_template_memory`).
         let document = mllm_cli::standalone_config::deployment_document(
             "w13-model",
             "w13-model",
@@ -357,13 +358,14 @@ impl Installation {
                     .into_owned(),
             },
             Engine::Vllm,
-            capacity,
+            &support::binary_template_memory(),
             mllm_cli::standalone_config::DEFAULT_REQUEST_DEADLINE,
             // The host runs with MLLM_DEEP_PARK=off (ADR 0012 opt-out), so
             // its generated deployment is restart_only.
             false,
             "local",
-        );
+        )
+        .expect("the template fits the stated card");
         let file = self.root.path().join("deployment.json");
         std::fs::write(&file, document.to_string()).unwrap();
         let out = self.cli(&[
@@ -671,7 +673,7 @@ impl Drop for TwoRoles {
 }
 
 fn command(state: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .env("MLLM_STATE_DIR", state)
         .env_remove("MLLM_VLLM_BIN")

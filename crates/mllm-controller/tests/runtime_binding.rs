@@ -151,6 +151,7 @@ impl NativeFixture {
                     device_id: "gpu0".into(),
                     memory_domain: "unified".into(),
                     physical_gpu_uuid: None,
+                    cuda_pci_index: None,
                 },
             },
             self.root.to_str().unwrap().into(),

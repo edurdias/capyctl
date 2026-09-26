@@ -126,7 +126,13 @@ impl InstanceSpec {
 /// Unnamed device claims in `resources` phases take the same devices in the
 /// same order. Named claims are left as they are. A host without enough
 /// suitable devices refuses the deployment.
+///
+/// Owner decision 2026-09-25: this is where a deployment becomes one host's
+/// document, so the host's defaults are filled first
+/// ([`crate::deployment_defaults::for_host`]): the profile an engine family
+/// names, its published revision, and the GPU when none is stated.
 pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigError> {
+    let deployment = &crate::deployment_defaults::for_host(deployment, host)?;
     let unnamed = |claims: &Value| {
         claims
             .as_array()
@@ -196,6 +202,77 @@ pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigE
         }
     }
     Ok(result)
+}
+
+/// Discrete GPU design §7 (ADR 0019, owner decision 3): on a host whose GPUs
+/// are device-memory domains, a deployment that pins no device is resolved
+/// once per GPU, and placement picks the GPU. Each choice is the deployment
+/// with that device selected (`devices: [{id, sharing}]`), lowest driver
+/// index first; the first is what the host's own resolution records.
+///
+/// A deployment offers a choice when it declares no device, or one unnamed
+/// claim (the multi-host shape, whose sharing it keeps; a shared claim takes
+/// only a device the host lets be shared). There is no choice (an empty list)
+/// when the host has no device domain, when the deployment names a device
+/// (`devices: [{id: gpuN}]` pins it), declares several claims (refused
+/// `multi_gpu_unsupported` by resolution), or declares explicit `resources`,
+/// which name their domains and so their device.
+pub fn device_choices(
+    deployment: &Value,
+    host: &Value,
+) -> Result<Vec<(String, Value)>, ConfigError> {
+    let policy = &host["resource_policy"];
+    let default_sharing = policy["device_sharing"].as_str().unwrap_or("exclusive");
+    let mut devices: Vec<(String, String)> = policy["devices"]
+        .as_object()
+        .map(|devices| {
+            devices
+                .iter()
+                .filter(|(_, device)| {
+                    device["domain"]
+                        .as_str()
+                        .is_some_and(|domain| policy["domains"][domain]["memory"] == "device")
+                })
+                .map(|(id, device)| {
+                    let sharing = device["sharing"].as_str().unwrap_or(default_sharing);
+                    (id.clone(), sharing.to_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if devices.is_empty() || deployment.get("resources").is_some_and(|r| !r.is_null()) {
+        return Ok(Vec::new());
+    }
+    let claims = match deployment.get("devices") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(claims)) => claims.clone(),
+        Some(_) => return Err(invalid("devices", "must be a list")),
+    };
+    let wanted = match claims.as_slice() {
+        [] => None,
+        [claim] if claim.get("id").is_none() => claim["sharing"].as_str(),
+        _ => return Ok(Vec::new()),
+    };
+    if wanted == Some("shared") {
+        devices.retain(|(_, sharing)| sharing == "shared");
+    }
+    let index = |id: &str| -> u32 {
+        id.strip_prefix("gpu")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(u32::MAX)
+    };
+    devices.sort_by(|(a, _), (b, _)| index(a).cmp(&index(b)).then_with(|| a.cmp(b)));
+    Ok(devices
+        .into_iter()
+        .map(|(id, sharing)| {
+            let mut choice = deployment.clone();
+            choice["devices"] = serde_json::json!([{
+                "id": id,
+                "sharing": wanted.unwrap_or(&sharing),
+            }]);
+            (id, choice)
+        })
+        .collect())
 }
 
 /// The command identity of unnamed device claims: each takes the placeholder

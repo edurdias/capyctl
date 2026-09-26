@@ -508,6 +508,7 @@ async fn a_park_refused_before_sending_forgets_readiness_so_a_probe_reopens_disp
             plan,
             ingress_gate_key: [7; 32],
             instance_index: 0,
+            device_memory: false,
         },
         readiness.clone(),
     );
@@ -730,4 +731,354 @@ async fn a_malformed_declaration_is_refused() {
         .expect_err("refused");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     h.server.abort();
+}
+
+/// ADR 0019: the prepared document on a discrete host: host RAM in `system`
+/// and one GPU in its own device domain `gpu0`.
+fn discrete_document() -> Value {
+    let mut host = prepared_document();
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1528MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    host
+}
+
+const BOOT: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+/// The inventory a host with `document` reports: `domains` as given.
+fn inventory_of(
+    host: &str,
+    document: &Value,
+    domains: Vec<pb::DomainObservation>,
+) -> pb::ReportInventory {
+    let config = mllm_config::remote_roles::HostConfig::parse(&document.to_string()).unwrap();
+    pb::ReportInventory {
+        domains,
+        approved_host_config_json: config.document.to_string(),
+        policy_fingerprint: mllm_config::remote_resources::policy_fingerprint(&config.document),
+        ..inventory(host)
+    }
+}
+
+fn observed(domain: &str, kind: &str, capacity: i64, available: i64) -> pb::DomainObservation {
+    let now = mllm_protocol::now_unix_ms();
+    pb::DomainObservation {
+        domain_id: domain.into(),
+        kind: kind.into(),
+        device_id: if kind == "device" {
+            domain.into()
+        } else {
+            String::new()
+        },
+        observed_bytes: available,
+        observed_at_unix: now / 1000,
+        capacity_bytes: capacity,
+        available_bytes: available,
+        observed_at_unix_ms: now,
+        ..Default::default()
+    }
+}
+
+fn resident(pid: u32, bytes: i64, device: i64, host: i64) -> pb::ProcessResidency {
+    pb::ProcessResidency {
+        pid,
+        boot_id: BOOT.into(),
+        start_ticks: 7,
+        resident_bytes: bytes,
+        device_bytes: device,
+        host_bytes: host,
+    }
+}
+
+impl Harness {
+    /// Open a session declaring `capabilities`, publish `report` and
+    /// reconcile. `Err` is the controller's refusal of the publication.
+    async fn published(
+        &self,
+        capabilities: Vec<String>,
+        report: pb::ReportInventory,
+    ) -> Result<Opened, Box<tonic::Status>> {
+        let (send, mut stream) = self
+            .open(BINARY_VERSION, capabilities)
+            .await
+            .expect("session accepted");
+        for msg in [
+            agent_to_server::Msg::ReportInventory(report),
+            agent_to_server::Msg::ReconcileHistory(pb::ReconcileHistory {
+                records: vec![],
+                complete: true,
+            }),
+        ] {
+            let _ = send.send(pb::AgentToServer { msg: Some(msg) }).await;
+        }
+        match stream.message().await {
+            Ok(Some(pb::ServerToAgent {
+                msg: Some(server_to_agent::Msg::SessionReady(_)),
+            })) => Ok((send, stream)),
+            Err(status) => Err(Box::new(status)),
+            other => panic!("expected SessionReady or a refusal, got {other:?}"),
+        }
+    }
+}
+
+// T34 (ADR 0019, discrete GPU design §8): a host whose policy declares a
+// device memory domain but that did not declare `device_memory_domains` is
+// no placement candidate, with the typed reason; a launch or park on a device
+// domain is refused `host_capability_missing:device_memory_domains` and
+// nothing is sent. Such a host reporting a `device` observation is refused
+// at publication.
+#[tokio::test]
+async fn device_domains_need_the_capability() {
+    let h = enrolled().await;
+    let mut declared = all();
+    declared.retain(|c| c != capabilities::DEVICE_MEMORY_DOMAINS);
+    // What an older host reports: every domain as `system`, no device id.
+    let old = inventory_of(
+        &h.host,
+        &discrete_document(),
+        vec![
+            observed("system", "system", 64 << 30, 40 << 30),
+            observed("gpu0", "system", 16376 << 20, 14000 << 20),
+        ],
+    );
+    let (_send, mut stream) = h
+        .published(declared.clone(), old)
+        .await
+        .expect("the host connects");
+    let view = h.sessions.inspect(&h.host).unwrap();
+    assert!(view.online && view.reconciled);
+    assert!(
+        !view.eligible,
+        "a device-domain host without the capability"
+    );
+    assert!(view
+        .capabilities_missing
+        .contains(&capabilities::DEVICE_MEMORY_DOMAINS.to_owned()));
+    assert!(!h.sessions.eligible_hosts().unwrap().contains(&h.host));
+    let why = h.sessions.ineligible_hosts();
+    let why = why.get(&h.host).expect("the host has a reason");
+    assert!(
+        why.ends_with("host_capability_missing:device_memory_domains"),
+        "{why}"
+    );
+    assert_eq!(
+        h.sessions
+            .preflight(&h.host, &[capabilities::DEVICE_MEMORY_DOMAINS], true)
+            .unwrap_err(),
+        "host_capability_missing:device_memory_domains"
+    );
+    // A park of a launch charged to the device domain is refused typed,
+    // before anything is sent.
+    let MemberAction::LaunchSingle(plan) = launch() else {
+        unreachable!()
+    };
+    let binding_id = plan.binding_id.clone();
+    let incarnation = plan.incarnation.clone();
+    let engine = remote_execution::engine(
+        h.sessions.clone(),
+        h.state.clone(),
+        RemoteLaunchBinding {
+            controller_id: h.authority.controller_id(),
+            host_id: h.host.clone(),
+            member_id: "head".into(),
+            profile_fingerprint: "sglang-0.5.20".into(),
+            launch_command_id: "01K00000000000000000000005".into(),
+            plan,
+            ingress_gate_key: [7; 32],
+            instance_index: 0,
+            device_memory: true,
+        },
+        Default::default(),
+    );
+    let park = RuntimeCommand {
+        action: RuntimeAction::Park,
+        context: StepExecutionContext {
+            token: TransitionToken {
+                deployment_id: "deployment".into(),
+                revision: 1,
+                generation: 1,
+                operation_id: "01K00000000000000000000006".into(),
+                step_id: "01K00000000000000000000007".into(),
+            },
+            binding_id,
+            incarnation,
+            issued_at_ms: 1,
+            deadline_ms: mllm_protocol::now_unix_ms() + 20_000,
+            identities: ExecutionIdentities::Retained(vec![recorded()]),
+            completion_target: None,
+            grant_id: None,
+            launch_settings: None,
+        },
+    };
+    assert_eq!(
+        engine.execute_persisted(&park).await.unwrap_err(),
+        RuntimeError::Refused("host_capability_missing:device_memory_domains".into())
+    );
+    assert!(
+        next_command(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing was sent"
+    );
+
+    // Claiming a `device` observation without the capability is refused.
+    let claimed = inventory_of(
+        &h.host,
+        &discrete_document(),
+        vec![
+            observed("system", "system", 64 << 30, 40 << 30),
+            observed("gpu0", "device", 16376 << 20, 14000 << 20),
+        ],
+    );
+    let refused = h
+        .published(declared, claimed)
+        .await
+        .expect_err("a device observation needs the capability");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "host_capability_missing:device_memory_domains"
+    );
+    h.server.abort();
+}
+
+// T26 T29 (ADR 0019): a capable host's device observation reaches the
+// coordinator under the host's scoped domain, its residents carry the split
+// figures each domain is credited from, and a GPU it later cannot read is
+// no observation at all (so admission closes as `device_unobserved`), while
+// the session and the system domain carry on.
+#[tokio::test]
+async fn a_device_observation_is_accepted() {
+    let h = enrolled().await;
+    let mut system = observed("system", "system", 64 << 30, 40 << 30);
+    system.residents = vec![resident(4242, 12 << 30, 9 << 30, 3 << 30)];
+    let report = inventory_of(
+        &h.host,
+        &discrete_document(),
+        vec![system, observed("gpu0", "device", 16376 << 20, 14000 << 20)],
+    );
+    let (send, _stream) = h
+        .published(all(), report.clone())
+        .await
+        .expect("a capable host publishes its device domain");
+    let view = h.sessions.inspect(&h.host).unwrap();
+    assert!(view.eligible, "a capable discrete host is a candidate");
+    let gpu = view.domains.iter().find(|d| d.domain_id == "gpu0").unwrap();
+    assert_eq!(
+        (gpu.kind.as_str(), gpu.device_id.as_str()),
+        ("device", "gpu0")
+    );
+    let key = |domain: &str| mllm_config::remote_resources::ledger_key(&h.host, "domain", domain);
+    let (observations, residents) = h
+        .sessions
+        .observe_with_residents(h.host.clone())
+        .await
+        .unwrap();
+    let gpu = observations
+        .iter()
+        .find(|o| o.domain == key("gpu0"))
+        .unwrap();
+    assert_eq!(gpu.capacity_bytes, 16376 << 20);
+    assert_eq!(gpu.available_bytes, 14000 << 20);
+    assert_eq!(
+        residents,
+        vec![mllm_domain::resources::ProcessResident {
+            pid: 4242,
+            boot_id: BOOT.into(),
+            start_ticks: 7,
+            bytes: 12 << 30,
+            device_bytes: 9 << 30,
+            host_bytes: 3 << 30,
+        }]
+    );
+
+    // The GPU stops answering: the host reports it unknown (`-1`).
+    let mut blind = report.clone();
+    for domain in &mut blind.domains {
+        if domain.domain_id == "gpu0" {
+            (
+                domain.capacity_bytes,
+                domain.available_bytes,
+                domain.observed_bytes,
+            ) = (-1, -1, -1);
+        }
+    }
+    send.send(pb::AgentToServer {
+        msg: Some(agent_to_server::Msg::ReportInventory(blind)),
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.sessions.inspect(&h.host).is_some_and(|v| {
+            v.domains
+                .iter()
+                .any(|d| d.capacity_bytes > 0 && d.domain_id == "gpu0")
+        }) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the refresh is taken");
+    let view = h.sessions.inspect(&h.host).unwrap();
+    assert!(view.online, "an unknown GPU does not end the session");
+    let (observations, _) = h
+        .sessions
+        .observe_with_residents(h.host.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        observations
+            .iter()
+            .map(|o| o.domain.clone())
+            .collect::<Vec<_>>(),
+        vec![key("system")],
+        "the unknown GPU is no observation"
+    );
+    h.server.abort();
+}
+
+// T26 (ADR 0007, ADR 0019): today's two-host setup is unified. Its residents
+// credit exactly what they did before device domains: the sum, on its one
+// unified domain, whether the host is older (sum only) or reports the split
+// figures too. A unified host needs the capability for nothing.
+#[tokio::test]
+async fn a_remote_unified_host_keeps_its_resident_credit() {
+    for (declared, split) in [(false, false), (true, true)] {
+        let h = enrolled().await;
+        let mut capabilities = all();
+        if !declared {
+            capabilities.retain(|c| c != capabilities::DEVICE_MEMORY_DOMAINS);
+        }
+        let mut report = inventory(&h.host);
+        report.domains[0].residents = vec![if split {
+            resident(4242, 12 << 30, 9 << 30, 3 << 30)
+        } else {
+            resident(4242, 12 << 30, 0, 0)
+        }];
+        let (_send, _stream) = h.published(capabilities, report).await.unwrap();
+        let view = h.sessions.inspect(&h.host).unwrap();
+        assert!(view.eligible, "a unified host needs no device capability");
+        let (observations, residents) = h
+            .sessions
+            .observe_with_residents(h.host.clone())
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].domain,
+            mllm_config::remote_resources::ledger_key(&h.host, "domain", "unified")
+        );
+        assert_eq!(residents.len(), 1);
+        // The unified credit is the sum, as before (`resident_floors`).
+        assert_eq!(residents[0].bytes, 12 << 30);
+        assert_eq!(
+            (residents[0].device_bytes, residents[0].host_bytes),
+            if split { (9 << 30, 3 << 30) } else { (0, 0) }
+        );
+        h.server.abort();
+    }
 }

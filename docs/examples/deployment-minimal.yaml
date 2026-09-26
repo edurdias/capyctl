@@ -1,0 +1,18 @@
+# The smallest mllm deployment (`mllm deploy model --file deployment-minimal.yaml`).
+# Parsed by the product: `mllm validate config --file docs/examples/deployment-minimal.yaml`
+# shows the document with every default filled; `--host docs/examples/host.yaml`
+# also shows what that host fills in.
+#
+# Everything else is chosen by mllm: the route is the name, the recipe is
+# `standard`, the host's `vllm` engine at its published revision, its GPU, the
+# park tier its hardware supports, and memory sized from the checkpoint and the
+# GPU. Any field of `deployment-single.yaml` may be added to override a default.
+name: coding-small
+# The engine installation (runtime profile) on the host. `vllm` or `sglang`
+# also names a host's one installation of that engine.
+engine: vllm
+# A directory under the host's models directory (`~/models` by default), an
+# absolute path, `~/...` (expanded by the CLI), or a pinned Hugging Face
+# repository: `model: {hf: Qwen/Qwen3-4B-Instruct-2507}` (the CLI pins it to
+# the commit it names now; `@<commit>` pins it yourself).
+model: coding-small-r1

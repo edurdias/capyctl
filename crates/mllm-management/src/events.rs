@@ -503,6 +503,13 @@ fn project(event: &ManagementEvent) -> Result<String, Failure> {
             ("ledger_epoch", Number),
             ("session_epoch", Number),
         ],
+        // ADR 0019: a generated policy replaced for a changed machine shape.
+        "host_resource_policy_migrated" => &[
+            ("previous_revision", Number),
+            ("current_revision", Number),
+            ("ledger_epoch", Number),
+            ("session_epoch", Number),
+        ],
         // ADR 0008: drift evidence a host reported; bounded tokens only.
         "installation_drift_flagged" => &[
             ("host_id", Token),

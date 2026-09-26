@@ -244,6 +244,78 @@ fn weights_that_do_not_fit_a_declared_request_make_the_revision_unusable() {
     ));
 }
 
+// T26 (discrete GPU design §11): found live on the 16 GB discrete-GPU laptop
+// host. A minimal deployment whose request, derived from the measured
+// weights, is larger than the card was accepted provisionally, turned
+// unusable once measured, and every start answered `checkpoint_mismatch`
+// (exit 2) instead of `insufficient_device_memory` (exit 4). The refusal the
+// re-resolution met is kept and a start is refused with it.
+#[test]
+fn a_derived_request_larger_than_the_card_refuses_the_start_with_its_code() {
+    let value: Value = serde_json::from_str(include_str!(
+        "../../../mllm-config/tests/fixtures/f2-deployment.json"
+    ))
+    .unwrap();
+    let (mut config, mut host) = (value["deployment"].clone(), value["host"].clone());
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "16GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    config.as_object_mut().unwrap().remove("resources");
+    config["residency"] = json!("deep");
+    config["engine_config"] = json!({"memory": {"kv_cache": "12GiB"}});
+    let store = Store::open_in_memory().unwrap();
+    let session = store.begin_coordinator_session().unwrap();
+    // The host policy, from a resolvable deployment on the same host.
+    let mut sized = config.clone();
+    sized["engine_config"] = json!({"memory": {"request": "10GiB", "kv_cache": "2GiB"}});
+    let effective = mllm_config::effective::resolve_effective(&sized, &host).unwrap();
+    let observation = |domain: &str, gib: i64| mllm_domain::resources::MemoryObservation {
+        domain: domain.into(),
+        capacity_bytes: gib << 30,
+        available_bytes: gib << 30,
+        sampled_at_ms: 1,
+    };
+    store
+        .import_resource_policy(
+            &session,
+            &effective.host,
+            &[observation("gpu0", 16), observation("system", 64)],
+            1,
+        )
+        .unwrap();
+    let receipt = deploy(&store, &session, "big", &config, &host);
+    let id = &receipt.deployment_id;
+    assert_eq!(
+        store
+            .record_checkpoint_digest(&session, id, 1, "lab", DIGEST, 8 << 30, 2)
+            .unwrap(),
+        RecordOutcome::Unusable
+    );
+    let diagnostic = store
+        .checkpoint_digest(id, 1)
+        .unwrap()
+        .unwrap()
+        .diagnostic
+        .unwrap();
+    assert!(
+        diagnostic.starts_with("insufficient_device_memory:"),
+        "{diagnostic}"
+    );
+    match store.accept_start(&session, &fence(&receipt), 100, 100_100) {
+        Err(LifecycleError::CheckpointUnusable(reason)) => {
+            assert!(
+                reason.starts_with("insufficient_device_memory:"),
+                "{reason}"
+            )
+        }
+        other => panic!("expected the device refusal, got {other:?}"),
+    }
+}
+
 // T33, owner decision 2026-09-22: a revision accepted before WE3 has no
 // digest row; it starts, and its first placement records the digest.
 #[test]

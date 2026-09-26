@@ -133,15 +133,24 @@ pub(super) async fn initialize(
     let engine_bin = std::path::Path::new(launch.frozen.executable())
         .parent()
         .ok_or(RuntimeError::Unsupported)?;
-    let tool_path = std::env::join_paths([
-        engine_bin,
-        std::path::Path::new("/usr/bin"),
-        std::path::Path::new("/bin"),
-    ])
-    .map_err(|_| RuntimeError::Unsupported)?
-    .into_string()
-    .map_err(|_| RuntimeError::Unsupported)?;
+    // SPEC §13.3 as amended 2026-09-25: the profile's CUDA bin, when it names
+    // one, follows the engine's own bin (engine_env.rs).
+    let engine_bin = engine_bin.to_str().ok_or(RuntimeError::Unsupported)?;
+    let tool_path = crate::engine_env::tool_path(
+        (!engine_bin.is_empty()).then_some(engine_bin),
+        launch.frozen.cuda_home(),
+        "/usr/bin:/bin",
+    );
     cmd.env.insert("PATH".into(), tool_path);
+    // Owner decision 2026-09-25: JIT build jobs follow free memory at launch.
+    let (toolchain, limits) = crate::engine_env::toolchain_environment(
+        launch.frozen.cuda_home(),
+        launch.frozen.build_env(),
+        crate::engine_env::mem_available_bytes(),
+        crate::engine_env::cpu_count(),
+    );
+    eprintln!("{limits} (binding {})", context.binding_id);
+    cmd.env.extend(toolchain);
     // SPEC §9.1 / T21: neither the entry nor any engine child writes bytecode
     // beside mllm's checked runtime source.
     cmd.env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
@@ -184,8 +193,17 @@ pub(super) async fn initialize(
     // names; the entry observes the namespace, it never invents it. Absent
     // when the host published no inventory UUID, which leaves the namespace
     // unset and placement fail-closed.
-    if let Some(uuid) = launch.frozen.metadata().device.physical_gpu_uuid.as_deref() {
+    let device = &launch.frozen.metadata().device;
+    if let Some(uuid) = device.physical_gpu_uuid.as_deref() {
         cmd.env.insert("CUDA_VISIBLE_DEVICES".into(), uuid.into());
+    } else if let Some(index) = device.cuda_pci_index {
+        // Discrete GPU design §7 (review decision): a host with a choice of
+        // GPU that published no UUID pins the selected one by its index, in
+        // the PCI bus order `nvidia-smi` published it under.
+        let namespace = mllm_config::effective::CudaNamespace::PciIndex(index);
+        for (name, value) in namespace.environment() {
+            cmd.env.insert(name.into(), value);
+        }
     }
 
     // The tool is synchronous on purpose (mllm-launchers has no runtime), so every

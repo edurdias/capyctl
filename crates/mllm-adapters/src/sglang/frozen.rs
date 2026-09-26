@@ -56,6 +56,16 @@ pub fn frozen_from_effective(
         .devices
         .get(&device.id)
         .and_then(|policy| policy.physical_gpu_uuid.clone());
+    // Discrete GPU design §7 (review decision): with a choice of GPU and no
+    // published UUID, the selected GPU is pinned by its PCI-ordered index; one
+    // that cannot be pinned either way is refused, never handed every GPU.
+    let cuda_pci_index = match effective
+        .cuda_namespace()
+        .map_err(|_| RuntimeError::Uncertain("the selected GPU cannot be pinned".into()))?
+    {
+        Some(mllm_config::effective::CudaNamespace::PciIndex(index)) => Some(index),
+        _ => None,
+    };
     // SPEC §13.3: a launch needs a directory on disk; an unresolved source is
     // refused rather than invented.
     let checkpoint_root = effective
@@ -92,6 +102,7 @@ pub fn frozen_from_effective(
             device_id: device.id.clone(),
             memory_domain: memory_domain.clone(),
             physical_gpu_uuid,
+            cuda_pci_index,
         },
     };
     Ok(NativeLaunch::from_frozen_store(
@@ -101,5 +112,9 @@ pub fn frozen_from_effective(
         inference_ref,
         admin_ref,
         settings.clone(),
+    )
+    .with_toolchain(
+        profile.cuda_home.clone(),
+        crate::engine_env::build_overrides(&profile.env),
     ))
 }

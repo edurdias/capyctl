@@ -44,7 +44,9 @@ mod saver_source;
 pub use saver_source::{EnrolledSaver, LaunchSglangObserver};
 // SPEC §13 (WE3 limit 1): pre-effect policy refusals are terminal results.
 mod refusal;
-use refusal::LaunchVerdict;
+// Discrete GPU design §4: the launch check the switch planner agrees with.
+use refusal::charges_device;
+pub use refusal::{admit_memory_with, LaunchVerdict};
 // SPEC §§3.1, 7.3 (per-launch claims): host-side co-residence admission.
 mod coresidence;
 
@@ -106,6 +108,37 @@ pub struct NativeHostExecution {
     /// model store under its own `model_sources` policy. `None` when the host
     /// document states no usable store, which refuses every request.
     sources: Option<Arc<crate::sources::SourceStore>>,
+    /// SPEC §7.2 / ADR 0019: where a device domain's memory is read from. It
+    /// runs only when the accepted policy declares a device domain, off the
+    /// session loop, so a slow collector never delays a heartbeat.
+    gpu: Option<Arc<crate::gpu_memory::CachedGpuSampler>>,
+    /// SPEC §13.2, §7.2 (review decision, discrete GPU design §4): the GPU
+    /// sample each launch took just before the journal was locked, keyed by the
+    /// command's canonical digest. A collector run is bounded at seconds, so it
+    /// never runs under the journal's locks; the locked recheck reads this.
+    lock_samples: Arc<Mutex<std::collections::HashMap<[u8; 32], LockSample>>>,
+}
+
+/// A GPU sample taken for one command before the journal was locked, and when.
+type LockSample = (std::time::Instant, Option<crate::gpu_memory::GpuSample>);
+
+/// How long a sample taken before the lock stands for the locked recheck. A
+/// launch's last check runs when the engine is spawned, after its durable
+/// attempt began; an older sample leaves the device unobserved.
+const LOCK_SAMPLE_TTL: Duration = Duration::from_secs(60);
+/// A sample this recent is reused instead of running the collector again.
+const LOCK_SAMPLE_REUSE: Duration = Duration::from_secs(1);
+
+/// Where the memory half of a launch's admission reads the GPU from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuReading {
+    /// Outside the journal's locks: sample the card now (bounded), and keep
+    /// the sample for the locked recheck of the same command.
+    Now,
+    /// Under the journal's locks: the sample this command took just before the
+    /// lock. Never a collector run: a slow `nvidia-smi` would stall every
+    /// other host operation for its whole bound.
+    BeforeLock,
 }
 
 /// How long a pre-admission stands for the locked recheck.
@@ -165,12 +198,12 @@ impl NativeHostExecution {
             .and_then(|host| mllm_config::effective::normalize_host_policy(&host).ok())
             .map(|policy| {
                 crate::sources::SourceStore::new(
-                    &policy.model_store,
+                    policy.model_sources.root(&policy.model_store),
                     policy.model_sources.clone(),
                     Some(config.state_dir.join("secrets")),
                 )
             });
-        Arc::new(Self {
+        let this = Arc::new(Self {
             sources,
             load,
             journal,
@@ -187,7 +220,90 @@ impl NativeHostExecution {
             residency: None,
             rendezvous: None,
             pre_admitted: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        })
+            lock_samples: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            gpu: Some(crate::gpu_memory::CachedGpuSampler::new(Arc::new(
+                crate::gpu_memory::sample,
+            ))),
+        });
+        this.prime_gpu();
+        this
+    }
+
+    /// Start the first device sample on a host that declares a device
+    /// domain, so the session's first inventory is likely to carry it. A
+    /// unified host never runs the collector.
+    fn prime_gpu(&self) {
+        let declared = !device_domains(&self.profiles.accepted().config.document).is_empty();
+        if let Some(gpu) = self.gpu.as_ref().filter(|_| declared) {
+            let _ = gpu.current();
+        }
+    }
+
+    /// SPEC §7.2 / ADR 0019: a GPU sample taken now, for a launch's memory
+    /// check. The cached reading may predate a victim's verified release by
+    /// seconds, and refusing on it would refuse the very launch the switch
+    /// planner made room for. `None` (no sampler, a failed or overdue
+    /// collector) leaves the device unobserved.
+    fn fresh_gpu(&self) -> Option<crate::gpu_memory::GpuSample> {
+        self.gpu.as_ref().and_then(|sampler| sampler.fresh())
+    }
+
+    /// The GPU sample a launch's memory check reads ([`GpuReading`]). Outside
+    /// the journal's locks the card is sampled now and the sample kept for the
+    /// command's locked recheck; under the locks only that kept sample is read.
+    pub(crate) fn gpu_for(
+        &self,
+        command: &MemberCommand,
+        reading: GpuReading,
+    ) -> Option<crate::gpu_memory::GpuSample> {
+        let key = command.canonical_digest();
+        match reading {
+            GpuReading::Now => {
+                let sample = self.fresh_gpu();
+                if let Ok(mut samples) = self.lock_samples.lock() {
+                    samples.retain(|_, (at, _)| at.elapsed() < LOCK_SAMPLE_TTL);
+                    if samples.len() < MAX_PRE_ADMISSIONS {
+                        samples.insert(key, (std::time::Instant::now(), sample.clone()));
+                    }
+                }
+                sample
+            }
+            GpuReading::BeforeLock => self.lock_samples.lock().ok().and_then(|samples| {
+                samples
+                    .get(&key)
+                    .filter(|(at, _)| at.elapsed() < LOCK_SAMPLE_TTL)
+                    .and_then(|(_, sample)| sample.clone())
+            }),
+        }
+    }
+
+    /// SPEC §13.2 (review decision): sample the GPU for `command` before the
+    /// journal is locked, so the locked recheck and the launch it admits read a
+    /// sample taken moments ago without running the collector under the lock.
+    /// A sample taken within the last second for the same command (its
+    /// pre-admission just now) is reused. `None` when the launch charges no
+    /// device domain, or when the card is unobserved.
+    pub(crate) fn sample_before_lock(
+        &self,
+        command: &MemberCommand,
+    ) -> Option<crate::gpu_memory::GpuSample> {
+        if !matches!(command.action, MemberAction::LaunchSingle(_)) {
+            return None;
+        }
+        let effective = self.resolve(command).ok()?;
+        if !charges_device(&effective) {
+            return None;
+        }
+        let key = command.canonical_digest();
+        if let Some(recent) = self.lock_samples.lock().ok().and_then(|samples| {
+            samples
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < LOCK_SAMPLE_REUSE)
+                .map(|(_, sample)| sample.clone())
+        }) {
+            return recent;
+        }
+        self.gpu_for(command, GpuReading::Now)
     }
 
     /// SPEC §13.2: run the slow half of a command's admission outside the
@@ -199,7 +315,9 @@ impl NativeHostExecution {
             return Ok(());
         }
         match &command.action {
-            MemberAction::LaunchSingle(plan) => self.admit_launch_full(command, plan)?,
+            MemberAction::LaunchSingle(plan) => {
+                self.admit_launch_full(command, plan, GpuReading::Now)?
+            }
             MemberAction::Park { owned_handle } | MemberAction::Restore { owned_handle, .. } => {
                 let owner = self
                     .journal
@@ -244,6 +362,16 @@ impl NativeHostExecution {
         sampler: Arc<crate::process_residency::ResidencySampler>,
     ) -> Arc<Self> {
         Arc::make_mut(&mut self).residency = Some(sampler);
+        self
+    }
+    /// SPEC §7.2 / ADR 0019: read device domains through `sampler` instead
+    /// of `nvidia-smi`.
+    pub fn with_gpu_sampler(
+        mut self: Arc<Self>,
+        sampler: Arc<crate::gpu_memory::GpuSampler>,
+    ) -> Arc<Self> {
+        Arc::make_mut(&mut self).gpu = Some(crate::gpu_memory::CachedGpuSampler::new(sampler));
+        self.prime_gpu();
         self
     }
     /// ADR 0018 §3: the host's runtime profile sets, shared with the live
@@ -392,14 +520,18 @@ impl NativeHostExecution {
             || effective.profile.build_fingerprint != command.identity.profile_fingerprint
             || effective.model.content_fingerprint != plan.checkpoint_fingerprint
             || effective.selected_devices.len() != 1
+            // Discrete GPU design §7 (review decision): with a choice of
+            // GPU the launch pins the selected one; one it cannot pin (no
+            // published UUID, no `gpuN` index) is refused before any effect.
+            || effective.cuda_namespace().is_err()
             || plan.service_port < effective.host.endpoint_port_range.start
             || plan.service_port > effective.host.endpoint_port_range.end
         {
             return Err(JournalError::Unauthorized);
         }
+        // ADR 0008: a downloaded checkpoint is inside the sources store.
         let root = effective
-            .host
-            .model_store
+            .checkpoint_store()
             .canonicalize()
             .map_err(|_| JournalError::Unauthorized)?;
         let checkpoint = std::path::Path::new(
@@ -435,7 +567,7 @@ impl NativeHostExecution {
             .require_resolved_path()
             .map_err(|_| CheckpointError::InvalidRoot)?;
         let verified = self.checkpoints.verify(
-            &effective.host.model_store,
+            effective.checkpoint_store(),
             std::path::Path::new(checkpoint),
             &plan.checkpoint_digest,
         )?;
@@ -770,7 +902,21 @@ impl NativeHostExecution {
         command: &MemberCommand,
         plan: &SingleLaunchPlan,
     ) -> Result<(), LaunchError> {
-        let effective = self.resolve(command).map_err(|_| SessionError)?;
+        // SPEC §13.2 (review decision): the durable attempt and the spawn
+        // recheck admission under the journal's locks; the GPU is sampled for
+        // them now, before either lock is taken.
+        let host = self.clone();
+        let sampled = command.clone();
+        let sample = tokio::task::spawn_blocking(move || host.sample_before_lock(&sampled))
+            .await
+            .map_err(|_| SessionError)?;
+        // Discrete GPU design §6: an engine on a device domain is sized against
+        // the card's total, read from the same sample its launch check reads.
+        let effective = self
+            .resolve(command)
+            .map_err(|_| SessionError)?
+            .with_device_total(|index| device_total(sample.as_ref(), index))
+            .map_err(|_| SessionError)?;
         let scope = self.scope(command).map_err(|_| SessionError)?;
         let keys = self
             .identities
@@ -949,9 +1095,15 @@ impl NativeHostExecution {
         {
             let host = self.clone();
             let admitted = command.clone();
-            match tokio::task::spawn_blocking(move || host.pre_admit(&admitted))
-                .await
-                .map_err(|_| SessionError)?
+            // SPEC §13.2 (review decision): the GPU is sampled here, before
+            // the journal is locked; the locked recheck reads this sample.
+            match tokio::task::spawn_blocking(move || {
+                host.pre_admit(&admitted)?;
+                host.sample_before_lock(&admitted);
+                Ok(())
+            })
+            .await
+            .map_err(|_| SessionError)?
             {
                 Ok(()) => {}
                 Err(LaunchVerdict::Refused(_)) => return self.refused_launch(&command).await,
@@ -1262,7 +1414,9 @@ impl LocalExecutionPolicy for NativeHostExecution {
             MemberAction::LaunchSingle(plan) if command.identity.expected_state == "reserved" => {
                 // ADR 0014 §7, SPEC §13: checkpoint, pool shape and memory, the
                 // same admission provisioning runs and reports when refused.
-                Ok(self.admit_launch(command, plan)?)
+                // This runs under the journal's locks, so the GPU is read from
+                // the sample taken just before them (`sample_before_lock`).
+                Ok(self.admit_launch(command, plan, GpuReading::BeforeLock)?)
             }
             MemberAction::Terminate { .. } if command.identity.expected_state == "retained" => {
                 Ok(())
@@ -1297,9 +1451,10 @@ impl LocalExecutionPolicy for NativeHostExecution {
         let effective = self.resolve_retained(owner)?;
         // Owner decision (ADR 0012): park only at the declared tier. A
         // `restart_only` deployment never parks. `host_backed` is refused on
-        // unified pools at resolution (ADR 0010 decision 5) and has no remote
-        // park path; only `deep` parks here.
-        if effective.residency != mllm_config::effective::Residency::Deep {
+        // unified pools at resolution (ADR 0010 decision 5), so where it
+        // resolved the pools are distinct and it parks to host RAM (discrete
+        // GPU design §5); `deep` parks everywhere.
+        if !effective.residency.parks() {
             return Err(JournalError::Unauthorized);
         }
         // ADR 0008: a Park needs the internals deep parking drives; a build the
@@ -1469,11 +1624,17 @@ impl SessionExecution for NativeHostExecution {
         let mut inventory = set.inventory.clone();
         // ADR 0008: status carries installation drift and missing capabilities.
         set.installations.overlay(&mut inventory.profiles);
-        // Startup only publishes measured domains. Refresh exactly the same
-        // single unified pool, preserving its approved name and policy binding.
-        if inventory.domains.len() != 1 {
+        // SPEC §7.2 / ADR 0019: each domain is refreshed from its own source.
+        // A device domain reads its GPU; every other domain reads host memory.
+        let devices = device_domains(&set.config.document);
+        let (device, host): (Vec<usize>, Vec<usize>) = (0..inventory.domains.len())
+            .partition(|i| devices.contains_key(&inventory.domains[*i].domain_id));
+        // Startup only publishes measured domains. Refresh exactly the one host
+        // pool, preserving its approved name and policy binding; several host
+        // pools would need their own observers, never a copied reading.
+        let [host] = host[..] else {
             return None;
-        }
+        };
         let memory = crate::memory::read_host_memory().ok()?.memory;
         // ADR 0007: availability first, then the processes still alive, so a
         // process that grew in between is under-credited, never over-credited.
@@ -1482,7 +1643,7 @@ impl SessionExecution for NativeHostExecution {
             .as_ref()
             .map(|sampler| sampler.current())
             .unwrap_or_default();
-        let domain = &mut inventory.domains[0];
+        let domain = &mut inventory.domains[host];
         domain.observed_bytes = memory.available_bytes;
         domain.available_bytes = memory.available_bytes;
         domain.capacity_bytes = memory.capacity_bytes;
@@ -1495,10 +1656,73 @@ impl SessionExecution for NativeHostExecution {
                 boot_id: p.boot_id,
                 start_ticks: p.start_ticks,
                 resident_bytes: p.bytes,
+                // ADR 0019 (`device_memory_domains`): the split figures, so
+                // the server credits each domain with its own memory.
+                device_bytes: p.device_bytes,
+                host_bytes: p.host_bytes,
             })
             .collect();
+        if !device.is_empty() {
+            // One sample for every device domain, taken only on a host that
+            // declares one. A failed, hung or stale sample leaves every device
+            // unobserved; this refresh runs on the session loop and never
+            // waits for the collector (heartbeats share that loop).
+            let sample = self.gpu.as_ref().and_then(|sampler| sampler.current());
+            for i in device {
+                let domain = &mut inventory.domains[i];
+                let observed = devices[&domain.domain_id].and_then(|index| {
+                    let sample = sample.as_ref()?;
+                    let memory = sample
+                        .devices
+                        .iter()
+                        .find(|d| d.index == index)?
+                        .memory
+                        .as_ref()?;
+                    Some((memory, sample.sampled_at_ms))
+                });
+                match observed {
+                    Some((memory, sampled_at_ms)) => {
+                        domain.observed_bytes = memory.free_bytes;
+                        domain.available_bytes = memory.free_bytes;
+                        domain.capacity_bytes = memory.total_bytes;
+                        domain.observed_at_unix = sampled_at_ms / 1000;
+                        domain.observed_at_unix_ms = sampled_at_ms;
+                    }
+                    // SPEC §7.2: an unobserved device is unknown (`-1`), which
+                    // closes admission on its domain; RAM never stands in.
+                    None => {
+                        domain.observed_bytes = -1;
+                        domain.available_bytes = -1;
+                        domain.capacity_bytes = -1;
+                    }
+                }
+                domain.residents.clear();
+            }
+        }
         Some(inventory)
     }
+}
+
+/// The device domains of an approved host document, each with the nvidia-smi
+/// index its `gpuN` device names (`None`: a device id with no index, which is
+/// never observed). A document whose policy does not resolve declares none, so
+/// its domains are refreshed as before.
+/// The total memory of GPU `index` in `sample`, when the sample reports it.
+fn device_total(sample: Option<&crate::gpu_memory::GpuSample>, index: u32) -> Option<i64> {
+    sample?
+        .devices
+        .iter()
+        .find(|device| device.index == index)?
+        .memory
+        .as_ref()
+        .map(|memory| memory.total_bytes)
+}
+
+fn device_domains(document: &serde_json::Value) -> std::collections::BTreeMap<String, Option<u32>> {
+    crate::device_domains::device_domains(document)
+        .into_iter()
+        .map(|(id, domain)| (id, domain.index))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1738,6 +1962,16 @@ mod tests {
         root: &std::path::Path,
         identity_dir: &std::path::Path,
     ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        checkpoint_fixture_with(root, identity_dir, |_| {})
+    }
+
+    /// [`checkpoint_fixture`] with an edit of the host document before it is
+    /// parsed.
+    fn checkpoint_fixture_with(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
         std::fs::create_dir_all(root.join("models/toy")).unwrap();
         std::fs::write(root.join("models/toy/config.json"), "{}").unwrap();
         std::fs::write(root.join("models/toy/model.safetensors"), "weights").unwrap();
@@ -1774,6 +2008,7 @@ mod tests {
         ] {
             document[field] = fixture["host"][field].clone();
         }
+        edit(&mut document);
         let config = HostConfig::parse(&document.to_string()).unwrap();
         let policy = mllm_config::remote_resources::policy_fingerprint(&config.document);
         let executor = NativeHostExecution::new(
@@ -2085,7 +2320,7 @@ mod tests {
     }
 
     /// ADR 0008: MaterializeSource answers from this host's own policy and
-    /// store; a remote source is denied unless the host opts in; once
+    /// store; a remote source is denied where the host turned it off; once
     /// verified, the WE3 digest measures the materialized directory like any
     /// local checkpoint. Refusals never end the session.
     // T14 T34
@@ -2094,8 +2329,13 @@ mod tests {
         use sha2::Digest as _;
         let root = directory();
         let identity_dir = directory();
+        // Owner decision 2026-09-25: sources are allowed by default; this
+        // host turns them off explicitly, so nothing is fetched for it.
         let (executor, mut deployment, policy) =
-            checkpoint_fixture(root.path(), identity_dir.path());
+            checkpoint_fixture_with(root.path(), identity_dir.path(), |host| {
+                host["model_sources"] =
+                    serde_json::json!({"huggingface": "disabled", "http": "disabled"});
+            });
         let weights = vec![3_u8; 5000];
         let sha = hex::encode(sha2::Sha256::digest(&weights));
         let served = weights.clone();
@@ -2133,7 +2373,7 @@ mod tests {
             mllm_protocol::execution::validate_result(&command, &result).unwrap();
             result.source.unwrap()
         };
-        // The fixture host states no model_sources: denied, nothing fetched.
+        // The fixture host turned model sources off: denied, nothing fetched.
         let denied = run(executor.clone(), command("s1", &policy)).await;
         assert_eq!(
             (denied.state.as_str(), denied.reason.as_str()),
@@ -2238,6 +2478,17 @@ mod tests {
         identity_dir: &std::path::Path,
         residency: &str,
     ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        sglang_fixture_with(root, identity_dir, residency, |_| {})
+    }
+
+    /// [`sglang_fixture`] with an edit of the host document before it is
+    /// parsed (a `host_backed` launch needs distinct host and device memory).
+    fn sglang_fixture_with(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        residency: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
         std::fs::create_dir_all(root.join("models/toy")).unwrap();
         std::fs::write(root.join("models/toy/config.json"), "{}").unwrap();
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -2258,6 +2509,7 @@ mod tests {
         profile["engine"] = "sglang".into();
         profile["args"] = serde_json::json!([]);
         profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+        edit(&mut document);
         let config = HostConfig::parse(&document.to_string()).unwrap();
         let policy = mllm_config::remote_resources::policy_fingerprint(&config.document);
         let executor = NativeHostExecution::new(
@@ -2409,7 +2661,7 @@ mod tests {
                 panic!("a launch");
             };
             assert_eq!(
-                executor.admit_launch(&launch, &plan),
+                executor.admit_launch(&launch, &plan, GpuReading::Now),
                 Err(LaunchVerdict::Refused(expected)),
                 "{policy_value:?}"
             );
@@ -2466,7 +2718,7 @@ mod tests {
             .installations
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(
-            executor.admit_launch(&owner, &plan),
+            executor.admit_launch(&owner, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("capability_missing:deep_park"))
         );
 
@@ -2510,7 +2762,104 @@ mod tests {
             .installations
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(
-            restart.admit_launch(&launch, &plan),
+            restart.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("checkpoint_mismatch"))
+        );
+    }
+
+    /// ADR 0010 decision 5: `host_backed` resolves only where host and device
+    /// memory are distinct.
+    fn distinct_memory(document: &mut serde_json::Value) {
+        document["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+    }
+
+    /// ADR 0008 (review decision, discrete GPU design §5): the launch-time
+    /// capability gate covers both parking tiers. A `host_backed` launch parks
+    /// with SGLang's memory saver and weights CPU backup, or vLLM's sleep mode,
+    /// which the probe's `deep_park` capability covers; a build the probe found
+    /// without it refuses the launch before any effect with the typed reason
+    /// `capability_missing:deep_park` (its hint names `restart_only`). With
+    /// the capability available the launch passes the gate and stops at the
+    /// fixture's unrecorded checkpoint, the next gate.
+    // T21 T22
+    #[test]
+    fn a_build_without_the_park_capability_refuses_a_host_backed_launch() {
+        let report =
+            |names: &[&str], missing: &str, label: &str| crate::installation::CapabilityReport {
+                missing: names
+                    .iter()
+                    .map(|name| {
+                        let labels = if *name == missing {
+                            vec![label.to_owned()]
+                        } else {
+                            vec![]
+                        };
+                        ((*name).to_owned(), labels)
+                    })
+                    .collect(),
+            };
+        let sglang = ["core", "deep_park", "metrics", "observation"];
+        let vllm = ["core", "deep_park", "metrics"];
+
+        // SGLang: without the memory saver hooks, then with them.
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = sglang_fixture_with(
+            root.path(),
+            identity_dir.path(),
+            "host_backed",
+            distinct_memory,
+        );
+        sglang_runtime(root.path());
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+            panic!("a launch");
+        };
+        assert_eq!(
+            executor.resolve(&launch).unwrap().residency,
+            mllm_config::effective::Residency::HostBacked
+        );
+        let installations = executor.profiles.accepted().installations.clone();
+        installations.record_capabilities(&plan.profile_name, "", without_saver_hooks());
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("capability_missing:deep_park"))
+        );
+        installations.record_capabilities(&plan.profile_name, "", report(&sglang, "", ""));
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("checkpoint_mismatch"))
+        );
+
+        // vLLM: without sleep mode, then with it.
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), distinct_memory);
+        deployment["residency"] = "host_backed".into();
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+            panic!("a launch");
+        };
+        assert_eq!(
+            executor.resolve(&launch).unwrap().residency,
+            mllm_config::effective::Residency::HostBacked
+        );
+        let installations = executor.profiles.accepted().installations.clone();
+        installations.record_capabilities(
+            &plan.profile_name,
+            "",
+            report(&vllm, "deep_park", "destination:enable_sleep_mode"),
+        );
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("capability_missing:deep_park"))
+        );
+        installations.record_capabilities(&plan.profile_name, "", report(&vllm, "", ""));
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
     }
@@ -2539,7 +2888,7 @@ mod tests {
                 panic!("a launch");
             };
             assert_eq!(
-                executor.admit_launch(&owner, &plan),
+                executor.admit_launch(&owner, &plan, GpuReading::Now),
                 Err(LaunchVerdict::Refused("capability_missing:deep_park")),
                 "{quantization}"
             );
@@ -2578,7 +2927,7 @@ mod tests {
             panic!("a launch");
         };
         assert_eq!(
-            restart.admit_launch(&launch, &plan),
+            restart.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
 
@@ -2593,7 +2942,7 @@ mod tests {
             panic!("a launch");
         };
         assert_eq!(
-            vllm.admit_launch(&launch, &plan),
+            vllm.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
     }

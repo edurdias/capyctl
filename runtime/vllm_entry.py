@@ -322,8 +322,8 @@ def _rendezvous():
 
 def _hint(code):
     if code.startswith("capability_missing:"):
-        return (" (this vLLM installation lacks what deep parking needs; declare"
-                " residency restart_only, or use a build that provides it)")
+        return (" (this vLLM installation lacks what parking (deep or host_backed)"
+                " needs; declare residency restart_only, or use a build that provides it)")
     return ""
 
 

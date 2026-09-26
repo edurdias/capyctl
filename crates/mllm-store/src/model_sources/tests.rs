@@ -158,6 +158,57 @@ fn a_remote_source_gates_activation_and_the_digest_until_verified() {
     assert_eq!(store.referenced_model_sources().unwrap(), vec![key()]);
 }
 
+// T14 (ADR 0008): a new deployment naming a source already verified on its
+// host (for a deployment that still exists) starts verified, so activation is
+// admitted at once; a copy still downloading is not reused (found live
+// 2026-09-25: `deploy --activate` was refused `model_source_pending`).
+#[test]
+fn a_copy_verified_on_the_host_is_reused_by_a_new_deployment() {
+    let (store, session, config, host) = setup();
+    let first = deploy(&store, &session, "k1", &config, &host);
+    let mut second_config = config.clone();
+    second_config["name"] = json!("second");
+    if second_config.get("routes").is_some() {
+        second_config["routes"] = json!(["second"]);
+    }
+    let second = deploy(&store, &session, "k2", &second_config, &host);
+    assert_eq!(
+        store
+            .model_source(&second.deployment_id, 1, "lab")
+            .unwrap()
+            .unwrap()
+            .state,
+        SourceState::Pending,
+        "a copy still pending is not reused"
+    );
+    store
+        .record_model_source(
+            &session,
+            &first.deployment_id,
+            1,
+            "lab",
+            &key(),
+            &report(SourceState::Verified, 100, 100, None),
+            3,
+        )
+        .unwrap();
+    let mut third_config = config.clone();
+    third_config["name"] = json!("third");
+    if third_config.get("routes").is_some() {
+        third_config["routes"] = json!(["third"]);
+    }
+    let third = deploy(&store, &session, "k3", &third_config, &host);
+    let record = store
+        .model_source(&third.deployment_id, 1, "lab")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, SourceState::Verified);
+    assert_eq!((record.bytes_done, record.bytes_total), (100, 100));
+    store
+        .accept_start(&session, &fence(&third), 100, 100_100)
+        .unwrap();
+}
+
 // T14 (ADR 0008): a terminal failure refuses activation and is not retried;
 // a retryable one stays pending. Reasons are closed categories.
 #[test]

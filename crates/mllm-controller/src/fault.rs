@@ -155,7 +155,9 @@ impl From<LifecycleError> for LifecycleFault {
             // ADR 0014 §7 (WE3): a digest still being measured clears on its
             // own; a checkpoint known not to match needs the operator.
             LifecycleError::CheckpointDigestPending => Self::Unavailable(text),
-            LifecycleError::CheckpointMismatch => Self::Blocked(text),
+            LifecycleError::CheckpointMismatch | LifecycleError::CheckpointUnusable(_) => {
+                Self::Blocked(text)
+            }
             // ADR 0008: a source still materializing clears on its own; one
             // that failed terminally needs a new revision.
             LifecycleError::ModelSourcePending => Self::Unavailable(text),

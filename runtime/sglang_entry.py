@@ -210,16 +210,27 @@ def _validate_settings(settings):
     expected_restore = "cpu_backup" if settings["cpu_weight_backup"] else "disk_reload"
     _literal(settings["weight_restore"], expected_restore)
     memory = settings["memory"]
-    _exact_object(memory, ("request_bytes", "kv_cache_bytes", "margin_bytes", "static_bytes"))
+    keys = ("request_bytes", "kv_cache_bytes", "margin_bytes", "static_bytes")
+    # Discrete GPU design §6: the card's total is stated only on a discrete
+    # device, where the static pool is a share of the card, not MemAvailable.
+    discrete = type(memory) is dict and "device_total_bytes" in memory
+    _exact_object(memory, keys + ("device_total_bytes",) if discrete else keys)
     for name in ("request_bytes", "kv_cache_bytes", "static_bytes"):
         _integer(memory[name], 1, _I64)
     _integer(memory["margin_bytes"], 0, _I64)
+    request, kv = memory["request_bytes"], memory["kv_cache_bytes"]
+    if kv > request:
+        _reject()
+    if discrete:
+        _integer(memory["device_total_bytes"], 1, 2**62 - 1)
+        # Design §3: a device request is weights x 1.10 plus the KV cache, so
+        # the margin is a tenth of the weights share.
+        if memory["margin_bytes"] != (request - kv) // 11:
+            _reject()
     # ADR 0014 §5: the static pool is the request minus the overhead margin,
     # floored at the declared KV cache and never above the whole request (an
     # explicit request below KV plus margin cannot honour the margin).
-    request, kv = memory["request_bytes"], memory["kv_cache_bytes"]
-    if kv > request or memory["static_bytes"] != min(max(request - memory["margin_bytes"], kv),
-                                                     request):
+    if memory["static_bytes"] != min(max(request - memory["margin_bytes"], kv), request):
         _reject()
     extra = settings["extra_args"]
     if type(extra) is not list or len(extra) > _MAX_EXTRA_ARGS:
@@ -588,6 +599,8 @@ def _keep_served_name_on_reload():
 def _observation_target(spec, launch):
     """The enrolling scheduler target, or None when this launch enrolls nothing.
 
+    The child scope carries the launch's declared weight restore, so the saver
+    observer admits the weights backup of a `host_backed` launch only (ADR 0019).
     Only a memory-saver launch enrolls, only when the host supplied its private
     observation directory (MLLM_OBSERVATION_DIR) and it validates, and only when
     the installation's `launch_server` takes a scheduler target (the
@@ -602,7 +615,8 @@ def _observation_target(spec, launch):
     if (directory is None or public["settings"]["memory_saver"] is not True
             or not engine_capabilities.accepts_scheduler_target(launch)
             or not enrollment.entry_environment(directory, public["binding_id"],
-                                                public["incarnation"])):
+                                                public["incarnation"],
+                                                public["settings"]["weight_restore"])):
         return None
     return enrollment.run_enrolled_scheduler
 
@@ -635,8 +649,8 @@ def _hint(code):
     """One fixed operator hint per capability category; never native detail."""
     if code == "capability_missing:deep_park":
         return (" (this SGLang installation lacks the memory saver hooks or routes"
-                " deep parking needs; declare residency restart_only, or use a build"
-                " that provides them)")
+                " parking (deep or host_backed) needs; declare residency restart_only,"
+                " or use a build that provides them)")
     if code == "capability_missing:core":
         return " (this SGLang installation lacks an interface every launch needs)"
     return ""
