@@ -465,6 +465,39 @@ pub(super) fn derived_device_sizing(
     })
 }
 
+/// Owner decision 2026-09-25: the memory domain the selected devices share,
+/// when they name exactly one (the domain a derived deployment runs in).
+pub(super) fn single_domain<'a>(
+    devices: &[DeviceClaim],
+    host: &'a HostPolicy,
+) -> Option<&'a DomainPolicy> {
+    let mut domains = devices
+        .iter()
+        .map(|claim| host.devices.get(&claim.id).map(|device| &device.domain));
+    let first = domains.next()??;
+    domains
+        .all(|domain| domain == Some(first))
+        .then(|| host.domains.get(first))
+        .flatten()
+}
+
+/// Discrete GPU design §5 (Task 6's `host_backed_unavailable` bound): what
+/// the one `distinct` system domain holds parked, the smaller of its parked
+/// and managed limits. Zero when the host has no single system domain.
+pub(super) fn system_parked_limit(host: &HostPolicy) -> i64 {
+    let mut systems = host
+        .domains
+        .values()
+        .filter(|domain| domain.memory == DomainMemory::Distinct);
+    match (systems.next(), systems.next()) {
+        (Some(system), None) => system
+            .parked_limit
+            .unwrap_or(system.managed_limit)
+            .min(system.managed_limit),
+        _ => 0,
+    }
+}
+
 /// Discrete GPU design §3, SPEC §16 (omission is not unlimited): explicit
 /// resources on a discrete host name the system domain wherever they charge a
 /// device domain. A phase that charges a device domain but no `distinct` system

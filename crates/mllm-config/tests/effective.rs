@@ -832,11 +832,13 @@ fn typed_decode_errors_do_not_echo_supplied_secret_scalars() {
     assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination);
     assert!(!error.to_string().contains("do-not-echo-secret"));
 
+    // Owner decision 2026-09-25: `model.revision` is defaulted now; a
+    // deployment without a runtime profile is still missing one.
     let (mut deployment, host) = fixture();
-    deployment["model"]
+    deployment
         .as_object_mut()
         .unwrap()
-        .remove("revision");
+        .remove("runtime_profile");
     let error = resolve_effective(&deployment, &host).unwrap_err();
     assert_eq!(error.code, ConfigErrorCode::MissingRequired);
 }

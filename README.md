@@ -72,18 +72,28 @@ The first start writes its role document and credentials under
 `~/.local/state/mllm`. Models live in `~/models` (created on first start);
 name another directory with `--models-root`, `MLLM_MODELS_ROOT` or
 `host.model_store.path`. A deployment may also name a Hugging Face or HTTP
-source pinned to a commit or digest: mllm downloads it into
-`~/models/sources`, checking free disk space first and
-capping all downloads at 500 GiB (`--model-sources disabled` or
+source: mllm downloads it into `~/models/sources`, checking free disk space
+first and capping all downloads at 500 GiB (`--model-sources disabled` or
 `MLLM_MODEL_SOURCES=disabled` turns downloads off; `--model-sources-max` or
 `MLLM_MODEL_SOURCES_MAX` changes the cap). In another shell, write a
-deployment document for a model under the models directory (start from
-[`docs/examples/deployment-single.yaml`](docs/examples/deployment-single.yaml);
-in standalone the engine installation, `runtime_profile`, is named `local`),
-then deploy it and check on it:
+deployment document. Three fields are enough:
+
+```yaml
+name: qwen3-4b
+engine: vllm                 # or sglang
+model: Qwen3-4B              # a directory under ~/models, an absolute path,
+                             # or {hf: Qwen/Qwen3-4B-Instruct-2507}
+```
+
+mllm fills in the rest: the route is the name, the engine's memory is sized
+from the checkpoint and the GPU, the GPU is picked, and the park tier follows
+the hardware. A Hugging Face repository is pinned to the commit it names when
+you deploy. Every other field of
+[`docs/examples/deployment-single.yaml`](docs/examples/deployment-single.yaml)
+may be added to override a default. Then deploy it and check on it:
 
 ```bash
-mllm validate config --file deployment.yaml
+mllm validate config --file deployment.yaml   # shows the defaults it fills in
 mllm deploy model --file deployment.yaml --activate --wait
 mllm list deployments
 mllm status deployment <name>

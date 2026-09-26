@@ -126,7 +126,13 @@ impl InstanceSpec {
 /// Unnamed device claims in `resources` phases take the same devices in the
 /// same order. Named claims are left as they are. A host without enough
 /// suitable devices refuses the deployment.
+///
+/// Owner decision 2026-09-25: this is where a deployment becomes one host's
+/// document, so the host's defaults are filled first
+/// ([`crate::deployment_defaults::for_host`]): the profile an engine family
+/// names, its published revision, and the GPU when none is stated.
 pub fn assign_devices(deployment: &Value, host: &Value) -> Result<Value, ConfigError> {
+    let deployment = &crate::deployment_defaults::for_host(deployment, host)?;
     let unnamed = |claims: &Value| {
         claims
             .as_array()

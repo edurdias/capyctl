@@ -885,7 +885,7 @@ pub async fn execute_with_start_options(
             // SPEC §14: an explicit, revision-aware update of the deployment
             // the file names. The server refuses a stale revision
             // (`revision_conflict`) and replays an exact retry by request id.
-            let config = read_deployment_file(file)?;
+            let config = read_deployment_file(file).await?;
             let name = config["name"]
                 .as_str()
                 .ok_or_else(|| error("invalid_config", "Deployment file names no deployment"))?
@@ -931,7 +931,7 @@ pub async fn execute_with_start_options(
             wait,
             revision: None,
         } => {
-            let config = read_deployment_file(file)?;
+            let config = read_deployment_file(file).await?;
             api.begin_request(
                 &journal_root,
                 request_id,
@@ -1135,21 +1135,11 @@ pub async fn execute_with_start_options(
     }
 }
 
-/// A deployment document from `--file`, bounded and strictly parsed.
-fn read_deployment_file(file: &std::path::Path) -> Result<Value, StructuredError> {
-    use std::io::Read;
-    let source = std::fs::File::open(file)
-        .map_err(|_| error("invalid_config", "Cannot read deployment file"))?;
-    let mut contents = String::new();
-    source
-        .take(1024 * 1024 + 1)
-        .read_to_string(&mut contents)
-        .map_err(|_| error("invalid_config", "Cannot read deployment file"))?;
-    if contents.len() > 1024 * 1024 {
-        return Err(error("invalid_config", "Deployment file is too large"));
-    }
-    mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &contents)
-        .map_err(|err| error("invalid_config", err.to_string()))
+/// A deployment document from `--file`, bounded and strictly parsed, with
+/// the defaults a minimal file leaves out (owner decision 2026-09-25,
+/// `crate::deployment_file`).
+async fn read_deployment_file(file: &std::path::Path) -> Result<Value, StructuredError> {
+    crate::deployment_file::prepare(&crate::deployment_file::read_text(file)?).await
 }
 
 /// SPEC §17 (M80): the latency view query for a resolved deployment view, by

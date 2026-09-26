@@ -111,6 +111,21 @@ pub(super) struct RawEngineConfig {
     extra_args: Option<Vec<String>>,
 }
 
+impl RawEngineConfig {
+    /// Whether the block states a memory request or a KV cache.
+    pub(super) fn states_memory(&self) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|memory| memory.request.is_some() || memory.kv_cache.is_some())
+    }
+
+    /// Owner decision 2026-09-25: state the default KV cache, in bytes, for a
+    /// deployment that states no memory (`deployment_defaults::default_kv_cache`).
+    pub(super) fn default_kv_cache(&mut self, bytes: i64) {
+        self.memory.get_or_insert_with(RawMemory::default).kv_cache = Some(format!("{bytes}B"));
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMemory {

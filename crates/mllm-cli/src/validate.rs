@@ -28,7 +28,9 @@ use crate::output::StructuredError;
 const MAX_BYTES: u64 = 1024 * 1024;
 
 pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, StructuredError> {
-    let text = read(file)?;
+    // Owner decision 2026-09-25: a `~/` model path means this user's home, as
+    // `deploy model --file` reads it.
+    let text = crate::deployment_file::with_home_expanded(&read(file)?);
     let kind = detect_kind(&text).map_err(|e| named(file, None, &e))?;
     if host.is_some() && kind != ConfigKind::Deployment {
         return Err(invalid(format!(
@@ -72,7 +74,24 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             mllm_config::effective::validate_declared_startup(&deployment)
                 .map_err(|e| named(file, Some(kind), &e))?;
             match host {
-                None => Value::Null,
+                // Owner decision 2026-09-25: the document with the defaults a
+                // minimal file leaves out, as deploy sends it.
+                // SPEC §15.3: say plainly what was not checked.
+                None => {
+                    let mut out = json!({
+                        "valid": true,
+                        "kind": kind.as_str(),
+                        "file": file.display().to_string(),
+                        "resolved_against": Value::Null,
+                        "document": deployment,
+                    });
+                    let mut unchecked = vec![
+                        "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, devices, resources and timeouts, and to see the host's defaults",
+                    ];
+                    unchecked.extend_from_slice(REQUIRES_SERVER);
+                    out["requires_server"] = json!(unchecked);
+                    return Ok(out);
+                }
                 Some(host_file) => {
                     read(host_file)?;
                     let (name, host_document) = host_policy_document(host_file)
@@ -108,7 +127,11 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                         )));
                     }
                     let profile = deployment["runtime_profile"].as_str().unwrap_or_default();
-                    if !profiles.contains_key(profile) {
+                    // Owner decision 2026-09-25: an engine family names the
+                    // host's one profile of that family.
+                    if mllm_config::deployment_defaults::profile_on_host(profile, &host_document)
+                        .is_none()
+                    {
                         let names: Vec<&str> = profiles.keys().map(String::as_str).collect();
                         return Err(StructuredError {
                             code: "profile_not_published",
@@ -152,8 +175,19 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                         "resolved_against": name,
                         "requires_server": REQUIRES_SERVER,
                         "provisional": provisional,
+                        // Owner decision 2026-09-25: the document as this host
+                        // runs it, with every default filled.
+                        "document": source,
                         "effective": {
                             "name": effective.name,
+                            "routes": effective.routes,
+                            "runtime_profile": source["runtime_profile"],
+                            "runtime_profile_revision": effective.profile.revision,
+                            "selected_devices": effective.selected_devices,
+                            "memory": effective.engine_config.memory(),
+                            "provenance": serde_json::to_value(&effective.engine_config)
+                                .ok()
+                                .map(|config| config["provenance"].clone()),
                             "residency": effective.residency,
                             "recipe": effective.recipe,
                             "recipe_fingerprint": effective.recipe_fingerprint,
@@ -176,20 +210,12 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             }
         }
     };
-    let mut out = json!({
+    let out = json!({
         "valid": true,
         "kind": kind.as_str(),
         "file": file.display().to_string(),
         "resolved_against": resolved_against,
     });
-    // SPEC §15.3: say plainly what was not checked.
-    if kind == ConfigKind::Deployment {
-        let mut unchecked = vec![
-            "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, devices, resources and timeouts",
-        ];
-        unchecked.extend_from_slice(REQUIRES_SERVER);
-        out["requires_server"] = json!(unchecked);
-    }
     Ok(out)
 }
 
@@ -277,6 +303,14 @@ fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
 /// a kind mismatch. A failure every kind shares (a duplicate key, a missing
 /// `kind`) is reported without a kind, since the document never said one.
 fn detect_kind(text: &str) -> Result<ConfigKind, ConfigError> {
+    // Owner decision 2026-09-25: a deployment is the one kind a document may
+    // leave implied, so a document without `kind` is a deployment.
+    if mllm_config::parse_document(text)?
+        .as_object()
+        .is_some_and(|document| !document.contains_key("kind"))
+    {
+        return Ok(ConfigKind::Deployment);
+    }
     let kinds = [
         ConfigKind::Server,
         ConfigKind::Host,

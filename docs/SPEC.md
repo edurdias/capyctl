@@ -595,6 +595,8 @@ Validate syntax/schema before side effects. Resolve paths and fingerprints local
 
 The matching files are included under `examples/`. They are parseable schema sketches, not runnable installations or measured resource recipes. Host names refer to the planned lab; network addresses and all byte/time values are examples. No certificate files, secrets, engine binaries, or checkpoints are included.
 
+A deployment document needs only `name`, `engine` (its runtime profile) and `model`; every other deployment field below is optional and defaulted from the document, the host and the checkpoint when absent (ADR 0014 amendment A3). The examples state every field to show the schema.
+
 The canonical examples use `memory.system` for the host's system physical domain: unified CPU/GPU capacity on a Spark, host RAM only on a discrete-GPU system. A discrete-GPU schema also needs per-device `device_memory` phase budgets; omission must not be interpreted as unlimited VRAM. The first schema ADR should preserve this distinction.
 
 ### 16.1 Server: policy and durable state

@@ -41,7 +41,26 @@ fn duration_regex() -> &'static regex::Regex {
 
 /// Parse `text` strictly for `kind` and return the normalized JSON view.
 pub fn parse_strict(kind: ConfigKind, text: &str) -> Result<Value, ConfigError> {
-    let root = build_value(text)?;
+    parse_strict_value(kind, build_value(text)?)
+}
+
+/// The document tree of `text` (duplicate keys refused), before any schema
+/// check, for a caller that completes it first (the CLI expands a `~/` model
+/// path and pins a Hugging Face reference) and then calls
+/// [`parse_strict_value`].
+pub fn parse_document(text: &str) -> Result<Value, ConfigError> {
+    build_value(text)
+}
+
+/// [`parse_strict`] on a tree [`parse_document`] built.
+pub fn parse_strict_value(kind: ConfigKind, mut root: Value) -> Result<Value, ConfigError> {
+    // Owner decision 2026-09-25 (ADR 0014 amendment): a deployment needs only
+    // `name`, `engine` and `model`; the rest is completed here, once, so every
+    // reader of a deployment document sees the same defaults. A full document
+    // is unchanged.
+    if kind == ConfigKind::Deployment {
+        crate::deployment_defaults::expand(&mut root)?;
+    }
     let obj = root.as_object().ok_or_else(|| {
         ConfigError::new(
             ConfigErrorCode::SchemaVersion,

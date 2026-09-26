@@ -353,3 +353,65 @@ cold phase stays the request. The launch plan carries the reserved peak
 it per deployment (with every measurement) and per starting instance. See ADR 0015's
 2026-09-23 amendment for the per-host activation gate. The placeholder factor is not a
 measurement; nothing here is qualified live.
+
+## Amendment A3 — the minimal deployment file (owner decision 2026-09-25)
+
+A deployment document needs three fields:
+
+```yaml
+name: my-model
+engine: vllm                 # the runtime profile; `runtime_profile` stays the long form
+model: Qwen3-4B              # or an absolute path, ~/models/Qwen3-4B, or {hf: owner/repo[@commit]}
+```
+
+Every other field is optional and, when stated, means exactly what it meant before; a
+full document resolves byte for byte as it did. Absent fields are defaulted in shared
+code (`mllm_config::deployment_defaults`), the same for server deployments and
+standalone (a server plus one host):
+
+- **From the document alone**, inside the strict deployment parse, so the CLI, the
+  management API, the store and the agent read the same completed document:
+  `schema_version: 1`, `kind: deployment`, `routes: [<name>]`,
+  `runtime_profile: <engine>`, `recipe: standard`, `recovery: reconcile`,
+  `model.revision: "1"`, and `model.content_fingerprint: measured`. That value is a
+  label, not a digest: mllm measures the checkpoint's digest on the host (§7) and
+  records it. A stated `sha256:<64 hex>` stays an expectation the measurement must
+  match (a different measurement is recorded `mismatch`).
+- **Model shorthands.** `model: <path>` is a local path: relative to the host's models
+  directory, or absolute. A leading `~/` is expanded by the CLI against the home of
+  the user who runs it; a document that still carries one is refused.
+  `model: {hf: owner/repo@<commit>}` is a pinned Hugging Face source (ADR 0008).
+  Without a commit (or with a branch or tag after `@`), `mllm deploy model --file`
+  pins it to the commit the reference names now, asking the Hugging Face API at
+  `HF_ENDPOINT` (default `https://huggingface.co`), so the server only ever stores a
+  pinned source. `mllm validate config` never contacts the network and refuses an
+  unpinned reference with the way to pin it. Private repositories are pinned by hand.
+- **From the host**, where the deployment becomes one host's document
+  (`instances::assign_devices`, which acceptance and `validate config --host` run):
+  an engine family name (`vllm`, `sglang`) that is not a profile name stands for the
+  host's one profile of that family (standalone publishes its installation as
+  `local`); `runtime_profile_revision` is the revision the host publishes; `devices`
+  is the lowest-index GPU with the sharing the host states. On a host whose GPUs are
+  device domains, acceptance resolves an undeclared deployment once per GPU and
+  placement picks one (discrete GPU design §7); the default is the host's own row.
+- **From the host and the checkpoint**, at resolution: `residency` is `restart_only`
+  when the profile opted out of deep parking (ADR 0012), `deep` on a unified host,
+  and on a discrete host `host_backed` when the weights plus the engine's host
+  overhead fit what the system domain holds parked, otherwise `deep` (discrete GPU
+  design §5). A deployment that states no memory and no `resources` gets
+  `memory.kv_cache = min(4 GiB, managed_limit / 4)` of the domain it runs in, and its
+  request derives from the weights (§5), sized for the card on a discrete host (the
+  standalone template's rule). Both are named `mllm default` in the engine
+  configuration's provenance (`residency`, `memory.kv_cache`), so a provisional
+  revision re-resolved with the measured weights chooses them again (§7) and a
+  snapshot of it decodes exactly.
+
+`mllm validate config` prints the completed document (`document`); with `--host` it
+prints the host's document and the resolved profile revision, devices, residency,
+memory and provenance. SPEC §16 notes that its examples state every field and that
+three are required.
+
+Consequences: a minimal deployment is always provisional at acceptance, since its
+request derives from weights not yet measured, and activation waits for the digest
+(`checkpoint_digest_pending`). Tests are CPU and Fake-engine tests; nothing here
+qualifies an engine recipe.

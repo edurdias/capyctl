@@ -427,6 +427,7 @@ fn every_documented_example_passes_validate_config() {
         .collect();
     files.sort();
     let mut kinds = Vec::new();
+    let mut minimal = false;
     for file in &files {
         let (code, value, raw) = validate(&["--file", file.to_str().unwrap()]);
         assert_eq!(code, 0, "{}: {raw}", file.display());
@@ -442,12 +443,32 @@ fn every_documented_example_passes_validate_config() {
             ]);
             assert_eq!(code, 0, "{} against host.yaml: {raw}", file.display());
             assert_eq!(value["resolved_against"], "gpu-box", "{raw}");
+            // T14 (owner decision 2026-09-25): the minimal example resolves
+            // to a complete document on the example host.
+            if file.ends_with("deployment-minimal.yaml") {
+                assert_eq!(
+                    value["document"]["routes"],
+                    serde_json::json!(["coding-small"])
+                );
+                assert_eq!(value["document"]["runtime_profile"], "vllm");
+                assert!(
+                    value["document"]["runtime_profile_revision"].is_u64(),
+                    "{raw}"
+                );
+                assert_eq!(value["document"]["devices"][0]["id"], "gpu0");
+                assert_eq!(value["effective"]["residency"], "deep", "{raw}");
+                minimal = true;
+            }
         }
         kinds.push(kind);
     }
     kinds.sort();
     kinds.dedup();
     assert_eq!(kinds, ["deployment", "host", "server", "standalone"]);
+    assert!(
+        minimal,
+        "docs/examples/deployment-minimal.yaml is validated"
+    );
 }
 
 // T03 (ADR 0013 §2, §3): resolving against a host runs the server's per-host

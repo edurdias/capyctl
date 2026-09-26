@@ -4,6 +4,9 @@
 // ADR 0014 §5 (owner decision 2026-09-25): context fitted to the KV grant.
 pub mod context_fit;
 pub mod defaults;
+// Owner decision 2026-09-25 (ADR 0014 amendment): the minimal deployment file
+// and the defaults that complete it, shared by every role.
+pub mod deployment_defaults;
 pub mod effective;
 pub mod engine_policy;
 pub mod error;
@@ -29,4 +32,4 @@ pub mod strict_yaml;
 pub use defaults::{generate_default, resolve_startup, LoadOutcome};
 pub use error::{ConfigError, ConfigErrorCode};
 pub use schema::ConfigKind;
-pub use strict_yaml::{parse_strict, validate};
+pub use strict_yaml::{parse_document, parse_strict, parse_strict_value, validate};

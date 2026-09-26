@@ -684,11 +684,20 @@ struct DeploymentInput {
     model: RawModel,
     routes: Vec<String>,
     runtime_profile: String,
-    runtime_profile_revision: u64,
+    /// Owner decision 2026-09-25: optional; the revision the host publishes
+    /// (`deployment_defaults::for_host`).
+    #[serde(default)]
+    runtime_profile_revision: Option<u64>,
     recipe: String,
-    residency: Residency,
+    /// Owner decision 2026-09-25: optional; chosen by host type and checkpoint
+    /// (`deployment_defaults::default_residency`).
+    #[serde(default)]
+    residency: Option<Residency>,
     recovery: Recovery,
-    devices: Vec<DeviceClaim>,
+    /// Owner decision 2026-09-25: optional; the host's first GPU, or one per
+    /// GPU on a discrete host (`deployment_defaults::for_host`).
+    #[serde(default)]
+    devices: Option<Vec<DeviceClaim>>,
     /// ADR 0014 §5: optional; derived from `engine_config.memory` when omitted.
     #[serde(default)]
     resources: Option<RawRecipe>,
@@ -1007,7 +1016,16 @@ pub fn resolve_effective_with_checkpoint(
     host: &serde_json::Value,
     facts: CheckpointFacts,
 ) -> Result<EffectiveDeployment, ConfigError> {
-    let d: DeploymentInput = decode(deployment, "deployment")?;
+    // Owner decision 2026-09-25 (ADR 0014 amendment): complete a minimal
+    // document, first from itself, then from this host. A full document is
+    // unchanged by both.
+    let completed = {
+        let mut document = deployment.clone();
+        crate::deployment_defaults::expand(&mut document)?;
+        crate::deployment_defaults::for_host(&document, host)?
+    };
+    let deployment = &completed;
+    let mut d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode_host(host)?;
     // ADR 0013 §2–3: refuse an unplaceable or contradictory instance
     // declaration before resolving anything against this host.
@@ -1030,9 +1048,44 @@ pub fn resolve_effective_with_checkpoint(
     let raw_profile = h
         .runtime_profiles
         .get(&d.runtime_profile)
-        .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
-    let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
+        .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
+        .clone();
     let host = core::normalize_host(h)?;
+    let devices = d.devices.take().unwrap_or_default();
+    // Owner decision 2026-09-25: an undeclared residency follows the host
+    // type and the checkpoint (`deployment_defaults::default_residency`); it
+    // is named in the provenance so a re-resolution with the measured weights
+    // chooses again (ADR 0014 §7).
+    let residency_defaulted = d.residency.is_none();
+    let device_sizing = core::derived_device_sizing(&devices, &host);
+    let residency = d.residency.unwrap_or_else(|| {
+        let discrete =
+            device_sizing.map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
+        crate::deployment_defaults::default_residency(
+            raw_profile.security.deep_park.is_enabled(),
+            discrete,
+        )
+    });
+    // Owner decision 2026-09-25: a deployment that states no memory (and no
+    // resources) gets the default KV cache of the domain it runs in; its
+    // request derives from the checkpoint's weights (ADR 0014 §5).
+    let mut kv_defaulted = false;
+    if d.resources.is_none() && !d.engine_config.states_memory() {
+        let managed = match device_sizing {
+            Some(sizing) => Some(sizing.managed_limit),
+            None => core::single_domain(&devices, &host).map(|domain| domain.managed_limit),
+        };
+        if let Some(managed) = managed {
+            d.engine_config
+                .default_kv_cache(crate::deployment_defaults::default_kv_cache(managed));
+            kv_defaulted = true;
+        }
+    }
+    let profile = core::normalize_profile(
+        &raw_profile,
+        d.runtime_profile_revision.unwrap_or(raw_profile.revision),
+        residency,
+    )?;
     let model = core::normalize_model(
         d.model,
         Some(&host.model_store),
@@ -1040,7 +1093,7 @@ pub fn resolve_effective_with_checkpoint(
     )?;
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
-    core::check_single_device(&d.devices, &host)?;
+    core::check_single_device(&devices, &host)?;
     let declared_resources = d.resources.map(raw_recipe).transpose()?;
     if let Some(resources) = &declared_resources {
         core::check_system_allocation(resources, &host)?;
@@ -1067,7 +1120,7 @@ pub fn resolve_effective_with_checkpoint(
         d.engine_config,
         engine_config::EngineInputs {
             engine: profile.engine,
-            residency: d.residency,
+            residency,
             security: &profile.security,
             profile_args: &profile.args,
             checkpoint_root: model.resolved_path.as_deref().map(Path::new),
@@ -1075,18 +1128,38 @@ pub fn resolve_effective_with_checkpoint(
             facts,
             device: match &declared_resources {
                 Some(_) => None,
-                None => core::derived_device_sizing(&d.devices, &host),
+                None => device_sizing,
             },
         },
     )?;
+    {
+        // T14: what mllm chose is named as its default, so a snapshot
+        // re-resolution chooses it again rather than restating it.
+        let provenance = match &mut engine_config {
+            LaunchSettings::Vllm(settings) => &mut settings.provenance,
+            LaunchSettings::Sglang(settings) => &mut settings.provenance,
+        };
+        if residency_defaulted {
+            provenance.insert(
+                "residency".into(),
+                mllm_domain::launch::SettingSource::MllmDefault,
+            );
+        }
+        if kv_defaulted {
+            provenance.insert(
+                "memory.kv_cache".into(),
+                mllm_domain::launch::SettingSource::MllmDefault,
+            );
+        }
+    }
     let resources = match declared_resources {
         Some(resources) => resources,
         None => {
             let derived = engine_config::derive_resources(
                 engine_config.memory().request_bytes,
                 engine_config.memory().startup_bytes,
-                d.residency,
-                &d.devices,
+                residency,
+                &devices,
                 &host,
                 facts.weights_bytes,
                 profile.engine,
@@ -1105,9 +1178,9 @@ pub fn resolve_effective_with_checkpoint(
     let recipe = core::NormalizedRecipe {
         model,
         recipe: d.recipe,
-        residency: d.residency,
+        residency,
         recovery: d.recovery,
-        devices: d.devices,
+        devices,
         resources,
         request_deadline_ms: d
             .request_deadline

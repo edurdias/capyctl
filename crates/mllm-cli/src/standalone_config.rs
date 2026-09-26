@@ -449,10 +449,11 @@ pub fn device_request(
     device_request_with_kv(engine, weights_bytes, managed_limit, device_total, None)
 }
 
-/// The default KV cache of a discrete template: `min(4 GiB, managed_limit / 4)`.
+/// The default KV cache of a discrete template: `min(4 GiB, managed_limit / 4)`,
+/// the rule every deployment that states no memory gets (owner decision
+/// 2026-09-25, `mllm_config::deployment_defaults::default_kv_cache`).
 pub fn default_device_kv(managed_limit: i64) -> i64 {
-    const GIB: i64 = 1 << 30;
-    (4 * GIB).min(managed_limit / 4)
+    mllm_config::deployment_defaults::default_kv_cache(managed_limit)
 }
 
 /// [`device_request`] with the KV cache the operator stated, when stated.
@@ -487,16 +488,18 @@ pub fn device_request_with_kv(
 /// what resolution holds to the limit (`host_backed_unavailable`), so the
 /// overhead is counted here too: the template never states a tier its own
 /// resolution refuses.
+///
+/// The rule is the one every deployment that states no residency gets (owner
+/// decision 2026-09-25, `mllm_config::deployment_defaults::default_residency`).
 pub fn default_residency(deep_park: bool, discrete: Option<(i64, i64)>) -> &'static str {
-    const OVERHEAD: i64 = mllm_config::effective::ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES;
-    match (deep_park, discrete) {
-        (false, _) => "restart_only",
-        (true, Some((weights, parked_limit)))
-            if weights.saturating_add(OVERHEAD) <= parked_limit =>
-        {
-            "host_backed"
-        }
-        (true, _) => "deep",
+    use mllm_config::effective::Residency;
+    match mllm_config::deployment_defaults::default_residency(
+        deep_park,
+        discrete.map(|(weights, parked_limit)| (Some(weights), parked_limit)),
+    ) {
+        Residency::RestartOnly => "restart_only",
+        Residency::HostBacked => "host_backed",
+        Residency::Deep => "deep",
     }
 }
 
