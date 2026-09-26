@@ -1056,3 +1056,37 @@ async fn a_card_too_small_for_vllm_boots_and_refuses_the_deployment() {
     assert_eq!(structured.code, "insufficient_device_memory");
     let _ = app.shutdown().await;
 }
+
+/// T15 (final review M12): the on-demand activation key names the
+/// deployment's latest operation (so a request after a failed launch is a
+/// new command). Once the first arrival's activation exists, that latest
+/// operation changes, so a second arrival derives another key; it must still
+/// join the activation in flight rather than start a second one.
+// T15
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arrivals_during_one_activation_join_it() {
+    let dir = safe_state_dir();
+    let app = boot(dir.path()).await;
+    let id = app
+        .deploy(
+            "joined",
+            ModelSource::Local {
+                path: "/models/joined".into(),
+            },
+        )
+        .unwrap();
+    let controller = app.controller.clone();
+    let requests: Vec<_> = (0..4)
+        .map(|_| {
+            let controller = controller.clone();
+            let id = id.clone();
+            tokio::spawn(async move { controller.activate_for_request(&id).await })
+        })
+        .collect();
+    for request in requests {
+        request.await.unwrap().expect("every arrival is served");
+    }
+    let starts = app.store.operations_of_kind(&id, "initialize").unwrap();
+    assert_eq!(starts.len(), 1, "one activation for every arrival: {starts:?}");
+    let _ = app.shutdown().await;
+}
