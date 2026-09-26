@@ -278,6 +278,8 @@ impl Command {
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
+    /// Where `init` and `invite` write their file. `--output json` also
+    /// prints JSON results, as `--format json` does.
     #[arg(long, global = true, value_name = "TARGET")]
     output: Option<String>,
     /// How a command that reads records prints them: an aligned table (the
@@ -1088,6 +1090,38 @@ pub struct Invocation {
     pub management_listen: Option<SocketAddr>,
 }
 
+/// The command grammar. `--output` is accepted everywhere, but its help is
+/// shown only at the top level and on the commands that write a file with
+/// it (`init`, `invite`): each other subcommand gets a hidden copy, which
+/// clap then propagates instead of the visible one.
+fn cli_command() -> clap::Command {
+    let command = <Cli as clap::CommandFactory>::command();
+    let names: Vec<String> = command
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_owned())
+        .collect();
+    names.into_iter().fold(command, |command, name| {
+        command.mut_subcommand(name.clone(), |sub| {
+            let output = clap::Arg::new("output")
+                .long("output")
+                .value_name("TARGET")
+                .global(true);
+            match name.as_str() {
+                "init" => sub.arg(output.value_name("FILE").help(
+                    "Where to write the generated document (default: the implicit \
+                     role document under the state directory)",
+                )),
+                "invite" => sub.arg(
+                    output
+                        .value_name("FILE")
+                        .help("Where to write the invitation; it is never printed"),
+                ),
+                _ => sub.arg(output.hide(true)),
+            }
+        })
+    })
+}
+
 /// Final review I13: the long `--help` text of `mllm` and of every
 /// subcommand, as `(command path, text)`, for the wording gate.
 pub fn help_texts() -> Vec<(String, String)> {
@@ -1098,7 +1132,7 @@ pub fn help_texts() -> Vec<(String, String)> {
             walk(sub, name, out);
         }
     }
-    let mut command = <Cli as clap::CommandFactory>::command();
+    let mut command = cli_command();
     command.build();
     let mut out = Vec::new();
     walk(&mut command, "mllm".into(), &mut out);
@@ -1110,7 +1144,8 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let mut cli = Cli::try_parse_from(args)?;
+    let matches = cli_command().try_get_matches_from(args)?;
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
     // SPEC §6.4 / §13: one request identity, one journal and one idempotency
     // key. ULID text is case-insensitive, so a retry typed in another case (or
     // any other spelling of the same value) is carried in canonical form.

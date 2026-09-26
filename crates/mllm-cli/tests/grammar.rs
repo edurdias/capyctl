@@ -859,3 +859,33 @@ fn generic_overrides_and_config_show_parse() {
     .unwrap();
     assert_eq!(i.sets, ["load_report_interval=2s"]);
 }
+
+// T03: `--output` is described at the top level and on the commands that
+// write a file with it, not on every subcommand's help; it still parses
+// anywhere on the line.
+#[test]
+fn output_help_is_shown_only_where_it_means_something() {
+    let texts = mllm_cli::grammar::help_texts();
+    let with_output: Vec<&str> = texts
+        .iter()
+        .filter(|(_, text)| text.contains("--output"))
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert!(with_output.contains(&"mllm"), "{with_output:?}");
+    assert!(with_output.contains(&"mllm init host"), "{with_output:?}");
+    assert!(with_output.contains(&"mllm invite"), "{with_output:?}");
+    assert!(
+        with_output
+            .iter()
+            .all(|path| *path == "mllm" || path.starts_with("mllm init") || *path == "mllm invite"),
+        "{with_output:?}"
+    );
+    let inv = parse_invocation(["mllm", "status", "deployment", "d", "--output", "json"]).unwrap();
+    assert_eq!(inv.output.as_deref(), Some("json"));
+    let inv = parse_invocation(["mllm", "--output", "json", "list", "hosts"]).unwrap();
+    assert_eq!(inv.output.as_deref(), Some("json"));
+    let inv = parse_invocation(["mllm", "init", "host", "--output", "h.yaml"]).unwrap();
+    assert_eq!(inv.output.as_deref(), Some("h.yaml"));
+    let inv = parse_invocation(["mllm", "invite", "host", "a", "--output", "i.json"]).unwrap();
+    assert_eq!(inv.output.as_deref(), Some("i.json"));
+}
