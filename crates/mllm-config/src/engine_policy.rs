@@ -549,7 +549,7 @@ impl ExtraArgsPolicy {
 /// a value may be a token or a path an operator did not mean to publish.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProfileArgError {
-    #[error("reserved option `{0}` is rendered by mllm and cannot be passed (ADR 0014 §3)")]
+    #[error("reserved option `{0}` is rendered by mllm and cannot be passed")]
     Reserved(String),
     #[error("duplicate option `{0}`")]
     Duplicate(String),
@@ -561,7 +561,7 @@ pub enum ProfileArgError {
     UnexpectedArgument(usize),
     #[error("short option `{0}` is refused; spell it as a long option")]
     ShortOption(String),
-    #[error("configuration-file option `{0}` would hide values from validation (SPEC §8.2)")]
+    #[error("configuration-file option `{0}` would hide values from validation")]
     ConfigFile(String),
     #[error(
         "option `{option}` duplicates typed field `engine_config.{field}`; set the typed field"
@@ -569,10 +569,10 @@ pub enum ProfileArgError {
     TypedField { option: String, field: String },
     #[error(
         "option `{0}` is security-sensitive; it needs the host installation to list it \
-         in security.approved_options (ADR 0014 §8)"
+         in security.approved_options"
     )]
     Sensitive(String),
-    #[error("option `{0}` names a path outside the host's security.approved_paths (ADR 0014 §8)")]
+    #[error("option `{0}` names a path outside the host's security.approved_paths")]
     PathNotApproved(String),
 }
 

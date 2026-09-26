@@ -192,7 +192,7 @@ fn expand_model(model: &mut Value) -> Result<(), ConfigError> {
                     format!(
                         "`{text}` is not pinned to a commit: `mllm deploy model --file` pins it \
                      to the commit it names now, or write `{repo}@<40-character commit>` \
-                     (ADR 0008: the same document must always mean the same bytes)"
+                     (so the same document always means the same bytes)"
                     ),
                 )
             })?;

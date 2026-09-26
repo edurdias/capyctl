@@ -216,7 +216,7 @@ fn refuse_hardlink(path: &Path, file: &File, owner: Option<(u32, u32)>) -> Resul
             ConfigErrorCode::Io,
             path.display().to_string(),
             format!(
-                "refusing to use {}: expected a regular file with one link, owned by root or uid {allowed_uid}; found {} link(s) owned by uid {} (ADR 0018)",
+                "refusing to use {}: expected a regular file with one link, owned by root or uid {allowed_uid}; found {} link(s) owned by uid {}",
                 path.display(),
                 meta.nlink(),
                 meta.uid()
