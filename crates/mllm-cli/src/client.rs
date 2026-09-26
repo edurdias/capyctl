@@ -382,7 +382,10 @@ impl Management {
             // waited for the same way; found live, `--activate --wait` was
             // refused `model_source_pending` while the download ran.
             let source_pending = model_source_pending(current);
-            if !digest_pending && !source_pending {
+            // SPEC §6.4: a start right after a stop waits for the stop to
+            // settle (verified cleanup) instead of being refused meanwhile.
+            let stop_pending = stopping(current);
+            if !digest_pending && !source_pending && !stop_pending {
                 return Ok(());
             }
             let (deadline, window_ms) = match until {
@@ -390,7 +393,9 @@ impl Management {
                 None => {
                     let window_ms = window(current, "start", self.initialize_timeout_ms)?;
                     let name = current["name"].as_str().unwrap_or(id);
-                    let what = if source_pending {
+                    let what = if stop_pending {
+                        format!("the stop of {name} to finish")
+                    } else if source_pending {
                         format!("the model source of {name} to be downloaded and verified")
                     } else {
                         format!("the checkpoint digest of {name} to be measured")
@@ -407,7 +412,12 @@ impl Management {
             };
             if tokio::time::Instant::now() >= deadline {
                 let name = current["name"].as_str().unwrap_or(id);
-                let message = if source_pending {
+                let message = if stop_pending {
+                    format!(
+                        "still_stopping: {name} was still stopping after {}s; nothing was started. `mllm status deployment {name}` shows it; run `mllm start deployment {name} --wait` again once it is stopped",
+                        window_ms / 1000
+                    )
+                } else if source_pending {
                     format!(
                         "model_source_pending: the model source of {name} was still being downloaded after {}s; nothing was started. `mllm status deployment {name}` shows its progress; run `mllm start deployment {name} --wait` again once it is verified",
                         window_ms / 1000
@@ -734,6 +744,41 @@ fn model_source_pending(deployment: &Value) -> bool {
         && sources.iter().any(|source| source["state"] != "failed")
 }
 
+/// Whether `deployment`, or any of its instances, is still stopping: a stop
+/// run is queued or running and its cleanup is not yet verified.
+fn stopping(deployment: &Value) -> bool {
+    deployment["observed_state"] == "stopping"
+        || deployment["instances"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|i| i["observed_state"] == "stopping"))
+}
+
+impl Management {
+    /// SPEC §6.4: a start refused `runtime_retained` because the deployment
+    /// is still stopping says so, and what to run, with its own exit code.
+    /// Any other refusal is returned as it was.
+    async fn still_stopping(&self, id: &str, refused: StructuredError) -> StructuredError {
+        if !refused.message.starts_with("runtime_retained") {
+            return refused;
+        }
+        let Ok(snapshot) = self.snapshot().await else {
+            return refused;
+        };
+        match deployment(&snapshot, id) {
+            Ok(current) if stopping(current) => {
+                let name = current["name"].as_str().unwrap_or(id);
+                error(
+                    "still_stopping",
+                    format!(
+                        "{name} is still stopping; nothing was started. Retry in a moment, or run `mllm start deployment {name} --wait`, which waits for the stop to finish and then starts"
+                    ),
+                )
+            }
+            _ => refused,
+        }
+    }
+}
+
 fn deployment<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value, StructuredError> {
     snapshot["deployments"]
         .as_array()
@@ -1028,7 +1073,12 @@ pub async fn execute_with_start_options(
             if api.wait_start && action == "start" {
                 api.await_activation_inputs(id).await?;
             }
-            let (receipt, deadline) = api.action(id, action).await?;
+            let (receipt, deadline) = match api.action(id, action).await {
+                Err(refused) if action == "start" => {
+                    return Err(api.still_stopping(id, refused).await)
+                }
+                result => result?,
+            };
             if api.wait_start && action == "start" {
                 return api.wait_all(receipt, deadline).await;
             }
@@ -1084,7 +1134,12 @@ pub async fn execute_with_start_options(
             if api.wait_start && action == "start" {
                 api.await_activation_inputs(id).await?;
             }
-            let (receipt, deadline) = api.action_on(id, action, Some(*instance)).await?;
+            let (receipt, deadline) = match api.action_on(id, action, Some(*instance)).await {
+                Err(refused) if action == "start" => {
+                    return Err(api.still_stopping(id, refused).await)
+                }
+                result => result?,
+            };
             if api.wait_start && action == "start" {
                 return api.wait(receipt, deadline).await;
             }

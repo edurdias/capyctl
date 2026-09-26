@@ -119,6 +119,7 @@ are defined in `crates/mllm-cli/src/output.rs`.
 | 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 | 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
+| 25 | The deployment is still stopping (`still_stopping`): a `start` sent right after a `stop` arrived before the stop's cleanup was verified; nothing was started | none: a CLI command's exit (`start`), never a role's | Retry in a moment, or run `mllm start deployment <name> --wait`, which waits for the stop to finish and then starts. |
 
 **A revoked host (14).** After `mllm revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its

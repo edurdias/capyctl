@@ -547,3 +547,131 @@ fn init_host_writes_a_document_that_validates_with_the_shared_defaults() {
     assert_eq!(setting("model_sources.huggingface")["value"], "allowed");
     assert_eq!(setting("model_sources.http")["value"], "allowed");
 }
+
+/// A scripted management API for a deployment whose stop is still settling:
+/// the snapshot shows it `stopping` for `stopped_after` reads, and a start is
+/// refused `runtime_retained` meanwhile, as the store does.
+struct Stopping {
+    reads: AtomicUsize,
+    refused_starts: AtomicUsize,
+    starts: AtomicUsize,
+    stopped_after: usize,
+}
+
+const START_ID: &str = "01K00000000000000000000004";
+
+async fn stopping_management(state: Arc<Stopping>) -> std::net::SocketAddr {
+    use axum::{extract::State, http::StatusCode, routing, Json, Router};
+    let still = |m: &Stopping| m.reads.load(Ordering::SeqCst) < m.stopped_after;
+    let app = Router::new()
+        .route(
+            "/management/v1/snapshot",
+            routing::get(move |State(m): State<Arc<Stopping>>| async move {
+                m.reads.fetch_add(1, Ordering::SeqCst);
+                let state = if still(&m) { "stopping" } else { "stopped" };
+                let operations = if m.starts.load(Ordering::SeqCst) > 0 {
+                    json!([{"id": START_ID, "state": "succeeded", "kind": "initialize"}])
+                } else {
+                    json!([])
+                };
+                Json(json!({"operations": operations, "deployments": [{
+                    "id": DEPLOYMENT_ID, "name": "first-model", "revision": "1",
+                    "observed_state": state, "desired_state": "stopped",
+                    "timeouts": {"initialize_ms": 60_000, "request_deadline_ms": 600_000},
+                    "checkpoint_digest": {"state": "recorded", "host_id": "h", "provisional": false},
+                }]}))
+            }),
+        )
+        .route(
+            &format!("/management/v1/deployments/{DEPLOYMENT_ID}/actions"),
+            routing::post(move |State(m): State<Arc<Stopping>>| async move {
+                if still(&m) {
+                    m.refused_starts.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({"api_version": "1", "error": {"code": "runtime_retained",
+                            "message": "Runtime ownership requires verified cleanup",
+                            "retryable": false, "operation_id": null, "details": {}}})),
+                    );
+                }
+                m.starts.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"api_version": "1", "operation_id": START_ID,
+                        "deployment_id": DEPLOYMENT_ID})),
+                )
+            }),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    address
+}
+
+async fn start(root: &Path, address: std::net::SocketAddr, extra: &[&str]) -> Output {
+    deploy_fixture(root);
+    let home = root.to_owned();
+    let args: Vec<String> = ["start", "deployment", "first-model"]
+        .iter()
+        .chain(extra)
+        .map(|s| s.to_string())
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let address = address.to_string();
+        mllm(
+            &home,
+            &home,
+            &args,
+            &[(mllm_cli::roles::MANAGEMENT_ADDR_ENV, &address)],
+        )
+    })
+    .await
+    .unwrap()
+}
+
+// T08 (SPEC §6.4): `start` right after `stop`, while the stop is still
+// settling, says so in plain words and exits with its own code, not the
+// invalid-configuration exit 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_while_the_stop_settles_says_still_stopping() {
+    let root = private_dir();
+    let state = Arc::new(Stopping {
+        reads: AtomicUsize::new(0),
+        refused_starts: AtomicUsize::new(0),
+        starts: AtomicUsize::new(0),
+        stopped_after: usize::MAX,
+    });
+    let address = stopping_management(state.clone()).await;
+    let output = start(root.path(), address, &[]).await;
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(25), "{all}");
+    assert!(all.contains("still_stopping"), "{all}");
+    assert!(all.contains("first-model is still stopping"), "{all}");
+    assert!(
+        all.contains("mllm start deployment first-model --wait"),
+        "{all}"
+    );
+    assert_eq!(state.starts.load(Ordering::SeqCst), 0);
+}
+
+// T08 (SPEC §6.4): `start --wait` right after `stop` waits for the stop to
+// settle, then starts: one command, exit 0, never refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_wait_waits_for_the_stop_to_settle() {
+    let root = private_dir();
+    let state = Arc::new(Stopping {
+        reads: AtomicUsize::new(0),
+        refused_starts: AtomicUsize::new(0),
+        starts: AtomicUsize::new(0),
+        stopped_after: 3,
+    });
+    let address = stopping_management(state.clone()).await;
+    let output = start(root.path(), address, &["--wait"]).await;
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{all}");
+    assert!(all.contains("Waiting for the stop of first-model"), "{all}");
+    assert_eq!(state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.refused_starts.load(Ordering::SeqCst), 0);
+}

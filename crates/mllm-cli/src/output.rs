@@ -45,6 +45,9 @@ impl ExitCode {
     /// ADR 0018 §7: a deploy named a runtime profile no allowed host
     /// publishes; nothing was stored.
     pub const PROFILE_NOT_PUBLISHED: Self = Self(24);
+    /// SPEC §6.4: a start refused while the deployment's stop is still
+    /// settling; retrying shortly, or `start --wait`, succeeds.
+    pub const STILL_STOPPING: Self = Self(25);
 }
 
 impl From<ExitCode> for u8 {
@@ -227,6 +230,7 @@ impl StructuredError {
             "agent_unreachable" => ExitCode::AGENT_UNREACHABLE,
             "not_interactive" => ExitCode::NOT_INTERACTIVE,
             "profile_not_published" => ExitCode::PROFILE_NOT_PUBLISHED,
+            "still_stopping" => ExitCode::STILL_STOPPING,
             _ => ExitCode::UNSUPPORTED,
         }
     }
