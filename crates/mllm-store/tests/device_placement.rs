@@ -36,6 +36,12 @@ struct Gpus {
 /// The embedded discrete host: host RAM in `system`, and two GPUs of 22 and
 /// 30 GiB managed, each its own device-memory domain.
 fn two_gpus() -> Gpus {
+    gpus("22GiB")
+}
+
+/// [`two_gpus`] with `gpu0` managing `gpu0_managed` (a heterogeneous host
+/// when it is small).
+fn gpus(gpu0_managed: &str) -> Gpus {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gpus.sqlite3");
     let store = Store::open(&path).unwrap();
@@ -52,7 +58,7 @@ fn two_gpus() -> Gpus {
     host["resource_policy"]["domains"] = json!({
         "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
                    "parked_limit": "12GiB", "host_kv_limit": "4GiB"},
-        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "22GiB",
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": gpu0_managed,
                  "free_reserve": "1GiB", "parked_limit": "2GiB"},
         "gpu1": {"memory": "device", "device": "gpu1", "managed_limit": "30GiB",
                  "free_reserve": "1GiB", "parked_limit": "2GiB"}
@@ -754,4 +760,79 @@ fn a_victim_whose_switch_park_was_refused_for_memory_is_reported_host_ram_full()
         other => panic!("{other:?}"),
     };
     assert_eq!(victims, vec![(a, false, true)]);
+}
+
+/// The GPUs a deployment's current revision may be placed on, and the device
+/// its host row names.
+fn options(t: &Gpus, id: &str) -> (Vec<String>, Option<String>) {
+    let devices = t
+        .sql
+        .prepare("SELECT device FROM host_device_effective_revisions WHERE deployment_id=?1 ORDER BY device")
+        .unwrap()
+        .query_map([id], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let host: Option<String> = t
+        .sql
+        .query_row(
+            "SELECT json_extract(effective_json,'$.selected_devices[0].id') FROM host_effective_revisions WHERE deployment_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    (devices, host)
+}
+
+// T27 (final review I7, design §7): on a heterogeneous multi-GPU host a GPU
+// too small for the model is excluded for that deployment, never the whole
+// host: a 12 GiB request is accepted on a host whose gpu0 manages 10 GiB and
+// gpu1 30 GiB, gpu1 is its only option and the host's row, and it starts
+// there. Before, the small GPU's refusal refused the host.
+#[test]
+fn a_gpu_too_small_for_the_model_is_excluded_not_the_host() {
+    let t = gpus("10GiB");
+    let id = t.deploy(json!({"instances": 1}));
+    assert_eq!(options(&t, &id), (vec!["gpu1".to_string()], Some("gpu1".into())));
+    t.start(&id, "start", StartScope::All);
+    let planned = t.planned(&id);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].2, "gpu1");
+}
+
+// T27 T14 (final review I7, ADR 0014 §7): a revision sized from the weights is
+// provisional until the checkpoint is measured, when every GPU is re-resolved.
+// A GPU the measured weights no longer fit is dropped as an option; the
+// record is not corrupt data and the revision stays usable on the other GPU.
+#[test]
+fn a_measured_checkpoint_drops_only_the_gpus_it_does_not_fit() {
+    let t = gpus("10GiB");
+    let id = t.deploy(json!({"instances": 1, "engine_config": {"memory": {"kv_cache": "4GiB"}}}));
+    let revision = t.store.current_revision(&id).unwrap().unwrap();
+    assert!(
+        t.store.checkpoint_digest(&id, revision).unwrap().unwrap().provisional,
+        "sized once measured"
+    );
+    let (devices, _) = options(&t, &id);
+    assert_eq!(devices, ["gpu0", "gpu1"], "both resolve before measurement");
+    let outcome = t
+        .store
+        .record_checkpoint_digest(
+            &t.session,
+            &id,
+            revision,
+            "lab",
+            &format!("sha256:{}", "a".repeat(64)),
+            10 * GIB,
+            NOW,
+        )
+        .expect("not corrupt data");
+    assert!(
+        matches!(
+            outcome,
+            mllm_store::checkpoint_digests::RecordOutcome::Recorded { .. }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(options(&t, &id), (vec!["gpu1".to_string()], Some("gpu1".into())));
 }

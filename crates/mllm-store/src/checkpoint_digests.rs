@@ -480,55 +480,138 @@ impl crate::Store {
                 weights_bytes: Some(weights_bytes),
                 ..Default::default()
             };
-            match resolve_snapshot_with_checkpoint(&raw, facts) {
-                Ok(mut resolved) => {
-                    resolved.routes.sort();
+            // Final review I7 (design §7): each GPU of a multi-GPU host is
+            // re-resolved on its own, and one the measured weights no longer
+            // fit is dropped as a placement option for this revision, never
+            // the whole record. A host whose GPUs all drop, or whose own row
+            // no longer resolves, is refused for the revision with a
+            // diagnostic; the revision is unusable only when no host resolves.
+            let devices: Vec<(String, String, String, String)> = tx
+                .prepare("SELECT host_id,device,effective_json,source_json FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 ORDER BY host_id,device")?
+                .query_map(params![deployment, revision], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut on_devices: std::collections::BTreeMap<
+                String,
+                Vec<(EffectiveDeployment, String)>,
+            > = Default::default();
+            let mut multi_gpu = std::collections::BTreeSet::new();
+            // Written only once the revision is known to resolve somewhere.
+            type DeviceWrite = (String, String, Option<(String, String)>);
+            let mut device_writes: Vec<DeviceWrite> = Vec::new();
+            type HostWrite = (String, Option<(String, String, Option<String>)>);
+            let mut host_writes: Vec<HostWrite> = Vec::new();
+            for (host, device, frozen_json, source_json) in devices {
+                multi_gpu.insert(host.clone());
+                match resolve_snapshot_with_checkpoint(&frozen_json, facts) {
+                    Ok(mut on_device) => {
+                        on_device.routes.sort();
+                        let device_json = serde_json::to_string(&on_device)
+                            .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
+                        device_writes.push((
+                            host.clone(),
+                            device,
+                            Some((device_json, on_device.recipe_fingerprint.clone())),
+                        ));
+                        on_devices
+                            .entry(host)
+                            .or_default()
+                            .push((on_device, source_json));
+                    }
+                    Err(_) => device_writes.push((host, device, None)),
+                }
+            }
+            // ADR 0013 §3: every host the revision resolved on was frozen with
+            // the same placeholder; each is re-resolved with the same
+            // measured facts. A multi-GPU host's own row is its first GPU
+            // that still resolves.
+            let hosts: Vec<(String, String)> = tx
+                .prepare("SELECT host_id,effective_json FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved' ORDER BY host_id")?
+                .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let any_hosts = !hosts.is_empty();
+            let mut canonical: Option<EffectiveDeployment> = None;
+            for (host, frozen_json) in hosts {
+                let resolved = if multi_gpu.contains(&host) {
+                    on_devices
+                        .get(&host)
+                        .and_then(|resolved| resolved.first())
+                        .map(|(on_device, source)| (on_device.clone(), Some(source.clone())))
+                } else {
+                    resolve_snapshot_with_checkpoint(&frozen_json, facts)
+                        .ok()
+                        .map(|mut on_host| {
+                            on_host.routes.sort();
+                            (on_host, None)
+                        })
+                };
+                match resolved {
+                    Some((on_host, source)) => {
+                        let host_json = serde_json::to_string(&on_host)
+                            .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
+                        host_writes.push((
+                            host,
+                            Some((host_json, on_host.recipe_fingerprint.clone(), source)),
+                        ));
+                        canonical.get_or_insert(on_host);
+                    }
+                    None => host_writes.push((host, None)),
+                }
+            }
+            let canonical = match canonical {
+                Some(resolved) => Ok(resolved),
+                // A revision frozen before per-host rows existed.
+                None if !any_hosts => {
+                    resolve_snapshot_with_checkpoint(&raw, facts).map(|mut resolved| {
+                        resolved.routes.sort();
+                        resolved
+                    })
+                }
+                None => resolve_snapshot_with_checkpoint(&raw, facts).and_then(|_| {
+                    Err(mllm_config::ConfigError::new(
+                        mllm_config::ConfigErrorCode::UnsupportedCombination,
+                        "engine_config.memory.request",
+                        "insufficient_device_memory: the measured weights fit none of the \
+                         allowed hosts' GPUs",
+                    ))
+                }),
+            };
+            match canonical {
+                Ok(resolved) => {
+                    for (host, device, write) in &device_writes {
+                        match write {
+                            Some((json, fingerprint)) => tx.execute(
+                                "UPDATE host_device_effective_revisions SET effective_json=?5,fingerprint=?6 WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                                params![deployment, revision, host, device, json, fingerprint],
+                            )?,
+                            None => tx.execute(
+                                "DELETE FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                                params![deployment, revision, host, device],
+                            )?,
+                        };
+                    }
+                    for (host, write) in &host_writes {
+                        match write {
+                            Some((json, fingerprint, source)) => tx.execute(
+                                "UPDATE host_effective_revisions SET effective_json=?4,fingerprint=?5,source_json=COALESCE(?6,source_json) WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
+                                params![deployment, revision, host, json, fingerprint, source],
+                            )?,
+                            None => tx.execute(
+                                "DELETE FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
+                                params![deployment, revision, host],
+                            )? + tx.execute(
+                                "UPDATE host_effective_revisions SET outcome='refused',effective_json=NULL,fingerprint=NULL,diagnostic='does_not_resolve' WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
+                                params![deployment, revision, host],
+                            )?,
+                        };
+                    }
                     let json = serde_json::to_string(&resolved)
                         .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
                     tx.execute(
                         "UPDATE effective_revisions SET effective_json=?3,fingerprint=?4 WHERE deployment_id=?1 AND revision=?2",
                         params![deployment, revision, json, resolved.recipe_fingerprint],
                     )?;
-                    // ADR 0013 §3: every host the revision resolved on was
-                    // frozen with the same placeholder; each is re-resolved
-                    // with the same measured facts.
-                    let hosts: Vec<(String, String)> = tx
-                        .prepare("SELECT host_id,effective_json FROM host_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND outcome='resolved'")?
-                        .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?)))?
-                        .collect::<rusqlite::Result<_>>()?;
-                    for (host, frozen_json) in hosts {
-                        let Ok(mut on_host) = resolve_snapshot_with_checkpoint(&frozen_json, facts)
-                        else {
-                            return Err(CheckpointDigestError::CorruptStoredData);
-                        };
-                        on_host.routes.sort();
-                        let host_json = serde_json::to_string(&on_host)
-                            .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
-                        tx.execute(
-                            "UPDATE host_effective_revisions SET effective_json=?4,fingerprint=?5 WHERE deployment_id=?1 AND revision=?2 AND host_id=?3",
-                            params![deployment, revision, host, host_json, on_host.recipe_fingerprint],
-                        )?;
-                    }
-                    // ADR 0019: so was every GPU's resolution on a multi-GPU
-                    // host (discrete GPU design §7).
-                    let devices: Vec<(String, String, String)> = tx
-                        .prepare("SELECT host_id,device,effective_json FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2")?
-                        .query_map(params![deployment, revision], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                        .collect::<rusqlite::Result<_>>()?;
-                    for (host, device, frozen_json) in devices {
-                        let Ok(mut on_device) =
-                            resolve_snapshot_with_checkpoint(&frozen_json, facts)
-                        else {
-                            return Err(CheckpointDigestError::CorruptStoredData);
-                        };
-                        on_device.routes.sort();
-                        let device_json = serde_json::to_string(&on_device)
-                            .map_err(|_| CheckpointDigestError::CorruptStoredData)?;
-                        tx.execute(
-                            "UPDATE host_device_effective_revisions SET effective_json=?5,fingerprint=?6 WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
-                            params![deployment, revision, host, device, device_json, on_device.recipe_fingerprint],
-                        )?;
-                    }
                     crate::managed_configuration::reseal_migrated_receipt(
                         &tx, deployment, revision, &json, None, None,
                     )

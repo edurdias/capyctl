@@ -367,25 +367,59 @@ impl crate::Store {
                     }
                     Ok(source)
                 };
-                let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
-                let (mut effective, provisional) =
-                    resolve_for_acceptance(&source, &host.trusted_host)?;
-                effective.routes.sort();
                 let mut devices = Vec::new();
-                if choices.len() > 1 {
+                let (source, effective, provisional) = if choices.len() > 1 {
+                    // Final review I7 (design §7): each GPU is judged on its
+                    // own. A GPU the deployment cannot fit is not a placement
+                    // option for it; the host is refused only when no GPU
+                    // resolves, and the host's own row is the first GPU that
+                    // does.
+                    let mut first_error = None;
+                    let mut resolved_on = Vec::new();
                     for (device, choice) in &choices {
-                        let source = recipe(choice)?;
-                        let (mut on_device, device_provisional) =
-                            resolve_for_acceptance(&source, &host.trusted_host)?;
-                        // One checkpoint, one set of facts: every GPU's
-                        // resolution is provisional exactly when the host's is.
-                        if device_provisional != provisional {
-                            return Err(ManagedConfigurationError::Invalid);
+                        let attempt = recipe(choice).and_then(|source| {
+                            resolve_for_acceptance(&source, &host.trusted_host)
+                                .map(|resolution| (source, resolution))
+                        });
+                        match attempt {
+                            Ok((source, (mut on_device, device_provisional))) => {
+                                on_device.routes.sort();
+                                resolved_on.push((
+                                    device.clone(),
+                                    source,
+                                    on_device,
+                                    device_provisional,
+                                ));
+                            }
+                            Err(ManagedConfigurationError::Sql(error)) => {
+                                return Err(ManagedConfigurationError::Sql(error))
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                            }
                         }
-                        on_device.routes.sort();
-                        devices.push((device.clone(), source, on_device));
                     }
-                }
+                    let Some((_, source, effective, provisional)) = resolved_on.first().cloned()
+                    else {
+                        return Err(first_error.unwrap_or(ManagedConfigurationError::Invalid));
+                    };
+                    // One checkpoint, one set of facts: every GPU's
+                    // resolution is provisional exactly when the host's is.
+                    if resolved_on.iter().any(|(.., p)| *p != provisional) {
+                        return Err(ManagedConfigurationError::Invalid);
+                    }
+                    devices = resolved_on
+                        .into_iter()
+                        .map(|(device, source, on_device, _)| (device, source, on_device))
+                        .collect();
+                    (source, effective, provisional)
+                } else {
+                    let source = recipe(choices.first().map_or(&command, |(_, first)| first))?;
+                    let (mut effective, provisional) =
+                        resolve_for_acceptance(&source, &host.trusted_host)?;
+                    effective.routes.sort();
+                    (source, effective, provisional)
+                };
                 let policy = read_selected_policy(&tx, &effective.host.name)
                     .map_err(|_| ManagedConfigurationError::PolicyConflict)?
                     .ok_or(ManagedConfigurationError::PolicyConflict)?;
