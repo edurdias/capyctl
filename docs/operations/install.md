@@ -354,6 +354,7 @@ sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/host \
 install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/host.yaml
 # Edit /etc/mllm/host.yaml: name, model_store, ingress, resource_policy,
 # runtime_profiles (see docs/examples/host.yaml). Leave runtime_dir out.
+# model_store and model_sources are optional (see "Models and downloads").
 mllm validate config --file /etc/mllm/host.yaml
 
 # Enroll with an invitation created on the server (`mllm invite host`).
@@ -376,6 +377,7 @@ environment. Put that environment in `/etc/mllm/standalone.env`:
 ```bash
 # /etc/mllm/standalone.env (root:mllm 0640)
 MLLM_VLLM_BIN=/opt/vllm/bin/vllm
+# Optional: models are in ~/models of the service user unless named here.
 MLLM_MODELS_ROOT=/srv/models
 ```
 
@@ -407,7 +409,9 @@ Where each setting comes from, highest precedence first:
 | Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_CONFIG_HOME/mllm/engines.yaml` (`~/.config/mllm/engines.yaml`). `mllm engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
 | State root | `MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
 | Listener addresses | `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR` for one run (loopback only), else `127.0.0.1:8443` / `127.0.0.1:7443`. The document may state only those defaults. |
-| Engine installation | The environment only (`MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN`, `MLLM_MODELS_ROOT`, ...). |
+| Engine installation | The environment (`MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN`, ...), or engines registered with `mllm engine add`. |
+| Models directory | `--models-root`, else `MLLM_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
+| Model downloads | `--model-sources` / `--model-sources-max`, else `MLLM_MODEL_SOURCES` / `MLLM_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
 | Drain bound, switching, observability | The role document in use. |
 
 The packaged units start standalone without `--config`, so an upgrade that
@@ -424,6 +428,34 @@ systemctl edit mllm-standalone
 #   ExecStart=mllm start standalone --config /etc/mllm/standalone.yaml
 systemctl restart mllm-standalone
 ```
+
+### Models and downloads
+
+Standalone and enrolled hosts resolve the same two settings by the same rule,
+highest precedence first: the flag on `mllm start standalone` or
+`mllm start host`, then the environment, then the YAML document (the host
+document, or the `host:` block of the standalone document), then the default.
+
+| Setting | Flag | Variable | YAML | Default |
+|---|---|---|---|---|
+| Models directory (relative model paths resolve here) | `--models-root <dir>` | `MLLM_MODELS_ROOT` | `model_store.path` | `~/models` |
+| Hugging Face and HTTP downloads | `--model-sources allowed\|disabled` | `MLLM_MODEL_SOURCES` | `model_sources.huggingface`, `model_sources.http` | `allowed` |
+| Cap on all downloaded models | `--model-sources-max <size>` | `MLLM_MODEL_SOURCES_MAX` | `model_sources.max_bytes` | `500GiB` |
+| Where downloads are kept | | | `model_sources.path` | `<state_dir>/models` |
+
+A deployment that names a pinned Hugging Face revision or an HTTP URL with its
+SHA-256 is downloaded by the host it is placed on, into
+`<downloads>/sources/...`, verified, and then started like a local checkpoint;
+`deploy model --activate --wait` waits for the download. Before a byte is
+written the host reserves the download's full size against the cap and against
+the free space of the filesystem, keeping 1 GiB free; a download that does not
+fit is refused (`too_large` or `insufficient_space`, shown by
+`mllm status deployment`). A document that states `huggingface: disabled` (or
+`denied`) keeps that kind off; `allowed_hosts` and `huggingface_endpoint` still
+narrow where downloads may come from. The role writes the values it resolved
+into the host document it publishes, so the server plans against exactly what
+the host enforces. `mllm prune sources --host-config <host.yaml>` reclaims
+downloads no deployment references.
 
 ### User services
 

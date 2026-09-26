@@ -38,8 +38,8 @@ Type=simple
 # A missing or invalid explicit file then fails the start (exit 2, not
 # restarted); it is never replaced by defaults (SPEC §15.2, R13).
 # The engine installation always comes from the environment (MLLM_VLLM_BIN or
-# MLLM_SGLANG_BIN, MLLM_MODELS_ROOT, ...), which belongs in the environment
-# file. The leading '-' makes the file optional.
+# MLLM_SGLANG_BIN, ...), which belongs in the environment file, as do the
+# optional MLLM_MODELS_ROOT (default ~/models) and MLLM_MODEL_SOURCES. The leading '-' makes the file optional.
 # MLLM_STATE_DIR is left unset: the role then uses ~/.local/state/mllm,
 # which is what `mllm drain standalone` run by the same user reads too.
 # mllm's runtime helpers are compiled into the binary and written to

@@ -213,3 +213,36 @@ whose download lock is held.
 The server's placement planner does not plan disk; the host enforces the store
 ceiling locally. A live Hugging Face download on a Spark has not been run, and
 the CPU tests (a local fake hub and origin) are not qualification.
+
+## Amendment 2026-09-25: sources allowed by default, a store of their own
+
+Owner decisions of 2026-09-25, applied to every host alike (standalone is a
+server plus one host):
+
+- **Default on.** Hugging Face and HTTP sources are `allowed` unless a host
+  states `denied` (also spelled `disabled`); an explicit value in an existing
+  host document wins over the default. `max_bytes` defaults to 500 GiB when a
+  host states none, so an allowed download is always bounded.
+- **Three ways, one rule.** The switch is `--model-sources allowed|disabled`
+  on `start host` and `start standalone`, `MLLM_MODEL_SOURCES`, or the
+  document's `model_sources.huggingface` / `model_sources.http`; the ceiling is
+  `--model-sources-max`, `MLLM_MODEL_SOURCES_MAX` or `model_sources.max_bytes`.
+  Precedence is flag > environment > document > default
+  (`mllm_config::model_settings`).
+- **Sources store.** Downloads live in `<state_dir>/models/sources` unless
+  `model_sources.path` names another directory; the model store keeps the
+  operator's own checkpoints. A downloaded checkpoint is contained by, and its
+  digest measured against, the sources store. The role writes the resolved
+  `model_store.path` and `model_sources` (including `path`) into the host
+  document it publishes, so the server resolves a revision against exactly what
+  the host enforces. A document that states neither keeps the earlier layout
+  (`<model_store>/sources`).
+- **Disk check.** A reservation also leaves 1 GiB free on the filesystem
+  (`insufficient_space` otherwise), besides the `max_bytes` ceiling
+  (`too_large`).
+- **Standalone.** The embedded host materializes declared sources in process
+  exactly as an enrolled host answers `MaterializeSource`, so a standalone
+  deployment with a remote source is accepted (provisionally where its memory is
+  sized from the weights, ADR 0014 §7) and activates once the copy is verified.
+  The "Not yet" note above about standalone no longer applies.
+

@@ -2,8 +2,11 @@
 # with local-only authenticated listeners. `mllm start standalone` generates
 # this shape under its state directory when none exists; the engine
 # installation comes from the environment (MLLM_VLLM_BIN or MLLM_SGLANG_BIN,
-# MLLM_MODELS_ROOT, ...), not from this file. The listeners serve plain HTTP
-# on loopback, so there is no `tls` block (SPEC §16.5).
+# ...), not from this file. The listeners serve plain HTTP on loopback, so
+# there is no `tls` block (SPEC §16.5). Models live in ~/models unless
+# `host.model_store.path` (or --models-root, MLLM_MODELS_ROOT) names another
+# directory; Hugging Face and HTTP downloads are allowed with a 500 GiB cap
+# unless `host.model_sources` says otherwise.
 # Parsed by the product: `mllm validate config --file docs/examples/standalone.yaml`.
 schema_version: 1
 kind: standalone
@@ -30,5 +33,12 @@ host:
         managed_limit: auto
         free_reserve: auto
   runtime_profiles: {}
+  # Optional (defaults shown in comments):
+  # model_store:
+  #   path: /home/operator/models
+  # model_sources:
+  #   huggingface: allowed      # or disabled
+  #   http: allowed             # or disabled
+  #   max_bytes: 500GiB
 shutdown:
   drain_timeout: "30s"

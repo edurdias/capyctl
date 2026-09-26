@@ -28,8 +28,6 @@ Not there yet:
 
 - Multi-GPU models (tensor parallelism across GPUs or machines) are designed
   but parked until after 0.1.0.
-- Downloading model sources (Hugging Face, HTTP) works on enrolled hosts but
-  not in standalone.
 - No web UI; everything goes through the CLI and the management API.
 - Other GPU vendors and operating systems are not supported.
 - Deep parking relies on engine development controls. mllm keeps them on
@@ -67,13 +65,19 @@ from the environment:
 
 ```bash
 export MLLM_VLLM_BIN=/path/to/venv/bin/vllm   # or MLLM_SGLANG_BIN
-export MLLM_MODELS_ROOT=/srv/models
 mllm start standalone                          # inference on 127.0.0.1:8443
 ```
 
 The first start writes its role document and credentials under
-`~/.local/state/mllm`. In another shell, write a deployment document for a
-model under `MLLM_MODELS_ROOT` (start from
+`~/.local/state/mllm`. Models live in `~/models` (created on first start);
+name another directory with `--models-root`, `MLLM_MODELS_ROOT` or
+`host.model_store.path`. A deployment may also name a Hugging Face or HTTP
+source pinned to a commit or digest: mllm downloads it into
+`~/.local/state/mllm/models/sources`, checking free disk space first and
+capping all downloads at 500 GiB (`--model-sources disabled` or
+`MLLM_MODEL_SOURCES=disabled` turns downloads off; `--model-sources-max` or
+`MLLM_MODEL_SOURCES_MAX` changes the cap). In another shell, write a
+deployment document for a model under the models directory (start from
 [`docs/examples/deployment-single.yaml`](docs/examples/deployment-single.yaml);
 in standalone the engine installation, `runtime_profile`, is named `local`),
 then deploy it and check on it:
