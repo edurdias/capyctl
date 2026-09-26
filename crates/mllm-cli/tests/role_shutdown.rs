@@ -1999,3 +1999,70 @@ fn a_client_finds_a_standalone_started_with_management_listen() {
     let (status, _) = role.exit(Duration::from_secs(30));
     assert!(status.success(), "{status:?}");
 }
+
+/// T01: `start host` says it is ready as `start standalone` does, naming its
+/// state directory, the ingress address the server forwards to and the
+/// owner-only identity file (never its contents), and its first control
+/// session is accepted: no "session ended; reconnecting" on a fresh host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_host_prints_a_ready_line_and_its_first_session_is_accepted() {
+    let roles = TwoRoles::new();
+    let server = roles.start("server");
+    roles.hosts(false, 0);
+    let invitation = roles.root.path().join("host.join");
+    let out = roles.manage(&[
+        "invite",
+        "host",
+        "--name",
+        "w11-host",
+        "--output",
+        invitation.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = roles.cli(
+        &roles.host_state,
+        &[
+            "join",
+            "host",
+            "--join-file",
+            invitation.to_str().unwrap(),
+            "--config",
+            roles.host_config.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let host = roles.start("host");
+    let ready = host.expect_line(
+        |line| line.starts_with("host ready"),
+        Duration::from_secs(30),
+    );
+    let document: Value =
+        serde_json::from_slice(&std::fs::read(&roles.host_config).unwrap()).unwrap();
+    let state_dir = document["state_dir"].as_str().unwrap();
+    let ingress = document["ingress"]["bind"].as_str().unwrap();
+    assert!(ready.contains(&format!("state_dir {state_dir}")), "{ready}");
+    assert!(ready.contains(ingress), "{ready}");
+    assert!(
+        ready.contains(&format!(
+            "credentials {}/host-identity.json",
+            document["identity_dir"].as_str().unwrap()
+        )),
+        "{ready}"
+    );
+    roles.hosts(true, 1);
+    host.signal();
+    let stderr = host.stderr.clone();
+    host.exit(Duration::from_secs(30));
+    let stderr = stderr_of(&stderr);
+    assert!(!stderr.contains("session ended"), "{stderr}");
+    server.signal();
+    server.exit(Duration::from_secs(30));
+}

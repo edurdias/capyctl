@@ -32,7 +32,7 @@ first, then stop the unit:
 
 ```bash
 # Remote host: from the server, as the service user.
-sudo -u mllm mllm drain host gpu-box --config /etc/mllm/server.yaml
+sudo -u mllm mllm drain host gpu-box
 sudo systemctl stop mllm-host           # on gpu-box
 
 # Standalone.
@@ -110,6 +110,7 @@ lists those codes, plus CLI exit codes an operator is likely to meet; the
 | 22 | A role is running but its control socket did not take or answer the request (`agent_unreachable`) | none | On `add`, `engines.yaml` is written and takes effect when the role restarts. On `remove` with no role listening, nothing is written: start the role and retry. If the message says the outcome is unknown (the role took the request, then closed the connection or did not answer in time), run `mllm engine list`, then `mllm engine remove` again; a retry resumes the same removal. |
 | 23 | `engine add` without a path needs a terminal (`not_interactive`) | none | Name the installation, or run it at a terminal to pick one. |
 | 24 | No allowed host publishes the deployment's runtime profile (`profile_not_published`); nothing was stored, and the message lists each host with the profiles it publishes | none: a CLI command's exit (`deploy`), never a role's | Register the profile on a host with `mllm engine add <path> --name <profile>`, then deploy again. A deployment is never re-resolved after `engine add`. |
+| 25 | The deployment is still stopping (`still_stopping`): a `start` sent right after a `stop` arrived before the stop's cleanup was verified; nothing was started | none: a CLI command's exit (`start`), never a role's | Retry in a moment, or run `mllm start deployment <name> --wait`, which waits for the stop to finish and then starts. |
 
 **A revoked host (14).** After `mllm revoke host <name|id>`, the controller
 answers the host's control session, over its mutual-TLS channel, that its
@@ -340,8 +341,14 @@ systemctl enable --now mllm-server
 
 `init` creates the server identity and credentials under the state directory
 (owner-only); it prints file locations, never secrets. Client commands on the
-server machine run as the service user with the same document, for example
-`sudo -u mllm mllm list hosts --config /etc/mllm/server.yaml`.
+server machine run as the service user and need no `--config`: the running
+server records the document it was started with, and they use it (see
+[Which role a command uses](configuration.md#which-role-a-command-uses)):
+
+```bash
+sudo -u mllm mllm list hosts
+sudo -u mllm mllm invite host gpu-box --output gpu-box.join
+```
 
 ### Host
 
@@ -349,9 +356,13 @@ server machine run as the service user with the same document, for example
 sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/host \
   mllm init host --output /var/lib/mllm/host/config/host.yaml
 install -m 0640 -o root -g mllm /var/lib/mllm/host/config/host.yaml /etc/mllm/host.yaml
-# Edit /etc/mllm/host.yaml: name, model_store, ingress, resource_policy,
-# runtime_profiles (see docs/examples/host.yaml). Leave runtime_dir out.
-# model_store and model_sources are optional (see "Models and downloads").
+# The generated document validates as written: its resource_policy is derived
+# from this machine's memory and GPUs as standalone derives its own, and models
+# live in ~/models of the service user (downloads in ~/models/sources) unless
+# model_store names another directory (see "Models and downloads").
+# Edit /etc/mllm/host.yaml for name, ingress (the address the server forwards
+# inference to) and, if you like, the limits (see docs/examples/host.yaml).
+# Leave runtime_dir out.
 mllm validate config --file /etc/mllm/host.yaml
 
 # Enroll with an invitation created on the server (`mllm invite host`).
@@ -616,7 +627,7 @@ the output is a terminal: `list hosts`, `list deployments`, `list engines`,
 detail (latency distributions, installation fingerprints, development-control
 marks) is only in the JSON.
 
-    $ mllm list engines --config server.yaml
+    $ mllm list engines
     HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
     gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 
@@ -637,7 +648,7 @@ mllm uses engines you install yourself. Register them on the machine that runs t
     mllm engine add ~/sglang/bin/python3 --name sglang-patched --drift refuse
     mllm engine list
     mllm engine remove vllm [--drain]
-    mllm list engines --config server.yaml # on the server: every host's engines
+    mllm list engines                      # on the server: every host's engines
 
 `detect` looks in PATH environments, conda, `~/venvs`, `~/.venv`,
 `~/.virtualenvs`, uv and pipx tool environments, `/opt`, and any venv directly
@@ -648,8 +659,10 @@ version check, the installation fingerprint and the deep-park probe), writes
 the profile into `engines.yaml`, and asks the running role to publish it
 without a restart. mllm never rewrites `host.yaml` or `standalone.yaml`.
 `engines.yaml` sits beside the role's configuration file (`--config
-dir/host.yaml` means `dir/engines.yaml`); without `--config` it is
-`~/.config/mllm/engines.yaml`, for a host and for standalone alike. The role
+dir/host.yaml` means `dir/engines.yaml`). Without `--config`, on a host machine
+it sits beside the document the host was started with (the host records it),
+and otherwise it is `~/.config/mllm/engines.yaml`, for a host and for
+standalone alike. The role
 merges it with its own document at start; a profile name declared in both is
 refused. Its first line records its revision (`# mllm-document-revision: N`).
 The running role listens on `<state_dir>/control.sock` (mode 0600; only the
@@ -709,11 +722,11 @@ creates a new one (and its lock) owned by the role's service user (the owner of
 the host's `state_dir`, `mllm`), mode 0600, so the role can read it. It talks to
 the role over `<state_dir>/control.sock`, which serves root as well as the
 service user. Root also runs the named installation's version check and
-deep-park probe, so name only an installation you trust. Keep the `--config`:
-`mllm engine`, `mllm list engines`, and the role itself all resolve
-`engines.yaml` by the same rule (`--config`, then `$MLLM_CONFIG`, then
-`~/.config/mllm/engines.yaml`), and without it root's `~/.config` is a
-different file than the one the role reads. The packaged standalone unit
+deep-park probe, so name only an installation you trust. Keep the `--config`
+here: a command finds the role running on the machine through the state root
+of the user who runs it, and root's is not the service user's, so without it
+root's `~/.config/mllm/engines.yaml` is a different file than the one the role
+reads. Run as the service user, `mllm engine` finds the host without it. The packaged standalone unit
 starts without `--config`, so its `engines.yaml` is the service user's
 `/var/lib/mllm/.config/mllm/engines.yaml`, which the service user can write:
 `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm engine add …`.

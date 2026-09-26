@@ -70,9 +70,13 @@ pub async fn execute(
 ) -> Result<Value, StructuredError> {
     let (endpoint, token, path_host, journal_root) = match host {
         Some(host) => {
-            let server = crate::remote_roles::server_context(config, state_dir)?;
-            let (endpoint, token) = crate::remote_roles::management_context(&server)?;
-            (endpoint, token, host.to_owned(), server.state_dir)
+            let target = crate::local_role::resolve(state_dir, config)?;
+            (
+                target.endpoint,
+                target.token,
+                host.to_owned(),
+                target.journal_root,
+            )
         }
         None => {
             let credentials = std::fs::read_to_string(state_dir.join("identity/credentials"))

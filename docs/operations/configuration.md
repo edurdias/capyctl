@@ -33,7 +33,7 @@ refused: an opt-out that was mistyped must not be read as "on".
 
 | Setting | YAML | Flag | Variable | Default | Roles |
 |---|---|---|---|---|---|
-| Role document | (none) | `--config <file>` | `MLLM_CONFIG` | `<state root>/config/<role>.yaml` | server, host, standalone, `mllm engine` |
+| Role document | (none) | `--config <file>` | `MLLM_CONFIG` | the running role's ([Which role a command uses](#which-role-a-command-uses)), else `<state root>/config/<role>.yaml` | server, host, standalone, `mllm engine` |
 | State root | `state_dir` at the top of a standalone document named by `--config` or `MLLM_CONFIG` | `--state-dir <dir>` | `MLLM_STATE_DIR` | `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm` | every command |
 | Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | `--state-dir <dir>` | `MLLM_STATE_DIR` | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
 | Registered engines file | (none) | `--config` (the file beside it) | `MLLM_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/mllm/engines.yaml` | host, standalone, `mllm engine` |
@@ -49,9 +49,46 @@ one of them overrides the document, the role uses it (its identity under
 `<state dir>/identity`) and prints one notice naming what it overrode.
 `join host` follows the same rule and takes `--set` like `start host`. A standalone document may state
 `server.state_dir` and `host.state_dir` only as `<state root>/server` and
-`<state root>/host`. Client commands (`mllm status`, `mllm deploy`, ...) find a
-standalone role's credentials under the state root, so they need the same
-`--state-dir` or `MLLM_STATE_DIR` as the role.
+`<state root>/host`. Commands find the role running on this machine under the
+state root (see [Which role a command uses](#which-role-a-command-uses)), so
+they need the same `--state-dir` or `MLLM_STATE_DIR` as the role.
+
+## Which role a command uses
+
+A command run on a machine uses the role running there; nothing needs to be
+set each time. The role document is, first match wins:
+
+| Setting | YAML | Flag | Variable | Default |
+|---|---|---|---|---|
+| Role a command uses | (none) | `--config <role document>` | `MLLM_CONFIG` | the role running on this machine |
+
+- **On the server machine**, client commands (`list`, `status`, `deploy`,
+  `start`, `stop`, `park`, `delete`, `drain`, `revoke`, `invite`, ...) use the
+  server's management API.
+- **On a standalone machine**, they use the standalone role's.
+- **On a host machine**, `mllm engine` and `mllm config show` use the host's
+  document. A host has no management API, so a command that needs the server is
+  refused with "This machine is an mllm host; run this command on the server".
+
+The role is found under the state root from what it records there: a server's
+or standalone role's credentials, the management address it serves on, and,
+for a server or host started with `--config` or `MLLM_CONFIG` (as the packaged
+units start them), the document it was named with (`<state root>/run/`). A
+command therefore needs the same `--state-dir` or `MLLM_STATE_DIR` as the role,
+and runs as the same user.
+
+When more than one role keeps its state under the same root:
+
+- a server and a host, or a standalone role and a host: client commands use
+  the server or standalone role, since a host has no management API;
+- a server and a standalone role: the one that answers is used; when both or
+  neither answer, the command is refused, naming both and the `--config` that
+  chooses;
+- `config show` with more than one role is refused, naming them; choose with
+  `--role` or `--config`.
+
+The management API is served on loopback only, on every role, so another
+machine is managed by running the command on it (for example over `ssh`).
 
 ## Listeners
 
@@ -226,9 +263,9 @@ How a value is read and checked:
 `mllm config show` prints the value each setting of a role will have, and
 where it came from: `default`, `yaml`, `env` (a named variable or
 `MLLM_SET__…`), `flag` or `set`. It reads the document named by `--config` (or
-`MLLM_CONFIG`), whose `kind` is the role; without one it reads the role's
-document under the state root (`--role server|host|standalone`, default
-standalone), which may not exist yet. It applies `--set` and the environment
+`MLLM_CONFIG`), whose `kind` is the role; without one it reads the document
+of the role on this machine (`--role server|host|standalone` chooses; with no
+role there yet, standalone's), which may not exist yet. It applies `--set` and the environment
 as the start would, checks the result the same way, and writes nothing.
 
 ```text

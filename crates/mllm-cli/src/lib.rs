@@ -9,6 +9,9 @@ pub mod engine;
 pub mod exposure;
 pub mod grammar;
 pub mod host_observation;
+// Owner decision 2026-09-26: the role running on this machine, which client
+// commands use without --config.
+pub mod local_role;
 pub mod managed_runtime;
 pub mod output;
 pub mod policy_migration;

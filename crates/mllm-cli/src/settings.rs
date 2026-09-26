@@ -89,9 +89,9 @@ pub fn describe(error: &ConfigError) -> String {
 /// `--set` > `MLLM_SET__…` > named flag > named variable > YAML > default.
 ///
 /// The document is `--config` (else `MLLM_CONFIG`), whose `kind` is the role;
-/// else the role's implicit document under the state root (`--role`, default
-/// standalone), which may not exist yet (its settings are then the
-/// defaults). The overridden document is validated as the start validates it,
+/// else the role's document on this machine (`--role`, default the one role
+/// found there, else standalone), which may not exist yet (its settings are
+/// then the defaults). The overridden document is validated as the start validates it,
 /// and a named form that disagrees with a generic override is refused, so a
 /// `config show` that succeeds is what the start would run with. Nothing is
 /// written.
@@ -141,15 +141,22 @@ pub fn config_show(
             }
             (kind, path.clone())
         }
-        None => {
-            let kind = role_kind(role.unwrap_or(Role::Standalone));
-            (
-                kind,
-                state_root
-                    .join("config")
-                    .join(format!("{}.yaml", kind.as_str())),
-            )
-        }
+        // Owner decision 2026-09-26: without a named document, the role
+        // running on this machine (the host's recorded document included),
+        // else standalone, the first run's role.
+        None => match role {
+            Some(role) => (
+                role_kind(role),
+                crate::local_role::role_document(state_root, role),
+            ),
+            None => match crate::local_role::detected_role(state_root)? {
+                Some((role, path)) => (role_kind(role), path),
+                None => (
+                    ConfigKind::Standalone,
+                    state_root.join("config/standalone.yaml"),
+                ),
+            },
+        },
     };
     if !mllm_config::setting_overrides::is_role_kind(kind) {
         return Err(invalid(format!(

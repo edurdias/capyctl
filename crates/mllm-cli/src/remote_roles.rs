@@ -221,13 +221,43 @@ fn state_dir_override(invocation: &Invocation, document_state_dir: &Path) -> Opt
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
 }
+/// Owner rule 2026-09-25 (standalone is a server plus one host, with the
+/// same defaults): the document `init host` writes validates as written. The
+/// models directory and model downloads are left to the shared defaults
+/// (`~/models`, downloads in `<model_store>/sources`, allowed; each settable
+/// three ways at start), and the resource policy is derived from this
+/// machine's memory and GPU shape exactly as standalone derives its own.
+fn host_template(root: &Path) -> Result<String, StructuredError> {
+    let mut document: Value =
+        serde_json::from_str(&HostConfig::template(root)).map_err(|_| unavailable())?;
+    if let Some(fields) = document.as_object_mut() {
+        fields.remove("model_store");
+    }
+    let capacity = mllm_agent::memory::read_host_memory()
+        .map_err(|_| error("Host memory inventory unavailable"))?
+        .memory
+        .capacity_bytes;
+    let sample = mllm_agent::gpu_memory::sample();
+    let shape =
+        mllm_agent::gpu_memory::shape(sample.as_ref()).map_err(|e| error(&e.to_string()))?;
+    document["hardware_fingerprint"] = json!("mllm-host");
+    document["environment_fingerprint"] = json!("mllm-host");
+    document["resource_policy"] = crate::standalone_config::resource_policy(
+        capacity,
+        None,
+        &shape,
+        mllm_config::engine_settings::DEFAULT_ENGINE_PORTS,
+    );
+    serde_json::to_string_pretty(&document).map_err(|_| unavailable())
+}
+
 fn initialize(root: &Path, role: InitTarget, output: &Path) -> Result<Value, StructuredError> {
     if fs::symlink_metadata(output).is_ok() {
         return Err(error("Output already exists; nothing was overwritten"));
     }
     let text = match role {
         InitTarget::Server => ServerConfig::template(root),
-        InitTarget::Host => HostConfig::template(root),
+        InitTarget::Host => host_template(root)?,
     };
     match role {
         InitTarget::Server => {
@@ -999,6 +1029,20 @@ async fn serve_host(
     );
     let gates = ingress.clone();
     let router = admission.gate(ingress.router());
+    // Design §9 ("Where the key is"): ready, said as `start standalone` says
+    // it, naming the owner-only identity file and never its contents.
+    println!(
+        "host ready (state_dir {}; ingress listener {}; credentials {})",
+        config.state_dir.display(),
+        config
+            .ingress
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |settings| settings.bind.to_string()),
+        config
+            .identity_dir
+            .join(mllm_agent::enrollment::HOST_FILE)
+            .display()
+    );
     let mut ingress_server = tokio::spawn(async move {
         match ingress_listener {
             Some(listener) => crate::shutdown::serve(listener, router, stopped)
@@ -1247,6 +1291,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                         ))
                     })?;
                 }
+                // Owner decision 2026-09-26: client commands run later on
+                // this machine without --config find this server.
+                crate::local_role::record_document(root, "server", named.as_deref());
                 serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,
@@ -1273,6 +1320,10 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 if let Some(dir) = state_dir_override(invocation, &host.state_dir) {
                     host = host.with_state_dir(dir);
                 }
+                // Owner decision 2026-09-26: a command run later on this
+                // machine without --config (`mllm engine`, `config show`)
+                // finds this host's document.
+                crate::local_role::record_document(root, "host", named.as_deref());
                 serve_host(host, path.clone(), engines).await
             }
         }
@@ -1337,6 +1388,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     .map_err(|_| error("Invitation conflicts with the retained host identity"))?
             };
             let host_id = pending.enroll(&storage, &invitation, now()).await.map_err(|_| error("Enrollment failed; retain identity and retry the same invitation transaction"))?;
+            crate::local_role::record_document(root, "host", named.as_deref());
             if *recover {
                 // ADR 0016: the same host id, a new certificate; engines the
                 // server recorded reopen only after a fresh probe.
@@ -1355,7 +1407,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                     "Invitation output already exists; nothing was overwritten",
                 ));
             }
-            let config = server_context(invocation.config.as_deref(), root)?;
+            let target = crate::local_role::resolve(root, invocation.config.as_deref())?;
             // ADR 0016: a recovery invitation is shorter-lived than an
             // ordinary one, and only a recovery request carries `recover`, so
             // an ordinary request keeps its exact earlier shape.
@@ -1364,8 +1416,9 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 json!({"host_name":name,"lifetime_seconds":3600})
             };
-            let result = management_request(
-                &config,
+            let result = management_call(
+                &target.endpoint,
+                &target.token,
                 reqwest::Method::POST,
                 "/host-invitations",
                 Some(body),
@@ -1391,8 +1444,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             resource: Resource::Host,
             ..
         } => {
-            let config = server_context(invocation.config.as_deref(), root)?;
-            let result = management_request(&config, reqwest::Method::GET, "/hosts", None).await?;
+            let target = crate::local_role::resolve(root, invocation.config.as_deref())?;
+            let result = management_call(
+                &target.endpoint,
+                &target.token,
+                reqwest::Method::GET,
+                "/hosts",
+                None,
+            )
+            .await?;
             if let Command::Inspect { id: Some(id), .. } = &invocation.command {
                 result["hosts"]
                     .as_array()
@@ -1411,8 +1471,15 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             resource: ListResource::Engines,
         } => {
             // ADR 0018: every host's published profiles, from the server.
-            let config = server_context(invocation.config.as_deref(), root)?;
-            management_request(&config, reqwest::Method::GET, "/engines", None).await
+            let target = crate::local_role::resolve(root, invocation.config.as_deref())?;
+            management_call(
+                &target.endpoint,
+                &target.token,
+                reqwest::Method::GET,
+                "/engines",
+                None,
+            )
+            .await
         }
         _ => Err(error("Unsupported remote role command")),
     }
@@ -1434,7 +1501,29 @@ pub async fn management_request(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, StructuredError> {
-    let credentials = load_credentials(config)?;
+    let (endpoint, token) = management_context(config)?;
+    management_call(&endpoint, &token, method, path, body).await
+}
+
+/// Owner decision 2026-09-26: the admin token in a server's identity
+/// directory (`server-credentials.json`, owner-only).
+pub(crate) fn server_admin_token(identity_dir: &Path) -> Result<String, StructuredError> {
+    let c: Credentials = serde_json::from_slice(&private_read(
+        &identity_dir.join("server-credentials.json"),
+    )?)
+    .map_err(|_| unavailable())?;
+    Ok(c.admin_token)
+}
+
+/// One management request to `endpoint` with the admin `token`, whichever
+/// role named them.
+pub async fn management_call(
+    endpoint: &str,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, StructuredError> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -1442,8 +1531,8 @@ pub async fn management_request(
         .build()
         .map_err(|_| unavailable())?;
     let mut request = client
-        .request(method, format!("{}{path}", management_context(config)?.0))
-        .bearer_auth(credentials.admin_token);
+        .request(method, format!("{endpoint}{path}"))
+        .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }

@@ -109,9 +109,10 @@ pub async fn execute(
         }
         None => {
             // Fail closed: with no answer from the server nothing is removed.
-            let server = crate::remote_roles::server_context(config, state_dir)?;
-            crate::remote_roles::management_request(
-                &server,
+            let target = crate::local_role::resolve(state_dir, config)?;
+            crate::remote_roles::management_call(
+                &target.endpoint,
+                &target.token,
                 reqwest::Method::GET,
                 "/model-sources",
                 None,

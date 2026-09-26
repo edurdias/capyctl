@@ -140,38 +140,44 @@ mllm init server --output server.yaml
 # edit server.yaml: listeners and enrollment addresses (docs/examples/server.yaml)
 mllm validate config --file server.yaml
 mllm start server --config server.yaml
-mllm invite host gpu-box --output gpu-box.join --config server.yaml
+mllm invite host gpu-box --output gpu-box.join
 ```
 
 Copy `gpu-box.join` to the GPU machine, then:
 
 ```bash
 mllm init host --output host.yaml
-# edit host.yaml: name, model store, ingress and memory (docs/examples/host.yaml
-# for unified memory, docs/examples/host-discrete.yaml for a discrete card)
+# host.yaml validates as written (limits derived from this machine, models
+# in ~/models); edit its name and ingress (docs/examples/host.yaml)
 mllm validate config --file host.yaml
 mllm join host --join-file gpu-box.join --config host.yaml
 mllm start host --config host.yaml
 mllm engine add ~/venvs/vllm --config host.yaml   # in another shell
 ```
 
-Back on the server machine, deploy through the server:
+Back on the server machine, deploy through the server. A command run on a
+machine uses the role running there, with no `--config`: on the server machine
+the server, on a standalone machine the standalone role. On a host machine the
+host's own commands (`mllm engine`, `mllm config show`) use the host, and a
+command that needs the server says to run it on the server (see
+[`docs/operations/configuration.md`](docs/operations/configuration.md#which-role-a-command-uses)).
 
 ```bash
-mllm list hosts --config server.yaml
-mllm deploy model --file deployment.yaml --activate --wait --config server.yaml
-mllm list deployments --config server.yaml
-mllm park deployment <name> --config server.yaml
+mllm list hosts
+mllm deploy model --file deployment.yaml --activate --wait
+mllm list deployments
+mllm park deployment <name>
 ```
 
 ```text
-$ mllm list hosts --config server.yaml
+$ mllm list hosts
 NAME      STATE    ELIGIBLE   VERSION      COMPATIBILITY   MEMORY (FREE / TOTAL)   ENGINES
 gpu-box   online   yes        0.1.0-rc.4   supported       46.5 GiB / 77.2 GiB     vllm
 
-$ mllm list deployments --config server.yaml
-NAME       KIND    DESIRED   STATE    READY   REVISION   HOSTS
-my-model   model   ready     parked   0/1     1          gpu-box
+$ mllm list deployments
+NAME           KIND    DESIRED   STATE    READY   REVISION   HOSTS
+qwen3-8b       model   ready     ready    1/1     1          gpu-box
+llama-3.1-8b   model   parked    parked   0/1     2          gpu-box
 ```
 
 A parked deployment releases its GPU memory and wakes on the next request for

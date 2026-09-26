@@ -45,9 +45,15 @@ pub async fn execute(
     config: Option<&Path>,
     request_id: Option<&str>,
 ) -> Result<Value, StructuredError> {
-    let server = crate::remote_roles::server_context(config, state_dir)?;
-    let (endpoint, token) = crate::remote_roles::management_context(&server)?;
-    revoke(&endpoint, &token, &server.state_dir, host, request_id).await
+    let target = crate::local_role::resolve(state_dir, config)?;
+    revoke(
+        &target.endpoint,
+        &target.token,
+        &target.journal_root,
+        host,
+        request_id,
+    )
+    .await
 }
 
 pub(crate) async fn revoke(

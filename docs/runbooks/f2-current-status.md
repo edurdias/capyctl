@@ -4,6 +4,69 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## A command uses the role on its machine; saved contexts removed — 2026-09-26 (branch `chore/remove-contexts`)
+
+Owner decision 2026-09-26: the user should not have to set the configuration
+every time, and a command run on a machine knows the role running there. The
+saved contexts added on `fix/first-run-ux-2` (the `mllm context` commands,
+`--context`, `MLLM_CONTEXT`, `MLLM_CONTEXT_KEY` and the files under
+`~/.config/mllm/`) are removed with their tests and documentation.
+
+- **Which role a command uses.** `--config` > `MLLM_CONFIG` > the role running
+  on this machine, found under the state root: a server's or standalone
+  role's credentials and recorded management address, and the document a
+  server or host was started or enrolled with when one was named
+  (`<state root>/run/server-document`, `<state root>/run/host-document`, 0600),
+  so the packaged system units are found without `--config`.
+- **Host machines.** `mllm engine` and `mllm config show` use the host's
+  document (recorded, else `<state root>/config/host.yaml`), and `engine add`
+  writes the `engines.yaml` the host reads. A command that needs the server is
+  refused with "This machine is an mllm host; run this command on the server".
+- **More than one role.** Server or standalone with a host: the server or
+  standalone role. Server and standalone: the one that answers, else refused
+  naming both and the `--config` that chooses. `config show` with more than
+  one role is refused, naming them (`--role` or `--config` chooses).
+- CPU tests only (`crates/mllm-cli/tests/local_role.rs`): detection of each
+  role, recorded server and host documents, precedence, the host refusal, and
+  that no context command or flag remains. Not qualification of any engine.
+
+## First-run UX, second pass — 2026-09-26 (branch `fix/first-run-ux-2`)
+
+Fixes from a first-run walk with the real binary, each with a regression test
+that failed first, plus the owner's 2026-09-26 decision on client commands.
+CPU tests, fake installations and scripted management APIs only; none of this
+is qualification of an engine recipe. The host session fix was also checked
+by hand on this machine with fake engine environments (a server and five
+hosts, one declaring its discrete GPU as a device domain).
+
+- **`status` names a failed launch.** LAST ERROR falls back to the failed
+  latest operation's code and first message line instead of `-`.
+- **`start` right after `stop`.** `start --wait` waits, within the start's
+  window, for the stop to settle and then starts; a plain start refused
+  `runtime_retained` while stopping says so and exits 25 (`still_stopping`)
+  instead of 2.
+- **`start host`** prints a ready line like standalone's (state directory,
+  ingress listener, identity file). A fresh host's first control session was
+  refused ("host inventory publication refused") and reconnected: its first
+  inventory raced the GPU collector on a host declaring a device domain, so the
+  device was published unobserved. A host with no executor (no ingress) sent
+  the startup snapshot, older than the observation TTL once installations had
+  been measured, and was refused on every session. The first inventory of a
+  session now waits (bounded, off the session loop) for a device sample, and a
+  host with no executor measures its domains again per session.
+- **`init host`** leaves the models directory to the shared default
+  (`~/models`, downloads in `~/models/sources`, allowed) and writes the
+  resource policy standalone derives from the same machine, so the generated
+  document validates as written.
+- **Plain runtime wording.** Warnings and validation errors no longer cite
+  requirement sections or decision records; the wording gate now scans string
+  literals in the CLI and configuration crates.
+- **`--output` help** is shown at the top level and on `init` and `invite`
+  only; the flag still parses anywhere.
+- **Client commands without `--config`** (owner decision 2026-09-26). They
+  use the role running on the machine; the saved contexts this branch first
+  added were removed afterwards (see the section above).
+
 ## Discrete GPU live re-check after the fix wave — 2026-09-26 (branch `feat/discrete-gpu-network`)
 
 Live re-check of the rows the final review left owed, with the branch's
