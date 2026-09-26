@@ -416,11 +416,31 @@ fn product_enrolls_unprepared_host_and_reconnects_without_identity_change() {
     );
     let identity = fs::read(host_root.join("identity/host-identity.json")).unwrap();
     let mut host = Service::start(&host_root, "host", &host_config);
-    let snapshot = hosts(&server_root, &server_config, true, 1);
+    // `init host` writes the resource policy derived from this machine
+    // (standalone's defaults), so the host publishes its measured domains:
+    // host memory, and each GPU with memory of its own as a device domain.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let snapshot = loop {
+        let snapshot = hosts(&server_root, &server_config, true, 1);
+        if snapshot["hosts"][0]["session"]["domains"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty())
+            || std::time::Instant::now() > deadline
+        {
+            break snapshot;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
     assert_eq!(snapshot["hosts"][0]["eligible"], false);
-    assert_eq!(
-        snapshot["hosts"][0]["session"]["domains"][0]["kind"],
-        "system"
+    let domains = snapshot["hosts"][0]["session"]["domains"]
+        .as_array()
+        .unwrap();
+    assert!(
+        domains.iter().any(|d| d["kind"] == "system")
+            && domains
+                .iter()
+                .all(|d| d["kind"] == "system" || d["kind"] == "device"),
+        "{snapshot}"
     );
     assert_eq!(
         snapshot["hosts"][0]["session"]["profiles"],
