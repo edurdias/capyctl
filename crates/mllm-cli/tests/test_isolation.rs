@@ -69,3 +69,54 @@ fn a_spawned_mllm_sees_only_the_isolated_home() {
         );
     }
 }
+
+/// The child half of [`the_developers_mllm_and_hf_variables_never_reach_a_spawned_process`]:
+/// run only when that test starts this binary with a probe environment.
+#[test]
+fn isolation_probe() {
+    if std::env::var_os("MLLM_ISOLATION_PROBE").is_none() {
+        return;
+    }
+    let mut command = std::process::Command::new("env");
+    support::isolate(&mut command);
+    let out = command.output().unwrap();
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+}
+
+// T03 (re-review): a developer's exported `MLLM_*` and `HF_*` variables never
+// reach a process a test spawns. This binary is run again with such
+// variables set; the probe spawns `env` through the isolating helper, and none
+// of them appear in what it prints.
+#[test]
+fn the_developers_mllm_and_hf_variables_never_reach_a_spawned_process() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "isolation_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("MLLM_ISOLATION_PROBE", "1")
+        .env("MLLM_STATE_DIR", "/developer/state")
+        .env("MLLM_VLLM_BIN", "/developer/vllm")
+        .env("MLLM_MANAGEMENT_ADDR", "127.0.0.1:9")
+        .env("HF_TOKEN", "developer-token")
+        .env("HF_ENDPOINT", "https://developer.example")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.contains("HOME="), "the probe ran: {printed}");
+    let leaked: Vec<&str> = printed
+        .lines()
+        .filter(|line| line.starts_with("MLLM_") || line.starts_with("HF_"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "leaked into a spawned process: {leaked:?}"
+    );
+}

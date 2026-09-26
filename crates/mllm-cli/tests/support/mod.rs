@@ -42,12 +42,23 @@ pub fn isolated_home() -> &'static std::path::Path {
 }
 
 /// Final review I14: `isolate(command)` points `HOME` and every XDG base
-/// directory of a spawned `mllm` at [`isolated_home`] and drops a role
-/// document named by the environment. A test that states its own `HOME` or
+/// directory of a spawned `mllm` at [`isolated_home`] and drops every
+/// `MLLM_*` and `HF_*` variable of the developer's environment (a role
+/// document named by `MLLM_CONFIG` included). A test that states its own `HOME` or
 /// `XDG_CONFIG_HOME` afterwards still wins, since later `env` calls replace
 /// these.
 pub fn isolate(command: &mut std::process::Command) -> &mut std::process::Command {
     let home = isolated_home();
+    // Re-review: the developer's own `MLLM_*` and `HF_*` settings (a state
+    // root, an engine, a management address, a Hugging Face token or
+    // endpoint) never reach a spawned process; a test states what it needs
+    // after this.
+    for (name, _) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if text.starts_with("MLLM_") || text.starts_with("HF_") {
+            command.env_remove(&name);
+        }
+    }
     command
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))

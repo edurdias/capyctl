@@ -4,6 +4,17 @@
 //! native engine recipe (SPEC §18).
 mod support;
 
+/// The binary under test (`support::mllm`), told the management address this
+/// test serves on, which the test sets as `MLLM_MANAGEMENT_ADDR` in its own
+/// environment (the isolation drops the developer's `MLLM_*` variables).
+fn mllm() -> std::process::Command {
+    let mut command = support::mllm();
+    if let Ok(address) = std::env::var(mllm_cli::roles::MANAGEMENT_ADDR_ENV) {
+        command.env(mllm_cli::roles::MANAGEMENT_ADDR_ENV, address);
+    }
+    command
+}
+
 use mllm_cli::grammar::{parse_invocation, Command, LifecycleAction};
 use mllm_config::effective::{Engine, ModelSource};
 use serde_json::Value;
@@ -51,7 +62,7 @@ fn evict_is_a_start_flag_only() {
 }
 
 fn cli(state: &std::path::Path, args: &[&str]) -> Value {
-    let result = support::mllm()
+    let result = mllm()
         .env("MLLM_STATE_DIR", state)
         .args(args)
         .output()
@@ -134,7 +145,7 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         "{journaled}"
     );
     // A different intent under the same request id is refused.
-    let reused = support::mllm()
+    let reused = mllm()
         .env("MLLM_STATE_DIR", dir.path())
         .args(["start", "deployment", &id, "--request-id", &request])
         .output()
