@@ -58,6 +58,16 @@ cards, as well as on unified-memory machines like the GB10.
   for its weights plus 10 % and a KV cache of up to 4 GiB; a vLLM deployment
   asks for at least 75 % of the card. A model too large for the card is refused at
   deploy (`insufficient_device_memory`).
+- **Upgrading a discrete-GPU machine** from a release candidate: the first
+  start of standalone replaces the resource policy it generated (one unified
+  pool) with `system` and `gpuN` domains. It stops the engines the earlier
+  release started, re-sizes their deployments as a new revision and prints
+  both; the next request for each starts it cold. This happens once.
+  Unified-memory machines are not affected.
+- **SGLang parking** warns instead of refusing when it cannot prove the
+  engine's memory-saver library private (for example group-writable files on
+  a machine whose groups come from a directory service). The warning is in the
+  engine log, visible only with `--debug-engine-logs`.
 - **Enrolled hosts** report device memory through a new capability,
   `device_memory_domains`; upgrade the server first, then the hosts. Unified
   hosts are unaffected.

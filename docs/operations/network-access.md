@@ -5,8 +5,7 @@ requests to. From 0.1.0 it listens on every interface of the machine and
 requires an API key, so a laptop, a phone or a Tailscale peer can use the models
 on your GPU machine without extra software. This page explains where the key is,
 how to narrow who can connect, and how to put the endpoint on the internet
-safely. The decision is recorded in
-ADR 0019 (`docs/design/adr/0019-discrete-gpu-and-network-endpoint.md` in the source repository).
+safely.
 
 Everything here applies to `mllm start standalone` and `mllm start server`. A
 host role has no inference listener of its own; the server forwards to it over
@@ -154,7 +153,7 @@ Open only port 443 to the internet, never 8443.
   a machine remotely with `ssh` and the local `mllm` commands. A server's
   bootstrap and control listeners keep mutual TLS for enrolled hosts.
 - **Engines.** vLLM and SGLang listen on loopback ports only, each with a key
-  generated for that launch and checked by mllm's guard (ADR 0012). The router
+  generated for that launch and checked by mllm's guard. The router
   is the only path from the network to an engine, and it forwards only the
   allowlisted inference routes.
 

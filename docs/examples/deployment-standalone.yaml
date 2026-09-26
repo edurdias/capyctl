@@ -13,7 +13,7 @@ recipe: standard
 residency: deep
 recovery: reconcile
 model:
-  # A checkpoint directory under MLLM_MODELS_ROOT.
+  # A checkpoint directory under the models directory (~/models by default).
   path: Qwen3-4B
   # Labels for this copy of the weights; change them when the files change.
   content_fingerprint: "qwen3-4b-1"

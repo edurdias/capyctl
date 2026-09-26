@@ -178,20 +178,15 @@ directory and run `packaging/release.sh --sums DIR` there to write the
 release's `SHA256SUMS`. `scripts/verify-packaging.sh` checks the units, the
 tarball and the installer locally.
 
+Building needs stable Rust and the Protocol Buffers compiler `protoc` on
+`PATH`, on ARM64 as on x86-64 (`sudo apt install protobuf-compiler`, or your
+distribution's package). A build over non-interactive SSH must see the same
+`PATH` as your login shell.
+
 ## Installing with install.sh
 
-Release candidates are published as pre-releases on the GitHub Releases page
-of the private repository `edurdias/mllm` (decided
-2026-09-24; the repository opens later). Two things follow:
-
-- **You need a credential.** Run `gh auth login` first (preferred), or export
-  `GITHUB_TOKEN` with read access to the repository. Without one, neither the
-  download of `install.sh` nor the installer itself can reach the release.
-- **You must pass `--version`.** GitHub's "latest release" never resolves to a
-  pre-release or a draft, so while only release candidates exist the
-  installer cannot find one on its own. Name it, for example
-  `--version v0.1.0-rc.4` (the leading `v` is optional). Without it the
-  installer stops and says so.
+The project site serves the installer; each release also publishes a copy
+beside its tarballs. It downloads the release from GitHub with `curl`.
 
 ```bash
 # As yourself: ~/.local/bin/mllm (add ~/.local/bin to PATH).
@@ -211,8 +206,8 @@ pre-release or a draft, so while only release candidates exist, pass
 `--version` (for example `--version v0.1.0-rc.4`; the leading `v` is optional).
 Without it the installer stops and says so.
 
-**Private repository.** The public download needs no credential. For a
-private repository, log in with `gh auth login` first, or export
+**Private repository.** The public download needs no credential. While the
+repository is private, log in with `gh auth login` first, or export
 `GITHUB_TOKEN` with read access, and fetch the installer itself the same way
 (`gh release download <tag> -R <owner>/mllm -p install.sh`).
 
@@ -503,8 +498,8 @@ units on shared machines.
 
 mllm runs on machines whose GPU has its own memory (a GeForce, RTX or data
 center card) as well as on unified-memory machines such as the GB10, where the
-GPU and the CPU share one pool. The rules are in
-ADR 0019 (`docs/design/adr/0019-discrete-gpu-and-network-endpoint.md` in the source repository).
+GPU and the CPU share one pool. The steps are the same on both; this section
+covers what differs.
 
 **Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
 (or `/bin/nvidia-smi`), which every driver package installs. mllm runs it with
@@ -623,8 +618,7 @@ marks) is only in the JSON.
 
     $ mllm list engines --config server.yaml
     HOST      PROFILE   ENGINE   VERSION   CUSTOM   DEEP PARK   STATE    DEPLOYMENTS
-    gpu-box   vllm      vllm     0.11.0    no       enabled     online   qwen3-8b
-    gpu-box   sglang    sglang   0.5.3     no       enabled     online   -
+    gpu-box   vllm      vllm     0.29.0    no       enabled     online   -
 
 Scripts pass `--format json` (or `--json`): the command then prints its JSON
 result, the same document earlier releases printed, and reports errors as JSON
@@ -739,6 +733,38 @@ them against its working directory first, so `mllm engine add … --config
 host.yaml` run beside `host.yaml` writes the `engines.yaml` next to it and asks
 the running role to publish it.
 
+## Engine logs and troubleshooting
+
+mllm does not keep an engine's own output by default, because it may contain
+secrets (prompts, keys in arguments). `--debug-engine-logs` on `mllm start
+host` or `mllm start standalone` keeps it, owner-only, in
+`<state dir>/logs/<deployment id>/<launch id>.log` for launches from then on.
+It is a flag only: a variable left in a unit file must not turn it on. For a
+unit, add it to `ExecStart=` in a drop-in while you investigate, then remove
+it.
+
+- **A launch fails.** `mllm status deployment <name>` shows the reason in
+  `LAST OPERATION` (for example `initialize failed (launch_failed)`); the
+  instance's `LAST ERROR` column can still read `-`. `--format json` has the
+  full record. A request for the deployment answers `activation_failed`, and
+  each new request tries a fresh start. The engine log says why the engine
+  exited.
+- **SGLang saver permission warning.** Before an SGLang park, mllm checks
+  that the engine's `torch_memory_saver` library is not writable by other
+  accounts. When that cannot be proven (for example, a group-writable
+  environment on a machine whose groups come from a directory service such as
+  `sss`), mllm parks anyway and writes one line to the engine log:
+  `{"event":"mllm_saver_library_permissions","problem":"group_undetermined","action":"warned"}`.
+  The line is only in the engine log, so it is visible only with
+  `--debug-engine-logs`. To clear it, remove group and other write permission
+  from the engine's environment (`chmod -R go-w <environment>`); mllm never
+  changes engine files itself.
+- **`config show` does not match a running role.** `mllm config show` reads
+  the document, the environment of the shell it runs in and the `--set`
+  options given to it. It does not ask the running role, so a role started
+  with `--set`, a flag, or a unit's `.env` file shows those values only if you
+  pass the same `--set` options or variables to `config show`.
+
 ## Hardening in the units
 
 The server unit takes the strict profile: read-only system, no home, private
@@ -769,6 +795,9 @@ start under the unit but starts by hand, check these first.
 ## Upgrade
 
 A restart re-attaches running engines, so an upgrade does not need a drain.
+The one exception is the first start of 0.1.0 on a discrete-GPU machine that
+ran an earlier release: it stops that machine's engines once (see
+"Upgrading to 0.1.0").
 
 **Order: the server first, then the hosts one at a time**. The
 server judges each host's release against its own when the host connects:
@@ -863,7 +892,34 @@ To narrow the address again, pick one:
   (`tailscale ip -4`).
 
 See [Network access](network-access.md) for the client key and a TLS reverse
-proxy. Two other defaults changed in 0.1.0 for every host and standalone:
+proxy.
+
+**Discrete GPUs: a one-time policy change and cold restart.** Earlier
+releases described every machine as one unified memory pool. On a machine
+with a discrete card, 0.1.0 derives a `system` domain (host RAM) and one
+`gpuN` domain per card instead. For standalone, the first start of 0.1.0
+replaces the resource policy it generated and prints:
+
+```
+this machine's memory shape changed, so the resource policy mllm generated for it was replaced (revision 2): domains [unified] are now [gpu0, system]; stopped with verified cleanup first: <deployments>
+re-sized for this machine's resource policy: <deployments>
+```
+
+To make that change, the start stops the engines the earlier release
+launched on this machine, waiting until each is proven gone, and accepts each
+deployment again as a new revision sized for the card (so its `REVISION`
+goes up by one). The deployments stay eligible for on-demand activation: the
+next request for each starts it cold. A restart does not re-attach them this
+one time. If an engine cannot be proven stopped in time, the start fails,
+keeps the earlier accounting and says so; start it again to retry. A
+deployment that cannot be sized for the card as written is named in the
+notice and must be deployed again with a file for this machine. This runs
+once; later starts re-attach as usual. Unified-memory machines are not
+changed. An enrolled host states its domains in its own document, which mllm
+never rewrites; for a discrete card, write it in the shape of
+[`examples/host-discrete.yaml`](../examples/host-discrete.yaml).
+
+Two other defaults changed in 0.1.0 for every host and standalone:
 Hugging Face and HTTP model downloads are allowed (500 GiB cap, see "Models and
 downloads"), and relative model paths resolve under `~/models` unless the
 document or `MLLM_MODELS_ROOT` names a models directory. On a discrete GPU,
