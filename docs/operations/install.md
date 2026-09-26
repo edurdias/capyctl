@@ -392,8 +392,8 @@ systemctl enable --now mllm-standalone
 ```
 
 The unit sets `MLLM_STATE_DIR=/var/lib/mllm/standalone`. Operator commands must
-use the same state directory (and the same `MLLM_STANDALONE_MANAGEMENT_ADDR`,
-if set): `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm status deployment <id>`.
+use the same state directory (and the same `MLLM_MANAGEMENT_ADDR`, if the unit
+moves the management listener with the variable rather than the document): `sudo -u mllm env MLLM_STATE_DIR=/var/lib/mllm/standalone mllm status deployment <id>`.
 `MLLM_RUNTIME_DIR` (development) makes standalone run from that directory
 instead of the managed one.
 
@@ -413,11 +413,12 @@ Where each setting comes from, highest precedence first:
 |---|---|
 | Role document | `--config <file>`, else `$MLLM_CONFIG`, else `<state root>/config/standalone.yaml`, else generated there. |
 | Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_CONFIG_HOME/mllm/engines.yaml` (`~/.config/mllm/engines.yaml`). `mllm engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
-| State root | `--state-dir`, else `MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
-| Listener addresses | Inference: `--listen`, else `MLLM_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `MLLM_STANDALONE_MANAGEMENT_ADDR` (loopback only), else `127.0.0.1:7443`, the only value the document may state. |
+| State root | `--state-dir`, else `MLLM_STATE_DIR`, else the top-level `state_dir` of the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
+| Listener addresses | Inference: `--listen`, else `MLLM_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `--management-listen`, else `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` is still read, with a warning), else `server.listeners.management.bind`, else `127.0.0.1:7443`; loopback only. |
 | Engine installation | `--vllm-bin` / `--sglang-bin` and the other engine flags, else `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` and the other variables, else `host.local_engine`, `host.runtime_dir` and `host.resource_policy.endpoint_port_range`; plus engines registered with `mllm engine add`. See the [settings reference](configuration.md#engine-installation). |
 | Models directory | `--models-root`, else `MLLM_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
 | Model downloads | `--model-sources` / `--model-sources-max`, else `MLLM_MODEL_SOURCES` / `MLLM_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
+| Any other setting of the document | `--set <path>=<value>`, else `MLLM_SET__<PATH>`, else the document, else its default. `mllm config show` prints every effective value and where it came from. See the [settings reference](configuration.md#any-setting-by-its-path). |
 | Drain bound, switching, observability | The role document in use. |
 
 The packaged units start standalone without `--config`, so an upgrade that

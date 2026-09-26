@@ -1,11 +1,18 @@
 # Settings reference
 
 Every setting mllm reads is listed here, with each of the ways to state it.
-Most settings can be stated three ways: in the YAML role document, as a flag on
-the command that starts the role, and as an environment variable. One rule
-decides which wins, for every setting and every role:
+Every setting of a role document can be stated three ways: in the YAML role
+document, on the command line that starts the role, and in the environment.
+The settings people change most have their own flag and variable (the tables
+below); any setting, including those, can also be named by its YAML path with
+`--set path=value` or `MLLM_SET__PATH=value` (see
+[Any setting by its path](#any-setting-by-its-path)). One rule decides which wins, for
+every setting and every role:
 
-**command-line flag > environment variable > YAML document > default**
+**`--set` > `MLLM_SET__…` > named flag > named variable > YAML document > default**
+
+`mllm config show` prints the value each setting will have and where it came
+from (see [Seeing the effective configuration](#seeing-the-effective-configuration)).
 
 Standalone is a server and one host in one process, so a host setting has the
 same flag, variable and default in both roles. Its YAML path is the same too:
@@ -19,19 +26,22 @@ An empty variable counts as unset, except for the switches `MLLM_DEEP_PARK`,
 `MLLM_INSTALLATION_DRIFT` and `MLLM_ENGINE_PORTS`, where an empty value is
 refused: an opt-out that was mistyped must not be read as "on".
 
-`mllm validate config --file <file>` checks any document offline.
+`mllm validate config --file <file>` checks any document offline;
+`--set path=value` checks it with a setting changed, as a start would.
 
 ## Files and state
 
 | Setting | YAML | Flag | Variable | Default | Roles |
 |---|---|---|---|---|---|
 | Role document | (none) | `--config <file>` | `MLLM_CONFIG` | `<state root>/config/<role>.yaml` | server, host, standalone, `mllm engine` |
-| State root | (none) | `--state-dir <dir>` | `MLLM_STATE_DIR` | `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm` | every command |
+| State root | `state_dir` at the top of a standalone document named by `--config` or `MLLM_CONFIG` | `--state-dir <dir>` | `MLLM_STATE_DIR` | `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm` | every command |
 | Role state directory | `state_dir` (server, host); `server.state_dir`, `host.state_dir` (standalone) | as the state root | as the state root | `<state root>` (server, host); `<state root>/server`, `<state root>/host` (standalone) | server, host, standalone |
 | Registered engines file | (none) | `--config` (the file beside it) | `MLLM_CONFIG` (the file beside it), `XDG_CONFIG_HOME` | `~/.config/mllm/engines.yaml` | host, standalone, `mllm engine` |
 
-The role document cannot name itself, and the state root is where mllm looks
-for the implicit role document, so neither has a YAML form. A server or host
+The role document cannot name itself, so it has no YAML form. The state root
+is where mllm looks for the implicit role document, so its YAML form is read
+only from a standalone document named with `--config` or `MLLM_CONFIG` (a
+relative path resolves against the document's directory). A server or host
 document's `state_dir` is where that role keeps its state; `init server` and
 `init host` write it from the state root. A standalone document may state
 `server.state_dir` and `host.state_dir` only as `<state root>/server` and
@@ -45,15 +55,18 @@ standalone role's credentials under the state root, so they need the same
 |---|---|---|---|---|---|
 | Inference address | `listeners.inference.bind` (server); `server.listeners.inference.bind` (standalone) | `--listen <addr:port>` | `MLLM_INFERENCE_ADDR` (`MLLM_STANDALONE_INFERENCE_ADDR` still read, with a warning) | `0.0.0.0:8443` | server, standalone |
 | Inference API key required | `listeners.inference.authentication: api_key\|none` (server; `server.` prefix in standalone) | `--no-inference-auth` | `MLLM_INFERENCE_AUTH=none` | `api_key` | server, standalone |
-| Standalone management address | `server.listeners.management.bind` (only its default) | (none) | `MLLM_STANDALONE_MANAGEMENT_ADDR` (loopback only) | `127.0.0.1:7443` | standalone and its client commands |
+| Standalone management address | `server.listeners.management.bind` | `--management-listen <addr:port>` | `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` still read, with a warning) | `127.0.0.1:7443` | standalone and its client commands |
 | Server management, bootstrap and control listeners | `listeners.management`, `listeners.bootstrap`, `listeners.control` | (none) | (none) | `127.0.0.1:7443`, `:7444`, `:7445` | server |
 
-The standalone management address has no flag because every client command
-must find the same address without reading the role document; one variable in
-the shell (or the unit's environment file) serves the role and its clients
-alike. It stays on loopback. The server's other listeners carry TLS identities
-and enrollment addresses that must agree with each other, so they are stated
-together in the document.
+The standalone management address stays on loopback in every form (any port).
+Client commands (`mllm status`, `mllm deploy`, ...) find it from
+`MLLM_MANAGEMENT_ADDR`, else from `server.listeners.management.bind` in the
+standalone document under the state root, else the default. They do not see a
+`--management-listen` given to the role, so a role started with that flag
+needs the same address in `MLLM_MANAGEMENT_ADDR` for its clients. The
+server's other listeners carry TLS identities and enrollment addresses that
+must agree with each other, so they are stated together in the document (or
+with `--set`).
 
 ## Models and downloads
 
@@ -124,11 +137,12 @@ mllm writes or reads, or environment variables.
 
 A token file readable by other users is refused, not used.
 
-## Settings stated only in the document
+## Settings without a named flag or variable
 
 These are structured policies (named domains, devices, profiles, labels,
-queues) or server policies that must agree with each other; there is no flag or
-variable for them. Change the document and restart the role.
+queues) or server policies that must agree with each other, so they have no
+flag or variable of their own. State them in the document, or change one for
+a run with `--set` or `MLLM_SET__…` (next section), and restart the role.
 
 | Settings | Where |
 |---|---|
@@ -140,6 +154,89 @@ variable for them. Change the document and restart the role.
 | Memory domains, devices, limits, queues, labels | host: `resource_policy` (standalone derives its own: its document accepts only `auto` values there, and `endpoint_port_range`) |
 | Runtime profiles | host: `runtime_profiles`; or `mllm engine add` (its own flags: `--name`, `--deep-park`, `--drift`, `--arg`) |
 | Load report period | host: `load_report_interval` |
+
+## Any setting by its path
+
+Every setting in a server, host or standalone document can be changed without
+editing the file:
+
+- on the command line, with `--set <path>=<value>` (repeatable) on
+  `mllm start server`, `mllm start host`, `mllm start standalone`,
+  `mllm validate config` and `mllm config show`;
+- in the environment, with `MLLM_SET__<PATH>=<value>`, where a double
+  underscore separates the keys of the path. Keys match the document's field
+  names in any case, so `MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT=45s` sets
+  `shutdown.drain_timeout`. A name inside a map (a listener, a runtime
+  profile, a label) is read in lower case from a variable.
+
+The path is the field's place in the document, in the document's own shape:
+a standalone document's host settings are under `host.` and its server
+settings under `server.`.
+
+```bash
+# A longer shutdown drain for this run of a server.
+mllm start server --set shutdown.drain_timeout=90s
+
+# A host that reports its engine load every 2 seconds, from its unit file.
+MLLM_SET__LOAD_REPORT_INTERVAL=2s
+
+# Standalone: the switch drain bound and the response timing header.
+mllm start standalone --set server.switching.drain_timeout=45s \
+  --set server.observability.timing_header=true
+```
+
+How a value is read and checked:
+
+- A value is read exactly as the same text in the YAML document would be:
+  `true` and `false` are booleans, `30` is a number, `30s` and `16GiB` are
+  text; a list is written in YAML's bracket form, `[--enforce-eager, --max-num-seqs, 4]`.
+  The document is then checked exactly as if the file said it, so a duration
+  written as `30` or a timeout outside its range is refused, naming the
+  override that stated it.
+- A path that does not exist is refused, with the valid paths nearest to it.
+  A path that names a block (such as `shutdown`) is refused with the settings
+  inside it.
+- `--set` wins over `MLLM_SET__…` for the same setting; both win over the
+  document.
+- A setting that also has a named flag or variable (the tables above) can be
+  stated both ways only if the two agree: `--deep-park on` together with
+  `--set local_engine.deep_park=off` (or `MLLM_DEEP_PARK=on` with
+  `MLLM_SET__LOCAL_ENGINE__DEEP_PARK=off`) refuses the start and names both.
+- Secrets are never command-line values. `--set` is refused for a setting
+  that names a key, a token or a credential (for example
+  `model_sources.huggingface_token_file`, a profile's `credential_ref`, or a
+  profile's engine `env`); state it in the document or with `MLLM_SET__…`.
+- A host applies its overrides again when `mllm engine add` or `remove`
+  reloads its document, so a live reload compares the file plus the same
+  overrides with what the host runs.
+
+## Seeing the effective configuration
+
+`mllm config show` prints the value each setting of a role will have, and
+where it came from: `default`, `yaml`, `env` (a named variable or
+`MLLM_SET__…`), `flag` or `set`. It reads the document named by `--config` (or
+`MLLM_CONFIG`), whose `kind` is the role; without one it reads the role's
+document under the state root (`--role server|host|standalone`, default
+standalone), which may not exist yet. It applies `--set` and the environment
+as the start would, checks the result the same way, and writes nothing.
+
+```text
+$ mllm config show --set server.switching.drain_timeout=45s
+standalone (document ~/.local/state/mllm/config/standalone.yaml)
+SETTING                            VALUE          SOURCE
+host.local_engine.deep_park        on             default
+host.local_engine.vllm             /opt/vllm/...  env
+server.listeners.inference.bind    0.0.0.0:8443   yaml
+server.switching.drain_timeout     45s            set
+shutdown.drain_timeout             30s            default
+...
+```
+
+`--format json` (or `--json`) prints the same as
+`{"role", "document", "settings": [{"path", "value", "source"}]}`. The flags a
+role start takes (`--deep-park`, `--listen`, ...) are not options of `config
+show`; their variables are read from the environment, and `--set` stands in
+for them.
 
 ## Command options that are not settings
 
