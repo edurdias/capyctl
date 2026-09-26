@@ -222,7 +222,7 @@ impl Installation {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+        let mut command = support::mllm();
         command
             .env("MLLM_STATE_DIR", self.state())
             .env("MLLM_VLLM_BIN", self.root.path().join("engine/vllm"))
@@ -1076,7 +1076,7 @@ fn server_installation(inference: &str) -> (tempfile::TempDir, PathBuf, PathBuf)
 }
 
 fn server_command(state: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .env("MLLM_STATE_DIR", state)
         .env_remove("MLLM_INFERENCE_ADDR")
@@ -1471,7 +1471,7 @@ impl TwoRoles {
     }
 
     fn command(&self, state: &Path) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+        let mut command = support::mllm();
         command
             .env("MLLM_STATE_DIR", state)
             .env_remove("MLLM_VLLM_BIN")

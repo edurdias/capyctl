@@ -8,9 +8,11 @@
 //! Each case makes the engines file the role should read a directory, so the
 //! role refuses at load naming that path, before it binds a listener or
 //! launches anything. CPU tests; not qualification.
+mod support;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn private_dir() -> tempfile::TempDir {
     // Role custody rejects group-writable ancestors such as a shared /tmp.
@@ -30,7 +32,7 @@ fn mkdir(path: &Path) {
 /// `mllm start <role>` with a clean environment: `HOME` and the state
 /// directory under `root`, plus `extra`.
 fn start(role: &str, root: &Path, extra: &[(&str, &Path)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .args(["start", role])
         .env_clear()

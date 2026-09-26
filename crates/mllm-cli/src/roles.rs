@@ -1244,7 +1244,45 @@ pub async fn start_standalone_with_overrides(
     engines: &EngineOverrides,
     overrides: &SettingOverrides,
 ) -> Result<App, StartError> {
-    start_standalone_inner(
+    start_standalone_production(
+        state_dir,
+        config,
+        flags,
+        engines,
+        overrides,
+        ConfigHome::Process,
+    )
+    .await
+}
+
+/// Final review I14: the production boot with its registered engines read
+/// from `<config_home>/mllm/engines.yaml` instead of this process's config
+/// home, for a test of the production path that must not read the
+/// developer's registrations.
+pub async fn start_standalone_with_config_home(
+    state_dir: &Path,
+    config_home: &Path,
+) -> Result<App, StartError> {
+    start_standalone_production(
+        state_dir,
+        None,
+        &ModelOverrides::default(),
+        &EngineOverrides::default(),
+        &no_overrides(),
+        ConfigHome::Isolated(config_home.to_path_buf()),
+    )
+    .await
+}
+
+async fn start_standalone_production(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+    engines: &EngineOverrides,
+    overrides: &SettingOverrides,
+    config_home: ConfigHome,
+) -> Result<App, StartError> {
+    start_standalone_in(
         state_dir,
         config,
         Arc::new(
@@ -1258,6 +1296,7 @@ pub async fn start_standalone_with_overrides(
         Arc::new(mllm_agent::gpu_memory::sample),
         flags,
         overrides,
+        config_home,
     )
     .await
 }
@@ -1466,6 +1505,17 @@ fn standalone_models(
     Ok(settings)
 }
 
+/// Where a standalone boot looks for `<config home>/mllm/engines.yaml` when
+/// no role document is named.
+#[derive(Debug, Clone)]
+enum ConfigHome {
+    /// `XDG_CONFIG_HOME`, else `~/.config`, of this process (production).
+    Process,
+    /// Final review I14: a boot with an explicit provider (a test's) reads its
+    /// own, never the developer's, registered engines.
+    Isolated(PathBuf),
+}
+
 async fn start_standalone_inner(
     state_dir: &Path,
     config: Option<&Path>,
@@ -1474,6 +1524,30 @@ async fn start_standalone_inner(
     gpu: Arc<GpuSampler>,
     flags: &ModelOverrides,
     overrides: &SettingOverrides,
+) -> Result<App, StartError> {
+    start_standalone_in(
+        state_dir,
+        config,
+        provider,
+        memory,
+        gpu,
+        flags,
+        overrides,
+        ConfigHome::Isolated(state_dir.join(".config")),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_standalone_in(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    gpu: Arc<GpuSampler>,
+    flags: &ModelOverrides,
+    overrides: &SettingOverrides,
+    config_home: ConfigHome,
 ) -> Result<App, StartError> {
     // Fail-closed credentials (SPEC §15.2, design §9): the generated api key
     // lives in the protected credentials file. There is no constant fallback:
@@ -1600,8 +1674,11 @@ async fn start_standalone_inner(
     // installations and the profiles registered in engines.yaml (beside
     // `--config`, else `<config home>/mllm/engines.yaml`); a name declared in
     // both is refused `profile_exists`. The standalone document is never written.
-    let engines = crate::engine::role_engines(config, &|key| {
-        std::env::var(key).ok().filter(|value| !value.is_empty())
+    let engines = crate::engine::role_engines(config, &|key| match &config_home {
+        ConfigHome::Process => std::env::var(key).ok().filter(|value| !value.is_empty()),
+        ConfigHome::Isolated(home) => {
+            (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
+        }
     });
     let registered = match &engines {
         Some(path) => mllm_config::registration::EnginesFile::load(path)?.profiles,

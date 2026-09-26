@@ -5,11 +5,13 @@
 //!
 //! Fake installations, a scripted role socket and a scripted management API
 //! only. CPU tests; they are not qualification (SPEC §18).
+mod support;
+
 use mllm_agent::control_socket::{ControlHandler, ControlRequest, ControlServer, SOCKET_NAME};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -55,7 +57,7 @@ fn vllm_env(root: &Path) -> PathBuf {
 /// `mllm <args>` with a clean environment: `HOME` and the state directory
 /// under `root`, run from `cwd`, plus `extra`.
 fn mllm(root: &Path, cwd: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .args(args)
         .current_dir(cwd)

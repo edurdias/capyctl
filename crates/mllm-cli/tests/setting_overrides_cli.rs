@@ -13,7 +13,7 @@
 mod support;
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 
@@ -27,7 +27,7 @@ fn repo(path: &str) -> String {
 
 /// `mllm <args>` with no MLLM_* variable of the developer's environment.
 fn mllm(args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     for (key, _) in std::env::vars() {
         if key.starts_with("MLLM_") || key == "HF_ENDPOINT" {
             command.env_remove(key);

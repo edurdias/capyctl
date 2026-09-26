@@ -49,10 +49,11 @@ async fn standalone_refuses_to_boot_without_an_engine_installation() {
     std::env::remove_var("MLLM_VLLM_BIN");
     std::env::remove_var("MLLM_MODELS_ROOT");
 
-    let error = mllm_cli::roles::start_standalone(dir.path())
-        .await
-        .err()
-        .expect("a host with no engine must refuse to boot");
+    let error =
+        mllm_cli::roles::start_standalone_with_config_home(dir.path(), &dir.path().join(".config"))
+            .await
+            .err()
+            .expect("a host with no engine must refuse to boot");
 
     assert!(
         matches!(error, mllm_cli::roles::StartError::NoEngineInstallation(_)),
@@ -113,10 +114,11 @@ async fn standalone_refuses_a_document_stating_settings_it_does_not_honour() {
         "  tls:\n    mode: managed\n    identity_dir: /nowhere\n  listeners:\n",
     );
     std::fs::write(&path, text).unwrap();
-    let error = mllm_cli::roles::start_standalone(dir.path())
-        .await
-        .err()
-        .expect("an ignored setting must refuse the boot");
+    let error =
+        mllm_cli::roles::start_standalone_with_config_home(dir.path(), &dir.path().join(".config"))
+            .await
+            .err()
+            .expect("an ignored setting must refuse the boot");
     let said = error.to_string();
     assert!(said.contains("server.tls"), "{said}");
     assert!(

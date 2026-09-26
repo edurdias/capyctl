@@ -3,10 +3,9 @@ mod support;
 
 use mllm_config::effective::{Engine, ModelSource};
 use serde_json::Value;
-use std::process::Command;
 
 fn cli(state: &std::path::Path, args: &[&str]) -> Value {
-    let result = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let result = support::mllm()
         .env("MLLM_STATE_DIR", state)
         .args(args)
         .output()
@@ -20,7 +19,7 @@ fn cli(state: &std::path::Path, args: &[&str]) -> Value {
 }
 
 fn stdout(state: &std::path::Path, args: &[&str]) -> String {
-    let result = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let result = support::mllm()
         .env("MLLM_STATE_DIR", state)
         .args(args)
         .output()
@@ -135,7 +134,7 @@ async fn binary_deploys_starts_observes_and_stops_through_management() {
     record_views_print_tables_and_json_on_request(dir.path(), id);
     // T32, SPEC §6.3: a plain delete is refused while the engine runs, and
     // changes nothing.
-    let refused = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let refused = support::mllm()
         .env("MLLM_STATE_DIR", dir.path())
         .args(["delete", "deployment", id])
         .output()
@@ -214,7 +213,7 @@ fn delete_by_name_replays_and_frees_the_name(
         ],
     );
     assert_eq!(replay, receipt);
-    let gone = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let gone = support::mllm()
         .env("MLLM_STATE_DIR", state)
         .args(["status", "deployment", "cli-model"])
         .output()
@@ -263,7 +262,7 @@ fn delete_with_stop_stops_waits_and_deletes(state: &std::path::Path, id: &str) {
     assert_eq!(report["deployment_id"], id, "{report}");
     assert!(report["operation_id"].is_string(), "{report}");
     assert_eq!(cli(state, &args), report, "a rerun replays the receipt");
-    let gone = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let gone = support::mllm()
         .env("MLLM_STATE_DIR", state)
         .args(["status", "deployment", "cli-model"])
         .output()

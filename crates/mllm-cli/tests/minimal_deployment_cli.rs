@@ -10,12 +10,12 @@ mod support;
 
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn mllm(state: &Path, home: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .env("MLLM_STATE_DIR", state)
         .env("HOME", home)

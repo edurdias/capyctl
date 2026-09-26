@@ -6,6 +6,53 @@
 
 pub mod process;
 
+/// Final review I14: an isolated home for every `mllm` process a test spawns,
+/// one per test binary, owner-only, so a spawned role or client never reads
+/// the developer's `~/.config/mllm/engines.yaml`, host document or state.
+/// It lives in cargo's scratch directory for integration tests
+/// (`CARGO_TARGET_TMPDIR`), never in the developer's home; a test that
+/// starts a role states its own `MLLM_STATE_DIR` under an owner-only root.
+pub fn isolated_home() -> &'static std::path::Path {
+    use std::os::unix::fs::PermissionsExt;
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = tempfile::Builder::new()
+            .prefix("mllm-test-home-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("an isolated home");
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for dir in [".config", ".local/state", ".local/share", ".cache"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        home
+    })
+    .path()
+}
+
+/// Final review I14: `isolate(command)` points `HOME` and every XDG base
+/// directory of a spawned `mllm` at [`isolated_home`] and drops a role
+/// document named by the environment. A test that states its own `HOME` or
+/// `XDG_CONFIG_HOME` afterwards still wins, since later `env` calls replace
+/// these.
+pub fn isolate(command: &mut std::process::Command) -> &mut std::process::Command {
+    let home = isolated_home();
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env_remove("MLLM_CONFIG")
+}
+
+/// The `mllm` binary under test, isolated from the developer's home
+/// ([`isolate`]). Every test spawns the binary through this.
+pub fn mllm() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mllm"));
+    isolate(&mut command);
+    command
+}
+
 use std::sync::Arc;
 
 use axum::response::IntoResponse as _;

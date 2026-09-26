@@ -1,8 +1,9 @@
 //! Owner decision 2026-09-23: the startup memory budget in `validate config`.
 //! CPU-only; no engine runs here, and nothing here measures a startup peak.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -27,7 +28,7 @@ fn write(root: &Path, name: &str, value: &Value) -> PathBuf {
 }
 
 fn validate(args: &[&str]) -> (i32, Value, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .args(["validate", "config"])
         .args(args)
         .args(["--format", "json"])

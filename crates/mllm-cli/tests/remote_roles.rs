@@ -10,7 +10,7 @@ const REFUSAL_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 /// A role start that must refuse and exit, bounded by [`REFUSAL_BOUND`].
 fn refused_start(root: &Path, args: &[&str]) -> std::process::Output {
     output_within(
-        Command::new(env!("CARGO_BIN_EXE_mllm"))
+        support::mllm()
             .args(args)
             .env("MLLM_STATE_DIR", root)
             .env_remove("MLLM_VLLM_BIN")
@@ -24,7 +24,7 @@ fn root() -> tempfile::TempDir {
     dir
 }
 fn cli(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_mllm"))
+    support::mllm()
         .args(args)
         .env("MLLM_STATE_DIR", root)
         .env_remove("MLLM_VLLM_BIN")
@@ -191,7 +191,7 @@ fn join_reads_a_relative_invitation_from_the_working_directory() {
     let invitation = temp.path().join("host.join");
     fs::write(&invitation, b"not an invitation").unwrap();
     fs::set_permissions(&invitation, fs::Permissions::from_mode(0o600)).unwrap();
-    let joined = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let joined = support::mllm()
         .current_dir(temp.path())
         .args([
             "join",
@@ -241,7 +241,7 @@ fn concurrent_initialization_has_one_winner_and_preserves_identity() {
     let state = temp.path().join("state");
     let output = temp.path().join("server.yaml");
     let start = || {
-        Command::new(env!("CARGO_BIN_EXE_mllm"))
+        support::mllm()
             .args(["init", "server", "--output", output.to_str().unwrap()])
             .env("MLLM_STATE_DIR", &state)
             .stdout(std::process::Stdio::null())
@@ -290,7 +290,7 @@ struct Service(Guarded);
 impl Service {
     fn start(root: &Path, role: &str, config: &Path) -> Self {
         Self(Guarded::spawn(
-            Command::new(env!("CARGO_BIN_EXE_mllm"))
+            support::mllm()
                 .args(["start", role, "--config", config.to_str().unwrap()])
                 .env("MLLM_STATE_DIR", root)
                 .env_remove("MLLM_VLLM_BIN")
@@ -394,7 +394,7 @@ fn product_enrolls_unprepared_host_and_reconnects_without_identity_change() {
     // W12 (U5 live): an operator joins from the directory holding the
     // invitation, so `--join-file` is a bare relative name.
     assert!(invitation.parent() == Some(temp.path()));
-    let joined = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let joined = support::mllm()
         .current_dir(temp.path())
         .args([
             "join",

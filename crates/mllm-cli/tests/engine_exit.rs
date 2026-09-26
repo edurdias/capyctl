@@ -272,7 +272,7 @@ impl Installation {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+        let mut command = support::mllm();
         command
             .env("MLLM_STATE_DIR", self.state())
             .env("MLLM_VLLM_BIN", self.root.path().join("engine/vllm"))
@@ -673,7 +673,7 @@ impl Drop for TwoRoles {
 }
 
 fn command(state: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+    let mut command = support::mllm();
     command
         .env("MLLM_STATE_DIR", state)
         .env_remove("MLLM_VLLM_BIN")

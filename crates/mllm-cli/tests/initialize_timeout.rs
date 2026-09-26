@@ -2,8 +2,9 @@
 //! in `validate config`, and the per-command `--initialize-timeout` override.
 //! CPU-only; no engine runs here.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use mllm_cli::grammar::{parse_invocation, Command as Cli, LifecycleAction};
 use serde_json::{json, Value};
@@ -29,7 +30,7 @@ fn write(root: &Path, name: &str, value: &Value) -> PathBuf {
 }
 
 fn validate(args: &[&str]) -> (i32, Value, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .args(["validate", "config"])
         .args(args)
         .args(["--format", "json"])

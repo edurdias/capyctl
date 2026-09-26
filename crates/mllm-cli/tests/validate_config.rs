@@ -3,8 +3,9 @@
 //! and resolution the product uses, reporting named errors and performing no
 //! side effects.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -34,7 +35,7 @@ fn write(root: &Path, name: &str, text: &str) -> PathBuf {
 }
 
 fn validate(args: &[&str]) -> (i32, Value, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .arg("validate")
         .arg("config")
         .args(args)

@@ -7,7 +7,6 @@ mod support;
 use mllm_cli::grammar::{parse_invocation, Command, LifecycleAction};
 use mllm_config::effective::{Engine, ModelSource};
 use serde_json::Value;
-use std::process::Command as Process;
 
 // T10: the flag parses on both start forms, defaults off, and is refused
 // anywhere else; help names it.
@@ -52,7 +51,7 @@ fn evict_is_a_start_flag_only() {
 }
 
 fn cli(state: &std::path::Path, args: &[&str]) -> Value {
-    let result = Process::new(env!("CARGO_BIN_EXE_mllm"))
+    let result = support::mllm()
         .env("MLLM_STATE_DIR", state)
         .args(args)
         .output()
@@ -135,7 +134,7 @@ async fn start_evict_reports_victims_and_replays_by_request_id() {
         "{journaled}"
     );
     // A different intent under the same request id is refused.
-    let reused = Process::new(env!("CARGO_BIN_EXE_mllm"))
+    let reused = support::mllm()
         .env("MLLM_STATE_DIR", dir.path())
         .args(["start", "deployment", &id, "--request-id", &request])
         .output()
