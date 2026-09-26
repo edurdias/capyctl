@@ -118,3 +118,27 @@ still parses every remote script with `bash -n`. `run_row.sh … --dry-run` writ
 - The remote login shell must be bash, because `rsh` sends `bash -lc $'…'`.
 - `MATRIX_LOCAL_RSH=1` with `MLLM_REMOTE_HOME=<scratch>` runs the "remote" scripts on this
   machine against fake venvs and models. It exists only to rehearse the harness.
+
+## Discrete-GPU rows (DG1-DG7)
+
+`discrete_gpu.sh` runs on the discrete-GPU machine itself, against a standalone role of the
+binary under test (`target/release/mllm` unless `MLLM_BIN` names another). It reads only the
+`DGPU_*` values of `hosts.local.env` and keeps its state in `DGPU_STATE` (default
+`~/mllm-dgpu-live`, whose ancestors must be owner-only) and its evidence in
+`target/live/dgpu/`.
+
+```bash
+M=scripts/live/matrix
+$M/discrete_gpu.sh prepare   # mllm engine add for both environments (idempotent)
+$M/discrete_gpu.sh dg1       # vLLM host_backed: A cold, B (A released), A, B, then A parked and woken
+$M/discrete_gpu.sh dg2       # the same with residency deep
+$M/discrete_gpu.sh dg3       # SGLang, both tiers
+$M/discrete_gpu.sh dg4       # A on vLLM, B on SGLang
+$M/discrete_gpu.sh dg5       # a derived request larger than the card: exit 4, insufficient_device_memory
+$M/discrete_gpu.sh dg6       # the key on DGPU_LISTEN_ADDR, loopback narrowing, upgrade from DGPU_PREVIOUS_BIN
+```
+
+The inference listener is loopback or `DGPU_LISTEN_ADDR`, always with the API key; the harness
+never serves without the key beyond loopback. SGLang deployments name the Triton attention
+backend in their `extra_args` (an SGLang profile carries no host-fixed arguments). On exit the
+trap deletes the deployments the run created (with verified cleanup) and stops its role.

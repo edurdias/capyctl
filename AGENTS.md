@@ -82,6 +82,11 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   control-plane server on the control host. Their real names and addresses live
   only in the untracked `scripts/live/matrix/hosts.local.env` (see
   `hosts.example.env`). Owner authorized host B on 2026-09-19.
+- Live work is also authorized on the maintainers' local machines, a discrete-GPU
+  laptop included. On a local machine: no driver, CUDA or system-package changes,
+  and engine virtual environments only in the home directory. The lab-host rules
+  above (no new environments beyond the listed exceptions) still apply to the lab
+  hosts.
 - Do not change engine environments, drivers, or reboot hosts. The only owner
   exceptions are the existing SGLang 0.5.20 venv on both hosts and the mirrored
   vLLM 0.29 venv on host B; do not create or modify others.

@@ -4,6 +4,84 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
+## Discrete GPU live rows DG1–DG7 — 2026-09-26 (branch `feat/discrete-gpu-network`)
+
+Live on the 16 GB discrete-GPU laptop host (one 16 GB card, 61 GiB of RAM of
+which other programs held about 30 GiB throughout), standalone role of the
+branch's release build, vLLM 0.29.0 and SGLang 0.5.20 registered with
+`mllm engine add`, models Qwen3-4B-Instruct (A, 8.04 GB of weights) and
+Qwen2.5-1.5B-Instruct (B, 3.09 GB), minimal deployment files (name, engine,
+model; residency set per row). Harness `scripts/live/matrix/discrete_gpu.sh`;
+evidence in `target/live/dgpu/` on that host (untracked). Commits `ba70c21..`
+the commit that records this section (fixes `12719ba`, `f9dd21f`, `aaa0382`,
+`1d67977`, `d935dc7`, `d50444b`). Core suite 1104 passed, 0 failed; config,
+scheduler, agent, domain and protocol 639 / 0; CLI 304 / 0; clippy clean. CPU and Fake-engine
+tests are not qualification; these rows are. The multi-GPU picker has no live
+evidence in the repository (one GPU here). The unified-host behaviour is not
+testable on this host and was not rerun; the GB10 regression row is pending.
+
+| Row | Result |
+|---|---|
+| DG1 vLLM `host_backed` | Pass with a host-RAM caveat. A cold 45 s (card 13.2 GiB used). Park 5.4 s: card 13 281 → 1 009 MiB, A's process 868 MiB; A's host memory 1.9 → 12.2 GiB (the pinned copy, 11.1 GB = 1.38 × the weights). Wake 1.4 s (request included), same process. B parked: 778 MiB on the card, 4.1 GB pinned; B's wake 0.8 s. In an A↔B switch A parks, then B's start reclaims (stops) it: with the RAM other programs hold, A's copy plus B's charge does not fit above the 20 % system reserve, so each switch is a cold start (72–78 s). No stall. |
+| DG2 vLLM `deep` | Pass. A and B switch both ways reusing their processes: A's wake 11.5–14.6 s, B's 7.4 s, A's park 0.6 s; residues 868 / 778 MiB. |
+| DG3 SGLang, both tiers | Serves A (66 s cold) and B. Every park is refused before any effect (`park_refused`, "the engine is not quiescent"): the saver binding refuses the SGLang environment's `torch_memory_saver` library (`unsafe_library`), because the environment's files are group-writable and this host's account database (`sss`) cannot prove the group private. The switch then stops the victim (cold switches 26–38 s). Environment, not product: needs `chmod -R g-w` on that environment by the owner (not done; engine environments are not changed). |
+| DG4 vLLM A, SGLang B | Pass for switching both ways (A parked then reclaimed, B's park refused as in DG3, so stopped). A's explicit park 5.3 s, wake 1.4 s. |
+| DG5 refusal | Pass after a fix: A with a 12 GiB KV cache derives a 21.7 GB request against 15.8 GB managed; `deploy` accepts it provisionally (exit 0, digest measured after), `start --wait` exits 4 `insufficient_device_memory` 0.6 s after the deploy; no engine started. |
+| DG6 network | Key: on this machine's tailnet address `/v1/models` is 200 with the key, 401 without or with a wrong one; bound there, loopback is refused; bound to loopback, the tailnet address is refused. A keyless run beyond loopback was not made (owner rule for this host). Not tested from another machine. `config show` lists each setting with its source (`default`, `yaml`, `set`). Upgrade from 0.1.0-rc.4: the notice appears once, the document holds `0.0.0.0:8443`, `standalone.yaml.pre-0.1.0` sits beside it. **Blocker:** the upgraded standalone then refuses to start (`resource policy revision conflict`, exit 1 `internal`): rc.4 stored a unified policy for this machine and this build derives `system` + `gpu0`; see "Owner attention". |
+| DG7 remote host | Not run (optional for 0.1.0); pending. |
+| Extra | `restart_only`: every release is a stop, every return a cold start. GPU pin: the engine is started with `CUDA_VISIBLE_DEVICES` set to the card's UUID. vLLM serves A with a fitted context of 26 752 tokens after the context fix. |
+
+Measured, to replace the placeholders: parked device residue 868 MiB (4B) and
+778 MiB (1.5B) for vLLM against the 1 GiB placeholder; engine host memory
+(anonymous plus shared) 1.8–1.9 GiB for vLLM and 2.0 GiB for SGLang when ready,
+against the 4 GiB placeholder; vLLM's pinned `host_backed` copy 1.37 × the
+weights, kept after the wake; vLLM's own process holds 13.2 GiB of the card
+against a 12.0 GiB reservation (weights, 3.7 GiB of KV cache and about 1.5 GiB of
+CUDA graphs and context).
+
+Product fixes found live (each with a CPU regression test; "live" means the
+row above exercised the fix):
+
+- vLLM refused a fitted context by one block (its null block): the fit leaves
+  one block to vLLM (live).
+- A park was charged its whole parking footprint against free memory, so a
+  `host_backed` park on a small card was held until its deadline; a park or
+  wake is now charged only what it adds beyond the owner's own charge on
+  `device` and `distinct` domains, and a domain it adds nothing to is not
+  judged on free memory (live).
+- A settled parked owner is credited on `device` and `distinct` domains (its
+  residue and its copy are in use); `unified` unchanged (live). Reclaiming such
+  an owner in a forecast removes its floors with it (CPU).
+- A switch park host memory cannot take is refused `parked_capacity` so the
+  switch stops the victim, instead of holding the request for 10 minutes (live).
+- The `host_backed` copy is charged at 1.5 × the weights in every phase for both
+  engines, and the process sample counts shared resident memory, where the
+  pinned copy lives (live measurements; ADR 0019 and the operator guide
+  amended).
+- Admission sampled GPU processes from a cache that was always past its age
+  bound, so it credited nothing; each observation takes a fresh sample (live).
+- A failed on-demand activation left every later request answered 409
+  `idempotency key identifies a different command`; the key names the latest
+  operation (CPU; found live).
+- A derived request larger than the card answered `checkpoint_mismatch` (exit 2);
+  it is `insufficient_device_memory` (exit 4) (live).
+
+Open, not fixed here:
+
+- The switch planner decides park or stop from the ledger only. On a host
+  whose other programs hold much of the RAM, host RAM refuses a planned park or
+  start at arm; it no longer stalls (refused or reclaimed), but `host_backed`
+  switching on this host always ends in a reclaim and a cold start.
+- `status deployment` shows the host's first registered installation, not the
+  deployment's (a vLLM deployment showed SGLang 0.5.20).
+- A request that arrives while the checkpoint digest is measured is answered 429
+  "no room could be made ... after 3 switch round(s)".
+- An SGLang profile takes no host-fixed arguments, so the Triton attention
+  backend goes in each SGLang deployment's `extra_args` (`engine add --arg`
+  is refused for SGLang).
+- A switch park refused for host RAM is reported `released: stopped`, not
+  `stopped (host RAM full)`.
+
 ## Single-box benchmark through mllm — 2026-09-25 (branch `test/model-benchmark`)
 
 Owner-approved experiment: five models, 256 in / 256 out, one user, vLLM 0.29.0
@@ -2699,6 +2777,17 @@ requires its own recipe and evidence under SPEC §11.
    milestones section above.
 
 ## Owner attention
+
+- **Upgrade of a standalone on a discrete-GPU machine (blocker, found
+  2026-09-26).** A 0.1.0-rc.4 standalone state on such a machine stored a
+  unified resource policy; this branch derives `system` + `gpu0` for the same
+  machine, and the start refuses the changed policy context
+  (`resource policy revision conflict`). Decide: keep an existing unified
+  policy until the operator resets it, migrate it when nothing is charged, or
+  refuse with a clear message and a reset procedure.
+- **SGLang parking on the discrete-GPU laptop host** needs its SGLang
+  environment's files made non-group-writable (`chmod -R g-w`), an engine
+  environment change left to the owner.
 
 Two items from S1, 2026-09-18. `crates/mllm-cli/tests/live_interactive.rs`
 (the owner's, excluded from agent edits) uses `ParkPolicy::ExperimentalAllowed`,
