@@ -19,7 +19,8 @@ Read these in order when orienting. Lower entries never override higher ones.
 2. `docs/design/adr/` — architecture decision records. ADR 0012 onward records
    owner decisions made after the F2 design (deep parking default-on, instances and
    placement, engine configuration, per-instance lifecycle, revoked-host recovery,
-   version skew).
+   version skew, engine registration, and ADR 0019 for discrete GPUs and the network
+   inference endpoint).
 3. `docs/design/milestones/f2-sglang-design.md` — approved F2 design.
 4. `docs/plans/` — per-slice implementation plans. Feature design notes written
    ahead of their plans live in `docs/specs/`.
