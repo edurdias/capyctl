@@ -471,6 +471,33 @@ fn every_documented_example_passes_validate_config() {
     );
 }
 
+// T03 T26 (ADR 0019): the discrete-GPU host example validates, and the
+// minimal deployment resolves on it to a budget charging both the GPU's
+// device domain and the system domain.
+#[test]
+fn the_discrete_host_example_validates() {
+    let host = examples().join("host-discrete.yaml");
+    let (code, value, raw) = validate(&["--file", host.to_str().unwrap()]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["valid"], true, "{raw}");
+    assert_eq!(value["kind"], "host", "{raw}");
+    let minimal = examples().join("deployment-minimal.yaml");
+    let (code, value, raw) = validate(&[
+        "--file",
+        minimal.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    let domains: Vec<&str> = value["effective"]["resources"]["ready"]["allocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(domains, ["gpu0", "system"], "{raw}");
+}
+
 // T03 (ADR 0013 §2, §3): resolving against a host runs the server's per-host
 // step: unnamed device claims take the host's devices, and a host outside the
 // allowed set is refused.

@@ -17,7 +17,9 @@ GitHub pre-releases; expect breaking changes before 0.1.0.
 
 What works in the release candidates:
 
-- vLLM and SGLang engines, one GPU per model.
+- vLLM and SGLang engines, one GPU per model, on unified-memory machines
+  (GB10) and on discrete NVIDIA cards, where mllm accounts the card's memory
+  separately and picks the GPU on a multi-GPU machine.
 - One machine (standalone) or a server with several GPU hosts.
 - Parking, waking and switching models under a memory budget.
 - An OpenAI-compatible API (`/v1/models`, `/v1/chat/completions`), with
@@ -67,7 +69,7 @@ setting works those three ways (see
 
 ```bash
 export MLLM_VLLM_BIN=/path/to/venv/bin/vllm   # or MLLM_SGLANG_BIN
-mllm start standalone                          # inference on 127.0.0.1:8443
+mllm start standalone                          # inference on 0.0.0.0:8443, key required
 ```
 
 The first start writes its role document and credentials under
@@ -135,6 +137,11 @@ curl http://127.0.0.1:8443/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"model": "<route>", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+From another machine, use this machine's name or Tailscale address instead
+of `127.0.0.1`. To keep inference on this machine only, start with
+`--listen 127.0.0.1:8443`; to narrow it to a tailnet or put it behind a TLS
+proxy, see [`docs/operations/network-access.md`](docs/operations/network-access.md).
 
 `mllm stop deployment <name>` stops the model and releases its memory;
 `mllm start deployment <name>` brings it back. `mllm delete deployment <name> --stop`

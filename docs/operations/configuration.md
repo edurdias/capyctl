@@ -58,6 +58,13 @@ standalone role's credentials under the state root, so they need the same
 | Standalone management address | `server.listeners.management.bind` | `--management-listen <addr:port>` | `MLLM_MANAGEMENT_ADDR` (`MLLM_STANDALONE_MANAGEMENT_ADDR` still read, with a warning) | `127.0.0.1:7443` | standalone and its client commands |
 | Server management, bootstrap and control listeners | `listeners.management`, `listeners.bootstrap`, `listeners.control` | (none) | (none) | `127.0.0.1:7443`, `:7444`, `:7445` | server |
 
+The inference listener serves every interface by default and requires the
+API key; [network access](network-access.md) covers narrowing it, the key,
+turning the key off (a warning is printed on a non-loopback address) and a TLS
+reverse proxy. A server or standalone document that still states the old
+default `127.0.0.1:8443` is updated once on the first start of 0.1.0
+([install](install.md#upgrading-to-010)).
+
 The standalone management address stays on loopback in every form (any port).
 Client commands (`mllm status`, `mllm deploy`, ...) find it from
 `MLLM_MANAGEMENT_ADDR`, else from `server.listeners.management.bind` in the
@@ -129,7 +136,7 @@ mllm writes or reads, or environment variables.
 
 | Secret | File | Variable | Notes |
 |---|---|---|---|
-| Inference API key and management admin token | `<state dir>/identity/credentials` (owner-only), generated on first start | (none) | Generated, never typed; read the file to use them. |
+| Inference API key and management admin token | standalone: `<state root>/identity/credentials` (owner-only, `api_key:` and `admin_token:` lines), generated on first start; server: `<identity_dir>/server-credentials.json` (owner-only JSON), created by `init server` | (none) | Generated, never typed or printed; read the file to use them ([network access](network-access.md#default)). |
 | Server enrollment and host identity | `identity_dir` (`<state dir>/identity`) | (none) | Created by `init server` and `join host`. |
 | Per-launch engine keys | written by mllm for each launch | (none) | Never an operator setting. |
 | Hugging Face token for a source that names none | `model_sources.huggingface_token_file` (absolute path to an owner-only file) | `MLLM_HF_TOKEN`, else `HF_TOKEN` | The variable wins over the file. The host that downloads reads it; `deploy model` also uses the variable to pin a private repository. |

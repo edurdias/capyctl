@@ -106,7 +106,8 @@ are defined in `crates/mllm-cli/src/output.rs`.
 |---|---|---|---|
 | 2 | Invalid configuration | all | Fix the role document (`mllm validate config`). |
 | 3 | Unauthorized | all | Fix the identity or credentials. |
-| 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`) | all | The newer binary or a restored backup (see "State and migrations"). |
+| 4 | Insufficient resources, including a GPU that cannot hold the deployment (`insufficient_device_memory`) or has no fresh reading (`device_unobserved`) | none: a CLI command's exit | Free memory, use a smaller or quantized checkpoint, or wait for the GPU to be observed. |
+| 5 | Unsupported, including state written by a newer mllm (`store_from_newer_version`), and on GPUs `unsupported_gpu_topology`, `multi_gpu_unsupported` and `host_backed_unavailable` | all | The newer binary or a restored backup (see "State and migrations"); for the GPU codes, see "Discrete NVIDIA GPUs". |
 | 14 | The controller revoked this host (`host_revoked`) | host | Recovery under the same identity (below). |
 | 15 | No allowed host is eligible for placement (`host_ineligible`) | none: a CLI command's exit (`start`), never a role's, so no unit lists it | Upgrade, undrain, reconnect or re-enroll the host the message names, then start again. |
 | 16 | The path holds no `vllm` or `sglang` package (`engine_not_found`) | none: `mllm engine` exits, never a role's | Name the venv, its `bin/vllm` or its `bin/python3`, or scan more with `mllm engine detect --path DIR`. |
@@ -500,6 +501,111 @@ User units carry no file-system sandboxing: `ProtectSystem=` and similar need
 privileges the per-user manager lacks (systemd.exec(5)). Prefer the system
 units on shared machines.
 
+## Discrete NVIDIA GPUs
+
+mllm runs on machines whose GPU has its own memory (a GeForce, RTX or data
+center card) as well as on unified-memory machines such as the GB10, where the
+GPU and the CPU share one pool. The rules are in
+[ADR 0019](../design/adr/0019-discrete-gpu-and-network-endpoint.md).
+
+**Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
+(or `/bin/nvidia-smi`), which every driver package installs. mllm runs it with
+a cleared environment and a 3 s bound to read each GPU's index, UUID, PCI
+address and memory; it needs no other library. A machine that mixes an
+integrated and a discrete GPU is refused at start (`unsupported_gpu_topology`,
+exit 5).
+
+**What standalone detects.** At start, standalone reads `nvidia-smi`. A GPU
+that reports no memory of its own is integrated, and the machine keeps the
+single `unified` domain. Otherwise it publishes two kinds of memory domain:
+
+| Domain | Memory | Managed limit | Free reserve | Parked limit |
+|---|---|---|---|---|
+| `system` (`memory: distinct`) | host RAM | 50 % of RAM | 20 % of RAM | 25 % of RAM (host-KV 10 %) |
+| `gpuN` (`memory: device`), one per GPU | the card | total − reserve | the larger of 1 GiB and 8 % of the card | the smaller of 8 GiB and 25 % of the card |
+
+The reserve on the card leaves room for a desktop session on a workstation
+GPU. Memory other programs already hold on the card lowers what mllm sees as
+available; it is never hidden. An enrolled host states the same shape in its
+document ([`examples/host-discrete.yaml`](../examples/host-discrete.yaml)), and
+the host refuses to start if a `device` domain does not match the GPU it
+observes (`device_policy_mismatch`, exit 2).
+
+**Both domains are charged.** Every deployment on a discrete GPU is charged on
+the card (weights, KV cache, the engine's CUDA memory) and in host RAM (the
+engine process itself, 4 GiB until measured). A deployment that states no
+memory is sized from its checkpoint: `weights × 1.10` plus a KV cache of
+`min(4 GiB, 25 % of the card's managed limit)`. A vLLM deployment asks for at
+least 75 % of the card, because vLLM 0.29 with CUDA graphs does not start a 4B
+model on a 16 GB card below `--gpu-memory-utilization 0.75`; for the same
+reason, a standalone start with a vLLM installation fails at boot on a card
+with less than about 4 GiB. A deployment that lists `resources:` itself must
+name the `system` domain as well as the GPU's (`missing_system_allocation`
+otherwise); leaving them out and letting mllm derive them is the portable form.
+
+**One GPU per model; mllm picks it.** On a machine with several GPUs, each GPU
+is its own domain. mllm places a new instance on the GPU where it fits with the
+most room, and when none has room it parks or stops models on the GPU where the
+fewest need to go. A stopped instance returns to its last GPU when it fits
+there. To pin a GPU, name it in the deployment:
+
+```yaml
+devices: [{id: gpu1, sharing: shared}]
+```
+
+`gpuN` is the driver's index at start (`nvidia-smi -L`). The engine is started
+with only that GPU visible: `CUDA_VISIBLE_DEVICES` set to the GPU's UUID, or to
+its index with `CUDA_DEVICE_ORDER=PCI_BUS_ID` when no UUID is known. A
+deployment that names two GPUs, or asks for tensor parallelism, is refused
+(`multi_gpu_unsupported`, exit 5): one GPU per model in 0.1.0. An instance
+started through a path that does not place it runs on the lowest-index GPU.
+
+**Residency tiers.** A deployment parks in one of three ways (its
+`residency`):
+
+| Tier | Park | Wake | Host RAM while parked |
+|---|---|---|---|
+| `host_backed` | the weights are copied to pinned host RAM | copied back to the card | the weights copy |
+| `deep` | the weights are dropped | reloaded from disk | the engine process only |
+| `restart_only` | never parks: the engine is stopped | a cold start | none |
+
+`host_backed` is the default on a discrete GPU, because a wake from host RAM is
+several times faster than a reload from disk. mllm chooses it when the copy
+plus the engine process fits the `system` domain's parked limit, and `deep`
+otherwise (also while a downloaded model's size is not known yet);
+`restart_only` when the engine's deep parking is off. The copy is charged in
+host RAM: SGLang keeps it for the engine's whole life, vLLM only while the
+model is parked. When a model must make room and its copy no longer fits in
+host RAM, it is stopped rather than parked, and the switch record says
+`released: stopped (host RAM full)`. An engine build without parking support
+refuses a `host_backed` or `deep` launch with `capability_missing:deep_park`,
+and so does an SGLang ModelOpt (NVFP4) checkpoint: its wake is not proven yet,
+so choose `restart_only` for it. On a unified machine `host_backed` is refused
+(`host_backed_unavailable`, exit 5): the copy would come out of the same
+memory it is supposed to free.
+
+**`insufficient_device_memory`** (exit 4) means the GPU cannot hold the
+deployment's card allocation plus its reserve: at deploy, when the size mllm
+derived from the checkpoint is larger than the card's managed limit, or at
+launch, when the card has less free memory than the allocation needs (another
+program may be holding it). Use a smaller or quantized checkpoint, a smaller KV
+cache, or free the card. **`device_unobserved`** (exit 4) means `nvidia-smi`
+gave no fresh reading for that GPU; nothing new starts on it until it does, and
+running models keep their accounting.
+
+An enrolled host with a discrete GPU needs this release on both the server
+and the host. The host declares the capability `device_memory_domains`; the
+server never places a deployment charged on a GPU's domain on a host that does
+not, and reports `host_capability_missing:device_memory_domains` instead.
+Unified-memory hosts need nothing new.
+
+## Network access
+
+The inference endpoint listens on `0.0.0.0:8443` and requires the API key.
+[Network access](network-access.md) shows where the key is, how to narrow the
+address to loopback or a Tailscale address, how to turn the key off (and why
+not to), and how to put a TLS reverse proxy in front for the internet.
+
 ## Command output
 
 Commands that read records print an aligned table by default, whether or not
@@ -713,6 +819,47 @@ After a restart, check that each deployment is back to its prior state
 (`mllm status deployment <id>`). If one is not, read its status reason before
 acting on it.
 
+### Upgrading to 0.1.0
+
+The inference endpoint now listens on all interfaces, `0.0.0.0:8443`, and
+still requires the API key. At the first start of 0.1.0, a server or
+standalone document whose inference bind is exactly `127.0.0.1:8443` (the
+default earlier releases generated) is updated once to `0.0.0.0:8443`. The
+original is kept beside it as `<file>.pre-0.1.0`, with the same mode, and the
+start prints:
+
+```
+NOTICE: mllm 0.1.0 serves inference on all interfaces: 0.0.0.0:8443 (was 127.0.0.1:8443).
+The API key is still required. Configuration updated: <path> (previous copy: <path>.pre-0.1.0).
+To keep inference local, start with --listen 127.0.0.1:8443 or set listeners.inference.bind.
+```
+
+The marker `<state dir>/migrations/inference-bind-v1` records that this ran, so
+it never runs again; any other address, and the authentication setting, are
+never touched. A document the role cannot rewrite (a read-only `/etc/mllm`,
+for example, or one where the address appears more than once) is left
+unchanged; the role serves on `0.0.0.0:8443` for that run only and prints
+`config_migration_failed` with the line to edit. Later starts follow the
+document again, so edit it: the system units mount `/etc` read-only, so a
+server whose document is `/etc/mllm/server.yaml` takes this path.
+
+To narrow the address again, pick one:
+
+- keep inference on the machine: `--listen 127.0.0.1:8443`, or
+  `MLLM_INFERENCE_ADDR=127.0.0.1:8443` in the unit's `.env` file, or
+  `listeners.inference.bind: "127.0.0.1:8443"` in the document (under
+  `server:` in standalone);
+- limit it to your tailnet: the same, with the machine's Tailscale address
+  (`tailscale ip -4`).
+
+See [Network access](network-access.md) for the client key and a TLS reverse
+proxy. Two other defaults changed in 0.1.0 for every host and standalone:
+Hugging Face and HTTP model downloads are allowed (500 GiB cap, see "Models and
+downloads"), and relative model paths resolve under `~/models` unless the
+document or `MLLM_MODELS_ROOT` names a models directory. On a discrete GPU,
+deployments that state no residency now default to `host_backed` (see
+"Discrete NVIDIA GPUs").
+
 ## Rollback
 
 ```bash
@@ -750,5 +897,6 @@ know. So:
   requires re-enrollment, not a copied directory.
 
 Role documents under `/etc/mllm` are operator configuration; mllm never
-rewrites them (SPEC §15.1). Validate them with the new binary
-(`mllm validate config`) before restarting.
+rewrites them (SPEC §15.1), with one exception: the one-time inference
+listener update of 0.1.0 described in "Upgrading to 0.1.0". Validate them with
+the new binary (`mllm validate config`) before restarting.
