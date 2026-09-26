@@ -104,6 +104,38 @@ class EnrollmentTests(unittest.TestCase):
         self.assertEqual(released["observation"]["allocations"]["mapped_bytes"], 0)
         self.assertEqual(released["observation"]["allocations"]["virtual_bytes"], 28672)
 
+    # T22 / ADR 0019: a host_backed launch's scope carries its declared
+    # `cpu_backup` restore, so its weights backup is observed; the same saver
+    # under a scope that declared a disk reload is never observed.
+    def test_scope_carries_the_declared_weight_restore(self):
+        from test_sglang_saver_residency import ServerArgs, host_backed_pools
+        self.fakes.impl._mem_pools = host_backed_pools()
+        self.fakes.scheduler.server_args = ServerArgs(enable_weights_cpu_backup=True)
+        self.assertTrue(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION,
+                                                     "cpu_backup"))
+        self.assertEqual(os.environ[enrollment.ENV_RESTORE], "cpu_backup")
+        self.assertTrue(enrollment.enroll(self.fakes.scheduler))
+        observed = self.ask()
+        self.assertEqual(observed["status"], "observed")
+        self.assertEqual(observed["observation"]["allocations"]["mapped_bytes"], 20480)
+
+    def test_a_disk_reload_scope_refuses_a_weights_backup(self):
+        from test_sglang_saver_residency import ServerArgs, host_backed_pools
+        self.fakes.impl._mem_pools = host_backed_pools()
+        self.fakes.scheduler.server_args = ServerArgs(enable_weights_cpu_backup=True)
+        self.scope()
+        self.assertEqual(os.environ[enrollment.ENV_RESTORE], "disk_reload")
+        self.assertTrue(enrollment.enroll(self.fakes.scheduler))
+        self.assertNotEqual((self.ask() or {}).get("status"), "observed")
+
+    def test_an_unknown_weight_restore_publishes_no_scope(self):
+        self.assertFalse(enrollment.entry_environment(self.directory.name, BINDING, INCARNATION,
+                                                      "cpu"))
+        self.assertNotIn(enrollment.ENV_SCOPE, os.environ)
+        os.environ[enrollment.ENV_DIR] = self.directory.name
+        os.environ[enrollment.ENV_SCOPE] = BINDING + ":" + INCARNATION
+        self.assertIsNone(enrollment._scope(), "a scope without its restore is no scope")
+
     # T20: a request without the launch's key proof, or in the enrolled-peer
     # protocol, gets no answer at all.
     def test_requests_without_the_launch_key_are_denied(self):
@@ -150,9 +182,10 @@ class EnrollmentTests(unittest.TestCase):
 
     def test_entry_hands_launch_server_the_target_only_for_an_enrollable_launch(self):
         class Spec:
-            def __init__(self, saver):
+            def __init__(self, saver, restore="disk_reload"):
                 self._public_json = json.dumps(dict(binding_id=BINDING, incarnation=INCARNATION,
-                                                    settings=dict(memory_saver=saver)))
+                                                    settings=dict(memory_saver=saver,
+                                                                  weight_restore=restore)))
 
         class Launch:
             def launch_server(self, server_args, run_scheduler_process_func=None):
@@ -166,11 +199,17 @@ class EnrollmentTests(unittest.TestCase):
         self.assertIs(entry._observation_target(Spec(True), Launch()),
                       enrollment.run_enrolled_scheduler)
         self.assertEqual(os.environ[enrollment.ENV_SCOPE], BINDING + ":" + INCARNATION)
+        self.assertEqual(os.environ[enrollment.ENV_RESTORE], "disk_reload")
+        os.environ[enrollment.ENV_DIR] = self.directory.name
+        self.assertIs(entry._observation_target(Spec(True, "cpu_backup"), Launch()),
+                      enrollment.run_enrolled_scheduler)
+        self.assertEqual(os.environ[enrollment.ENV_RESTORE], "cpu_backup")
         for spec, launch in ((Spec(False), Launch()), (Spec(True), OldLaunch())):
             os.environ[enrollment.ENV_DIR] = self.directory.name
             self.assertIsNone(entry._observation_target(spec, launch))
             self.assertNotIn(enrollment.ENV_SCOPE, os.environ)
             self.assertNotIn(enrollment.ENV_DIR, os.environ)
+            self.assertNotIn(enrollment.ENV_RESTORE, os.environ)
 
 
 if __name__ == "__main__":

@@ -74,7 +74,19 @@ fn command(action: RuntimeAction, step: &str) -> RuntimeCommand {
     }
 }
 
-fn frozen(endpoint: String) -> NativeLaunch {
+/// ADR 0010, discrete GPU design §5: the settings a `host_backed` deployment
+/// renders (the memory saver with its weights CPU backup).
+fn host_backed_settings() -> mllm_domain::launch::SglangLaunchSettings {
+    let mut settings = mllm_testkit::sglang_launch_settings();
+    settings.cpu_weight_backup = true;
+    settings.weight_restore = "cpu_backup".into();
+    settings
+}
+
+fn frozen_with(
+    endpoint: String,
+    settings: mllm_domain::launch::SglangLaunchSettings,
+) -> NativeLaunch {
     NativeLaunch::from_frozen_store(
         NativeLaunchMetadata {
             binding_id: BINDING.into(),
@@ -99,15 +111,23 @@ fn frozen(endpoint: String) -> NativeLaunch {
         "/opt/sglang/python".into(),
         "inference-ref".into(),
         "admin-ref".into(),
-        mllm_testkit::sglang_launch_settings(),
+        settings,
     )
 }
 
-struct Observer(Mutex<SglangRuntimeObservation>);
+/// The snapshot, and whether the next observation is a step's precondition
+/// after which the weights read as usable (the host observer's step content
+/// for a reload: weights unproven before, usable after).
+struct Observer(Mutex<SglangRuntimeObservation>, Mutex<bool>);
 #[async_trait]
 impl SglangRuntimeObserver for Observer {
     async fn observe(&self) -> Result<SglangRuntimeObservation, RuntimeError> {
-        Ok(self.0.lock().unwrap().clone())
+        let mut snapshot = self.0.lock().unwrap();
+        let observed = snapshot.clone();
+        if std::mem::take(&mut *self.1.lock().unwrap()) {
+            snapshot.weights = true;
+        }
+        Ok(observed)
     }
 }
 
@@ -194,18 +214,24 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        let observer = Arc::new(Observer(Mutex::new(SglangRuntimeObservation {
-            token: command(RuntimeAction::Park, "park").context.token,
-            binding_id: BINDING.into(),
-            incarnation: INCARNATION.into(),
-            identities: identities(),
-            real_memory_saver: true,
-            quiesced: true,
-            unknown_work: false,
-            allocations: true,
-            weights: true,
-            cache: true,
-        })));
+        Self::with_settings(mllm_testkit::sglang_launch_settings()).await
+    }
+    async fn with_settings(settings: mllm_domain::launch::SglangLaunchSettings) -> Self {
+        let observer = Arc::new(Observer(
+            Mutex::new(SglangRuntimeObservation {
+                token: command(RuntimeAction::Park, "park").context.token,
+                binding_id: BINDING.into(),
+                incarnation: INCARNATION.into(),
+                identities: identities(),
+                real_memory_saver: true,
+                quiesced: true,
+                unknown_work: false,
+                allocations: true,
+                weights: true,
+                cache: true,
+            }),
+            Mutex::new(false),
+        ));
         let server = Arc::new(Server {
             observer: observer.clone(),
             requests: Mutex::new(vec![]),
@@ -235,7 +261,7 @@ impl Fixture {
             axum::serve(listener, app).await.unwrap();
         });
         let adapter = Arc::new(
-            SglangAdapter::from_frozen(&frozen(endpoint), Some(observer))
+            SglangAdapter::from_frozen(&frozen_with(endpoint, settings), Some(observer))
                 .unwrap()
                 .with_credentials("inference-secret".into(), "admin-secret".into()),
         );
@@ -321,6 +347,58 @@ async fn restore_is_separate_from_reload_flush_and_accounted_probe() {
     assert!(requests[..3]
         .iter()
         .all(|r| r.authorization == "Bearer admin-secret"));
+}
+
+/// Discrete GPU design §5, ADR 0019: a `host_backed` launch parks to host RAM
+/// with SGLang's weights CPU backup. Release and resume carry both tags as for
+/// `deep`; the resume restores the weights from the pinned copy, so the reload
+/// step makes no `update_weights_from_disk` call and reports `WeightsUsable`
+/// from its own before and after saver observations. Flush and the fresh probe
+/// follow. Fake-engine tests are not qualification of a native SGLang recipe.
+// T16 T20 T22
+#[tokio::test]
+async fn host_backed_restores_from_host_ram_without_a_disk_reload() {
+    let f = Fixture::with_settings(host_backed_settings()).await;
+    for (action, step, reply, fact) in [
+        (RuntimeAction::Park, "park", "null".to_owned(), Milestone::MemoryReleased),
+        (RuntimeAction::Restore, "resume", "null".to_owned(), Milestone::AllocationsRestored),
+        (RuntimeAction::ReloadWeights, "reload", "null".to_owned(), Milestone::WeightsUsable),
+        (RuntimeAction::InvalidateCache, "flush", FLUSH_RESPONSE.into(), Milestone::CacheValid),
+        (RuntimeAction::Probe, "probe", json!({"model":MODEL,"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}).to_string(), Milestone::ModelUsable),
+    ] {
+        f.reply(StatusCode::OK, &reply);
+        if action == RuntimeAction::ReloadWeights {
+            // No engine call moves the fake: the observer's step content does.
+            *f.server.observer.1.lock().unwrap() = true;
+        }
+        let result = f.adapter.execute_persisted(&f.next(action, step)).await;
+        assert_eq!(result.unwrap().facts, vec![fact], "{action:?}");
+    }
+    let paths: Vec<_> = f.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(
+        paths,
+        [
+            "/release_memory_occupation",
+            "/resume_memory_occupation",
+            "/flush_cache?timeout=0",
+            "/v1/chat/completions"
+        ]
+    );
+}
+
+/// The reload step under `host_backed` still needs its evidence: with no
+/// allocations observed it is uncertain and sends nothing.
+// T20 T22
+#[tokio::test]
+async fn host_backed_reload_without_restored_allocations_is_uncertain() {
+    let f = Fixture::with_settings(host_backed_settings()).await;
+    f.parked();
+    uncertain(
+        f.adapter
+            .execute_persisted(&f.next(RuntimeAction::ReloadWeights, "reload"))
+            .await,
+    );
+    assert!(f.requests().is_empty());
 }
 
 #[tokio::test]

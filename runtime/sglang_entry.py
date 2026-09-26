@@ -599,6 +599,8 @@ def _keep_served_name_on_reload():
 def _observation_target(spec, launch):
     """The enrolling scheduler target, or None when this launch enrolls nothing.
 
+    The child scope carries the launch's declared weight restore, so the saver
+    observer admits the weights backup of a `host_backed` launch only (ADR 0019).
     Only a memory-saver launch enrolls, only when the host supplied its private
     observation directory (MLLM_OBSERVATION_DIR) and it validates, and only when
     the installation's `launch_server` takes a scheduler target (the
@@ -613,7 +615,8 @@ def _observation_target(spec, launch):
     if (directory is None or public["settings"]["memory_saver"] is not True
             or not engine_capabilities.accepts_scheduler_target(launch)
             or not enrollment.entry_environment(directory, public["binding_id"],
-                                                public["incarnation"])):
+                                                public["incarnation"],
+                                                public["settings"]["weight_restore"])):
         return None
     return enrollment.run_enrolled_scheduler
 

@@ -24,6 +24,7 @@ No exception text, path or credential is ever written anywhere. Nothing here
 proves release, residency or readiness; the host fuses these facts with its own.
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -32,19 +33,25 @@ import stat
 # Environment the protected entry sets for its spawned children (validated there).
 ENV_DIR = "MLLM_OBSERVATION_DIR"
 ENV_SCOPE = "MLLM_OBSERVATION_SCOPE"
+# ADR 0019: the launch's declared weight restore, which decides whether the
+# saver's weights region may hold a CPU backup (`cpu_backup`, host_backed).
+ENV_RESTORE = "MLLM_OBSERVATION_WEIGHT_RESTORE"
+WEIGHT_RESTORES = ("disk_reload", "cpu_backup")
 
 # The live listener, retained for the scheduler process lifetime.
 _ENROLLED = []
 
 
 def _scope():
-    """(dir, binding, incarnation) from the entry's environment, or None."""
+    """(dir, binding, incarnation, weight restore) from the entry's environment, or None."""
     directory = os.environ.get(ENV_DIR)
     scope = os.environ.get(ENV_SCOPE)
-    if not directory or not scope or scope.count(":") != 1:
+    restore = os.environ.get(ENV_RESTORE)
+    if (not directory or not scope or scope.count(":") != 1
+            or restore not in WEIGHT_RESTORES):
         return None
     binding, incarnation = scope.split(":")
-    return directory, binding, incarnation
+    return directory, binding, incarnation, restore
 
 
 def _preload_library():
@@ -99,7 +106,7 @@ def enroll(scheduler):
         scope = _scope()
         if scope is None:
             return False
-        directory, binding, incarnation = scope
+        directory, binding, incarnation, restore = scope
         from . import sglang_saver_binding as saver
         from . import sglang_saver_residency as residency
         from .sglang_observation_server import SchedulerObservationServer
@@ -115,7 +122,9 @@ def enroll(scheduler):
         owner = saver.current_process_identity()
         bridge = install_scheduler_observer(
             scheduler, binding_id=binding, incarnation_id=incarnation, expected_owner=owner,
-            build=build, observe=residency.observe_scheduler_saver, topology=residency.topology)
+            build=build,
+            observe=functools.partial(residency.observe_scheduler_saver, weight_restore=restore),
+            topology=residency.topology)
         server = SchedulerObservationServer.start(
             path=os.path.join(directory, binding + ".sock"), bridge=bridge, binding_id=binding,
             incarnation_id=incarnation, expected_owner=owner, key=key)
@@ -161,15 +170,17 @@ def run_enrolled_scheduler(*args, **kwargs):
     return module.run_scheduler_process(*args, **kwargs)
 
 
-def entry_environment(directory, binding, incarnation):
+def entry_environment(directory, binding, incarnation, weight_restore="disk_reload"):
     """Validate the host's observation directory and publish the child scope.
 
     Called by the protected entry before `launch_server`; the directory must be
-    an absolute, canonical, private (0700, service-owned) directory. Returns
-    False (no enrollment) otherwise.
+    an absolute, canonical, private (0700, service-owned) directory, and
+    `weight_restore` the launch's declared restore. Returns False (no
+    enrollment) otherwise.
     """
     try:
-        if (type(directory) is not str or not directory.startswith("/")
+        if (weight_restore not in WEIGHT_RESTORES
+                or type(directory) is not str or not directory.startswith("/")
                 or os.path.realpath(directory) != directory
                 or len(os.fsencode(os.path.join(directory, binding + ".sock"))) > 107):
             return False
@@ -179,6 +190,7 @@ def entry_environment(directory, binding, incarnation):
             return False
         os.environ[ENV_DIR] = directory
         os.environ[ENV_SCOPE] = binding + ":" + incarnation
+        os.environ[ENV_RESTORE] = weight_restore
         return True
     except Exception:
         return False
@@ -187,3 +199,4 @@ def entry_environment(directory, binding, incarnation):
 def clear_environment():
     os.environ.pop(ENV_DIR, None)
     os.environ.pop(ENV_SCOPE, None)
+    os.environ.pop(ENV_RESTORE, None)

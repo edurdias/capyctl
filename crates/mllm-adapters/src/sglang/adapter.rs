@@ -168,6 +168,11 @@ pub struct SglangAdapter {
     /// engine over the first one's memory. Spec §5 has cleanup take identities
     /// from the execution context, never from adapter memory, so none is kept.
     launched: Mutex<Option<(String, String)>>,
+    /// ADR 0010, ADR 0019, discrete GPU design §5: the frozen launch renders
+    /// SGLang's weights CPU backup (`host_backed`), so a resume restores the
+    /// weights from the pinned host copy and the reload step has nothing to
+    /// send. Fixed by the frozen settings at construction, never by a command.
+    cpu_weight_backup: bool,
 }
 
 impl SglangAdapter {
@@ -210,6 +215,7 @@ impl SglangAdapter {
             rendezvous_dir: None,
             extra_approvals: None,
             launched: Mutex::new(None),
+            cpu_weight_backup: frozen.settings().cpu_weight_backup,
         })
     }
 
@@ -521,7 +527,14 @@ impl SglangAdapter {
         if !valid {
             return Err(uncertain());
         }
-        if command.action != RuntimeAction::Drain {
+        // Discrete GPU design §5: under the weights CPU backup the resume
+        // already copied the weights back from host RAM, so the reload step
+        // sends no `update_weights_from_disk`. It still reports
+        // `WeightsUsable` only from the saver observations around it, and the
+        // fresh probe after the flush proves the model usable.
+        let host_restored =
+            command.action == RuntimeAction::ReloadWeights && self.cpu_weight_backup;
+        if command.action != RuntimeAction::Drain && !host_restored {
             self.http
                 .as_ref()
                 .ok_or_else(uncertain)?
