@@ -6,7 +6,7 @@ requires an API key, so a laptop, a phone or a Tailscale peer can use the models
 on your GPU machine without extra software. This page explains where the key is,
 how to narrow who can connect, and how to put the endpoint on the internet
 safely. The decision is recorded in
-[ADR 0019](../design/adr/0019-discrete-gpu-and-network-endpoint.md).
+ADR 0019 (`docs/design/adr/0019-discrete-gpu-and-network-endpoint.md` in the source repository).
 
 Everything here applies to `mllm start standalone` and `mllm start server`. A
 host role has no inference listener of its own; the server forwards to it over

@@ -506,7 +506,7 @@ units on shared machines.
 mllm runs on machines whose GPU has its own memory (a GeForce, RTX or data
 center card) as well as on unified-memory machines such as the GB10, where the
 GPU and the CPU share one pool. The rules are in
-[ADR 0019](../design/adr/0019-discrete-gpu-and-network-endpoint.md).
+ADR 0019 (`docs/design/adr/0019-discrete-gpu-and-network-endpoint.md` in the source repository).
 
 **Requirements.** The NVIDIA driver with `nvidia-smi` at `/usr/bin/nvidia-smi`
 (or `/bin/nvidia-smi`), which every driver package installs. mllm runs it with

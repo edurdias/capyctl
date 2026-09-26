@@ -136,7 +136,12 @@ copy_tracked() {
 # The runtime helpers are not shipped as files: they are compiled into
 # bin/mllm (crates/mllm-agent/build.rs) and materialized owner-only at role
 # start (crates/mllm-agent/src/embedded_runtime.rs).
-copy_tracked 0644 packaging/systemd docs/examples docs/operations/install.md
+# The operator guides ship together: install.md links configuration.md and
+# network-access.md, and the units point at configuration.md (final review
+# I12); scripts/verify-packaging.sh checks every relative link resolves.
+copy_tracked 0644 packaging/systemd docs/examples docs/operations/install.md \
+  docs/operations/configuration.md docs/operations/network-access.md \
+  docs/operations/release-notes-0.1.0.md
 
 if find "$pkg" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' -o -type l \) -print -quit | grep -q .; then
   echo "staged tree contains bytecode or symlinks" >&2
