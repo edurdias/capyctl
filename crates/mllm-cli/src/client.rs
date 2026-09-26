@@ -850,10 +850,9 @@ fn management_context(
     state_dir: &Path,
     config: Option<&Path>,
 ) -> Result<(String, String, std::path::PathBuf), StructuredError> {
-    // Owner decision 2026-09-26: `--config` or `--context`, else
-    // MLLM_CONTEXT, else the current saved context, else the role running
-    // on this machine.
-    let target = crate::context::resolve(state_dir, config)?;
+    // Owner decision 2026-09-26: `--config`, else MLLM_CONFIG, else the
+    // role running on this machine.
+    let target = crate::local_role::resolve(state_dir, config)?;
     Ok((target.endpoint, target.token, target.journal_root))
 }
 

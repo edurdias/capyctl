@@ -4,10 +4,36 @@ F2 is not complete. Work continues on `feat/f2-sglang`; no push or final merge i
 claimed. The current user instruction is one consolidated review at the end,
 not per task. Focused TDD and integration verification continue throughout.
 
-## First-run UX, second pass, and management contexts — 2026-09-26 (branch `fix/first-run-ux-2`)
+## A command uses the role on its machine; saved contexts removed — 2026-09-26 (branch `chore/remove-contexts`)
+
+Owner decision 2026-09-26: the user should not have to set the configuration
+every time, and a command run on a machine knows the role running there. The
+saved contexts added on `fix/first-run-ux-2` (the `mllm context` commands,
+`--context`, `MLLM_CONTEXT`, `MLLM_CONTEXT_KEY` and the files under
+`~/.config/mllm/`) are removed with their tests and documentation.
+
+- **Which role a command uses.** `--config` > `MLLM_CONFIG` > the role running
+  on this machine, found under the state root: a server's or standalone
+  role's credentials and recorded management address, and the document a
+  server or host was started or enrolled with when one was named
+  (`<state root>/run/server-document`, `<state root>/run/host-document`, 0600),
+  so the packaged system units are found without `--config`.
+- **Host machines.** `mllm engine` and `mllm config show` use the host's
+  document (recorded, else `<state root>/config/host.yaml`), and `engine add`
+  writes the `engines.yaml` the host reads. A command that needs the server is
+  refused with "This machine is an mllm host; run this command on the server".
+- **More than one role.** Server or standalone with a host: the server or
+  standalone role. Server and standalone: the one that answers, else refused
+  naming both and the `--config` that chooses. `config show` with more than
+  one role is refused, naming them (`--role` or `--config` chooses).
+- CPU tests only (`crates/mllm-cli/tests/local_role.rs`): detection of each
+  role, recorded server and host documents, precedence, the host refusal, and
+  that no context command or flag remains. Not qualification of any engine.
+
+## First-run UX, second pass — 2026-09-26 (branch `fix/first-run-ux-2`)
 
 Fixes from a first-run walk with the real binary, each with a regression test
-that failed first, plus the owner's 2026-09-26 decision on client contexts.
+that failed first, plus the owner's 2026-09-26 decision on client commands.
 CPU tests, fake installations and scripted management APIs only; none of this
 is qualification of an engine recipe. The host session fix was also checked
 by hand on this machine with fake engine environments (a server and five
@@ -37,16 +63,9 @@ hosts, one declaring its discrete GPU as a device domain).
   literals in the CLI and configuration crates.
 - **`--output` help** is shown at the top level and on `init` and `invite`
   only; the flag still parses anywhere.
-- **Management contexts** (owner decision 2026-09-26). Client commands find
-  their management API without `--config`: `--context`/`--config` >
-  `MLLM_CONTEXT` > the current saved context > the role running on this
-  machine (credentials and recorded address under the state root; with both a
-  server and a standalone role recorded, the one that answers). `mllm context
-  add|use|list|remove|show`; tokens come from `--key-file` or
-  `MLLM_CONTEXT_KEY` and are stored owner-only. Needs owner attention: the
-  management API stays loopback-only (network guide, every release), so a
-  context's address must be loopback; another machine is reached through an
-  SSH port forward rather than a TLS management listener.
+- **Client commands without `--config`** (owner decision 2026-09-26). They
+  use the role running on the machine; the saved contexts this branch first
+  added were removed afterwards (see the section above).
 
 ## Discrete GPU live re-check after the fix wave — 2026-09-26 (branch `feat/discrete-gpu-network`)
 

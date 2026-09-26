@@ -45,7 +45,7 @@ pub async fn execute(
     config: Option<&Path>,
     request_id: Option<&str>,
 ) -> Result<Value, StructuredError> {
-    let target = crate::context::resolve(state_dir, config)?;
+    let target = crate::local_role::resolve(state_dir, config)?;
     revoke(
         &target.endpoint,
         &target.token,

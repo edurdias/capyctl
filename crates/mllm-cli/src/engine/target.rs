@@ -68,12 +68,14 @@ pub fn role_engines(named: Option<&Path>, env: &dyn Fn(&str) -> Option<String>) 
     }
 }
 
-/// The role document: `--config`; else `$MLLM_CONFIG`; else
-/// `<config home>/mllm/host.yaml` if it exists; else
-/// `<state_dir>/config/standalone.yaml`. Both implicit documents present is
-/// ambiguous and refused. Neither present is the first run (review decision
-/// 2026-09-25): standalone, whose document `mllm start standalone` generates,
-/// and whose engines file is the one that start reads.
+/// The role document: `--config`; else `$MLLM_CONFIG`; else the host role
+/// on this machine (owner decision 2026-09-26: the document `start host` or
+/// `join host` was named with, else `<state_dir>/config/host.yaml`, else
+/// `<config home>/mllm/host.yaml`); else `<state_dir>/config/standalone.yaml`.
+/// A host and a standalone document both present is ambiguous and refused.
+/// Neither present is the first run (review decision 2026-09-25): standalone,
+/// whose document `mllm start standalone` generates, and whose engines file
+/// is the one that start reads.
 pub fn resolve_target(
     explicit: Option<&Path>,
     state_dir: &Path,
@@ -81,11 +83,20 @@ pub fn resolve_target(
 ) -> Result<Target, StructuredError> {
     let home = config_home(env)
         .ok_or_else(|| invalid("neither XDG_CONFIG_HOME nor HOME is set; pass --config"))?;
-    let named = named_role_document(explicit, env);
-    let chosen = match &named {
-        Some(path) => path.clone(),
+    let mut named = named_role_document(explicit, env);
+    let chosen = match named.clone() {
+        Some(path) => path,
         None => {
-            let host = Some(home.join("mllm/host.yaml")).filter(|p| p.exists());
+            let host = match crate::local_role::host_document(state_dir) {
+                // A host started with a named document keeps its engines
+                // file beside it, as when it is named here.
+                Some((path, true)) => {
+                    named = Some(path.clone());
+                    Some(path)
+                }
+                Some((path, false)) => Some(path),
+                None => Some(home.join("mllm/host.yaml")).filter(|p| p.exists()),
+            };
             let standalone = Some(state_dir.join("config/standalone.yaml")).filter(|p| p.exists());
             match (host, standalone) {
                 (Some(host), Some(standalone)) => {

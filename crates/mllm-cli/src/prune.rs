@@ -109,7 +109,7 @@ pub async fn execute(
         }
         None => {
             // Fail closed: with no answer from the server nothing is removed.
-            let target = crate::context::resolve(state_dir, config)?;
+            let target = crate::local_role::resolve(state_dir, config)?;
             crate::remote_roles::management_call(
                 &target.endpoint,
                 &target.token,
