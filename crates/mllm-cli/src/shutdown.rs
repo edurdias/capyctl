@@ -49,14 +49,38 @@ pub fn standalone_drain_bound(state_dir: &std::path::Path) -> Result<Duration, S
 /// explicit `--config`). A missing document gives the default here; the boot
 /// itself then refuses it (SPEC §15.2, R13).
 pub fn standalone_drain_bound_in(path: &std::path::Path) -> Result<Duration, String> {
-    let refused = |error: mllm_config::ConfigError| format!("{}: {error}", path.display());
+    standalone_drain_bound_with(
+        path,
+        &mllm_config::setting_overrides::SettingOverrides::none(
+            mllm_config::ConfigKind::Standalone,
+        ),
+    )
+}
+
+/// As [`standalone_drain_bound_in`], with this run's generic overrides
+/// (owner decision 2026-09-25: `--set shutdown.drain_timeout=…` or
+/// `MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT` win over the document).
+pub fn standalone_drain_bound_with(
+    path: &std::path::Path,
+    overrides: &mllm_config::setting_overrides::SettingOverrides,
+) -> Result<Duration, String> {
+    let refused = |error: mllm_config::ConfigError| {
+        format!("{}: {}", path.display(), overrides.annotate(error))
+    };
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DEFAULT_DRAIN),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A missing document is generated at the boot; the overrides
+            // still apply to it.
+            let mut document = serde_json::json!({});
+            overrides.apply(&mut document).map_err(refused)?;
+            return mllm_config::remote_roles::drain_timeout(&document).map_err(refused);
+        }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let document =
-        mllm_config::parse_strict(mllm_config::ConfigKind::Standalone, &text).map_err(refused)?;
+    let document = mllm_config::parse_document(&text)
+        .and_then(|document| overrides.apply_and_validate(document))
+        .map_err(refused)?;
     mllm_config::remote_roles::drain_timeout(&document).map_err(refused)
 }
 

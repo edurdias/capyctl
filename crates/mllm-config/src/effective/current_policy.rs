@@ -24,7 +24,7 @@ pub fn deployment_command_fingerprint(
         || input.kind != "deployment"
         || input.name.is_empty()
         || input.runtime_profile.is_empty()
-        || input.runtime_profile_revision == 0
+        || input.runtime_profile_revision == Some(0)
         || input.routes.is_empty()
         || input.routes.iter().any(String::is_empty)
     {
@@ -36,19 +36,20 @@ pub fn deployment_command_fingerprint(
     }
     // No host is in hand here, so nothing is resolved against a model store:
     // a command's identity must depend on the command alone.
-    let model = core::normalize_model(input.model, None)?;
+    let model = core::normalize_model(input.model, None, None)?;
     let request_deadline_ms = input
         .request_deadline
         .as_deref()
         .map(parse_duration_ms)
         .transpose()?
         .unwrap_or(original_deadline_ms);
-    core::validate_identity_intrinsic(&model, &input.recipe, &input.devices, request_deadline_ms)?;
+    let devices = input.devices.clone().unwrap_or_default();
+    core::validate_identity_intrinsic(&model, &input.recipe, &devices, request_deadline_ms)?;
     // ADR 0014 §5: resources may be omitted and derived at resolution; the
     // command identity then carries none.
     let resources: Option<RecipeFootprints> = input.resources.map(raw_recipe).transpose()?;
     if let Some(resources) = &resources {
-        core::validate_resources_intrinsic(resources, &input.devices)?;
+        core::validate_resources_intrinsic(resources, &devices)?;
     }
     // ADR 0014 §1: the deployment's engine configuration is part of what the
     // command asks for, so two commands differing only there are different.

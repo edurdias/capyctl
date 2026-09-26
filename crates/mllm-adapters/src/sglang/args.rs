@@ -249,10 +249,20 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         || memory.kv_cache_bytes <= 0
         || memory.kv_cache_bytes > memory.request_bytes
         || memory.margin_bytes < 0
+        || memory.device_total_bytes.is_some_and(|total| total <= 0)
     {
         return Err(RuntimeError::Unsupported);
     }
-    let static_bytes = (memory.request_bytes - memory.margin_bytes)
+    // Discrete GPU design §3, §6: a device request is `weights x 1.10 + kv`,
+    // so on a discrete device the margin is a tenth of the weights share
+    // (`(request - kv) / 11`) and the static pool holds the weights and the
+    // KV cache. The unified placeholder margin (8 GiB) would leave a card's
+    // static pool smaller than the weights it must load.
+    let margin_bytes = match memory.device_total_bytes {
+        Some(_) => (memory.request_bytes - memory.kv_cache_bytes) / 11,
+        None => memory.margin_bytes,
+    };
+    let static_bytes = (memory.request_bytes - margin_bytes)
         .max(memory.kv_cache_bytes)
         .min(memory.request_bytes);
     let expected_restore = if s.cpu_weight_backup {
@@ -305,14 +315,30 @@ fn public_settings(s: &SglangLaunchSettings) -> Result<Value, RuntimeError> {
         "memory_saver": s.memory_saver,
         "cpu_weight_backup": s.cpu_weight_backup,
         "weight_restore": s.weight_restore,
-        "memory": {
-            "request_bytes": memory.request_bytes,
-            "kv_cache_bytes": memory.kv_cache_bytes,
-            "margin_bytes": memory.margin_bytes,
-            "static_bytes": static_bytes,
-        },
+        "memory": public_memory(memory, margin_bytes, static_bytes),
         "extra_args": s.extra_args,
     }))
+}
+
+/// The closed memory object. `device_total_bytes` is present only on a
+/// discrete device (design §6): the entry then sizes `mem_fraction_static`
+/// against the card's total instead of `MemAvailable`, and a unified launch
+/// renders exactly as before.
+fn public_memory(
+    memory: &mllm_domain::launch::MemoryRequest,
+    margin_bytes: i64,
+    static_bytes: i64,
+) -> Value {
+    let mut rendered = json!({
+        "request_bytes": memory.request_bytes,
+        "kv_cache_bytes": memory.kv_cache_bytes,
+        "margin_bytes": margin_bytes,
+        "static_bytes": static_bytes,
+    });
+    if let Some(total) = memory.device_total_bytes {
+        rendered["device_total_bytes"] = json!(total);
+    }
+    rendered
 }
 
 fn selector(value: &str) -> bool {

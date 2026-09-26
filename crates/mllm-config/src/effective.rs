@@ -10,9 +10,12 @@ mod startup;
 mod timeouts;
 pub use current_policy::{compose_current_resource_controls, deployment_command_fingerprint};
 pub use engine_config::{
-    default_startup_bytes, overhead_margin, resolve_memory, resolve_startup, CheckpointFacts,
-    MemoryInputs, ResolvedMemory, PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES,
-    STARTUP_WEIGHTS_FACTOR, VLLM_OVERHEAD_MARGIN_BYTES,
+    default_startup_bytes, host_backed_copy_bytes, overhead_margin, resolve_memory,
+    resolve_startup, CheckpointFacts, MemoryInputs, ResolvedMemory,
+    ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES, ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES,
+    HOST_BACKED_COPY_FACTOR, PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES,
+    PARKED_RESIDUAL_PLACEHOLDER_BYTES, SGLANG_OVERHEAD_MARGIN_BYTES, STARTUP_WEIGHTS_FACTOR,
+    VLLM_OVERHEAD_MARGIN_BYTES,
 };
 pub use legacy::{
     is_legacy_effective, legacy_engine_config, legacy_retained_deployment,
@@ -453,8 +456,9 @@ pub struct HostPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_inventory_digest: Option<String>,
     /// Absolute directory this host keeps model weights under. SPEC §7: a relative
-    /// local model path is resolved against it, so it is required rather than
-    /// defaulted — a guessed directory would resolve paths somewhere unnamed.
+    /// local model path is resolved against it. A published host document
+    /// always states it: the roles fill `~/models` (or `MLLM_MODELS_ROOT`,
+    /// `--models-root`) before publishing (owner decision 2026-09-25).
     pub model_store: PathBuf,
     pub domains: BTreeMap<String, DomainPolicy>,
     pub devices: BTreeMap<String, DevicePolicy>,
@@ -482,6 +486,9 @@ pub struct HostPolicy {
 pub enum DomainMemory {
     Unified,
     Distinct,
+    /// ADR 0019: a discrete GPU's own memory. The domain names its device, and
+    /// host RAM is a separate `distinct` system domain beside it.
+    Device,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -491,6 +498,11 @@ pub struct DomainPolicy {
     pub host_kv_limit: Option<i64>,
     pub parked_limit: Option<i64>,
     pub memory: DomainMemory,
+    /// ADR 0019: the device whose memory this is. `Some` exactly when `memory` is
+    /// `Device`; omitted from the encoding otherwise, so a unified or distinct
+    /// domain encodes exactly as it did before device domains existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,6 +518,147 @@ pub struct DevicePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_gpu_uuid: Option<String>,
 }
+/// Discrete GPU design §7 (review decision): how an engine child's CUDA
+/// namespace is narrowed to the one GPU its launch selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CudaNamespace {
+    /// `CUDA_VISIBLE_DEVICES` set to the physical UUID the host published.
+    Uuid(String),
+    /// `CUDA_DEVICE_ORDER=PCI_BUS_ID` and `CUDA_VISIBLE_DEVICES` set to the
+    /// driver index the host published the GPU under (`gpuN`). `nvidia-smi`
+    /// numbers GPUs in PCI bus order; CUDA's default order is fastest first,
+    /// so without the order variable the index could name another GPU.
+    PciIndex(u32),
+}
+
+impl CudaNamespace {
+    /// The variables that narrow the engine child to this GPU.
+    pub fn environment(&self) -> Vec<(&'static str, String)> {
+        match self {
+            CudaNamespace::Uuid(uuid) => vec![("CUDA_VISIBLE_DEVICES", uuid.clone())],
+            CudaNamespace::PciIndex(index) => vec![
+                ("CUDA_DEVICE_ORDER", "PCI_BUS_ID".into()),
+                ("CUDA_VISIBLE_DEVICES", index.to_string()),
+            ],
+        }
+    }
+}
+
+/// A launch that must be pinned to one GPU names no GPU it can pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the selected GPU has neither a published UUID nor a gpuN index to pin the engine to")]
+pub struct UnpinnableDevice;
+
+impl EffectiveDeployment {
+    /// The directory this deployment's checkpoint must be inside: the host's
+    /// model store for a local source, its sources store for a remote one
+    /// (ADR 0008; owner decision 2026-09-25 gives downloads a store of their
+    /// own). Whoever opens the checkpoint checks containment against it.
+    pub fn checkpoint_store(&self) -> &Path {
+        match self.model.source {
+            ModelSource::Local { .. } => &self.host.model_store,
+            _ => self.host.model_sources.root(&self.host.model_store),
+        }
+    }
+
+    /// Discrete GPU design §7 (review decision): the namespace a launch's
+    /// engine child is narrowed to. Where there is a choice of GPU (several
+    /// devices) or the GPU is a discrete device domain, the selected GPU is
+    /// always pinned: by the physical UUID the host published, else by its
+    /// `gpuN` index in PCI bus order. A launch is never handed every GPU, so
+    /// with several devices one it cannot name is [`UnpinnableDevice`].
+    /// `Ok(None)` keeps the agent's own namespace: a one-device unified host
+    /// (a GB10), or a lone discrete GPU with no name to pin.
+    pub fn cuda_namespace(&self) -> Result<Option<CudaNamespace>, UnpinnableDevice> {
+        let several = self.host.devices.len() > 1;
+        let unpinned = || {
+            if several {
+                Err(UnpinnableDevice)
+            } else {
+                Ok(None)
+            }
+        };
+        let [claim] = self.selected_devices.as_slice() else {
+            return unpinned();
+        };
+        let Some(device) = self.host.devices.get(&claim.id) else {
+            return unpinned();
+        };
+        let discrete = self
+            .host
+            .domains
+            .get(&device.domain)
+            .is_some_and(|domain| domain.memory == DomainMemory::Device);
+        if !several && !discrete {
+            return Ok(None);
+        }
+        if let Some(uuid) = &device.physical_gpu_uuid {
+            return Ok(Some(CudaNamespace::Uuid(uuid.clone())));
+        }
+        match gpu_index(&claim.id) {
+            Some(index) => Ok(Some(CudaNamespace::PciIndex(index))),
+            None => unpinned(),
+        }
+    }
+
+    /// Discrete GPU design §6 (ADR 0019): the device domain this deployment's
+    /// Ready footprint charges, as the driver index of the GPU the domain names
+    /// (`gpuN`) and the bytes the Ready phase holds there. `None` on a unified
+    /// or host-only footprint. A device domain whose device is not a `gpuN` id
+    /// has no index (`Some((None, bytes))`): no sample can name it.
+    pub fn ready_device_allocation(&self) -> Option<(Option<u32>, i64)> {
+        self.resources
+            .ready
+            .allocations
+            .iter()
+            .find_map(|allocation| {
+                let domain = self.host.domains.get(&allocation.domain)?;
+                (domain.memory == DomainMemory::Device).then(|| {
+                    (
+                        domain.device.as_deref().and_then(gpu_index),
+                        allocation.bytes,
+                    )
+                })
+            })
+    }
+
+    /// Discrete GPU design §6: state the observed total of the card a launch on
+    /// a device domain runs on, in this launch's own copy of the settings.
+    /// `totals` maps a driver index to the card's total bytes (a GPU sample).
+    /// A deployment that charges no device domain is left unchanged; one whose
+    /// card the sample does not report is [`DeviceTotalUnknown`]: sizing it
+    /// against anything else would size the engine against the wrong memory.
+    pub fn with_device_total(
+        mut self,
+        totals: impl Fn(u32) -> Option<i64>,
+    ) -> Result<Self, DeviceTotalUnknown> {
+        let Some((index, _)) = self.ready_device_allocation() else {
+            return Ok(self);
+        };
+        let total = index
+            .and_then(totals)
+            .filter(|total| *total > 0)
+            .ok_or(DeviceTotalUnknown)?;
+        self.engine_config.memory_mut().device_total_bytes = Some(total);
+        Ok(self)
+    }
+}
+
+/// Discrete GPU design §6: a launch on a device domain whose card total was not
+/// observed. The launch is refused rather than sized against host memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the total memory of the GPU this launch runs on was not observed")]
+pub struct DeviceTotalUnknown;
+
+/// The driver index a `gpuN` device id names; `None` for any other id.
+fn gpu_index(device_id: &str) -> Option<u32> {
+    device_id
+        .strip_prefix("gpu")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortRange {
@@ -539,11 +692,20 @@ struct DeploymentInput {
     model: RawModel,
     routes: Vec<String>,
     runtime_profile: String,
-    runtime_profile_revision: u64,
+    /// Owner decision 2026-09-25: optional; the revision the host publishes
+    /// (`deployment_defaults::for_host`).
+    #[serde(default)]
+    runtime_profile_revision: Option<u64>,
     recipe: String,
-    residency: Residency,
+    /// Owner decision 2026-09-25: optional; chosen by host type and checkpoint
+    /// (`deployment_defaults::default_residency`).
+    #[serde(default)]
+    residency: Option<Residency>,
     recovery: Recovery,
-    devices: Vec<DeviceClaim>,
+    /// Owner decision 2026-09-25: optional; the host's first GPU, or one per
+    /// GPU on a discrete host (`deployment_defaults::for_host`).
+    #[serde(default)]
+    devices: Option<Vec<DeviceClaim>>,
     /// ADR 0014 §5: optional; derived from `engine_config.memory` when omitted.
     #[serde(default)]
     resources: Option<RawRecipe>,
@@ -655,6 +817,8 @@ struct RawDomain {
     #[serde(skip_serializing_if = "Option::is_none")]
     parked_limit: Option<String>,
     memory: DomainMemory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -699,6 +863,7 @@ pub fn compose_resource_policy(
                     host_kv_limit: d.host_kv_limit.map(|n| format!("{n}B")),
                     parked_limit: d.parked_limit.map(|n| format!("{n}B")),
                     memory: d.memory,
+                    device: d.device.clone(),
                 },
             )
         })
@@ -861,7 +1026,16 @@ pub fn resolve_effective_with_checkpoint(
     host: &serde_json::Value,
     facts: CheckpointFacts,
 ) -> Result<EffectiveDeployment, ConfigError> {
-    let d: DeploymentInput = decode(deployment, "deployment")?;
+    // Owner decision 2026-09-25 (ADR 0014 amendment): complete a minimal
+    // document, first from itself, then from this host. A full document is
+    // unchanged by both.
+    let completed = {
+        let mut document = deployment.clone();
+        crate::deployment_defaults::expand(&mut document)?;
+        crate::deployment_defaults::for_host(&document, host)?
+    };
+    let deployment = &completed;
+    let mut d: DeploymentInput = decode(deployment, "deployment")?;
     let h: HostInput = decode_host(host)?;
     // ADR 0013 §2–3: refuse an unplaceable or contradictory instance
     // declaration before resolving anything against this host.
@@ -884,42 +1058,133 @@ pub fn resolve_effective_with_checkpoint(
     let raw_profile = h
         .runtime_profiles
         .get(&d.runtime_profile)
-        .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?;
-    let profile = core::normalize_profile(raw_profile, d.runtime_profile_revision, d.residency)?;
+        .ok_or_else(|| invalid("runtime_profile", "unknown runtime profile"))?
+        .clone();
     let host = core::normalize_host(h)?;
-    let model = core::normalize_model(d.model, Some(&host.model_store))?;
+    let devices = d.devices.take().unwrap_or_default();
+    // Owner decision 2026-09-25: an undeclared residency follows the host
+    // type and the checkpoint (`deployment_defaults::default_residency`); it
+    // is named in the provenance so a re-resolution with the measured weights
+    // chooses again (ADR 0014 §7).
+    let residency_defaulted = d.residency.is_none();
+    let device_sizing = core::derived_device_sizing(&devices, &host);
+    let residency = d.residency.unwrap_or_else(|| {
+        let discrete =
+            device_sizing.map(|_| (facts.weights_bytes, core::system_parked_limit(&host)));
+        crate::deployment_defaults::default_residency(
+            raw_profile.security.deep_park.is_enabled(),
+            discrete,
+        )
+    });
+    // Owner decision 2026-09-25: a deployment that states no memory (and no
+    // resources) gets the default KV cache of the domain it runs in; its
+    // request derives from the checkpoint's weights (ADR 0014 §5).
+    let mut kv_defaulted = false;
+    if d.resources.is_none() && !d.engine_config.states_memory() {
+        let managed = match device_sizing {
+            Some(sizing) => Some(sizing.managed_limit),
+            None => core::single_domain(&devices, &host).map(|domain| domain.managed_limit),
+        };
+        if let Some(managed) = managed {
+            d.engine_config
+                .default_kv_cache(crate::deployment_defaults::default_kv_cache(managed));
+            kv_defaulted = true;
+        }
+    }
+    let profile = core::normalize_profile(
+        &raw_profile,
+        d.runtime_profile_revision.unwrap_or(raw_profile.revision),
+        residency,
+    )?;
+    let model = core::normalize_model(
+        d.model,
+        Some(&host.model_store),
+        Some(host.model_sources.root(&host.model_store)),
+    )?;
     // ADR 0008: a remote source resolves only on a host that opted in to it.
     host.model_sources.permits(&model.source)?;
+    core::check_single_device(&devices, &host)?;
     let declared_resources = d.resources.map(raw_recipe).transpose()?;
+    if let Some(resources) = &declared_resources {
+        core::check_system_allocation(resources, &host)?;
+    }
+    // ADR 0014 §5: an explicit Ready phase states the memory request. On a
+    // discrete host (review decision, discrete GPU design §6) that is the
+    // device allocation alone: the request sizes the engine on the card (vLLM's
+    // utilization, SGLang's static fraction), and the system allocation beside
+    // it is the engine process's host RAM, which the card does not hold.
     let declared_ready_total = declared_resources.as_ref().map(|resources| {
-        resources
-            .ready
-            .allocations
+        let on_device = |domain: &str| {
+            host.domains
+                .get(domain)
+                .is_some_and(|policy| policy.memory == DomainMemory::Device)
+        };
+        let ready = &resources.ready.allocations;
+        let discrete = ready.iter().any(|a| on_device(&a.domain));
+        ready
             .iter()
+            .filter(|a| !discrete || on_device(&a.domain))
             .fold(0_i64, |total, a| total.saturating_add(a.bytes))
     });
     let mut engine_config = engine_config::normalize_engine_config(
         d.engine_config,
         engine_config::EngineInputs {
             engine: profile.engine,
-            residency: d.residency,
+            residency,
             security: &profile.security,
             profile_args: &profile.args,
             checkpoint_root: model.resolved_path.as_deref().map(Path::new),
             declared_ready_total,
             facts,
+            device: match &declared_resources {
+                Some(_) => None,
+                None => device_sizing,
+            },
         },
     )?;
+    {
+        // T14: what mllm chose is named as its default, so a snapshot
+        // re-resolution chooses it again rather than restating it.
+        let provenance = match &mut engine_config {
+            LaunchSettings::Vllm(settings) => &mut settings.provenance,
+            LaunchSettings::Sglang(settings) => &mut settings.provenance,
+        };
+        if residency_defaulted {
+            provenance.insert(
+                "residency".into(),
+                mllm_domain::launch::SettingSource::MllmDefault,
+            );
+        }
+        if kv_defaulted {
+            provenance.insert(
+                "memory.kv_cache".into(),
+                mllm_domain::launch::SettingSource::MllmDefault,
+            );
+        }
+    }
     let resources = match declared_resources {
         Some(resources) => resources,
         None => {
+            // Re-review parity rule: the engine's CUDA context and graphs are
+            // charged on every host shape; a revision frozen before the charge
+            // re-derives without it.
+            let overhead = if facts.legacy_overhead {
+                0
+            } else {
+                ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+            };
             let derived = engine_config::derive_resources(
                 engine_config.memory().request_bytes,
                 engine_config.memory().startup_bytes,
-                d.residency,
-                &d.devices,
+                residency,
+                &devices,
                 &host,
+                facts.weights_bytes,
+                overhead,
             )?;
+            if !facts.legacy_overhead {
+                engine_config.memory_mut().overhead_bytes = Some(overhead);
+            }
             let provenance = match &mut engine_config {
                 LaunchSettings::Vllm(settings) => &mut settings.provenance,
                 LaunchSettings::Sglang(settings) => &mut settings.provenance,
@@ -934,9 +1199,9 @@ pub fn resolve_effective_with_checkpoint(
     let recipe = core::NormalizedRecipe {
         model,
         recipe: d.recipe,
-        residency: d.residency,
+        residency,
         recovery: d.recovery,
-        devices: d.devices,
+        devices,
         resources,
         request_deadline_ms: d
             .request_deadline

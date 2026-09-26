@@ -102,6 +102,18 @@ impl ResidencySampler {
         }
     }
 
+    /// Take one sample now, on this thread, and keep it as the latest for
+    /// [`Self::current`]. For a caller that asks rarely (an admission attempt
+    /// every few tens of seconds), for which a cached sample is always past
+    /// [`MAX_AGE`] (found live on a 16 GB discrete GPU).
+    pub fn sample_fresh(&self) -> Vec<ProcessResident> {
+        let sample = self.sample_now();
+        if let Ok(mut state) = self.state.lock() {
+            state.last = Some((Instant::now(), sample.clone()));
+        }
+        sample
+    }
+
     /// Take one sample now, on this thread.
     pub fn sample_now(&self) -> Vec<ProcessResident> {
         let Some(gpu) = (self.collect)() else {
@@ -115,11 +127,16 @@ impl ResidencySampler {
             .filter_map(|(pid, gpu_bytes)| {
                 let start_ticks = start_ticks(pid)?;
                 let anonymous = anonymous_resident_bytes(pid)?;
+                // ADR 0019: the two figures stay separate so a discrete host
+                // credits each to its own domain; a unified host credits the
+                // sum (ADR 0007).
                 Some(ProcessResident {
                     pid,
                     boot_id: boot_id.clone(),
                     start_ticks,
                     bytes: gpu_bytes.checked_add(anonymous)?,
+                    device_bytes: gpu_bytes,
+                    host_bytes: anonymous,
                 })
             })
             .collect()
@@ -203,14 +220,25 @@ fn start_ticks(pid: u32) -> Option<u64> {
         .and_then(|field| field.parse().ok())
 }
 
-/// `RssAnon` of /proc/<pid>/status, in bytes: resident pages no page-cache
-/// reclaim can return to the host's availability.
+/// `RssAnon` plus `RssShmem` of /proc/<pid>/status, in bytes: resident pages
+/// no page-cache reclaim can return to the host's availability. Pinned host
+/// memory (a `host_backed` weights copy) is shared memory, not anonymous:
+/// found live on a 16 GB discrete GPU, vLLM's parked copy of Qwen3-4B was
+/// 11.2 GB of `RssShmem` beside 1.9 GB of `RssAnon`, and stayed after the wake.
 fn anonymous_resident_bytes(pid: u32) -> Option<i64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let line = status.lines().find(|line| line.starts_with("RssAnon:"))?;
-    let mut words = line["RssAnon:".len()..].split_whitespace();
-    let kib: i64 = words.next()?.parse().ok()?;
-    (words.next() == Some("kB") && kib >= 0).then(|| kib.checked_mul(1024))?
+    parse_resident_host_bytes(&status)
+}
+
+/// The `RssAnon` and `RssShmem` lines of a /proc/<pid>/status text, summed.
+fn parse_resident_host_bytes(status: &str) -> Option<i64> {
+    let field = |name: &str| -> Option<i64> {
+        let line = status.lines().find(|line| line.starts_with(name))?;
+        let mut words = line[name.len()..].split_whitespace();
+        let kib: i64 = words.next()?.parse().ok()?;
+        (words.next() == Some("kB") && kib >= 0).then(|| kib.checked_mul(1024))?
+    };
+    field("RssAnon:")?.checked_add(field("RssShmem:")?)
 }
 
 #[cfg(test)]
@@ -231,6 +259,23 @@ mod tests {
         }
     }
 
+    // T26: the host figure is anonymous plus shared resident memory (a
+    // pinned host_backed copy is shared memory); a status without either line
+    // gives none.
+    #[test]
+    fn host_bytes_count_anonymous_and_shared_pages() {
+        let status = "Name:\tVLLM::EngineCore\nRssAnon:\t 1828364 kB\nRssFile:\t  611900 kB\nRssShmem:\t10971276 kB\n";
+        assert_eq!(
+            parse_resident_host_bytes(status),
+            Some((1_828_364 + 10_971_276) * 1024)
+        );
+        assert_eq!(parse_resident_host_bytes("RssAnon:\t 1 kB\n"), None);
+        assert_eq!(
+            parse_resident_host_bytes("RssAnon:\t x kB\nRssShmem:\t 1 kB\n"),
+            None
+        );
+    }
+
     // T26: a sample is bound to the process identity: this process's own pid
     // reports its start ticks and anonymous pages beside the GPU bytes read,
     // and a pid that does not exist is dropped.
@@ -245,6 +290,14 @@ mod tests {
         assert_eq!(sample[0].pid, me);
         assert_eq!(Some(sample[0].start_ticks), start_ticks(me));
         assert!(sample[0].bytes > 1 << 20, "GPU bytes plus anonymous pages");
+        // ADR 0019: the GPU bytes and the anonymous pages are also reported
+        // apart, for a discrete host's device and system domains.
+        assert_eq!(sample[0].device_bytes, 1 << 20);
+        assert!(sample[0].host_bytes > 0);
+        assert_eq!(
+            sample[0].bytes,
+            sample[0].device_bytes + sample[0].host_bytes
+        );
     }
 
     // T26: `current` never blocks; the first call starts a sample and a later

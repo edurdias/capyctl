@@ -15,10 +15,14 @@ Capabilities, per engine family, and the feature each gates:
   SGLang entry renders and rechecks, SGLang's `launch_server`; vLLM's `serve`
   parser destinations the vLLM entry reserves). Missing refuses the launch.
 - `deep_park`: SGLang's memory saver hooks (the saver adapter and an importable
-  torch_memory_saver) and the release, resume, weight update from disk and
-  flush routes; vLLM's sleep mode and middleware destinations and its sleep,
-  wake, collective RPC and prefix cache routes. Missing refuses a deployment
-  declared `deep` (use `restart_only`) and any Park.
+  torch_memory_saver), the memory saver and weights CPU backup ServerArgs
+  fields and the release, resume, weight update from disk and flush routes;
+  vLLM's sleep mode and middleware destinations and its sleep, wake,
+  collective RPC and prefix cache routes. It is the parking capability of
+  both parking tiers: missing refuses a deployment declared `deep` or
+  `host_backed` (discrete GPU design §5; use `restart_only`) and any Park.
+  `host_backed` drives a subset of these shapes (no disk reload, no
+  collective RPC), so a build must carry the whole set to park either way.
 - `metrics`: the gauges the host agent scrapes for load reports. Missing
   degrades load reporting only; it never refuses a launch.
 - `observation` (SGLang): the scheduler and saver shapes the allocation
@@ -240,7 +244,11 @@ def sglang_observation(importer, launch=None):
 
 
 def sglang_required(settings):
-    """The capabilities an SGLang launch with these typed settings depends on."""
+    """The capabilities an SGLang launch with these typed settings depends on.
+
+    Either parking tier renders the memory saver (`deep`, and `host_backed`
+    with its weights CPU backup), so both need `deep_park`.
+    """
     return ("core", "deep_park") if settings.get("memory_saver") is True else ("core",)
 
 

@@ -6,6 +6,76 @@
 
 pub mod process;
 
+/// Final review I14: an isolated home for every `mllm` process a test spawns,
+/// one per test binary, owner-only, so a spawned role or client never reads
+/// the developer's `~/.config/mllm/engines.yaml`, host document or state.
+/// It lives in cargo's scratch directory for integration tests
+/// (`CARGO_TARGET_TMPDIR`), never in the developer's home; a test that
+/// starts a role states its own `MLLM_STATE_DIR` under an owner-only root.
+pub fn isolated_home() -> &'static std::path::Path {
+    use std::os::unix::fs::PermissionsExt;
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    /// Removes the isolated home when the test binary exits (the harness
+    /// exits through `exit`, which runs `atexit` handlers).
+    extern "C" fn remove_home() {
+        if let Some(home) = HOME.get() {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+    HOME.get_or_init(|| {
+        let home = tempfile::Builder::new()
+            .prefix("mllm-test-home-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("an isolated home")
+            .keep();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for dir in [".config", ".local/state", ".local/share", ".cache"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        // SAFETY: `remove_home` is a plain function that only reads an
+        // initialised static; registering it has no other precondition.
+        unsafe {
+            libc::atexit(remove_home);
+        }
+        home
+    })
+}
+
+/// Final review I14: `isolate(command)` points `HOME` and every XDG base
+/// directory of a spawned `mllm` at [`isolated_home`] and drops every
+/// `MLLM_*` and `HF_*` variable of the developer's environment (a role
+/// document named by `MLLM_CONFIG` included). A test that states its own `HOME` or
+/// `XDG_CONFIG_HOME` afterwards still wins, since later `env` calls replace
+/// these.
+pub fn isolate(command: &mut std::process::Command) -> &mut std::process::Command {
+    let home = isolated_home();
+    // Re-review: the developer's own `MLLM_*` and `HF_*` settings (a state
+    // root, an engine, a management address, a Hugging Face token or
+    // endpoint) never reach a spawned process; a test states what it needs
+    // after this.
+    for (name, _) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if text.starts_with("MLLM_") || text.starts_with("HF_") {
+            command.env_remove(&name);
+        }
+    }
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env_remove("MLLM_CONFIG")
+}
+
+/// The `mllm` binary under test, isolated from the developer's home
+/// ([`isolate`]). Every test spawns the binary through this.
+pub fn mllm() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mllm"));
+    isolate(&mut command);
+    command
+}
+
 use std::sync::Arc;
 
 use axum::response::IntoResponse as _;
@@ -46,8 +116,94 @@ pub async fn try_boot_on(
             ports,
             deep_park: false,
             members: None,
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
+    )
+    .await
+}
+
+/// As [`try_boot_on`], sampling the host's GPUs through `gpu` (design §1)
+/// instead of the machine's own `nvidia-smi`.
+pub async fn try_boot_with_gpu(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_with_gpu(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
+        }),
+        test_memory(),
+        Arc::new(gpu),
+    )
+    .await
+}
+
+/// As [`try_boot_with_gpu`], with deep parking set by `deep_park` and the
+/// model store at `models_root`, so a test can size a checkpoint it wrote.
+pub async fn try_boot_discrete(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+    models_root: &std::path::Path,
+    deep_park: bool,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    try_boot_discrete_with_kv(state_dir, gpu, models_root, deep_park, None).await
+}
+
+/// As [`try_boot_discrete`], on the engine port range `ports`: a test that
+/// restarts the role passes the same range again (it is part of the
+/// generated policy).
+pub async fn try_boot_discrete_on(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+    models_root: &std::path::Path,
+    ports: (u16, u16),
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_with_gpu(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports,
+            deep_park: true,
+            members: None,
+            models_root: Some(models_root.to_path_buf()),
+            kv_cache: None,
+            source_origin: None,
+        }),
+        test_memory(),
+        Arc::new(gpu),
+    )
+    .await
+}
+
+/// As [`try_boot_discrete`], with the KV cache the operator stated
+/// (`MLLM_KV_CACHE_BYTES`) when `kv_cache` is `Some`.
+pub async fn try_boot_discrete_with_kv(
+    state_dir: &std::path::Path,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+    models_root: &std::path::Path,
+    deep_park: bool,
+    kv_cache: Option<&'static str>,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_with_gpu(
+        state_dir,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park,
+            members: None,
+            models_root: Some(models_root.to_path_buf()),
+            kv_cache,
+            source_origin: None,
+        }),
+        test_memory(),
+        Arc::new(gpu),
     )
     .await
 }
@@ -70,6 +226,9 @@ pub async fn boot_deep_parking(
             ports: engine_ports(),
             deep_park: true,
             members: Some(members),
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
     )
@@ -101,8 +260,67 @@ pub async fn boot_configured_on(
             ports,
             deep_park: false,
             members: None,
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
         }),
         test_memory(),
+    )
+    .await
+}
+
+/// Owner decision 2026-09-25: boot with the role document `config` (if any),
+/// this run's model flags, and an installation whose models directory is
+/// `models_root` (an empty path names none, as `MLLM_MODELS_ROOT` unset does;
+/// `None` is the testkit's store). Model-source downloads are served from
+/// `source_origin`, else from an origin nothing listens on; the GPUs are
+/// sampled through `gpu`.
+pub async fn boot_with_models(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+    models_root: Option<std::path::PathBuf>,
+    flags: &mllm_cli::roles::ModelOverrides,
+    source_origin: Option<String>,
+    gpu: impl Fn() -> Option<mllm_agent::gpu_memory::GpuSample> + Send + Sync + 'static,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_configured_with_models(
+        state_dir,
+        config,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+            models_root,
+            kv_cache: None,
+            source_origin,
+        }),
+        test_memory(),
+        Arc::new(gpu),
+        flags,
+    )
+    .await
+}
+
+/// Owner decision 2026-09-25: boot with the role document `config` (if any)
+/// and this run's generic overrides (`--set`, `MLLM_SET__…`).
+pub async fn boot_with_overrides(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+    overrides: &mllm_cli::roles::SettingOverrides,
+) -> Result<mllm_cli::roles::App, mllm_cli::roles::StartError> {
+    mllm_cli::roles::start_standalone_configured_with_overrides(
+        state_dir,
+        config,
+        Arc::new(PortedProvider {
+            ports: engine_ports(),
+            deep_park: false,
+            members: None,
+            models_root: None,
+            kv_cache: None,
+            source_origin: None,
+        }),
+        test_memory(),
+        overrides,
     )
     .await
 }
@@ -123,6 +341,45 @@ pub const TEST_CAPACITY_BYTES: i64 = 32 << 30;
 /// memory free on a busy one (a document sized from the whole machine asked
 /// for a fifth of it at cold start).
 pub const BINARY_TEST_CAPACITY_BYTES: i64 = 4 << 30;
+
+/// The template memory a test that drives the real `mllm` binary sizes its
+/// deployment document from.
+///
+/// Design §1: the binary samples this machine's GPUs with `nvidia-smi`, and a
+/// test cannot hand a sampler to another process, so it samples them the same
+/// way and generates the template for the shape the binary will publish: a
+/// machine without a GPU (or a unified one) gets the unified template sized
+/// from [`BINARY_TEST_CAPACITY_BYTES`]; a discrete one gets a device request
+/// sized for a small stated card, so it fits under the limits the binary
+/// derives from any real card and the memory free on a busy one. The toy
+/// checkpoint's weights are negligible.
+pub fn binary_template_memory() -> mllm_cli::standalone_config::TemplateMemory {
+    use mllm_agent::gpu_memory::{shape, GpuMemory, HostShape};
+    match shape(mllm_agent::gpu_memory::sample().as_ref()) {
+        Ok(HostShape::Discrete(_)) => {
+            let card = GpuMemory {
+                total_bytes: BINARY_TEST_DEVICE_BYTES,
+                used_bytes: 0,
+                free_bytes: BINARY_TEST_DEVICE_BYTES,
+            };
+            let limits = mllm_cli::standalone_config::device_limits(&card, 4);
+            mllm_cli::standalone_config::TemplateMemory::Device {
+                managed_limit: limits.managed_limit,
+                device_total: card.total_bytes,
+                weights_bytes: Some(0),
+                system_parked_limit: BINARY_TEST_CAPACITY_BYTES / 4,
+                kv_cache_bytes: None,
+            }
+        }
+        _ => mllm_cli::standalone_config::TemplateMemory::Unified {
+            capacity_bytes: BINARY_TEST_CAPACITY_BYTES,
+        },
+    }
+}
+
+/// The card a binary test sizes a discrete deployment for (see
+/// [`binary_template_memory`]).
+pub const BINARY_TEST_DEVICE_BYTES: i64 = 10 << 30;
 
 pub fn test_memory() -> mllm_cli::host_observation::MemoryReader {
     mllm_cli::host_observation::fixed_memory(TEST_CAPACITY_BYTES, TEST_CAPACITY_BYTES)
@@ -145,6 +402,13 @@ struct PortedProvider {
     deep_park: bool,
     /// Real processes the Fake reports as its launched group, if any.
     members: Option<Vec<mllm_domain::completion::ProcessIdentity>>,
+    /// The model store, when the test states one.
+    models_root: Option<std::path::PathBuf>,
+    /// The KV cache the operator stated (`MLLM_KV_CACHE_BYTES`), if any.
+    kv_cache: Option<&'static str>,
+    /// The loopback origin model-source downloads are served from; unset,
+    /// one nothing listens on, so no test reaches the network.
+    source_origin: Option<String>,
 }
 
 impl mllm_controller::EngineProvider for PortedProvider {
@@ -154,6 +418,13 @@ impl mllm_controller::EngineProvider for PortedProvider {
         let mut installation = mllm_testkit::fake_installation();
         installation.engine_ports = self.ports;
         installation.deep_park = self.deep_park;
+        if let Some(root) = &self.models_root {
+            installation.models_root = root.clone();
+        }
+        if let Some(kv) = self.kv_cache {
+            installation.engine_config["memory"]["kv_cache"] = kv.into();
+            installation.kv_cache_declared = true;
+        }
         Ok(installation)
     }
 
@@ -176,6 +447,14 @@ impl mllm_controller::EngineProvider for PortedProvider {
 
     fn tools_factory(&self) -> mllm_controller::coordinator::ToolsFactory {
         mllm_testkit::fake_tools_factory()
+    }
+
+    fn model_source_origin(&self) -> Option<String> {
+        Some(
+            self.source_origin
+                .clone()
+                .unwrap_or_else(|| mllm_testkit::NO_NETWORK_ORIGIN.into()),
+        )
     }
 }
 

@@ -26,6 +26,8 @@ pub mod enrollment;
 pub mod engines;
 pub mod events;
 pub mod hosts;
+// Design §9: the inference listener's bind and authentication, for status.
+pub mod inference_listener;
 // ADR 0008: the standalone role's embedded installation.
 pub mod installation;
 // SPEC §17 (M80): router, ingress and engine latency distributions.

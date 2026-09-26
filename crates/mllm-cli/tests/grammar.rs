@@ -151,7 +151,7 @@ fn deploy_flags() {
     ])
     .unwrap();
     assert!(
-        matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true, revision: None} if f == std::path::Path::new("d.yaml"))
+        matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true, revision: None, hf_endpoint: None} if f == std::path::Path::new("d.yaml"))
     );
 }
 
@@ -235,13 +235,13 @@ fn request_identity_is_canonicalized() {
 fn validate_config_file() {
     let c = parse(["mllm", "validate", "config", "--file", "host.yaml"]).unwrap();
     assert!(
-        matches!(c, Command::Validate{file, host: None} if file == std::path::Path::new("host.yaml"))
+        matches!(c, Command::Validate{file, host: None, ..} if file == std::path::Path::new("host.yaml"))
     );
     let c = parse([
         "mllm", "validate", "config", "--file", "d.yaml", "--host", "h.yaml",
     ])
     .unwrap();
-    assert!(matches!(c, Command::Validate{file, host: Some(host)}
+    assert!(matches!(c, Command::Validate{file, host: Some(host), ..}
         if file == std::path::Path::new("d.yaml") && host == std::path::Path::new("h.yaml")));
 }
 
@@ -555,4 +555,307 @@ fn engine_commands_parse() {
         parse(["mllm", "list", "engines"]).unwrap().label(),
         "list engines"
     );
+}
+
+// T01 (design §9): `--listen <addr:port>` narrows the inference bind of
+// `start standalone` and `start server`, and of no other command.
+#[test]
+fn listen_is_parsed_on_start_standalone_and_server() {
+    let i =
+        parse_invocation(["mllm", "start", "standalone", "--listen", "100.64.0.5:8443"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Standalone)));
+    assert_eq!(i.listen, Some("100.64.0.5:8443".parse().unwrap()));
+    let i = parse_invocation(["mllm", "start", "server", "--listen", "[::]:9443"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Server)));
+    assert_eq!(i.listen, Some("[::]:9443".parse().unwrap()));
+    assert_eq!(
+        parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .listen,
+        None
+    );
+    for bad in ["bad", "0.0.0.0:0", "224.0.0.1:8443", "0.0.0.0"] {
+        assert!(
+            parse_invocation(["mllm", "start", "standalone", "--listen", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(parse_invocation(["mllm", "start", "host", "--listen", "0.0.0.0:1"]).is_err());
+    assert!(parse_invocation(["mllm", "status", "--listen", "0.0.0.0:1"]).is_err());
+}
+
+// T01 T37 (design §9): `--no-inference-auth` turns the inference key off for
+// one run of `start standalone` and `start server`, and of no other command.
+#[test]
+fn no_inference_auth_is_parsed_on_start_standalone_and_server() {
+    let i = parse_invocation(["mllm", "start", "standalone", "--no-inference-auth"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Standalone)));
+    assert!(i.no_inference_auth);
+    let i = parse_invocation(["mllm", "start", "server", "--no-inference-auth"]).unwrap();
+    assert!(matches!(i.command, Command::Start(Role::Server)));
+    assert!(i.no_inference_auth);
+    assert!(
+        !parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .no_inference_auth
+    );
+    assert!(parse_invocation(["mllm", "start", "host", "--no-inference-auth"]).is_err());
+    assert!(parse_invocation(["mllm", "status", "--no-inference-auth"]).is_err());
+}
+
+// T01 T03 (owner decision 2026-09-25): `--models-root`, `--model-sources` and
+// `--model-sources-max` on `start standalone` and `start host`, the roles
+// that hold a model store; malformed values are refused at parse time.
+#[test]
+fn model_flags_are_parsed_on_start_standalone_and_host() {
+    use mllm_config::model_source::SourceSwitch;
+    for role in ["standalone", "host"] {
+        let i = parse_invocation([
+            "mllm",
+            "start",
+            role,
+            "--models-root",
+            "/data/models",
+            "--model-sources",
+            "disabled",
+            "--model-sources-max",
+            "100GiB",
+        ])
+        .unwrap();
+        assert_eq!(
+            i.model_overrides.models_root.as_deref(),
+            Some(std::path::Path::new("/data/models"))
+        );
+        assert_eq!(i.model_overrides.sources, Some(SourceSwitch::Denied));
+        assert_eq!(i.model_overrides.sources_max.as_deref(), Some("100GiB"));
+        let i = parse_invocation(["mllm", "start", role, "--model-sources", "allowed"]).unwrap();
+        assert_eq!(i.model_overrides.sources, Some(SourceSwitch::Allowed));
+        assert!(parse_invocation(["mllm", "start", role, "--model-sources", "maybe"]).is_err());
+        assert!(parse_invocation(["mllm", "start", role, "--model-sources-max", "lots"]).is_err());
+        // A relative directory is made absolute against the working directory.
+        let i = parse_invocation(["mllm", "start", role, "--models-root", "m"]).unwrap();
+        assert!(i.model_overrides.models_root.unwrap().is_absolute());
+    }
+    assert_eq!(
+        parse_invocation(["mllm", "start", "standalone"])
+            .unwrap()
+            .model_overrides,
+        Default::default()
+    );
+    assert!(parse_invocation(["mllm", "start", "server", "--models-root", "/m"]).is_err());
+}
+
+// T03 (owner rule 2026-09-25: every setting three ways): the engine and
+// download flags parse on `start standalone` and `start host`, `--kv-cache`
+// on standalone only, `--state-dir` on every command, and `--hf-endpoint` on
+// `deploy model`; a malformed value is refused by the parser.
+#[test]
+fn engine_flags_are_parsed_on_start_standalone_and_host() {
+    use mllm_config::effective::InstallationDrift;
+    use mllm_config::engine_settings::EngineOverrides;
+    for role in ["standalone", "host"] {
+        let i = parse_invocation([
+            "mllm",
+            "start",
+            role,
+            "--vllm-bin",
+            "/opt/vllm/bin/vllm",
+            "--sglang-bin",
+            "/opt/sglang/bin/python3",
+            "--engine-fingerprint",
+            "vllm 0.29.0",
+            "--engine-args",
+            "--enforce-eager --max-num-seqs 4",
+            "--deep-park",
+            "off",
+            "--trust-remote-code",
+            "true",
+            "--installation-drift",
+            "refuse",
+            "--runtime-dir",
+            "/opt/mllm/runtime",
+            "--engine-ports",
+            "9000-9099",
+            "--cuda-home",
+            "/usr/local/cuda-13.0",
+            "--model-sources-path",
+            "/data/downloads",
+            "--hf-endpoint",
+            "https://mirror.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            i.engine_overrides,
+            EngineOverrides {
+                vllm: Some("/opt/vllm/bin/vllm".into()),
+                sglang: Some("/opt/sglang/bin/python3".into()),
+                build_fingerprint: Some("vllm 0.29.0".into()),
+                args: Some(vec![
+                    "--enforce-eager".into(),
+                    "--max-num-seqs".into(),
+                    "4".into()
+                ]),
+                kv_cache: None,
+                deep_park: Some(false),
+                trust_remote_code: Some(true),
+                installation_drift: Some(InstallationDrift::Refuse),
+                runtime_dir: Some("/opt/mllm/runtime".into()),
+                engine_ports: Some((9000, 9099)),
+                cuda_home: Some("/usr/local/cuda-13.0".into()),
+            }
+        );
+        assert_eq!(
+            i.model_overrides.sources_path.as_deref(),
+            Some(std::path::Path::new("/data/downloads"))
+        );
+        assert_eq!(
+            i.model_overrides.hf_endpoint.as_deref(),
+            Some("https://mirror.example")
+        );
+        for (flag, bad) in [
+            ("--deep-park", "disabled"),
+            ("--trust-remote-code", "yes"),
+            ("--installation-drift", "ignore"),
+            ("--engine-ports", "80-90"),
+            ("--hf-endpoint", "http://mirror.example"),
+        ] {
+            assert!(
+                parse_invocation(["mllm", "start", role, flag, bad]).is_err(),
+                "{flag} {bad}"
+            );
+        }
+    }
+    let i = parse_invocation(["mllm", "start", "standalone", "--kv-cache", "8GiB"]).unwrap();
+    assert_eq!(i.engine_overrides.kv_cache.as_deref(), Some("8GiB"));
+    assert!(parse_invocation(["mllm", "start", "host", "--kv-cache", "8GiB"]).is_err());
+    assert!(parse_invocation(["mllm", "start", "standalone", "--kv-cache", "lots"]).is_err());
+    assert!(parse_invocation(["mllm", "start", "server", "--vllm-bin", "/v"]).is_err());
+    // `--state-dir` on any command.
+    let i = parse_invocation(["mllm", "--state-dir", "/srv/mllm", "list", "hosts"]).unwrap();
+    assert_eq!(
+        i.state_dir.as_deref(),
+        Some(std::path::Path::new("/srv/mllm"))
+    );
+    let i = parse_invocation(["mllm", "start", "standalone", "--state-dir", "/srv/s"]).unwrap();
+    assert_eq!(i.state_dir.as_deref(), Some(std::path::Path::new("/srv/s")));
+    // `--hf-endpoint` on `deploy model`.
+    assert!(matches!(
+        parse([
+            "mllm",
+            "deploy",
+            "model",
+            "--file",
+            "d.yaml",
+            "--hf-endpoint",
+            "http://127.0.0.1:9"
+        ]),
+        Ok(Command::Deploy { hf_endpoint: Some(endpoint), .. }) if endpoint == "http://127.0.0.1:9"
+    ));
+}
+
+// T03 (owner decision 2026-09-25): `--set path=value` (repeatable) on every
+// role start, `validate config` and `config show`; `--management-listen` on
+// `start standalone` (loopback only).
+#[test]
+fn generic_overrides_and_config_show_parse() {
+    for role in ["server", "host", "standalone"] {
+        let i = parse_invocation([
+            "mllm",
+            "start",
+            role,
+            "--set",
+            "shutdown.drain_timeout=45s",
+            "--set",
+            "a.b=c=d",
+        ])
+        .unwrap();
+        assert_eq!(
+            i.sets,
+            vec!["shutdown.drain_timeout=45s", "a.b=c=d"],
+            "{role}"
+        );
+        for bad in ["novalue", "=x", "a.b="] {
+            assert!(
+                parse_invocation(["mllm", "start", role, "--set", bad]).is_err(),
+                "{role} {bad}"
+            );
+        }
+    }
+    let i = parse_invocation([
+        "mllm", "validate", "config", "--file", "s.yaml", "--set", "name=x",
+    ])
+    .unwrap();
+    assert!(matches!(&i.command, Command::Validate { sets, .. } if sets == &["name=x"]));
+    assert_eq!(i.sets, vec!["name=x"]);
+    let i = parse_invocation([
+        "mllm",
+        "config",
+        "show",
+        "--role",
+        "host",
+        "--set",
+        "load_report_interval=2s",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        &i.command,
+        Command::ConfigShow { role: Some(Role::Host), sets } if sets == &["load_report_interval=2s"]
+    ));
+    assert!(parse_invocation(["mllm", "config", "show", "--role", "engine"]).is_err());
+    assert!(parse_invocation(["mllm", "list", "hosts", "--set", "a=b"]).is_err());
+    let i = parse_invocation([
+        "mllm",
+        "start",
+        "standalone",
+        "--management-listen",
+        "127.0.0.1:7543",
+    ])
+    .unwrap();
+    assert_eq!(i.management_listen, Some("127.0.0.1:7543".parse().unwrap()));
+    for bad in ["0.0.0.0:7543", "127.0.0.1:0", "localhost"] {
+        assert!(
+            parse_invocation(["mllm", "start", "standalone", "--management-listen", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    // Final review I8: the server takes `--management-listen` too, with the
+    // same loopback rule.
+    let i = parse_invocation([
+        "mllm",
+        "start",
+        "server",
+        "--management-listen",
+        "127.0.0.1:7543",
+    ])
+    .unwrap();
+    assert_eq!(i.management_listen, Some("127.0.0.1:7543".parse().unwrap()));
+    assert!(parse_invocation([
+        "mllm",
+        "start",
+        "server",
+        "--management-listen",
+        "0.0.0.0:7543"
+    ])
+    .is_err());
+    assert!(parse_invocation([
+        "mllm",
+        "start",
+        "host",
+        "--management-listen",
+        "127.0.0.1:7543"
+    ])
+    .is_err());
+    // `join host --set` applies the host document's overrides as `start host`.
+    let i = parse_invocation([
+        "mllm",
+        "join",
+        "host",
+        "--join-file",
+        "/tmp/j",
+        "--set",
+        "load_report_interval=2s",
+    ])
+    .unwrap();
+    assert_eq!(i.sets, ["load_report_interval=2s"]);
 }

@@ -596,7 +596,7 @@ impl NativeHostExecution {
         let checkpoints = self.checkpoints.clone();
         let journal = self.journal.clone();
         let handle = owner.identity.command_id.clone();
-        let store = effective.host.model_store.clone();
+        let store = effective.checkpoint_store().to_path_buf();
         let _ = tokio::task::spawn_blocking(move || {
             let measured = checkpoints
                 .measure(&store, std::path::Path::new(&checkpoint))

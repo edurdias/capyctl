@@ -179,8 +179,77 @@ fn an_unnamed_claim_never_takes_a_device_named_by_another_claim() {
     let host = json!({"resource_policy": {"devices": {"gpu0": {}, "gpu1": {}}}});
     let deployment = json!({"devices": [{"id": "gpu0"}, {}]});
     let assigned = mllm_config::instances::assign_devices(&deployment, &host).unwrap();
-    assert_eq!(assigned["devices"], json!([{"id": "gpu0"}, {"id": "gpu1"}]));
+    // The named claim takes the host's sharing for its device (the short pin
+    // form, final review I9); the host states none, so exclusive.
+    assert_eq!(
+        assigned["devices"],
+        json!([{"id": "gpu0", "sharing": "exclusive"}, {"id": "gpu1"}])
+    );
     // With only the named device on the host, the unnamed claim has none.
     let host = json!({"resource_policy": {"devices": {"gpu0": {}}}});
     assert!(mllm_config::instances::assign_devices(&deployment, &host).is_err());
+}
+
+/// A discrete host with two GPUs, each its own device-memory domain.
+fn two_gpu_host() -> serde_json::Value {
+    json!({"resource_policy": {
+        "device_sharing": "shared",
+        "domains": {
+            "system": {"memory": "distinct"},
+            "gpu0": {"memory": "device", "device": "gpu0"},
+            "gpu1": {"memory": "device", "device": "gpu1"}
+        },
+        "devices": {
+            "gpu1": {"domain": "gpu1", "sharing": "exclusive"},
+            "gpu0": {"domain": "gpu0"}
+        }
+    }})
+}
+
+// T27: discrete GPU design §7: a deployment that pins no device is resolved
+// once per GPU of a discrete host, lowest index first.
+#[test]
+fn an_unpinned_deployment_has_one_choice_per_gpu() {
+    use mllm_config::instances::device_choices;
+    let host = two_gpu_host();
+    let choices = device_choices(&json!({"name": "d"}), &host).unwrap();
+    let devices: Vec<_> = choices.iter().map(|(d, _)| d.as_str()).collect();
+    assert_eq!(devices, ["gpu0", "gpu1"]);
+    assert_eq!(
+        choices[0].1["devices"],
+        json!([{"id": "gpu0", "sharing": "shared"}])
+    );
+    assert_eq!(
+        choices[1].1["devices"],
+        json!([{"id": "gpu1", "sharing": "exclusive"}])
+    );
+    // An unnamed claim keeps its sharing, and takes only devices allowing it.
+    let shared = json!({"devices": [{"sharing": "shared"}]});
+    let choices = device_choices(&shared, &host).unwrap();
+    assert_eq!(choices.len(), 1);
+    assert_eq!(
+        choices[0].1["devices"],
+        json!([{"id": "gpu0", "sharing": "shared"}])
+    );
+    let exclusive = json!({"devices": [{"sharing": "exclusive"}]});
+    assert_eq!(device_choices(&exclusive, &host).unwrap().len(), 2);
+}
+
+// T27: a pin, explicit resources, several claims or a host without device
+// domains offer no choice: resolution proceeds as before.
+#[test]
+fn a_pinned_or_unified_deployment_has_no_choice() {
+    use mllm_config::instances::device_choices;
+    let host = two_gpu_host();
+    for deployment in [
+        json!({"devices": [{"id": "gpu1", "sharing": "shared"}]}),
+        json!({"devices": [{}, {}]}),
+        json!({"devices": [], "resources": {}}),
+    ] {
+        assert!(device_choices(&deployment, &host).unwrap().is_empty());
+    }
+    let (deployment, unified) = fixture();
+    let mut unpinned = deployment.clone();
+    unpinned.as_object_mut().unwrap().remove("devices");
+    assert!(device_choices(&unpinned, &unified).unwrap().is_empty());
 }

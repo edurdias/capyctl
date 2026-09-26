@@ -1,8 +1,9 @@
 //! Owner decision 2026-09-23: the startup memory budget in `validate config`.
 //! CPU-only; no engine runs here, and nothing here measures a startup peak.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -27,7 +28,7 @@ fn write(root: &Path, name: &str, value: &Value) -> PathBuf {
 }
 
 fn validate(args: &[&str]) -> (i32, Value, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .args(["validate", "config"])
         .args(args)
         .args(["--format", "json"])
@@ -62,13 +63,14 @@ fn validate_shows_the_startup_reservation_and_its_provenance() {
     for (doc, bytes, provenance) in [
         (
             derived(json!({"request": "8GiB", "kv_cache": "4GiB", "startup": "12GiB"})),
-            12_i64 << 30,
+            // The reservation carries the engine's CUDA context and graphs.
+            (12_i64 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
             "declared",
         ),
         // Weights pending: the placeholder is the request.
         (
             derived(json!({"request": "8GiB", "kv_cache": "4GiB"})),
-            8_i64 << 30,
+            (8_i64 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
             "default",
         ),
         (
@@ -128,7 +130,8 @@ fn validate_shows_the_effective_context() {
     let dir = tempfile::tempdir().unwrap();
     let models = dir.path().join("models");
     std::fs::create_dir_all(models.join("toy")).unwrap();
-    // 512 KiB of bfloat16 KV per token: the 4 GiB grant holds 8192.
+    // 512 KiB of bfloat16 KV per token: the 4 GiB grant holds 8192, of
+    // which vLLM keeps one 16-token block (8176).
     std::fs::write(
         models.join("toy/config.json"),
         json!({
@@ -145,7 +148,7 @@ fn validate_shows_the_effective_context() {
     let mut doc = golden()["input"]["deployment"].clone();
     doc["model"]["path"] = json!(models.join("toy"));
     for (declared, expected) in [
-        (None, json!({"tokens": 8192, "source": "fitted"})),
+        (None, json!({"tokens": 8176, "source": "fitted"})),
         (Some(2048), json!({"tokens": 2048, "source": "declared"})),
     ] {
         if let Some(tokens) = declared {

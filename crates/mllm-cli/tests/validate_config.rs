@@ -3,8 +3,9 @@
 //! and resolution the product uses, reporting named errors and performing no
 //! side effects.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -34,7 +35,7 @@ fn write(root: &Path, name: &str, text: &str) -> PathBuf {
 }
 
 fn validate(args: &[&str]) -> (i32, Value, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .arg("validate")
         .arg("config")
         .args(args)
@@ -427,6 +428,7 @@ fn every_documented_example_passes_validate_config() {
         .collect();
     files.sort();
     let mut kinds = Vec::new();
+    let mut minimal = false;
     for file in &files {
         let (code, value, raw) = validate(&["--file", file.to_str().unwrap()]);
         assert_eq!(code, 0, "{}: {raw}", file.display());
@@ -442,12 +444,75 @@ fn every_documented_example_passes_validate_config() {
             ]);
             assert_eq!(code, 0, "{} against host.yaml: {raw}", file.display());
             assert_eq!(value["resolved_against"], "gpu-box", "{raw}");
+            // T14 (owner decision 2026-09-25): the minimal example resolves
+            // to a complete document on the example host.
+            if file.ends_with("deployment-minimal.yaml") {
+                assert_eq!(
+                    value["document"]["routes"],
+                    serde_json::json!(["coding-small"])
+                );
+                assert_eq!(value["document"]["runtime_profile"], "vllm");
+                assert!(
+                    value["document"]["runtime_profile_revision"].is_u64(),
+                    "{raw}"
+                );
+                assert_eq!(value["document"]["devices"][0]["id"], "gpu0");
+                assert_eq!(value["effective"]["residency"], "deep", "{raw}");
+                minimal = true;
+            }
         }
         kinds.push(kind);
     }
     kinds.sort();
     kinds.dedup();
     assert_eq!(kinds, ["deployment", "host", "server", "standalone"]);
+    assert!(
+        minimal,
+        "docs/examples/deployment-minimal.yaml is validated"
+    );
+}
+
+// T03 T26 (ADR 0019): the discrete-GPU host example validates, and the
+// minimal deployment resolves on it to a budget charging both the GPU's
+// device domain and the system domain.
+#[test]
+fn the_discrete_host_example_validates() {
+    let host = examples().join("host-discrete.yaml");
+    let (code, value, raw) = validate(&["--file", host.to_str().unwrap()]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["valid"], true, "{raw}");
+    assert_eq!(value["kind"], "host", "{raw}");
+    let minimal = examples().join("deployment-minimal.yaml");
+    let (code, value, raw) = validate(&[
+        "--file",
+        minimal.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    // Its weights are unknown offline, so it is provisional (final review
+    // I10); a deployment stating its memory shows the budget.
+    assert_eq!(value["provisional"], true, "{raw}");
+    let dir = tempfile::tempdir().unwrap();
+    let sized = write(
+        dir.path(),
+        "sized.yaml",
+        "name: sized\nengine: vllm\nmodel: coding-small-r1\nengine_config:\n  memory:\n    request: 12GiB\n    kv_cache: 2GiB\n",
+    );
+    let (code, value, raw) = validate(&[
+        "--file",
+        sized.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    let domains: Vec<&str> = value["effective"]["resources"]["ready"]["allocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(domains, ["gpu0", "system"], "{raw}");
 }
 
 // T03 (ADR 0013 §2, §3): resolving against a host runs the server's per-host
@@ -477,4 +542,69 @@ fn a_multi_host_deployment_resolves_on_an_allowed_host_only() {
         value["message"].as_str().unwrap().contains("gpu-box"),
         "{raw}"
     );
+}
+
+// T03 (final review I10): `validate config` runs the checks `start
+// standalone` runs before any side effect, so a standalone document that
+// binds management beyond loopback is refused here (before, it validated and
+// only the start refused it). The documented example still validates.
+#[test]
+fn a_standalone_document_start_refuses_is_refused_by_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let text = format!(
+        "schema_version: 1\nkind: standalone\nname: local\nserver:\n  name: local\n  state_dir: {}\n  listeners:\n    management:\n      bind: \"0.0.0.0:7443\"\n      authentication: admin_token\n",
+        state.join("server").display()
+    );
+    let file = write(dir.path(), "standalone.yaml", &text);
+    let (code, _, raw) = validate(&["--file", file.to_str().unwrap()]);
+    assert_eq!(code, 2, "{raw}");
+    assert!(raw.contains("server.listeners.management"), "{raw}");
+    let loopback = write(
+        dir.path(),
+        "loopback.yaml",
+        &text.replace("0.0.0.0:7443", "127.0.0.1:7443"),
+    );
+    let (code, value, raw) = validate(&["--file", loopback.to_str().unwrap()]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["valid"], true);
+    // A state directory outside the root the start uses is refused too.
+    let (code, _, raw) = validate(&[
+        "--file",
+        loopback.to_str().unwrap(),
+        "--state-dir",
+        dir.path().join("elsewhere").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "{raw}");
+    assert!(raw.contains("server.state_dir"), "{raw}");
+}
+
+// T03 T14 (final review I10, ADR 0014 §7): offline validation does not know
+// a checkpoint's weights. A deployment sized from them is reported
+// provisional with every weight-derived figure unknown, never a request
+// sized from zero bytes or a host_backed tier for a zero-byte copy.
+#[test]
+fn unknown_weights_are_reported_unknown_not_zero() {
+    let host = examples().join("host-discrete.yaml");
+    let dir = tempfile::tempdir().unwrap();
+    let file = write(
+        dir.path(),
+        "remote.yaml",
+        "name: remote\nengine: vllm\nmodel: {hf: org/model@0123456789abcdef0123456789abcdef01234567}\n",
+    );
+    let (code, value, raw) = validate(&[
+        "--file",
+        file.to_str().unwrap(),
+        "--host",
+        host.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{raw}");
+    assert_eq!(value["provisional"], true, "{raw}");
+    let effective = &value["effective"];
+    let unknown = "unknown until the checkpoint is measured (after deploy)";
+    assert_eq!(effective["memory"]["request_bytes"], unknown, "{raw}");
+    assert_eq!(effective["memory"]["weights_bytes"], unknown, "{raw}");
+    assert_eq!(effective["resources"], unknown, "{raw}");
+    assert_eq!(effective["residency"], unknown, "{raw}");
+    assert_ne!(effective["residency"], "host_backed");
 }

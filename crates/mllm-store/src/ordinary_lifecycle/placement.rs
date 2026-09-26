@@ -20,6 +20,7 @@ use crate::instances::{draw_generation, instance_owner_id};
 use crate::resource_ledger::{read_snapshot, scoped_to_domain_hosts};
 use mllm_config::instances::{Placement, PlacementStrategy};
 use mllm_domain::resources::MemoryLimit;
+use mllm_scheduler::device_choice::DeviceOption;
 use mllm_scheduler::placement::{place, HostCandidate, Strategy};
 use std::collections::BTreeSet;
 
@@ -192,7 +193,11 @@ pub(super) fn candidates(
         // managed limit for a solo first start.
         let (footprint, whole_host) =
             super::startup::startup_footprint(tx, deployment_id, revision, &e)?;
+        let (device_options, preferred_device) =
+            device_options(tx, deployment_id, revision, instance, &host)?;
         candidates.push(HostCandidate {
+            device_options,
+            preferred_device,
             occupied,
             whole_host,
             // ADR 0018 §4: nor while the deployment's profile is retiring on
@@ -214,6 +219,59 @@ pub(super) fn candidates(
         });
     }
     Ok(candidates)
+}
+
+/// ADR 0019 (discrete GPU design §7): the GPUs of `host` the instance may
+/// run on, each with the startup footprint it resolved to there, and the GPU
+/// it last ran on when that was on this host (ADR 0013 §4 step 5). Empty when
+/// the host offered no GPU choice for the revision (a unified host, a pinned
+/// device, explicit resources).
+fn device_options(
+    tx: &Transaction<'_>,
+    deployment_id: &str,
+    revision: i64,
+    instance: u32,
+    host: &str,
+) -> Result<(Vec<DeviceOption>, Option<String>), LifecycleError> {
+    let rows: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT device,effective_json FROM host_device_effective_revisions
+              WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 ORDER BY device",
+        )?
+        .query_map(params![deployment_id, revision, host], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut options = Vec::with_capacity(rows.len());
+    for (device, raw) in rows {
+        let on_device =
+            decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
+        let domain = on_device
+            .host
+            .devices
+            .get(&device)
+            .map(|policy| policy.domain.clone())
+            .ok_or(LifecycleError::CorruptStoredData)?;
+        let (footprint, _) =
+            super::startup::startup_footprint(tx, deployment_id, revision, &on_device)?;
+        options.push(DeviceOption {
+            device,
+            domain,
+            footprint,
+        });
+    }
+    if options.is_empty() {
+        return Ok((options, None));
+    }
+    let preferred: Option<String> = tx
+        .query_row(
+            "SELECT device FROM deployment_instances WHERE deployment_id=?1 AND instance_index=?2 AND host_id=?3",
+            params![deployment_id, instance, host],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok((options, preferred))
 }
 
 /// ADR 0013 §4, §5: get instance `instance` ready for a start: join a start in
@@ -303,7 +361,15 @@ pub(crate) fn prepare(
             }
         }
     };
-    let (raw, _) = frozen_on_host(tx, deployment_id, current, Some(&chosen.host_id))?;
+    // ADR 0019: on a multi-GPU host, the revision as resolved on the GPU
+    // placement chose; the instance records it with its host.
+    let (raw, _) = frozen_on_device(
+        tx,
+        deployment_id,
+        current,
+        Some(&chosen.host_id),
+        chosen.device.as_deref(),
+    )?;
     let e = decode_effective_snapshot(&raw).map_err(|_| LifecycleError::CorruptStoredData)?;
     let devices = serde_json::to_string(&e.selected_devices)
         .map_err(|_| LifecycleError::CorruptStoredData)?;
@@ -341,7 +407,7 @@ pub(crate) fn prepare(
         _ => draw_generation(tx, deployment_id)?,
     };
     one(tx.execute(
-        "UPDATE deployment_instances SET revision=?3,generation=?4,host_id=?5,device_json=?6,
+        "UPDATE deployment_instances SET revision=?3,generation=?4,host_id=?5,device_json=?6,device=?7,
                 placed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
           WHERE deployment_id=?1 AND instance_index=?2",
         params![
@@ -350,7 +416,8 @@ pub(crate) fn prepare(
             current,
             generation,
             chosen.host_id,
-            devices
+            devices,
+            chosen.device
         ],
     )?)?;
     Ok(Prepared::Placed(DeploymentFence {

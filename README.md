@@ -17,7 +17,9 @@ GitHub pre-releases; expect breaking changes before 0.1.0.
 
 What works in the release candidates:
 
-- vLLM and SGLang engines, one GPU per model.
+- vLLM and SGLang engines, one GPU per model, on unified-memory machines
+  (GB10) and on discrete NVIDIA cards, where mllm accounts the card's memory
+  separately and picks the GPU on a multi-GPU machine.
 - One machine (standalone) or a server with several GPU hosts.
 - Parking, waking and switching models under a memory budget.
 - An OpenAI-compatible API (`/v1/models`, `/v1/chat/completions`), with
@@ -28,8 +30,6 @@ Not there yet:
 
 - Multi-GPU models (tensor parallelism across GPUs or machines) are designed
   but parked until after 0.1.0.
-- Downloading model sources (Hugging Face, HTTP) works on enrolled hosts but
-  not in standalone.
 - No web UI; everything goes through the CLI and the management API.
 - Other GPU vendors and operating systems are not supported.
 - Deep parking relies on engine development controls. mllm keeps them on
@@ -61,25 +61,43 @@ upgrades and rollback.
 
 ## Quickstart: one machine
 
-Standalone runs the server and one host in a single process, with every
-listener on loopback. It uses one engine installation, vLLM or SGLang, taken
-from the environment:
+Standalone runs the server and one host in a single process. It uses one
+engine installation, vLLM or SGLang, named by a variable (as here), by
+`--vllm-bin` / `--sglang-bin`, or by `host.local_engine` in its document; every
+setting works those three ways (see
+[`docs/operations/configuration.md`](docs/operations/configuration.md)):
 
 ```bash
 export MLLM_VLLM_BIN=/path/to/venv/bin/vllm   # or MLLM_SGLANG_BIN
-export MLLM_MODELS_ROOT=/srv/models
-mllm start standalone                          # inference on 127.0.0.1:8443
+mllm start standalone                          # inference on 0.0.0.0:8443, key required
 ```
 
 The first start writes its role document and credentials under
-`~/.local/state/mllm`. In another shell, write a deployment document for a
-model under `MLLM_MODELS_ROOT` (start from
-[`docs/examples/deployment-single.yaml`](docs/examples/deployment-single.yaml);
-in standalone the engine installation, `runtime_profile`, is named `local`),
-then deploy it and check on it:
+`~/.local/state/mllm`. Models live in `~/models` (created on first start);
+name another directory with `--models-root`, `MLLM_MODELS_ROOT` or
+`host.model_store.path`. A deployment may also name a Hugging Face or HTTP
+source: mllm downloads it into `~/models/sources`, checking free disk space
+first and capping all downloads at 500 GiB (`--model-sources disabled` or
+`MLLM_MODEL_SOURCES=disabled` turns downloads off; `--model-sources-max` or
+`MLLM_MODEL_SOURCES_MAX` changes the cap). In another shell, write a
+deployment document. Three fields are enough:
+
+```yaml
+name: qwen3-4b
+engine: vllm                 # or sglang
+model: Qwen3-4B              # a directory under ~/models, an absolute path,
+                             # or {hf: Qwen/Qwen3-4B-Instruct-2507}
+```
+
+mllm fills in the rest: the route is the name, the engine's memory is sized
+from the checkpoint and the GPU, the GPU is picked, and the park tier follows
+the hardware. A Hugging Face repository is pinned to the commit it names when
+you deploy. Every other field of
+[`docs/examples/deployment-single.yaml`](docs/examples/deployment-single.yaml)
+may be added to override a default. Then deploy it and check on it:
 
 ```bash
-mllm validate config --file deployment.yaml
+mllm validate config --file deployment.yaml   # shows the defaults it fills in
 mllm deploy model --file deployment.yaml --activate --wait
 mllm list deployments
 mllm status deployment <name>
@@ -119,6 +137,11 @@ curl http://127.0.0.1:8443/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"model": "<route>", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+From another machine, use this machine's name or Tailscale address instead
+of `127.0.0.1`. To keep inference on this machine only, start with
+`--listen 127.0.0.1:8443`; to narrow it to a tailnet or put it behind a TLS
+proxy, see [`docs/operations/network-access.md`](docs/operations/network-access.md).
 
 `mllm stop deployment <name>` stops the model and releases its memory;
 `mllm start deployment <name>` brings it back. `mllm delete deployment <name> --stop`
@@ -182,6 +205,9 @@ Upgrade the server first, then the hosts one at a time.
 
 - [`docs/operations/install.md`](docs/operations/install.md): install,
   services, upgrades, rollback and exit codes.
+- [`docs/operations/configuration.md`](docs/operations/configuration.md):
+  every setting, with its YAML field, flag and environment variable, and the
+  one precedence rule (flag, then variable, then YAML, then default).
 - [`docs/examples/`](docs/examples/): example server, host, standalone and
   deployment documents. A test checks that `mllm validate config` accepts
   them; they show the schema and are not tested engine recipes.

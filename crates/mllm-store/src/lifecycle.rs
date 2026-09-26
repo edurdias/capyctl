@@ -368,6 +368,12 @@ pub enum LifecycleError {
     /// or recorded one, or its weights do not resolve the revision.
     #[error("checkpoint does not match its recorded digest")]
     CheckpointMismatch,
+    /// Discrete GPU design §11 (found live on a 16 GB card): the measured
+    /// weights do not resolve the revision for a closed reason, kept as its
+    /// `<code>: ...` text (`insufficient_device_memory: ...`); a new revision
+    /// is needed.
+    #[error("{0}")]
+    CheckpointUnusable(String),
     /// ADR 0008: the revision's declared remote model source is not yet
     /// materialized on any host; activation waits for it.
     #[error("model source pending")]

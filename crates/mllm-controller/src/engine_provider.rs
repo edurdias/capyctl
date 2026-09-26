@@ -37,13 +37,21 @@ pub struct EngineInstallation {
     /// value here would duplicate that validation where it could drift. Not
     /// part of the published host policy.
     pub engine_config: serde_json::Value,
+    /// Whether the operator stated the KV cache in `engine_config`
+    /// (`MLLM_KV_CACHE_BYTES`) rather than taking the unified default. A
+    /// discrete host sizes its template's KV cache from the card unless the
+    /// operator stated one, which it then honours within the card or refuses
+    /// (review decision, discrete GPU design §3).
+    pub kv_cache_declared: bool,
     /// Whether the deep-park controls may be called on this engine (SPEC §9.1, T21).
     pub deep_park: bool,
     /// Whether this installation may run an engine flag that executes Python
     /// shipped inside a checkpoint (Spec §3).
     pub trust_remote_code: bool,
     /// The directory the host keeps model weights under. Spec §7 resolves a
-    /// relative model path against it.
+    /// relative model path against it. Empty when the installation does not
+    /// name one: the role then resolves `model_store.path` or `~/models`
+    /// (owner decision 2026-09-25, `mllm_config::model_settings`).
     pub models_root: PathBuf,
     /// Where mllm's own guard middleware lives. It is not part of the frozen
     /// effective configuration: it is a property of this installation.
@@ -161,7 +169,39 @@ pub trait EngineProvider: Send + Sync {
         runtime_dir: PathBuf,
     ) -> Arc<dyn EngineBindings>;
 
+    /// [`Self::bindings`] for a host whose discrete GPUs have these totals, by
+    /// driver index (discrete GPU design §6): an engine on a device domain is
+    /// sized against its card's total. A provider whose bindings size nothing
+    /// against a card keeps the default.
+    fn bindings_for_devices(
+        &self,
+        clock: ServiceClock,
+        log_dir: PathBuf,
+        runtime_dir: PathBuf,
+        _device_totals: std::collections::BTreeMap<u32, i64>,
+    ) -> Arc<dyn EngineBindings> {
+        self.bindings(clock, log_dir, runtime_dir)
+    }
+
     /// The process tools a launch is given, built per launch around the
     /// association that records its API identity (Spec §3).
     fn tools_factory(&self) -> ToolsFactory;
+
+    /// Owner rule 2026-09-25 (every setting three ways): the role document's
+    /// `host:` block, whose `local_engine`, `runtime_dir` and
+    /// `resource_policy.endpoint_port_range` are the YAML layer of the
+    /// installation settings (flag > environment > YAML > default). Called once
+    /// at boot before [`Self::installations`]. A provider that states its
+    /// installation itself (a test double) ignores it.
+    fn configure(&self, _host: &serde_json::Value) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// Test seam: a loopback `http://127.0.0.1:<port>` origin that serves
+    /// every model-source download instead of the network (ADR 0008). A
+    /// production provider names none.
+    #[doc(hidden)]
+    fn model_source_origin(&self) -> Option<String> {
+        None
+    }
 }

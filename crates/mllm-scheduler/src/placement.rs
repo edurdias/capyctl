@@ -16,6 +16,8 @@ use mllm_domain::resources::{
     claims_conflict, validate_footprint, LedgerSnapshot, MemoryLimit, PhaseFootprint, ResourcePhase,
 };
 
+use crate::device_choice::{choose_device, DeviceOption};
+
 /// ADR 0013 §4 step 3: how candidate hosts are ordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -52,6 +54,13 @@ pub struct HostCandidate {
     /// limit, reserved for an unmeasured model whose startup estimate exceeds
     /// it. It starts only when no other owner holds a charge on the host.
     pub whole_host: bool,
+    /// Discrete GPU design §7: on a multi-GPU host, the instance resolved once
+    /// per device it may run on. Empty on a unified host and whenever the
+    /// deployment pins its device: `footprint` alone is judged, as before.
+    pub device_options: Vec<DeviceOption>,
+    /// ADR 0013 §4 step 5 for devices: the device the instance last ran on,
+    /// when this host is the one it last ran on.
+    pub preferred_device: Option<String>,
 }
 
 /// Why a host cannot take the instance.
@@ -92,6 +101,9 @@ impl HostRefusal {
 pub struct Placement {
     pub host_id: String,
     pub headroom_bytes: i64,
+    /// Discrete GPU design §7: the device chosen on that host, when the host
+    /// offered a choice (`HostCandidate::device_options`).
+    pub device: Option<String>,
 }
 
 /// No host can take the instance without releasing capacity. Every allowed
@@ -213,29 +225,24 @@ pub fn place(
             // Owner decision 2026-09-23: no other engine charge on the host.
             Err(HostRefusal::RequiresEmptyHost)
         } else {
-            fits(
-                &candidate.ledger,
-                owner,
-                &candidate.footprint,
-                &candidate.limits,
-                candidate.max_parked,
-            )
+            candidate_fits(candidate, owner)
         };
         match verdict {
-            Ok(headroom) => fitting.push((candidate, headroom)),
+            Ok((headroom, device)) => fitting.push((candidate, headroom, device)),
             Err(refusal) => refusals.push((candidate.host_id.clone(), refusal)),
         }
     }
     refusals.sort_by(|a, b| a.0.cmp(&b.0));
-    if let Some((candidate, headroom)) =
-        preferred.and_then(|host| fitting.iter().find(|(c, _)| c.host_id == host))
+    if let Some((candidate, headroom, device)) =
+        preferred.and_then(|host| fitting.iter().find(|(c, _, _)| c.host_id == host))
     {
         return Ok(Placement {
             host_id: candidate.host_id.clone(),
             headroom_bytes: *headroom,
+            device: device.clone(),
         });
     }
-    fitting.sort_by(|(a, a_room), (b, b_room)| {
+    fitting.sort_by(|(a, a_room, _), (b, b_room, _)| {
         let by_count = match strategy {
             Strategy::Spread => a.instances_here.cmp(&b.instances_here),
             Strategy::Pack => b.instances_here.cmp(&a.instances_here),
@@ -251,11 +258,41 @@ pub fn place(
     });
     fitting
         .first()
-        .map(|(candidate, headroom)| Placement {
+        .map(|(candidate, headroom, device)| Placement {
             host_id: candidate.host_id.clone(),
             headroom_bytes: *headroom,
+            device: device.clone(),
         })
         .ok_or(Unplaceable { refusals })
+}
+
+/// Whether the instance fits on this host as the ledger stands, by
+/// reservations alone: its one footprint, or, on a host offering a device
+/// choice, the device `choose_device` picks (discrete GPU design §7). The
+/// headroom and the chosen device, if any.
+pub fn candidate_fits(
+    candidate: &HostCandidate,
+    owner: &str,
+) -> Result<(i64, Option<String>), HostRefusal> {
+    if candidate.device_options.is_empty() {
+        return fits(
+            &candidate.ledger,
+            owner,
+            &candidate.footprint,
+            &candidate.limits,
+            candidate.max_parked,
+        )
+        .map(|headroom| (headroom, None));
+    }
+    choose_device(
+        &candidate.ledger,
+        owner,
+        &candidate.device_options,
+        &candidate.limits,
+        candidate.max_parked,
+        candidate.preferred_device.as_deref(),
+    )
+    .map(|(device, headroom)| (headroom, Some(device)))
 }
 
 #[cfg(test)]
@@ -312,6 +349,8 @@ mod tests {
             max_parked: 4,
             occupied: false,
             whole_host: false,
+            device_options: vec![],
+            preferred_device: None,
         }
     }
 
@@ -564,6 +603,67 @@ mod tests {
                 .unwrap()
                 .host_id,
             "host-b"
+        );
+    }
+
+    // Discrete GPU design §7: a host offering a device choice is placed on
+    // the device with room, and a stopped instance keeps its last device
+    // while it fits there.
+    // T27
+    #[test]
+    fn a_multi_gpu_host_places_on_a_device() {
+        use crate::device_choice::DeviceOption;
+        let device = |id: &str, bytes: i64| DeviceOption {
+            device: id.into(),
+            domain: id.into(),
+            footprint: PhaseFootprint {
+                phase: ResourcePhase::Cold,
+                allocations: vec![Allocation {
+                    domain: id.into(),
+                    bytes,
+                    host_kv_bytes: 0,
+                }],
+                devices: vec![],
+            },
+        };
+        let mut candidate = host("host-a", 100 * GIB, 0, &[]);
+        candidate.limits = ["gpu0", "gpu1"]
+            .iter()
+            .zip([22 * GIB, 30 * GIB])
+            .map(|(domain, managed)| MemoryLimit {
+                domain: (*domain).into(),
+                managed_bytes: managed,
+                free_reserve_bytes: 0,
+                host_kv_bytes: None,
+                parked_bytes: None,
+            })
+            .collect();
+        candidate.device_options = vec![device("gpu0", 12 * GIB), device("gpu1", 12 * GIB)];
+        let placed = place(
+            std::slice::from_ref(&candidate),
+            "d",
+            Strategy::Spread,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(placed.device.as_deref(), Some("gpu1"));
+        candidate.preferred_device = Some("gpu0".into());
+        let placed = place(&[candidate.clone()], "d", Strategy::Spread, None, None).unwrap();
+        assert_eq!(placed.device.as_deref(), Some("gpu0"));
+        candidate.device_options = vec![device("gpu0", 40 * GIB), device("gpu1", 40 * GIB)];
+        assert_eq!(
+            place(&[candidate], "d", Strategy::Spread, None, None)
+                .unwrap_err()
+                .code(),
+            "insufficient_capacity"
+        );
+        let unified = host("host-b", 100 * GIB, 0, &[]);
+        assert_eq!(
+            place(&[unified], "d", Strategy::Spread, None, None)
+                .unwrap()
+                .device,
+            None
         );
     }
 }

@@ -1,5 +1,7 @@
 //! ADR 0018: `mllm engine` against fake environments and a scripted role
 //! socket. CPU tests only; they are not qualification.
+mod support;
+
 use mllm_agent::control_socket::{ControlHandler, ControlRequest, ControlServer};
 use mllm_cli::engine::{execute, resolve_target};
 use mllm_cli::grammar::{Command, DeepParkChoice, DriftChoice};
@@ -743,7 +745,7 @@ async fn a_rerun_remove_finishes_a_removal_the_file_already_shows() {
 }
 
 fn mllm(home: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let out = support::mllm()
         .env("HOME", home)
         .env("PATH", "/nonexistent")
         .env_remove("XDG_DATA_HOME")

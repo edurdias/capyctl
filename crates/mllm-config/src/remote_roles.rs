@@ -14,6 +14,10 @@ pub struct ServerConfig {
     pub identity_dir: PathBuf,
     pub management: SocketAddr,
     pub inference: SocketAddr,
+    /// Design §9: `listeners.inference.authentication`, `api_key` or the
+    /// explicit `none`. `--no-inference-auth` and `MLLM_INFERENCE_AUTH`
+    /// override it for one run.
+    pub inference_auth: crate::standalone::InferenceAuth,
     pub bootstrap: SocketAddr,
     pub control: SocketAddr,
     pub bootstrap_address: String,
@@ -218,6 +222,11 @@ pub struct HostConfig {
     /// `shutdown.drain_timeout`: how long a signalled role lets admitted work finish.
     pub drain_timeout: Duration,
     pub document: Value,
+    /// Owner decision 2026-09-25: the generic overrides (`--set`,
+    /// `MLLM_SET__…`) the host started with. A live reload of the document
+    /// applies them again, so the reloaded document is compared with what the
+    /// host runs, not with the file alone.
+    pub overrides: crate::setting_overrides::SettingOverrides,
 }
 /// The shutdown drain bound when a role document names none (plan W11).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -310,6 +319,19 @@ fn listener(v: &Value, name: &str, auth: &str, local: bool) -> Result<SocketAddr
     }
     Ok(addr)
 }
+/// No two listeners share a port on overlapping addresses (an unspecified
+/// address overlaps every address).
+fn distinct_listeners(all: &[SocketAddr]) -> Result<(), ConfigError> {
+    for (i, a) in all.iter().enumerate() {
+        if all[i + 1..].iter().any(|b| {
+            a.port() == b.port()
+                && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+        }) {
+            return Err(invalid("listeners"));
+        }
+    }
+    Ok(())
+}
 pub fn endpoint_name(address: &str) -> Result<String, ConfigError> {
     let authority = address
         .strip_prefix("https://")
@@ -340,7 +362,16 @@ impl ServerConfig {
             return Err(invalid("identity_dir"));
         }
         let management = listener(&v, "management", "token", true)?;
-        let inference = listener(&v, "inference", "api_key", true)?;
+        // Design §9 (owner decision 5): the inference listener is not forced
+        // to loopback; it keeps the API key unless the document states the
+        // explicit `none` (design §9), and the router's allowlist (SPEC
+        // §13.3); engines stay on loopback (ADR 0012).
+        let inference_auth = crate::standalone::listener_auth(
+            &v["listeners"]["inference"],
+            "listeners.inference.authentication",
+        )
+        .map_err(|_| invalid("listeners"))?;
+        let inference = listener(&v, "inference", inference_auth.as_str(), false)?;
         let bootstrap = listener(&v, "bootstrap", "server_tls", false)?;
         let control = listener(&v, "control", "mutual_tls", false)?;
         let listeners = v["listeners"]
@@ -349,15 +380,7 @@ impl ServerConfig {
         if listeners.len() != 4 {
             return Err(invalid("listeners"));
         }
-        let all = [management, inference, bootstrap, control];
-        for (i, a) in all.iter().enumerate() {
-            if all[i + 1..].iter().any(|b| {
-                a.port() == b.port()
-                    && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
-            }) {
-                return Err(invalid("listeners"));
-            }
-        }
+        distinct_listeners(&[management, inference, bootstrap, control])?;
         let bootstrap_address = text(&v["enrollment"], "bootstrap_address")?.to_owned();
         let control_address = text(&v["enrollment"], "control_address")?.to_owned();
         let certificate_name = endpoint_name(&bootstrap_address)?;
@@ -371,6 +394,7 @@ impl ServerConfig {
             identity_dir,
             management,
             inference,
+            inference_auth,
             bootstrap,
             control,
             bootstrap_address,
@@ -383,6 +407,35 @@ impl ServerConfig {
             timing_header: timing_header(&v)?,
         })
     }
+    /// Design §9: `--listen` replaces the inference bind for one run. The
+    /// address follows the document's rule
+    /// ([`crate::standalone::inference_address`]) and must not collide with
+    /// another listener.
+    /// Final review I8-bis: the state directory this run uses when
+    /// `--state-dir` or `MLLM_STATE_DIR` overrides the document's, with the
+    /// identity directory it implies (`<state_dir>/identity`).
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.identity_dir = state_dir.join("identity");
+        self.state_dir = state_dir;
+        self
+    }
+    /// Final review I8: the management listener this run serves on
+    /// (`--management-listen` or `MLLM_MANAGEMENT_ADDR`), a loopback address
+    /// with a non-zero port that no other server listener shares.
+    pub fn with_management(mut self, address: SocketAddr) -> Result<Self, ConfigError> {
+        crate::standalone::management_address(&address.to_string())
+            .ok_or_else(|| invalid("listeners"))?;
+        distinct_listeners(&[address, self.inference, self.bootstrap, self.control])?;
+        self.management = address;
+        Ok(self)
+    }
+    pub fn with_inference(mut self, address: SocketAddr) -> Result<Self, ConfigError> {
+        crate::standalone::inference_address(&address.to_string())
+            .ok_or_else(|| invalid("listeners"))?;
+        distinct_listeners(&[self.management, address, self.bootstrap, self.control])?;
+        self.inference = address;
+        Ok(self)
+    }
     pub fn template(root: &Path) -> String {
         // JSON is a strict YAML subset and quotes every generated path safely.
         serde_json::to_string_pretty(&json!({
@@ -390,7 +443,8 @@ impl ServerConfig {
             "state_dir":root,"identity_dir":root.join("identity"),
             "listeners":{
                 "management":{"bind":"127.0.0.1:7443","authentication":"token"},
-                "inference":{"bind":"127.0.0.1:8443","authentication":"api_key"},
+                // Design §9 (owner decision 5): as standalone.
+                "inference":{"bind":crate::standalone::DEFAULT_INFERENCE_BIND,"authentication":"api_key"},
                 "bootstrap":{"bind":"127.0.0.1:7444","authentication":"server_tls"},
                 "control":{"bind":"127.0.0.1:7445","authentication":"mutual_tls"}},
             "enrollment":{"bootstrap_address":"https://127.0.0.1:7444","control_address":"https://127.0.0.1:7445"}
@@ -398,6 +452,20 @@ impl ServerConfig {
     }
 }
 impl HostConfig {
+    /// Final review I8-bis: as [`ServerConfig::with_state_dir`]. A runtime
+    /// directory the document does not name follows the state directory, and
+    /// the held document states the directories this run uses.
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.identity_dir = state_dir.join("identity");
+        if !self.runtime_dir_declared {
+            self.runtime_dir = state_dir.join("runtime");
+        }
+        self.document["state_dir"] = Value::String(state_dir.to_string_lossy().into_owned());
+        self.document["identity_dir"] =
+            Value::String(self.identity_dir.to_string_lossy().into_owned());
+        self.state_dir = state_dir;
+        self
+    }
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
         let document = parse_strict(ConfigKind::Host, source)?;
         let state_dir = path(&document, "state_dir")?;
@@ -433,7 +501,12 @@ impl HostConfig {
         {
             return Err(invalid("name"));
         }
-        path(&document["model_store"], "path")?;
+        // Owner decision 2026-09-25: the model store may be omitted (the role
+        // fills `~/models`, `MLLM_MODELS_ROOT` or `--models-root` through
+        // `crate::model_settings` before publishing); stated, it is a path.
+        if document.get("model_store").is_some() {
+            path(&document["model_store"], "path")?;
+        }
         let profiles = match document.get("runtime_profiles") {
             None => Map::new(),
             Some(v) => v
@@ -464,7 +537,49 @@ impl HostConfig {
             load_report_interval,
             drain_timeout: drain_timeout(&document)?,
             document,
+            overrides: crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
         })
+    }
+    /// Owner decision 2026-09-25: state the host's models directory and
+    /// model-source policy in its document, resolved by the shared rule
+    /// (`crate::model_settings`, flag > environment > document > default:
+    /// `~/models` from `home`, downloads under `<model_store>/sources`), so the
+    /// document the host publishes is the one it enforces.
+    pub fn with_models(
+        mut self,
+        flags: &crate::model_settings::ModelOverrides,
+        env: &crate::model_settings::ModelOverrides,
+        home: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        crate::model_settings::apply(
+            &mut self.document,
+            flags,
+            env,
+            crate::model_settings::default_models_root(home).as_deref(),
+        )?;
+        Ok(self)
+    }
+    /// Owner rule 2026-09-25 (every setting three ways, standalone is a
+    /// server plus one host): apply the host's engine settings, resolved
+    /// flag > environment > document > default
+    /// (`crate::engine_settings`), to its document before it is published:
+    /// the runtime directory, the engines' port range and the `local_engine`
+    /// executables as the `local` runtime profiles. `probe` reads an
+    /// executable's version when no fingerprint is stated.
+    pub fn with_engines(
+        self,
+        flags: &crate::engine_settings::EngineOverrides,
+        env: &crate::engine_settings::EngineOverrides,
+        probe: &dyn Fn(&Path) -> Result<String, String>,
+    ) -> Result<Self, ConfigError> {
+        let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
+        let settings = crate::engine_settings::resolve(flags, env, &stated);
+        let overrides = self.overrides;
+        let mut document = self.document;
+        crate::engine_settings::apply_to_host(&mut document, &settings, probe)?;
+        let mut config = Self::parse(&document.to_string())?;
+        config.overrides = overrides;
+        Ok(config)
     }
     pub fn template(root: &Path) -> String {
         serde_json::to_string_pretty(&json!({
@@ -485,6 +600,21 @@ impl HostConfig {
     /// for a host started without a named document is
     /// `<config home>/mllm/engines.yaml`, not the file beside it.
     pub fn load_with_engines(path: &Path, engines: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_overrides(
+            path,
+            engines,
+            &crate::setting_overrides::SettingOverrides::none(ConfigKind::Host),
+        )
+    }
+    /// As [`HostConfig::load_with_engines`], with this run's generic
+    /// overrides (owner decision 2026-09-25: `--set` > `MLLM_SET__…` > YAML)
+    /// applied to the document before it is validated, exactly as if the
+    /// file stated them.
+    pub fn load_with_overrides(
+        path: &Path,
+        engines: &Path,
+        overrides: &crate::setting_overrides::SettingOverrides,
+    ) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             ConfigError::new(
                 ConfigErrorCode::Io,
@@ -492,9 +622,12 @@ impl HostConfig {
                 e.to_string(),
             )
         })?;
-        let mut document = crate::parse_strict(crate::ConfigKind::Host, &text)?;
+        let document = crate::parse_document(&text)?;
+        let mut document = overrides.apply_and_validate(document)?;
         let engines = crate::registration::EnginesFile::load(engines)?;
         crate::registration::merge_into_host(&mut document, &engines)?;
-        Self::parse(&document.to_string())
+        let mut config = Self::parse(&document.to_string()).map_err(|e| overrides.annotate(e))?;
+        config.overrides = overrides.clone();
+        Ok(config)
     }
 }

@@ -5,8 +5,8 @@ use super::*;
 /// was observed at makes that the store's decision rather than the router's.
 #[test]
 fn arrivals_that_saw_the_same_state_share_an_activation_key() {
-    let a = CoordinatorLifecycle::activation_key("dep-1", 3, 7);
-    let b = CoordinatorLifecycle::activation_key("dep-1", 3, 7);
+    let a = CoordinatorLifecycle::activation_key("dep-1", 3, 7, "op-1");
+    let b = CoordinatorLifecycle::activation_key("dep-1", 3, 7, "op-1");
     assert_eq!(a, b, "concurrent arrivals must join one activation");
 }
 
@@ -14,18 +14,36 @@ fn arrivals_that_saw_the_same_state_share_an_activation_key() {
 /// must not join an operation raised for the previous one.
 #[test]
 fn a_later_generation_does_not_join_an_earlier_activation() {
-    let earlier = CoordinatorLifecycle::activation_key("dep-1", 3, 7);
-    let later = CoordinatorLifecycle::activation_key("dep-1", 3, 8);
-    let revised = CoordinatorLifecycle::activation_key("dep-1", 4, 7);
+    let earlier = CoordinatorLifecycle::activation_key("dep-1", 3, 7, "op-1");
+    let later = CoordinatorLifecycle::activation_key("dep-1", 3, 8, "op-1");
+    let revised = CoordinatorLifecycle::activation_key("dep-1", 4, 7, "op-1");
     assert_ne!(earlier, later);
     assert_ne!(earlier, revised);
+}
+
+/// T15: found live on the 16 GB discrete-GPU laptop host. A failed launch
+/// leaves the generation unchanged, and the key a later request derived was
+/// the failed attempt's: its receipt carried another deadline, so every
+/// request for the deployment was answered 409 `idempotency key identifies a
+/// different command` until an operator started it. The key also names the
+/// deployment's latest operation, so an attempt after a failed one is new,
+/// while arrivals that saw the same state still share one.
+#[test]
+fn an_activation_after_a_failed_one_is_a_new_command() {
+    let failed = CoordinatorLifecycle::activation_key("dep-1", 1, 1, "op-create");
+    let retry = CoordinatorLifecycle::activation_key("dep-1", 1, 1, "op-failed-start");
+    assert_ne!(failed, retry);
+    assert_eq!(
+        retry,
+        CoordinatorLifecycle::activation_key("dep-1", 1, 1, "op-failed-start")
+    );
 }
 
 #[test]
 fn different_deployments_never_share_a_key() {
     assert_ne!(
-        CoordinatorLifecycle::activation_key("dep-1", 1, 1),
-        CoordinatorLifecycle::activation_key("dep-2", 1, 1)
+        CoordinatorLifecycle::activation_key("dep-1", 1, 1, "op-1"),
+        CoordinatorLifecycle::activation_key("dep-2", 1, 1, "op-1")
     );
 }
 
@@ -204,6 +222,6 @@ mod deployment_acceptance {
         // idempotency without failing anything else.
         let expected = key("ctx", &r.name, &r.manifest);
         assert_eq!(expected.len(), 64, "a sha256 hex digest");
-        let _ = CoordinatorLifecycle::activation_key("dep", 1, 1);
+        let _ = CoordinatorLifecycle::activation_key("dep", 1, 1, "op");
     }
 }

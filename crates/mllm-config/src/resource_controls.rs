@@ -166,6 +166,7 @@ mod tests {
                     host_kv_limit: Some(8 << 30),
                     parked_limit: Some(32 << 30),
                     memory: DomainMemory::Distinct,
+                    device: None,
                 },
             )]),
             max_parked: 16,

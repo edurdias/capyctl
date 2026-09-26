@@ -10,7 +10,7 @@ const REFUSAL_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 /// A role start that must refuse and exit, bounded by [`REFUSAL_BOUND`].
 fn refused_start(root: &Path, args: &[&str]) -> std::process::Output {
     output_within(
-        Command::new(env!("CARGO_BIN_EXE_mllm"))
+        support::mllm()
             .args(args)
             .env("MLLM_STATE_DIR", root)
             .env_remove("MLLM_VLLM_BIN")
@@ -24,7 +24,7 @@ fn root() -> tempfile::TempDir {
     dir
 }
 fn cli(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_mllm"))
+    support::mllm()
         .args(args)
         .env("MLLM_STATE_DIR", root)
         .env_remove("MLLM_VLLM_BIN")
@@ -191,7 +191,7 @@ fn join_reads_a_relative_invitation_from_the_working_directory() {
     let invitation = temp.path().join("host.join");
     fs::write(&invitation, b"not an invitation").unwrap();
     fs::set_permissions(&invitation, fs::Permissions::from_mode(0o600)).unwrap();
-    let joined = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let joined = support::mllm()
         .current_dir(temp.path())
         .args([
             "join",
@@ -241,7 +241,7 @@ fn concurrent_initialization_has_one_winner_and_preserves_identity() {
     let state = temp.path().join("state");
     let output = temp.path().join("server.yaml");
     let start = || {
-        Command::new(env!("CARGO_BIN_EXE_mllm"))
+        support::mllm()
             .args(["init", "server", "--output", output.to_str().unwrap()])
             .env("MLLM_STATE_DIR", &state)
             .stdout(std::process::Stdio::null())
@@ -290,7 +290,7 @@ struct Service(Guarded);
 impl Service {
     fn start(root: &Path, role: &str, config: &Path) -> Self {
         Self(Guarded::spawn(
-            Command::new(env!("CARGO_BIN_EXE_mllm"))
+            support::mllm()
                 .args(["start", role, "--config", config.to_str().unwrap()])
                 .env("MLLM_STATE_DIR", root)
                 .env_remove("MLLM_VLLM_BIN")
@@ -394,7 +394,7 @@ fn product_enrolls_unprepared_host_and_reconnects_without_identity_change() {
     // W12 (U5 live): an operator joins from the directory holding the
     // invitation, so `--join-file` is a bare relative name.
     assert!(invitation.parent() == Some(temp.path()));
-    let joined = Command::new(env!("CARGO_BIN_EXE_mllm"))
+    let joined = support::mllm()
         .current_dir(temp.path())
         .args([
             "join",
@@ -755,4 +755,43 @@ fn a_started_host_serves_its_control_socket() {
     // The role removes its socket when it stops.
     assert!(!socket.exists());
     server.stop();
+}
+
+// T03 T26 (ADR 0019, discrete GPU design §2): a host whose document declares
+// a device domain its GPUs cannot back refuses to start, exit 2, with
+// `device_policy_mismatch` naming the domain, before anything else (no
+// enrollment is looked at, nothing connects). `gpu7` is backed by no GPU on
+// any machine this suite runs on: a host without a GPU, with a unified GPU,
+// or with fewer than eight discrete GPUs all refuse it.
+#[test]
+fn a_host_whose_device_domain_no_gpu_backs_refuses_to_start() {
+    let temp = root();
+    let state = temp.path().join("host-state");
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
+    ))
+    .unwrap();
+    let mut host = golden["input"]["host"].clone();
+    host["state_dir"] = serde_json::json!(state);
+    host["identity_dir"] = serde_json::json!(state.join("identity"));
+    host["model_store"]["path"] = serde_json::json!(temp.path().join("models"));
+    host["runtime_profiles"] = serde_json::json!({});
+    host["resource_policy"]["domains"] = serde_json::json!({
+        "system": {"memory": "distinct", "managed_limit": "8GiB", "free_reserve": "1GiB"},
+        "gpu7": {"memory": "device", "device": "gpu7", "managed_limit": "14GiB",
+                 "free_reserve": "1GiB"}
+    });
+    host["resource_policy"]["devices"] =
+        serde_json::json!({"gpu7": {"domain": "gpu7", "sharing": "shared"}});
+    let config = temp.path().join("host.yaml");
+    fs::write(&config, host.to_string()).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let refused = refused_start(
+        &state,
+        &["start", "host", "--config", config.to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("device_policy_mismatch: gpu7"), "{stderr}");
+    assert!(!stderr.contains("join host"), "{stderr}");
 }

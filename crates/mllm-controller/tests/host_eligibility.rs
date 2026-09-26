@@ -61,6 +61,7 @@ fn inventory(document: &Value) -> pb::ReportInventory {
     let now = mllm_protocol::now_unix_ms();
     pb::ReportInventory {
         domains: vec![pb::DomainObservation {
+            device_id: String::new(),
             residents: vec![],
             domain_id: "unified".into(),
             kind: "system".into(),

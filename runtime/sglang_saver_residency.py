@@ -40,6 +40,12 @@ TAGS = frozenset({"weights", "kv_cache"})
 # The preload library's own exports this installation serves (no snapshot).
 EXPORTS = ("tms_pause", "tms_resume", "tms_set_current_tag", "tms_set_interesting_region",
            "tms_set_enable_cpu_backup")
+# The saver switches the recipe renders (sglang_saver_binding.check_values).
+_SWITCHES = ("enable_memory_saver", "enable_weights_cpu_backup",
+             "enable_draft_weights_cpu_backup")
+# torch-memory-saver 0.0.10's host shadows for a CPU-backup region (its
+# CpuBackupBackend); either keeps the weights copy in host RAM.
+_BACKUP_BACKENDS = frozenset({"pinned", "mmap"})
 _MAX_SEGMENTS = 4096
 _CUDA_SUCCESS = 0
 _CUDA_ERROR_INVALID_VALUE = 1
@@ -111,15 +117,12 @@ class CudaDriver:
         raise ObservationError("internal")
 
 
-def _chain(scheduler, build):
+def _chain(scheduler, build, weight_restore="disk_reload"):
     """The exact object chain from the Scheduler to the saver's pools and library."""
     saver._exact(scheduler, "sglang.srt.managers.scheduler", "Scheduler")
     args = saver._exact(saver._fields(scheduler).get("server_args"),
                         "sglang.srt.server_args", "ServerArgs")
-    if (server_arg(args, "enable_memory_saver") is not True
-            or server_arg(args, "enable_weights_cpu_backup") is not False
-            or server_arg(args, "enable_draft_weights_cpu_backup") is not False):
-        raise saver.SaverBindingError("configuration_mismatch")
+    saver.check_values({name: server_arg(args, name) for name in _SWITCHES}, weight_restore)
     module_name = "sglang.srt.utils.torch_memory_saver_adapter"
     adapter = saver._exact(saver._fields(scheduler).get("memory_saver_adapter"), module_name,
                            "_TorchMemorySaverAdapterReal")
@@ -165,7 +168,20 @@ def _integer(value, low, high=(1 << 64) - 1):
     return value
 
 
-def observe_pools(pools, driver):
+def _region_backup(tag, cpu_backup, backend, weight_restore):
+    """ADR 0019: whether a region key's CPU-backup flags are the recipe's.
+
+    Only the weights region of a launch that declared `cpu_backup` (the
+    `host_backed` tier) has a backup, in a host-RAM backend; every other region
+    has none, and a declared backup the weights region lacks is refused too.
+    """
+    expected = tag == "weights" and weight_restore == "cpu_backup"
+    if cpu_backup is not expected:
+        return False
+    return backend in _BACKUP_BACKENDS if expected else backend == ""
+
+
+def observe_pools(pools, driver, weight_restore="disk_reload"):
     """Aggregate mapped and paused saver segments per device and tag."""
     pool_class = _pool_class()
     grouped = {}
@@ -173,12 +189,14 @@ def observe_pools(pools, driver):
     seen = 0
     for key, pool in list(pools.items()):
         # (tag, cpu backup, disk backup, cpu backup backend, device): the
-        # recipe allows no backup of either kind (disk reload restores).
+        # recipe allows no disk backup, and a CPU backup only for the weights
+        # of a `host_backed` launch (ADR 0019); a deep launch reloads from disk.
         if type(key) is not tuple or len(key) != 5:
             raise ObservationError("invalid")
         tag, cpu_backup, disk_backup, backend, device = key
-        if (type(tag) is not str or tag not in TAGS or cpu_backup is not False
-                or disk_backup is not False or backend != "" or type(device) is not int
+        if (type(tag) is not str or tag not in TAGS
+                or not _region_backup(tag, cpu_backup, backend, weight_restore)
+                or disk_backup is not False or type(device) is not int
                 or device < 0):
             raise ObservationError("unsupported")
         if type(pool) is not pool_class:
@@ -220,9 +238,13 @@ def observe_pools(pools, driver):
                             sum(g.mapped_bytes for g in groups), 0)
 
 
-def observe_scheduler_saver(scheduler, *, expected_owner, build, driver=None):
+def observe_scheduler_saver(scheduler, *, expected_owner, build, driver=None,
+                            weight_restore="disk_reload"):
     """One observation of the enrolled scheduler's saver pools; see the module notes.
 
+    `weight_restore` is the launch's declared restore (the enrollment scope
+    carries it from the protected entry): `cpu_backup` admits the weights
+    region's host-RAM backup, `disk_reload` admits no backup at all.
     Rechecks the object chain, process and backing file afterwards, as the
     patched-saver reader does. Point-in-time facts only.
     """
@@ -235,10 +257,11 @@ def observe_scheduler_saver(scheduler, *, expected_owner, build, driver=None):
         owner = saver.current_process_identity()
         if type(expected_owner) is not saver.ProcessIdentity or expected_owner != owner:
             raise saver.SaverBindingError("owner_mismatch")
-        chain = _chain(scheduler, build)
+        chain = _chain(scheduler, build, weight_restore)
         library = saver._library(build, chain[6], exports=EXPORTS)
-        allocations = observe_pools(chain[7], driver if driver is not None else CudaDriver())
-        current = _chain(scheduler, build)
+        allocations = observe_pools(chain[7], driver if driver is not None else CudaDriver(),
+                                    weight_restore)
+        current = _chain(scheduler, build, weight_restore)
         if (any(left is not right for left, right in zip(chain, current))
                 or saver.current_process_identity() != owner
                 or saver._library(build, current[6], exports=EXPORTS) != library):

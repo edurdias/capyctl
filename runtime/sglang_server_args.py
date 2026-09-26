@@ -182,8 +182,8 @@ def available_memory_bytes(meminfo="/proc/meminfo"):
     get_available_gpu_memory reads psutil's system `available`, which is
     /proc/meminfo MemAvailable. This is read before the engine starts, so a
     later release by another engine can raise SGLang's own reading; the
-    resolved fraction is still the one mllm rendered. Discrete devices are
-    not modelled here (unverified; ADR 0014 open issue 2).
+    resolved fraction is still the one mllm rendered. A discrete device sizes
+    against its own total instead (`available_bytes_for`).
     """
     try:
         with open(meminfo, "rb") as stream:
@@ -197,6 +197,22 @@ def available_memory_bytes(meminfo="/proc/meminfo"):
     except Exception:
         pass
     raise ServerArgsError("memory_grant_unavailable") from None
+
+
+def available_bytes_for(memory):
+    """The baseline mem_fraction_static is a fraction of (discrete GPU design §6).
+
+    ADR 0019: on a discrete device the launching host states the card's total
+    (`device_total_bytes`, observed with the sample its launch check used) and
+    SGLang's static pool is a share of the card. Unified memory keeps
+    MemAvailable. A stated total that is not a positive integer is refused.
+    """
+    total = memory.get("device_total_bytes")
+    if total is None:
+        return available_memory_bytes()
+    if type(total) is not int or not 0 < total < 2**62:
+        raise ServerArgsError("memory_grant_unavailable")
+    return total
 
 
 def static_fraction(static_bytes, available_bytes):
@@ -346,7 +362,8 @@ def construct_server_args(spec, placement, guarded_constructor, available_bytes=
                              spec._checkpoint_root)
     fraction = static_fraction(
         settings["memory"]["static_bytes"],
-        available_memory_bytes() if available_bytes is None else available_bytes)
+        available_bytes_for(settings["memory"]) if available_bytes is None
+        else available_bytes)
     reserved = dict(_RESERVED_CONSTANT)
     if os.environ.get("MLLM_DEBUG_ENGINE_LOGS") == "1":
         reserved.update(log_level="debug", log_level_http="debug")

@@ -63,7 +63,8 @@ fn shown(store: &Store) -> Value {
     serde_json::to_value(store.snapshot().unwrap()).unwrap()["deployments"][0]["context"].clone()
 }
 
-/// A dense model at 512 KiB of KV per token: the 4 GiB grant holds 8192.
+/// A dense model at 512 KiB of KV per token: the 4 GiB grant holds 8192, of
+/// which vLLM keeps one 16-token block for itself (8176).
 fn checkpoint() -> tempfile::TempDir {
     let models = tempfile::tempdir().unwrap();
     std::fs::create_dir(models.path().join("toy")).unwrap();
@@ -84,13 +85,13 @@ fn checkpoint() -> tempfile::TempDir {
 fn status_shows_the_context_fitted_to_the_grant() {
     let models = checkpoint();
     let (_dir, store) = store_with(&effective(models.path(), None), false);
-    assert_eq!(shown(&store), json!({"tokens": 8192, "source": "fitted"}));
+    assert_eq!(shown(&store), json!({"tokens": 8176, "source": "fitted"}));
     // A declared context wins, and one the grant cannot hold is flagged.
     let (_dir, store) = store_with(&effective(models.path(), Some(16384)), false);
     let context = shown(&store);
     assert_eq!(context["tokens"], 16384);
     assert_eq!(context["source"], "declared");
-    assert!(context["warning"].as_str().unwrap().contains("8192"));
+    assert!(context["warning"].as_str().unwrap().contains("8176"));
     // No configuration: the fallback and its reason.
     std::fs::remove_file(models.path().join("toy/config.json")).unwrap();
     let (_dir, store) = store_with(&effective(models.path(), None), false);

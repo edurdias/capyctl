@@ -83,6 +83,8 @@ with open(os.path.join(here, "record.json"), "w") as f:
     json.dump({"argv": args, "has_key": bool(key),
                "has_admin_key": bool(admin) and admin != key,
                "env": sorted(os.environ),
+               "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+               "cuda_device_order": os.environ.get("CUDA_DEVICE_ORDER"),
                "dev_mode": os.environ.get("VLLM_SERVER_DEV_MODE"),
                "pythonpath": os.environ.get("PYTHONPATH")}, f)
 port = int(args[args.index("--port") + 1])
@@ -166,6 +168,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(500); self.end_headers(); return
         if call == "sleep:2":
             state.update(sleeping=True, weights=False, loaded=False, kv=False)
+        elif call == "sleep:1":
+            # Level 1 offloads the weights to host RAM; the weights wake
+            # copies them back, so they stay loaded.
+            state.update(sleeping=True, weights=False, kv=False)
         elif call == "wake:weights":
             state["weights"] = True
         elif call == "wake:kv_cache":
@@ -207,6 +213,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
+/// A loopback port for one stand-in engine, below the kernel's ephemeral
+/// range and never handed out twice by this binary.
+///
+/// Final review M19: the port was taken from `127.0.0.1:0`, the ephemeral
+/// range, and released before the engine bound it; under a parallel run an
+/// outbound connection could take it as its local port first, the stand-in
+/// failed to bind and exited before readiness, and whichever test owned it
+/// failed (1 run in 4 to 10).
+fn engine_port() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    const LOW: u16 = 20_000;
+    let high = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse::<u16>().ok())
+        .filter(|low| *low > LOW + 1_000)
+        .unwrap_or(32_768);
+    let mut taken = TAKEN.lock().unwrap_or_else(|error| error.into_inner());
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    let mut port = LOW + (hasher.finish() % u64::from(high - LOW)) as u16;
+    for _ in 0..u32::from(high - LOW) {
+        if !taken.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            taken.push(port);
+            return port;
+        }
+        port = if port + 1 >= high { LOW } else { port + 1 };
+    }
+    panic!("no free loopback port below the ephemeral range");
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     port: u16,
@@ -224,14 +261,16 @@ impl Fixture {
     /// `None` leaves `deep_park` out of the host document, so the ADR 0012
     /// default (enabled) applies; the deployment then asks for `deep`.
     fn with_switch(switch: Option<bool>, guard: bool) -> Self {
+        Self::build(switch, guard, |_, _| {})
+    }
+
+    /// As [`Fixture::with_switch`], with the host document and the deployment
+    /// edited before the host document is parsed.
+    fn build(switch: Option<bool>, guard: bool, edit: impl FnOnce(&mut Value, &mut Value)) -> Self {
         let deep_park = switch.unwrap_or(true);
         let root = directory();
         let path = root.path();
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = engine_port();
         let bin = path.join("venv/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let engine = bin.join("vllm");
@@ -321,6 +360,7 @@ impl Fixture {
             deployment["resources"][phase]["allocations"][0]["bytes"] = json!(bytes);
             deployment["resources"][phase]["allocations"][0]["host_kv_bytes"] = json!("0B");
         }
+        edit(&mut host, &mut deployment);
         let config = HostConfig::parse(&host.to_string()).unwrap();
         Self {
             root,
@@ -1318,6 +1358,63 @@ async fn a_restart_only_launch_is_never_parked() {
     assert_eq!(host.journal.residency_of("launch").unwrap(), None);
 }
 
+/// Discrete GPU design §5: a `host_backed` launch (distinct host and device
+/// memory) is admitted to Park, sleeps at level 1, and is restored by the
+/// weights wake with no `reload_weights` collective, then the KV wake, the
+/// prefix-cache reset and a fresh model probe.
+// T16 T20 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_backed_launch_parks_at_level_one_and_restores_without_a_reload() {
+    let fixture = Fixture::build(Some(true), true, |host, deployment| {
+        // ADR 0010 decision 5: host_backed needs distinct pools.
+        host["resource_policy"]["domains"]["unified"]["memory"] = json!("distinct");
+        deployment["residency"] = json!("host_backed");
+    });
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    assert!(
+        host.executor
+            .execute(host.session, launch.clone())
+            .await
+            .unwrap()
+            .model_usable
+    );
+    let park = fixture.park(&launch, "park");
+    let parked = host
+        .executor
+        .execute(host.session, park.clone())
+        .await
+        .unwrap();
+    mllm_protocol::execution::validate_result(&park, &parked).unwrap();
+    assert_eq!(residency(&parked), "parked", "{parked:?}");
+    assert_eq!(fixture.controls(), ["sleep:1"]);
+    let restore = fixture.restore(&launch, "restore");
+    let restored = host
+        .executor
+        .execute(host.session, restore.clone())
+        .await
+        .unwrap();
+    mllm_protocol::execution::validate_result(&restore, &restored).unwrap();
+    assert_eq!(residency(&restored), "restored", "{restored:?}");
+    assert!(restored.model_usable && restored.claim_retained);
+    assert_eq!(
+        fixture.controls(),
+        [
+            "sleep:1",
+            "wake:weights",
+            "wake:kv_cache",
+            "reset_prefix_cache"
+        ]
+    );
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert!(!stopped.claim_retained);
+}
+
 /// SPEC §10 step 4: work the engine still reports is not quiescence. The park
 /// is refused without a sleep and the launch stays resident; a Restore of it is
 /// refused. SPEC §§9.1, 13.2: a refusal is `unchanged`, so the gate the park
@@ -1720,4 +1817,229 @@ async fn a_parked_launch_that_loses_a_member_is_reported() {
         host.journal.residency_of("launch").unwrap().as_deref(),
         Some("parked")
     );
+}
+
+const GPU0_UUID: &str = "GPU-00000000-0000-0000-0000-000000000000";
+const GPU1_UUID: &str = "GPU-11111111-1111-1111-1111-111111111111";
+
+/// A host with two GPUs, each published with its physical UUID, and a
+/// deployment document naming `device` (what the server sends for the GPU
+/// placement chose).
+fn two_gpus_launching_on(device: &'static str) -> Fixture {
+    two_gpus_named(
+        json!({
+            "gpu0": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": GPU0_UUID},
+            "gpu1": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": GPU1_UUID}
+        }),
+        device,
+    )
+}
+
+/// A host with the GPUs `devices` declares, launching on `device`.
+fn two_gpus_named(devices: Value, device: &'static str) -> Fixture {
+    Fixture::build(Some(false), true, move |host, deployment| {
+        host["resource_policy"]["devices"] = devices;
+        name_device(deployment, device);
+    })
+}
+
+fn name_device(deployment: &mut Value, device: &str) {
+    let claim = json!([{"id": device, "sharing": "shared"}]);
+    deployment["devices"] = claim.clone();
+    for phase in ["cold", "ready", "parking", "wake"] {
+        deployment["resources"][phase]["devices"] = claim.clone();
+    }
+}
+
+/// Discrete GPU design §7: the launch names the GPU placement chose, and the
+/// agent sets the engine child's `CUDA_VISIBLE_DEVICES` to that GPU's
+/// physical UUID from its own approved policy, so the engine sees only it.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chosen_gpu_reaches_the_engine_by_its_published_uuid() {
+    let fixture = two_gpus_launching_on("gpu1");
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the chosen GPU");
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let record = fixture.record().expect("the engine recorded its launch");
+    assert_eq!(record["cuda_visible_devices"], GPU1_UUID);
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}
+
+/// Discrete GPU design §7: a GPU the host's own policy does not publish is
+/// never launched on: the launch is refused `unauthorized` and nothing runs.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_the_host_does_not_publish_refuses_the_launch() {
+    let fixture = two_gpus_launching_on("gpu1");
+    let host = host(&fixture);
+    let mut launch = fixture.launch();
+    if let MemberAction::LaunchSingle(plan) = &mut launch.action {
+        let mut deployment: Value = serde_json::from_str(&plan.deployment_config).unwrap();
+        name_device(&mut deployment, "gpu7");
+        plan.deployment_config = deployment.to_string();
+    }
+    let launch = sign(launch);
+    refused_launch(&host.executor, host.session, &launch).await;
+    assert!(fixture.record().is_none(), "no engine was started");
+}
+
+/// Discrete GPU design §7 (review decision): a host with two GPUs that
+/// published no UUIDs still pins the chosen one, by its index in PCI bus
+/// order; the engine never inherits every GPU.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chosen_gpu_without_a_uuid_is_pinned_by_its_pci_index() {
+    let fixture = two_gpus_named(
+        json!({
+            "gpu0": {"domain": "unified", "sharing": "shared"},
+            "gpu1": {"domain": "unified", "sharing": "shared"}
+        }),
+        "gpu1",
+    );
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the chosen GPU");
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    let record = fixture.record().expect("the engine recorded its launch");
+    assert_eq!(record["cuda_visible_devices"], "1");
+    assert_eq!(record["cuda_device_order"], "PCI_BUS_ID");
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
+}
+
+/// Discrete GPU design §7 (review decision): with two GPUs, one the host
+/// names neither by a UUID nor by a `gpuN` index cannot be pinned, so the
+/// launch is refused `unauthorized` and nothing runs.
+// T27 T21
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_that_cannot_be_pinned_refuses_the_launch() {
+    let fixture = two_gpus_named(
+        json!({
+            "left": {"domain": "unified", "sharing": "shared"},
+            "right": {"domain": "unified", "sharing": "shared"}
+        }),
+        "right",
+    );
+    let host = host(&fixture);
+    let launch = fixture.launch();
+    refused_launch(&host.executor, host.session, &launch).await;
+    assert!(fixture.record().is_none(), "no engine was started");
+}
+
+/// One 16 GB discrete card (`gpu0`, a device domain) beside host RAM
+/// (`system`), and a restart-only deployment holding 12 GiB of the card and a
+/// little host RAM in every active phase.
+fn discrete_fixture() -> Fixture {
+    let mut fixture = Fixture::build(Some(false), true, |_, deployment| {
+        let both = |device: &str, system: &str| {
+            json!([
+                {"domain": "gpu0", "bytes": device, "host_kv_bytes": "0B"},
+                {"domain": "system", "bytes": system, "host_kv_bytes": "0B"}
+            ])
+        };
+        for phase in ["cold", "ready", "parking", "wake"] {
+            deployment["resources"][phase]["allocations"] = both("12GiB", "64MiB");
+        }
+        deployment["resources"]["parked"]["allocations"] = both("0B", "0B");
+    });
+    // The strict remote-role schema learns `device` with the remote device
+    // capability; the agent resolves from the approved document it is handed.
+    fixture.config.document["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "1GiB", "free_reserve": "16MiB",
+                   "parked_limit": "256MiB", "host_kv_limit": "64MiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    fixture.config.document["resource_policy"]["devices"] =
+        json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    fixture
+}
+
+/// SPEC §13.2, §7.2 (review decision, discrete GPU design §4, §6): the GPU
+/// collector is bounded at seconds, so a launch samples the card before the
+/// journal is locked and never while holding it; the locked rechecks read that
+/// sample. A slow sampler that looks at the journal from inside its own run
+/// always finds both locks free. The engine is sized from the same sample:
+/// its utilization is the device request's share of the card (12 GiB of
+/// 16376 MiB rounds up to 0.76), with the grant's KV bytes.
+// T26 T16 T13
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_gpu_sample_never_holds_the_journal_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fixture = discrete_fixture();
+    let mut host = host(&fixture);
+    let journal = host.journal.clone();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let locked = Arc::new(AtomicUsize::new(0));
+    let (counted, seen) = (runs.clone(), locked.clone());
+    let sampler: Arc<mllm_agent::gpu_memory::GpuSampler> = Arc::new(move || {
+        if !journal.locks_free() {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        counted.fetch_add(1, Ordering::SeqCst);
+        mllm_agent::gpu_memory::parse_query_gpu(
+            "0, GPU-11111111-2222-3333-4444-555555555555, 00000000:01:00.0, RTX, 16376, 0, 16376\n",
+            now_ms(),
+        )
+    });
+    host.executor = host.executor.clone().with_gpu_sampler(sampler);
+    let launch = fixture.launch();
+    host.executor.provision(launch.clone(), GATE).await.unwrap();
+    let ready = host
+        .executor
+        .execute(host.session, launch.clone())
+        .await
+        .expect("the agent launches on the discrete card");
+    // The locked rechecks (acceptance, the durable attempt, the spawn) read
+    // the device from a sample: without one the device is unobserved and the
+    // launch would be uncertain, never ready.
+    assert!(ready.model_usable && ready.claim_retained, "{ready:?}");
+    assert!(runs.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        locked.load(Ordering::SeqCst),
+        0,
+        "a sample ran under a lock"
+    );
+    let record = fixture.record().expect("the engine recorded its launch");
+    let argv: Vec<String> = serde_json::from_value(record["argv"].clone()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--gpu-memory-utilization", "0.76"]),
+        "{argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|w| w == ["--kv-cache-memory-bytes", "67108864"]),
+        "{argv:?}"
+    );
+    // Discrete GPU design §7: the discrete card is pinned by its index.
+    assert_eq!(record["cuda_visible_devices"], "0");
+    let stopped = host
+        .executor
+        .execute(host.session, fixture.stop(&launch))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, "completed");
 }

@@ -1167,6 +1167,7 @@ fn plan(t: &TwoHosts, id: &str) -> mllm_store::ordinary_lifecycle::switching::Sw
             None,
             &BTreeSet::new(),
             &|_, _| None,
+            &Default::default(),
         )
         .unwrap()
 }
@@ -1710,6 +1711,7 @@ fn a_switch_that_ends_without_reopening_clears_its_closures() {
         instance: 0,
         generation,
         parks: false,
+        park_does_not_fit: false,
         last_ready: true,
         serves_elsewhere: false,
     }];

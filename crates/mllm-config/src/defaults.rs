@@ -244,7 +244,9 @@ fn write_credentials_from(state_dir: &Path, entropy: &str) -> Result<bool, Confi
 ///
 /// SPEC §15.3: it states only what the standalone role honours
 /// ([`crate::standalone::check_honoured`]). The §16.5 example's `tls` block is
-/// left out because the standalone listeners serve plain HTTP on loopback.
+/// left out because the standalone listeners serve plain HTTP. Design §9:
+/// inference binds every interface (the API key stays required); management
+/// stays on loopback.
 fn render_standalone(state_dir: &Path) -> String {
     // SPEC §16.5: relative paths in the document would resolve against the
     // configuration file, not the working directory, so state them absolute.
@@ -262,7 +264,7 @@ fn render_standalone(state_dir: &Path) -> String {
          \x20     bind: \"127.0.0.1:7443\"\n\
          \x20     authentication: admin_token\n\
          \x20   inference:\n\
-         \x20     bind: \"127.0.0.1:8443\"\n\
+         \x20     bind: \"0.0.0.0:8443\"\n\
          \x20     authentication: api_key\n\
          host:\n\
          \x20 name: local\n\
@@ -330,6 +332,27 @@ mod tests {
         let yaml = render_standalone(&d);
         let document = crate::strict_yaml::parse_strict(ConfigKind::Standalone, &yaml).unwrap();
         crate::standalone::check_honoured(&document, &d.join("config"), &d).unwrap();
+    }
+
+    // T02 (design §9): a new standalone document binds inference on every
+    // interface; management stays on loopback.
+    #[test]
+    fn the_generated_document_binds_all_interfaces() {
+        let d = temp_dir();
+        let yaml = render_standalone(&d);
+        let doc = crate::strict_yaml::parse_strict(ConfigKind::Standalone, &yaml).unwrap();
+        assert_eq!(
+            doc["server"]["listeners"]["inference"]["bind"],
+            "0.0.0.0:8443"
+        );
+        assert_eq!(
+            doc["server"]["listeners"]["management"]["bind"],
+            "127.0.0.1:7443"
+        );
+        assert_eq!(
+            crate::standalone::inference_bind(&doc).unwrap().to_string(),
+            crate::standalone::DEFAULT_INFERENCE_BIND
+        );
     }
 
     #[test]

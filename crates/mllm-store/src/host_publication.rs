@@ -340,6 +340,38 @@ impl Store {
 }
 
 impl Store {
+    /// ADR 0019 (discrete GPU design §7): the deployment document a launch on
+    /// `host` is rendered from when it runs on `device`: that GPU's scoped
+    /// document on a multi-GPU host that offered a GPU choice, otherwise the
+    /// host's own ([`Store::host_configuration_source`]). The host agent
+    /// resolves it against its own approved policy, so the GPU's physical UUID
+    /// comes from the host, never from this document.
+    pub fn launch_configuration_source(
+        &self,
+        deployment: &str,
+        revision: i64,
+        host: &str,
+        device: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let chosen: Option<String> = match device {
+            Some(device) => self
+                .conn
+                .query_row(
+                    "SELECT source_json FROM host_device_effective_revisions WHERE deployment_id=?1 AND revision=?2 AND host_id=?3 AND device=?4",
+                    params![deployment, revision, host, device],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        match chosen {
+            Some(source) => mllm_config::parse_strict(mllm_config::ConfigKind::Deployment, &source)
+                .map(Some)
+                .map_err(|_| StoreError::Conflict),
+            None => self.host_configuration_source(deployment, revision, host),
+        }
+    }
+
     // SPEC §§6,15: freeze the peer ingress with the binding; mutable discovery
     // cannot redirect an already admitted runtime or reuse its gate credential.
     pub fn bind_remote_ingress(

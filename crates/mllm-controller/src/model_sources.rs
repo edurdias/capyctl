@@ -207,6 +207,65 @@ impl SourceHost for RemoteSources {
     }
 }
 
+/// Owner rule 2026-09-25 (standalone is a server plus one host): the embedded
+/// host's own sources store, asked in-process exactly as a remote host
+/// answers `MaterializeSource` from its store.
+pub struct LocalSources {
+    store: Arc<mllm_agent::sources::SourceStore>,
+}
+
+impl LocalSources {
+    pub fn new(store: Arc<mllm_agent::sources::SourceStore>) -> Arc<Self> {
+        Arc::new(Self { store })
+    }
+}
+
+/// What a host's store says about a source, as the store records it.
+pub fn report_from_status(status: mllm_agent::sources::SourceStatus) -> SourceReport {
+    use mllm_agent::sources::SourceStatus;
+    let (state, bytes_done, bytes_total, reason) = match status {
+        SourceStatus::Pending => (SourceState::Pending, 0, 0, None),
+        SourceStatus::Downloading {
+            bytes_done,
+            bytes_total,
+        } => (
+            SourceState::Downloading,
+            if bytes_total == 0 {
+                0
+            } else {
+                bytes_done.min(bytes_total)
+            },
+            bytes_total,
+            None,
+        ),
+        SourceStatus::Verified { bytes } => (SourceState::Verified, bytes, bytes, None),
+        SourceStatus::Failed(failure) => (SourceState::Failed, 0, 0, Some(failure.reason.into())),
+    };
+    SourceReport {
+        state,
+        bytes_done,
+        bytes_total,
+        reason,
+    }
+}
+
+impl SourceHost for LocalSources {
+    fn reachable(&self, _: &str) -> bool {
+        true
+    }
+    fn request(&self, pending: PendingSource) -> ReportFuture {
+        let source = &pending.effective.model.source;
+        // The revision names the directory it will load from; a store that
+        // would put the copy elsewhere (the store moved since the revision was
+        // accepted) is not asked, so nothing lands where no launch looks.
+        let placed = self.store.directory(source).is_some_and(|directory| {
+            pending.effective.model.resolved_path.as_deref() == directory.to_str()
+        });
+        let report = placed.then(|| report_from_status(self.store.request(source)));
+        Box::pin(async move { report.ok_or(Unavailable) })
+    }
+}
+
 /// ADR 0008: before a launch on `host`, its copy of the revision's remote
 /// source must be verified. The host is asked (starting the download if
 /// needed) and polled until it answers `verified`, a failure, or `deadline_ms`

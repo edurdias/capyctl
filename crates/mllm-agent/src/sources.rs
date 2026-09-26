@@ -8,11 +8,12 @@
 //! source resolves to (`<store>/sources/...`), with the offline environment
 //! they always had.
 //!
-//! The model store is a charged filesystem resource owner (SPEC §7). Before a
-//! byte is written, the download's full size (from the Hugging Face listing or
-//! the response's length) is reserved against the host's
-//! `model_sources.max_bytes` ceiling and the filesystem's free space, and the
-//! reservation is persisted. It stays charged while the download runs and
+//! The sources store is a charged filesystem resource owner (SPEC §7). Before
+//! a byte is written, the download's full size (from the Hugging Face listing
+//! or the response's length) is reserved against the host's
+//! `model_sources.max_bytes` ceiling (500 GiB unless the host states one,
+//! owner decision 2026-09-25) and the filesystem's free space less
+//! [`FREE_SPACE_RESERVE`], and the reservation is persisted. It stays charged while the download runs and
 //! while partial files remain on disk; it is released only when the
 //! temporary directory is verifiably gone (SPEC §7.3: uncertainty retains
 //! accounting), or converted into the verified copy's charge on commit.
@@ -54,6 +55,10 @@ const STATE_DIR: &str = ".mllm";
 const MAX_LISTING_BYTES: usize = 16 << 20;
 /// Most files one source may select.
 const MAX_FILES: usize = 100_000;
+/// SPEC §7.3 (owner decision 2026-09-25): the free space a download must
+/// leave on the filesystem that holds the sources store, so a download never
+/// fills the disk the host (and its logs and state) runs from.
+pub const FREE_SPACE_RESERVE: u64 = 1 << 30;
 
 /// The closed failure categories a materialization reports (ADR 0008).
 pub use mllm_config::model_source::reason;
@@ -152,7 +157,21 @@ pub struct SourceStore {
     failures: Mutex<BTreeMap<String, SourceFailure>>,
     accounting: Mutex<()>,
     log: Mutex<LogSink>,
+    /// Test seam: the filesystem's free bytes, instead of `statvfs`.
+    free_override: Mutex<Option<u64>>,
+    /// Where the default Hugging Face token variables are read: the process
+    /// environment, or a test's own.
+    environment: Mutex<Environment>,
 }
+
+/// Reads one environment variable.
+pub type Environment = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Owner rule 2026-09-25: the variables naming the host's default Hugging
+/// Face token, in precedence order. A secret is a variable or a protected
+/// file (`model_sources.huggingface_token_file`), never a CLI flag, which
+/// would leak into process listings and shell history.
+pub const HF_TOKEN_VARIABLES: &[&str] = &["MLLM_HF_TOKEN", "HF_TOKEN"];
 
 /// Where progress and failure lines go.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -229,10 +248,39 @@ impl SourceStore {
             failures: Mutex::default(),
             accounting: Mutex::default(),
             log: Mutex::new(Arc::new(|line| eprintln!("{line}"))),
+            free_override: Mutex::default(),
+            environment: Mutex::new(Arc::new(|key| std::env::var(key).ok())),
         })
     }
 
+    /// Test seam: report `bytes` as the filesystem's free space (`None`
+    /// measures it again).
+    #[doc(hidden)]
+    pub fn set_free_bytes_for_test(&self, bytes: Option<u64>) {
+        if let Ok(mut free) = self.free_override.lock() {
+            *free = bytes;
+        }
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        match self.free_override.lock().ok().and_then(|free| *free) {
+            Some(bytes) => Some(bytes),
+            // The store may not exist before its first download: measure the
+            // filesystem it will be created on.
+            None => self.store.ancestors().find_map(free_bytes),
+        }
+    }
+
     /// Replace where progress and failure lines go (tests capture them).
+    /// Test seam: read the default token variables through `environment`
+    /// instead of the process environment.
+    #[doc(hidden)]
+    pub fn set_environment(&self, environment: Environment) {
+        if let Ok(mut current) = self.environment.lock() {
+            *current = environment;
+        }
+    }
+
     pub fn set_log(&self, log: LogSink) {
         if let Ok(mut current) = self.log.lock() {
             *current = log;
@@ -492,7 +540,11 @@ impl SourceStore {
         }
         let own = dir_bytes(&self.partial_dir(id));
         let needed = outstanding.saturating_add(bytes.saturating_sub(own));
-        if free_bytes(&self.store).is_some_and(|free| free < needed) {
+        // SPEC §7.3: the download and the free-space reserve must both fit.
+        if self
+            .free_bytes()
+            .is_some_and(|free| free < needed.saturating_add(FREE_SPACE_RESERVE))
+        {
             return Err(SourceFailure::new(reason::INSUFFICIENT_SPACE));
         }
         self.write_json(
@@ -560,20 +612,44 @@ impl SourceStore {
     }
 
     fn token(&self, source: &ModelSource) -> Result<Option<Secret>, SourceFailure> {
-        let ModelSource::HuggingFace {
-            token_ref: Some(reference),
-            ..
-        } = source
-        else {
+        let ModelSource::HuggingFace { token_ref, .. } = source else {
             return Ok(None);
         };
         let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
-        let name = secret_name(reference).ok_or_else(unavailable)?;
-        let path = self
-            .secrets_dir
-            .as_ref()
-            .ok_or_else(unavailable)?
-            .join(name);
+        let path = match token_ref {
+            Some(reference) => {
+                let name = secret_name(reference).ok_or_else(unavailable)?;
+                self.secrets_dir
+                    .as_ref()
+                    .ok_or_else(unavailable)?
+                    .join(name)
+            }
+            // Owner rule 2026-09-25: a source that names no token uses the
+            // host's default one, `MLLM_HF_TOKEN` (else `HF_TOKEN`) in its
+            // environment, else `model_sources.huggingface_token_file`; with
+            // neither it is fetched without a token, as before.
+            None => {
+                let environment = self
+                    .environment
+                    .lock()
+                    .map(|environment| environment.clone())
+                    .map_err(|_| unavailable())?;
+                if let Some(token) = HF_TOKEN_VARIABLES
+                    .iter()
+                    .find_map(|name| environment(name).filter(|value| !value.is_empty()))
+                {
+                    let token = token.trim().to_owned();
+                    if token.chars().any(|c| c.is_control() || c == ' ') {
+                        return Err(unavailable());
+                    }
+                    return Ok(Some(Secret(token)));
+                }
+                match &self.policy.huggingface_token_file {
+                    Some(file) => file.clone(),
+                    None => return Ok(None),
+                }
+            }
+        };
         let metadata = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
         // SPEC §13.3: a credential is private state; no group or other access,
         // owned by the account this agent runs as.

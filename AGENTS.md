@@ -19,7 +19,8 @@ Read these in order when orienting. Lower entries never override higher ones.
 2. `docs/design/adr/` — architecture decision records. ADR 0012 onward records
    owner decisions made after the F2 design (deep parking default-on, instances and
    placement, engine configuration, per-instance lifecycle, revoked-host recovery,
-   version skew).
+   version skew, engine registration, and ADR 0019 for discrete GPUs and the network
+   inference endpoint).
 3. `docs/design/milestones/f2-sglang-design.md` — approved F2 design.
 4. `docs/plans/` — per-slice implementation plans. Feature design notes written
    ahead of their plans live in `docs/specs/`.
@@ -28,7 +29,9 @@ Read these in order when orienting. Lower entries never override higher ones.
 
 If a summary disagrees with `docs/SPEC.md`, the spec wins.
 
-Operator-facing docs: `docs/operations/install.md` (install, services, upgrades).
+Operator-facing docs: `docs/operations/install.md` (install, services, upgrades,
+discrete GPUs), `docs/operations/configuration.md` (every setting) and
+`docs/operations/network-access.md` (the inference endpoint on the network).
 Live test harness: `scripts/live/matrix/README.md`.
 
 ## Documentation rules
@@ -79,6 +82,11 @@ never push to `main` directly. Never publish a GitHub release; the owner publish
   control-plane server on the control host. Their real names and addresses live
   only in the untracked `scripts/live/matrix/hosts.local.env` (see
   `hosts.example.env`). Owner authorized host B on 2026-09-19.
+- Live work is also authorized on the maintainers' local machines, a discrete-GPU
+  laptop included. On a local machine: no driver, CUDA or system-package changes,
+  and engine virtual environments only in the home directory. The lab-host rules
+  above (no new environments beyond the listed exceptions) still apply to the lab
+  hosts.
 - Do not change engine environments, drivers, or reboot hosts. The only owner
   exceptions are the existing SGLang 0.5.20 venv on both hosts and the mirrored
   vLLM 0.29 venv on host B; do not create or modify others.

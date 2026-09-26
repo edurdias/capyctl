@@ -12,6 +12,7 @@ from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass, field
 import hashlib
+import json
 import os
 import re
 import stat
@@ -121,14 +122,32 @@ def _exact(value, module_name, class_name):
     return value
 
 
-def _chain(scheduler, build):
-    _exact(scheduler, "sglang.srt.managers.scheduler", "Scheduler")
-    args = _exact(_fields(scheduler).get("server_args"), "sglang.srt.server_args", "ServerArgs")
-    values = _fields(args)
+# The launch's declared weight restore (sglang_entry: `cpu_backup` exactly when
+# the deployment is `host_backed`, else `disk_reload`).
+WEIGHT_RESTORES = ("disk_reload", "cpu_backup")
+
+
+def check_values(values, weight_restore):
+    """ADR 0019, discrete GPU design §5: the recipe's saver switches.
+
+    The memory saver is on. The weights CPU backup is the `host_backed` tier's
+    mechanism, so it is present exactly when the launch declared `cpu_backup`;
+    the draft-model backup is never used by mllm. `values` maps the ServerArgs
+    field names to their values (a lookup that misses reads as absent).
+    """
+    if weight_restore not in WEIGHT_RESTORES:
+        raise SaverBindingError("configuration_mismatch")
+    expected = weight_restore == "cpu_backup"
     if (values.get("enable_memory_saver") is not True
-            or values.get("enable_weights_cpu_backup") is not False
+            or values.get("enable_weights_cpu_backup") is not expected
             or values.get("enable_draft_weights_cpu_backup") is not False):
         raise SaverBindingError("configuration_mismatch")
+
+
+def _chain(scheduler, build, weight_restore="disk_reload"):
+    _exact(scheduler, "sglang.srt.managers.scheduler", "Scheduler")
+    args = _exact(_fields(scheduler).get("server_args"), "sglang.srt.server_args", "ServerArgs")
+    check_values(_fields(args), weight_restore)
     module_name = "sglang.srt.utils.torch_memory_saver_adapter"
     adapter = _exact(_fields(scheduler).get("memory_saver_adapter"), module_name,
                      "_TorchMemorySaverAdapterReal")
@@ -156,14 +175,37 @@ def _chain(scheduler, build):
     return args, adapter, saver, impl, hook, pool, wrapper, cdll
 
 
+# Permission problems already reported by this process, so the engine log
+# carries each once rather than once per observation.
+_WARNED = set()
+
+
+def _warn(problem):
+    """Write one fixed-word warning line to the engine's stderr (its log)."""
+    if problem in _WARNED:
+        return
+    _WARNED.add(problem)
+    try:
+        sys.stderr.write(json.dumps(dict(event="mllm_saver_library_permissions",
+                                         problem=problem, action="warned"),
+                                    separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _protected(info):
-    # Owner decision 2026-09-23: the service-reviewed saver build and the
-    # directories on the way to it follow the owner-only rule mllm applies to
-    # its own helpers; group write is the owner's only under its private group.
+    # SPEC §8.1, ADR 0008: the saver library lives in the engine's
+    # installation, and engine files get no permission rule; a changed file
+    # is caught by the digest below and by the installation's drift
+    # fingerprint. The owner-only rule mllm applies to its own helpers is
+    # therefore a warning here, never a refusal (decided 2026-09-25 after a
+    # group-writable SGLang environment refused every park, DG3). The
+    # warning names the closed problem only, never a path or an account.
     try:
         owner_only.check(info, owners=(0, os.getuid()))
-    except owner_only.OwnerOnlyError:
-        raise SaverBindingError("unsafe_library") from None
+    except owner_only.OwnerOnlyError as problem:
+        _warn(problem.problem)
 
 
 def _library(build, cdll, exports=_EXPORTS):
@@ -235,7 +277,15 @@ def _library(build, cdll, exports=_EXPORTS):
         raise SaverBindingError("library_mismatch") from None
 
 
-def observe_scheduler_saver(scheduler, *, expected_owner, build):
+def _backup_only_on_weights(allocations):
+    """ADR 0019: a CPU backup may only shadow the weights region."""
+    for group in allocations.groups:
+        if group.tag != "weights" and (group.backup_bytes or group.backup_enabled_count):
+            raise SaverBindingError("backup_disallowed")
+    return allocations
+
+
+def observe_scheduler_saver(scheduler, *, expected_owner, build, weight_restore="disk_reload"):
     """Make one snapshot call; preserve unknown residency and downstream authority.
 
     Recheck the object chain, process, backing file and export mappings afterwards.
@@ -243,7 +293,9 @@ def observe_scheduler_saver(scheduler, *, expected_owner, build):
     identity is its registered fingerprint and the saver shapes are probed at
     launch (ADR 0008); no pinned source audit precedes this. These are point-in-time checks, not a lock on
     arbitrary Python mutation. The recipe's backup flags and snapshot records are
-    checked, but no future allocation policy or complete process footprint is proved.
+    checked against the launch's declared `weight_restore` (a weights backup
+    only for `cpu_backup`), but no future allocation policy or complete process
+    footprint is proved.
     """
     try:
         if (type(build) is not TrustedSaverBuild or type(build.path) is not str
@@ -253,10 +305,11 @@ def observe_scheduler_saver(scheduler, *, expected_owner, build):
         owner = current_process_identity()
         if type(expected_owner) is not ProcessIdentity or expected_owner != owner:
             raise SaverBindingError("owner_mismatch")
-        chain = _chain(scheduler, build)
+        chain = _chain(scheduler, build, weight_restore)
         library = _library(build, chain[-1])
-        allocations = observe_saver(chain[-1], require_no_backup=True)
-        current = _chain(scheduler, build)
+        allocations = _backup_only_on_weights(observe_saver(
+            chain[-1], require_no_backup=weight_restore != "cpu_backup"))
+        current = _chain(scheduler, build, weight_restore)
         if (any(left is not right for left, right in zip(chain, current))
                 or current_process_identity() != owner or _library(build, current[-1]) != library):
             raise SaverBindingError("changed")

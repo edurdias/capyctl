@@ -61,6 +61,7 @@ pub fn fake_installation() -> EngineInstallation {
         executable: PathBuf::from("/bin/true"),
         build_fingerprint: "fake-v1".into(),
         engine_config: crate::vllm_engine_config_json(),
+        kv_cache_declared: false,
         // SPEC §9.1, T21: this test host opts out of deep park; the product
         // default is enabled (owner decision 2026-09-17). Opting out is what keeps
         // a Fake-driven launch from rendering flags no Fake honours.
@@ -85,10 +86,21 @@ pub fn fake_bindings(
     runtime_dir: PathBuf,
 ) -> Arc<dyn EngineBindings> {
     Arc::new(FakeBindings {
-        profile: ProfileBindings::new(log_dir, runtime_dir),
+        profile: ProfileBindings::new(log_dir, runtime_dir).with_device_totals(fake_cards()),
         clock,
         members: None,
     })
+}
+
+/// The card total every discrete GPU a Fake "runs on" states (16 GB), so the
+/// product's plan for a launch on a device domain builds (discrete GPU design
+/// §6). The Fake runs on no card; the total only has to be a card's.
+pub const FAKE_CARD_BYTES: i64 = 16376 << 20;
+
+/// [`FAKE_CARD_BYTES`] for the driver indices a test host names (`gpu0` to
+/// `gpu7`).
+fn fake_cards() -> std::collections::BTreeMap<u32, i64> {
+    (0..8).map(|index| (index, FAKE_CARD_BYTES)).collect()
 }
 
 /// As [`fake_bindings`], with every Fake reporting `members` as its launched
@@ -101,7 +113,7 @@ pub fn fake_bindings_with_members(
     members: Vec<mllm_domain::completion::ProcessIdentity>,
 ) -> Arc<dyn EngineBindings> {
     Arc::new(FakeBindings {
-        profile: ProfileBindings::new(log_dir, runtime_dir),
+        profile: ProfileBindings::new(log_dir, runtime_dir).with_device_totals(fake_cards()),
         clock,
         members: Some(members),
     })
@@ -165,6 +177,11 @@ pub fn spawn_fake_coordinator(
     )
 }
 
+/// A loopback origin nothing listens on: a model-source download a test
+/// provider starts fails at once with `network` instead of reaching the
+/// internet (ADR 0008; tests never download).
+pub const NO_NETWORK_ORIGIN: &str = "http://127.0.0.1:9";
+
 /// The Fake as a host's one engine installation.
 pub fn fake_provider() -> Arc<dyn EngineProvider> {
     Arc::new(FakeProvider)
@@ -188,6 +205,10 @@ impl EngineProvider for FakeProvider {
 
     fn tools_factory(&self) -> ToolsFactory {
         fake_tools_factory()
+    }
+
+    fn model_source_origin(&self) -> Option<String> {
+        Some(NO_NETWORK_ORIGIN.into())
     }
 }
 

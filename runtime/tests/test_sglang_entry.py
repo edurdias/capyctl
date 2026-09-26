@@ -357,6 +357,27 @@ class LaunchTests(LaunchFixture, unittest.TestCase):
         public["settings"].update(cpu_weight_backup=True, weight_restore="cpu_backup")
         self.build(self.argv(public), self.payloads(public))
 
+    # T26: discrete GPU design §6. The card's total rides the closed memory
+    # object only on a discrete device, as a positive integer, and there the
+    # margin is a tenth of the weights share (a device request is weights x
+    # 1.10 plus the KV cache), so the static pool holds weights and KV.
+    def test_a_discrete_memory_object_states_the_card_total(self):
+        request, kv = 16 << 30, 4 << 30
+        margin = (request - kv) // 11
+        discrete = dict(request_bytes=request, kv_cache_bytes=kv, margin_bytes=margin,
+                        static_bytes=request - margin, device_total_bytes=16376 << 20)
+        public = copy.deepcopy(self.public)
+        public["settings"]["memory"] = dict(discrete)
+        self.build(self.argv(public), self.payloads(public))
+        for key, value in (("device_total_bytes", 0), ("device_total_bytes", True),
+                           ("device_total_bytes", "16"), ("device_total_bytes", 2 ** 63),
+                           ("margin_bytes", 8 << 30),
+                           ("static_bytes", request - (8 << 30))):
+            with self.subTest(key=key, value=value):
+                public = copy.deepcopy(self.public)
+                public["settings"]["memory"] = dict(discrete, **{key: value})
+                self.rejects(self.argv(public), self.payloads(public))
+
     def test_memory_request_is_closed_and_static_share_is_request_minus_margin(self):
         for key, value in (("request_bytes", 0), ("request_bytes", True),
                            ("kv_cache_bytes", 0), ("margin_bytes", -1),

@@ -43,6 +43,7 @@ pub struct RouterDeps {
     pub forwards: Arc<dyn forwarders::ForwarderSource>,
     pub limits: QueueLimits,
     /// Shared inference API key (F1: single-owner lab; per-client keys later).
+    /// `None` only when the operator turned authentication off (design §9).
     pub api_key: Option<String>,
     /// Conservative in-flight accounting (released only on confirmed end).
     pub inflight: Arc<admission::InFlight>,
@@ -71,7 +72,10 @@ pub fn serve_router(deps: RouterDeps) -> axum::Router {
 fn authorized(headers: &HeaderMap, deps: &RouterDeps) -> bool {
     use subtle::ConstantTimeEq;
     match &deps.api_key {
-        None => true, // no key configured: local-only default (SPEC §15.2)
+        // Design §9: no key only when the operator chose `authentication:
+        // none` (document, `--no-inference-auth` or MLLM_INFERENCE_AUTH); the
+        // role warns at start when that listener is not on loopback.
+        None => true,
         Some(expected) => headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())

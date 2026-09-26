@@ -56,6 +56,8 @@ pub const ENGINE_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "HOME",
     "CUDA_VISIBLE_DEVICES",
+    // Discrete GPU design §7: set with an index-pinned GPU, never inherited.
+    "CUDA_DEVICE_ORDER",
     "HF_HUB_OFFLINE",
     "TRANSFORMERS_OFFLINE",
     "VLLM_API_KEY",

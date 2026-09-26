@@ -120,6 +120,48 @@ pub const STORE_FROM_NEWER_VERSION: &str = "store_from_newer_version";
 /// its certificate. Exits with [`ExitCode::HOST_REVOKED`].
 pub const HOST_REVOKED: &str = "host_revoked";
 
+/// Design §11: the discrete GPU closed codes. Resolution and admission report
+/// them as a detail prefix (`<code>: ...`) inside a configuration refusal or
+/// an operation's reason, so the CLI finds them there to choose the exit.
+pub const DEVICE_CODES: &[&str] = &[
+    "insufficient_device_memory",
+    "device_unobserved",
+    "multi_gpu_unsupported",
+    "unsupported_gpu_topology",
+    "host_backed_unavailable",
+    "device_policy_mismatch",
+    "missing_system_allocation",
+];
+
+/// The CLI classes a closed code may travel under without being the reason.
+const GENERIC_CLASSES: &[&str] = &[
+    "invalid_config",
+    "command_rejected",
+    "operation_failed",
+    "internal",
+    "management_unavailable",
+    "insufficient_resources",
+    "unsupported",
+];
+
+/// The first discrete GPU closed code in `message` stated as a detail prefix:
+/// the code as a whole word, directly followed by `:`.
+fn device_code_in(message: &str) -> Option<&'static str> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    DEVICE_CODES
+        .iter()
+        .filter_map(|code| {
+            message
+                .match_indices(code)
+                .find(|(at, _)| {
+                    !message[..*at].ends_with(word) && message[at + code.len()..].starts_with(':')
+                })
+                .map(|(at, _)| (at, *code))
+        })
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, code)| code)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredError {
     pub code: &'static str,
@@ -136,12 +178,38 @@ impl StructuredError {
         }
     }
 
+    /// Design §11: the code that decides this refusal's exit. A generic class
+    /// (`invalid_config`, `command_rejected`, `operation_failed`, ...) whose
+    /// message carries one of the discrete GPU closed codes as a detail prefix
+    /// (`<code>: ...`) is that code; any other code is itself.
+    pub fn closed_code(&self) -> &'static str {
+        if GENERIC_CLASSES.contains(&self.code) {
+            if let Some(code) = device_code_in(&self.message) {
+                return code;
+            }
+        }
+        self.code
+    }
+
     pub fn exit_code(&self) -> ExitCode {
-        match self.code {
+        match self.closed_code() {
             "internal" | "management_unavailable" | "operation_failed" => ExitCode::INTERNAL,
             "invalid_config" | "command_rejected" | "not_found" => ExitCode::INVALID_CONFIG,
             "unauthorized" => ExitCode::UNAUTHORIZED,
-            "insufficient_resources" => ExitCode::INSUFFICIENT_RESOURCES,
+            // Discrete GPU design §11: a device domain that cannot hold the
+            // allocation uses the existing insufficient-resources exit.
+            "insufficient_resources" | "insufficient_device_memory" => {
+                ExitCode::INSUFFICIENT_RESOURCES
+            }
+            // Design §11: a device domain with no fresh observation closes
+            // admission there; the insufficient-resources exit.
+            "device_unobserved" => ExitCode::INSUFFICIENT_RESOURCES,
+            // Design §11: the existing unsupported exit.
+            "multi_gpu_unsupported" | "unsupported_gpu_topology" | "host_backed_unavailable" => {
+                ExitCode::UNSUPPORTED
+            }
+            // Design §11: the invalid-configuration exit.
+            "device_policy_mismatch" | "missing_system_allocation" => ExitCode::INVALID_CONFIG,
             "unreconciled" => ExitCode::UNRECONCILED,
             "device_conflict" => ExitCode::DEVICE_CONFLICT,
             "category_limit" => ExitCode::CATEGORY_LIMIT,
@@ -166,7 +234,7 @@ impl StructuredError {
     pub fn to_json(&self) -> String {
         format!(
             "{{\"code\":{},\"message\":{}}}",
-            json_string(self.code),
+            json_string(self.closed_code()),
             json_string(&self.message)
         )
     }
@@ -174,7 +242,7 @@ impl StructuredError {
 
 impl fmt::Display for StructuredError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "error [{}]: {}", self.code, self.message)
+        write!(f, "error [{}]: {}", self.closed_code(), self.message)
     }
 }
 

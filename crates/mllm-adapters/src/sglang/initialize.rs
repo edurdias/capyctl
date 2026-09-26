@@ -193,8 +193,17 @@ pub(super) async fn initialize(
     // names; the entry observes the namespace, it never invents it. Absent
     // when the host published no inventory UUID, which leaves the namespace
     // unset and placement fail-closed.
-    if let Some(uuid) = launch.frozen.metadata().device.physical_gpu_uuid.as_deref() {
+    let device = &launch.frozen.metadata().device;
+    if let Some(uuid) = device.physical_gpu_uuid.as_deref() {
         cmd.env.insert("CUDA_VISIBLE_DEVICES".into(), uuid.into());
+    } else if let Some(index) = device.cuda_pci_index {
+        // Discrete GPU design §7 (review decision): a host with a choice of
+        // GPU that published no UUID pins the selected one by its index, in
+        // the PCI bus order `nvidia-smi` published it under.
+        let namespace = mllm_config::effective::CudaNamespace::PciIndex(index);
+        for (name, value) in namespace.environment() {
+            cmd.env.insert(name.into(), value);
+        }
     }
 
     // The tool is synchronous on purpose (mllm-launchers has no runtime), so every

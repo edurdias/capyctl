@@ -9,6 +9,7 @@ use mllm_agent::{
     identity_storage::IdentityDirectory,
     journal::HostJournal,
 };
+use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
 use mllm_config::remote_roles::{HostConfig, ServerConfig};
 use mllm_controller::{
     agent_sessions::AgentSessions, enrollment::EnrollmentAuthority, OwnedCoordinatorState,
@@ -191,6 +192,32 @@ fn host_engines(named: Option<&Path>, document: &Path) -> PathBuf {
     crate::engine::role_engines(named, &role_env)
         .unwrap_or_else(|| mllm_config::registration::engines_beside(document))
 }
+/// Final review I8-bis (every setting three ways, standalone's precedence): a
+/// server's or host's state directory is `--state-dir`, else
+/// `MLLM_STATE_DIR`, else the document's `state_dir`. When a named form
+/// overrides the document, the winner is used and one notice names the
+/// overridden value. `None` when the document's own directory stands.
+fn state_dir_override(invocation: &Invocation, document_state_dir: &Path) -> Option<PathBuf> {
+    let (winner, source) = match invocation.state_dir.clone() {
+        Some(dir) => (dir, "--state-dir"),
+        None => (
+            std::env::var_os("MLLM_STATE_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)?,
+            "MLLM_STATE_DIR",
+        ),
+    };
+    let winner = crate::engine::absolute(&winner);
+    if winner == crate::engine::absolute(document_state_dir) {
+        return None;
+    }
+    eprintln!(
+        "notice: state directory {} from {source} overrides the document's state_dir {}",
+        winner.display(),
+        document_state_dir.display()
+    );
+    Some(winner)
+}
 fn implicit(root: &Path, role: &str) -> PathBuf {
     root.join("config").join(format!("{role}.yaml"))
 }
@@ -282,8 +309,15 @@ fn load_credentials(config: &ServerConfig) -> Result<Credentials, StructuredErro
 pub(crate) fn management_context(
     config: &ServerConfig,
 ) -> Result<(String, String), StructuredError> {
+    // Final review I8: `MLLM_MANAGEMENT_ADDR`, else the address the server
+    // recorded when it started (a `--management-listen` start), else the
+    // document's, as for standalone.
+    let address = crate::roles::management_override(None)
+        .map_err(|e| error(&e.to_string()))?
+        .or_else(|| crate::roles::recorded_management_address(&config.state_dir))
+        .unwrap_or(config.management);
     Ok((
-        format!("http://{}/management/v1", config.management),
+        format!("http://{address}/management/v1"),
         load_credentials(config)?.admin_token,
     ))
 }
@@ -516,7 +550,12 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
             max_requests_per_deployment: 32,
             max_buffered_bytes_total: 64 * 1024 * 1024,
         },
-        api_key: Some(credentials.api_key.clone()),
+        // Design §9: the key check is off only when the operator chose
+        // `none` for this run (document, flag or variable).
+        api_key: match config.inference_auth {
+            crate::exposure::InferenceAuth::ApiKey => Some(credentials.api_key.clone()),
+            crate::exposure::InferenceAuth::None => None,
+        },
         inflight,
         activation_join: Arc::new(mllm_router::WakeJoin::new()),
     });
@@ -550,10 +589,29 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
                 owner,
                 sessions.clone(),
             ))
-            .merge(latency_view);
+            .merge(latency_view)
+            // Design §9: the inference listener's bind and authentication.
+            .merge(
+                mllm_management::inference_listener::inference_listener_router(
+                    management_credentials(&credentials)?,
+                    {
+                        let view = Arc::new(
+                            mllm_management::inference_listener::InferenceListenerView::default(),
+                        );
+                        view.set(crate::exposure::listener_view(
+                            config.inference,
+                            config.inference_auth,
+                        ));
+                        view
+                    },
+                ),
+            );
     let management_listener = tokio::net::TcpListener::bind(config.management)
         .await
         .map_err(|_| unavailable())?;
+    crate::roles::record_management_address(&config.state_dir, config.management);
+    // Design §9: said out loud before the listener accepts connections.
+    crate::exposure::warn_if_exposed(config.inference, config.inference_auth);
     let inference_listener = tokio::net::TcpListener::bind(config.inference)
         .await
         .map_err(|_| unavailable())?;
@@ -611,7 +669,11 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
         );
     println!(
         "{}",
-        json!({"role":"server","management":config.management.to_string(),"state_dir":config.state_dir})
+        // Design §9 ("Where the key is"): the owner-only file holding the
+        // API key and admin token, never the key itself.
+        json!({"role":"server","management":config.management.to_string(),
+            "inference":config.inference.to_string(),"state_dir":config.state_dir,
+            "credentials":config.identity_dir.join("server-credentials.json")})
     );
     // SPEC §3: remote and embedded modes share the ordinary lifecycle/router.
     let management_stopped = stopped.clone();
@@ -680,6 +742,63 @@ async fn serve_server(config: ServerConfig) -> Result<Value, StructuredError> {
 /// dispatch is suspended before it closes ingress anyway.
 const DRAIN_NOTICE_BOUND: Duration = Duration::from_secs(5);
 
+/// Discrete GPU design §2: the start-time check of a host's declared device
+/// domains against the GPUs it observes (`device_policy_mismatch`, exit 2).
+fn check_host_device_policy(
+    document: &Value,
+    shape: &mllm_agent::gpu_memory::HostShape,
+) -> Result<(), StructuredError> {
+    let local = mllm_config::remote_resources::local_host_document(document).map_err(|e| {
+        error(&format!(
+            "Invalid host configuration: {}: {}",
+            e.path, e.detail
+        ))
+    })?;
+    let policy = mllm_config::effective::normalize_host_policy(&local).map_err(|e| {
+        error(&format!(
+            "Invalid host configuration: {}: {}",
+            e.path, e.detail
+        ))
+    })?;
+    mllm_agent::device_domains::check_device_policy(&policy, shape)
+        .map_err(|message| error(&message))
+}
+
+/// ADR 0018 §2: the host document at `path` merged with `engines`, with its
+/// models directory and model-source policy resolved (owner decision
+/// 2026-09-25: `flags` > `MLLM_MODELS_ROOT` / `MLLM_MODEL_SOURCES` /
+/// `MLLM_MODEL_SOURCES_MAX` > the document > `~/models`, sources allowed with
+/// a 500 GiB ceiling in `<model_store>/sources`).
+///
+/// Owner rule 2026-09-25: the engine settings (`--vllm-bin`, `MLLM_VLLM_BIN`,
+/// `local_engine`, `--runtime-dir`, `--engine-ports` and the rest) are
+/// resolved by the same rule and applied to the document before publication.
+fn load_host(
+    path: &Path,
+    engines: &Path,
+    flags: &mllm_config::model_settings::ModelOverrides,
+    engine_flags: &mllm_config::engine_settings::EngineOverrides,
+    overrides: &mllm_config::setting_overrides::SettingOverrides,
+) -> Result<HostConfig, StructuredError> {
+    let invalid = |e: mllm_config::ConfigError| {
+        let e = overrides.annotate(e);
+        error(&format!(
+            "Invalid host configuration: {}: {}",
+            e.path, e.detail
+        ))
+    };
+    let env = mllm_config::model_settings::ModelOverrides::from_process_env().map_err(invalid)?;
+    let engine_env =
+        mllm_config::engine_settings::EngineOverrides::from_process_env().map_err(invalid)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    HostConfig::load_with_overrides(path, engines, overrides)
+        .and_then(|config| config.with_models(flags, &env, home.as_deref()))
+        .and_then(|config| {
+            config.with_engines(engine_flags, &engine_env, &crate::roles::engine_version)
+        })
+        .map_err(invalid)
+}
+
 /// `document` is the host.yaml `config` was loaded from, merged with
 /// `engines` (the role's engines.yaml); the control handler re-reads both
 /// (ADR 0018 §3).
@@ -692,6 +811,19 @@ async fn serve_host(
     // the embedded runtime, refreshed before anything can launch from it.
     if !config.runtime_dir_declared {
         crate::managed_runtime::prepare_for_role(&config.runtime_dir)?;
+    }
+    // ADR 0019 (discrete GPU design §2): a host that declares a device domain
+    // checks the declaration against the GPUs it observes (a bounded sample,
+    // off the async thread) before anything else, and refuses to start on a
+    // mismatch. A unified or RAM-only host never runs the collector.
+    let discrete = !mllm_agent::device_domains::device_domains(&config.document).is_empty();
+    if discrete {
+        let sample = tokio::task::spawn_blocking(mllm_agent::gpu_memory::sample)
+            .await
+            .map_err(|_| unavailable())?;
+        let shape =
+            mllm_agent::gpu_memory::shape(sample.as_ref()).map_err(|e| error(&e.to_string()))?;
+        check_host_device_policy(&config.document, &shape)?;
     }
     let storage = IdentityDirectory::open(&config.identity_dir)
         .map_err(|_| error("Host identity is unsafe or in use; run join host before startup"))?;
@@ -725,46 +857,17 @@ async fn serve_host(
     let memory = mllm_agent::memory::read_host_memory()
         .map_err(|_| error("Host memory inventory unavailable"))?
         .memory;
-    let declared = config.document["resource_policy"]["domains"].as_object();
-    let domains = if let Some(declared) = declared {
-        declared
-            .iter()
-            .map(|(name, policy)| {
-                // The supported GB10 preparation has one unified physical pool.
-                // Multiple/distinct pools require their own observers, never copied capacity.
-                let supported = declared.len() == 1 && policy["memory"] == "unified";
-                pb::DomainObservation {
-                    residents: vec![],
-                    domain_id: name.clone(),
-                    kind: "system".into(),
-                    observed_bytes: if supported {
-                        memory.available_bytes
-                    } else {
-                        -1
-                    },
-                    observed_at_unix: memory.sampled_at_ms / 1000,
-                    capacity_bytes: if supported { memory.capacity_bytes } else { -1 },
-                    available_bytes: if supported {
-                        memory.available_bytes
-                    } else {
-                        -1
-                    },
-                    observed_at_unix_ms: memory.sampled_at_ms,
-                }
-            })
-            .collect()
+    // SPEC §7.2 / ADR 0019: the device domains are published from a sample
+    // taken beside the memory reading, so both are fresh at publication.
+    let gpu = if discrete {
+        tokio::task::spawn_blocking(mllm_agent::gpu_memory::sample)
+            .await
+            .map_err(|_| unavailable())?
     } else {
-        vec![pb::DomainObservation {
-            residents: vec![],
-            domain_id: "system".into(),
-            kind: "system".into(),
-            observed_bytes: memory.available_bytes,
-            observed_at_unix: memory.sampled_at_ms / 1000,
-            capacity_bytes: memory.capacity_bytes,
-            available_bytes: memory.available_bytes,
-            observed_at_unix_ms: memory.sampled_at_ms,
-        }]
+        None
     };
+    let domains =
+        mllm_agent::device_domains::startup_domains(&config.document, &memory, gpu.as_ref());
     // ADR 0008 (owner decision 2026-09-23): registration measures each
     // installation (engine package version and a digest over its files);
     // later drift is flagged against this. Unmeasurable is never a refusal.
@@ -1009,13 +1112,31 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 "host"
             };
-            // ADR 0018 §2 (review decision 2026-09-25): a host's document is
-            // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`.
-            let named = if *role == Role::Host {
-                crate::engine::named_role_document(invocation.config.as_deref(), &role_env)
+            // ADR 0018 §2 (review decision 2026-09-25): a role's document is
+            // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`; owner
+            // rule 2026-09-25: the server's too, so the setting has its two
+            // run-time forms for every role.
+            // Owner decision 2026-09-25: this run's generic overrides
+            // (`--set` > `MLLM_SET__…` > the document); a named flag or
+            // variable of the same setting must agree with them. Checked
+            // before anything is created.
+            let kind = if *role == Role::Server {
+                mllm_config::ConfigKind::Server
             } else {
-                invocation.config.clone()
+                mllm_config::ConfigKind::Host
             };
+            let overrides = crate::settings::role_overrides(
+                kind,
+                &invocation.sets,
+                &crate::settings::flag_layer(invocation),
+            )
+            .map_err(|e| {
+                error(&format!(
+                    "Invalid {label} configuration: {}",
+                    crate::settings::describe(&e)
+                ))
+            })?;
+            let named = crate::engine::named_role_document(invocation.config.as_deref(), &role_env);
             let path = named.clone().unwrap_or_else(|| implicit(root, label));
             if named.is_none()
                 && fs::symlink_metadata(&path)
@@ -1036,28 +1157,123 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             }
             let source = read_config(&path)?;
             if *role == Role::Server {
-                serve_server(
-                    ServerConfig::parse(&source)
-                        .map_err(|_| error("Invalid server configuration"))?,
-                )
-                .await
+                // Design §9: a bad `--listen` or MLLM_INFERENCE_ADDR refuses
+                // before the document is touched.
+                crate::roles::inference_override(invocation.listen)?;
+                crate::exposure::effective_inference_auth(
+                    crate::exposure::InferenceAuth::ApiKey,
+                    invocation.no_inference_auth,
+                )?;
+                if let Some(warning) =
+                    crate::roles::deprecated_inference_env_warning(invocation.listen)
+                {
+                    eprintln!("{warning}");
+                }
+                let invalid = |e: mllm_config::ConfigError| {
+                    error(&format!(
+                        "Invalid server configuration: {}",
+                        crate::settings::describe(&overrides.annotate(e))
+                    ))
+                };
+                let parse = |source: &str| {
+                    let document = mllm_config::parse_document(source)
+                        .and_then(|document| overrides.apply_and_validate(document))
+                        .map_err(invalid)?;
+                    ServerConfig::parse(&document.to_string()).map_err(invalid)
+                };
+                let mut config = parse(&source)?;
+                // Final review I8-bis: `--state-dir` > MLLM_STATE_DIR > the
+                // document, before anything reads the state directory.
+                let state_dir = state_dir_override(invocation, &config.state_dir);
+                if let Some(dir) = &state_dir {
+                    config = config.with_state_dir(dir.clone());
+                }
+                // ADR 0019, design §9: the old loopback default moves to
+                // 0.0.0.0:8443 once, after the document has been accepted.
+                // The migration reads the file's own bind, not an override.
+                let file_bind = mllm_config::parse_document(&source)
+                    .ok()
+                    .and_then(|document| {
+                        document["listeners"]["inference"]["bind"]
+                            .as_str()
+                            .map(str::to_owned)
+                    });
+                let document_bind = match crate::roles::listener_migration(
+                    &path,
+                    &config.state_dir,
+                    file_bind.as_deref(),
+                ) {
+                    Migration::Rewritten { .. } => {
+                        config = parse(&read_config(&path)?)?;
+                        if let Some(dir) = &state_dir {
+                            config = config.with_state_dir(dir.clone());
+                        }
+                        config.inference
+                    }
+                    Migration::BindOnly { .. }
+                        if overrides.get("listeners.inference.bind").is_none() =>
+                    {
+                        NEW_INFERENCE_DEFAULT.parse().expect("valid default")
+                    }
+                    Migration::BindOnly { .. } | Migration::NotNeeded => config.inference,
+                };
+                // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document,
+                // by the rule the standalone role uses, and never onto another
+                // server listener.
+                let address =
+                    crate::roles::effective_inference_address(document_bind, invocation.listen)?;
+                let mut config = config.with_inference(address).map_err(|_| {
+                    error(&format!(
+                        "inference address {address} collides with another server listener \
+                         or is not a unicast address with a non-zero port"
+                    ))
+                })?;
+                // Design §9: `--no-inference-auth` > MLLM_INFERENCE_AUTH >
+                // the document, by the rule the standalone role uses.
+                config.inference_auth = crate::exposure::effective_inference_auth(
+                    config.inference_auth,
+                    invocation.no_inference_auth,
+                )?;
+                // Final review I8: `--management-listen` >
+                // MLLM_MANAGEMENT_ADDR > the document, as for standalone.
+                if let Some(address) =
+                    crate::roles::management_override(invocation.management_listen)
+                        .map_err(|e| error(&e.to_string()))?
+                {
+                    config = config.with_management(address).map_err(|_| {
+                        error(&format!(
+                            "management address {address} collides with another server listener \
+                             or is not a loopback address with a non-zero port"
+                        ))
+                    })?;
+                }
+                serve_server(config).await
             } else {
                 // ADR 0018 §2: the host document merged with its `engines.yaml`,
                 // resolved by the same rule as `mllm engine`; the document
                 // itself was already read above for the size and existence
                 // checks.
                 let engines = host_engines(named.as_deref(), &path);
-                serve_host(
-                    HostConfig::load_with_engines(&path, &engines).map_err(|e| {
-                        error(&format!(
-                            "Invalid host configuration: {}: {}",
-                            e.path, e.detail
-                        ))
-                    })?,
-                    path.clone(),
-                    engines,
-                )
-                .await
+                // Owner rule 2026-09-25: a deprecated variable name is
+                // warned about once.
+                for warning in mllm_config::engine_settings::deprecation_warnings(&|key| {
+                    std::env::var(key).ok()
+                }) {
+                    eprintln!("{warning}");
+                }
+                let mut host = load_host(
+                    &path,
+                    &engines,
+                    &invocation.model_overrides,
+                    &invocation.engine_overrides,
+                    &overrides,
+                )?;
+                // Final review I8-bis: `--state-dir` > MLLM_STATE_DIR > the
+                // document.
+                if let Some(dir) = state_dir_override(invocation, &host.state_dir) {
+                    host = host.with_state_dir(dir);
+                }
+                serve_host(host, path.clone(), engines).await
             }
         }
         Command::Join { join_file, recover } => {
@@ -1067,12 +1283,30 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
             let engines = host_engines(named.as_deref(), &path);
-            let config = HostConfig::load_with_engines(&path, &engines).map_err(|e| {
+            // Owner decision 2026-09-25: the generic overrides apply here as
+            // at `start host` (final review I8: `join host --set` too), so
+            // both find the same identity.
+            let overrides = mllm_config::setting_overrides::SettingOverrides::from_process(
+                mllm_config::ConfigKind::Host,
+                &invocation.sets,
+            )
+            .map_err(|e| {
                 error(&format!(
-                    "Invalid host configuration: {}: {}",
-                    e.path, e.detail
+                    "Invalid host configuration: {}",
+                    crate::settings::describe(&e)
                 ))
             })?;
+            let mut config = load_host(
+                &path,
+                &engines,
+                &Default::default(),
+                &Default::default(),
+                &overrides,
+            )?;
+            // Final review I8-bis: the identity `start host` will use.
+            if let Some(dir) = state_dir_override(invocation, &config.state_dir) {
+                config = config.with_state_dir(dir);
+            }
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery
@@ -1208,10 +1442,7 @@ pub async fn management_request(
         .build()
         .map_err(|_| unavailable())?;
     let mut request = client
-        .request(
-            method,
-            format!("http://{}/management/v1{path}", config.management),
-        )
+        .request(method, format!("{}{path}", management_context(config)?.0))
         .bearer_auth(credentials.admin_token);
     if let Some(body) = body {
         request = request.json(&body);

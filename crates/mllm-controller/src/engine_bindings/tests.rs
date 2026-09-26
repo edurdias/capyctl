@@ -479,3 +479,106 @@ fn a_standalone_sglang_launch_keeps_its_rendezvous_in_the_private_root() {
     assert!(!dir.exists());
     assert!(root.is_dir(), "the root itself stays");
 }
+
+/// A golden deployment on a discrete host: one 16 GB card (`gpu0`, a device
+/// domain) beside host RAM, the phases derived from a 12 GiB device request.
+fn discrete_work(golden: &str) -> InitializeWork {
+    let store = Store::open_in_memory().expect("open in-memory store");
+    let session = store
+        .begin_coordinator_session()
+        .expect("begin coordinator session");
+    let source: Value = serde_json::from_str(golden).expect("fixture JSON parses");
+    let mut host = source["input"]["host"].clone();
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "30GiB", "free_reserve": "12GiB",
+                   "parked_limit": "15GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let mut deployment = source["input"]["deployment"].clone();
+    deployment.as_object_mut().unwrap().remove("resources");
+    deployment["residency"] = json!("restart_only");
+    deployment["engine_config"]["memory"] =
+        json!({"request": "12GiB", "kv_cache": "4GiB", "startup": "12GiB"});
+    let policy = resolve_effective(&deployment, &host)
+        .expect("fixture resolves")
+        .host;
+    let observations: Vec<_> = policy
+        .domains
+        .keys()
+        .map(|domain| MemoryObservation {
+            domain: domain.clone(),
+            capacity_bytes: 1_i64 << 50,
+            available_bytes: 1_i64 << 50,
+            sampled_at_ms: 1000,
+        })
+        .collect();
+    store
+        .import_resource_policy(&session, &policy, &observations, 1000)
+        .expect("import resource policy");
+    let receipt = store
+        .create_stopped_managed_configuration(
+            &session,
+            "owner",
+            "toy",
+            &json!({ "config": deployment }).to_string(),
+            &host,
+            1700,
+        )
+        .expect("create managed configuration");
+    let fence = mllm_store::lifecycle::DeploymentFence {
+        deployment_id: receipt.deployment_id,
+        revision: receipt.revision,
+        generation: receipt.generation,
+    };
+    store
+        .accept_start(&session, &fence, 1800, 10_000)
+        .expect("accept start");
+    store
+        .next_initialize(&session)
+        .expect("next initialize")
+        .expect("a freshly accepted start plans initialize work")
+}
+
+/// Discrete GPU design §6 (ADR 0019): an embedded launch on a device domain is
+/// sized against the total of the card the boot sample observed: vLLM's
+/// utilization is the device request's share of it, and SGLang's settings
+/// carry it for `mem_fraction_static`. Without the card's total the launch is
+/// refused, never sized against host memory.
+// T26
+#[test]
+fn an_embedded_discrete_launch_is_sized_against_the_card() {
+    let card = std::collections::BTreeMap::from([(0_u32, 16376_i64 << 20)]);
+    let vllm = discrete_work(include_str!(
+        "../../../mllm-config/tests/fixtures/effective-vllm-golden.json"
+    ));
+    assert!(bindings().spec(&vllm).is_err(), "no card total, no launch");
+    let spec = bindings()
+        .with_device_totals(card.clone())
+        .spec(&vllm)
+        .expect("vllm spec builds");
+    let AdapterSpec::Vllm { launch, .. } = spec else {
+        panic!("fixture profile declares vllm");
+    };
+    let launch = launch.expect("an owned vllm binding carries a launch plan");
+    assert_eq!(launch.granted.gpu_utilization_pct, Some(76));
+    let sglang = discrete_work(include_str!(
+        "../../../mllm-config/tests/fixtures/effective-sglang-golden.json"
+    ));
+    assert!(
+        bindings().spec(&sglang).is_err(),
+        "no card total, no launch"
+    );
+    let spec = bindings()
+        .with_device_totals(card)
+        .spec(&sglang)
+        .expect("sglang spec builds");
+    let AdapterSpec::Sglang { frozen, .. } = spec else {
+        panic!("fixture profile declares sglang");
+    };
+    assert_eq!(
+        frozen.settings().memory.device_total_bytes,
+        Some(16376 << 20)
+    );
+}

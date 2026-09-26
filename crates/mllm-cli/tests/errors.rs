@@ -230,3 +230,60 @@ fn profile_not_published_exits_24() {
     assert_eq!(error.exit_code(), ExitCode(24));
     assert_eq!(ExitCode::PROFILE_NOT_PUBLISHED, ExitCode(24));
 }
+
+// T26 T29 (design §11): the discrete GPU closed codes travel inside a
+// refusal's message (a management `invalid_config` or `command_rejected`, a
+// failed operation, a boot error). The CLI exits with the code's class: 4 for
+// memory, 5 for unsupported, 2 for configuration. No new exit number.
+#[test]
+fn discrete_gpu_codes_exit_with_their_spec_class() {
+    let cases = [
+        ("insufficient_device_memory", 4),
+        ("device_unobserved", 4),
+        ("multi_gpu_unsupported", 5),
+        ("unsupported_gpu_topology", 5),
+        ("host_backed_unavailable", 5),
+        ("device_policy_mismatch", 2),
+        ("missing_system_allocation", 2),
+    ];
+    for (code, exit) in cases {
+        // The code itself.
+        let direct = StructuredError {
+            code,
+            message: "refused".into(),
+        };
+        assert_eq!(direct.exit_code(), ExitCode(exit), "{code}");
+        // As a detail prefix under each generic class that carries it.
+        for carrier in [
+            "invalid_config",
+            "command_rejected",
+            "operation_failed",
+            "internal",
+            "management_unavailable",
+            "insufficient_resources",
+        ] {
+            let wrapped = StructuredError {
+                code: carrier,
+                message: format!(
+                    "invalid_config: Invalid deployment configuration: unsupported combination \
+                     at `resources`: {code}: the detail"
+                ),
+            };
+            assert_eq!(wrapped.exit_code(), ExitCode(exit), "{carrier} {code}");
+            assert_eq!(wrapped.closed_code(), code, "{carrier} {code}");
+        }
+    }
+    // A code named without its detail colon, or inside a longer word, is not
+    // the refusal's code.
+    let prose = StructuredError {
+        code: "invalid_config",
+        message: "see device_unobserved docs; xdevice_unobserved: no".into(),
+    };
+    assert_eq!(prose.exit_code(), ExitCode(2));
+    // A specific code is never overridden by its message.
+    let specific = StructuredError {
+        code: "unauthorized",
+        message: "device_unobserved: x".into(),
+    };
+    assert_eq!(specific.exit_code(), ExitCode(3));
+}

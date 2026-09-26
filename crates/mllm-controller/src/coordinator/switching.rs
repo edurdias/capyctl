@@ -3,7 +3,7 @@
 //! sequence that drives them lives in `crate::switching`.
 use super::*;
 use mllm_store::ordinary_lifecycle::switching::{
-    StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchRelease,
+    PlanningObservations, StartSwitchPlan, SwitchPlan, SwitchRecord, SwitchRelease,
 };
 use std::collections::BTreeSet;
 
@@ -36,6 +36,7 @@ impl CoordinatorCommands {
         only: Option<u32>,
         explicit: bool,
         protected: &BTreeSet<String>,
+        observed: &PlanningObservations,
     ) -> Result<SwitchPlan, CoordinatorCommandError> {
         // Read before the owner lock: the source keeps its own state.
         let eligible = self.shared.observations.eligible_hosts();
@@ -60,8 +61,31 @@ impl CoordinatorCommands {
                 eligible.as_ref(),
                 protected,
                 &last,
+                observed,
             )
         })
+    }
+
+    /// Final review I4: a fresh observation of each of `hosts` (availability
+    /// and the processes sampled beside it), for a switch planned on them.
+    /// A host whose observation fails is left out and planned from the
+    /// ledger alone; the arm judges it again either way.
+    pub async fn observe_for_planning(
+        &self,
+        hosts: impl IntoIterator<Item = String>,
+    ) -> PlanningObservations {
+        let mut observed = PlanningObservations::new();
+        for host in hosts {
+            if let Ok(sample) = self
+                .shared
+                .observations
+                .observe_with_residents(host.clone())
+                .await
+            {
+                observed.insert(host, sample);
+            }
+        }
+        observed
     }
 
     /// Owner decision 2026-09-25 (`start deployment --evict`): plan the
@@ -71,6 +95,7 @@ impl CoordinatorCommands {
         &self,
         target: &str,
         protected: &BTreeSet<String>,
+        observed: &PlanningObservations,
     ) -> Result<StartSwitchPlan, CoordinatorCommandError> {
         let eligible = self.shared.observations.eligible_hosts();
         let activity = self
@@ -92,6 +117,7 @@ impl CoordinatorCommands {
                 eligible.as_ref(),
                 protected,
                 &last,
+                observed,
             )
         })
     }

@@ -87,6 +87,9 @@ pub struct DomainView {
     pub capacity_bytes: i64,
     pub available_bytes: i64,
     pub observed_at_unix_ms: i64,
+    /// ADR 0019: the host-local device a `device` domain reads.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device_id: String,
     /// ADR 0007: per-process resident memory sampled beside this domain's
     /// availability (`process_residency`). Evidence for admission only; never
     /// shown in status.
@@ -99,11 +102,23 @@ impl DomainView {
     fn of(d: &pb::DomainObservation) -> Self {
         let valid = d.residents.len() <= crate::agent_sessions::MAX_RESIDENTS
             && d.residents.iter().all(|r| {
+                // ADR 0019: the split figures, when reported, add up to the
+                // sum; the host pages alone are bounded by this (host) domain,
+                // and the sum only when it is not split (an older host, whose
+                // sum is one pool's).
+                let split = r.device_bytes != 0 || r.host_bytes != 0;
                 r.pid != 0
                     && r.start_ticks != 0
                     && r.boot_id.len() == 36
                     && r.resident_bytes >= 0
-                    && r.resident_bytes <= d.capacity_bytes
+                    && r.device_bytes >= 0
+                    && r.host_bytes >= 0
+                    && if split {
+                        r.device_bytes.checked_add(r.host_bytes) == Some(r.resident_bytes)
+                            && r.host_bytes <= d.capacity_bytes
+                    } else {
+                        r.resident_bytes <= d.capacity_bytes
+                    }
             });
         Self {
             domain_id: d.domain_id.clone(),
@@ -113,6 +128,7 @@ impl DomainView {
             capacity_bytes: d.capacity_bytes,
             available_bytes: d.available_bytes,
             observed_at_unix_ms: d.observed_at_unix_ms.min(mllm_protocol::now_unix_ms()),
+            device_id: d.device_id.clone(),
             residents: if valid {
                 d.residents
                     .iter()
@@ -121,6 +137,13 @@ impl DomainView {
                         boot_id: r.boot_id.clone(),
                         start_ticks: r.start_ticks,
                         bytes: r.resident_bytes,
+                        // ADR 0019 (`device_memory_domains`): each domain is
+                        // credited from its own figure. An older host sends
+                        // neither (both 0), so only a unified domain, which
+                        // is credited the sum, receives its credit, exactly
+                        // as before; its device or system domain gets none.
+                        device_bytes: r.device_bytes,
+                        host_bytes: r.host_bytes,
                     })
                     .collect()
             } else {
@@ -227,9 +250,15 @@ fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
             bounded_name(&d.domain_id)
                 && matches!(
                     d.kind.as_str(),
-                    "system" | "device_memory" | "filesystem" | "remote_storage"
+                    "system" | "device" | "device_memory" | "filesystem" | "remote_storage"
                 )
                 && d.observed_bytes >= -1
+                // ADR 0019: only a `device` domain names its device.
+                && if d.kind == "device" {
+                    bounded_name(&d.device_id)
+                } else {
+                    d.device_id.is_empty()
+                }
         })
         && inventory.profiles.iter().all(|p| {
             bounded_name(&p.name)
@@ -240,6 +269,16 @@ fn inventory_shape_valid(inventory: &pb::ReportInventory, host: &str) -> bool {
                 )
                 && installation_fields_valid(p)
         })
+}
+/// ADR 0017 / 0019: whether every `device` domain `inventory` reports comes
+/// from a host that declared `device_memory_domains`. An older host never
+/// reports one; this refuses a peer that claims the kind without the feature.
+fn device_kinds_declared(
+    inventory: &pb::ReportInventory,
+    declared: &std::collections::BTreeSet<String>,
+) -> bool {
+    declared.contains(capabilities::DEVICE_MEMORY_DOMAINS)
+        || inventory.domains.iter().all(|d| d.kind != "device")
 }
 /// ADR 0008: what a host registered for its installations stays fixed for the
 /// session; drift and probe results may change as its launches find them.
@@ -318,6 +357,11 @@ struct Session {
     /// ADR 0017: new work may be placed here: not drain-only, and every
     /// placement requirement declared.
     placeable: bool,
+    /// ADR 0019 (discrete GPU design §8): the approved policy declares a
+    /// device memory domain, but the host did not declare
+    /// `device_memory_domains`. Every launch there names that domain, so the
+    /// host takes no placement (`host_capability_missing:device_memory_domains`).
+    device_domains_missing: bool,
 }
 /// Owner decision 2026-09-23: application heartbeats on the control session.
 /// The server sends one every `interval` to a host that declared heartbeats and
@@ -1067,6 +1111,11 @@ impl AgentSessions {
                             match message.msg {
                                 Some(agent_to_server::Msg::ReportInventory(inventory)) if !s.view.reconciled && s.inventory.is_none() => {
                                     if !inventory_shape_valid(&inventory, &host) { return Err(denied()); }
+                                    // ADR 0017 / 0019: a device domain is reported only by a
+                                    // host that declared `device_memory_domains`.
+                                    if !device_kinds_declared(&inventory, &s.capabilities) {
+                                        return Err(Status::failed_precondition(capabilities::missing(capabilities::DEVICE_MEMORY_DOMAINS)));
+                                    }
                                     after = After::Publish(Box::new(inventory));
                                     false
                                 }
@@ -1081,10 +1130,17 @@ impl AgentSessions {
                                         || inventory.envelope.as_ref().is_none_or(|e| e.host_id != host || !mllm_protocol::compatible_peer(&e.protocol_version))
                                     { return Err(denied()); }
                                     for domain in &inventory.domains {
-                                        if !old.domains.iter().any(|d| d.domain_id == domain.domain_id && d.kind == domain.kind)
-                                            || domain.capacity_bytes <= 0 || domain.available_bytes < 0
-                                            || domain.available_bytes > domain.capacity_bytes
+                                        if !old.domains.iter().any(|d| d.domain_id == domain.domain_id && d.kind == domain.kind && d.device_id == domain.device_id)
                                             || domain.observed_at_unix_ms > mllm_protocol::now_unix_ms() + HOST_CLOCK_LEAD_MS
+                                        { return Err(denied()); }
+                                        // SPEC §7.2 / ADR 0019: a GPU the host could not read is
+                                        // reported unknown (`-1`); its domain then has no
+                                        // observation, which closes admission there
+                                        // (`device_unobserved`). Anything else must be measured.
+                                        let unknown = domain.kind == "device"
+                                            && domain.capacity_bytes == -1 && domain.available_bytes == -1;
+                                        if !unknown && (domain.capacity_bytes <= 0 || domain.available_bytes < 0
+                                            || domain.available_bytes > domain.capacity_bytes)
                                         { return Err(denied()); }
                                     }
                                     // SPEC §7: a tolerated host clock lead is recorded on the
@@ -1142,7 +1198,7 @@ impl AgentSessions {
                                         // ends this session, which clears it below.
                                         // ADR 0017: nor a drain-only host, nor
                                         // one missing a placement requirement.
-                                        s.view.eligible = s.prepared && s.placeable;
+                                        s.view.eligible = s.prepared && s.placeable && !s.device_domains_missing;
                                     }
                                     page.complete
                                 }
@@ -1202,7 +1258,11 @@ impl AgentSessions {
                             After::Publish(inventory) => {
                                 // SPEC §§4.2, 13: a refused publication ends the session with a
                                 // named reason instead of a generic denial.
-                                self.authority.publish_inventory(&host, &inventory).map_err(|_| Status::failed_precondition("host inventory publication refused"))?;
+                                self.authority.publish_inventory(&host, &inventory).map_err(|refusal| Status::failed_precondition(match refusal.reason {
+                                    // ADR 0019: a changed hand-written policy says what to do.
+                                    Some(reason) => format!("host inventory publication refused: {reason}"),
+                                    None => "host inventory publication refused".to_owned(),
+                                }))?;
                                 let mut sessions = self.sessions.lock().map_err(|_| denied())?;
                                 let s = sessions.get_mut(&host).ok_or_else(denied)?;
                                 if s.view.session_id != id || s.view.reconciled || s.inventory.is_some() { return Err(denied()); }
@@ -1210,6 +1270,8 @@ impl AgentSessions {
                                 s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                 // Only an inventory `publish` accepted reaches here.
                                 s.prepared = crate::host_publication::eligible(&inventory);
+                                s.device_domains_missing = !s.capabilities.contains(capabilities::DEVICE_MEMORY_DOMAINS)
+                                    && crate::host_publication::declares_device_domains(&inventory);
                                 s.inventory = Some(*inventory);
                             }
                             After::Refresh(inventory, drifts) => {
@@ -1233,7 +1295,7 @@ impl AgentSessions {
                                     if s.view.session_id != id { return Err(denied()); }
                                     s.view.profiles = inventory.profiles.iter().map(ProfileView::of).collect();
                                     s.prepared = crate::host_publication::eligible(&inventory);
-                                    s.view.eligible = s.prepared && s.placeable;
+                                    s.view.eligible = s.prepared && s.placeable && !s.device_domains_missing;
                                     s.inventory = Some(*inventory);
                                 }
                                 let (accepted, reason) = match verdict {
@@ -1552,6 +1614,7 @@ impl AgentControl for AgentSessions {
                     drain_only,
                     capabilities: declared,
                     placeable,
+                    device_domains_missing: false,
                 },
             ) {
                 let _ = old.cancel.send(true);
@@ -1604,6 +1667,7 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                                 && !s.draining
                                 && !s.unresponsive
                                 && s.placeable
+                                && !s.device_domains_missing
                                 && !pending.contains(*host)
                         })
                         .map(|(host, _)| host.clone())
@@ -1657,6 +1721,11 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                                 "lacks a placement capability (host version {version}, server version {server}): {}",
                                 s.view.capabilities_missing.join(", ")
                             )
+                        } else if s.device_domains_missing {
+                            format!(
+                                "declares a device memory domain but lacks its capability (host version {version}, server version {server}): {}",
+                                capabilities::missing(capabilities::DEVICE_MEMORY_DOMAINS)
+                            )
                         } else if !s.view.eligible {
                             "is not prepared: no approved configuration carries a runtime profile whose build it reported".to_owned()
                         } else {
@@ -1708,9 +1777,14 @@ impl crate::coordinator::ServiceObservation for AgentSessions {
                 .iter()
                 .flat_map(|d| d.residents.iter().cloned())
                 .collect();
+            // SPEC §7.2 / ADR 0019: an unknown reading (`-1`) is no
+            // observation. A device domain without one is `device_unobserved`
+            // at admission, exactly as on a standalone host; nothing reserved
+            // is released for it.
             let observed = host
                 .domains
                 .into_iter()
+                .filter(|d| d.capacity_bytes > 0 && d.available_bytes >= 0)
                 .map(|d| mllm_domain::resources::MemoryObservation {
                     domain: mllm_config::remote_resources::ledger_key(
                         &host_id,

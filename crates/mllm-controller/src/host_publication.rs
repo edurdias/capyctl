@@ -1,9 +1,13 @@
 //! SPEC §§4.2,7,13: peer-bound preparation, independently from model readiness.
 use crate::ownership::SharedCoordinatorState;
 use mllm_protocol::pb::ReportInventory;
-#[derive(Debug, thiserror::Error)]
-#[error("host preparation publication refused")]
-pub struct PublicationError;
+#[derive(Debug, Default, thiserror::Error)]
+#[error("host preparation publication refused{}", .reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default())]
+pub struct PublicationError {
+    /// An operator-safe reason, when the refusal has one the host can act on
+    /// (ADR 0019: a hand-written policy whose shape changed).
+    pub reason: Option<String>,
+}
 
 /// SPEC §4.2: profile eligibility, derived only from evidence the controller
 /// accepted, never from a claim. A host is eligible for placement when its
@@ -33,6 +37,23 @@ pub fn eligible(inventory: &ReportInventory) -> bool {
             })
     })
 }
+/// ADR 0019: whether the approved policy `inventory` carries declares a
+/// device memory domain. A document without a resolvable policy declares none.
+pub fn declares_device_domains(inventory: &ReportInventory) -> bool {
+    mllm_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
+        .ok()
+        .filter(|config| config.document.get("resource_policy").is_some())
+        .and_then(|config| {
+            mllm_config::remote_resources::local_host_document(&config.document).ok()
+        })
+        .and_then(|local| mllm_config::effective::normalize_host_policy(&local).ok())
+        .is_some_and(|policy| {
+            policy
+                .domains
+                .values()
+                .any(|d| d.memory == mllm_config::effective::DomainMemory::Device)
+        })
+}
 pub fn publish(
     state: &SharedCoordinatorState,
     host_id: &str,
@@ -43,15 +64,15 @@ pub fn publish(
         return if inventory.profiles.is_empty() {
             Ok(())
         } else {
-            Err(PublicationError)
+            Err(PublicationError::default())
         };
     }
     let config = mllm_config::remote_roles::HostConfig::parse(&inventory.approved_host_config_json)
-        .map_err(|_| PublicationError)?;
+        .map_err(|_| PublicationError::default())?;
     if mllm_config::remote_resources::policy_fingerprint(&config.document)
         != inventory.policy_fingerprint
     {
-        return Err(PublicationError);
+        return Err(PublicationError::default());
     }
     let now = mllm_protocol::now_unix_ms();
     let publication = mllm_store::host_publication::HostPublication {
@@ -61,16 +82,25 @@ pub fn publish(
         fingerprint: inventory.policy_fingerprint.clone(),
         received_at_ms: now,
     };
-    let state = state.lock().map_err(|_| PublicationError)?;
+    let state = state.lock().map_err(|_| PublicationError::default())?;
     if config.document.get("resource_policy").is_some() {
         let local = mllm_config::remote_resources::local_host_document(&config.document)
-            .map_err(|_| PublicationError)?;
-        let policy =
-            mllm_config::effective::normalize_host_policy(&local).map_err(|_| PublicationError)?;
+            .map_err(|_| PublicationError::default())?;
+        let policy = mllm_config::effective::normalize_host_policy(&local)
+            .map_err(|_| PublicationError::default())?;
         let mut observations = Vec::new();
-        for domain in policy.domains.keys() {
+        for (domain, declared) in &policy.domains {
             let mut matches = inventory.domains.iter().filter(|d| &d.domain_id == domain);
-            let observation = matches.next().ok_or(PublicationError)?;
+            let observation = matches.next().ok_or_else(PublicationError::default)?;
+            // ADR 0019: a `device` observation is the GPU of a device domain
+            // the approved policy declares, and names that domain's device.
+            let device_kind = observation.kind == "device";
+            if device_kind
+                && (declared.memory != mllm_config::effective::DomainMemory::Device
+                    || declared.device.as_deref() != Some(observation.device_id.as_str()))
+            {
+                return Err(PublicationError::default());
+            }
             if matches.next().is_some()
                 || observation.capacity_bytes <= 0
                 || observation.available_bytes < 0
@@ -79,7 +109,7 @@ pub fn publish(
                 || observation.observed_at_unix_ms > now + 500
                 || now - observation.observed_at_unix_ms > policy.observation_ttl_ms
             {
-                return Err(PublicationError);
+                return Err(PublicationError::default());
             }
             observations.push(mllm_domain::resources::MemoryObservation {
                 domain: domain.clone(),
@@ -94,7 +124,15 @@ pub fn publish(
         state
             .store()
             .import_remote_resource_policy(state.session(), host_id, &policy, &observations, now)
-            .map_err(|_| PublicationError)?;
+            .map_err(|error| match error {
+                // ADR 0019: the host is told what differs and what to do.
+                shape @ mllm_store::resource_policy::ResourcePolicyError::ShapeChanged {
+                    ..
+                } => PublicationError {
+                    reason: Some(shape.to_string()),
+                },
+                _ => PublicationError::default(),
+            })?;
     }
     // Publish executable authority only after all resource observations validate.
     // A rejected policy import must not replace the previously approved snapshot.
@@ -110,7 +148,7 @@ pub fn publish(
     state
         .store()
         .publish_host_configuration_with_launch_claims(&publication, claims)
-        .map_err(|_| PublicationError)?;
+        .map_err(|_| PublicationError::default())?;
     Ok(())
 }
 

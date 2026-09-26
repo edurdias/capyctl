@@ -178,3 +178,30 @@ CPU and transport tests (`crates/mllm-config/tests/registration.rs`,
 `configuration.rs`, `crates/mllm-cli/tests/engine_cli.rs`, `standalone_engines.rs`). They are not qualification. Live rows ENG1–ENG4
 (`scripts/live/matrix/rows/`) on host-a and host-b with the existing engine
 environments are.
+
+## Amendment A1 (owner rule 2026-09-25: every setting three ways)
+
+The role's own installation (§5) is no longer standalone-only and no longer
+environment-only. Both roles that run engines resolve it, by one rule in
+shared code (`mllm_config::engine_settings`): CLI flag > environment > YAML >
+default.
+
+- YAML: `local_engine` (`vllm`, `sglang`, `build_fingerprint`, `args`,
+  `kv_cache`, `deep_park`, `trust_remote_code`, `installation_drift`) in a host
+  document, or under `host:` in a standalone document; `runtime_dir` and
+  `resource_policy.endpoint_port_range` beside it.
+- Flags on `start host` and `start standalone`: `--vllm-bin`, `--sglang-bin`,
+  `--engine-fingerprint`, `--engine-args`, `--deep-park`,
+  `--trust-remote-code`, `--installation-drift`, `--runtime-dir`,
+  `--engine-ports`; `--kv-cache` on standalone only (a host generates no
+  deployment).
+- Variables: as before, with `MLLM_ENGINE_PORTS` for both roles and
+  `MLLM_STANDALONE_ENGINE_PORTS` kept as a deprecated alias (warned once).
+
+On a host the installation is published as the profile `local` (both engines:
+`local-vllm` and `local-sglang`), built as `engine add` builds a profile, and
+the `local_engine` block itself is not published. The names in
+`ENVIRONMENT_PROFILES` are therefore reserved on a host as in standalone:
+`engine add` refuses them, and a name declared in `runtime_profiles` or
+`engines.yaml` and also by the local installation is refused at start. A live
+reload carries the start-time settings over (§3): they change on restart only.

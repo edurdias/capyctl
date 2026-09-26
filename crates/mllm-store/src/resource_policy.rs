@@ -83,6 +83,17 @@ pub enum ResourcePolicyError {
     CorruptStoredPolicy,
     #[error("legacy reservations require reconciliation")]
     NeedsReconciliation,
+    /// ADR 0019: a hand-written host policy whose domains differ from the
+    /// ones the server recorded for the host. mllm never replaces a policy it
+    /// did not generate, so the operator is told what differs and what to do.
+    #[error(
+        "the host's resource policy declares domains [{declared}], but the server recorded \
+         [{recorded}] for this host; mllm does not replace a hand-written policy. Restore the \
+         recorded domains in the host document, or stop every deployment on this host and \
+         enroll the machine again as a new host (`mllm revoke host`, then `mllm invite host` \
+         with a new name and `mllm join host`)"
+    )]
+    ShapeChanged { recorded: String, declared: String },
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
 }
@@ -126,6 +137,10 @@ struct StoredDomain {
     // SPEC §6.2: whether a host-backed park frees anything depends on this; it must
     // persist losslessly like every other required domain field.
     memory: String,
+    // ADR 0019: a device domain's device. Serialized only when present, so every
+    // stored unified or distinct policy keeps its bytes, identity and digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +211,7 @@ fn domain_memory(value: DomainMemory) -> String {
     match value {
         DomainMemory::Unified => "unified",
         DomainMemory::Distinct => "distinct",
+        DomainMemory::Device => "device",
     }
     .into()
 }
@@ -203,6 +219,7 @@ fn parse_domain_memory(value: &str) -> Result<DomainMemory, ResourcePolicyError>
     match value {
         "unified" => Ok(DomainMemory::Unified),
         "distinct" => Ok(DomainMemory::Distinct),
+        "device" => Ok(DomainMemory::Device),
         _ => Err(ResourcePolicyError::CorruptStoredPolicy),
     }
 }
@@ -244,6 +261,7 @@ impl StoredControls {
                             host_kv_limit: d.host_kv_limit,
                             parked_limit: d.parked_limit,
                             memory: domain_memory(d.memory),
+                            device: d.device.clone(),
                         },
                     )
                 })
@@ -281,6 +299,7 @@ impl StoredControls {
                             host_kv_limit: d.host_kv_limit,
                             parked_limit: d.parked_limit,
                             memory: parse_domain_memory(&d.memory)?,
+                            device: d.device.clone(),
                         },
                     ))
                 })
@@ -584,16 +603,22 @@ impl crate::Store {
         let local = ResourceContext::from_host(host);
         let mut scoped = host.clone();
         scoped.name = host_id.into();
-        scoped.domains = host
-            .domains
-            .iter()
-            .map(|(id, p)| {
-                (
-                    crate::resource_namespace::ledger_key(host_id, "domain", id),
-                    p.clone(),
-                )
-            })
-            .collect();
+        scoped.domains =
+            host.domains
+                .iter()
+                .map(|(id, p)| {
+                    let mut policy = p.clone();
+                    // ADR 0019: a device domain's device is scoped like the
+                    // device map's keys, so the pair still names each other.
+                    policy.device = p.device.as_deref().map(|device| {
+                        crate::resource_namespace::ledger_key(host_id, "device", device)
+                    });
+                    (
+                        crate::resource_namespace::ledger_key(host_id, "domain", id),
+                        policy,
+                    )
+                })
+                .collect();
         scoped.devices = host
             .devices
             .iter()
@@ -696,6 +721,25 @@ impl crate::Store {
         }
         if let Some(current) = read_selected_policy(&tx, &context.host_id)? {
             if current.context != context {
+                // ADR 0019: an enrolled host's policy is hand-written; name
+                // the difference rather than a bare revision conflict.
+                if let Some((host_id, _)) = remote {
+                    let prefix = crate::resource_namespace::ledger_key(host_id, "domain", "");
+                    let local_ids = |ids: &BTreeSet<String>| {
+                        ids.iter()
+                            .map(|id| id.strip_prefix(&prefix).unwrap_or(id).to_owned())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    if current.context.domain_ids != context.domain_ids
+                        || current.context.device_domains != context.device_domains
+                    {
+                        return Err(ResourcePolicyError::ShapeChanged {
+                            recorded: local_ids(&current.context.domain_ids),
+                            declared: local_ids(&context.domain_ids),
+                        });
+                    }
+                }
                 return Err(ResourcePolicyError::RevisionConflict);
             }
             validate_observations(
@@ -820,13 +864,12 @@ impl crate::Store {
         // report success while freeing nothing. A domain new to the incoming
         // controls is not a change; a domain's absence is already governed by the
         // membership check in `controls.validate` above.
+        // ADR 0019: which device a device domain holds is the same kind of
+        // hardware fact, so rebinding it is refused the same way.
         for (id, domain) in &controls.domains {
-            if current
-                .controls
-                .domains
-                .get(id)
-                .is_some_and(|previous| previous.memory != domain.memory)
-            {
+            if current.controls.domains.get(id).is_some_and(|previous| {
+                previous.memory != domain.memory || previous.device != domain.device
+            }) {
                 return Err(ResourcePolicyError::RevisionConflict);
             }
         }
@@ -1043,5 +1086,7 @@ impl From<StoredReceipt> for ResourcePolicyUpdate {
     }
 }
 
+mod migration;
+pub use migration::{GeneratedPolicyMigration, PreviousPolicyCharge, ResolvedElsewhere};
 #[cfg(test)]
 mod tests;

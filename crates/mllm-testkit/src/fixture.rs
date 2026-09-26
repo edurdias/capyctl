@@ -69,6 +69,13 @@ impl Fixture {
 
 /// A store whose only durable state is the host's imported resource policy.
 pub fn fixture() -> Fixture {
+    fixture_with(|_, _| {})
+}
+
+/// As [`fixture`], with the golden deployment and host document edited
+/// before the policy is resolved and imported (a test states another host
+/// shape; `managed_edit` must then apply the same host edit).
+pub fn fixture_with(edit: impl FnOnce(&mut Value, &mut Value)) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ordinary.db");
     let store = Store::open(&path).unwrap();
@@ -77,9 +84,12 @@ pub fn fixture() -> Fixture {
         "../../mllm-config/tests/fixtures/effective-vllm-golden.json"
     ))
     .unwrap();
-    let policy = resolve_effective(&source["input"]["deployment"], &source["input"]["host"])
-        .unwrap()
-        .host;
+    let (mut deployment, mut host) = (
+        source["input"]["deployment"].clone(),
+        source["input"]["host"].clone(),
+    );
+    edit(&mut deployment, &mut host);
+    let policy = resolve_effective(&deployment, &host).unwrap().host;
     let observations: Vec<_> = policy
         .domains
         .keys()

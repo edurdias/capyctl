@@ -305,6 +305,14 @@ fn frozen_launch(port: u16) -> NativeLaunch {
 /// The same launch with the host policy's service-authorized physical UUID,
 /// which is what the guarded launcher sets the child's CUDA namespace from.
 fn frozen_launch_with_device(port: u16, physical_gpu_uuid: Option<&str>) -> NativeLaunch {
+    frozen_launch_pinned(port, physical_gpu_uuid, None)
+}
+
+fn frozen_launch_pinned(
+    port: u16,
+    physical_gpu_uuid: Option<&str>,
+    cuda_pci_index: Option<u32>,
+) -> NativeLaunch {
     NativeLaunch::from_frozen_store(
         NativeLaunchMetadata {
             engine: "sglang".into(),
@@ -322,6 +330,7 @@ fn frozen_launch_with_device(port: u16, physical_gpu_uuid: Option<&str>) -> Nati
                 device_id: "gpu0".into(),
                 memory_domain: "uma".into(),
                 physical_gpu_uuid: physical_gpu_uuid.map(str::to_owned),
+                cuda_pci_index,
             },
         },
         CHECKPOINT.into(),
@@ -941,6 +950,56 @@ async fn the_guarded_launcher_sets_the_devices_cuda_namespace() {
             .env
             .contains_key("CUDA_VISIBLE_DEVICES"),
         "no mapping, no namespace"
+    );
+    std::fs::remove_file(&log).ok();
+}
+
+/// Discrete GPU design §7 (review decision): a GPU the host published no
+/// UUID for, on a host with a choice of GPU, is pinned by its index in PCI bus
+/// order; the child never inherits every GPU. A published UUID wins.
+// T27 T21
+#[tokio::test]
+async fn the_guarded_launcher_pins_an_unpublished_gpu_by_its_pci_index() {
+    let log = launch_log();
+    std::fs::write(&log, "").unwrap();
+    let (_stub, port) = serve_stub(MODEL, 0, INFERENCE, 0).await;
+    let cuda = |env: &std::collections::BTreeMap<String, String>| {
+        env.iter()
+            .filter(|(name, _)| name.starts_with("CUDA_"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>()
+    };
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let adapter = equipped(
+        frozen_launch_pinned(port, None, Some(1)),
+        tool.clone(),
+        &log,
+    );
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        cuda(&tool.spawned.lock().unwrap()[0].env),
+        [
+            ("CUDA_DEVICE_ORDER".to_string(), "PCI_BUS_ID".to_string()),
+            ("CUDA_VISIBLE_DEVICES".to_string(), "1".to_string())
+        ]
+    );
+    let uuid = "GPU-1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d";
+    let tool = Arc::new(ScriptedTool::alive(api_identity(), vec![worker0()]));
+    let adapter = equipped(
+        frozen_launch_pinned(port, Some(uuid), None),
+        tool.clone(),
+        &log,
+    );
+    adapter
+        .execute_persisted(&initialize_command(30_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        cuda(&tool.spawned.lock().unwrap()[0].env),
+        [("CUDA_VISIBLE_DEVICES".to_string(), uuid.to_string())]
     );
     std::fs::remove_file(&log).ok();
 }

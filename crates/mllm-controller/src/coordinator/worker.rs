@@ -1976,6 +1976,19 @@ fn remaining(shared: &Shared, deadline: i64) -> Result<Duration, CoordinatorErro
     Ok(Duration::from_millis((deadline - now) as u64).min(shared.options.protocol_timeout))
 }
 
+/// The first device domain of `controls` with no observation in `observed`.
+fn unobserved_device<'a>(
+    controls: &'a mllm_config::resource_controls::ResourceControls,
+    observed: &[MemoryObservation],
+) -> Option<&'a str> {
+    controls
+        .domains
+        .iter()
+        .filter(|(_, domain)| domain.memory == mllm_config::effective::DomainMemory::Device)
+        .map(|(id, _)| id.as_str())
+        .find(|id| !observed.iter().any(|o| o.domain == *id))
+}
+
 fn fresh(observations: &[MemoryObservation], now: i64, ttl: i64) -> bool {
     !observations.is_empty()
         && observations.len() <= 1024
@@ -2059,6 +2072,14 @@ async fn drive(
         return Err(CoordinatorError::Service(
             "invalid bounded service observation".into(),
         ));
+    }
+    // SPEC §7.2 / ADR 0019 (T29): a device domain whose GPU could not be read
+    // has no observation. Its memory is unknown, so admission closes there;
+    // it is never admitted against host RAM, and nothing reserved is released.
+    if let Some(domain) = unobserved_device(&work.policy().controls, &observed) {
+        return Err(CoordinatorError::Service(format!(
+            "device_unobserved: device memory domain {domain} has no observation"
+        )));
     }
     remaining(shared, work.deadline_ms())?;
     let driver = factory(work)?;

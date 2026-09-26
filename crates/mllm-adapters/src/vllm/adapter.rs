@@ -74,6 +74,9 @@ pub struct VllmAdapter {
     /// The residency-step fence (SPEC §13.2): one step at a time, each step id
     /// once, and nothing further after a step whose outcome is unknown.
     residency: Mutex<ResidencyFence>,
+    /// ADR 0010, discrete GPU design §5: the sleep level a park uses, from the
+    /// deployment's declared residency at launch; never from a command.
+    park_level: crate::vllm::residency::ParkLevel,
 }
 
 #[derive(Default)]
@@ -105,7 +108,26 @@ impl VllmAdapter {
             engine_key: None,
             admin_key: None,
             residency: Mutex::new(ResidencyFence::default()),
+            park_level: crate::vllm::residency::ParkLevel::Deep,
         }
+    }
+
+    /// ADR 0010, discrete GPU design §5: park at the level the deployment's
+    /// declared residency names. `host_backed` sleeps at level 1 (weights kept
+    /// in host RAM); every other tier keeps the deep level 2. A `restart_only`
+    /// launch never parks: its park policy refuses every sleep call.
+    pub fn with_residency(mut self, residency: mllm_config::effective::Residency) -> Self {
+        use crate::vllm::residency::ParkLevel;
+        self.park_level = match residency {
+            mllm_config::effective::Residency::HostBacked => ParkLevel::HostBacked,
+            _ => ParkLevel::Deep,
+        };
+        self
+    }
+
+    /// The sleep level this launch parks at.
+    pub(super) fn park_level(&self) -> crate::vllm::residency::ParkLevel {
+        self.park_level
     }
 
     /// Whether the host's deep-park policy admits sleep, wake and collective

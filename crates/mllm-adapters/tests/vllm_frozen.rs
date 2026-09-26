@@ -5,7 +5,7 @@
 
 use mllm_adapters::vllm::{park_policy, plan_from_effective, render_command, VllmPlanError};
 use mllm_adapters::ParkPolicy;
-use mllm_config::effective::{resolve_effective, EffectiveDeployment};
+use mllm_config::effective::{resolve_effective, CudaNamespace, EffectiveDeployment};
 use serde_json::{json, Value};
 
 fn fixture() -> (Value, Value) {
@@ -208,4 +208,122 @@ fn deployment_engine_config_reaches_the_plan_or_is_refused_by_name() {
     assert!(!argv
         .iter()
         .any(|a| a == "--kv-cache-dtype" || a == "--block-size"));
+}
+
+/// Discrete GPU design §§6–7: with several GPUs, the selected one narrows the
+/// engine's CUDA namespace (its published UUID, else its PCI-ordered index);
+/// a one-device unified host keeps the agent's own pass-through as before.
+// T27 T21
+#[test]
+fn the_selected_gpu_narrows_the_namespace_only_where_there_is_a_choice() {
+    const UUID: &str = "GPU-11111111-1111-1111-1111-111111111111";
+    let render = |devices: Value, selected: &str| {
+        let (mut deployment, mut host) = fixture();
+        deployment["residency"] = json!("restart_only");
+        host["runtime_profiles"]["local"]["security"]["deep_park"] = json!("disabled");
+        host["resource_policy"]["devices"] = devices;
+        let claim = json!([{"id": selected, "sharing": "shared"}]);
+        deployment["devices"] = claim.clone();
+        for phase in ["cold", "ready", "parking", "wake"] {
+            deployment["resources"][phase]["devices"] = claim.clone();
+        }
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let plan = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+        (
+            plan.cuda_namespace.clone(),
+            render_command(&plan)
+                .unwrap()
+                .env
+                .get("CUDA_VISIBLE_DEVICES")
+                .cloned(),
+        )
+    };
+    let one =
+        json!({"gpu0": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": UUID}});
+    assert_eq!(render(one, "gpu0"), (None, None));
+    let two = json!({
+        "gpu0": {"domain": "unified", "sharing": "shared"},
+        "gpu1": {"domain": "unified", "sharing": "shared", "physical_gpu_uuid": UUID}
+    });
+    assert_eq!(
+        render(two.clone(), "gpu1"),
+        (
+            Some(CudaNamespace::Uuid(UUID.to_string())),
+            Some(UUID.to_string())
+        )
+    );
+    // No UUID published for the selected GPU: its index pins it, never a
+    // pass-through of every GPU (review decision; see device_namespace.rs).
+    assert_eq!(
+        render(two, "gpu0"),
+        (Some(CudaNamespace::PciIndex(0)), Some("0".to_string()))
+    );
+}
+
+/// The golden deployment on a discrete host: one 16 GB card (`gpu0`, a device
+/// domain) beside host RAM (`system`), its phases derived from a 12 GiB device
+/// request.
+fn discrete_effective() -> EffectiveDeployment {
+    let (mut deployment, mut host) = fixture();
+    host["resource_policy"]["domains"] = json!({
+        "system": {"memory": "distinct", "managed_limit": "30GiB", "free_reserve": "12GiB",
+                   "parked_limit": "15GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    host["resource_policy"]["devices"] = json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    let object = deployment.as_object_mut().unwrap();
+    object.remove("resources");
+    deployment["engine_config"]["memory"] =
+        json!({"request": "12GiB", "kv_cache": "4GiB", "startup": "12GiB"});
+    resolve_effective(&deployment, &host).unwrap()
+}
+
+/// Discrete GPU design §6 (ADR 0019): on a device domain the utilization vLLM
+/// checks at start is the device request's share of the observed card, not
+/// the unified gate, and the KV bytes are the grant's. A launch whose card
+/// total was not observed is refused before a plan exists.
+// T26
+#[test]
+fn a_discrete_plan_sizes_utilization_from_the_device_request() {
+    let effective = discrete_effective();
+    // The card is charged the request and the CUDA context and graphs; vLLM
+    // is sized from the request alone (76 % of the card below).
+    assert_eq!(
+        effective.ready_device_allocation(),
+        Some((
+            Some(0),
+            (12 << 30) + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+        ))
+    );
+    // Without the card's total the plan keeps the gate; the launch paths
+    // refuse such a launch before building it (`with_device_total`).
+    let gated = plan_from_effective(&effective, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(
+        gated.granted.gpu_utilization_pct,
+        Some(mllm_adapters::vllm::GPU_UTILIZATION_GATE_PCT)
+    );
+    assert!(effective.clone().with_device_total(|_| None).is_err());
+    assert!(effective
+        .clone()
+        .with_device_total(|index| (index == 1).then_some(16376 << 20))
+        .is_err());
+    let sized = effective
+        .with_device_total(|index| (index == 0).then_some(16376 << 20))
+        .unwrap();
+    let plan = plan_from_effective(&sized, 8123, "l".into(), "/r".into()).unwrap();
+    assert_eq!(plan.granted.gpu_utilization_pct, Some(76));
+    assert_eq!(plan.granted.kv_cache_bytes, Some(4 << 30));
+    let argv = render_command(&plan).unwrap().argv;
+    assert!(argv
+        .windows(2)
+        .any(|w| w == ["--gpu-memory-utilization", "0.76"]));
+    // A unified deployment is never given a device total.
+    let unified = effective_with_deep_park_disabled();
+    let same = unified.clone().with_device_total(|_| Some(1)).unwrap();
+    assert_eq!(same.engine_config.memory().device_total_bytes, None);
+}
+
+fn effective_with_deep_park_disabled() -> EffectiveDeployment {
+    effective("disabled")
 }

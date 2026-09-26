@@ -14,6 +14,10 @@
 //!   when `--host` names a host document, the effective resolution the host
 //!   agent performs before launch.
 //!
+//! Owner decision 2026-09-25: `--set path=value` (and `MLLM_SET__…` in the
+//! environment) change a role document's settings before these checks, as the
+//! role start applies them, and the result lists the overrides applied.
+//!
 //! Nothing is written, created, or contacted: the command reads the named files
 //! and reports.
 
@@ -28,8 +32,52 @@ use crate::output::StructuredError;
 const MAX_BYTES: u64 = 1024 * 1024;
 
 pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, StructuredError> {
-    let text = read(file)?;
+    validate_config_with(file, host, &[])
+}
+
+/// As [`validate_config`], with `--set` overrides (`sets`) and the
+/// environment's `MLLM_SET__…` applied to a role document first.
+pub fn validate_config_with(
+    file: &Path,
+    host: Option<&Path>,
+    sets: &[String],
+) -> Result<Value, StructuredError> {
+    validate_config_at(file, host, sets, None)
+}
+
+/// As [`validate_config_with`], with the state root a start would use when
+/// the invocation names one (`--state-dir` or `MLLM_STATE_DIR`). A standalone
+/// document's state directories are checked against it; without one, against
+/// the document's own `state_dir`, else the directory its `server.state_dir`
+/// names, else the document's directory.
+pub fn validate_config_at(
+    file: &Path,
+    host: Option<&Path>,
+    sets: &[String],
+    state_root: Option<&Path>,
+) -> Result<Value, StructuredError> {
+    // Owner decision 2026-09-25: a `~/` model path means this user's home, as
+    // `deploy model --file` reads it.
+    let text = crate::deployment_file::with_home_expanded(&read(file)?);
     let kind = detect_kind(&text).map_err(|e| named(file, None, &e))?;
+    let overrides = mllm_config::setting_overrides::SettingOverrides::from_process(kind, sets)
+        .map_err(|e| named(file, Some(kind), &e))?;
+    // Owner decision 2026-09-25: the role document with the overrides
+    // applied, validated exactly as the start validates it.
+    let overridden = |text: &str| -> Result<String, StructuredError> {
+        if overrides.is_empty() {
+            return Ok(text.to_owned());
+        }
+        mllm_config::parse_document(text)
+            .and_then(|document| overrides.apply_and_validate(document))
+            .map(|document| document.to_string())
+            .map_err(|e| named(file, Some(kind), &e))
+    };
+    let applied: Vec<Value> = overrides
+        .effective()
+        .into_iter()
+        .map(|item| json!({"path": item.path, "value": item.value, "source": item.source.as_str()}))
+        .collect();
     if host.is_some() && kind != ConfigKind::Deployment {
         return Err(invalid(format!(
             "{}: --host applies only to a deployment document, not a {} document",
@@ -37,20 +85,53 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             kind.as_str()
         )));
     }
+    let mut standalone_ignored: Vec<String> = Vec::new();
     let resolved_against = match kind {
         ConfigKind::Server => {
-            mllm_config::remote_roles::ServerConfig::parse(&text)
-                .map_err(|e| named(file, Some(kind), &e))?;
+            mllm_config::remote_roles::ServerConfig::parse(&overridden(&text)?)
+                .map_err(|e| named(file, Some(kind), &overrides.annotate(e)))?;
             Value::Null
         }
         ConfigKind::Host => {
-            host_policy_document(file).map_err(|e| named(file, Some(kind), &e))?;
+            host_policy_document(file, &overrides)
+                .map_err(|e| named(file, Some(kind), &overrides.annotate(e)))?;
             Value::Null
         }
         ConfigKind::Standalone => {
-            let document = parse_strict(kind, &text).map_err(|e| named(file, Some(kind), &e))?;
+            let document =
+                parse_strict(kind, &overridden(&text)?).map_err(|e| named(file, Some(kind), &e))?;
             mllm_config::remote_roles::drain_timeout(&document)
                 .map_err(|e| named(file, Some(kind), &e))?;
+            // Final review I10: the checks `start standalone` runs before any
+            // side effect (listeners, management on loopback, state
+            // directories, TLS, model and engine settings), so a document this
+            // command accepts is not refused by the start.
+            let config_dir = crate::engine::absolute(file.parent().unwrap_or(Path::new(".")));
+            let root = state_root.map(Path::to_path_buf).unwrap_or_else(|| {
+                let resolve = |dir: &str| {
+                    let dir = Path::new(dir);
+                    if dir.is_relative() {
+                        config_dir.join(dir)
+                    } else {
+                        dir.to_path_buf()
+                    }
+                };
+                document["state_dir"]
+                    .as_str()
+                    .map(resolve)
+                    .or_else(|| {
+                        document["server"]["state_dir"]
+                            .as_str()
+                            .map(resolve)
+                            .and_then(|dir| dir.parent().map(Path::to_path_buf))
+                    })
+                    .unwrap_or_else(|| config_dir.clone())
+            });
+            let ignored = mllm_config::standalone::check_honoured(&document, &config_dir, &root)
+                .map_err(|e| named(file, Some(kind), &overrides.annotate(e)))?;
+            if !ignored.is_empty() {
+                standalone_ignored = ignored.iter().map(ToString::to_string).collect();
+            }
             Value::Null
         }
         // ADR 0018 §2: `engines.yaml` validates like any other document kind.
@@ -72,11 +153,31 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
             mllm_config::effective::validate_declared_startup(&deployment)
                 .map_err(|e| named(file, Some(kind), &e))?;
             match host {
-                None => Value::Null,
+                // Owner decision 2026-09-25: the document with the defaults a
+                // minimal file leaves out, as deploy sends it.
+                // SPEC §15.3: say plainly what was not checked.
+                None => {
+                    let mut out = json!({
+                        "valid": true,
+                        "kind": kind.as_str(),
+                        "file": file.display().to_string(),
+                        "resolved_against": Value::Null,
+                        "document": deployment,
+                    });
+                    let mut unchecked = vec![
+                        "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, devices, resources and timeouts, and to see the host's defaults",
+                    ];
+                    unchecked.extend_from_slice(REQUIRES_SERVER);
+                    out["requires_server"] = json!(unchecked);
+                    return Ok(out);
+                }
                 Some(host_file) => {
                     read(host_file)?;
-                    let (name, host_document) = host_policy_document(host_file)
-                        .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
+                    let (name, host_document) = host_policy_document(
+                        host_file,
+                        &mllm_config::setting_overrides::SettingOverrides::none(ConfigKind::Host),
+                    )
+                    .map_err(|e| named(host_file, Some(ConfigKind::Host), &e))?;
                     // ADR 0013 §2, §3, ADR 0018 §7: the checks the server's
                     // deploy runs against this host's publication, in its
                     // order (`registry_targets`), so a file validate accepts
@@ -108,7 +209,11 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                         )));
                     }
                     let profile = deployment["runtime_profile"].as_str().unwrap_or_default();
-                    if !profiles.contains_key(profile) {
+                    // Owner decision 2026-09-25: an engine family names the
+                    // host's one profile of that family.
+                    if mllm_config::deployment_defaults::profile_on_host(profile, &host_document)
+                        .is_none()
+                    {
                         let names: Vec<&str> = profiles.keys().map(String::as_str).collect();
                         return Err(StructuredError {
                             code: "profile_not_published",
@@ -145,15 +250,26 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                     );
                     let (effective, provisional) = resolve_for_acceptance(&source, &host_document)
                         .map_err(|e| named(file, Some(kind), &e))?;
-                    return Ok(json!({
+                    let mut out = json!({
                         "valid": true,
                         "kind": kind.as_str(),
                         "file": file.display().to_string(),
                         "resolved_against": name,
                         "requires_server": REQUIRES_SERVER,
                         "provisional": provisional,
+                        // Owner decision 2026-09-25: the document as this host
+                        // runs it, with every default filled.
+                        "document": source,
                         "effective": {
                             "name": effective.name,
+                            "routes": effective.routes,
+                            "runtime_profile": source["runtime_profile"],
+                            "runtime_profile_revision": effective.profile.revision,
+                            "selected_devices": effective.selected_devices,
+                            "memory": effective.engine_config.memory(),
+                            "provenance": serde_json::to_value(&effective.engine_config)
+                                .ok()
+                                .map(|config| config["provenance"].clone()),
                             "residency": effective.residency,
                             "recipe": effective.recipe,
                             "recipe_fingerprint": effective.recipe_fingerprint,
@@ -171,7 +287,11 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
                             // again from its own copy at launch).
                             "context": mllm_config::context_fit::fit_for_effective(&effective),
                         },
-                    }));
+                    });
+                    if provisional {
+                        unknown_until_measured(&mut out["effective"], &effective);
+                    }
+                    return Ok(out);
                 }
             }
         }
@@ -182,15 +302,48 @@ pub fn validate_config(file: &Path, host: Option<&Path>) -> Result<Value, Struct
         "file": file.display().to_string(),
         "resolved_against": resolved_against,
     });
-    // SPEC §15.3: say plainly what was not checked.
-    if kind == ConfigKind::Deployment {
-        let mut unchecked = vec![
-            "resolution against a host: pass --host <host.yaml> to check the runtime profile, placement, devices, resources and timeouts",
-        ];
-        unchecked.extend_from_slice(REQUIRES_SERVER);
-        out["requires_server"] = json!(unchecked);
+    if !applied.is_empty() {
+        out["overrides"] = Value::Array(applied);
+    }
+    if !standalone_ignored.is_empty() {
+        out["ignored"] = json!(standalone_ignored);
     }
     Ok(out)
+}
+
+/// Final review I10 (ADR 0014 §5, §7): a provisional resolution is sized
+/// with zero weights, a placeholder nothing may reserve. Offline validation
+/// does not know the weights, so every figure derived from them is reported
+/// as unknown rather than rendered from zero, and a residency mllm would
+/// choose from the weights (a `host_backed` copy of zero bytes) is not
+/// claimed. A declared value is still shown.
+fn unknown_until_measured(
+    view: &mut Value,
+    effective: &mllm_config::effective::EffectiveDeployment,
+) {
+    const UNKNOWN: &str = "unknown until the checkpoint is measured (after deploy)";
+    let provenance = serde_json::to_value(&effective.engine_config)
+        .ok()
+        .map(|config| config["provenance"].clone())
+        .unwrap_or(Value::Null);
+    // Provenance names only what mllm derived or defaulted.
+    let derived = |field: &str| provenance.get(field).is_some();
+    let memory = &mut view["memory"];
+    if derived("memory.request") {
+        memory["request_bytes"] = json!(UNKNOWN);
+    }
+    if derived("memory.startup") {
+        memory["startup_bytes"] = json!(UNKNOWN);
+    }
+    memory["weights_bytes"] = json!(UNKNOWN);
+    for field in ["resources", "startup", "context", "timeouts"] {
+        view[field] = json!(UNKNOWN);
+    }
+    // On a discrete host the tier is chosen from the weights (whether their
+    // host-RAM copy fits); elsewhere it does not depend on them.
+    if derived("residency") && effective.ready_device_allocation().is_some() {
+        view["residency"] = json!(UNKNOWN);
+    }
 }
 
 /// SPEC §15.3: the deploy checks that need the server's live state, which an
@@ -255,9 +408,30 @@ fn resolve_for_acceptance(
 /// merged with the `engines.yaml` beside it (ADR 0018 §2, as the host role
 /// loads it), the role-local settings removed and the resource policy
 /// normalized.
-fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
+fn host_policy_document(
+    path: &Path,
+    overrides: &mllm_config::setting_overrides::SettingOverrides,
+) -> Result<(String, Value), ConfigError> {
     let engines = mllm_config::registration::engines_beside(path);
-    let config = mllm_config::remote_roles::HostConfig::load_with_engines(path, &engines)?;
+    // Owner decision 2026-09-25: the models directory and the model-source
+    // policy as the host role resolves them (without its run's flags).
+    let config =
+        mllm_config::remote_roles::HostConfig::load_with_overrides(path, &engines, overrides)?
+            .with_models(
+                &Default::default(),
+                &mllm_config::model_settings::ModelOverrides::from_process_env()?,
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+            )?
+            // Owner rule 2026-09-25: the engine settings too (`local_engine` and
+            // its variables). Validation never runs an engine, so an unstated
+            // fingerprint is a placeholder here; the role reads the real one.
+            .with_engines(
+                &Default::default(),
+                &mllm_config::engine_settings::EngineOverrides::from_process_env()?,
+                &|_| Ok("unknown (validate does not run the engine)".into()),
+            )?;
     let local = mllm_config::remote_resources::local_host_document(&config.document)?;
     mllm_config::effective::normalize_host_policy(&local)?;
     Ok((config.name, local))
@@ -268,6 +442,14 @@ fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
 /// a kind mismatch. A failure every kind shares (a duplicate key, a missing
 /// `kind`) is reported without a kind, since the document never said one.
 fn detect_kind(text: &str) -> Result<ConfigKind, ConfigError> {
+    // Owner decision 2026-09-25: a deployment is the one kind a document may
+    // leave implied, so a document without `kind` is a deployment.
+    if mllm_config::parse_document(text)?
+        .as_object()
+        .is_some_and(|document| !document.contains_key("kind"))
+    {
+        return Ok(ConfigKind::Deployment);
+    }
     let kinds = [
         ConfigKind::Server,
         ConfigKind::Host,

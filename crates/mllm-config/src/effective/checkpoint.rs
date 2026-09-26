@@ -14,7 +14,9 @@ use serde_json::Value;
 /// Where one deployment's checkpoint lives on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointLocation {
-    /// The host's model store, as the host document states it (absolute).
+    /// The root the checkpoint must be inside (absolute): the host's model
+    /// store for a local source, its sources store for a remote one (ADR
+    /// 0008, owner decision 2026-09-25).
     pub model_store: PathBuf,
     /// The checkpoint directory, as the deployment's source resolves against
     /// the store. Containment is checked by whoever opens it, on the opened
@@ -37,10 +39,15 @@ pub fn checkpoint_location(
     if !store.is_absolute() {
         return Err(invalid("host.model_store.path", "must be absolute"));
     }
-    let model = normalize_model(raw, Some(&store))?;
+    let sources = crate::model_source::ModelSourcePolicy::from_raw(host.model_sources)?;
+    let model = normalize_model(raw, Some(&store), Some(sources.root(&store)))?;
     let checkpoint = PathBuf::from(model.require_resolved_path()?);
+    let root = match model.source {
+        ModelSource::Local { .. } => store,
+        _ => sources.root(&store).to_path_buf(),
+    };
     Ok(CheckpointLocation {
-        model_store: store,
+        model_store: root,
         checkpoint,
         content_fingerprint: model.content_fingerprint,
     })

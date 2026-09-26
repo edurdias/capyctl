@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod support;
@@ -129,7 +129,7 @@ fn python3() -> PathBuf {
         .expect("python3 on PATH for the fake engine")
 }
 
-/// A per-installation engine port range (`MLLM_STANDALONE_ENGINE_PORTS`):
+/// A per-installation engine port range (`MLLM_ENGINE_PORTS`):
 /// four consecutive loopback ports free when chosen, below the ephemeral
 /// range (`support::process::free_ports`). The 8100 default would make every
 /// standalone fake engine in parallel tests bind the same port.
@@ -222,7 +222,7 @@ impl Installation {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+        let mut command = support::mllm();
         command
             .env("MLLM_STATE_DIR", self.state())
             .env("MLLM_VLLM_BIN", self.root.path().join("engine/vllm"))
@@ -232,9 +232,10 @@ impl Installation {
             .env("MLLM_ENGINE_FINGERPRINT", "fake-vllm-w11")
             .env("MLLM_KV_CACHE_BYTES", "64MiB")
             .env("MLLM_DEEP_PARK", "off")
-            .env("MLLM_STANDALONE_INFERENCE_ADDR", &self.inference)
-            .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
-            .env("MLLM_STANDALONE_ENGINE_PORTS", &self.engines);
+            .env("MLLM_INFERENCE_ADDR", &self.inference)
+            .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
+            .env("MLLM_MANAGEMENT_ADDR", &self.management)
+            .env("MLLM_ENGINE_PORTS", &self.engines);
         command
     }
 
@@ -261,35 +262,28 @@ impl Installation {
     }
 
     fn start(&self, drain_secs: Option<u64>) -> Role {
+        self.start_with(drain_secs, &[]).0
+    }
+
+    /// As [`Self::start`], with extra `start standalone` arguments; also
+    /// returns the ready line.
+    fn start_with(&self, drain_secs: Option<u64>, extra: &[&str]) -> (Role, String) {
         let mut command = self.command();
-        command
-            .args(["start", "standalone"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        command.args(["start", "standalone"]).args(extra);
+        self.start_command(drain_secs, &mut command)
+    }
+
+    /// As [`Self::start_with`], running `command` as the role.
+    fn start_command(&self, drain_secs: Option<u64>, command: &mut Command) -> (Role, String) {
         if let Some(seconds) = drain_secs {
             self.drain_timeout(&format!("{seconds}s"));
         }
-        // Guard first: a role that never prints its ready line is killed
-        // with its process group when the wait below panics.
-        let mut child = Guarded::spawn(&mut command);
-        let (lines, received) = mpsc::channel();
-        let stdout = child.child().stdout.take().unwrap();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if lines.send(line).is_err() {
-                    return;
-                }
-            }
-        });
-        let role = Role {
-            child,
-            lines: received,
-        };
-        role.expect_line(
+        let role = Role::spawn(command);
+        let ready = role.expect_line(
             |line| line.starts_with("standalone ready"),
             Duration::from_secs(60),
         );
-        role
+        (role, ready)
     }
 }
 
@@ -307,9 +301,46 @@ impl Drop for Installation {
 struct Role {
     child: Guarded,
     lines: mpsc::Receiver<String>,
+    /// Everything the role wrote to stderr so far (it is also forwarded to the
+    /// test's own stderr), and whether the stream has ended.
+    stderr: Arc<Mutex<(String, bool)>>,
 }
 
 impl Role {
+    /// Run `command` as a role, reading its stdout lines and its stderr.
+    fn spawn(command: &mut Command) -> Self {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Guard first: a role that never prints its ready line is killed
+        // with its process group when a wait on it panics.
+        let mut child = Guarded::spawn(command);
+        let (lines, received) = mpsc::channel();
+        let stdout = child.child().stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if lines.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new((String::new(), false)));
+        let pipe = child.child().stderr.take().unwrap();
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                let mut text = sink.lock().unwrap();
+                text.0.push_str(&line);
+                text.0.push('\n');
+            }
+            sink.lock().unwrap().1 = true;
+        });
+        Self {
+            child,
+            lines: received,
+            stderr,
+        }
+    }
+
     fn expect_line(&self, want: impl Fn(&str) -> bool, within: Duration) -> String {
         let deadline = Instant::now() + within;
         loop {
@@ -402,9 +433,9 @@ fn deploy(installation: &Installation) -> Value {
 }
 
 fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> Value {
-    // Sized from an explicit capacity, not this machine's (see
-    // `support::BINARY_TEST_CAPACITY_BYTES`).
-    let capacity = support::BINARY_TEST_CAPACITY_BYTES;
+    // Sized for the shape the binary publishes on this machine, from an
+    // explicit capacity rather than this machine's (see
+    // `support::binary_template_memory`).
     let document = mllm_cli::standalone_config::deployment_document(
         "w11-model",
         "w11-model",
@@ -417,13 +448,14 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
                 .into_owned(),
         },
         Engine::Vllm,
-        capacity,
+        &support::binary_template_memory(),
         request_deadline,
         // The host runs with MLLM_DEEP_PARK=off (ADR 0012 opt-out), so
         // its generated deployment is restart_only.
         false,
         "local",
-    );
+    )
+    .expect("the template fits the stated card");
     let file = installation.root.path().join("deployment.json");
     std::fs::write(&file, document.to_string()).unwrap();
     let out = installation.cli(&[
@@ -449,6 +481,112 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
 /// the drain bound is cut at the bound. `mllm drain standalone` then stops the
 /// engine with verified cleanup, and the deployment stays eligible for
 /// on-demand activation.
+/// T03 T21 (owner rule 2026-09-25: every setting three ways): a standalone
+/// whose engine installation, runtime directory and engine port range are
+/// stated only in its document (`host.local_engine`, `host.runtime_dir`,
+/// `host.resource_policy.endpoint_port_range`), started with `--state-dir`
+/// instead of `MLLM_STATE_DIR`, boots and serves; the environment then wins
+/// over the document, and a flag over both (the published fingerprint).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standalone_engine_settings_come_from_the_document_env_or_flags() {
+    let installation = Installation::new();
+    let state = installation.state();
+    let (path, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, &state).unwrap();
+    let mut document: Value =
+        mllm_config::parse_document(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let (start, end) = installation.engines.split_once('-').unwrap();
+    document["host"]["local_engine"] = json!({
+        "vllm": installation.root.path().join("engine/vllm"),
+        "build_fingerprint": "yaml-fp",
+        "kv_cache": "64MiB",
+        "deep_park": "off",
+    });
+    document["host"]["runtime_dir"] = json!(installation.root.path().join("runtime"));
+    document["host"]["resource_policy"]["endpoint_port_range"] =
+        json!({"start": start.parse::<u16>().unwrap(), "end": end.parse::<u16>().unwrap()});
+    std::fs::write(&path, document.to_string()).unwrap();
+    let bare = |command: &mut Command| {
+        for name in [
+            "MLLM_STATE_DIR",
+            "MLLM_VLLM_BIN",
+            "MLLM_RUNTIME_DIR",
+            "MLLM_ENGINE_FINGERPRINT",
+            "MLLM_KV_CACHE_BYTES",
+            "MLLM_DEEP_PARK",
+            "MLLM_ENGINE_PORTS",
+        ] {
+            command.env_remove(name);
+        }
+    };
+    let engines = |extra_env: &[(&str, &str)]| -> Value {
+        let mut command = installation.command();
+        bare(&mut command);
+        command.envs(extra_env.iter().copied()).args([
+            "--state-dir",
+            state.to_str().unwrap(),
+            "engine",
+            "list",
+            "--format",
+            "json",
+        ]);
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let version = |listed: &Value| {
+        let rows = listed["engines"].as_array().cloned().unwrap_or_default();
+        let local = rows
+            .iter()
+            .find(|row| row["profile"] == "local")
+            .unwrap_or_else(|| panic!("no local profile: {listed}"));
+        local["version"].as_str().unwrap().to_owned()
+    };
+    let start_with = |env: &[(&str, &str)], flags: &[&str]| {
+        let mut command = installation.command();
+        bare(&mut command);
+        command
+            .envs(env.iter().copied())
+            .args([
+                "--state-dir",
+                state.to_str().unwrap(),
+                "start",
+                "standalone",
+            ])
+            .args(flags);
+        installation.start_command(None, &mut command).0
+    };
+
+    // The document alone declares the engine; it serves.
+    let role = start_with(&[], &[]);
+    assert_eq!(version(&engines(&[])), "yaml-fp");
+    let deployed = deploy(&installation);
+    assert_eq!(deployed["deployment"]["observed_state"], "ready");
+    served_within(&installation, Duration::from_secs(10)).await;
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(25));
+    assert!(status.success(), "{status:?}");
+
+    // The environment wins over the document, a flag over both.
+    let role = start_with(&[("MLLM_ENGINE_FINGERPRINT", "env-fp")], &[]);
+    assert_eq!(version(&engines(&[])), "env-fp");
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(25));
+    assert!(status.success(), "{status:?}");
+    let role = start_with(
+        &[("MLLM_ENGINE_FINGERPRINT", "env-fp")],
+        &["--engine-fingerprint", "flag-fp"],
+    );
+    assert_eq!(version(&engines(&[])), "flag-fp");
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(25));
+    assert!(status.success(), "{status:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     let installation = Installation::new();
@@ -719,22 +857,470 @@ fn a_writable_runtime_module_refuses_standalone_startup() {
     assert!(installation.launches().is_empty());
 }
 
-/// T03: a standalone listener override must stay on loopback (SPEC §16.5).
+/// T03: the management listener override must stay on loopback (SPEC §16.5);
+/// the inference override may name any unicast address (design §9) but never
+/// a multicast one.
 #[test]
 fn a_non_loopback_standalone_listener_is_refused() {
     let installation = Installation::new();
     // A port free now: a regressed refusal would otherwise bind a fixed
     // public port, and serve until the bound below fails the test.
+    // Owner decision 2026-09-25: MLLM_MANAGEMENT_ADDR, and the deprecated
+    // MLLM_STANDALONE_MANAGEMENT_ADDR when it is the one set.
+    for variable in ["MLLM_MANAGEMENT_ADDR", "MLLM_STANDALONE_MANAGEMENT_ADDR"] {
+        let out = output_within(
+            installation
+                .command()
+                .args(["start", "standalone"])
+                .env_remove("MLLM_MANAGEMENT_ADDR")
+                .env(variable, format!("0.0.0.0:{}", free_port())),
+            REFUSAL_BOUND,
+        );
+        assert!(!out.status.success());
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains(variable), "{said}");
+    }
+    for variable in ["MLLM_INFERENCE_ADDR", "MLLM_STANDALONE_INFERENCE_ADDR"] {
+        let out = output_within(
+            installation
+                .command()
+                .args(["start", "standalone"])
+                .env_remove("MLLM_INFERENCE_ADDR")
+                .env(variable, format!("224.0.0.1:{}", free_port())),
+            REFUSAL_BOUND,
+        );
+        assert!(!out.status.success());
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains(variable), "{said}");
+    }
+}
+
+/// Everything `role` wrote to stderr, once the stream has ended (the role
+/// has exited).
+fn stderr_of(stderr: &Arc<Mutex<(String, bool)>>) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = stderr.lock().unwrap();
+        if text.1 {
+            return text.0.clone();
+        }
+        drop(text);
+        assert!(Instant::now() < deadline, "the role's stderr never ended");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Run `command` as a role until it prints `ready`, stop it, and return the
+/// ready line and everything it wrote to stderr.
+fn run_until_ready(command: &mut Command, ready: impl Fn(&str) -> bool) -> (String, String) {
+    let role = Role::spawn(command);
+    let line = role.expect_line(ready, Duration::from_secs(60));
+    let stderr = role.stderr.clone();
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+    (line, stderr_of(&stderr))
+}
+
+/// T02 (ADR 0019, design §9): a standalone installation whose document the
+/// previous generator wrote (inference on `127.0.0.1:8443`) is migrated on its
+/// first start: the notice is printed once on stderr, the document states
+/// `0.0.0.0:8443` with the original kept beside it, and the next start prints
+/// nothing. The runs here listen on a loopback port through
+/// `MLLM_INFERENCE_ADDR`, so the test never serves on every interface; the
+/// document's effective bind is checked in `standalone_start.rs`.
+#[test]
+fn the_old_loopback_standalone_document_is_migrated_once() {
+    let installation = Installation::new();
+    let (path, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, &installation.state())
+            .unwrap();
+    let previous = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("0.0.0.0:8443", "127.0.0.1:8443");
+    std::fs::write(&path, &previous).unwrap();
+
+    let standalone = |line: &str| line.starts_with("standalone ready");
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    let (_, said) = run_until_ready(&mut command, standalone);
+    assert_eq!(
+        said.matches("NOTICE: mllm 0.1.0 serves inference on all interfaces")
+            .count(),
+        1,
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("Configuration updated: {}", path.display())),
+        "{said}"
+    );
+    assert!(!said.contains("config_migration_failed"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        previous.replace("127.0.0.1:8443", "0.0.0.0:8443")
+    );
+    let backup = path.with_file_name("standalone.yaml.pre-0.1.0");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), previous);
+    assert!(installation
+        .state()
+        .join("migrations/inference-bind-v1")
+        .exists());
+
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    let (_, said) = run_until_ready(&mut command, standalone);
+    assert!(!said.contains("NOTICE"), "{said}");
+}
+
+/// T03 (design §9, owner rule): the standalone inference address is set three
+/// ways, `--listen` > `MLLM_INFERENCE_ADDR` > the document's
+/// `server.listeners.inference.bind`; the deprecated
+/// `MLLM_STANDALONE_INFERENCE_ADDR` still works, after the new variable, and
+/// says it is deprecated.
+#[test]
+fn the_standalone_inference_address_follows_flag_then_environment_then_document() {
+    let installation = Installation::new();
+    let (path, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, &installation.state())
+            .unwrap();
+    let document = format!("127.0.0.1:{}", free_port());
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("0.0.0.0:8443", &document)).unwrap();
+    let environment = format!("127.0.0.1:{}", free_port());
+    let flag = format!("127.0.0.1:{}", free_port());
+    let alias = format!("127.0.0.1:{}", free_port());
+    let standalone = |line: &str| line.starts_with("standalone ready");
+    let bound = |line: &str| {
+        line.rsplit("inference listener ")
+            .next()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_end_matches(')')
+            .to_owned()
+    };
+
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone", "--listen", &flag])
+        .env("MLLM_INFERENCE_ADDR", &environment);
+    assert_eq!(bound(&run_until_ready(&mut command, standalone).0), flag);
+
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env("MLLM_INFERENCE_ADDR", &environment);
+    assert_eq!(
+        bound(&run_until_ready(&mut command, standalone).0),
+        environment
+    );
+
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env_remove("MLLM_INFERENCE_ADDR");
+    let (line, said) = run_until_ready(&mut command, standalone);
+    assert_eq!(bound(&line), document);
+    assert!(!said.contains("deprecated"), "{said}");
+
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env_remove("MLLM_INFERENCE_ADDR")
+        .env("MLLM_STANDALONE_INFERENCE_ADDR", &alias);
+    let (line, said) = run_until_ready(&mut command, standalone);
+    assert_eq!(bound(&line), alias);
+    assert!(
+        said.contains("MLLM_STANDALONE_INFERENCE_ADDR is deprecated; use MLLM_INFERENCE_ADDR"),
+        "{said}"
+    );
+
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env("MLLM_INFERENCE_ADDR", &environment)
+        .env("MLLM_STANDALONE_INFERENCE_ADDR", &alias);
+    let (line, said) = run_until_ready(&mut command, standalone);
+    assert_eq!(bound(&line), environment);
+    assert!(said.contains("deprecated"), "{said}");
+}
+
+/// A server initialised by the binary, every listener on a free loopback port
+/// except inference, which states `inference`.
+fn server_installation(inference: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let root = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state = root.path().join("server");
+    let config = root.path().join("server.yaml");
+    let out = server_command(&state)
+        .args(["init", "server", "--output", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut server: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    for name in ["management", "bootstrap", "control"] {
+        let address = format!("127.0.0.1:{}", free_port());
+        server["listeners"][name]["bind"] = address.clone().into();
+        if name != "management" {
+            server["enrollment"][format!("{name}_address")] = format!("https://{address}").into();
+        }
+    }
+    server["listeners"]["inference"]["bind"] = inference.into();
+    std::fs::write(&config, serde_json::to_vec_pretty(&server).unwrap()).unwrap();
+    (root, state, config)
+}
+
+fn server_command(state: &Path) -> Command {
+    let mut command = support::mllm();
+    command
+        .env("MLLM_STATE_DIR", state)
+        .env_remove("MLLM_INFERENCE_ADDR")
+        .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
+        .env_remove("MLLM_VLLM_BIN")
+        .env_remove("MLLM_SGLANG_BIN");
+    command
+}
+
+/// The inference address in a server's start banner.
+fn server_inference(banner: &str) -> String {
+    serde_json::from_str::<Value>(banner).unwrap()["inference"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// T01 T02 T03 (ADR 0019, design §9, owner rule): `mllm start server --listen`
+/// moves the server's inference listener for one run; the address follows
+/// `--listen` > `MLLM_INFERENCE_ADDR` > the document, as for standalone. A
+/// server document stating the old loopback default is migrated once, with
+/// the notice; loopback set back afterwards is kept. Every run listens on a
+/// loopback port.
+#[test]
+fn start_server_listen_environment_and_migration() {
+    let (_root, state, config) = server_installation("127.0.0.1:8443");
+    let original = std::fs::read_to_string(&config).unwrap();
+    let banner = |line: &str| line.contains("\"role\":\"server\"");
+    let start = |state: &Path| {
+        let mut command = server_command(state);
+        command.args(["start", "server", "--config", config.to_str().unwrap()]);
+        command
+    };
+    let flag = format!("127.0.0.1:{}", free_port());
+    let environment = format!("127.0.0.1:{}", free_port());
+
+    // First start: --listen wins over the environment; the document migrates.
+    let mut command = start(&state);
+    command
+        .args(["--listen", &flag])
+        .env("MLLM_INFERENCE_ADDR", &environment);
+    let (line, said) = run_until_ready(&mut command, banner);
+    assert_eq!(server_inference(&line), flag);
+    assert_eq!(
+        said.matches("NOTICE: mllm 0.1.0 serves inference on all interfaces")
+            .count(),
+        1,
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        original.replace("127.0.0.1:8443", "0.0.0.0:8443")
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.with_file_name("server.yaml.pre-0.1.0")).unwrap(),
+        original
+    );
+    assert!(state.join("migrations/inference-bind-v1").exists());
+
+    // The environment wins over the document; no second notice.
+    let mut command = start(&state);
+    command.env("MLLM_INFERENCE_ADDR", &environment);
+    let (line, said) = run_until_ready(&mut command, banner);
+    assert_eq!(server_inference(&line), environment);
+    assert!(!said.contains("NOTICE"), "{said}");
+
+    // The operator narrows the document back to loopback: it is kept and bound.
+    let document = format!("127.0.0.1:{}", free_port());
+    std::fs::write(&config, original.replace("127.0.0.1:8443", &document)).unwrap();
+    let (line, said) = run_until_ready(&mut start(&state), banner);
+    assert_eq!(server_inference(&line), document);
+    assert!(!said.contains("NOTICE"), "{said}");
+    std::fs::write(&config, &original).unwrap();
+    let mut command = start(&state);
+    command.env("MLLM_INFERENCE_ADDR", &environment);
+    let (_, said) = run_until_ready(&mut command, banner);
+    assert!(!said.contains("NOTICE"), "{said}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        original,
+        "never migrated twice"
+    );
+
+    // The deprecated standalone name also moves the server, with a warning.
+    let alias = format!("127.0.0.1:{}", free_port());
+    let mut command = start(&state);
+    command.env("MLLM_STANDALONE_INFERENCE_ADDR", &alias);
+    let (line, said) = run_until_ready(&mut command, banner);
+    assert_eq!(server_inference(&line), alias);
+    assert!(
+        said.contains("MLLM_STANDALONE_INFERENCE_ADDR is deprecated"),
+        "{said}"
+    );
+}
+
+/// T37 (design §9): the server's inference authentication follows the same
+/// rule: `--no-inference-auth` on a non-loopback bind prints the warning
+/// once; the document's `authentication: none` on loopback says nothing.
+#[test]
+fn start_server_warns_only_for_an_exposed_unauthenticated_listener() {
+    let (_root, state, config) = server_installation("127.0.0.1:8443");
+    std::fs::create_dir_all(state.join("migrations")).unwrap();
+    std::fs::write(state.join("migrations/inference-bind-v1"), "").unwrap();
+    let banner = |line: &str| line.contains("\"role\":\"server\"");
+    let open = format!("0.0.0.0:{}", free_port());
+    let mut command = server_command(&state);
+    command.args([
+        "start",
+        "server",
+        "--config",
+        config.to_str().unwrap(),
+        "--listen",
+        &open,
+        "--no-inference-auth",
+    ]);
+    let (line, said) = run_until_ready(&mut command, banner);
+    assert_eq!(server_inference(&line), open);
+    assert_eq!(
+        said.matches(&format!(
+            "WARNING: the inference endpoint on {open} accepts requests without an API key."
+        ))
+        .count(),
+        1,
+        "{said}"
+    );
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("\"api_key\"", "\"none\"")).unwrap();
+    let loopback = format!("127.0.0.1:{}", free_port());
+    let mut command = server_command(&state);
+    command.args([
+        "start",
+        "server",
+        "--config",
+        config.to_str().unwrap(),
+        "--listen",
+        &loopback,
+    ]);
+    let (_, said) = run_until_ready(&mut command, banner);
+    assert!(!said.contains("WARNING"), "{said}");
+}
+
+/// T01 T03 (design §9): `--listen` replaces the inference bind for one run and
+/// wins over `MLLM_INFERENCE_ADDR`; the ready line names the address
+/// bound.
+#[test]
+fn listen_moves_the_standalone_inference_listener() {
+    let installation = Installation::new();
+    let listen = format!("127.0.0.1:{}", free_port());
+    let (role, ready) = installation.start_with(None, &["--listen", &listen]);
+    assert!(
+        ready.contains(&format!("inference listener {listen}")),
+        "{ready}"
+    );
+    std::net::TcpStream::connect(&listen).expect("the --listen address is served");
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+}
+
+/// T37 (design §9): `--no-inference-auth` on a non-loopback bind prints the
+/// warning once, before the listener serves; requests then need no key; and
+/// `mllm status` repeats it as `inference: unauthenticated on <addr>`.
+#[test]
+fn an_unauthenticated_exposed_listener_is_announced_and_shown_in_status() {
+    let installation = Installation::new();
+    let port = free_port();
+    let open = format!("0.0.0.0:{port}");
+    let mut command = installation.command();
+    command.args([
+        "start",
+        "standalone",
+        "--listen",
+        &open,
+        "--no-inference-auth",
+    ]);
+    let (role, _) = installation.start_command(None, &mut command);
+    let stderr = role.stderr.clone();
+    // No key is needed on this run.
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    std::io::Write::write_all(
+        &mut stream,
+        b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut reply = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    deploy(&installation);
+    let out = installation.cli(&["status", "deployment", "w11-model"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        shown.contains(&format!("inference: unauthenticated on {open}")),
+        "{shown}"
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+    let said = stderr_of(&stderr);
+    assert_eq!(
+        said.matches(&format!(
+            "WARNING: the inference endpoint on {open} accepts requests without an API key."
+        ))
+        .count(),
+        1,
+        "{said}"
+    );
+    assert!(
+        said.contains("Anyone who can reach this address can use your models and GPU."),
+        "{said}"
+    );
+}
+
+/// T37 (design §9): without a key on loopback, and with the key anywhere,
+/// the role says nothing; `MLLM_INFERENCE_AUTH` turns the key off as the
+/// flag does, and a malformed value refuses the start.
+#[test]
+fn a_loopback_or_keyed_listener_is_not_announced() {
+    let installation = Installation::new();
+    let standalone = |line: &str| line.starts_with("standalone ready");
+    let mut command = installation.command();
+    command.args(["start", "standalone", "--no-inference-auth"]);
+    let (_, said) = run_until_ready(&mut command, standalone);
+    assert!(!said.contains("WARNING"), "{said}");
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env("MLLM_INFERENCE_AUTH", "none");
+    let (_, said) = run_until_ready(&mut command, standalone);
+    assert!(!said.contains("WARNING"), "{said}");
     let out = output_within(
-        installation.command().args(["start", "standalone"]).env(
-            "MLLM_STANDALONE_INFERENCE_ADDR",
-            format!("0.0.0.0:{}", free_port()),
-        ),
+        installation
+            .command()
+            .args(["start", "standalone"])
+            .env("MLLM_INFERENCE_AUTH", "off"),
         REFUSAL_BOUND,
     );
     assert!(!out.status.success());
-    let said = String::from_utf8_lossy(&out.stderr);
-    assert!(said.contains("MLLM_STANDALONE_INFERENCE_ADDR"), "{said}");
+    let refused = String::from_utf8_lossy(&out.stderr);
+    assert!(refused.contains("MLLM_INFERENCE_AUTH"), "{refused}");
 }
 
 /// T01: drain is action-first and names its resource; stopping a role
@@ -885,7 +1471,7 @@ impl TwoRoles {
     }
 
     fn command(&self, state: &Path) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mllm"));
+        let mut command = support::mllm();
         command
             .env("MLLM_STATE_DIR", state)
             .env_remove("MLLM_VLLM_BIN")
@@ -909,25 +1495,10 @@ impl TwoRoles {
             "server" => (&self.server_state, &self.server_config),
             _ => (&self.host_state, &self.host_config),
         };
-        let mut child = Guarded::spawn(
+        Role::spawn(
             self.command(state)
-                .args(["start", role, "--config", config.to_str().unwrap()])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit()),
-        );
-        let (lines, received) = mpsc::channel();
-        let stdout = child.child().stdout.take().unwrap();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if lines.send(line).is_err() {
-                    return;
-                }
-            }
-        });
-        Role {
-            child,
-            lines: received,
-        }
+                .args(["start", role, "--config", config.to_str().unwrap()]),
+        )
     }
 
     fn hosts(&self, online: bool, expected: usize) -> Value {
@@ -1229,4 +1800,202 @@ async fn remote_signals_restart_and_drain_host_stops_with_cleanup() {
         store.pending_dispatches(&deployment_id).unwrap().is_empty(),
         "request leases left behind"
     );
+}
+
+/// T03 (owner decision 2026-09-25): a standalone start honours the generic
+/// overrides of a document-only setting, `--set` over `MLLM_SET__…` over the
+/// document: the drain bound it reports at shutdown is the overridden one.
+/// Fake engine only; not qualification (SPEC §18).
+#[test]
+fn a_standalone_start_takes_its_drain_bound_from_set_then_env_then_document() {
+    let installation = Installation::new();
+    let standalone = |line: &str| line.starts_with("standalone ready");
+    let bound_after = |command: &mut Command| {
+        let role = Role::spawn(command);
+        role.expect_line(standalone, Duration::from_secs(60));
+        role.signal();
+        let (status, report) = role.exit(Duration::from_secs(30));
+        assert!(status.success(), "{status:?}");
+        report["drain_bound_secs"].clone()
+    };
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    assert_eq!(bound_after(&mut command), json!(30));
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone"])
+        .env("MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT", "6s");
+    assert_eq!(bound_after(&mut command), json!(6));
+    let mut command = installation.command();
+    command
+        .args(["start", "standalone", "--set", "shutdown.drain_timeout=7s"])
+        .env("MLLM_SET__SHUTDOWN__DRAIN_TIMEOUT", "6s");
+    assert_eq!(bound_after(&mut command), json!(7));
+}
+
+/// T37 (design §9 "Where the key is", final review I11): each role's ready
+/// line names the owner-only credentials file that holds the API key, and
+/// never carries the key itself.
+#[test]
+fn the_ready_lines_name_the_credentials_file_never_the_key() {
+    let installation = Installation::new();
+    let mut command = installation.command();
+    command.args(["start", "standalone"]);
+    let (ready, _) = run_until_ready(&mut command, |line| line.starts_with("standalone ready"));
+    let credentials = installation.state().join("identity/credentials");
+    assert!(
+        ready.contains(&format!("credentials {}", credentials.display())),
+        "{ready}"
+    );
+    assert!(!ready.contains(&installation.api_key()), "{ready}");
+
+    let (_root, state, config) = server_installation(&format!("127.0.0.1:{}", free_port()));
+    let mut command = server_command(&state);
+    command.args(["start", "server", "--config", config.to_str().unwrap()]);
+    let (banner, _) = run_until_ready(&mut command, |line| line.contains("\"role\":\"server\""));
+    let banner: Value = serde_json::from_str(&banner).unwrap();
+    let path = banner["credentials"]
+        .as_str()
+        .expect("the credentials path");
+    assert!(path.ends_with("server-credentials.json"), "{banner}");
+    let stored: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let key = stored["api_key"].as_str().unwrap();
+    assert!(!banner.to_string().contains(key), "{banner}");
+}
+
+/// T03 (final review I8, owner rule: every setting three ways, standalone is
+/// a server and a host in one process): the server's management address is
+/// `--management-listen` > `MLLM_MANAGEMENT_ADDR` > the document, as for
+/// standalone; the role records the address it serves on, so a client
+/// command finds a role started with the flag without the variable; and a
+/// named document whose state_dir disagrees with a named state root is
+/// refused instead of moving the role's state.
+#[test]
+fn the_server_management_address_and_state_root_follow_the_shared_rule() {
+    let (_root, state, config) = server_installation(&format!("127.0.0.1:{}", free_port()));
+    let banner = |line: &str| line.contains("\"role\":\"server\"");
+    let flag = format!("127.0.0.1:{}", free_port());
+    let environment = format!("127.0.0.1:{}", free_port());
+    let start = || {
+        let mut command = server_command(&state);
+        command.args(["start", "server", "--config", config.to_str().unwrap()]);
+        command
+    };
+    let mut command = start();
+    command
+        .args(["--management-listen", &flag])
+        .env("MLLM_MANAGEMENT_ADDR", &environment);
+    let role = Role::spawn(&mut command);
+    let line = role.expect_line(banner, Duration::from_secs(60));
+    let banner_value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(banner_value["management"], flag.as_str(), "{line}");
+    assert_eq!(
+        std::fs::read_to_string(state.join("run/management-address"))
+            .unwrap()
+            .trim(),
+        flag
+    );
+    // A client with no variable finds it through the recorded address.
+    let listed = server_command(&state)
+        .env_remove("MLLM_MANAGEMENT_ADDR")
+        .args([
+            "list",
+            "hosts",
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+
+    // The variable over the document.
+    let mut command = start();
+    command.env("MLLM_MANAGEMENT_ADDR", &environment);
+    let (line, _) = run_until_ready(&mut command, banner);
+    let banner_value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(banner_value["management"], environment.as_str(), "{line}");
+
+    // Final review I8-bis: `--state-dir` > MLLM_STATE_DIR > the document's
+    // state_dir, as for standalone. The winner is used and one notice names
+    // what it overrides; nothing is refused.
+    let other = state.parent().unwrap().join("other");
+    let copied = std::process::Command::new("cp")
+        .args(["-a", state.to_str().unwrap(), other.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let _ = std::fs::remove_file(other.join("run/management-address"));
+    let started = |command: &mut std::process::Command| {
+        let (line, said) = run_until_ready(command, banner);
+        let banner: Value = serde_json::from_str(&line).unwrap();
+        (banner["state_dir"].as_str().unwrap().to_owned(), said)
+    };
+    // The variable over the document.
+    let mut command = server_command(&other);
+    command.args(["start", "server", "--config", config.to_str().unwrap()]);
+    let (used, said) = started(&mut command);
+    assert_eq!(std::path::Path::new(&used), other.as_path());
+    assert_eq!(
+        said.matches("overrides the document's state_dir").count(),
+        1,
+        "{said}"
+    );
+    assert!(said.contains("from MLLM_STATE_DIR"), "{said}");
+    // The flag over the variable.
+    let mut command = server_command(&state);
+    command.args([
+        "start",
+        "server",
+        "--config",
+        config.to_str().unwrap(),
+        "--state-dir",
+        other.to_str().unwrap(),
+    ]);
+    let (used, said) = started(&mut command);
+    assert_eq!(std::path::Path::new(&used), other.as_path());
+    assert!(said.contains("from --state-dir"), "{said}");
+    // The same directory as the document: no notice.
+    let mut command = server_command(&state);
+    command.args(["start", "server", "--config", config.to_str().unwrap()]);
+    let (used, said) = started(&mut command);
+    assert_eq!(std::path::Path::new(&used), state.as_path());
+    assert!(!said.contains("overrides the document"), "{said}");
+}
+
+/// T03 (final review I8): a standalone role started with
+/// `--management-listen` is found by a client command that names neither
+/// the flag nor the variable, through the address the role recorded.
+#[test]
+fn a_client_finds_a_standalone_started_with_management_listen() {
+    let installation = Installation::new();
+    let other = format!("127.0.0.1:{}", free_port());
+    let mut command = installation.command();
+    command.args(["start", "standalone", "--management-listen", &other]);
+    let role = Role::spawn(&mut command);
+    role.expect_line(
+        |line| line.starts_with("standalone ready"),
+        Duration::from_secs(60),
+    );
+    let listed = installation
+        .command()
+        .env_remove("MLLM_MANAGEMENT_ADDR")
+        .args(["list", "deployments", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
 }

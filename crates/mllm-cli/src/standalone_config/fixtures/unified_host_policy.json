@@ -1,0 +1,63 @@
+{
+  "device_inventory_digest": null,
+  "environment_fingerprint": "env",
+  "hardware_fingerprint": "standalone-vllm",
+  "kind": "host",
+  "model_store": {
+    "path": "/srv/models"
+  },
+  "name": "standalone",
+  "resource_policy": {
+    "device_sharing": "shared",
+    "devices": {
+      "gpu0": {
+        "domain": "unified",
+        "sharing": "shared"
+      }
+    },
+    "domains": {
+      "unified": {
+        "free_reserve": "27487790680B",
+        "host_kv_limit": "13743895340B",
+        "managed_limit": "68719476700B",
+        "memory": "unified",
+        "parked_limit": "34359738350B"
+      }
+    },
+    "endpoint_port_range": {
+      "end": 8199,
+      "start": 8100
+    },
+    "max_parked": 4,
+    "observation_ttl": "2s",
+    "planner_max_states": 4096,
+    "queue": {
+      "admission_window": "2s",
+      "max_buffered_bytes_total": "64MiB",
+      "max_pending_per_deployment": 64,
+      "max_pending_total": 256,
+      "request_deadline": "1800s"
+    }
+  },
+  "runtime_profiles": {
+    "local": {
+      "args": [],
+      "build_fingerprint": "fp-1",
+      "engine": "vllm",
+      "env": {},
+      "executable": "/opt/venv/bin/vllm",
+      "log_policy": {
+        "max_file_bytes": "16MiB",
+        "retained_files": 3
+      },
+      "revision": 1,
+      "security": {
+        "admin_credential_ref": "secret://admin-key",
+        "credential_ref": "secret://engine-key",
+        "deep_park": "disabled",
+        "trust_remote_code": false
+      }
+    }
+  },
+  "schema_version": 1
+}

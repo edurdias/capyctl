@@ -8,12 +8,14 @@ state_dir: /var/lib/mllm/server
 # Must be `<state_dir>/identity`.
 identity_dir: /var/lib/mllm/server/identity
 listeners:
-  # Management and inference stay on loopback (SPEC §16.5).
+  # Management stays on loopback. Inference listens on all interfaces and
+  # requires the API key (ADR 0019); `--listen 127.0.0.1:8443` or this bind
+  # narrows it (docs/operations/network-access.md).
   management:
     bind: "127.0.0.1:7443"
     authentication: token
   inference:
-    bind: "127.0.0.1:8443"
+    bind: "0.0.0.0:8443"
     authentication: api_key
   # Host agents enroll through bootstrap and hold their control session here.
   bootstrap:

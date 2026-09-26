@@ -115,13 +115,21 @@ fn weighed_placeholder(
         )
         .optional()?
         .flatten();
-    let Some(estimate) = weights.and_then(|weights| {
-        mllm_config::effective::default_startup_bytes(
-            memory.request_bytes,
-            Some(weights),
-            memory.margin_bytes,
-        )
-    }) else {
+    // The derived cold phase carries the engine's CUDA context and graphs
+    // beside the startup peak (re-review parity rule), so the recomputed
+    // estimate does too.
+    let Some(estimate) = weights
+        .and_then(|weights| {
+            mllm_config::effective::default_startup_bytes(
+                memory.request_bytes,
+                Some(weights),
+                memory.margin_bytes,
+            )
+        })
+        .and_then(|estimate| {
+            estimate.checked_add(mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES)
+        })
+    else {
         return Ok(None);
     };
     Ok((estimate > total(&e.resources.cold)).then_some(estimate))

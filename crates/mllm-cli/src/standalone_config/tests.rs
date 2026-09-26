@@ -57,6 +57,7 @@ fn installed(engine: Engine, executable: &str) -> EngineInstallation {
         executable: executable.into(),
         build_fingerprint: "fp-1".into(),
         engine_config: mllm_testkit::vllm_engine_config_json(),
+        kv_cache_declared: false,
         deep_park: false,
         trust_remote_code: false,
         models_root: "/srv/models".into(),
@@ -95,6 +96,7 @@ fn the_host_declares_exactly_one_engine_installation() {
         "env-1",
         CAPACITY,
         None,
+        &HostShape::NoGpu,
     );
     let profiles = host["runtime_profiles"]
         .as_object()
@@ -128,6 +130,7 @@ fn an_installation_cuda_home_is_published_only_when_named() {
         "env-1",
         CAPACITY,
         None,
+        &HostShape::NoGpu,
     );
     assert_eq!(
         host["runtime_profiles"]["local-vllm"]["cuda_home"],
@@ -147,7 +150,13 @@ fn the_deep_park_switch_is_carried_by_the_profile() {
     for allowed in [false, true] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.deep_park = allowed;
-        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installation),
+            "env-1",
+            CAPACITY,
+            None,
+            &HostShape::NoGpu,
+        );
         assert_eq!(
             host["runtime_profiles"][STANDALONE_PROFILE]["security"]["deep_park"],
             if allowed { "enabled" } else { "disabled" }
@@ -167,6 +176,7 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
             "env-1",
             CAPACITY,
             None,
+            &HostShape::NoGpu,
         );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         assert_eq!(
@@ -186,7 +196,13 @@ fn every_engine_profile_names_distinct_inference_and_admin_references() {
 fn trusting_checkpoint_code_is_published_separately_from_deep_park() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.trust_remote_code = true;
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
     assert_eq!(security["trust_remote_code"], true);
     assert_eq!(security["deep_park"], "disabled");
@@ -202,7 +218,13 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
     for policy in [InstallationDrift::Warn, InstallationDrift::Refuse] {
         let mut installation = installed(Engine::Vllm, "/opt/vllm");
         installation.installation_drift = policy;
-        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installation),
+            "env-1",
+            CAPACITY,
+            None,
+            &HostShape::NoGpu,
+        );
         let security = &host["runtime_profiles"][STANDALONE_PROFILE]["security"];
         match policy {
             InstallationDrift::Warn => assert!(security.get("installation_drift").is_none()),
@@ -213,11 +235,14 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
             "d",
             &local("/srv/models/d"),
             Engine::Vllm,
-            CAPACITY,
+            &TemplateMemory::Unified {
+                capacity_bytes: CAPACITY,
+            },
             DEFAULT_REQUEST_DEADLINE,
             false,
             "local",
-        );
+        )
+        .expect("the unified template");
         let mut deployment = deployment;
         deployment["engine_config"] = installation.engine_config.clone();
         let effective = mllm_config::effective::resolve_effective(&deployment, &host).unwrap();
@@ -231,7 +256,13 @@ fn the_installation_drift_policy_is_carried_by_the_profile() {
 fn the_published_host_names_the_store_its_weights_live_under() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm");
     installation.models_root = "/data/checkpoints".into();
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     assert_eq!(host["model_store"]["path"], "/data/checkpoints");
 }
 
@@ -240,8 +271,20 @@ fn the_published_host_names_the_store_its_weights_live_under() {
 #[test]
 fn limits_scale_with_observed_capacity() {
     let installation = installed(Engine::Vllm, "/bin/true");
-    let small = host_policy(&named(&installation), "env-1", 16 << 30, None);
-    let large = host_policy(&named(&installation), "env-1", 128 << 30, None);
+    let small = host_policy(
+        &named(&installation),
+        "env-1",
+        16 << 30,
+        None,
+        &HostShape::NoGpu,
+    );
+    let large = host_policy(
+        &named(&installation),
+        "env-1",
+        128 << 30,
+        None,
+        &HostShape::NoGpu,
+    );
     let managed = |h: &Value| {
         h["resource_policy"]["domains"][DOMAIN]["managed_limit"]
             .as_str()
@@ -267,6 +310,7 @@ fn the_managed_ceiling_and_reserve_fit_inside_capacity() {
         "env-1",
         CAPACITY,
         None,
+        &HostShape::NoGpu,
     );
     let bytes = |field: &str| {
         host["resource_policy"]["domains"][DOMAIN][field]
@@ -292,11 +336,14 @@ fn every_phase_is_declared_and_the_peak_is_a_transition() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     let resources = d["resources"].as_object().unwrap();
     for phase in ["cold", "ready", "parking", "parked", "wake"] {
         assert!(resources.contains_key(phase), "{phase} must be declared");
@@ -328,11 +375,14 @@ fn a_parked_deployment_holds_no_device() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(
         d["resources"]["parked"]["devices"]
             .as_array()
@@ -355,11 +405,14 @@ fn the_deployment_names_its_installation() {
         "route-m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(d["runtime_profile"], STANDALONE_PROFILE);
     assert_eq!(d["routes"][0], "route-m");
 }
@@ -373,11 +426,14 @@ fn the_deployment_states_its_model_source() {
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(d["model"]["source"]["type"], "local");
     assert_eq!(d["model"]["source"]["path"], "/models/m");
 
@@ -391,11 +447,14 @@ fn the_deployment_states_its_model_source() {
             token_ref: None,
         },
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(fetched["model"]["source"]["type"], "huggingface");
     assert_eq!(fetched["model"]["source"]["repo"], "org/model");
 }
@@ -413,6 +472,7 @@ fn the_published_host_declares_one_memory_pool() {
         "env-1",
         1 << 40,
         None,
+        &HostShape::NoGpu,
     );
     assert_eq!(
         host["resource_policy"]["domains"]["unified"]["memory"],
@@ -430,17 +490,26 @@ fn the_published_host_declares_one_memory_pool() {
 fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     let mut installation = installed(Engine::Vllm, "/opt/vllm/bin/vllm");
     installation.deep_park = true;
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let deployment = deployment_document(
         "m",
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         true,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(deployment["residency"], "deep");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("a deep vLLM deployment resolves on a deep-parking host");
@@ -456,17 +525,26 @@ fn a_standalone_vllm_deployment_deep_parks_when_the_host_does() {
     // SPEC §6.2: the opted-out host declares restart_only and launches without
     // sleep mode.
     installation.deep_park = false;
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let deployment = deployment_document(
         "m",
         "m",
         &local("/models/m"),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         false,
         "local",
-    );
+    )
+    .expect("the unified template");
     assert_eq!(deployment["residency"], "restart_only");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("an opted-out vLLM host's deployment resolves");
@@ -545,7 +623,13 @@ fn host_policy_from_env_is_complete() {
     // claiming the same build after an upgrade.
     assert_eq!(installation.build_fingerprint, "vllm 0.29.0");
 
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     // ADR 0014 §1: the published profile carries no engine tuning.
     assert!(host["runtime_profiles"][STANDALONE_PROFILE]
         .get("launch_settings")
@@ -555,11 +639,14 @@ fn host_policy_from_env_is_complete() {
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
         Engine::Vllm,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         installation.deep_park,
         "local",
-    );
+    )
+    .expect("the unified template");
     deployment["engine_config"] = installation.engine_config.clone();
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host)
         .expect("the published table resolves");
@@ -728,7 +815,13 @@ fn the_engine_port_range_can_be_named_for_one_run() {
             .installation()
             .expect("the environment declares an installation");
         assert_eq!(installation.engine_ports, ports, "{value:?}");
-        let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+        let host = host_policy(
+            &named(&installation),
+            "env-1",
+            CAPACITY,
+            None,
+            &HostShape::NoGpu,
+        );
         let range = &host["resource_policy"]["endpoint_port_range"];
         assert_eq!(
             (range["start"].as_u64(), range["end"].as_u64()),
@@ -829,17 +922,26 @@ fn an_sglang_host_that_opts_out_of_deep_park_deploys_restart_only() {
     assert_eq!(installation.engine, Engine::Sglang);
     assert!(!installation.deep_park, "the host opted out");
 
-    let host = host_policy(&named(&installation), "env-1", CAPACITY, None);
+    let host = host_policy(
+        &named(&installation),
+        "env-1",
+        CAPACITY,
+        None,
+        &HostShape::NoGpu,
+    );
     let mut deployment = deployment_document(
         "m",
         "m",
         &local(models.join("m").to_str().expect("a utf-8 path")),
         installation.engine,
-        CAPACITY,
+        &TemplateMemory::Unified {
+            capacity_bytes: CAPACITY,
+        },
         DEFAULT_REQUEST_DEADLINE,
         installation.deep_park,
         "local",
-    );
+    )
+    .expect("the unified template");
     deployment["engine_config"] = installation.engine_config.clone();
     assert_eq!(deployment["residency"], "restart_only");
     let resolved = mllm_config::effective::resolve_effective(&deployment, &host);
@@ -872,11 +974,14 @@ fn the_residency_follows_the_deep_park_switch_for_every_engine() {
             "m",
             &local("/models/m"),
             engine,
-            CAPACITY,
+            &TemplateMemory::Unified {
+                capacity_bytes: CAPACITY,
+            },
             DEFAULT_REQUEST_DEADLINE,
             deep_park,
             "local",
-        )["residency"]
+        )
+        .expect("the unified template")["residency"]
             .clone()
     };
     assert_eq!(residency(Engine::Sglang, true), "deep");
@@ -1072,4 +1177,663 @@ fn an_isolated_test_leaves_this_process_environment_alone() {
         return;
     }
     assert!(std::env::var_os("MLLM_ISOLATION_PROBE").is_none());
+}
+
+use mllm_agent::gpu_memory::{GpuDevice, GpuMemory, HostShape};
+const GIB: i64 = 1 << 30;
+const MIB: i64 = 1 << 20;
+
+/// The installation the discrete-host tests publish; the unified fixture was
+/// captured from `main` with exactly this one.
+fn installations() -> Vec<mllm_controller::engine_provider::NamedInstallation> {
+    named(&installed(Engine::Vllm, "/opt/venv/bin/vllm"))
+}
+
+fn rtx(index: u32, total_mib: i64, used_mib: i64) -> GpuDevice {
+    GpuDevice {
+        index,
+        uuid: format!("GPU-{index:08}-2222-3333-4444-555555555555"),
+        pci_bus_id: format!("00000000:0{index}:00.0"),
+        name: "RTX".into(),
+        memory: Some(GpuMemory {
+            total_bytes: total_mib * MIB,
+            used_bytes: used_mib * MIB,
+            free_bytes: (total_mib - used_mib) * MIB,
+        }),
+    }
+}
+
+// T26: a 16 GB card with 1.5 GiB of desktop use; 61 GiB of RAM.
+#[test]
+fn a_discrete_standalone_host_has_system_and_device_domains() {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let doc = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let domains = &doc["resource_policy"]["domains"];
+    assert!(domains.get("unified").is_none());
+    assert_eq!(domains["system"]["memory"], "distinct");
+    assert_eq!(domains["gpu0"]["memory"], "device");
+    assert_eq!(domains["gpu0"]["device"], "gpu0");
+    let reserve = (16376 * MIB / 100 * 8).max(GIB);
+    assert_eq!(domains["gpu0"]["free_reserve"], format!("{reserve}B"));
+    assert_eq!(
+        domains["gpu0"]["managed_limit"],
+        format!("{}B", 16376 * MIB - reserve)
+    );
+    assert!(domains["gpu0"].get("host_kv_limit").is_none());
+    assert_eq!(doc["resource_policy"]["devices"]["gpu0"]["domain"], "gpu0");
+    // The published document is one the host policy accepts (ADR 0019).
+    mllm_config::effective::normalize_host_policy(&doc).expect("a valid discrete host policy");
+}
+
+// T26: the unified document is byte-identical to before.
+#[test]
+fn a_unified_standalone_host_is_unchanged() {
+    // Captured from `main` before discrete hosts were published.
+    let before = include_str!("fixtures/unified_host_policy.json");
+    let doc = host_policy(
+        &installations(),
+        "env",
+        128 * GIB,
+        None,
+        &HostShape::Unified,
+    );
+    assert_eq!(
+        serde_json::to_string_pretty(&doc).unwrap(),
+        before.trim_end()
+    );
+    let no_gpu = host_policy(&installations(), "env", 128 * GIB, None, &HostShape::NoGpu);
+    assert_eq!(no_gpu, doc);
+}
+
+// T26 (owner decision 3): two GPUs publish two devices and two device domains.
+#[test]
+fn two_gpus_publish_two_device_domains() {
+    let shape = HostShape::Discrete(vec![rtx(0, 24576, 0), rtx(1, 32768, 0)]);
+    let doc = host_policy(&installations(), "env", 64 * GIB, None, &shape);
+    assert_eq!(doc["resource_policy"]["devices"]["gpu1"]["domain"], "gpu1");
+    assert_eq!(doc["resource_policy"]["domains"]["gpu1"]["device"], "gpu1");
+    mllm_config::effective::normalize_host_policy(&doc).expect("a valid two-GPU host policy");
+}
+
+// T26
+#[test]
+fn device_limits_follow_the_spec_table() {
+    let limits = device_limits(&rtx(0, 16376, 0).memory.unwrap(), 4);
+    assert_eq!(limits.free_reserve, GIB.max(16376 * MIB / 100 * 8));
+    assert_eq!(
+        limits.parked_limit,
+        (2 * GIB * 4).min(16376 * MIB / 100 * 25)
+    );
+}
+
+fn source() -> ModelSource {
+    ModelSource::Local {
+        path: "/models/a".into(),
+    }
+}
+
+// T26/T23: a 3B bf16 model (~6 GiB) on a 16 GB card: request, no fixed
+// shares; its pinned copy (1.5 x 6 GiB) plus the engine's 4 GiB fits the
+// 15 GiB the system domain holds parked, so it parks host_backed.
+#[test]
+fn a_discrete_template_states_a_request_and_derives_phases() {
+    let memory = TemplateMemory::Device {
+        managed_limit: 15 << 30,
+        device_total: 16376 << 20,
+        weights_bytes: Some(6 << 30),
+        system_parked_limit: 15 << 30,
+        kv_cache_bytes: None,
+    };
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Sglang,
+        &memory,
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert!(doc.get("resources").is_none());
+    // The picker chooses the GPU (discrete GPU design §7); the deployment
+    // parser requires the key, so the template pins nothing with an empty list.
+    assert_eq!(doc["devices"], serde_json::json!([]));
+    let (request, kv) = device_request(Engine::Sglang, 6 << 30, 15 << 30, 16376 << 20);
+    assert_eq!(kv, (15i64 << 30) / 4); // min(4 GiB, 3.75 GiB)
+    assert_eq!(
+        doc["engine_config"]["memory"]["request"],
+        format!("{request}B")
+    );
+    assert_eq!(doc["engine_config"]["memory"]["kv_cache"], format!("{kv}B"));
+    assert_eq!(doc["residency"], "host_backed");
+}
+
+// T26: vLLM's request never falls below 0.75 of the card.
+#[test]
+fn the_vllm_request_has_a_floor() {
+    let (small, _) = device_request(Engine::Vllm, 2 << 30, 15 << 30, 16376 << 20);
+    assert!(small >= (16376i64 << 20) / 100 * 75);
+    // SGLang has no floor: weights x 1.10 plus the KV cache.
+    let (sglang, kv) = device_request(Engine::Sglang, 2 << 30, 15 << 30, 16376 << 20);
+    assert_eq!(sglang, (2i64 << 30) / 100 * 110 + kv);
+}
+
+// Owner decision 2: host_backed is the discrete default when the copy fits.
+#[test]
+fn the_default_tier_follows_the_host() {
+    // The pinned copy is charged at 1.5 times the weights: 12 + 4 <= 16.
+    assert_eq!(
+        default_residency(true, Some((8 << 30, 16 << 30))),
+        "host_backed"
+    );
+    assert_eq!(default_residency(true, Some((8 << 30, 15 << 30))), "deep");
+    assert_eq!(default_residency(true, Some((20 << 30, 15 << 30))), "deep");
+    assert_eq!(default_residency(true, None), "deep");
+    assert_eq!(
+        default_residency(false, Some((8 << 30, 15 << 30))),
+        "restart_only"
+    );
+    // Task 6's rule: the parked system allocation is the engine's host overhead
+    // plus the copy, so a copy that fits only without the overhead parks deep.
+    assert_eq!(default_residency(true, Some((12 << 30, 15 << 30))), "deep");
+}
+
+// Review focus 1: a model that cannot fit is refused at deploy with numbers.
+#[test]
+fn a_model_larger_than_the_device_is_refused() {
+    let memory = TemplateMemory::Device {
+        managed_limit: 15 << 30,
+        device_total: 16376 << 20,
+        weights_bytes: Some(16 << 30),
+        system_parked_limit: 15 << 30,
+        kv_cache_bytes: None,
+    };
+    let error = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Vllm,
+        &memory,
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        TemplateError::InsufficientDeviceMemory { .. }
+    ));
+    assert!(error.to_string().starts_with("insufficient_device_memory"));
+    let (request, _) = device_request(Engine::Vllm, 16 << 30, 15 << 30, 16376 << 20);
+    let charged = request + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    assert!(error.to_string().contains(&charged.to_string()), "{error}");
+    assert!(
+        error.to_string().contains(&(15i64 << 30).to_string()),
+        "{error}"
+    );
+}
+
+// T26: the unified template is byte-identical to before.
+#[test]
+fn the_unified_template_is_unchanged() {
+    // Captured from `main` before discrete hosts had a template.
+    let before = include_str!("fixtures/unified_deployment.json");
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Vllm,
+        &TemplateMemory::Unified {
+            capacity_bytes: 128 << 30,
+        },
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string_pretty(&doc).unwrap(),
+        before.trim_end()
+    );
+}
+
+// T26/T23: the generated discrete template resolves on the discrete host this
+// module publishes, for every engine and tier, and every phase fits the card:
+// a template whose startup peak exceeded the device could never be placed.
+#[test]
+fn the_discrete_template_resolves_and_fits_the_card() {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    let gpu = rtx(0, 16376, 1536).memory.unwrap();
+    let limits = device_limits(&gpu, MAX_PARKED);
+    let system_parked = 61 * GIB / 100 * PARKED_FRACTION;
+    for (engine, deep_park) in [
+        (Engine::Vllm, true),
+        (Engine::Sglang, true),
+        (Engine::Vllm, false),
+    ] {
+        let mut host = host.clone();
+        host["runtime_profiles"]["local"]["engine"] = engine_name(engine).into();
+        host["runtime_profiles"]["local"]["security"]["deep_park"] =
+            if deep_park { "enabled" } else { "disabled" }.into();
+        let doc = deployment_document(
+            "a",
+            "a",
+            &source(),
+            engine,
+            &TemplateMemory::Device {
+                managed_limit: limits.managed_limit,
+                device_total: gpu.total_bytes,
+                weights_bytes: Some(6 * GIB),
+                system_parked_limit: system_parked,
+                kv_cache_bytes: None,
+            },
+            DEFAULT_REQUEST_DEADLINE,
+            deep_park,
+            "local",
+        )
+        .unwrap();
+        let expected = if deep_park {
+            "host_backed"
+        } else {
+            "restart_only"
+        };
+        assert_eq!(doc["residency"], expected);
+        let choices = mllm_config::instances::device_choices(&doc, &host).unwrap();
+        let (device, chosen) = choices.first().expect("the picker has a GPU to choose");
+        assert_eq!(device, "gpu0");
+        let effective = mllm_config::effective::resolve_effective_with_checkpoint(
+            chosen,
+            &host,
+            mllm_config::effective::CheckpointFacts {
+                weights_bytes: Some(6 * GIB),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
+        let value = serde_json::to_value(&effective).unwrap();
+        for (phase, footprint) in value["resources"].as_object().unwrap() {
+            for allocation in footprint["allocations"].as_array().unwrap() {
+                if allocation["domain"] == "gpu0" {
+                    assert!(
+                        allocation["bytes"].as_i64().unwrap() <= limits.managed_limit,
+                        "{engine:?} {phase}: {allocation}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn hugging_face() -> ModelSource {
+    ModelSource::HuggingFace {
+        repo: "org/model".into(),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        files: vec![],
+        token_ref: None,
+    }
+}
+
+/// The discrete host this module publishes for one 16 GB card, opted in to
+/// Hugging Face sources (ADR 0008).
+fn discrete_host_allowing_sources(engine: Engine) -> serde_json::Value {
+    let shape = HostShape::Discrete(vec![rtx(0, 16376, 1536)]);
+    let mut host = host_policy(&installations(), "env", 61 * GIB, None, &shape);
+    host["runtime_profiles"]["local"]["engine"] = engine_name(engine).into();
+    host["runtime_profiles"]["local"]["security"]["deep_park"] = "enabled".into();
+    host["model_sources"] = serde_json::json!({"huggingface": "allowed", "max_bytes": "100GiB"});
+    host
+}
+
+fn card_memory(weights_bytes: Option<i64>, kv_cache_bytes: Option<i64>) -> TemplateMemory {
+    let gpu = rtx(0, 16376, 1536).memory.unwrap();
+    TemplateMemory::Device {
+        managed_limit: device_limits(&gpu, MAX_PARKED).managed_limit,
+        device_total: gpu.total_bytes,
+        weights_bytes,
+        system_parked_limit: 61 * GIB / 100 * PARKED_FRACTION,
+        kv_cache_bytes,
+    }
+}
+
+// T26 (review decision): a Hugging Face or HTTP source works on a discrete
+// host. Its weights are known only once downloaded, so the template states the
+// KV cache alone and parks deep (a host-RAM copy cannot be sized yet): the
+// revision is accepted provisional and sized from the checkpoint once the
+// download is measured (ADR 0014 §7), never refused for being remote.
+#[test]
+fn a_remote_source_on_a_discrete_host_is_sized_once_downloaded() {
+    for engine in [Engine::Vllm, Engine::Sglang] {
+        let doc = deployment_document(
+            "a",
+            "a",
+            &hugging_face(),
+            engine,
+            &card_memory(None, None),
+            DEFAULT_REQUEST_DEADLINE,
+            true,
+            "local",
+        )
+        .expect("a remote source is not refused");
+        let kv = device_limits(&rtx(0, 16376, 1536).memory.unwrap(), MAX_PARKED).managed_limit / 4;
+        let kv = kv.min(4 * GIB);
+        assert_eq!(
+            doc["engine_config"]["memory"],
+            serde_json::json!({"kv_cache": format!("{kv}B")})
+        );
+        assert_eq!(doc["residency"], "deep");
+        let host = discrete_host_allowing_sources(engine);
+        let (_, chosen) = mllm_config::instances::device_choices(&doc, &host)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the picker has a GPU");
+        // Not materializable before the download: acceptance freezes it
+        // provisional (the placeholder zero weights resolve).
+        let e = mllm_config::effective::resolve_effective(&chosen, &host).unwrap_err();
+        assert_eq!(
+            e.code,
+            mllm_config::ConfigErrorCode::NotMaterializable,
+            "{e}"
+        );
+        let facts = |weights| mllm_config::effective::CheckpointFacts {
+            weights_bytes: Some(weights),
+            ..Default::default()
+        };
+        mllm_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts(0))
+            .expect("the provisional placeholder");
+        // Measured: sized as a local checkpoint of the same weights is.
+        let sized = mllm_config::effective::resolve_effective_with_checkpoint(
+            &chosen,
+            &host,
+            facts(8 * GIB),
+        )
+        .unwrap_or_else(|error| panic!("{engine:?}: {error}"));
+        let (_, device) = sized.ready_device_allocation().expect("on the card");
+        let gpu = rtx(0, 16376, 1536).memory.unwrap();
+        let (local, _) = device_request(
+            engine,
+            8 * GIB,
+            device_limits(&gpu, MAX_PARKED).managed_limit,
+            gpu.total_bytes,
+        );
+        assert_eq!(
+            device,
+            local + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
+            "{engine:?}"
+        );
+    }
+    // Without deep parking the tier is restart_only, as for a local checkpoint.
+    let doc = deployment_document(
+        "a",
+        "a",
+        &hugging_face(),
+        Engine::Vllm,
+        &card_memory(None, None),
+        DEFAULT_REQUEST_DEADLINE,
+        false,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(doc["residency"], "restart_only");
+}
+
+// T26 (review decision): an operator's MLLM_KV_CACHE_BYTES is honoured on a
+// discrete host within the card, and refused with the numbers and the variable
+// when it cannot fit, never silently replaced by the template's own KV cache.
+#[test]
+fn a_declared_kv_cache_is_honoured_within_the_card_or_refused() {
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Sglang,
+        &card_memory(Some(8 * GIB), Some(2 * GIB)),
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(
+        doc["engine_config"]["memory"]["kv_cache"],
+        format!("{}B", 2 * GIB)
+    );
+    assert_eq!(
+        doc["engine_config"]["memory"]["request"],
+        format!("{}B", (8 * GIB) / 100 * 110 + 2 * GIB)
+    );
+    // A remote source states the operator's KV cache too.
+    let remote = deployment_document(
+        "a",
+        "a",
+        &hugging_face(),
+        Engine::Sglang,
+        &card_memory(None, Some(2 * GIB)),
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    assert_eq!(
+        remote["engine_config"]["memory"],
+        serde_json::json!({"kv_cache": format!("{}B", 2 * GIB)})
+    );
+    // 8 GiB of weights and a 10 GiB KV cache do not fit a 16 GB card; neither
+    // does a KV cache alone larger than what the card's domain manages.
+    for (weights, kv) in [(Some(8 * GIB), 10 * GIB), (None, 16 * GIB)] {
+        let error = deployment_document(
+            "a",
+            "a",
+            &source(),
+            Engine::Sglang,
+            &card_memory(weights, Some(kv)),
+            DEFAULT_REQUEST_DEADLINE,
+            true,
+            "local",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "insufficient_device_memory");
+        let text = error.to_string();
+        assert!(text.contains("MLLM_KV_CACHE_BYTES"), "{text}");
+        assert!(text.contains(&kv.to_string()), "{text}");
+    }
+}
+
+/// Owner decision 2026-09-25: `MLLM_MODELS_ROOT` is optional. Unset, the
+/// installation names no models directory (the role resolves `~/models`);
+/// set, it must be a directory, and a relative value is made absolute.
+// T03 T14
+#[test]
+fn the_models_root_variable_is_optional() {
+    let Some(_guard) = isolated("the_models_root_variable_is_optional") else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    engine_env(dir.path(), true, false);
+    std::env::remove_var("MLLM_MODELS_ROOT");
+    let installation = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect("no models directory is needed to find the engine");
+    assert!(installation.models_root.as_os_str().is_empty());
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path().join("missing"));
+    let message = crate::roles::EnvEngineProvider::new()
+        .installation()
+        .expect_err("a named directory must exist")
+        .to_string();
+    assert!(message.contains("MLLM_MODELS_ROOT"), "{message}");
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    assert_eq!(
+        crate::roles::EnvEngineProvider::new()
+            .installation()
+            .unwrap()
+            .models_root,
+        dir.path()
+    );
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_MODELS_ROOT",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_ENGINE_FINGERPRINT",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+/// Owner rule 2026-09-25 (every setting three ways, SPEC §15.2): the
+/// standalone installation's settings follow CLI flag > environment > the
+/// document's `host:` block > default, and the document alone can declare
+/// the engine (`host.local_engine.vllm`) with no variable set.
+// T03 T21
+#[test]
+fn the_standalone_installation_follows_flag_env_document_default() {
+    use crate::roles::EngineOverrides;
+    use mllm_config::effective::InstallationDrift;
+    let Some(_guard) = isolated("the_standalone_installation_follows_flag_env_document_default")
+    else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    let runtime = private_runtime(dir.path());
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_SGLANG_BIN",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_ENGINE_FINGERPRINT",
+        "MLLM_KV_CACHE_BYTES",
+        "MLLM_ENGINE_ARGS",
+        "MLLM_DEEP_PARK",
+        "MLLM_TRUST_REMOTE_CODE",
+        "MLLM_INSTALLATION_DRIFT",
+        "MLLM_ENGINE_PORTS",
+        "MLLM_STANDALONE_ENGINE_PORTS",
+    ] {
+        std::env::remove_var(name);
+    }
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    let host = serde_json::json!({
+        "local_engine": {
+            "vllm": bin, "build_fingerprint": "yaml-fp", "args": ["--yaml"],
+            "kv_cache": "1GiB", "deep_park": "off", "trust_remote_code": false,
+            "installation_drift": "refuse",
+        },
+        "runtime_dir": runtime,
+        "resource_policy": {"endpoint_port_range": {"start": 20200, "end": 20209}},
+    });
+    let provider = |flags: EngineOverrides| {
+        let provider = crate::roles::EnvEngineProvider::new().with_flags(flags);
+        provider.configure(&host).expect("the document is valid");
+        provider
+            .installation()
+            .expect("the document declares an installation")
+    };
+    // The document alone.
+    let yaml = provider(EngineOverrides::default());
+    assert_eq!(yaml.executable, bin);
+    assert_eq!(yaml.build_fingerprint, "yaml-fp");
+    assert_eq!(yaml.args, ["--yaml"]);
+    assert_eq!(yaml.engine_config["memory"]["kv_cache"], "1GiB");
+    assert!(yaml.kv_cache_declared);
+    assert!(!yaml.deep_park);
+    assert!(!yaml.trust_remote_code);
+    assert_eq!(yaml.installation_drift, InstallationDrift::Refuse);
+    assert_eq!(yaml.engine_ports, (20200, 20209));
+    // The environment wins over the document.
+    std::env::set_var("MLLM_ENGINE_FINGERPRINT", "env-fp");
+    std::env::set_var("MLLM_ENGINE_ARGS", "--env");
+    std::env::set_var("MLLM_KV_CACHE_BYTES", "2GiB");
+    std::env::set_var("MLLM_DEEP_PARK", "on");
+    std::env::set_var("MLLM_TRUST_REMOTE_CODE", "1");
+    std::env::set_var("MLLM_INSTALLATION_DRIFT", "warn");
+    std::env::set_var("MLLM_ENGINE_PORTS", "20300-20309");
+    let env = provider(EngineOverrides::default());
+    assert_eq!(env.build_fingerprint, "env-fp");
+    assert_eq!(env.args, ["--env"]);
+    assert_eq!(env.engine_config["memory"]["kv_cache"], "2GiB");
+    assert!(env.deep_park);
+    assert!(env.trust_remote_code);
+    assert_eq!(env.installation_drift, InstallationDrift::Warn);
+    assert_eq!(env.engine_ports, (20300, 20309));
+    // The flags win over both.
+    let flagged = provider(EngineOverrides {
+        build_fingerprint: Some("flag-fp".into()),
+        args: Some(vec!["--flag".into()]),
+        kv_cache: Some("3GiB".into()),
+        deep_park: Some(false),
+        trust_remote_code: Some(false),
+        installation_drift: Some(InstallationDrift::Refuse),
+        engine_ports: Some((20400, 20409)),
+        ..Default::default()
+    });
+    assert_eq!(flagged.build_fingerprint, "flag-fp");
+    assert_eq!(flagged.args, ["--flag"]);
+    assert_eq!(flagged.engine_config["memory"]["kv_cache"], "3GiB");
+    assert!(!flagged.deep_park);
+    assert!(!flagged.trust_remote_code);
+    assert_eq!(flagged.installation_drift, InstallationDrift::Refuse);
+    assert_eq!(flagged.engine_ports, (20400, 20409));
+    // A malformed document value is refused with its path.
+    let refused = crate::roles::EnvEngineProvider::new()
+        .configure(&serde_json::json!({"local_engine": {"deep_park": "maybe"}}))
+        .expect_err("a malformed switch is refused")
+        .to_string();
+    assert!(refused.contains("host.local_engine.deep_park"), "{refused}");
+    for name in [
+        "MLLM_MODELS_ROOT",
+        "MLLM_ENGINE_FINGERPRINT",
+        "MLLM_ENGINE_ARGS",
+        "MLLM_KV_CACHE_BYTES",
+        "MLLM_DEEP_PARK",
+        "MLLM_TRUST_REMOTE_CODE",
+        "MLLM_INSTALLATION_DRIFT",
+        "MLLM_ENGINE_PORTS",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+// T26 (final review I3): found live on the discrete-GPU laptop host, vLLM
+// 0.29 held 13.2 GiB of the 16 GB card against a 12.0 GiB reservation (the
+// CUDA context and graphs sit outside the request). The device domain is now
+// charged the request plus that overhead, so the planner's figure and what
+// the launch check sees on the card agree; before, the ledger under-charged
+// the card by about 1.2 GiB.
+#[test]
+fn a_discrete_charge_covers_what_vllm_holds_on_the_card() {
+    const MEASURED_HELD: i64 = 13_516 << 20; // 13.2 GiB
+    let gpu = rtx(0, 16376, 1536).memory.unwrap();
+    let limits = device_limits(&gpu, MAX_PARKED);
+    let weights = 8_040_000_000;
+    let (request, _) = device_request(Engine::Vllm, weights, limits.managed_limit, gpu.total_bytes);
+    assert!(request < MEASURED_HELD, "the request alone under-charges");
+    let doc = deployment_document(
+        "a",
+        "a",
+        &source(),
+        Engine::Vllm,
+        &card_memory(Some(weights), None),
+        DEFAULT_REQUEST_DEADLINE,
+        true,
+        "local",
+    )
+    .unwrap();
+    let host = discrete_host_allowing_sources(Engine::Vllm);
+    let (_, chosen) = mllm_config::instances::device_choices(&doc, &host)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let facts = mllm_config::effective::CheckpointFacts {
+        weights_bytes: Some(weights),
+        ..Default::default()
+    };
+    let effective =
+        mllm_config::effective::resolve_effective_with_checkpoint(&chosen, &host, facts).unwrap();
+    let (_, charged) = effective.ready_device_allocation().unwrap();
+    assert!(charged >= MEASURED_HELD, "{charged} < {MEASURED_HELD}");
+    assert!(charged <= limits.managed_limit);
+    // vLLM is still told the request, not the charge: the overhead is what it
+    // holds beyond the fraction mllm renders.
+    assert_eq!(effective.engine_config.memory().request_bytes, request);
 }

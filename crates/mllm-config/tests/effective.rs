@@ -1,6 +1,9 @@
 use mllm_config::effective::{
-    binding_fingerprint, derive_default_managed_ceiling, parse_bytes, parse_duration_ms,
-    resolve_effective, DeepPark, DeepParkSource, DomainMemory, Engine, ModelSource, Residency,
+    binding_fingerprint, derive_default_managed_ceiling, normalize_host_policy, parse_bytes,
+    parse_duration_ms, resolve_effective, resolve_effective_with_checkpoint, CheckpointFacts,
+    DeepPark, DeepParkSource, DomainMemory, Engine, ModelSource, PhaseFootprint, Residency,
+    ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES, PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES,
+    PARKED_RESIDUAL_PLACEHOLDER_BYTES,
 };
 use mllm_config::resource_controls::ResourceControls;
 use mllm_config::{parse_strict, ConfigErrorCode, ConfigKind};
@@ -115,16 +118,19 @@ fn a_host_backed_park_is_refused_on_a_unified_domain() {
     let error = resolve_effective(&deployment, &host).expect_err("must be refused");
     let text = format!("{error}");
     assert!(text.contains("unified"), "names the domain: {text}");
+    assert!(
+        error.detail.starts_with("host_backed_unavailable:"),
+        "{text}"
+    );
 }
 
 /// The same deployment is valid where the pools are distinct - that is the hardware
 /// the tier exists for.
+// T26
 #[test]
 fn a_host_backed_park_resolves_on_a_distinct_domain() {
-    let (mut deployment, _) = fixture();
-    deployment["residency"] = "host_backed".into();
-    let host = host_with_domain_memory("distinct");
-    resolve_effective(&deployment, &host).expect("host-backed is valid where pools differ");
+    let deployment = deployment_with("host_backed", "vllm", "10GiB");
+    resolve(&deployment, &discrete_host()).expect("host-backed is valid where pools differ");
 }
 
 /// Deep parking releases the weights, so it is valid on either topology.
@@ -826,11 +832,13 @@ fn typed_decode_errors_do_not_echo_supplied_secret_scalars() {
     assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination);
     assert!(!error.to_string().contains("do-not-echo-secret"));
 
+    // Owner decision 2026-09-25: `model.revision` is defaulted now; a
+    // deployment without a runtime profile is still missing one.
     let (mut deployment, host) = fixture();
-    deployment["model"]
+    deployment
         .as_object_mut()
         .unwrap()
-        .remove("revision");
+        .remove("runtime_profile");
     let error = resolve_effective(&deployment, &host).unwrap_err();
     assert_eq!(error.code, ConfigErrorCode::MissingRequired);
 }
@@ -1093,13 +1101,14 @@ fn model_store_is_required_and_local_paths_resolve_against_it() {
     }
 }
 
-/// ADR 0008: a remote source resolves only on a host that opted in to its
-/// kind, only when pinned (a commit SHA, a SHA-256, HTTPS), and it resolves to
-/// its fixed directory in the host's model store. The resolver performs no
-/// fetch; the host materializes the directory before the first placement.
+/// ADR 0008: a remote source resolves only on a host whose policy allows its
+/// kind (the default since the owner decision of 2026-09-25), only when
+/// pinned (a commit SHA, a SHA-256, HTTPS), and it resolves to its fixed
+/// directory in the host's sources store. The resolver performs no fetch; the
+/// host materializes the directory before the first placement.
 // T14
 #[test]
-fn remote_sources_need_host_opt_in_and_pins_and_resolve_into_the_store() {
+fn remote_sources_are_allowed_by_default_need_pins_and_resolve_into_the_store() {
     let sha = "0123456789abcdef0123456789abcdef01234567";
     let with_source = |source: serde_json::Value, policy: Option<serde_json::Value>| {
         let (mut deployment, mut host) = fixture();
@@ -1131,10 +1140,43 @@ fn remote_sources_need_host_opt_in_and_pins_and_resolve_into_the_store() {
             format!("/srv/models/sources/http/{digest}"),
         ),
     ] {
-        // Denied by default: remote sources need the host's explicit opt-in.
+        // Owner decision 2026-09-25: allowed by default; an explicit
+        // `denied` (or `disabled`) keeps a host's sources off.
         let (deployment, host) = with_source(source.clone(), None);
-        let error = resolve_effective(&deployment, &host).expect_err("denied by default");
-        assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied, "{source}");
+        let effective = resolve_effective(&deployment, &host).expect("allowed by default");
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(expected.as_str())
+        );
+        for off in ["denied", "disabled"] {
+            let (deployment, host) = with_source(
+                source.clone(),
+                Some(serde_json::json!({"huggingface": off, "http": off})),
+            );
+            let error = resolve_effective(&deployment, &host).expect_err("explicitly off");
+            assert_eq!(error.code, ConfigErrorCode::ModelSourceDenied, "{source}");
+        }
+        // A stated sources store holds the download instead of the model store.
+        let (deployment, host) = with_source(
+            source.clone(),
+            Some(serde_json::json!({"path": "/state/models"})),
+        );
+        let effective = resolve_effective(&deployment, &host).unwrap();
+        let relocated = expected.replace("/srv/models/", "/state/models/");
+        assert_eq!(
+            effective.model.resolved_path.as_deref(),
+            Some(relocated.as_str())
+        );
+        assert_eq!(
+            effective.checkpoint_store(),
+            std::path::Path::new("/state/models")
+        );
+        let text = serde_json::to_string(&effective).unwrap();
+        assert_eq!(
+            mllm_config::effective::decode_effective_snapshot(&text).unwrap(),
+            effective,
+            "{source}"
+        );
 
         let (deployment, host) = with_source(source.clone(), Some(allowed.clone()));
         let effective = resolve_effective(&deployment, &host)
@@ -1324,4 +1366,520 @@ fn strict_schema_accepts_model_sources_and_points_locked_commit_at_revision() {
         parse_strict(ConfigKind::Host, &unknown).unwrap_err().code,
         ConfigErrorCode::UnknownField
     );
+}
+
+/// The example host document on its own, for host-policy rules (ADR 0019).
+fn host() -> serde_json::Value {
+    fixture().1
+}
+
+/// A discrete host: a system domain for host RAM and a device domain for the
+/// GPU's own memory (ADR 0019, discrete GPU design §2).
+fn discrete_host() -> serde_json::Value {
+    let mut h = host();
+    h["resource_policy"]["domains"] = serde_json::json!({
+        "system": {"memory": "distinct", "managed_limit": "24GiB", "free_reserve": "8GiB",
+                   "parked_limit": "16GiB", "host_kv_limit": "4GiB"},
+        "gpu0": {"memory": "device", "device": "gpu0", "managed_limit": "14848MiB",
+                 "free_reserve": "1536MiB", "parked_limit": "2GiB"}
+    });
+    h["resource_policy"]["devices"] =
+        serde_json::json!({"gpu0": {"domain": "gpu0", "sharing": "shared"}});
+    h
+}
+
+// T26: a discrete host declares a system domain and a device domain.
+#[test]
+fn a_discrete_host_policy_resolves_with_a_device_domain() {
+    let policy = normalize_host_policy(&discrete_host()).expect("valid");
+    let gpu = &policy.domains["gpu0"];
+    assert_eq!(gpu.memory, DomainMemory::Device);
+    assert_eq!(gpu.device.as_deref(), Some("gpu0"));
+    assert_eq!(policy.domains["system"].device, None);
+}
+
+// T26: an existing unified host keeps resolving exactly as before.
+#[test]
+fn a_unified_host_policy_has_no_device_domain() {
+    let policy = normalize_host_policy(&host()).expect("valid");
+    assert_eq!(policy.domains["unified"].memory, DomainMemory::Unified);
+    assert_eq!(policy.domains["unified"].device, None);
+}
+
+// T26: every broken device shape is refused with its path and its code.
+#[test]
+fn broken_device_domains_are_refused() {
+    type Mutation = Box<dyn Fn(&mut serde_json::Value)>;
+    let cases: Vec<(&str, &str, Mutation)> = vec![
+        (
+            "device domain without device",
+            "device_policy_mismatch:",
+            Box::new(|h| {
+                h["resource_policy"]["domains"]["gpu0"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("device");
+            }),
+        ),
+        (
+            "unknown device",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["domains"]["gpu0"]["device"] = "gpu9".into()),
+        ),
+        (
+            "device maps elsewhere",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["devices"]["gpu0"]["domain"] = "system".into()),
+        ),
+        (
+            "another device maps to the device domain",
+            "device_policy_mismatch:",
+            Box::new(|h| {
+                h["resource_policy"]["devices"]["gpu1"] =
+                    serde_json::json!({"domain": "gpu0", "sharing": "shared"})
+            }),
+        ),
+        (
+            "host kv on device",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["domains"]["gpu0"]["host_kv_limit"] = "1GiB".into()),
+        ),
+        (
+            "device on system domain",
+            "device_policy_mismatch:",
+            Box::new(|h| h["resource_policy"]["domains"]["system"]["device"] = "gpu0".into()),
+        ),
+        (
+            "unified mixed with device",
+            "unsupported_gpu_topology:",
+            Box::new(|h| h["resource_policy"]["domains"]["system"]["memory"] = "unified".into()),
+        ),
+    ];
+    for (name, prefix, mutate) in cases {
+        let mut h = discrete_host();
+        mutate(&mut h);
+        let error = normalize_host_policy(&h).expect_err(name);
+        assert_eq!(
+            error.code,
+            ConfigErrorCode::UnsupportedCombination,
+            "{name}"
+        );
+        assert!(error.path.starts_with("resource_policy"), "{name}: {error}");
+        assert!(error.detail.starts_with(prefix), "{name}: {error}");
+    }
+}
+
+// T26: at most one unified domain per host.
+#[test]
+fn two_unified_domains_are_refused() {
+    let mut h = host();
+    let unified = h["resource_policy"]["domains"]["unified"].clone();
+    h["resource_policy"]["domains"]["unified1"] = unified;
+    let error = normalize_host_policy(&h).expect_err("two unified domains");
+    assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination);
+    assert!(
+        error.detail.starts_with("unsupported_gpu_topology:"),
+        "{error}"
+    );
+}
+
+// T26: two GPUs, each its own device domain (owner decision 3).
+#[test]
+fn two_device_domains_resolve() {
+    let mut h = discrete_host();
+    h["resource_policy"]["domains"]["gpu1"] = serde_json::json!({"memory": "device", "device": "gpu1",
+        "managed_limit": "22GiB", "free_reserve": "2GiB", "parked_limit": "2GiB"});
+    h["resource_policy"]["devices"]["gpu1"] =
+        serde_json::json!({"domain": "gpu1", "sharing": "shared"});
+    assert_eq!(normalize_host_policy(&h).unwrap().domains.len(), 3);
+}
+
+// T26: a device domain round-trips through the one writer of the host shape.
+#[test]
+fn a_device_domain_round_trips_through_composition() {
+    use mllm_config::effective::compose_resource_policy;
+    use mllm_config::resource_controls::ResourceContext;
+    let policy = normalize_host_policy(&discrete_host()).unwrap();
+    let composed = compose_resource_policy(
+        &ResourceControls::from_host(&policy),
+        &ResourceContext::from_host(&policy),
+    );
+    assert_eq!(composed["domains"]["gpu0"]["device"], "gpu0");
+    assert_eq!(composed["domains"]["gpu0"]["memory"], "device");
+    assert!(composed["domains"]["system"].get("device").is_none());
+}
+
+// Discrete GPU design §3: derived budgets for the three tiers on a discrete host.
+
+const GIB: i64 = 1 << 30;
+
+/// The fixture deployment with its budget derived from `engine_config.memory.request`
+/// rather than declared, on the runtime profile named after `engine`.
+fn deployment_with(residency: &str, engine: &str, request: &str) -> serde_json::Value {
+    let (mut d, _) = fixture();
+    d.as_object_mut().unwrap().remove("resources");
+    d["residency"] = residency.into();
+    d["runtime_profile"] = engine.into();
+    d["engine_config"] = serde_json::json!({"memory": {"request": request, "kv_cache": "1GiB"}});
+    d
+}
+
+/// The fixture deployment with explicit resources that name only `domain`.
+fn deployment_with_resources(domain: &str) -> serde_json::Value {
+    let (mut d, _) = fixture();
+    d["runtime_profile"] = "vllm".into();
+    let resources = d["resources"].as_object_mut().unwrap();
+    for phase in resources.values_mut() {
+        for allocation in phase["allocations"].as_array_mut().unwrap() {
+            allocation["domain"] = domain.into();
+            allocation["host_kv_bytes"] = "0B".into();
+        }
+    }
+    d
+}
+
+/// The fixture deployment with explicit resources on a discrete host: the card
+/// holds 12 GiB when Ready (room for the 8 GiB checkpoint and the 4 GiB KV
+/// cache, review decision: the request is the device allocation), and host
+/// RAM holds `system` in every phase.
+fn deployment_with_discrete_resources(system: &str) -> serde_json::Value {
+    let mut d = deployment_with_resources("gpu0");
+    for (phase, device) in [
+        ("cold", "14GiB"),
+        ("ready", "12GiB"),
+        ("parking", "12GiB"),
+        ("parked", "2GiB"),
+        ("wake", "14GiB"),
+    ] {
+        d["resources"][phase]["allocations"] = serde_json::json!([
+            {"domain": "gpu0", "bytes": device, "host_kv_bytes": "0B"},
+            {"domain": "system", "bytes": system, "host_kv_bytes": "0B"}
+        ]);
+    }
+    d
+}
+
+/// A discrete host with two GPUs, each its own device domain (owner decision 3).
+fn two_gpu_host() -> serde_json::Value {
+    let mut h = discrete_host();
+    h["resource_policy"]["domains"]["gpu1"] = serde_json::json!({"memory": "device",
+        "device": "gpu1", "managed_limit": "14848MiB", "free_reserve": "1536MiB",
+        "parked_limit": "2GiB"});
+    h["resource_policy"]["devices"]["gpu1"] =
+        serde_json::json!({"domain": "gpu1", "sharing": "shared"});
+    h
+}
+
+/// Resolve against `host` with a `vllm` and an `sglang` profile and a checkpoint
+/// whose weights are 8 GiB.
+fn resolve(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+) -> Result<mllm_config::effective::EffectiveDeployment, mllm_config::ConfigError> {
+    resolve_weighing(deployment, host, Some(8 * GIB))
+}
+
+/// [`resolve`] with the checkpoint's weights stated (`None`: not yet measured).
+fn resolve_weighing(
+    deployment: &serde_json::Value,
+    host: &serde_json::Value,
+    weights_bytes: Option<i64>,
+) -> Result<mllm_config::effective::EffectiveDeployment, mllm_config::ConfigError> {
+    let mut host = host.clone();
+    let mut sglang = host.clone();
+    sglang_profile(&mut sglang);
+    host["runtime_profiles"]["vllm"] = host["runtime_profiles"]["local"].clone();
+    host["runtime_profiles"]["sglang"] = sglang["runtime_profiles"]["local"].clone();
+    resolve_effective_with_checkpoint(
+        deployment,
+        &host,
+        CheckpointFacts {
+            weights_bytes,
+            ..CheckpointFacts::default()
+        },
+    )
+}
+
+fn phase(p: &PhaseFootprint) -> Vec<(String, i64)> {
+    p.allocations
+        .iter()
+        .map(|a| (a.domain.clone(), a.bytes))
+        .collect()
+}
+
+// T26/T23: deep on a discrete host: device and system per phase.
+#[test]
+fn deep_budgets_charge_device_and_system() {
+    let d = deployment_with("deep", "vllm", "10GiB");
+    let r = resolve(&d, &discrete_host()).unwrap().resources;
+    // The card holds the request and the engine's CUDA context and graphs.
+    assert_eq!(
+        phase(&r.ready),
+        vec![
+            (
+                "gpu0".into(),
+                10 * GIB + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
+            ),
+            ("system".into(), ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES)
+        ]
+    );
+    assert_eq!(
+        phase(&r.parked),
+        vec![
+            ("gpu0".into(), PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES),
+            ("system".into(), ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES)
+        ]
+    );
+    assert!(r.parked.devices.is_empty());
+    assert_eq!(r.ready.devices.len(), 1);
+}
+
+// T26/T23: host_backed charges the pinned weights copy (1.5 times the
+// weights) in every phase, for vLLM as for SGLang. Found live on a 16 GB
+// discrete GPU: vLLM 0.29's pinned backup took 1.37 times the weights and
+// stayed allocated after the wake.
+#[test]
+fn host_backed_charges_the_pinned_copy_in_every_phase() {
+    for engine in ["vllm", "sglang"] {
+        let r = resolve(
+            &deployment_with("host_backed", engine, "10GiB"),
+            &discrete_host(),
+        )
+        .unwrap()
+        .resources;
+        for p in [&r.cold, &r.ready, &r.parking, &r.parked, &r.wake] {
+            assert_eq!(
+                phase(p)[1].1,
+                ENGINE_HOST_OVERHEAD_PLACEHOLDER_BYTES + 12 * GIB,
+                "{engine}"
+            );
+        }
+        assert_eq!(
+            phase(&r.parked)[0].1,
+            PARKED_DEVICE_RESIDUE_PLACEHOLDER_BYTES
+        );
+        assert!(r.parked.allocations.iter().all(|a| a.host_kv_bytes == 0));
+    }
+}
+
+// T26: restart_only parks nothing; unified unchanged.
+#[test]
+fn restart_only_and_unified_are_unchanged() {
+    let r = resolve(
+        &deployment_with("restart_only", "vllm", "10GiB"),
+        &discrete_host(),
+    )
+    .unwrap()
+    .resources;
+    assert!(r.parked.allocations.iter().all(|a| a.bytes == 0));
+    let u = resolve(&deployment_with("deep", "vllm", "10GiB"), &host())
+        .unwrap()
+        .resources;
+    assert_eq!(u.ready.allocations.len(), 1);
+    assert_eq!(
+        u.parked.allocations[0].bytes,
+        PARKED_RESIDUAL_PLACEHOLDER_BYTES
+    );
+}
+
+// T26: every discrete-host resolution refusal carries its code.
+#[test]
+fn discrete_refusals_are_typed() {
+    let err = |d: &serde_json::Value, h: &serde_json::Value| {
+        let e = resolve(d, h).unwrap_err();
+        assert_eq!(e.code, ConfigErrorCode::UnsupportedCombination, "{e}");
+        e.to_string()
+    };
+    assert!(err(&deployment_with_resources("gpu0"), &discrete_host())
+        .contains("missing_system_allocation"));
+    let mut two = deployment_with("deep", "vllm", "10GiB");
+    two["devices"] = serde_json::json!([{"id": "gpu0", "sharing": "shared"}, {"id": "gpu1", "sharing": "shared"}]);
+    assert!(err(&two, &two_gpu_host()).contains("multi_gpu_unsupported"));
+    assert!(
+        err(&deployment_with("host_backed", "vllm", "10GiB"), &host())
+            .contains("host_backed_unavailable")
+    );
+}
+
+// T26: explicit resources naming both domains resolve on a discrete host.
+#[test]
+fn explicit_resources_naming_both_domains_resolve() {
+    let d = deployment_with_discrete_resources("4GiB");
+    resolve(&d, &discrete_host()).expect("both domains named");
+}
+
+// T26 (review decision): explicit resources on a discrete host size the engine
+// from the device allocation alone. The memory request is what the engine may
+// use on the card (vLLM's utilization, SGLang's static fraction); the system
+// allocation beside it is host RAM the engine process holds, and adding it
+// would ask the card for memory it does not have.
+#[test]
+fn explicit_discrete_resources_size_the_engine_from_the_device_allocation() {
+    let mut d = deployment_with_discrete_resources("4GiB");
+    let resolved = resolve(&d, &discrete_host()).expect("both domains named");
+    assert_eq!(resolved.engine_config.memory().request_bytes, 12 << 30);
+    assert_eq!(
+        resolved.ready_device_allocation(),
+        Some((Some(0), 12 << 30))
+    );
+    // A declared request must match the device allocation, not the sum.
+    d["engine_config"]["memory"]["request"] = "12GiB".into();
+    resolve(&d, &discrete_host()).expect("the device allocation");
+    d["engine_config"]["memory"]["request"] = "16GiB".into();
+    assert!(resolve(&d, &discrete_host()).is_err());
+    // A unified host keeps the whole Ready total.
+    let (unified, host) = fixture();
+    assert_eq!(
+        resolve_effective(&unified, &host)
+            .unwrap()
+            .engine_config
+            .memory()
+            .request_bytes,
+        8 << 30
+    );
+}
+
+// T26 (review decision): a deployment that states only its KV cache on a
+// discrete host (a Hugging Face or HTTP source, whose weights are known only
+// once downloaded) is not materializable until the checkpoint digest measures
+// the weights, which is what lets acceptance freeze it provisional (ADR 0014
+// §7). Once measured, it is sized as the standalone template sizes a local
+// checkpoint (design §3): weights x 1.10 plus the KV cache, at least 0.75 of the
+// card for vLLM, with the startup peak on the card equal to the request. A
+// request the device domain can never hold is refused with its code.
+#[test]
+fn a_discrete_request_derived_from_the_weights_is_sized_for_the_card() {
+    let kv_only = |engine: &str| {
+        let mut d = deployment_with("deep", engine, "1GiB");
+        d["engine_config"] = serde_json::json!({"memory": {"kv_cache": "1GiB"}});
+        d
+    };
+    for engine in ["vllm", "sglang"] {
+        let e = resolve_weighing(&kv_only(engine), &discrete_host(), None).unwrap_err();
+        assert_eq!(e.code, ConfigErrorCode::NotMaterializable, "{e}");
+        assert!(e.path.starts_with("engine_config.memory"), "{e}");
+        // Acceptance's placeholder: zero weights resolve to the KV cache
+        // (vLLM: its floor), a bound nothing reserves until re-resolved.
+        resolve_weighing(&kv_only(engine), &discrete_host(), Some(0)).expect("placeholder");
+    }
+    // SGLang: 8 GiB of weights x 1.10 plus 1 GiB of KV.
+    let sglang = resolve(&kv_only("sglang"), &discrete_host()).unwrap();
+    let request = 8 * GIB / 100 * 110 + GIB;
+    assert_eq!(sglang.engine_config.memory().request_bytes, request);
+    assert_eq!(sglang.engine_config.memory().startup_bytes, Some(request));
+    let on_card = request + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    assert_eq!(sglang.ready_device_allocation(), Some((Some(0), on_card)));
+    assert_eq!(phase(&sglang.resources.cold)[0], ("gpu0".into(), on_card));
+    // vLLM: at least 0.75 of the card the device domain declares (managed
+    // limit plus free reserve, 16 GiB here).
+    let vllm = resolve(&kv_only("vllm"), &discrete_host()).unwrap();
+    let floor = 16 * GIB / 100 * 75;
+    assert_eq!(vllm.engine_config.memory().request_bytes, floor);
+    assert_eq!(vllm.engine_config.memory().startup_bytes, Some(floor));
+    // 14 GiB of weights: 16.4 GiB, beyond the 14.5 GiB the card's domain manages.
+    let e = resolve_weighing(&kv_only("sglang"), &discrete_host(), Some(14 * GIB)).unwrap_err();
+    assert!(e.detail.starts_with("insufficient_device_memory:"), "{e}");
+    // A unified host keeps the placeholder margin.
+    let unified = resolve(&kv_only("sglang"), &host()).unwrap();
+    assert_eq!(
+        unified.engine_config.memory().request_bytes,
+        8 * GIB + GIB + mllm_config::effective::overhead_margin(Engine::Sglang)
+    );
+}
+
+// T26: a discrete host whose policy has no single distinct system domain cannot
+// derive the host overhead, so derivation refuses rather than omit it.
+#[test]
+fn derivation_needs_one_system_domain() {
+    let mut h = discrete_host();
+    h["resource_policy"]["domains"]["system2"] = h["resource_policy"]["domains"]["system"].clone();
+    let e = resolve(&deployment_with("deep", "vllm", "10GiB"), &h).unwrap_err();
+    assert!(e.detail.starts_with("missing_system_allocation:"), "{e}");
+}
+
+// T26: the host-RAM tier on a discrete host needs the weight size to charge the copy.
+#[test]
+fn host_backed_with_unknown_weights_is_not_materializable() {
+    let mut host = discrete_host();
+    host["runtime_profiles"]["vllm"] = host["runtime_profiles"]["local"].clone();
+    let e = resolve_effective(&deployment_with("host_backed", "vllm", "10GiB"), &host).unwrap_err();
+    // ADR 0014 §7: not materializable until the digest measures the weights,
+    // which is what lets acceptance freeze the revision provisional.
+    assert_eq!(
+        e.code,
+        mllm_config::ConfigErrorCode::NotMaterializable,
+        "{e}"
+    );
+    assert!(e.path.starts_with("engine_config.memory"), "{e}");
+}
+
+// T26: the host-RAM tier on a discrete host is allowed only when the system domain
+// has room for the weights copy: its parked phase must fit the system domain's
+// parked_limit and managed_limit.
+#[test]
+fn host_backed_is_refused_when_the_system_domain_has_no_room_for_the_copy() {
+    let mut h = discrete_host();
+    h["resource_policy"]["domains"]["system"]["parked_limit"] = "11GiB".into();
+    let e = resolve(&deployment_with("host_backed", "vllm", "10GiB"), &h).unwrap_err();
+    assert!(e.detail.starts_with("host_backed_unavailable:"), "{e}");
+    // Deep parks no copy, so the same host takes it.
+    resolve(&deployment_with("deep", "vllm", "10GiB"), &h).expect("deep keeps no copy");
+    // Explicit resources are held to the same rule.
+    let mut d = deployment_with_discrete_resources("12GiB");
+    d["residency"] = "host_backed".into();
+    let e = resolve(&d, &h).unwrap_err();
+    assert!(e.detail.starts_with("host_backed_unavailable:"), "{e}");
+}
+
+// T26: one GPU per deployment on a discrete host, even when both devices would
+// share a domain view.
+#[test]
+fn two_device_claims_are_refused_before_derivation() {
+    let mut two = deployment_with_resources("gpu0");
+    two["devices"] = serde_json::json!([{"id": "gpu0", "sharing": "shared"}, {"id": "gpu1", "sharing": "shared"}]);
+    let e = resolve(&two, &two_gpu_host()).unwrap_err();
+    assert!(e.detail.starts_with("multi_gpu_unsupported:"), "{e}");
+}
+
+// T26 (final review I9, ADR 0019 pin form): `devices: [{id: gpu0}]` pins the
+// GPU and takes the sharing the host states for it; before, the claim failed
+// to parse without `sharing`.
+#[test]
+fn the_short_pin_form_takes_the_hosts_sharing() {
+    let mut d = deployment_with("deep", "vllm", "10GiB");
+    d["devices"] = serde_json::json!([{"id": "gpu0"}]);
+    let r = resolve(&d, &discrete_host()).expect("the short pin form resolves");
+    assert_eq!(r.selected_devices.len(), 1);
+    assert_eq!(r.selected_devices[0].id, "gpu0");
+    assert_eq!(
+        r.selected_devices[0].sharing,
+        mllm_config::effective::Sharing::Shared
+    );
+    // A stated sharing is kept.
+    d["devices"] = serde_json::json!([{"id": "gpu0", "sharing": "exclusive"}]);
+    let r = resolve(&d, &discrete_host()).unwrap();
+    assert_eq!(
+        r.selected_devices[0].sharing,
+        mllm_config::effective::Sharing::Exclusive
+    );
+}
+
+// T26 (re-review parity rule): the engine's CUDA context and graphs are
+// charged beside the request by one rule on a unified pool and on a card, and
+// the revision records the charge so a snapshot re-derives it; a revision
+// frozen before the charge (no `overhead_bytes`) still decodes without it.
+#[test]
+fn the_cuda_context_is_charged_alike_on_unified_and_discrete_hosts() {
+    let overhead = mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES;
+    let d = deployment_with("deep", "vllm", "10GiB");
+    for host in [host(), discrete_host()] {
+        let r = resolve(&d, &host).unwrap();
+        assert_eq!(r.resources.ready.allocations[0].bytes, 10 * GIB + overhead);
+        assert_eq!(r.engine_config.memory().overhead_bytes, Some(overhead));
+        let snapshot = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            mllm_config::effective::decode_effective_snapshot(&snapshot).unwrap(),
+            r
+        );
+    }
 }

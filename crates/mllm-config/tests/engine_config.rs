@@ -632,7 +632,12 @@ fn phases_derive_from_the_memory_request_and_snapshot_exactly() {
             &effective.resources.parking,
             &effective.resources.wake,
         ] {
-            assert_eq!(phase.allocations[0].bytes, 12 * GIB, "{residency}");
+            // The request and the engine's CUDA context and graphs.
+            assert_eq!(
+                phase.allocations[0].bytes,
+                12 * GIB + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES,
+                "{residency}"
+            );
             assert_eq!(phase.allocations[0].domain, "unified");
             assert_eq!(phase.devices.len(), 1);
         }
@@ -680,7 +685,7 @@ fn a_request_derived_from_checkpoint_weights_round_trips() {
     assert_eq!(memory.weights_bytes, Some(10 * GIB));
     assert_eq!(
         effective.resources.ready.allocations[0].bytes,
-        memory.request_bytes
+        memory.request_bytes + mllm_config::effective::ENGINE_DEVICE_OVERHEAD_PLACEHOLDER_BYTES
     );
     let snapshot = serde_json::to_value(&effective).unwrap();
     assert_eq!(

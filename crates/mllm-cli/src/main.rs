@@ -17,6 +17,9 @@ fn main() -> ExitCode {
     // here, so every command and role names the same absolute document (and
     // the engines file beside it) whatever it does later.
     invocation.config = invocation.config.as_deref().map(mllm_cli::engine::absolute);
+    // Owner rule 2026-09-25: the state root, `--state-dir` > `MLLM_STATE_DIR`
+    // > the per-user default, resolved once for every command.
+    let state_root = state_root(&invocation);
     // Owner decision 2026-09-25: `--format json` is machine mode, exactly as
     // `--output json` was (and still is): JSON results and JSON errors.
     let format = match invocation.format.as_deref() {
@@ -44,10 +47,7 @@ fn main() -> ExitCode {
             Ok(runtime) => runtime,
             Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
         };
-        return match runtime.block_on(mllm_cli::remote_roles::execute(
-            &invocation,
-            &default_state_dir(),
-        )) {
+        return match runtime.block_on(mllm_cli::remote_roles::execute(&invocation, &state_root)) {
             Ok(value) => {
                 emit(&value, view, &Default::default());
                 warn_development_controls(&value, format);
@@ -75,7 +75,28 @@ fn main() -> ExitCode {
         let config = mllm_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
             std::env::var(key).ok().filter(|value| !value.is_empty())
         });
-        return run_standalone(config.as_deref(), format);
+        // Owner decision 2026-09-25: `--set` > `MLLM_SET__…` > the document;
+        // a named flag or variable of the same setting must agree.
+        let overrides = match mllm_cli::settings::role_overrides(
+            mllm_config::ConfigKind::Standalone,
+            &invocation.sets,
+            &mllm_cli::settings::flag_layer(&invocation),
+        ) {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                let err: StructuredError =
+                    roles::StartError::Setting(mllm_cli::settings::describe(&error)).into();
+                output::print_error(&err, format);
+                return ExitCode::from(err.exit_code().0 as u8);
+            }
+        };
+        return run_standalone(
+            &state_root,
+            config.as_deref(),
+            &invocation,
+            &overrides,
+            format,
+        );
     }
     // ADR 0018: engine registration, on this machine, through its role's socket.
     if mllm_cli::engine::is_engine_command(&invocation.command) {
@@ -86,7 +107,7 @@ fn main() -> ExitCode {
         return match runtime.block_on(mllm_cli::engine::execute(
             &invocation.command,
             invocation.config.as_deref(),
-            &default_state_dir(),
+            &state_root,
         )) {
             Ok(value) => {
                 emit(&value, view, &Default::default());
@@ -114,7 +135,7 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::drain::execute(
             host.as_deref(),
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
             invocation.request_id.as_deref(),
             *wait,
@@ -138,7 +159,7 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::revoke::execute(
             host,
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
             invocation.request_id.as_deref(),
         )) {
@@ -168,7 +189,7 @@ fn main() -> ExitCode {
             host_config,
             *apply,
             referenced_file.as_deref(),
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
         )) {
             Ok(value) => {
@@ -182,10 +203,38 @@ fn main() -> ExitCode {
         };
     }
     // SPEC §14 / §15.3: offline validation; no runtime, state, or network.
-    if let Command::Validate { file, host } = &invocation.command {
-        return match mllm_cli::validate::validate_config(file, host.as_deref()) {
+    if let Command::Validate { file, host, sets } = &invocation.command {
+        // The state root a start would use, when this invocation names one.
+        let named_root = invocation.state_dir.clone().or_else(|| {
+            std::env::var_os("MLLM_STATE_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(std::path::PathBuf::from)
+        });
+        return match mllm_cli::validate::validate_config_at(
+            file,
+            host.as_deref(),
+            sets,
+            named_root.as_deref(),
+        ) {
             Ok(value) => {
                 println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                output::print_error(&err, format);
+                ExitCode::from(err.exit_code().0 as u8)
+            }
+        };
+    }
+    // Owner decision 2026-09-25: the effective configuration of a role.
+    if let Command::ConfigShow { role, sets } = &invocation.command {
+        return match mllm_cli::settings::config_show(&invocation, *role, sets, &state_root) {
+            Ok(value) => {
+                if json_records {
+                    println!("{value}");
+                } else {
+                    print!("{}", mllm_cli::settings::render_table(&value));
+                }
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -201,7 +250,7 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::client::execute_with_start_options(
             &invocation.command,
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
             invocation.request_id.as_deref(),
             invocation.initialize_timeout_ms,
@@ -210,12 +259,9 @@ fn main() -> ExitCode {
         )) {
             Ok(value) => {
                 let names = match view {
-                    Some(view) if view.needs_host_names() => {
-                        runtime.block_on(mllm_cli::client::host_names(
-                            &default_state_dir(),
-                            invocation.config.as_deref(),
-                        ))
-                    }
+                    Some(view) if view.needs_host_names() => runtime.block_on(
+                        mllm_cli::client::host_names(&state_root, invocation.config.as_deref()),
+                    ),
                     _ => Default::default(),
                 };
                 emit(&value, view, &names);
@@ -254,18 +300,29 @@ fn emit(value: &serde_json::Value, view: Option<View>, names: &HostNames) {
 
 /// SPEC §9.1 / T21 / P4: in text mode, status and inspect views warn on stderr
 /// about every deployment or host installation exposing vLLM development
-/// controls. The JSON result on stdout is unchanged.
+/// controls, and (design §9) about an inference endpoint served on a
+/// non-loopback address without the API key. The JSON result on stdout is
+/// unchanged.
 fn warn_development_controls(value: &serde_json::Value, format: OutputFormat) {
     if format == OutputFormat::Text {
         for notice in output::development_controls_notices(value) {
+            eprintln!("{notice}");
+        }
+        // Design §9: status repeats the unauthenticated-exposure warning.
+        if let Some(notice) = mllm_cli::exposure::status_notice(value) {
             eprintln!("{notice}");
         }
     }
 }
 
 /// Foreground standalone boot with authenticated management and inference.
-fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> ExitCode {
-    let state_dir = default_state_dir();
+fn run_standalone(
+    state_dir: &std::path::Path,
+    config: Option<&std::path::Path>,
+    invocation: &grammar::Invocation,
+    overrides: &roles::SettingOverrides,
+    format: OutputFormat,
+) -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -277,7 +334,7 @@ fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> Exi
             return ExitCode::from(output::ExitCode::INTERNAL.0 as u8);
         }
     };
-    match runtime.block_on(serve_standalone(&state_dir, config)) {
+    match runtime.block_on(serve_standalone(state_dir, config, invocation, overrides)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let err: StructuredError = err.into();
@@ -287,8 +344,10 @@ fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> Exi
     }
 }
 
-/// Boot the standalone graph and serve the inference listener
-/// (127.0.0.1:8443, SPEC §15.2) until the process is signalled.
+/// Boot the standalone graph and serve the inference listener (design §9:
+/// the document's bind, `0.0.0.0:8443` by default, unless `--listen` or
+/// `MLLM_INFERENCE_ADDR` moves it for this run) until the process
+/// is signalled.
 ///
 /// SPEC §4.3 (owner decision P3): SIGTERM or SIGINT is a service restart.
 /// Inference admission closes (new requests get a retryable 503), admitted
@@ -299,21 +358,54 @@ fn run_standalone(config: Option<&std::path::Path>, format: OutputFormat) -> Exi
 async fn serve_standalone(
     state_dir: &std::path::Path,
     config: Option<&std::path::Path>,
+    invocation: &grammar::Invocation,
+    overrides: &roles::SettingOverrides,
 ) -> Result<(), roles::StartError> {
-    use mllm_cli::shutdown;
-    let bound = match config {
-        Some(document) => shutdown::standalone_drain_bound_in(document),
-        None => shutdown::standalone_drain_bound(state_dir),
+    use mllm_cli::{exposure, shutdown};
+    let listen = invocation.listen;
+    let no_inference_auth = invocation.no_inference_auth;
+    let models = &invocation.model_overrides;
+    let engines = &invocation.engine_overrides;
+    let implicit = state_dir.join("config").join("standalone.yaml");
+    let bound = shutdown::standalone_drain_bound_with(config.unwrap_or(&implicit), overrides)
+        .map_err(roles::StartError::Setting)?;
+    // Checked before the boot, so a bad override refuses without side effects.
+    roles::inference_override(listen)?;
+    exposure::effective_inference_auth(exposure::InferenceAuth::ApiKey, no_inference_auth)?;
+    if let Some(warning) = roles::deprecated_inference_env_warning(listen) {
+        eprintln!("{warning}");
     }
-    .map_err(roles::StartError::Setting)?;
-    let inference_address = roles::standalone_inference_address()?;
-    let management_address = roles::standalone_management_address()?;
+    // Owner rule 2026-09-25: a deprecated variable name is warned about once.
+    for warning in
+        mllm_config::engine_settings::deprecation_warnings(&|key| std::env::var(key).ok())
+    {
+        eprintln!("{warning}");
+    }
+    // Owner decision 2026-09-25: `--management-listen` >
+    // MLLM_MANAGEMENT_ADDR (or its deprecated alias) > the document, checked
+    // before the boot so a bad override refuses without side effects.
+    let management_override = roles::management_override(invocation.management_listen)?;
+    if let Some(warning) = roles::deprecated_management_env_warning(invocation.management_listen) {
+        eprintln!("{warning}");
+    }
     let mut signals = shutdown::Signals::install()?;
-    let app = roles::start_standalone_from(state_dir, config).await?;
+    // Owner decision 2026-09-25: `--models-root`, `--model-sources` and
+    // `--model-sources-max` win over the environment and the document; the
+    // generic overrides win over the document too.
+    let app = roles::start_standalone_with_overrides(state_dir, config, models, engines, overrides)
+        .await?;
+    let management_address = management_override.unwrap_or(app.management_bind());
+    // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document.
+    let inference_address = roles::effective_inference_address(app.inference_bind(), listen)?;
+    // Design §9: `--no-inference-auth` > MLLM_INFERENCE_AUTH > the document.
+    let inference_auth =
+        exposure::effective_inference_auth(app.inference_auth(), no_inference_auth)?;
     // SPEC §15.3: an accepted-but-ignored setting is reported, not silent.
     for notice in app.config_notices() {
         eprintln!("warning: {notice}");
     }
+    // Design §9: said out loud before the listener accepts connections.
+    exposure::warn_if_exposed(inference_address, inference_auth);
     let listener = tokio::net::TcpListener::bind(inference_address)
         .await
         .map_err(roles::StartError::from)?;
@@ -321,11 +413,12 @@ async fn serve_standalone(
     let management = tokio::net::TcpListener::bind(management_address)
         .await
         .map_err(roles::StartError::from)?;
+    roles::record_management_address(state_dir, management_address);
     let admission = shutdown::Admission::new();
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let mut inference = tokio::spawn(shutdown::serve(
         listener,
-        admission.gate(app.router()),
+        admission.gate(app.inference_router(inference_address, inference_auth)),
         stopped.clone(),
     ));
     let mut control = tokio::spawn(shutdown::serve(
@@ -333,9 +426,12 @@ async fn serve_standalone(
         app.management_router(),
         stopped,
     ));
+    // Design §9 ("Where the key is"): the ready line names the owner-only
+    // credentials file that holds the API key, never the key.
     println!(
-        "standalone ready (state_dir {}; inference listener {inference_address})",
-        state_dir.display()
+        "standalone ready (state_dir {}; inference listener {inference_address}; credentials {})",
+        state_dir.display(),
+        roles::credentials_path(state_dir).display()
     );
     let failed = tokio::select! {
         _ = signals.recv() => None,
@@ -375,11 +471,65 @@ async fn serve_standalone(
     Ok(())
 }
 
-/// F0 default state root: `$MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`,
-/// else `~/.local/state/mllm` (SPEC §16.5 standalone shape).
-fn default_state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MLLM_STATE_DIR") {
+/// The state root (owner decision 2026-09-25, `--set` > `MLLM_SET__…` >
+/// flag > environment > YAML > default): `--set state_dir=<dir>` (on `start
+/// standalone` and `config show`), else `MLLM_SET__STATE_DIR`, else
+/// `--state-dir`, else `$MLLM_STATE_DIR`, else the top-level `state_dir` of
+/// the standalone document named by `--config` or `MLLM_CONFIG`, else
+/// `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm` (SPEC §16.5
+/// standalone shape). It locates the implicit role documents; a standalone
+/// document's `server.state_dir` and `host.state_dir` must lie under it
+/// (SPEC §15.3), and a server or host document's `state_dir` is that role's
+/// own state. A generic override that disagrees with `--state-dir` or
+/// `MLLM_STATE_DIR` refuses the start (`mllm_cli::settings`).
+fn state_root(invocation: &grammar::Invocation) -> PathBuf {
+    let absolute = |dir: &str| mllm_cli::engine::absolute(std::path::Path::new(dir));
+    // A server or host document's `state_dir` is that role's own state, not
+    // the root: only a standalone start (or `config show` of one) reads the
+    // generic override here.
+    let standalone = match &invocation.command {
+        Command::Start(Role::Standalone) => true,
+        Command::ConfigShow { role, .. } => match role {
+            Some(role) => *role == Role::Standalone,
+            None => mllm_cli::engine::named_role_document(invocation.config.as_deref(), &|key| {
+                std::env::var(key).ok().filter(|value| !value.is_empty())
+            })
+            .is_none_or(|named| {
+                std::fs::read_to_string(named)
+                    .ok()
+                    .and_then(|text| mllm_config::parse_document(&text).ok())
+                    .is_some_and(|document| document["kind"] == "standalone")
+            }),
+        },
+        _ => false,
+    };
+    let generic = invocation
+        .sets
+        .iter()
+        .rev()
+        .find_map(|set| {
+            set.split_once('=')
+                .filter(|(path, _)| path.eq_ignore_ascii_case("state_dir"))
+                .map(|(_, value)| value.to_owned())
+        })
+        .or_else(|| {
+            std::env::vars().find_map(|(key, value)| {
+                (key.eq_ignore_ascii_case("MLLM_SET__STATE_DIR") && !value.is_empty())
+                    .then_some(value)
+            })
+        })
+        .filter(|_| standalone);
+    if let Some(dir) = generic {
+        return absolute(&dir);
+    }
+    if let Some(dir) = invocation.state_dir.as_deref() {
+        return dir.to_path_buf();
+    }
+    if let Some(dir) = std::env::var_os("MLLM_STATE_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
+    }
+    if let Some(dir) = document_state_root(invocation.config.as_deref()) {
+        return dir;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match std::env::var_os("XDG_STATE_HOME") {
@@ -388,6 +538,25 @@ fn default_state_dir() -> PathBuf {
             .map(|home| home.join(".local").join("state").join("mllm"))
             .unwrap_or_else(|| PathBuf::from(".mllm-state")),
     }
+}
+
+/// The top-level `state_dir` of the standalone document named by `--config`
+/// (else `MLLM_CONFIG`), resolved against the document's directory.
+fn document_state_root(config: Option<&std::path::Path>) -> Option<PathBuf> {
+    let named = mllm_cli::engine::named_role_document(config, &|key| {
+        std::env::var(key).ok().filter(|value| !value.is_empty())
+    })?;
+    let text = std::fs::read_to_string(&named).ok()?;
+    let document = mllm_config::parse_document(&text).ok()?;
+    if document["kind"] != "standalone" {
+        return None;
+    }
+    let dir = std::path::Path::new(document["state_dir"].as_str()?);
+    let base = mllm_cli::engine::absolute(&named);
+    Some(match base.parent() {
+        Some(parent) if dir.is_relative() => parent.join(dir),
+        _ => dir.to_path_buf(),
+    })
 }
 
 fn report_cli_error(err: &CliError) -> ExitCode {

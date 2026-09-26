@@ -97,6 +97,12 @@ pub struct PlanInputVllm {
     /// cannot be loaded, so dev mode without a runtime dir is refused
     /// rather than served unguarded.
     pub runtime_dir: Option<String>,
+    /// Discrete GPU design §§6–7: the selected GPU, from the host's own
+    /// approved policy, that the child's CUDA namespace is narrowed to so the
+    /// engine sees exactly that device as `cuda:0` (by its published UUID, or
+    /// by its index in PCI bus order). `None` keeps the agent's own
+    /// pass-through (a one-device unified host).
+    pub cuda_namespace: Option<mllm_config::effective::CudaNamespace>,
 }
 
 /// SPEC §13.3: the engine key is never formatted.
@@ -131,8 +137,22 @@ impl std::fmt::Debug for PlanInputVllm {
             .field("build_env", &self.build_env)
             .field("engine_log", &self.engine_log)
             .field("runtime_dir", &self.runtime_dir)
+            .field("cuda_namespace", &self.cuda_namespace)
             .finish()
     }
+}
+
+/// Discrete GPU design §6 (ADR 0019): the `--gpu-memory-utilization` percent of
+/// a launch on a discrete device, the device request's share of the card's
+/// total rounded up to a whole percent. vLLM checks at start that this share
+/// of the card is free; the planner and the launch check already made that
+/// room. At least 75: vLLM 0.29 with CUDA graphs does not start a 4B model on a
+/// 16 GB card below 0.75 (design §3, observed on the discrete-GPU laptop host).
+/// At most 99: vLLM refuses a whole card.
+pub fn device_utilization_pct(request: i64, device_total: i64) -> u8 {
+    let total = device_total.max(1);
+    let pct = request.max(0).saturating_mul(100).saturating_add(total - 1) / total;
+    pct.clamp(75, 99) as u8
 }
 
 #[derive(Debug, Clone, Default)]
@@ -340,6 +360,14 @@ pub fn render_command(input: &PlanInputVllm) -> Result<RenderedCommand, ArgsErro
     if !input.extra_args.is_empty() {
         argv.push(EXTRA_ARGS_MARKER.into());
         argv.extend(input.extra_args.iter().cloned());
+    }
+    // Discrete GPU design §7: the chosen device, by the UUID the host itself
+    // published or its PCI-ordered index, replaces whatever namespace the
+    // agent was started with.
+    if let Some(namespace) = &input.cuda_namespace {
+        for (name, value) in namespace.environment() {
+            env.insert(name.into(), value);
+        }
     }
     if let Some(approvals) = &input.extra_approvals {
         env.insert(

@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 use mllm_config::defaults::{resolve_startup, LoadOutcome};
 use mllm_config::effective::ModelSource;
 use mllm_config::engine_policy::Engine;
+use mllm_config::listener_migration::{Migration, NEW_DEFAULT as NEW_INFERENCE_DEFAULT};
+pub use mllm_config::model_settings::ModelOverrides;
 use mllm_config::schema::ConfigKind;
+pub use mllm_config::setting_overrides::SettingOverrides;
 use mllm_controller::coordinator::{
     CoordinatorOptions, EngineBindings, OwnedCoordinator, ServiceClock, ServiceObservation as _,
     ToolsFactory,
@@ -32,6 +35,7 @@ use mllm_store::secrets::SecretsKey;
 use mllm_store::Store;
 
 use crate::host_observation::{system_clock, HostMemoryObservation};
+use mllm_agent::gpu_memory::{GpuSampler, HostShape};
 
 use crate::grammar::Command as CliCommand;
 use crate::output::{ExitCode, StructuredError};
@@ -46,28 +50,26 @@ pub use mllm_controller::engine_provider::{
 pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 
 /// The engine's executable. A host with no engine cannot serve: one of these
-/// two, or a profile registered with `mllm engine add`, must name one. ADR
-/// 0018 §5: both set publish two profiles, `local-vllm` and `local-sglang`.
-const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
-const SGLANG_BIN: &str = "MLLM_SGLANG_BIN";
-/// SPEC §13.3 amendment (owner decision 2026-09-25): the CUDA toolkit root of
-/// the `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` installation (its `cuda_home`).
-const CUDA_HOME_ENV: &str = "MLLM_CUDA_HOME";
-/// The directory model weights live under (Spec §7). Required for the same reason:
-/// a guessed store resolves relative paths somewhere the operator never named.
-const MODELS_ROOT: &str = "MLLM_MODELS_ROOT";
-const KV_CACHE_BYTES: &str = "MLLM_KV_CACHE_BYTES";
-const ENGINE_ARGS: &str = "MLLM_ENGINE_ARGS";
-const ENGINE_FINGERPRINT: &str = "MLLM_ENGINE_FINGERPRINT";
-const DEEP_PARK: &str = "MLLM_DEEP_PARK";
-const TRUST_REMOTE_CODE: &str = "MLLM_TRUST_REMOTE_CODE";
-const RUNTIME_DIR: &str = "MLLM_RUNTIME_DIR";
-const INSTALLATION_DRIFT: &str = "MLLM_INSTALLATION_DRIFT";
+/// two (or `--vllm-bin` / `--sglang-bin`, or `host.local_engine`), or a
+/// profile registered with `mllm engine add`, must name one. ADR 0018 §5:
+/// both set publish two profiles, `local-vllm` and `local-sglang`.
+const ENGINE_BIN: &str = mllm_config::engine_settings::VLLM_BIN_ENV;
+const SGLANG_BIN: &str = mllm_config::engine_settings::SGLANG_BIN_ENV;
+/// The directory model weights live under (Spec §7). Optional (owner decision
+/// 2026-09-25): `~/models` unless `--models-root`, this variable or
+/// `host.model_store.path` names another.
+const MODELS_ROOT: &str = mllm_config::model_settings::MODELS_ROOT_ENV;
+const KV_CACHE_BYTES: &str = mllm_config::engine_settings::KV_CACHE_ENV;
+const ENGINE_FINGERPRINT: &str = mllm_config::engine_settings::ENGINE_FINGERPRINT_ENV;
+const RUNTIME_DIR: &str = mllm_config::engine_settings::RUNTIME_DIR_ENV;
 /// SPEC §15.2: a run-time override of the engines' loopback port range, as
-/// `start-end`, so two roles on one machine lease different engine ports.
-pub const ENGINE_PORTS_ENV: &str = "MLLM_STANDALONE_ENGINE_PORTS";
+/// `start-end`, so two roles on one machine lease different engine ports
+/// (owner rule 2026-09-25: one name for both roles; the standalone-only
+/// `MLLM_STANDALONE_ENGINE_PORTS` is a deprecated alias).
+pub const ENGINE_PORTS_ENV: &str = mllm_config::engine_settings::ENGINE_PORTS_ENV;
+pub use mllm_config::engine_settings::EngineOverrides;
 /// SPEC §16.5 default engine port range.
-const DEFAULT_ENGINE_PORTS: (u16, u16) = (8100, 8199);
+const DEFAULT_ENGINE_PORTS: (u16, u16) = mllm_config::engine_settings::DEFAULT_ENGINE_PORTS;
 
 /// SPEC §8.2 / T21 (owner decision 2026-09-25): the standalone rendezvous
 /// root under the state directory, the same name a host uses.
@@ -135,6 +137,10 @@ pub struct App {
     host: Arc<crate::standalone_engines::EmbeddedHost>,
     /// Observed host capacity the published limits were derived from.
     capacity_bytes: i64,
+    /// Design §1: the host's GPU shape, sampled once at boot. It decides the
+    /// domains the host publishes and, on a discrete host, the deployment
+    /// template and the memory observation.
+    pub gpu_shape: HostShape,
     /// Servable router (F1: the standalone role's inference surface).
     router: axum::Router,
     management: axum::Router,
@@ -153,6 +159,19 @@ pub struct App {
     /// not honoured (only the `server.tls` block an older generator wrote),
     /// reported by the role at boot so nobody believes them in force.
     config_notices: Vec<String>,
+    /// Design §9: the document's `server.listeners.inference.bind`, or the
+    /// `0.0.0.0:8443` default when it states none.
+    inference_bind: std::net::SocketAddr,
+    /// Owner decision 2026-09-25: the document's
+    /// `server.listeners.management.bind`, or `127.0.0.1:7443`.
+    management_bind: std::net::SocketAddr,
+    /// ADR 0019, design §9: what this start's one-time listener migration did.
+    listener_migration: Migration,
+    /// Design §9: the document's `server.listeners.inference.authentication`
+    /// (`api_key` unless it states `none`).
+    inference_auth: mllm_config::standalone::InferenceAuth,
+    /// Design §9: the listener the role serves, reported to status.
+    inference_listener: Arc<mllm_management::inference_listener::InferenceListenerView>,
 }
 
 impl App {
@@ -169,6 +188,60 @@ impl App {
 
     pub fn router(&self) -> axum::Router {
         self.router.clone()
+    }
+
+    /// Design §9: the inference bind the standalone document states (default
+    /// `0.0.0.0:8443`). The listener binds it unless `--listen` or
+    /// `MLLM_INFERENCE_ADDR` overrides it
+    /// ([`effective_inference_address`]).
+    pub fn inference_bind(&self) -> std::net::SocketAddr {
+        self.inference_bind
+    }
+
+    /// Owner decision 2026-09-25: the management bind the standalone document
+    /// states (default `127.0.0.1:7443`), unless `--management-listen` or
+    /// `MLLM_MANAGEMENT_ADDR` overrides it ([`management_override`]).
+    pub fn management_bind(&self) -> std::net::SocketAddr {
+        self.management_bind
+    }
+
+    /// ADR 0019, design §9: what this start's one-time migration of the old
+    /// loopback inference bind did (reported on stderr as it happened).
+    pub fn listener_migration(&self) -> &Migration {
+        &self.listener_migration
+    }
+
+    /// Design §9: the inference authentication the standalone document
+    /// states (`api_key` unless `none`). `--no-inference-auth` and
+    /// `MLLM_INFERENCE_AUTH` override it for one run
+    /// ([`crate::exposure::effective_inference_auth`]).
+    pub fn inference_auth(&self) -> mllm_config::standalone::InferenceAuth {
+        self.inference_auth
+    }
+
+    /// Design §9: the router to serve on `bind` with `auth` for this run, and
+    /// the listener recorded for status. With [`InferenceAuth::None`] the
+    /// router's key check is off (`RouterDeps.api_key: None`); with
+    /// [`InferenceAuth::ApiKey`] it is [`App::router`], which requires the
+    /// key on every route (SPEC §13.3, T37).
+    ///
+    /// [`InferenceAuth::None`]: mllm_config::standalone::InferenceAuth::None
+    /// [`InferenceAuth::ApiKey`]: mllm_config::standalone::InferenceAuth::ApiKey
+    pub fn inference_router(
+        &self,
+        bind: std::net::SocketAddr,
+        auth: mllm_config::standalone::InferenceAuth,
+    ) -> axum::Router {
+        use mllm_config::standalone::InferenceAuth;
+        self.inference_listener
+            .set(crate::exposure::listener_view(bind, auth));
+        match auth {
+            InferenceAuth::ApiKey => self.router.clone(),
+            InferenceAuth::None => mllm_router::serve_router(mllm_router::RouterDeps {
+                api_key: None,
+                ..self.deps.clone()
+            }),
+        }
     }
 
     pub fn deps(&self) -> &mllm_router::RouterDeps {
@@ -222,36 +295,232 @@ impl App {
     }
 }
 
-/// The standalone listeners' loopback addresses (SPEC §16.5 defaults), each
-/// overridable for one run so two roles can share a machine. SPEC §15.2: a
-/// run-time override of an ordinary setting, never of the safety limit, so an
-/// address that is not loopback is refused.
-pub const INFERENCE_ADDR_ENV: &str = "MLLM_STANDALONE_INFERENCE_ADDR";
-pub const MANAGEMENT_ADDR_ENV: &str = "MLLM_STANDALONE_MANAGEMENT_ADDR";
+/// The standalone listeners' addresses, each overridable for one run so two
+/// roles can share a machine (SPEC §15.2: a run-time override of an ordinary
+/// setting). Management stays on loopback (SPEC §16.5), so a management
+/// address that is not loopback is refused. Inference follows the document's
+/// rule (design §9): any unicast address with a non-zero port.
+///
+/// Design §9: one variable moves the inference listener of either role, the
+/// server's and the standalone one's alike.
+pub const INFERENCE_ADDR_ENV: &str = "MLLM_INFERENCE_ADDR";
+/// The standalone-only name [`INFERENCE_ADDR_ENV`] replaces. Still read, after
+/// it, with a deprecation warning.
+pub const DEPRECATED_INFERENCE_ADDR_ENV: &str = "MLLM_STANDALONE_INFERENCE_ADDR";
+/// Owner decision 2026-09-25: the standalone management address for one
+/// run, for the role and its client commands alike (loopback only).
+pub const MANAGEMENT_ADDR_ENV: &str = "MLLM_MANAGEMENT_ADDR";
+/// The standalone-only name [`MANAGEMENT_ADDR_ENV`] replaces. Still read,
+/// after it, with a deprecation warning.
+pub const DEPRECATED_MANAGEMENT_ADDR_ENV: &str = "MLLM_STANDALONE_MANAGEMENT_ADDR";
 
-fn loopback_address(variable: &str, default: &str) -> Result<std::net::SocketAddr, StartError> {
-    let text = match std::env::var_os(variable) {
-        None => default.to_owned(),
-        Some(value) => value
-            .into_string()
-            .map_err(|_| StartError::Setting(format!("{variable} is not valid text")))?,
+/// SPEC §16.5, owner decision 2026-09-25: the run-time override of the
+/// standalone management bind, if any: `--management-listen`, then
+/// `MLLM_MANAGEMENT_ADDR`, then the deprecated
+/// `MLLM_STANDALONE_MANAGEMENT_ADDR`. Each must be a loopback address with a
+/// non-zero port; a bad one is refused with its name.
+pub fn management_override(
+    flag: Option<std::net::SocketAddr>,
+) -> Result<Option<std::net::SocketAddr>, StartError> {
+    use mllm_config::standalone::management_address;
+    if let Some(address) = flag {
+        return management_address(&address.to_string())
+            .map(Some)
+            .ok_or_else(|| {
+                StartError::Setting(format!(
+                    "--management-listen {address} must be a loopback address with a non-zero port"
+                ))
+            });
+    }
+    let (variable, value) = match std::env::var_os(MANAGEMENT_ADDR_ENV) {
+        Some(value) => (MANAGEMENT_ADDR_ENV, value),
+        None => match std::env::var_os(DEPRECATED_MANAGEMENT_ADDR_ENV) {
+            Some(value) => (DEPRECATED_MANAGEMENT_ADDR_ENV, value),
+            None => return Ok(None),
+        },
     };
-    text.parse::<std::net::SocketAddr>()
+    value
+        .into_string()
         .ok()
-        .filter(|address| address.ip().is_loopback() && address.port() != 0)
+        .and_then(|text| management_address(&text))
+        .map(Some)
         .ok_or_else(|| {
             StartError::Setting(format!(
-                "{variable} must be a loopback address with a port, e.g. 127.0.0.1:8443"
+                "{variable} must be a loopback address with a port, e.g. 127.0.0.1:7443"
             ))
         })
 }
 
-pub fn standalone_inference_address() -> Result<std::net::SocketAddr, StartError> {
-    loopback_address(INFERENCE_ADDR_ENV, "127.0.0.1:8443")
+/// The warning a role prints once at start when the deprecated
+/// `MLLM_STANDALONE_MANAGEMENT_ADDR` is set, or `None`.
+pub fn deprecated_management_env_warning(flag: Option<std::net::SocketAddr>) -> Option<String> {
+    std::env::var_os(DEPRECATED_MANAGEMENT_ADDR_ENV)?;
+    let ignored = flag.is_some() || std::env::var_os(MANAGEMENT_ADDR_ENV).is_some();
+    Some(format!(
+        "warning: {DEPRECATED_MANAGEMENT_ADDR_ENV} is deprecated; use {MANAGEMENT_ADDR_ENV}{}",
+        if ignored {
+            " (ignored for this run: --management-listen or MLLM_MANAGEMENT_ADDR is set)"
+        } else {
+            ""
+        }
+    ))
 }
 
-pub fn standalone_management_address() -> Result<std::net::SocketAddr, StartError> {
-    loopback_address(MANAGEMENT_ADDR_ENV, "127.0.0.1:7443")
+/// Design §9: the run-time override of the inference bind, if any, for the
+/// server and standalone roles alike. Precedence: `--listen`, then
+/// `MLLM_INFERENCE_ADDR`, then the deprecated `MLLM_STANDALONE_INFERENCE_ADDR`
+/// ([`deprecated_inference_env_warning`]). Each must be a unicast address with a
+/// non-zero port ([`mllm_config::standalone::inference_address`]). Checked
+/// before the role boots, so a bad value refuses without side effects.
+pub fn inference_override(
+    listen: Option<std::net::SocketAddr>,
+) -> Result<Option<std::net::SocketAddr>, StartError> {
+    use mllm_config::standalone::inference_address;
+    if let Some(address) = listen {
+        return inference_address(&address.to_string())
+            .map(Some)
+            .ok_or_else(|| {
+                StartError::Setting(format!(
+                    "--listen {address} must have a non-zero port and not be multicast"
+                ))
+            });
+    }
+    let (variable, value) = match std::env::var_os(INFERENCE_ADDR_ENV) {
+        Some(value) => (INFERENCE_ADDR_ENV, value),
+        None => match std::env::var_os(DEPRECATED_INFERENCE_ADDR_ENV) {
+            Some(value) => (DEPRECATED_INFERENCE_ADDR_ENV, value),
+            None => return Ok(None),
+        },
+    };
+    value
+        .into_string()
+        .ok()
+        .and_then(|text| inference_address(&text))
+        .map(Some)
+        .ok_or_else(|| {
+            StartError::Setting(format!(
+                "{variable} must be an address with a non-zero port that is not \
+                 multicast, e.g. 0.0.0.0:8443 or 127.0.0.1:8443"
+            ))
+        })
+}
+
+/// The warning a role prints once at start when the deprecated
+/// `MLLM_STANDALONE_INFERENCE_ADDR` is set, or `None`.
+pub fn deprecated_inference_env_warning(listen: Option<std::net::SocketAddr>) -> Option<String> {
+    std::env::var_os(DEPRECATED_INFERENCE_ADDR_ENV)?;
+    let ignored = listen.is_some() || std::env::var_os(INFERENCE_ADDR_ENV).is_some();
+    Some(format!(
+        "warning: {DEPRECATED_INFERENCE_ADDR_ENV} is deprecated; use {INFERENCE_ADDR_ENV}{}",
+        if ignored {
+            " (ignored for this run: --listen or MLLM_INFERENCE_ADDR is set)"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// Design §9, owner rule (flag > environment > document > default): the
+/// address the inference listener of either role binds for this run.
+/// `--listen` > `MLLM_INFERENCE_ADDR` (or its deprecated alias) > the
+/// document's inference `bind` (`document_bind`, which is `0.0.0.0:8443` when
+/// the document states none).
+pub fn effective_inference_address(
+    document_bind: std::net::SocketAddr,
+    listen: Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, StartError> {
+    Ok(inference_override(listen)?.unwrap_or(document_bind))
+}
+
+/// Final review I8: where a role records the management address it serves
+/// on this run, under its own owner-only state directory, so client commands
+/// find a role started with `--management-listen`.
+pub fn recorded_management_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("run").join("management-address")
+}
+
+/// Record the management address a role serves on (`<state>/run`, 0700; the
+/// file 0600, replaced atomically). A failure is reported, never fatal: a
+/// client still finds the role by `MLLM_MANAGEMENT_ADDR` or its document.
+pub fn record_management_address(state_dir: &Path, address: std::net::SocketAddr) {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let path = recorded_management_path(state_dir);
+    let written = (|| -> std::io::Result<()> {
+        let dir = path.parent().expect("a parent");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let temporary = dir.join(".management-address.tmp");
+        let _ = std::fs::remove_file(&temporary);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        writeln!(file, "{address}")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = written {
+        eprintln!(
+            "warning: could not record the management address in {} ({error}); clients \
+             find it through MLLM_MANAGEMENT_ADDR or the role document",
+            path.display()
+        );
+    }
+}
+
+/// The management address a role under `state_dir` recorded, when it is a
+/// loopback address (SPEC §16.5: management never leaves loopback, so a
+/// recorded value that is not one is ignored).
+pub fn recorded_management_address(state_dir: &Path) -> Option<std::net::SocketAddr> {
+    let text = std::fs::read_to_string(recorded_management_path(state_dir)).ok()?;
+    mllm_config::standalone::management_address(text.trim())
+}
+
+/// Owner decision 2026-09-25: the management address a client command uses
+/// for the standalone role under `state_dir`: `MLLM_MANAGEMENT_ADDR` (or its
+/// deprecated alias), else `server.listeners.management.bind` of the
+/// standalone document under the state root with this environment's
+/// `MLLM_SET__…` overrides, else `127.0.0.1:7443`. Between the variable and
+/// the document: the address the role recorded when it started
+/// ([`recorded_management_address`]), so a role started with
+/// `--management-listen` is found without the variable.
+pub fn standalone_management_address(state_dir: &Path) -> Result<std::net::SocketAddr, StartError> {
+    if let Some(address) = management_override(None)? {
+        return Ok(address);
+    }
+    // Final review I8: the address the role serves on this run, which a
+    // `--management-listen` start recorded.
+    if let Some(address) = recorded_management_address(state_dir) {
+        return Ok(address);
+    }
+    let document = state_dir.join("config").join("standalone.yaml");
+    let text = match std::fs::read_to_string(&document) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(mllm_config::standalone::DEFAULT_MANAGEMENT_BIND
+                .parse()
+                .expect("valid default"))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let refused = |error: mllm_config::ConfigError| {
+        StartError::Setting(format!(
+            "{}: {}",
+            document.display(),
+            crate::settings::describe(&error)
+        ))
+    };
+    let overrides =
+        mllm_config::setting_overrides::SettingOverrides::from_process(ConfigKind::Standalone, &[])
+            .map_err(refused)?;
+    let parsed = mllm_config::parse_document(&text)
+        .and_then(|parsed| overrides.apply_and_validate(parsed))
+        .map_err(refused)?;
+    mllm_config::standalone::management_bind(&parsed).map_err(refused)
 }
 
 impl App {
@@ -289,18 +558,49 @@ impl App {
             .into_iter()
             .next()
             .ok_or_else(|| StartError::Deploy("the host publishes no engine".into()))?;
+        // Design §3: a discrete host sizes the deployment from the checkpoint's
+        // weights; a unified host from its observed capacity, as before.
+        let memory = match &self.gpu_shape {
+            HostShape::Discrete(gpus) => {
+                let weights = checkpoint_weights(&first.installation.models_root, &source)?;
+                crate::standalone_config::discrete_template_memory(
+                    gpus,
+                    self.capacity_bytes,
+                    weights,
+                    declared_kv_cache(&first.installation)?,
+                )
+                .ok_or_else(|| StartError::Deploy("the host publishes no GPU".into()))?
+            }
+            HostShape::Unified | HostShape::NoGpu => {
+                crate::standalone_config::TemplateMemory::Unified {
+                    capacity_bytes: self.capacity_bytes,
+                }
+            }
+        };
+        // Spec §3, §11: a request the device cannot hold is refused here,
+        // before anything is stored.
         let mut deployment = crate::standalone_config::deployment_document(
             name,
             name,
             &source,
             first.installation.engine,
-            self.capacity_bytes,
+            &memory,
             request_deadline,
             first.installation.deep_park,
             &first.profile,
-        );
-        // ADR 0014 §2: the engine configuration the environment asked for.
+        )
+        .map_err(StartError::Template)?;
+        // ADR 0014 §2: the engine configuration the environment asked for. On a
+        // discrete host its memory block is the template's: the device request
+        // is sized from the checkpoint, not from a unified KV default.
+        let template = deployment["engine_config"]["memory"].take();
         deployment["engine_config"] = first.installation.engine_config.clone();
+        if matches!(
+            memory,
+            crate::standalone_config::TemplateMemory::Device { .. }
+        ) {
+            deployment["engine_config"]["memory"] = template;
+        }
         let receipt = self
             .controller
             .create_configuration(
@@ -342,6 +642,71 @@ pub enum StartError {
     /// SPEC §15.3: a run-time setting that is present but malformed is refused.
     #[error("invalid setting: {0}")]
     Setting(String),
+    /// Design §1: integrated and discrete GPUs on one host are refused at
+    /// boot, not guessed at (`unsupported_gpu_topology`).
+    #[error("{0}")]
+    GpuTopology(mllm_agent::gpu_memory::GpuShapeError),
+    /// Spec §3, §11: the generated deployment cannot fit this host's device
+    /// (`insufficient_device_memory`).
+    #[error("{0}")]
+    Template(crate::standalone_config::TemplateError),
+}
+
+/// Discrete GPU design §6: each discrete GPU's total memory by driver index,
+/// from the boot sample. Empty on a unified host or one without a GPU.
+fn device_totals(shape: &HostShape) -> std::collections::BTreeMap<u32, i64> {
+    match shape {
+        HostShape::Discrete(gpus) => gpus
+            .iter()
+            .filter_map(|gpu| Some((gpu.index, gpu.memory.as_ref()?.total_bytes)))
+            .collect(),
+        HostShape::Unified | HostShape::NoGpu => Default::default(),
+    }
+}
+
+/// ADR 0014 §5: the sum of a local checkpoint's weight-file sizes, sized with
+/// the same bounded, confined walk the digest uses (a stat per file, no hash).
+/// A relative path resolves against the model store (spec §7).
+///
+/// Design §3: a discrete deployment's device request is sized from these
+/// weights, so a local checkpoint that cannot be sized here (a path outside the
+/// store, a missing directory) is refused rather than given a guessed request.
+/// A Hugging Face or HTTP source is not on disk yet: `None`, and the request is
+/// sized once the download is measured (review decision, ADR 0014 §7).
+fn checkpoint_weights(models_root: &Path, source: &ModelSource) -> Result<Option<i64>, StartError> {
+    let ModelSource::Local { path } = source else {
+        return Ok(None);
+    };
+    let checkpoint = models_root.join(path);
+    mllm_agent::checkpoint::CheckpointVerifier::in_memory()
+        .size(models_root, &checkpoint)
+        .map(|size| Some(size.weights_bytes))
+        .map_err(|error| {
+            StartError::Deploy(format!(
+                "the checkpoint at {} could not be sized ({error:?}); a discrete GPU \
+                 deployment is sized from its weights",
+                checkpoint.display()
+            ))
+        })
+}
+
+/// Review decision (discrete GPU design §3): the KV cache the operator stated
+/// with `MLLM_KV_CACHE_BYTES`, which a discrete template honours within the
+/// card or refuses. `None` when the installation carries the unified default.
+fn declared_kv_cache(installation: &EngineInstallation) -> Result<Option<i64>, StartError> {
+    if !installation.kv_cache_declared {
+        return Ok(None);
+    }
+    let stated = installation.engine_config["memory"]["kv_cache"]
+        .as_str()
+        .ok_or_else(|| StartError::Setting(format!("{KV_CACHE_BYTES} is not a byte size")))?;
+    mllm_config::effective::parse_bytes(stated)
+        .ok()
+        .filter(|bytes| *bytes > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            StartError::Setting(format!("{KV_CACHE_BYTES} is not a byte size: {stated}"))
+        })
 }
 
 impl From<ProviderError> for StartError {
@@ -366,6 +731,8 @@ impl From<StartError> for StructuredError {
             StartError::NoEngineInstallation(_) => "invalid_config",
             StartError::ProfileExists(_) => "profile_exists",
             StartError::Setting(_) => "invalid_config",
+            StartError::GpuTopology(error) => error.code(),
+            StartError::Template(ref error) => error.code(),
             _ => "internal",
         };
         StructuredError {
@@ -383,15 +750,22 @@ impl From<StartError> for StructuredError {
 /// standalone refuses to boot rather than come up unable to run anything.
 pub struct EnvEngineProvider {
     /// The managed runtime directory (`<state root>/runtime`) used when
-    /// `MLLM_RUNTIME_DIR` is unset. `None` means there is none, and a run
-    /// must name its runtime directory.
+    /// no layer names a runtime directory. `None` means there is none, and a
+    /// run must name its runtime directory.
     managed_runtime: Option<PathBuf>,
+    /// Owner rule 2026-09-25: this run's engine flags, the top layer.
+    flags: EngineOverrides,
+    /// The standalone document's `host:` block settings, the YAML layer
+    /// ([`EngineProvider::configure`]).
+    document: std::sync::Mutex<EngineOverrides>,
 }
 
 impl EnvEngineProvider {
     pub fn new() -> Self {
         Self {
             managed_runtime: None,
+            flags: EngineOverrides::default(),
+            document: Default::default(),
         }
     }
 
@@ -400,7 +774,32 @@ impl EnvEngineProvider {
     pub fn with_managed_runtime(dir: PathBuf) -> Self {
         Self {
             managed_runtime: Some(dir),
+            ..Self::new()
         }
+    }
+
+    /// Owner rule 2026-09-25: this run's engine flags, which win over the
+    /// environment and the document.
+    pub fn with_flags(mut self, flags: EngineOverrides) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// The engine settings in force: flag > environment > document > default
+    /// (`mllm_config::engine_settings`).
+    fn settings(&self) -> Result<mllm_config::engine_settings::EngineSettings, ProviderError> {
+        let env = EngineOverrides::from_process_env()
+            .map_err(|error| no_installation(format!("{}: {}", error.path, error.detail)))?;
+        let document = self
+            .document
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Ok(mllm_config::engine_settings::resolve(
+            &self.flags,
+            &env,
+            &document,
+        ))
     }
 }
 
@@ -418,60 +817,6 @@ fn env_value(name: &str) -> Option<String> {
 
 fn no_installation(what: impl Into<String>) -> ProviderError {
     ProviderError::NoEngineInstallation(what.into())
-}
-
-/// The standalone deep-park switch. SPEC §9.1 / ADR 0012: unset means on and
-/// `off` is the host opt-out. SPEC §15.3 (T03): anything else, an empty export
-/// included, is refused rather than read as either, because a mistyped opt-out
-/// silently left on is the failure this switch exists to prevent.
-fn deep_park_switch() -> Result<bool, ProviderError> {
-    let Some(value) = std::env::var_os(DEEP_PARK) else {
-        return Ok(true);
-    };
-    match value.to_str() {
-        Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        _ => Err(no_installation(format!(
-            "{DEEP_PARK} must be `on` or `off` (unset means on; `off` opts this host \
-             out of deep parking); got {value:?}"
-        ))),
-    }
-}
-
-/// ADR 0008 (owner decision 2026-09-23): the standalone host's
-/// `security.installation_drift`. Unset means `warn`; SPEC §15.3 (T03):
-/// anything other than `warn` or `refuse` is refused rather than guessed.
-fn installation_drift_switch() -> Result<mllm_config::effective::InstallationDrift, ProviderError> {
-    use mllm_config::effective::InstallationDrift;
-    let Some(value) = std::env::var_os(INSTALLATION_DRIFT) else {
-        return Ok(InstallationDrift::Warn);
-    };
-    match value.to_str() {
-        Some("warn") => Ok(InstallationDrift::Warn),
-        Some("refuse") => Ok(InstallationDrift::Refuse),
-        _ => Err(no_installation(format!(
-            "{INSTALLATION_DRIFT} must be `warn` or `refuse` (unset means warn); got {value:?}"
-        ))),
-    }
-}
-
-/// The engines' loopback port range: the default unless this run names one.
-/// SPEC §15.3: a malformed, empty, reversed or privileged range is refused.
-fn engine_ports() -> Result<(u16, u16), ProviderError> {
-    let Some(value) = std::env::var_os(ENGINE_PORTS_ENV) else {
-        return Ok(DEFAULT_ENGINE_PORTS);
-    };
-    value
-        .to_str()
-        .and_then(|text| text.split_once('-'))
-        .and_then(|(start, end)| Some((start.parse::<u16>().ok()?, end.parse::<u16>().ok()?)))
-        .filter(|&(start, end)| start >= 1024 && start <= end)
-        .ok_or_else(|| {
-            no_installation(format!(
-                "{ENGINE_PORTS_ENV} must be an inclusive port range `start-end` with \
-                 1024 <= start <= end, e.g. 8100-8199; got {value:?}"
-            ))
-        })
 }
 
 impl EnvEngineProvider {
@@ -497,46 +842,51 @@ impl EnvEngineProvider {
         fingerprint: Option<&str>,
         deep_park: Option<bool>,
     ) -> Result<EngineInstallation, ProviderError> {
-        let models_root = PathBuf::from(env_value(MODELS_ROOT).ok_or_else(|| {
-            no_installation(format!(
-                "this host names no model store: set {MODELS_ROOT} to the directory \
-                 weights live under (the engine itself comes from {ENGINE_BIN})"
-            ))
-        })?);
-        if !models_root.is_dir() {
-            return Err(no_installation(format!(
-                "{MODELS_ROOT} is not a directory: {}",
-                models_root.display()
-            )));
-        }
+        // Owner decision 2026-09-25: the models directory is optional here.
+        // Unset, the installation names none (an empty path) and the role
+        // resolves `model_store.path` or `~/models` with the shared rule
+        // (`mllm_config::model_settings`); set, it must be a directory.
+        let models_root = match env_value(MODELS_ROOT) {
+            None => PathBuf::new(),
+            Some(value) => {
+                let root = mllm_config::model_settings::absolute(MODELS_ROOT, &value)
+                    .map_err(|error| no_installation(error.detail))?;
+                if !root.is_dir() {
+                    return Err(no_installation(format!(
+                        "{MODELS_ROOT} is not a directory: {}",
+                        root.display()
+                    )));
+                }
+                root
+            }
+        };
+        // Owner rule 2026-09-25: every setting below is resolved flag >
+        // environment > `host:` block > default (`engine_settings`); a
+        // malformed value in any layer is refused, even when a registered
+        // profile states its own.
+        let settings = self.settings()?;
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
-        // out. Sleep mode follows the same switch as deep parking. A malformed
-        // switch is refused even when a registered profile states its own.
-        let switch = deep_park_switch()?;
-        let deep_park = deep_park.unwrap_or(switch);
-        let trust_remote_code = env_value(TRUST_REMOTE_CODE).is_some_and(|value| value == "1");
-        let installation_drift = installation_drift_switch()?;
-        let engine_ports = engine_ports()?;
-        let build_fingerprint = match (fingerprint, env_value(ENGINE_FINGERPRINT)) {
+        // out. Sleep mode follows the same switch as deep parking.
+        let deep_park = deep_park.unwrap_or(settings.deep_park);
+        let trust_remote_code = settings.trust_remote_code;
+        let installation_drift = settings.installation_drift;
+        let engine_ports = settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS);
+        let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
             (Some(registered), _) => registered.to_owned(),
             (None, Some(declared)) => declared,
             (None, None) => probe_fingerprint(&executable)?,
         };
-        let kv_cache_bytes =
-            env_value(KV_CACHE_BYTES).unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
+        let declared_kv = settings.kv_cache;
+        let kv_cache_declared = declared_kv.is_some();
+        let kv_cache_bytes = declared_kv.unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
         // ADR 0014 §1: the installation keeps host-fixed arguments only; engine
         // tuning belongs to the deployment. SGLang's protected entry takes no
         // argument vector (`engine_policy.rs` refuses any on that family).
         // ADR 0014 §5 (owner decision 2026-09-25): no `--max-model-len`
         // default; an undeclared context is fitted to the KV grant at launch.
-        // An explicit `MLLM_ENGINE_ARGS` is kept as the host's fixed args.
+        // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
-            Engine::Vllm => env_value(ENGINE_ARGS)
-                .unwrap_or_default()
-                .split(' ')
-                .filter(|argument| !argument.is_empty())
-                .map(str::to_owned)
-                .collect(),
+            Engine::Vllm => settings.args,
             Engine::Sglang => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
@@ -547,15 +897,22 @@ impl EnvEngineProvider {
             executable,
             build_fingerprint,
             engine_config,
+            kv_cache_declared,
             deep_park,
             trust_remote_code,
             models_root,
-            runtime_dir: runtime_dir(engine, deep_park, self.managed_runtime.as_deref())?,
+            runtime_dir: runtime_dir(
+                engine,
+                deep_park,
+                settings.runtime_dir,
+                self.managed_runtime.as_deref(),
+            )?,
             args,
             installation_drift,
-            // SPEC §13.3 amendment (owner decision 2026-09-25): an environment
-            // installation names its CUDA toolkit explicitly; nothing is detected.
-            cuda_home: env_value(CUDA_HOME_ENV).map(PathBuf::from),
+            // SPEC §13.3 amendment (owner decision 2026-09-25): the role's own
+            // installation names its CUDA toolkit explicitly (`--cuda-home`,
+            // `MLLM_CUDA_HOME` or `local_engine.cuda_home`); nothing is detected.
+            cuda_home: settings.cuda_home,
             engine_ports,
         })
     }
@@ -565,15 +922,26 @@ impl EngineProvider for EnvEngineProvider {
     /// The environment's one installation. ADR 0018 §5: with both variables
     /// set this is the vLLM one; [`Self::installations`] publishes both.
     fn installation(&self) -> Result<EngineInstallation, ProviderError> {
-        match (env_value(ENGINE_BIN), env_value(SGLANG_BIN)) {
-            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm.into()),
-            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang.into()),
+        let settings = self.settings()?;
+        match (settings.vllm, settings.sglang) {
+            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm),
+            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang),
             (None, None) => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                 for SGLang) to the engine's executable and {MODELS_ROOT} to the \
-                 directory its weights live under"
+                 for SGLang, or --vllm-bin / --sglang-bin, or host.local_engine) to \
+                 the engine's executable"
             ))),
         }
+    }
+
+    fn configure(&self, host: &serde_json::Value) -> Result<(), ProviderError> {
+        let stated = EngineOverrides::from_document(host)
+            .map_err(|error| no_installation(format!("host.{}: {}", error.path, error.detail)))?;
+        *self
+            .document
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stated;
+        Ok(())
     }
 
     fn installations(
@@ -586,27 +954,12 @@ impl EngineProvider for EnvEngineProvider {
             profile: profile.into(),
             installation,
         };
-        let mut all = match (env_value(ENGINE_BIN), env_value(SGLANG_BIN)) {
-            (Some(vllm), None) => vec![named(
-                crate::standalone_config::STANDALONE_PROFILE,
-                self.role_installation(Engine::Vllm, vllm.into())?,
-            )],
-            (None, Some(sglang)) => vec![named(
-                crate::standalone_config::STANDALONE_PROFILE,
-                self.role_installation(Engine::Sglang, sglang.into())?,
-            )],
-            (Some(vllm), Some(sglang)) => vec![
-                named(
-                    "local-vllm",
-                    self.role_installation(Engine::Vllm, vllm.into())?,
-                ),
-                named(
-                    "local-sglang",
-                    self.role_installation(Engine::Sglang, sglang.into())?,
-                ),
-            ],
-            (None, None) => Vec::new(),
-        };
+        // Owner rule 2026-09-25: the same names a host gives its
+        // `local_engine` profiles (`engine_settings::EngineSettings::installations`).
+        let mut all = Vec::new();
+        for (profile, engine, executable) in self.settings()?.installations() {
+            all.push(named(profile, self.role_installation(engine, executable)?));
+        }
         for (name, profile) in registered {
             if all.iter().any(|n| &n.profile == name) {
                 return Err(ProviderError::ProfileExists(name.clone()));
@@ -630,9 +983,9 @@ impl EngineProvider for EnvEngineProvider {
         }
         if all.is_empty() {
             return Err(no_installation(format!(
-                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} to the \
-                 engine's executable (and {MODELS_ROOT} to the directory its weights \
-                 live under), or register one with `mllm engine add`"
+                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} (or \
+                 --vllm-bin / --sglang-bin, or host.local_engine) to the engine's \
+                 executable, or register one with `mllm engine add`"
             )));
         }
         Ok(all)
@@ -640,9 +993,19 @@ impl EngineProvider for EnvEngineProvider {
 
     fn bindings(
         &self,
+        clock: ServiceClock,
+        log_dir: PathBuf,
+        runtime_dir: PathBuf,
+    ) -> Arc<dyn EngineBindings> {
+        self.bindings_for_devices(clock, log_dir, runtime_dir, Default::default())
+    }
+
+    fn bindings_for_devices(
+        &self,
         _clock: ServiceClock,
         log_dir: PathBuf,
         runtime_dir: PathBuf,
+        device_totals: std::collections::BTreeMap<u32, i64>,
     ) -> Arc<dyn EngineBindings> {
         // ADR 0014 §7, Q9: the checkpoint stat cache is private host state,
         // kept beside the logs in the standalone state directory.
@@ -651,6 +1014,7 @@ impl EngineProvider for EnvEngineProvider {
         // their file rendezvous in the private root the role created at start
         // (`<state>/rendezvous`, as on a host), never the entry's /tmp fallback.
         let bindings = ProfileBindings::new(log_dir.clone(), runtime_dir)
+            .with_device_totals(device_totals)
             .with_checkpoint_cache(cache)
             .with_rendezvous_root(log_dir.with_file_name(RENDEZVOUS_DIR));
         // SPEC §9.2 (W5): memory-saver SGLang launches enroll their saver
@@ -694,10 +1058,11 @@ impl EngineProvider for EnvEngineProvider {
 fn runtime_dir(
     engine: Engine,
     deep_park: bool,
+    declared: Option<PathBuf>,
     managed: Option<&Path>,
 ) -> Result<PathBuf, ProviderError> {
-    let dir = match (env_value(RUNTIME_DIR), managed) {
-        (Some(declared), _) => PathBuf::from(declared),
+    let dir = match (declared, managed) {
+        (Some(declared), _) => declared,
         (None, Some(managed)) => {
             crate::managed_runtime::prepare(managed)
                 .map_err(|error| no_installation(format!("managed runtime directory: {error}")))?;
@@ -752,6 +1117,12 @@ fn runtime_dir(
         ))
     })?;
     Ok(dir)
+}
+
+/// [`probe_fingerprint`] for the host role, which states `local_engine`
+/// profiles in its document (owner rule 2026-09-25).
+pub(crate) fn engine_version(executable: &Path) -> Result<String, String> {
+    probe_fingerprint(executable).map_err(|error| error.to_string())
 }
 
 /// What the installed engine says it is.
@@ -830,19 +1201,112 @@ pub async fn start_standalone_from(
     state_dir: &Path,
     config: Option<&Path>,
 ) -> Result<App, StartError> {
-    start_standalone_inner(
+    start_standalone_with_models(state_dir, config, &ModelOverrides::default()).await
+}
+
+/// As [`start_standalone_from`], with this run's `--models-root`,
+/// `--model-sources` and `--model-sources-max` (owner decision 2026-09-25:
+/// flag > environment > document > default).
+pub async fn start_standalone_with_models(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+) -> Result<App, StartError> {
+    start_standalone_with_settings(state_dir, config, flags, &EngineOverrides::default()).await
+}
+
+/// As [`start_standalone_with_models`], with this run's engine flags too
+/// (owner rule 2026-09-25: `--vllm-bin`, `--engine-ports` and the rest win
+/// over their variables and the `host:` block of the document).
+pub async fn start_standalone_with_settings(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+    engines: &EngineOverrides,
+) -> Result<App, StartError> {
+    start_standalone_with_overrides(
         state_dir,
         config,
-        Arc::new(EnvEngineProvider::with_managed_runtime(
-            state_dir.join("runtime"),
-        )),
+        flags,
+        engines,
+        &SettingOverrides::none(ConfigKind::Standalone),
+    )
+    .await
+}
+
+/// As [`start_standalone_with_settings`], with this run's generic overrides
+/// (owner decision 2026-09-25: `--set` > `MLLM_SET__…` > the document),
+/// applied to the standalone document before it is validated.
+pub async fn start_standalone_with_overrides(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+    engines: &EngineOverrides,
+    overrides: &SettingOverrides,
+) -> Result<App, StartError> {
+    start_standalone_production(
+        state_dir,
+        config,
+        flags,
+        engines,
+        overrides,
+        ConfigHome::Process,
+    )
+    .await
+}
+
+/// Final review I14: the production boot with its registered engines read
+/// from `<config_home>/mllm/engines.yaml` instead of this process's config
+/// home, for a test of the production path that must not read the
+/// developer's registrations.
+pub async fn start_standalone_with_config_home(
+    state_dir: &Path,
+    config_home: &Path,
+) -> Result<App, StartError> {
+    start_standalone_production(
+        state_dir,
+        None,
+        &ModelOverrides::default(),
+        &EngineOverrides::default(),
+        &no_overrides(),
+        ConfigHome::Isolated(config_home.to_path_buf()),
+    )
+    .await
+}
+
+async fn start_standalone_production(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+    engines: &EngineOverrides,
+    overrides: &SettingOverrides,
+    config_home: ConfigHome,
+) -> Result<App, StartError> {
+    start_standalone_in(
+        state_dir,
+        config,
+        Arc::new(
+            EnvEngineProvider::with_managed_runtime(state_dir.join("runtime"))
+                .with_flags(engines.clone()),
+        ),
         crate::host_observation::proc_meminfo(),
+        // Design §1: the production boot samples the GPUs with the bounded
+        // `nvidia-smi` collector. A machine without one samples nothing and
+        // publishes the unified shape, exactly as before.
+        Arc::new(mllm_agent::gpu_memory::sample),
+        flags,
+        overrides,
+        config_home,
     )
     .await
 }
 
 /// Boot against an explicit provider, which is how a test supplies an installation
 /// it controls instead of one the environment happens to name.
+///
+/// The test entry points observe no GPU, so the published policy is the one a
+/// test states rather than the one the machine running it happens to have;
+/// [`start_standalone_with_gpu`] states a sample.
 pub async fn start_standalone_with(
     state_dir: &Path,
     provider: Arc<dyn EngineProvider>,
@@ -852,6 +1316,9 @@ pub async fn start_standalone_with(
         None,
         provider,
         crate::host_observation::proc_meminfo(),
+        no_gpu(),
+        &ModelOverrides::default(),
+        &no_overrides(),
     )
     .await
 }
@@ -865,7 +1332,41 @@ pub async fn start_standalone_with_memory(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, None, provider, memory).await
+    start_standalone_inner(
+        state_dir,
+        None,
+        provider,
+        memory,
+        no_gpu(),
+        &ModelOverrides::default(),
+        &no_overrides(),
+    )
+    .await
+}
+
+/// As [`start_standalone_with_memory`], sampling the host's GPUs through `gpu`
+/// instead of `nvidia-smi` (design §1).
+pub async fn start_standalone_with_gpu(
+    state_dir: &Path,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    gpu: Arc<GpuSampler>,
+) -> Result<App, StartError> {
+    start_standalone_inner(
+        state_dir,
+        None,
+        provider,
+        memory,
+        gpu,
+        &ModelOverrides::default(),
+        &no_overrides(),
+    )
+    .await
+}
+
+/// The sampler of a boot that observes no GPU.
+fn no_gpu() -> Arc<GpuSampler> {
+    Arc::new(|| None)
 }
 
 /// As [`start_standalone_with_memory`], with an explicit role document
@@ -876,7 +1377,143 @@ pub async fn start_standalone_configured(
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
 ) -> Result<App, StartError> {
-    start_standalone_inner(state_dir, config, provider, memory).await
+    start_standalone_inner(
+        state_dir,
+        config,
+        provider,
+        memory,
+        no_gpu(),
+        &ModelOverrides::default(),
+        &no_overrides(),
+    )
+    .await
+}
+
+/// As [`start_standalone_configured`], sampling the GPUs through `gpu`, with
+/// this run's model flags ([`start_standalone_with_models`]).
+pub async fn start_standalone_configured_with_models(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    gpu: Arc<GpuSampler>,
+    flags: &ModelOverrides,
+) -> Result<App, StartError> {
+    start_standalone_inner(
+        state_dir,
+        config,
+        provider,
+        memory,
+        gpu,
+        flags,
+        &no_overrides(),
+    )
+    .await
+}
+
+/// As [`start_standalone_configured`], with generic overrides (owner decision
+/// 2026-09-25: `--set` > `MLLM_SET__…` > the document).
+pub async fn start_standalone_configured_with_overrides(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    overrides: &SettingOverrides,
+) -> Result<App, StartError> {
+    start_standalone_inner(
+        state_dir,
+        config,
+        provider,
+        memory,
+        no_gpu(),
+        &ModelOverrides::default(),
+        overrides,
+    )
+    .await
+}
+
+/// Design §9: the owner-only file of a standalone state root that holds the
+/// API key and the admin token (`identity/credentials`).
+pub fn credentials_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("identity").join("credentials")
+}
+
+/// No generic override.
+fn no_overrides() -> SettingOverrides {
+    SettingOverrides::none(ConfigKind::Standalone)
+}
+
+/// ADR 0019, design §9: run the one-time migration of the role `document`
+/// under `state_dir` and report it on stderr, which is the role's log: the
+/// notice on the start that migrated, and `config_migration_failed` when the
+/// document could not be rewritten (the role then binds 0.0.0.0:8443 for this
+/// run). Shared by the standalone and server roles.
+pub fn listener_migration(
+    document: &Path,
+    state_dir: &Path,
+    parsed_bind: Option<&str>,
+) -> Migration {
+    let outcome = mllm_config::listener_migration::migrate(document, state_dir, parsed_bind);
+    if let Migration::BindOnly { reason } = &outcome {
+        eprintln!(
+            "warning: config_migration_failed: {} was not rewritten ({reason}); \
+             inference binds {NEW_INFERENCE_DEFAULT} for this run",
+            document.display()
+        );
+    }
+    if let Some(notice) = mllm_config::listener_migration::notice(document, &outcome) {
+        eprintln!("{notice}");
+    }
+    outcome
+}
+
+/// Owner decision 2026-09-25: the embedded host's models directory and
+/// model-source policy, resolved by the shared rule
+/// (`mllm_config::model_settings`): flag > environment > `host:` block of the
+/// standalone document > default. An installation that names a models
+/// directory (`MLLM_MODELS_ROOT`, or a test provider's own) is the
+/// environment's layer; the default is `~/models`, created when missing. A
+/// named directory must already exist.
+fn standalone_models(
+    stated_host: &serde_json::Value,
+    named: &[NamedInstallation],
+    flags: &ModelOverrides,
+) -> Result<mllm_config::model_settings::ModelSettings, StartError> {
+    use mllm_config::model_settings::{default_models_root, resolve, RootSource};
+    let mut env = ModelOverrides::from_process_env()
+        .map_err(|error| StartError::Setting(format!("{}: {}", error.path, error.detail)))?;
+    env.models_root = named
+        .first()
+        .map(|first| first.installation.models_root.clone())
+        .filter(|root| !root.as_os_str().is_empty());
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let settings = resolve(
+        stated_host,
+        flags,
+        &env,
+        default_models_root(home.as_deref()).as_deref(),
+    )
+    .map_err(|error| StartError::Setting(format!("{}: {}", error.path, error.detail)))?;
+    if settings.root_source == RootSource::Default {
+        std::fs::create_dir_all(&settings.models_root)?;
+    } else if !settings.models_root.is_dir() {
+        return Err(StartError::Setting(format!(
+            "the models directory is not a directory: {}",
+            settings.models_root.display()
+        )));
+    }
+    Ok(settings)
+}
+
+/// Where a standalone boot looks for `<config home>/mllm/engines.yaml` when
+/// no role document is named.
+#[derive(Debug, Clone)]
+enum ConfigHome {
+    /// `XDG_CONFIG_HOME`, else `~/.config`, of this process (production).
+    Process,
+    /// Final review I14: a boot with an explicit provider (a test's) reads its
+    /// own, never the developer's, registered engines.
+    Isolated(PathBuf),
 }
 
 async fn start_standalone_inner(
@@ -884,43 +1521,98 @@ async fn start_standalone_inner(
     config: Option<&Path>,
     provider: Arc<dyn EngineProvider>,
     memory: crate::host_observation::MemoryReader,
+    gpu: Arc<GpuSampler>,
+    flags: &ModelOverrides,
+    overrides: &SettingOverrides,
 ) -> Result<App, StartError> {
-    // Fail-closed credentials (SPEC §15.2): the generated api key lives in
-    // the protected credentials file. The hardcoded fallback exists ONLY
-    // for a boot that generated the config (and its credentials) this run
-    // — an existing state dir missing its credentials refuses to serve
-    // instead of serving with a guessable key.
+    start_standalone_in(
+        state_dir,
+        config,
+        provider,
+        memory,
+        gpu,
+        flags,
+        overrides,
+        ConfigHome::Isolated(state_dir.join(".config")),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_standalone_in(
+    state_dir: &Path,
+    config: Option<&Path>,
+    provider: Arc<dyn EngineProvider>,
+    memory: crate::host_observation::MemoryReader,
+    gpu: Arc<GpuSampler>,
+    flags: &ModelOverrides,
+    overrides: &SettingOverrides,
+    config_home: ConfigHome,
+) -> Result<App, StartError> {
+    // Fail-closed credentials (SPEC §15.2, design §9): the generated api key
+    // lives in the protected credentials file. There is no constant fallback:
+    // credentials that cannot be read, even ones created by this boot, refuse
+    // to serve (MissingCredentials) instead of serving with a guessable key.
     //
     // SPEC §15.2 (R13): an explicit `--config` that is missing or invalid is an
     // error here; it is never replaced by a generated default.
     let outcome = resolve_startup(ConfigKind::Standalone, config, state_dir)?;
-    let mut created_this_boot = matches!(
-        outcome,
-        LoadOutcome::Generated {
-            created_identity: true,
-            ..
-        }
-    );
     // SPEC §10 (W10): the switch drain bound, `server.switching.drain_timeout`
     // of the standalone document; 30 s when it names none.
-    let (switch_drain_timeout, timing_header, config_notices) = {
+    let (
+        switch_drain_timeout,
+        timing_header,
+        config_notices,
+        inference_bind,
+        management_bind,
+        inference_auth,
+        listener_migration,
+        stated_host,
+    ) = {
         let path = match &outcome {
             LoadOutcome::Loaded(path) => PathBuf::from(path),
             LoadOutcome::Generated { config_path, .. } => config_path.clone(),
         };
-        let text = std::fs::read_to_string(&path)?;
-        let document = mllm_config::parse_strict(ConfigKind::Standalone, &text)
-            .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
-        // SPEC §15.3: a value this role would silently ignore (another state
-        // directory or listener, TLS, a model store, profiles, numeric limits)
-        // is refused before any side effect.
         let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
         let config_dir = absolute(path.parent().unwrap_or(Path::new(".")));
-        // SPEC §15.2 (R13): the `server.tls` block an older generator wrote is
-        // accepted and reported, never rewritten; every other value is refused.
-        let ignored =
-            mllm_config::standalone::check_honoured(&document, &config_dir, &absolute(state_dir))
-                .map_err(|error| StartError::Deploy(format!("standalone configuration: {error}")))?;
+        let load = || -> Result<_, StartError> {
+            let text = std::fs::read_to_string(&path)?;
+            let invalid = |error: mllm_config::ConfigError| {
+                StartError::Deploy(format!(
+                    "standalone configuration: {}",
+                    overrides.annotate(error)
+                ))
+            };
+            // Owner decision 2026-09-25: the generic overrides are applied to
+            // the document before it is validated, exactly as if it stated
+            // them. The one-time listener migration reads the file's own bind.
+            let raw = mllm_config::parse_document(&text).map_err(invalid)?;
+            let file_bind = raw["server"]["listeners"]["inference"]["bind"]
+                .as_str()
+                .map(str::to_owned);
+            let document = overrides.apply_and_validate(raw).map_err(invalid)?;
+            // SPEC §15.3: a value this role would silently ignore (another state
+            // directory or listener, TLS, a model store, profiles, numeric limits)
+            // is refused before any side effect.
+            // SPEC §15.2 (R13): the `server.tls` block an older generator wrote is
+            // accepted and reported; every other value is refused.
+            let ignored = mllm_config::standalone::check_honoured(
+                &document,
+                &config_dir,
+                &absolute(state_dir),
+            )
+            .map_err(invalid)?;
+            Ok((document, ignored, file_bind))
+        };
+        let (mut document, mut ignored, file_bind) = load()?;
+        // ADR 0019, design §9: a document still stating the old loopback
+        // default is migrated to 0.0.0.0:8443 once, after it has been accepted
+        // and before its listeners are read. A refused document is never
+        // touched.
+        let migration = listener_migration(&path, state_dir, file_bind.as_deref());
+        if matches!(migration, Migration::Rewritten { .. }) {
+            (document, ignored, _) = load()?;
+        }
         (
             mllm_config::remote_roles::switch_drain_timeout(&document["server"]).map_err(
                 |error| StartError::Deploy(format!("standalone configuration: {error}")),
@@ -930,6 +1622,32 @@ async fn start_standalone_inner(
                 StartError::Deploy(format!("standalone configuration: {error}"))
             })?,
             ignored.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            // Design §9: validated by `check_honoured` above. A document the
+            // migration could not rewrite still serves on the new default.
+            match migration {
+                Migration::BindOnly { .. }
+                    if overrides.get("server.listeners.inference.bind").is_none() =>
+                {
+                    NEW_INFERENCE_DEFAULT.parse().expect("valid default")
+                }
+                _ => mllm_config::standalone::inference_bind(&document).map_err(|error| {
+                    StartError::Deploy(format!("standalone configuration: {error}"))
+                })?,
+            },
+            // Owner decision 2026-09-25: validated by `check_honoured` above.
+            mllm_config::standalone::management_bind(&document).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
+            // Design §9: `server.listeners.inference.authentication`
+            // (`api_key` unless the document states `none`). The flag and
+            // MLLM_INFERENCE_AUTH are applied by the caller for this run.
+            mllm_config::standalone::inference_auth(&document, false).map_err(|error| {
+                StartError::Deploy(format!("standalone configuration: {error}"))
+            })?,
+            migration,
+            // Owner decision 2026-09-25: `host.model_store` and
+            // `host.model_sources`, validated by `check_honoured` above.
+            document["host"].clone(),
         )
     };
     let db_path = state_dir.join("server").join("srv.sqlite3");
@@ -945,14 +1663,10 @@ async fn start_standalone_inner(
             .join("credentials")
             .try_exists()?
     {
-        created_this_boot = mllm_config::defaults::create_standalone_credentials(state_dir)?;
+        mllm_config::defaults::create_standalone_credentials(state_dir)?;
     }
     let store = Rc::new(Store::open(&db_path)?);
-    let api_key = match read_api_key(state_dir) {
-        Some(k) => k,
-        None if created_this_boot => "mllm-local".to_string(),
-        None => return Err(StartError::MissingCredentials),
-    };
+    let api_key = read_api_key(state_dir)?;
 
     // Spec §8: what this host publishes about its engines is what it has. There
     // is no fallback installation: a host with none refuses to boot rather than
@@ -960,8 +1674,11 @@ async fn start_standalone_inner(
     // installations and the profiles registered in engines.yaml (beside
     // `--config`, else `<config home>/mllm/engines.yaml`); a name declared in
     // both is refused `profile_exists`. The standalone document is never written.
-    let engines = crate::engine::role_engines(config, &|key| {
-        std::env::var(key).ok().filter(|value| !value.is_empty())
+    let engines = crate::engine::role_engines(config, &|key| match &config_home {
+        ConfigHome::Process => std::env::var(key).ok().filter(|value| !value.is_empty()),
+        ConfigHome::Isolated(home) => {
+            (key == "XDG_CONFIG_HOME").then(|| home.to_string_lossy().into_owned())
+        }
     });
     let registered = match &engines {
         Some(path) => mllm_config::registration::EnginesFile::load(path)?.profiles,
@@ -970,7 +1687,16 @@ async fn start_standalone_inner(
     for (name, profile) in &registered {
         mllm_config::registration::check_profile(name, profile)?;
     }
-    let named = provider.installations(&registered)?;
+    // Owner rule 2026-09-25: the `host:` block's engine settings are the
+    // YAML layer of the installation (flag > environment > YAML > default).
+    provider.configure(&stated_host)?;
+    let mut named = provider.installations(&registered)?;
+    // Owner decision 2026-09-25 (standalone is a server plus one host): the
+    // models directory and the model-source policy, by the rule a host uses.
+    let models = standalone_models(&stated_host, &named, flags)?;
+    for n in &mut named {
+        n.installation.models_root = models.models_root.clone();
+    }
     // Role-level settings (runtime directory, ports, model store) are the same
     // for every installation; the first one states them.
     let installation = named
@@ -981,6 +1707,14 @@ async fn start_standalone_inner(
     let capacity_bytes = memory()
         .map(|sample| sample.capacity_bytes)
         .map_err(|error| StartError::Deploy(format!("host capacity unreadable: {error}")))?;
+
+    // Design §1: the GPUs are sampled once, and the shape they describe decides
+    // the domains this host publishes. Integrated and discrete devices mixed on
+    // one host are refused rather than guessed at. No sample (no `nvidia-smi`,
+    // or a failed run) is a host with no GPU, which publishes as before.
+    let gpu_sample = gpu();
+    let gpu_shape =
+        mllm_agent::gpu_memory::shape(gpu_sample.as_ref()).map_err(StartError::GpuTopology)?;
 
     // SPEC §3: the NVIDIA device inventory is a host fact published at boot
     // like the fingerprints. The collector is bounded and closed-error: a
@@ -993,33 +1727,28 @@ async fn start_standalone_inner(
             .runtime_dir
             .parent()
             .unwrap_or(&installation.runtime_dir),
+        gpu_sample.as_ref(),
     );
 
     // The host's own accounting units, resolved before anything can observe or be
     // admitted against them. The coordinator's observation source is named by these,
     // so it has to exist before the coordinator does.
     let declared_host = {
-        let host = crate::standalone_config::host_policy(
+        let mut host = crate::standalone_config::host_policy(
             &named,
             &environment_fingerprint,
             capacity_bytes,
             inventory.as_ref(),
+            &gpu_shape,
         );
-        let probe = crate::standalone_config::deployment_document(
-            "policy-probe",
-            "policy-probe",
-            &ModelSource::Local {
-                path: "/dev/null".into(),
-            },
-            installation.engine,
-            capacity_bytes,
-            crate::standalone_config::DEFAULT_REQUEST_DEADLINE,
-            installation.deep_park,
-            &named[0].profile,
-        );
-        mllm_config::effective::resolve_effective(&probe, &host)
+        models.write_into(&mut host);
+        // The host's own policy, normalized exactly as resolution normalizes
+        // it (`resolve_effective(..).host` is this same value). Nothing here
+        // sizes a deployment: a card too small for any template boots and
+        // refuses each deployment with `insufficient_device_memory` and its
+        // numbers, instead of the whole start failing on a sized probe.
+        mllm_config::effective::normalize_host_policy(&host)
             .map_err(|error| StartError::Deploy(format!("host policy invalid: {error}")))?
-            .host
     };
 
     // Spec §3: the identity key that seals every per-launch engine key lives in a
@@ -1062,10 +1791,12 @@ async fn start_standalone_inner(
     // Initialize measures the one its profile names again for drift. Bounded,
     // reads files only, and a failure is `unmeasured`, never a refusal.
     let embedded = {
-        let (named, fingerprint, inventory) = (
+        let (named, fingerprint, inventory, shape, models) = (
             named.clone(),
             environment_fingerprint.clone(),
             inventory.clone(),
+            gpu_shape.clone(),
+            models.clone(),
         );
         tokio::task::spawn_blocking(move || {
             crate::standalone_engines::EmbeddedHost::new(
@@ -1073,6 +1804,8 @@ async fn start_standalone_inner(
                 fingerprint,
                 capacity_bytes,
                 inventory,
+                shape,
+                models,
             )
         })
         .await
@@ -1080,10 +1813,13 @@ async fn start_standalone_inner(
     };
     let bindings: Arc<dyn EngineBindings> =
         Arc::new(mllm_controller::installation_gate::InstalledBindings::new(
-            provider.bindings(
+            // Discrete GPU design §6: engines on a device domain are sized
+            // against the total of the card the boot sample observed.
+            provider.bindings_for_devices(
                 system_clock(),
                 state_dir.join("logs"),
                 installation.runtime_dir.clone(),
+                device_totals(&gpu_shape),
             ),
             embedded.installations(),
         ));
@@ -1099,13 +1835,41 @@ async fn start_standalone_inner(
             .spawn_until(supervision.cancel_signal()),
         );
     }
+    // ADR 0008 (owner decision 2026-09-25): declared remote sources are
+    // materialized by the embedded host into its sources store
+    // (`<model_store>/sources` unless `host.model_sources.path` names
+    // another), exactly as an enrolled host does; activation and the
+    // checkpoint digest wait for the verified copy (ADR 0014 §7).
+    {
+        let root = models.policy.root(&models.models_root).to_path_buf();
+        let secrets = Some(state_dir.join("secrets"));
+        let store = match provider.model_source_origin() {
+            Some(origin) => mllm_agent::sources::SourceStore::with_loopback_origin(
+                &root,
+                models.policy.clone(),
+                secrets,
+                &origin,
+            ),
+            None => mllm_agent::sources::SourceStore::new(&root, models.policy.clone(), secrets),
+        };
+        supervision.supervise(
+            mllm_controller::model_sources::SourceMaterializer::new(
+                owner.clone(),
+                mllm_controller::model_sources::LocalSources::new(store),
+            )
+            .spawn_until(supervision.cancel_signal()),
+        );
+    }
     let coordinator = OwnedCoordinator::spawn_resolved(
         owner.clone(),
         Arc::new(
-            HostMemoryObservation::with_reader(
-                declared_host.domains.keys().cloned(),
-                memory.clone(),
-            )
+            // SPEC §7.2 / ADR 0019: host domains from host memory, each device
+            // domain from its GPU; an unobserved device closes admission there.
+            HostMemoryObservation::with_domains(crate::host_observation::observed_domains(
+                &declared_host.domains,
+            ))
+            .with_memory_reader(memory.clone())
+            .with_gpu_sampler(gpu.clone())
             // ADR 0007 (found live 2026-09-23, matrix M33): credit the
             // engines already resident here instead of charging them twice.
             .with_process_residency(mllm_agent::process_residency::ResidencySampler::nvidia()),
@@ -1144,6 +1908,22 @@ async fn start_standalone_inner(
         )
         .map_err(|_| StartError::Deploy("management configuration unavailable".into()))?,
     );
+    // ADR 0019 (upgrade of a generated policy): a machine whose shape changed
+    // since the stored policy was generated gets its policy replaced here,
+    // before it is published; charged engines are stopped with verified
+    // cleanup first and deployments are re-sized for the new shape.
+    let migration_notices = crate::policy_migration::migrate(
+        &coordinator.commands(),
+        configuration.as_ref(),
+        &HostMemoryObservation::with_domains(crate::host_observation::observed_domains(
+            &declared_host.domains,
+        ))
+        .with_memory_reader(memory.clone())
+        .with_gpu_sampler(gpu.clone()),
+        &declared_host,
+        switch_drain_timeout + Duration::from_secs(60),
+    )
+    .await?;
     // SPEC §10, ADR 0013 §8 (W10): one switcher for request-driven switching
     // and the operator's `start --evict`, so both take the same host turns.
     let switcher = Arc::new(mllm_controller::switching::Switcher::new(
@@ -1191,10 +1971,20 @@ async fn start_standalone_inner(
     let retirements = Arc::new(mllm_management::engines::StoreRetirements::new(
         source.clone(),
     ));
+    // Design §9: the inference listener's bind and authentication, set when
+    // the caller serves it (`App::inference_router`), for status.
+    let inference_listener =
+        Arc::new(mllm_management::inference_listener::InferenceListenerView::default());
+    let inference_listener_view = mllm_management::inference_listener::inference_listener_router(
+        mllm_management::ManagementCredentials::from_trusted_resolver(admin, &api_key)
+            .map_err(|_| StartError::MissingCredentials)?,
+        inference_listener.clone(),
+    );
     let management = mllm_management::lifecycle_router(management_credentials, source)
         .merge(drain)
         .merge(installation_view)
-        .merge(latency_view);
+        .merge(latency_view)
+        .merge(inference_listener_view);
     let controller =
         Arc::new(CoordinatorLifecycle::new(coordinator.commands()).with_switcher(switcher.clone()));
     let deps = mllm_router::RouterDeps {
@@ -1220,10 +2010,11 @@ async fn start_standalone_inner(
     {
         // The same source the coordinator will observe through, so the policy and
         // the evidence for it cannot disagree about what a domain is called.
-        let observations = HostMemoryObservation::with_reader(
-            declared_host.domains.keys().cloned(),
-            memory.clone(),
+        let observations = HostMemoryObservation::with_domains(
+            crate::host_observation::observed_domains(&declared_host.domains),
         )
+        .with_memory_reader(memory.clone())
+        .with_gpu_sampler(gpu.clone())
         .observe(declared_host.name.clone())
         .await
         .map_err(|error| StartError::Deploy(error.to_string()))?;
@@ -1261,6 +2052,7 @@ async fn start_standalone_inner(
     // role, no engines file) is reported and the role runs without it, so
     // `engine add` answers `agent_unreachable` and takes effect at start.
     let mut config_notices = config_notices;
+    config_notices.extend(migration_notices);
     match &engines {
         None => config_notices.push(
             "engine control socket not served: neither XDG_CONFIG_HOME nor HOME is set, \
@@ -1301,6 +2093,7 @@ async fn start_standalone_inner(
         store,
         host: embedded,
         capacity_bytes,
+        gpu_shape,
         router,
         management,
         deps,
@@ -1308,18 +2101,68 @@ async fn start_standalone_inner(
         supervision,
         switcher,
         config_notices,
+        listener_migration,
+        inference_bind,
+        management_bind,
+        inference_auth,
+        inference_listener,
     })
 }
 
 /// Read the generated API key from the protected credentials file (F0's
 /// fail-closed generation; the key is printed never, only used).
-fn read_api_key(state_dir: &Path) -> Option<String> {
-    let creds = std::fs::read_to_string(state_dir.join("identity").join("credentials")).ok()?;
-    creds
-        .lines()
-        .find_map(|l| l.strip_prefix("api_key: ").map(str::to_string))
+///
+/// Design §9 (T37): there is no constant key. A file that is missing,
+/// unreadable or has no non-empty `api_key` line, including one this boot
+/// just created, is [`StartError::MissingCredentials`].
+fn read_api_key(state_dir: &Path) -> Result<String, StartError> {
+    std::fs::read_to_string(state_dir.join("identity").join("credentials"))
+        .ok()
+        .and_then(|creds| {
+            creds
+                .lines()
+                .find_map(|l| l.strip_prefix("api_key: ").map(str::to_string))
+        })
+        .filter(|key| !key.trim().is_empty())
+        .ok_or(StartError::MissingCredentials)
 }
 
 pub fn dispatch(command: &CliCommand) -> Result<Infallible, StructuredError> {
     Err(StructuredError::not_yet_implemented(&command.label()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T37 (design §9): there is no constant key. Freshly created credentials
+    // that cannot be read back are a start failure; readable ones give the
+    // generated key.
+    #[test]
+    fn fresh_credentials_must_be_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_api_key(dir.path()),
+            Err(StartError::MissingCredentials)
+        ));
+        assert!(mllm_config::defaults::create_standalone_credentials(dir.path()).unwrap());
+        let path = dir.path().join("identity/credentials");
+        let key = read_api_key(dir.path()).expect("the generated key");
+        assert!(!key.is_empty());
+        assert_ne!(key, "mllm-local");
+        let text = std::fs::read_to_string(&path).unwrap();
+        for corrupt in [
+            text.lines()
+                .filter(|line| !line.starts_with("api_key: "))
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+            text.replace(&key, ""),
+        ] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(matches!(
+                read_api_key(dir.path()),
+                Err(StartError::MissingCredentials)
+            ));
+        }
+    }
 }

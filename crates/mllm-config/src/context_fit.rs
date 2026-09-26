@@ -35,6 +35,12 @@ pub const FALLBACK_CONTEXT: u32 = 4096;
 /// none (vLLM's default block size; a multiple of SGLang's page size).
 pub const DEFAULT_BLOCK_TOKENS: u32 = 16;
 
+/// The KV blocks a vLLM fit leaves to the engine. vLLM keeps a null block out
+/// of its pool, so a context that uses every whole block of the grant is
+/// refused at start. Found live on a 16 GB discrete GPU: vLLM 0.29 held one
+/// block fewer than the grant divided by the block size.
+pub const VLLM_RESERVED_BLOCKS: u32 = 1;
+
 /// The largest `config.json` read. A model configuration is a few kilobytes.
 const MAX_CONFIG_BYTES: u64 = 4 << 20;
 
@@ -194,6 +200,9 @@ pub struct FitInputs<'a> {
     pub kv_cache_dtype: Option<&'a str>,
     pub dtype: Option<&'a str>,
     pub block_tokens: Option<u32>,
+    /// Whole blocks of the grant the engine keeps for itself
+    /// ([`VLLM_RESERVED_BLOCKS`] for vLLM).
+    pub reserved_blocks: u32,
 }
 
 /// The width of one cached element: an explicit KV dtype (fp8 variants are one
@@ -235,7 +244,8 @@ fn fitted_tokens(inputs: &FitInputs<'_>, shape: &KvShape) -> Result<u64, String>
         .filter(|bytes| *bytes > 0)
         .ok_or("the KV cache grant is not positive")?;
     let block = u64::from(inputs.block_tokens.unwrap_or(DEFAULT_BLOCK_TOKENS).max(1));
-    let tokens = (grant / per_token).min(shape.max_position);
+    let blocks = (grant / per_token / block).saturating_sub(u64::from(inputs.reserved_blocks));
+    let tokens = (blocks * block).min(shape.max_position);
     let aligned = tokens - tokens % block;
     if aligned == 0 {
         return Err(format!(
@@ -321,9 +331,14 @@ pub fn fit_for_launch(
     profile_args: &[String],
     checkpoint_root: Option<&Path>,
 ) -> ContextFit {
-    let (common, memory, block) = match settings {
-        LaunchSettings::Vllm(s) => (&s.common, &s.memory, s.block_size_tokens),
-        LaunchSettings::Sglang(s) => (&s.common, &s.memory, None),
+    let (common, memory, block, reserved_blocks) = match settings {
+        LaunchSettings::Vllm(s) => (
+            &s.common,
+            &s.memory,
+            s.block_size_tokens,
+            VLLM_RESERVED_BLOCKS,
+        ),
+        LaunchSettings::Sglang(s) => (&s.common, &s.memory, None, 0),
     };
     if common.context_length.is_none() {
         if let Some(option) = typed_field_option(engine, "context_length") {
@@ -347,6 +362,7 @@ pub fn fit_for_launch(
             kv_cache_dtype: common.kv_cache_dtype.as_deref(),
             dtype: common.dtype.as_deref(),
             block_tokens: block,
+            reserved_blocks,
         },
         config.as_ref().map_err(Clone::clone),
     )
