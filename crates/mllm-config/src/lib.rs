@@ -9,6 +9,9 @@ pub mod defaults;
 pub mod deployment_defaults;
 pub mod effective;
 pub mod engine_policy;
+// Owner rule 2026-09-25: the engine-installation settings of a role, three
+// ways (flag > environment > YAML > default), shared by host and standalone.
+pub mod engine_settings;
 pub mod error;
 pub mod instances;
 // ADR 0019, design §9: the one-time move of the old loopback inference bind.

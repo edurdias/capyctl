@@ -521,6 +521,25 @@ impl HostConfig {
         )?;
         Ok(self)
     }
+    /// Owner rule 2026-09-25 (every setting three ways, standalone is a
+    /// server plus one host): apply the host's engine settings, resolved
+    /// flag > environment > document > default
+    /// (`crate::engine_settings`), to its document before it is published:
+    /// the runtime directory, the engines' port range and the `local_engine`
+    /// executables as the `local` runtime profiles. `probe` reads an
+    /// executable's version when no fingerprint is stated.
+    pub fn with_engines(
+        self,
+        flags: &crate::engine_settings::EngineOverrides,
+        env: &crate::engine_settings::EngineOverrides,
+        probe: &dyn Fn(&Path) -> Result<String, String>,
+    ) -> Result<Self, ConfigError> {
+        let stated = crate::engine_settings::EngineOverrides::from_document(&self.document)?;
+        let settings = crate::engine_settings::resolve(flags, env, &stated);
+        let mut document = self.document;
+        crate::engine_settings::apply_to_host(&mut document, &settings, probe)?;
+        Self::parse(&document.to_string())
+    }
     pub fn template(root: &Path) -> String {
         serde_json::to_string_pretty(&json!({
             "schema_version":1,"kind":"host","name":"mllm-host",

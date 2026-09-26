@@ -159,7 +159,19 @@ pub struct SourceStore {
     log: Mutex<LogSink>,
     /// Test seam: the filesystem's free bytes, instead of `statvfs`.
     free_override: Mutex<Option<u64>>,
+    /// Where the default Hugging Face token variables are read: the process
+    /// environment, or a test's own.
+    environment: Mutex<Environment>,
 }
+
+/// Reads one environment variable.
+pub type Environment = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Owner rule 2026-09-25: the variables naming the host's default Hugging
+/// Face token, in precedence order. A secret is a variable or a protected
+/// file (`model_sources.huggingface_token_file`), never a CLI flag, which
+/// would leak into process listings and shell history.
+pub const HF_TOKEN_VARIABLES: &[&str] = &["MLLM_HF_TOKEN", "HF_TOKEN"];
 
 /// Where progress and failure lines go.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -237,6 +249,7 @@ impl SourceStore {
             accounting: Mutex::default(),
             log: Mutex::new(Arc::new(|line| eprintln!("{line}"))),
             free_override: Mutex::default(),
+            environment: Mutex::new(Arc::new(|key| std::env::var(key).ok())),
         })
     }
 
@@ -259,6 +272,15 @@ impl SourceStore {
     }
 
     /// Replace where progress and failure lines go (tests capture them).
+    /// Test seam: read the default token variables through `environment`
+    /// instead of the process environment.
+    #[doc(hidden)]
+    pub fn set_environment(&self, environment: Environment) {
+        if let Ok(mut current) = self.environment.lock() {
+            *current = environment;
+        }
+    }
+
     pub fn set_log(&self, log: LogSink) {
         if let Ok(mut current) = self.log.lock() {
             *current = log;
@@ -590,20 +612,44 @@ impl SourceStore {
     }
 
     fn token(&self, source: &ModelSource) -> Result<Option<Secret>, SourceFailure> {
-        let ModelSource::HuggingFace {
-            token_ref: Some(reference),
-            ..
-        } = source
-        else {
+        let ModelSource::HuggingFace { token_ref, .. } = source else {
             return Ok(None);
         };
         let unavailable = || SourceFailure::new(reason::SECRET_UNAVAILABLE);
-        let name = secret_name(reference).ok_or_else(unavailable)?;
-        let path = self
-            .secrets_dir
-            .as_ref()
-            .ok_or_else(unavailable)?
-            .join(name);
+        let path = match token_ref {
+            Some(reference) => {
+                let name = secret_name(reference).ok_or_else(unavailable)?;
+                self.secrets_dir
+                    .as_ref()
+                    .ok_or_else(unavailable)?
+                    .join(name)
+            }
+            // Owner rule 2026-09-25: a source that names no token uses the
+            // host's default one, `MLLM_HF_TOKEN` (else `HF_TOKEN`) in its
+            // environment, else `model_sources.huggingface_token_file`; with
+            // neither it is fetched without a token, as before.
+            None => {
+                let environment = self
+                    .environment
+                    .lock()
+                    .map(|environment| environment.clone())
+                    .map_err(|_| unavailable())?;
+                if let Some(token) = HF_TOKEN_VARIABLES
+                    .iter()
+                    .find_map(|name| environment(name).filter(|value| !value.is_empty()))
+                {
+                    let token = token.trim().to_owned();
+                    if token.chars().any(|c| c.is_control() || c == ' ') {
+                        return Err(unavailable());
+                    }
+                    return Ok(Some(Secret(token)));
+                }
+                match &self.policy.huggingface_token_file {
+                    Some(file) => file.clone(),
+                    None => return Ok(None),
+                }
+            }
+        };
         let metadata = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
         // SPEC §13.3: a credential is private state; no group or other access,
         // owned by the account this agent runs as.

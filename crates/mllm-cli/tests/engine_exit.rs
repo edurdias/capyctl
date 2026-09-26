@@ -117,7 +117,7 @@ fn python3() -> PathBuf {
         .expect("python3 on PATH for the fake engine")
 }
 
-/// A per-installation engine port range (`MLLM_STANDALONE_ENGINE_PORTS`):
+/// A per-installation engine port range (`MLLM_ENGINE_PORTS`):
 /// four consecutive loopback ports free when chosen, below the ephemeral
 /// range (`support::process::free_ports`). The 8100 default would make every
 /// standalone fake engine in parallel tests bind the same port.
@@ -285,7 +285,7 @@ impl Installation {
             .env("MLLM_INFERENCE_ADDR", &self.inference)
             .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
             .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
-            .env("MLLM_STANDALONE_ENGINE_PORTS", &self.engines);
+            .env("MLLM_ENGINE_PORTS", &self.engines);
         command
     }
 

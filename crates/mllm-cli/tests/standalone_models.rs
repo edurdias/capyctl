@@ -201,6 +201,7 @@ async fn standalone_model_settings_follow_flag_env_document_default() {
         models_root: Some(flag_root.path().to_path_buf()),
         sources: Some(SourceSwitch::Denied),
         sources_max: Some("300GiB".into()),
+        ..Default::default()
     })
     .await;
     assert_eq!(policy.model_store, flag_root.path());

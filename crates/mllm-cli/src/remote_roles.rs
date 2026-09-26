@@ -732,10 +732,15 @@ fn check_host_device_policy(
 /// 2026-09-25: `flags` > `MLLM_MODELS_ROOT` / `MLLM_MODEL_SOURCES` /
 /// `MLLM_MODEL_SOURCES_MAX` > the document > `~/models`, sources allowed with
 /// a 500 GiB ceiling in `<model_store>/sources`).
+///
+/// Owner rule 2026-09-25: the engine settings (`--vllm-bin`, `MLLM_VLLM_BIN`,
+/// `local_engine`, `--runtime-dir`, `--engine-ports` and the rest) are
+/// resolved by the same rule and applied to the document before publication.
 fn load_host(
     path: &Path,
     engines: &Path,
     flags: &mllm_config::model_settings::ModelOverrides,
+    engine_flags: &mllm_config::engine_settings::EngineOverrides,
 ) -> Result<HostConfig, StructuredError> {
     let invalid = |e: mllm_config::ConfigError| {
         error(&format!(
@@ -744,9 +749,14 @@ fn load_host(
         ))
     };
     let env = mllm_config::model_settings::ModelOverrides::from_process_env().map_err(invalid)?;
+    let engine_env =
+        mllm_config::engine_settings::EngineOverrides::from_process_env().map_err(invalid)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     HostConfig::load_with_engines(path, engines)
         .and_then(|config| config.with_models(flags, &env, home.as_deref()))
+        .and_then(|config| {
+            config.with_engines(engine_flags, &engine_env, &crate::roles::engine_version)
+        })
         .map_err(invalid)
 }
 
@@ -1063,13 +1073,11 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             } else {
                 "host"
             };
-            // ADR 0018 §2 (review decision 2026-09-25): a host's document is
-            // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`.
-            let named = if *role == Role::Host {
-                crate::engine::named_role_document(invocation.config.as_deref(), &role_env)
-            } else {
-                invocation.config.clone()
-            };
+            // ADR 0018 §2 (review decision 2026-09-25): a role's document is
+            // `--config`, else `$MLLM_CONFIG`, as for `mllm engine`; owner
+            // rule 2026-09-25: the server's too, so the setting has its two
+            // run-time forms for every role.
+            let named = crate::engine::named_role_document(invocation.config.as_deref(), &role_env);
             let path = named.clone().unwrap_or_else(|| implicit(root, label));
             if named.is_none()
                 && fs::symlink_metadata(&path)
@@ -1146,8 +1154,20 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
                 // itself was already read above for the size and existence
                 // checks.
                 let engines = host_engines(named.as_deref(), &path);
+                // Owner rule 2026-09-25: a deprecated variable name is
+                // warned about once.
+                for warning in mllm_config::engine_settings::deprecation_warnings(&|key| {
+                    std::env::var(key).ok()
+                }) {
+                    eprintln!("{warning}");
+                }
                 serve_host(
-                    load_host(&path, &engines, &invocation.model_overrides)?,
+                    load_host(
+                        &path,
+                        &engines,
+                        &invocation.model_overrides,
+                        &invocation.engine_overrides,
+                    )?,
                     path.clone(),
                     engines,
                 )
@@ -1161,7 +1181,7 @@ pub async fn execute(invocation: &Invocation, root: &Path) -> Result<Value, Stru
             // checks; the host document is loaded merged with `engines.yaml`.
             read_config(&path)?;
             let engines = host_engines(named.as_deref(), &path);
-            let config = load_host(&path, &engines, &Default::default())?;
+            let config = load_host(&path, &engines, &Default::default(), &Default::default())?;
             let invitation: JoinInvitation = serde_json::from_slice(&private_read(join_file)?)
                 .map_err(|_| error("Invalid join invitation"))?;
             // ADR 0016: recovery is explicit on both sides. A recovery

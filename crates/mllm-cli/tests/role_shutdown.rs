@@ -129,7 +129,7 @@ fn python3() -> PathBuf {
         .expect("python3 on PATH for the fake engine")
 }
 
-/// A per-installation engine port range (`MLLM_STANDALONE_ENGINE_PORTS`):
+/// A per-installation engine port range (`MLLM_ENGINE_PORTS`):
 /// four consecutive loopback ports free when chosen, below the ephemeral
 /// range (`support::process::free_ports`). The 8100 default would make every
 /// standalone fake engine in parallel tests bind the same port.
@@ -235,7 +235,7 @@ impl Installation {
             .env("MLLM_INFERENCE_ADDR", &self.inference)
             .env_remove("MLLM_STANDALONE_INFERENCE_ADDR")
             .env("MLLM_STANDALONE_MANAGEMENT_ADDR", &self.management)
-            .env("MLLM_STANDALONE_ENGINE_PORTS", &self.engines);
+            .env("MLLM_ENGINE_PORTS", &self.engines);
         command
     }
 
@@ -481,6 +481,112 @@ fn deploy_with_deadline(installation: &Installation, request_deadline: &str) -> 
 /// the drain bound is cut at the bound. `mllm drain standalone` then stops the
 /// engine with verified cleanup, and the deployment stays eligible for
 /// on-demand activation.
+/// T03 T21 (owner rule 2026-09-25: every setting three ways): a standalone
+/// whose engine installation, runtime directory and engine port range are
+/// stated only in its document (`host.local_engine`, `host.runtime_dir`,
+/// `host.resource_policy.endpoint_port_range`), started with `--state-dir`
+/// instead of `MLLM_STATE_DIR`, boots and serves; the environment then wins
+/// over the document, and a flag over both (the published fingerprint).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standalone_engine_settings_come_from_the_document_env_or_flags() {
+    let installation = Installation::new();
+    let state = installation.state();
+    let (path, _) =
+        mllm_config::generate_default(mllm_config::ConfigKind::Standalone, &state).unwrap();
+    let mut document: Value =
+        mllm_config::parse_document(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let (start, end) = installation.engines.split_once('-').unwrap();
+    document["host"]["local_engine"] = json!({
+        "vllm": installation.root.path().join("engine/vllm"),
+        "build_fingerprint": "yaml-fp",
+        "kv_cache": "64MiB",
+        "deep_park": "off",
+    });
+    document["host"]["runtime_dir"] = json!(installation.root.path().join("runtime"));
+    document["host"]["resource_policy"]["endpoint_port_range"] =
+        json!({"start": start.parse::<u16>().unwrap(), "end": end.parse::<u16>().unwrap()});
+    std::fs::write(&path, document.to_string()).unwrap();
+    let bare = |command: &mut Command| {
+        for name in [
+            "MLLM_STATE_DIR",
+            "MLLM_VLLM_BIN",
+            "MLLM_RUNTIME_DIR",
+            "MLLM_ENGINE_FINGERPRINT",
+            "MLLM_KV_CACHE_BYTES",
+            "MLLM_DEEP_PARK",
+            "MLLM_ENGINE_PORTS",
+        ] {
+            command.env_remove(name);
+        }
+    };
+    let engines = |extra_env: &[(&str, &str)]| -> Value {
+        let mut command = installation.command();
+        bare(&mut command);
+        command.envs(extra_env.iter().copied()).args([
+            "--state-dir",
+            state.to_str().unwrap(),
+            "engine",
+            "list",
+            "--format",
+            "json",
+        ]);
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let version = |listed: &Value| {
+        let rows = listed["engines"].as_array().cloned().unwrap_or_default();
+        let local = rows
+            .iter()
+            .find(|row| row["profile"] == "local")
+            .unwrap_or_else(|| panic!("no local profile: {listed}"));
+        local["version"].as_str().unwrap().to_owned()
+    };
+    let start_with = |env: &[(&str, &str)], flags: &[&str]| {
+        let mut command = installation.command();
+        bare(&mut command);
+        command
+            .envs(env.iter().copied())
+            .args([
+                "--state-dir",
+                state.to_str().unwrap(),
+                "start",
+                "standalone",
+            ])
+            .args(flags);
+        installation.start_command(None, &mut command).0
+    };
+
+    // The document alone declares the engine; it serves.
+    let role = start_with(&[], &[]);
+    assert_eq!(version(&engines(&[])), "yaml-fp");
+    let deployed = deploy(&installation);
+    assert_eq!(deployed["deployment"]["observed_state"], "ready");
+    served_within(&installation, Duration::from_secs(10)).await;
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(25));
+    assert!(status.success(), "{status:?}");
+
+    // The environment wins over the document, a flag over both.
+    let role = start_with(&[("MLLM_ENGINE_FINGERPRINT", "env-fp")], &[]);
+    assert_eq!(version(&engines(&[])), "env-fp");
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(25));
+    assert!(status.success(), "{status:?}");
+    let role = start_with(
+        &[("MLLM_ENGINE_FINGERPRINT", "env-fp")],
+        &["--engine-fingerprint", "flag-fp"],
+    );
+    assert_eq!(version(&engines(&[])), "flag-fp");
+    role.signal();
+    let (status, _) = role.exit(Duration::from_secs(25));
+    assert!(status.success(), "{status:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn standalone_signal_restarts_and_drain_stops_with_cleanup() {
     let installation = Installation::new();

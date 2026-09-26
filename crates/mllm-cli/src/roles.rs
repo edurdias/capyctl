@@ -49,26 +49,26 @@ pub use mllm_controller::engine_provider::{
 pub const NOT_IMPLEMENTED_EXIT: ExitCode = ExitCode::UNSUPPORTED;
 
 /// The engine's executable. A host with no engine cannot serve: one of these
-/// two, or a profile registered with `mllm engine add`, must name one. ADR
-/// 0018 §5: both set publish two profiles, `local-vllm` and `local-sglang`.
-const ENGINE_BIN: &str = "MLLM_VLLM_BIN";
-const SGLANG_BIN: &str = "MLLM_SGLANG_BIN";
+/// two (or `--vllm-bin` / `--sglang-bin`, or `host.local_engine`), or a
+/// profile registered with `mllm engine add`, must name one. ADR 0018 §5:
+/// both set publish two profiles, `local-vllm` and `local-sglang`.
+const ENGINE_BIN: &str = mllm_config::engine_settings::VLLM_BIN_ENV;
+const SGLANG_BIN: &str = mllm_config::engine_settings::SGLANG_BIN_ENV;
 /// The directory model weights live under (Spec §7). Optional (owner decision
 /// 2026-09-25): `~/models` unless `--models-root`, this variable or
 /// `host.model_store.path` names another.
 const MODELS_ROOT: &str = mllm_config::model_settings::MODELS_ROOT_ENV;
-const KV_CACHE_BYTES: &str = "MLLM_KV_CACHE_BYTES";
-const ENGINE_ARGS: &str = "MLLM_ENGINE_ARGS";
-const ENGINE_FINGERPRINT: &str = "MLLM_ENGINE_FINGERPRINT";
-const DEEP_PARK: &str = "MLLM_DEEP_PARK";
-const TRUST_REMOTE_CODE: &str = "MLLM_TRUST_REMOTE_CODE";
-const RUNTIME_DIR: &str = "MLLM_RUNTIME_DIR";
-const INSTALLATION_DRIFT: &str = "MLLM_INSTALLATION_DRIFT";
+const KV_CACHE_BYTES: &str = mllm_config::engine_settings::KV_CACHE_ENV;
+const ENGINE_FINGERPRINT: &str = mllm_config::engine_settings::ENGINE_FINGERPRINT_ENV;
+const RUNTIME_DIR: &str = mllm_config::engine_settings::RUNTIME_DIR_ENV;
 /// SPEC §15.2: a run-time override of the engines' loopback port range, as
-/// `start-end`, so two roles on one machine lease different engine ports.
-pub const ENGINE_PORTS_ENV: &str = "MLLM_STANDALONE_ENGINE_PORTS";
+/// `start-end`, so two roles on one machine lease different engine ports
+/// (owner rule 2026-09-25: one name for both roles; the standalone-only
+/// `MLLM_STANDALONE_ENGINE_PORTS` is a deprecated alias).
+pub const ENGINE_PORTS_ENV: &str = mllm_config::engine_settings::ENGINE_PORTS_ENV;
+pub use mllm_config::engine_settings::EngineOverrides;
 /// SPEC §16.5 default engine port range.
-const DEFAULT_ENGINE_PORTS: (u16, u16) = (8100, 8199);
+const DEFAULT_ENGINE_PORTS: (u16, u16) = mllm_config::engine_settings::DEFAULT_ENGINE_PORTS;
 
 /// SPEC §8.2 / T21 (owner decision 2026-09-25): the standalone rendezvous
 /// root under the state directory, the same name a host uses.
@@ -612,15 +612,22 @@ impl From<StartError> for StructuredError {
 /// standalone refuses to boot rather than come up unable to run anything.
 pub struct EnvEngineProvider {
     /// The managed runtime directory (`<state root>/runtime`) used when
-    /// `MLLM_RUNTIME_DIR` is unset. `None` means there is none, and a run
-    /// must name its runtime directory.
+    /// no layer names a runtime directory. `None` means there is none, and a
+    /// run must name its runtime directory.
     managed_runtime: Option<PathBuf>,
+    /// Owner rule 2026-09-25: this run's engine flags, the top layer.
+    flags: EngineOverrides,
+    /// The standalone document's `host:` block settings, the YAML layer
+    /// ([`EngineProvider::configure`]).
+    document: std::sync::Mutex<EngineOverrides>,
 }
 
 impl EnvEngineProvider {
     pub fn new() -> Self {
         Self {
             managed_runtime: None,
+            flags: EngineOverrides::default(),
+            document: Default::default(),
         }
     }
 
@@ -629,7 +636,32 @@ impl EnvEngineProvider {
     pub fn with_managed_runtime(dir: PathBuf) -> Self {
         Self {
             managed_runtime: Some(dir),
+            ..Self::new()
         }
+    }
+
+    /// Owner rule 2026-09-25: this run's engine flags, which win over the
+    /// environment and the document.
+    pub fn with_flags(mut self, flags: EngineOverrides) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// The engine settings in force: flag > environment > document > default
+    /// (`mllm_config::engine_settings`).
+    fn settings(&self) -> Result<mllm_config::engine_settings::EngineSettings, ProviderError> {
+        let env = EngineOverrides::from_process_env()
+            .map_err(|error| no_installation(format!("{}: {}", error.path, error.detail)))?;
+        let document = self
+            .document
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        Ok(mllm_config::engine_settings::resolve(
+            &self.flags,
+            &env,
+            &document,
+        ))
     }
 }
 
@@ -647,60 +679,6 @@ fn env_value(name: &str) -> Option<String> {
 
 fn no_installation(what: impl Into<String>) -> ProviderError {
     ProviderError::NoEngineInstallation(what.into())
-}
-
-/// The standalone deep-park switch. SPEC §9.1 / ADR 0012: unset means on and
-/// `off` is the host opt-out. SPEC §15.3 (T03): anything else, an empty export
-/// included, is refused rather than read as either, because a mistyped opt-out
-/// silently left on is the failure this switch exists to prevent.
-fn deep_park_switch() -> Result<bool, ProviderError> {
-    let Some(value) = std::env::var_os(DEEP_PARK) else {
-        return Ok(true);
-    };
-    match value.to_str() {
-        Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        _ => Err(no_installation(format!(
-            "{DEEP_PARK} must be `on` or `off` (unset means on; `off` opts this host \
-             out of deep parking); got {value:?}"
-        ))),
-    }
-}
-
-/// ADR 0008 (owner decision 2026-09-23): the standalone host's
-/// `security.installation_drift`. Unset means `warn`; SPEC §15.3 (T03):
-/// anything other than `warn` or `refuse` is refused rather than guessed.
-fn installation_drift_switch() -> Result<mllm_config::effective::InstallationDrift, ProviderError> {
-    use mllm_config::effective::InstallationDrift;
-    let Some(value) = std::env::var_os(INSTALLATION_DRIFT) else {
-        return Ok(InstallationDrift::Warn);
-    };
-    match value.to_str() {
-        Some("warn") => Ok(InstallationDrift::Warn),
-        Some("refuse") => Ok(InstallationDrift::Refuse),
-        _ => Err(no_installation(format!(
-            "{INSTALLATION_DRIFT} must be `warn` or `refuse` (unset means warn); got {value:?}"
-        ))),
-    }
-}
-
-/// The engines' loopback port range: the default unless this run names one.
-/// SPEC §15.3: a malformed, empty, reversed or privileged range is refused.
-fn engine_ports() -> Result<(u16, u16), ProviderError> {
-    let Some(value) = std::env::var_os(ENGINE_PORTS_ENV) else {
-        return Ok(DEFAULT_ENGINE_PORTS);
-    };
-    value
-        .to_str()
-        .and_then(|text| text.split_once('-'))
-        .and_then(|(start, end)| Some((start.parse::<u16>().ok()?, end.parse::<u16>().ok()?)))
-        .filter(|&(start, end)| start >= 1024 && start <= end)
-        .ok_or_else(|| {
-            no_installation(format!(
-                "{ENGINE_PORTS_ENV} must be an inclusive port range `start-end` with \
-                 1024 <= start <= end, e.g. 8100-8199; got {value:?}"
-            ))
-        })
 }
 
 impl EnvEngineProvider {
@@ -744,20 +722,23 @@ impl EnvEngineProvider {
                 root
             }
         };
+        // Owner rule 2026-09-25: every setting below is resolved flag >
+        // environment > `host:` block > default (`engine_settings`); a
+        // malformed value in any layer is refused, even when a registered
+        // profile states its own.
+        let settings = self.settings()?;
         // SPEC §9.1 / T21 / ADR 0012: deep parking is on unless the host opts
-        // out. Sleep mode follows the same switch as deep parking. A malformed
-        // switch is refused even when a registered profile states its own.
-        let switch = deep_park_switch()?;
-        let deep_park = deep_park.unwrap_or(switch);
-        let trust_remote_code = env_value(TRUST_REMOTE_CODE).is_some_and(|value| value == "1");
-        let installation_drift = installation_drift_switch()?;
-        let engine_ports = engine_ports()?;
-        let build_fingerprint = match (fingerprint, env_value(ENGINE_FINGERPRINT)) {
+        // out. Sleep mode follows the same switch as deep parking.
+        let deep_park = deep_park.unwrap_or(settings.deep_park);
+        let trust_remote_code = settings.trust_remote_code;
+        let installation_drift = settings.installation_drift;
+        let engine_ports = settings.engine_ports.unwrap_or(DEFAULT_ENGINE_PORTS);
+        let build_fingerprint = match (fingerprint, settings.build_fingerprint) {
             (Some(registered), _) => registered.to_owned(),
             (None, Some(declared)) => declared,
             (None, None) => probe_fingerprint(&executable)?,
         };
-        let declared_kv = env_value(KV_CACHE_BYTES);
+        let declared_kv = settings.kv_cache;
         let kv_cache_declared = declared_kv.is_some();
         let kv_cache_bytes = declared_kv.unwrap_or_else(|| DEFAULT_KV_CACHE.to_string());
         // ADR 0014 §1: the installation keeps host-fixed arguments only; engine
@@ -765,14 +746,9 @@ impl EnvEngineProvider {
         // argument vector (`engine_policy.rs` refuses any on that family).
         // ADR 0014 §5 (owner decision 2026-09-25): no `--max-model-len`
         // default; an undeclared context is fitted to the KV grant at launch.
-        // An explicit `MLLM_ENGINE_ARGS` is kept as the host's fixed args.
+        // Explicit engine args are kept as the host's fixed args.
         let args = match engine {
-            Engine::Vllm => env_value(ENGINE_ARGS)
-                .unwrap_or_default()
-                .split(' ')
-                .filter(|argument| !argument.is_empty())
-                .map(str::to_owned)
-                .collect(),
+            Engine::Vllm => settings.args,
             Engine::Sglang => Vec::new(),
         };
         // ADR 0014 §2, §5: the generated standalone deployment states its KV
@@ -787,7 +763,12 @@ impl EnvEngineProvider {
             deep_park,
             trust_remote_code,
             models_root,
-            runtime_dir: runtime_dir(engine, deep_park, self.managed_runtime.as_deref())?,
+            runtime_dir: runtime_dir(
+                engine,
+                deep_park,
+                settings.runtime_dir,
+                self.managed_runtime.as_deref(),
+            )?,
             args,
             installation_drift,
             engine_ports,
@@ -799,14 +780,26 @@ impl EngineProvider for EnvEngineProvider {
     /// The environment's one installation. ADR 0018 §5: with both variables
     /// set this is the vLLM one; [`Self::installations`] publishes both.
     fn installation(&self) -> Result<EngineInstallation, ProviderError> {
-        match (env_value(ENGINE_BIN), env_value(SGLANG_BIN)) {
-            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm.into()),
-            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang.into()),
+        let settings = self.settings()?;
+        match (settings.vllm, settings.sglang) {
+            (Some(vllm), _) => self.role_installation(Engine::Vllm, vllm),
+            (None, Some(sglang)) => self.role_installation(Engine::Sglang, sglang),
             (None, None) => Err(no_installation(format!(
                 "this host declares no engine: set {ENGINE_BIN} (or {SGLANG_BIN} \
-                 for SGLang) to the engine's executable"
+                 for SGLang, or --vllm-bin / --sglang-bin, or host.local_engine) to \
+                 the engine's executable"
             ))),
         }
+    }
+
+    fn configure(&self, host: &serde_json::Value) -> Result<(), ProviderError> {
+        let stated = EngineOverrides::from_document(host)
+            .map_err(|error| no_installation(format!("host.{}: {}", error.path, error.detail)))?;
+        *self
+            .document
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stated;
+        Ok(())
     }
 
     fn installations(
@@ -819,27 +812,12 @@ impl EngineProvider for EnvEngineProvider {
             profile: profile.into(),
             installation,
         };
-        let mut all = match (env_value(ENGINE_BIN), env_value(SGLANG_BIN)) {
-            (Some(vllm), None) => vec![named(
-                crate::standalone_config::STANDALONE_PROFILE,
-                self.role_installation(Engine::Vllm, vllm.into())?,
-            )],
-            (None, Some(sglang)) => vec![named(
-                crate::standalone_config::STANDALONE_PROFILE,
-                self.role_installation(Engine::Sglang, sglang.into())?,
-            )],
-            (Some(vllm), Some(sglang)) => vec![
-                named(
-                    "local-vllm",
-                    self.role_installation(Engine::Vllm, vllm.into())?,
-                ),
-                named(
-                    "local-sglang",
-                    self.role_installation(Engine::Sglang, sglang.into())?,
-                ),
-            ],
-            (None, None) => Vec::new(),
-        };
+        // Owner rule 2026-09-25: the same names a host gives its
+        // `local_engine` profiles (`engine_settings::EngineSettings::installations`).
+        let mut all = Vec::new();
+        for (profile, engine, executable) in self.settings()?.installations() {
+            all.push(named(profile, self.role_installation(engine, executable)?));
+        }
         for (name, profile) in registered {
             if all.iter().any(|n| &n.profile == name) {
                 return Err(ProviderError::ProfileExists(name.clone()));
@@ -863,8 +841,9 @@ impl EngineProvider for EnvEngineProvider {
         }
         if all.is_empty() {
             return Err(no_installation(format!(
-                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} to the \
-                 engine's executable, or register one with `mllm engine add`"
+                "this host declares no engine: set {ENGINE_BIN} or {SGLANG_BIN} (or \
+                 --vllm-bin / --sglang-bin, or host.local_engine) to the engine's \
+                 executable, or register one with `mllm engine add`"
             )));
         }
         Ok(all)
@@ -937,10 +916,11 @@ impl EngineProvider for EnvEngineProvider {
 fn runtime_dir(
     engine: Engine,
     deep_park: bool,
+    declared: Option<PathBuf>,
     managed: Option<&Path>,
 ) -> Result<PathBuf, ProviderError> {
-    let dir = match (env_value(RUNTIME_DIR), managed) {
-        (Some(declared), _) => PathBuf::from(declared),
+    let dir = match (declared, managed) {
+        (Some(declared), _) => declared,
         (None, Some(managed)) => {
             crate::managed_runtime::prepare(managed)
                 .map_err(|error| no_installation(format!("managed runtime directory: {error}")))?;
@@ -995,6 +975,12 @@ fn runtime_dir(
         ))
     })?;
     Ok(dir)
+}
+
+/// [`probe_fingerprint`] for the host role, which states `local_engine`
+/// profiles in its document (owner rule 2026-09-25).
+pub(crate) fn engine_version(executable: &Path) -> Result<String, String> {
+    probe_fingerprint(executable).map_err(|error| error.to_string())
 }
 
 /// What the installed engine says it is.
@@ -1084,12 +1070,25 @@ pub async fn start_standalone_with_models(
     config: Option<&Path>,
     flags: &ModelOverrides,
 ) -> Result<App, StartError> {
+    start_standalone_with_settings(state_dir, config, flags, &EngineOverrides::default()).await
+}
+
+/// As [`start_standalone_with_models`], with this run's engine flags too
+/// (owner rule 2026-09-25: `--vllm-bin`, `--engine-ports` and the rest win
+/// over their variables and the `host:` block of the document).
+pub async fn start_standalone_with_settings(
+    state_dir: &Path,
+    config: Option<&Path>,
+    flags: &ModelOverrides,
+    engines: &EngineOverrides,
+) -> Result<App, StartError> {
     start_standalone_inner(
         state_dir,
         config,
-        Arc::new(EnvEngineProvider::with_managed_runtime(
-            state_dir.join("runtime"),
-        )),
+        Arc::new(
+            EnvEngineProvider::with_managed_runtime(state_dir.join("runtime"))
+                .with_flags(engines.clone()),
+        ),
         crate::host_observation::proc_meminfo(),
         // Design §1: the production boot samples the GPUs with the bounded
         // `nvidia-smi` collector. A machine without one samples nothing and
@@ -1387,6 +1386,9 @@ async fn start_standalone_inner(
     for (name, profile) in &registered {
         mllm_config::registration::check_profile(name, profile)?;
     }
+    // Owner rule 2026-09-25: the `host:` block's engine settings are the
+    // YAML layer of the installation (flag > environment > YAML > default).
+    provider.configure(&stated_host)?;
     let mut named = provider.installations(&registered)?;
     // Owner decision 2026-09-25 (standalone is a server plus one host): the
     // models directory and the model-source policy, by the rule a host uses.

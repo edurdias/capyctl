@@ -151,7 +151,7 @@ fn deploy_flags() {
     ])
     .unwrap();
     assert!(
-        matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true, revision: None} if f == std::path::Path::new("d.yaml"))
+        matches!(c, Command::Deploy{file: Some(f), activate: true, wait: true, revision: None, hf_endpoint: None} if f == std::path::Path::new("d.yaml"))
     );
 }
 
@@ -643,4 +643,109 @@ fn model_flags_are_parsed_on_start_standalone_and_host() {
         Default::default()
     );
     assert!(parse_invocation(["mllm", "start", "server", "--models-root", "/m"]).is_err());
+}
+
+// T03 (owner rule 2026-09-25: every setting three ways): the engine and
+// download flags parse on `start standalone` and `start host`, `--kv-cache`
+// on standalone only, `--state-dir` on every command, and `--hf-endpoint` on
+// `deploy model`; a malformed value is refused by the parser.
+#[test]
+fn engine_flags_are_parsed_on_start_standalone_and_host() {
+    use mllm_config::effective::InstallationDrift;
+    use mllm_config::engine_settings::EngineOverrides;
+    for role in ["standalone", "host"] {
+        let i = parse_invocation([
+            "mllm",
+            "start",
+            role,
+            "--vllm-bin",
+            "/opt/vllm/bin/vllm",
+            "--sglang-bin",
+            "/opt/sglang/bin/python3",
+            "--engine-fingerprint",
+            "vllm 0.29.0",
+            "--engine-args",
+            "--enforce-eager --max-num-seqs 4",
+            "--deep-park",
+            "off",
+            "--trust-remote-code",
+            "true",
+            "--installation-drift",
+            "refuse",
+            "--runtime-dir",
+            "/opt/mllm/runtime",
+            "--engine-ports",
+            "9000-9099",
+            "--model-sources-path",
+            "/data/downloads",
+            "--hf-endpoint",
+            "https://mirror.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            i.engine_overrides,
+            EngineOverrides {
+                vllm: Some("/opt/vllm/bin/vllm".into()),
+                sglang: Some("/opt/sglang/bin/python3".into()),
+                build_fingerprint: Some("vllm 0.29.0".into()),
+                args: Some(vec![
+                    "--enforce-eager".into(),
+                    "--max-num-seqs".into(),
+                    "4".into()
+                ]),
+                kv_cache: None,
+                deep_park: Some(false),
+                trust_remote_code: Some(true),
+                installation_drift: Some(InstallationDrift::Refuse),
+                runtime_dir: Some("/opt/mllm/runtime".into()),
+                engine_ports: Some((9000, 9099)),
+            }
+        );
+        assert_eq!(
+            i.model_overrides.sources_path.as_deref(),
+            Some(std::path::Path::new("/data/downloads"))
+        );
+        assert_eq!(
+            i.model_overrides.hf_endpoint.as_deref(),
+            Some("https://mirror.example")
+        );
+        for (flag, bad) in [
+            ("--deep-park", "disabled"),
+            ("--trust-remote-code", "yes"),
+            ("--installation-drift", "ignore"),
+            ("--engine-ports", "80-90"),
+            ("--hf-endpoint", "http://mirror.example"),
+        ] {
+            assert!(
+                parse_invocation(["mllm", "start", role, flag, bad]).is_err(),
+                "{flag} {bad}"
+            );
+        }
+    }
+    let i = parse_invocation(["mllm", "start", "standalone", "--kv-cache", "8GiB"]).unwrap();
+    assert_eq!(i.engine_overrides.kv_cache.as_deref(), Some("8GiB"));
+    assert!(parse_invocation(["mllm", "start", "host", "--kv-cache", "8GiB"]).is_err());
+    assert!(parse_invocation(["mllm", "start", "standalone", "--kv-cache", "lots"]).is_err());
+    assert!(parse_invocation(["mllm", "start", "server", "--vllm-bin", "/v"]).is_err());
+    // `--state-dir` on any command.
+    let i = parse_invocation(["mllm", "--state-dir", "/srv/mllm", "list", "hosts"]).unwrap();
+    assert_eq!(
+        i.state_dir.as_deref(),
+        Some(std::path::Path::new("/srv/mllm"))
+    );
+    let i = parse_invocation(["mllm", "start", "standalone", "--state-dir", "/srv/s"]).unwrap();
+    assert_eq!(i.state_dir.as_deref(), Some(std::path::Path::new("/srv/s")));
+    // `--hf-endpoint` on `deploy model`.
+    assert!(matches!(
+        parse([
+            "mllm",
+            "deploy",
+            "model",
+            "--file",
+            "d.yaml",
+            "--hf-endpoint",
+            "http://127.0.0.1:9"
+        ]),
+        Ok(Command::Deploy { hf_endpoint: Some(endpoint), .. }) if endpoint == "http://127.0.0.1:9"
+    ));
 }

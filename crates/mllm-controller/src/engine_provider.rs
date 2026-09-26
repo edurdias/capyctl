@@ -182,6 +182,16 @@ pub trait EngineProvider: Send + Sync {
     /// association that records its API identity (Spec §3).
     fn tools_factory(&self) -> ToolsFactory;
 
+    /// Owner rule 2026-09-25 (every setting three ways): the role document's
+    /// `host:` block, whose `local_engine`, `runtime_dir` and
+    /// `resource_policy.endpoint_port_range` are the YAML layer of the
+    /// installation settings (flag > environment > YAML > default). Called once
+    /// at boot before [`Self::installations`]. A provider that states its
+    /// installation itself (a test double) ignores it.
+    fn configure(&self, _host: &serde_json::Value) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Test seam: a loopback `http://127.0.0.1:<port>` origin that serves
     /// every model-source download instead of the network (ADR 0008). A
     /// production provider names none.

@@ -15,7 +15,11 @@
 //! default with its admin token, the inference listener at any unicast
 //! address with a port (design §9: `0.0.0.0:8443` by default, as for a
 //! server) with `api_key` or the explicit `none` authentication, an `embedded` connection, `auto` resource values and no
-//! runtime profiles. A listener moves for one run through `--listen` (inference
+//! runtime profiles. The models directory and model sources, the engine
+//! installation (`host.local_engine`), the runtime directory
+//! (`host.runtime_dir`) and the engines' port range
+//! (`host.resource_policy.endpoint_port_range`) are honoured as on a host
+//! (owner rule 2026-09-25: every setting three ways). A listener moves for one run through `--listen` (inference
 //! only) or `MLLM_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR`
 //! (SPEC §15.2: a run-time override of an ordinary setting). The `name` fields
 //! are labels and are not checked.
@@ -334,8 +338,18 @@ pub fn check_honoured(
         )
         .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     }
+    // Owner rule 2026-09-25 (`crate::engine_settings`): the engine
+    // installation (`local_engine`), the runtime directory and the engines'
+    // port range are honoured here exactly as on a host; a malformed value is
+    // refused before any side effect. Every other resource value is `auto`.
+    crate::engine_settings::EngineOverrides::from_document(host)
+        .map_err(|error| refuse(&format!("host.{}", error.path), error.detail))?;
     if let Some(policy) = host.get("resource_policy") {
-        only_auto(policy, "host.resource_policy")?;
+        let mut policy = policy.clone();
+        if let Some(map) = policy.as_object_mut() {
+            map.remove("endpoint_port_range");
+        }
+        only_auto(&policy, "host.resource_policy")?;
     }
     if let Some(profiles) = host.get("runtime_profiles") {
         if profiles.as_object().is_none_or(|map| !map.is_empty()) {
@@ -521,6 +535,21 @@ mod tests {
                 "host.runtime_profiles",
                 Box::new(|d| d["host"]["runtime_profiles"] = json!({"p": {"engine": "vllm"}})),
             ),
+            (
+                "host.local_engine.deep_park",
+                Box::new(|d| d["host"]["local_engine"] = json!({"deep_park": "disabled"})),
+            ),
+            (
+                "host.runtime_dir",
+                Box::new(|d| d["host"]["runtime_dir"] = json!("relative/runtime")),
+            ),
+            (
+                "host.resource_policy.endpoint_port_range",
+                Box::new(|d| {
+                    d["host"]["resource_policy"]["endpoint_port_range"] =
+                        json!({"start": 80, "end": 90})
+                }),
+            ),
         ];
         for (path, mutate) in cases {
             let mut doc = generated("/s");
@@ -529,6 +558,29 @@ mod tests {
             assert_eq!(error.path, path);
             assert_eq!(error.code, ConfigErrorCode::UnsupportedCombination);
         }
+    }
+
+    // T03 (owner rule 2026-09-25: every setting three ways): the engine
+    // installation, the runtime directory and the port range are honoured in
+    // the document, as on a host.
+    #[test]
+    fn the_engine_settings_are_accepted_in_the_document() {
+        let mut doc = generated("/s");
+        doc["server"]["state_dir"] = json!("/s/server");
+        doc["host"]["local_engine"] = json!({
+            "vllm": "/opt/vllm/bin/vllm", "sglang": "/opt/sglang/bin/python3",
+            "build_fingerprint": "vllm 0.29.0", "args": ["--enforce-eager"],
+            "kv_cache": "8GiB", "deep_park": "off", "trust_remote_code": true,
+            "installation_drift": "refuse",
+        });
+        doc["host"]["runtime_dir"] = json!("/opt/mllm/runtime");
+        doc["host"]["resource_policy"]["endpoint_port_range"] = json!({"start": 9000, "end": 9099});
+        crate::validate(
+            &serde_json::to_string(&doc).unwrap(),
+            crate::ConfigKind::Standalone,
+        )
+        .unwrap();
+        check_honoured(&doc, Path::new("/s/config"), Path::new("/s")).unwrap();
     }
 
     fn check(document: &Value) -> Result<Vec<IgnoredSetting>, ConfigError> {

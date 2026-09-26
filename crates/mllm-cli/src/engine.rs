@@ -246,6 +246,14 @@ fn role_document(target: &Target) -> Result<Value, StructuredError> {
 }
 
 /// Profiles the operator declared in the role document itself.
+/// Whether `name` is registered in engines.yaml or declared in the role
+/// document (an older host may have registered a profile named `local`).
+fn registered_or_declared(target: &Target, name: &str) -> Result<bool, StructuredError> {
+    let engines =
+        EnginesFile::load(&target.engines).map_err(|e| error("invalid_config", e.detail))?;
+    Ok(engines.profiles.contains_key(name) || declared_by_operator(target)?.contains_key(name))
+}
+
 fn declared_by_operator(
     target: &Target,
 ) -> Result<serde_json::Map<String, Value>, StructuredError> {
@@ -301,8 +309,10 @@ async fn add(
             format!("profile name {name:?} must be lowercase letters, digits, '-' or '_'"),
         ));
     }
-    if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name.as_str()) {
-        return Err(error("profile_exists", format!("{name} is reserved for the MLLM_VLLM_BIN / MLLM_SGLANG_BIN installation; use --name")));
+    // Owner rule 2026-09-25: on a host as in standalone, these names are the
+    // role's own installation (`local_engine`, `--vllm-bin`, `MLLM_VLLM_BIN`).
+    if ENVIRONMENT_PROFILES.contains(&name.as_str()) {
+        return Err(error("profile_exists", format!("{name} is reserved for the role's own installation (--vllm-bin / --sglang-bin, MLLM_VLLM_BIN / MLLM_SGLANG_BIN or local_engine); use --name")));
     }
     // Checked before anything runs, and again under the lock when writing.
     let existing =
@@ -465,9 +475,9 @@ async fn list(target: &Target) -> Result<Value, StructuredError> {
 /// resumes the same retirement (review decision I1), so a crash between the
 /// confirmation and the write is finished by running remove again.
 async fn remove(target: &Target, name: &str, drain: bool) -> Result<Value, StructuredError> {
-    if target.kind == RoleKind::Standalone && ENVIRONMENT_PROFILES.contains(&name) {
+    if ENVIRONMENT_PROFILES.contains(&name) && !registered_or_declared(target, name)? {
         return Err(error("invalid_config", format!(
-            "{name} comes from MLLM_VLLM_BIN / MLLM_SGLANG_BIN; unset the variable and restart the role instead"
+            "{name} comes from the role's own installation (--vllm-bin / --sglang-bin, MLLM_VLLM_BIN / MLLM_SGLANG_BIN or local_engine); unset it and restart the role instead"
         )));
     }
     let engines =

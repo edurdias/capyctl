@@ -292,6 +292,14 @@ fn host_policy_document(path: &Path) -> Result<(String, Value), ConfigError> {
             std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .as_deref(),
+        )?
+        // Owner rule 2026-09-25: the engine settings too (`local_engine` and
+        // its variables). Validation never runs an engine, so an unstated
+        // fingerprint is a placeholder here; the role reads the real one.
+        .with_engines(
+            &Default::default(),
+            &mllm_config::engine_settings::EngineOverrides::from_process_env()?,
+            &|_| Ok("unknown (validate does not run the engine)".into()),
         )?;
     let local = mllm_config::remote_resources::local_host_document(&config.document)?;
     mllm_config::effective::normalize_host_policy(&local)?;

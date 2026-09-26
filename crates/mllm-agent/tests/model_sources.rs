@@ -261,6 +261,7 @@ fn policy(max_bytes: i64) -> ModelSourcePolicy {
         allowed_hosts: vec![],
         huggingface_endpoint: Some("https://hub.example.test".into()),
         path: None,
+        huggingface_token_file: None,
     }
 }
 
@@ -331,12 +332,29 @@ async fn fixture() -> Fixture {
 
 impl Fixture {
     fn source_store(&self, max_bytes: i64) -> Arc<SourceStore> {
-        SourceStore::with_loopback_origin(
+        self.source_store_with(policy(max_bytes), &[])
+    }
+
+    /// A store under `policy` whose default-token variables are exactly `env`
+    /// (never the test process's own).
+    fn source_store_with(
+        &self,
+        policy: ModelSourcePolicy,
+        env: &[(&'static str, &'static str)],
+    ) -> Arc<SourceStore> {
+        let store = SourceStore::with_loopback_origin(
             &self.store,
-            policy(max_bytes),
+            policy,
             Some(self.secrets.clone()),
             &self.origin,
-        )
+        );
+        let env = env.to_vec();
+        store.set_environment(Arc::new(move |key| {
+            env.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }));
+        store
     }
     fn requests(&self, needle: &str) -> Vec<(String, Option<String>, Option<String>)> {
         self.hub
@@ -719,6 +737,73 @@ async fn secret_token_is_never_logged_or_persisted() {
     let failure = store.materialize(&other).await.unwrap_err();
     assert_eq!(failure.reason, reason::SECRET_UNAVAILABLE);
     assert!(!lines.lock().unwrap().join("\n").contains(TOKEN));
+}
+
+// T14 T37 (owner rule 2026-09-25: a secret is a variable or a protected file,
+// never a CLI flag): a source that names no token uses the host's default one,
+// `MLLM_HF_TOKEN` over `HF_TOKEN` over `model_sources.huggingface_token_file`;
+// a token file others can read is refused, and with none the fetch carries
+// no token.
+#[tokio::test]
+async fn a_default_token_comes_from_the_environment_or_the_token_file() {
+    let token_file = |f: &Fixture| {
+        let mut policy = policy(1 << 30);
+        policy.huggingface_token_file = Some(f.secrets.join("hf-token"));
+        policy
+    };
+    type Case = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        bool,
+        Result<(), &'static str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "mllm variable",
+            &[("MLLM_HF_TOKEN", TOKEN), ("HF_TOKEN", "wrong")],
+            true,
+            Ok(()),
+        ),
+        ("tools variable", &[("HF_TOKEN", TOKEN)], false, Ok(())),
+        (
+            "variable over file",
+            &[("MLLM_HF_TOKEN", "wrong")],
+            true,
+            Err(reason::UNAUTHORIZED),
+        ),
+        ("file", &[], true, Ok(())),
+        ("nothing", &[], false, Err(reason::UNAUTHORIZED)),
+    ];
+    for (name, env, file, expected) in cases {
+        let f = fixture().await;
+        f.hub.lock().unwrap().require_token = true;
+        let policy = if file {
+            token_file(&f)
+        } else {
+            policy(1 << 30)
+        };
+        let store = f.source_store_with(policy, env);
+        let outcome = store
+            .materialize(&hf(vec![], false))
+            .await
+            .map(|_| ())
+            .map_err(|failure| failure.reason);
+        assert_eq!(outcome, expected, "{name}");
+    }
+    // A token file others can read is refused, not used.
+    let f = fixture().await;
+    f.hub.lock().unwrap().require_token = true;
+    std::fs::set_permissions(
+        f.secrets.join("hf-token"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let failure = f
+        .source_store_with(token_file(&f), &[])
+        .materialize(&hf(vec![], false))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, reason::SECRET_UNAVAILABLE);
 }
 
 // T14 (ADR 0008): a tar payload is verified as a whole, then extracted.

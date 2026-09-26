@@ -103,6 +103,9 @@ pub enum Command {
         /// SPEC §14: an update of an existing deployment names the revision it
         /// replaces (the management API's `expected_revision`).
         revision: Option<i64>,
+        /// Owner rule 2026-09-25: `--hf-endpoint`, the endpoint an unpinned
+        /// `hf:` reference is pinned against.
+        hf_endpoint: Option<String>,
     },
     Status {
         deployment: String,
@@ -277,6 +280,11 @@ struct Cli {
     json: bool,
     #[arg(long, global = true, value_name = "ID")]
     request_id: Option<String>,
+    /// The state root: where implicit role documents, standalone state and
+    /// client credentials live. Wins over MLLM_STATE_DIR (default
+    /// $XDG_STATE_HOME/mllm, else ~/.local/state/mllm).
+    #[arg(long, global = true, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -480,6 +488,106 @@ enum DrainArgs {
     Standalone,
 }
 
+/// Owner rule 2026-09-25 (SPEC §15.2): the settings of a role that runs
+/// engines, on `start host` and `start standalone`. Each wins over its
+/// environment variable, which wins over the YAML document, which wins over
+/// the default (`docs/operations/configuration.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, clap::Args)]
+struct RoleSettingsArgs {
+    /// The models directory a relative model path resolves under for this
+    /// run (default ~/models). Wins over MLLM_MODELS_ROOT and
+    /// model_store.path.
+    #[arg(long, value_name = "DIR", value_parser = parse_models_root)]
+    models_root: Option<PathBuf>,
+    /// Allow or disable Hugging Face and HTTP model downloads for this
+    /// run (default allowed). Wins over MLLM_MODEL_SOURCES and
+    /// model_sources in the document.
+    #[arg(long, value_name = "allowed|disabled", value_parser = parse_model_sources)]
+    model_sources: Option<mllm_config::model_source::SourceSwitch>,
+    /// The most bytes downloaded models may take (default 500GiB). Wins
+    /// over MLLM_MODEL_SOURCES_MAX and model_sources.max_bytes.
+    #[arg(long, value_name = "SIZE", value_parser = parse_model_sources_max)]
+    model_sources_max: Option<String>,
+    /// The directory downloads are kept under (default: the models
+    /// directory). Wins over MLLM_MODEL_SOURCES_PATH and model_sources.path.
+    #[arg(long, value_name = "DIR", value_parser = parse_model_sources_path)]
+    model_sources_path: Option<PathBuf>,
+    /// The Hugging Face endpoint downloads use (https://, default
+    /// https://huggingface.co). Wins over MLLM_HF_ENDPOINT, HF_ENDPOINT and
+    /// model_sources.huggingface_endpoint.
+    #[arg(long, value_name = "URL", value_parser = parse_hf_endpoint)]
+    hf_endpoint: Option<String>,
+    /// The vLLM executable this role runs as its `local` profile. Wins over
+    /// MLLM_VLLM_BIN and local_engine.vllm.
+    #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
+    vllm_bin: Option<PathBuf>,
+    /// The SGLang interpreter this role runs as its `local` profile. Wins
+    /// over MLLM_SGLANG_BIN and local_engine.sglang.
+    #[arg(long, value_name = "PATH", value_parser = parse_engine_path)]
+    sglang_bin: Option<PathBuf>,
+    /// The build fingerprint the local engine publishes (default: what
+    /// `<engine> --version` prints). Wins over MLLM_ENGINE_FINGERPRINT and
+    /// local_engine.build_fingerprint.
+    #[arg(long, value_name = "TEXT")]
+    engine_fingerprint: Option<String>,
+    /// Host-fixed vLLM arguments of the local engine, one string. Wins over
+    /// MLLM_ENGINE_ARGS and local_engine.args.
+    #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
+    engine_args: Option<String>,
+    /// Deep parking of the local engine, `on` (default) or `off`. Wins over
+    /// MLLM_DEEP_PARK and local_engine.deep_park.
+    #[arg(long, value_name = "on|off", value_parser = parse_deep_park)]
+    deep_park: Option<bool>,
+    /// Whether the local engine may run checkpoint-supplied Python, `true` or
+    /// `false` (default). Wins over MLLM_TRUST_REMOTE_CODE and
+    /// local_engine.trust_remote_code.
+    #[arg(long, value_name = "true|false", value_parser = parse_trust_remote_code)]
+    trust_remote_code: Option<bool>,
+    /// What a launch does when the local engine's files changed, `warn`
+    /// (default) or `refuse`. Wins over MLLM_INSTALLATION_DRIFT and
+    /// local_engine.installation_drift.
+    #[arg(long, value_name = "warn|refuse", value_parser = parse_installation_drift)]
+    installation_drift: Option<mllm_config::effective::InstallationDrift>,
+    /// mllm's runtime directory (default: the managed copy in the state
+    /// directory). Wins over MLLM_RUNTIME_DIR and runtime_dir.
+    #[arg(long, value_name = "DIR", value_parser = parse_engine_path)]
+    runtime_dir: Option<PathBuf>,
+    /// The engines' loopback port range, `start-end` (default 8100-8199).
+    /// Wins over MLLM_ENGINE_PORTS and resource_policy.endpoint_port_range.
+    #[arg(long, value_name = "START-END", value_parser = parse_engine_ports)]
+    engine_ports: Option<(u16, u16)>,
+}
+
+impl RoleSettingsArgs {
+    fn models(&self) -> mllm_config::model_settings::ModelOverrides {
+        mllm_config::model_settings::ModelOverrides {
+            models_root: self.models_root.clone(),
+            sources: self.model_sources,
+            sources_max: self.model_sources_max.clone(),
+            sources_path: self.model_sources_path.clone(),
+            hf_endpoint: self.hf_endpoint.clone(),
+        }
+    }
+
+    fn engines(&self, kv_cache: Option<String>) -> mllm_config::engine_settings::EngineOverrides {
+        mllm_config::engine_settings::EngineOverrides {
+            vllm: self.vllm_bin.clone(),
+            sglang: self.sglang_bin.clone(),
+            build_fingerprint: self.engine_fingerprint.clone(),
+            args: self
+                .engine_args
+                .as_deref()
+                .map(mllm_config::engine_settings::split_args),
+            kv_cache,
+            deep_park: self.deep_park,
+            trust_remote_code: self.trust_remote_code,
+            installation_drift: self.installation_drift,
+            runtime_dir: self.runtime_dir.clone(),
+            engine_ports: self.engine_ports,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum StartTarget {
     Server {
@@ -500,20 +608,8 @@ enum StartTarget {
         /// Retain full native engine logs in private files (may contain secrets).
         #[arg(long)]
         debug_engine_logs: bool,
-        /// The models directory a relative model path resolves under for this
-        /// run (default ~/models). Wins over MLLM_MODELS_ROOT and
-        /// model_store.path.
-        #[arg(long, value_name = "DIR", value_parser = parse_models_root)]
-        models_root: Option<PathBuf>,
-        /// Allow or disable Hugging Face and HTTP model downloads for this
-        /// run (default allowed). Wins over MLLM_MODEL_SOURCES and
-        /// model_sources in the document.
-        #[arg(long, value_name = "allowed|disabled", value_parser = parse_model_sources)]
-        model_sources: Option<mllm_config::model_source::SourceSwitch>,
-        /// The most bytes downloaded models may take (default 500GiB). Wins
-        /// over MLLM_MODEL_SOURCES_MAX and model_sources.max_bytes.
-        #[arg(long, value_name = "SIZE", value_parser = parse_model_sources_max)]
-        model_sources_max: Option<String>,
+        #[command(flatten)]
+        settings: RoleSettingsArgs,
     },
     Standalone {
         /// Retain full native engine logs in private files (may contain secrets).
@@ -531,20 +627,12 @@ enum StartTarget {
         /// MLLM_INFERENCE_AUTH and listeners.inference.authentication.
         #[arg(long)]
         no_inference_auth: bool,
-        /// The models directory a relative model path resolves under for this
-        /// run (default ~/models). Wins over MLLM_MODELS_ROOT and
-        /// model_store.path.
-        #[arg(long, value_name = "DIR", value_parser = parse_models_root)]
-        models_root: Option<PathBuf>,
-        /// Allow or disable Hugging Face and HTTP model downloads for this
-        /// run (default allowed). Wins over MLLM_MODEL_SOURCES and
-        /// model_sources in the document.
-        #[arg(long, value_name = "allowed|disabled", value_parser = parse_model_sources)]
-        model_sources: Option<mllm_config::model_source::SourceSwitch>,
-        /// The most bytes downloaded models may take (default 500GiB). Wins
-        /// over MLLM_MODEL_SOURCES_MAX and model_sources.max_bytes.
-        #[arg(long, value_name = "SIZE", value_parser = parse_model_sources_max)]
-        model_sources_max: Option<String>,
+        #[command(flatten)]
+        settings: RoleSettingsArgs,
+        /// The KV cache of the deployments standalone generates (for example
+        /// 16GiB). Wins over MLLM_KV_CACHE_BYTES and host.local_engine.kv_cache.
+        #[arg(long, value_name = "SIZE", value_parser = parse_kv_cache)]
+        kv_cache: Option<String>,
     },
     Deployment {
         deployment: String,
@@ -666,6 +754,12 @@ enum DeployArgs {
         #[arg(long, value_name = "N", conflicts_with = "activate",
               value_parser = clap::value_parser!(i64).range(1..))]
         revision: Option<i64>,
+        /// The Hugging Face endpoint an `hf:` reference without a commit is
+        /// pinned against (https://, or a loopback http:// mirror). Wins over
+        /// MLLM_HF_ENDPOINT, HF_ENDPOINT and the role document's
+        /// model_sources.huggingface_endpoint.
+        #[arg(long, value_name = "URL")]
+        hf_endpoint: Option<String>,
     },
 }
 
@@ -771,12 +865,14 @@ impl From<CliCommand> for Command {
                     activate,
                     wait,
                     revision,
+                    hf_endpoint,
                     ..
                 } => Command::Deploy {
                     file,
                     activate,
                     wait,
                     revision,
+                    hf_endpoint,
                 },
             },
             CliCommand::Status { resource } => match resource {
@@ -883,9 +979,18 @@ pub struct Invocation {
     /// Design §9: `--no-inference-auth` on `start standalone` and `start
     /// server`: the inference key is off for this run.
     pub no_inference_auth: bool,
-    /// Owner decision 2026-09-25: `--models-root`, `--model-sources` and
-    /// `--model-sources-max` on `start standalone` and `start host`.
+    /// Owner decision 2026-09-25: `--models-root`, `--model-sources`,
+    /// `--model-sources-max`, `--model-sources-path` and `--hf-endpoint` on
+    /// `start standalone` and `start host`.
     pub model_overrides: mllm_config::model_settings::ModelOverrides,
+    /// Owner rule 2026-09-25: the engine flags (`--vllm-bin`, `--sglang-bin`,
+    /// `--engine-fingerprint`, `--engine-args`, `--deep-park`,
+    /// `--trust-remote-code`, `--installation-drift`, `--runtime-dir`,
+    /// `--engine-ports`, and on standalone `--kv-cache`) on the same starts.
+    pub engine_overrides: mllm_config::engine_settings::EngineOverrides,
+    /// Owner rule 2026-09-25: `--state-dir`, the state root (wins over
+    /// `MLLM_STATE_DIR`).
+    pub state_dir: Option<PathBuf>,
 }
 
 pub fn parse_invocation<I, T>(args: I) -> Result<Invocation, CliError>
@@ -959,27 +1064,17 @@ where
         }
     );
     // Owner decision 2026-09-25: the model flags on `start standalone` and
-    // `start host`, the two roles that hold a model store.
-    let model_overrides = match &cli.command {
+    // `start host`, the two roles that hold a model store; owner rule
+    // 2026-09-25: the engine flags on the same two starts.
+    let (model_overrides, engine_overrides) = match &cli.command {
         CliCommand::Start {
-            target:
-                StartTarget::Standalone {
-                    models_root,
-                    model_sources,
-                    model_sources_max,
-                    ..
-                }
-                | StartTarget::Host {
-                    models_root,
-                    model_sources,
-                    model_sources_max,
-                    ..
-                },
-        } => mllm_config::model_settings::ModelOverrides {
-            models_root: models_root.clone(),
-            sources: *model_sources,
-            sources_max: model_sources_max.clone(),
-        },
+            target: StartTarget::Standalone {
+                settings, kv_cache, ..
+            },
+        } => (settings.models(), settings.engines(kv_cache.clone())),
+        CliCommand::Start {
+            target: StartTarget::Host { settings, .. },
+        } => (settings.models(), settings.engines(None)),
         _ => Default::default(),
     };
     let evict = matches!(
@@ -1052,6 +1147,8 @@ where
         listen,
         no_inference_auth,
         model_overrides,
+        engine_overrides,
+        state_dir: cli.state_dir.map(|dir| crate::engine::absolute(&dir)),
     })
 }
 
@@ -1059,6 +1156,52 @@ where
 /// working directory.
 fn parse_models_root(text: &str) -> Result<PathBuf, String> {
     mllm_config::model_settings::absolute("--models-root", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--model-sources-path`, made absolute.
+fn parse_model_sources_path(text: &str) -> Result<PathBuf, String> {
+    mllm_config::model_settings::absolute("--model-sources-path", text)
+        .map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--hf-endpoint`, an https:// URL.
+fn parse_hf_endpoint(text: &str) -> Result<String, String> {
+    mllm_config::model_settings::hf_endpoint("--hf-endpoint", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: an executable or directory named by a flag, made
+/// absolute against the working directory.
+fn parse_engine_path(text: &str) -> Result<PathBuf, String> {
+    mllm_config::model_settings::absolute("path", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--deep-park on|off`.
+fn parse_deep_park(text: &str) -> Result<bool, String> {
+    mllm_config::engine_settings::deep_park("--deep-park", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--trust-remote-code true|false`.
+fn parse_trust_remote_code(text: &str) -> Result<bool, String> {
+    mllm_config::engine_settings::boolean("--trust-remote-code", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--installation-drift warn|refuse`.
+fn parse_installation_drift(
+    text: &str,
+) -> Result<mllm_config::effective::InstallationDrift, String> {
+    mllm_config::engine_settings::drift("--installation-drift", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--engine-ports start-end`.
+fn parse_engine_ports(text: &str) -> Result<(u16, u16), String> {
+    mllm_config::engine_settings::port_range("--engine-ports", text).map_err(|error| error.detail)
+}
+
+/// Owner rule 2026-09-25: `--kv-cache <size>` on `start standalone`.
+fn parse_kv_cache(text: &str) -> Result<String, String> {
+    mllm_config::engine_settings::kv_cache("--kv-cache", text)
+        .map(|_| text.to_owned())
+        .map_err(|error| error.detail)
 }
 
 /// Owner decision 2026-09-25: `--model-sources allowed|disabled`.

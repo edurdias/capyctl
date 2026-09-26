@@ -158,6 +158,50 @@ async fn a_minimal_file_deploys_on_standalone() {
         inspected["effective"]["model"]["source"],
         json!({"type": "huggingface", "repo": "org/model", "revision": SHA})
     );
+
+    // T03 (owner rule 2026-09-25: every setting three ways): `--hf-endpoint`
+    // wins over MLLM_HF_ENDPOINT, which wins over HF_ENDPOINT. The losing
+    // values would be refused (not https), so a pin proves which was used.
+    let not_https = "http://mirror.example";
+    for (name, args, extra) in [
+        (
+            "flag-mini",
+            vec!["--hf-endpoint", origin.as_str()],
+            vec![("MLLM_HF_ENDPOINT", not_https), ("HF_ENDPOINT", not_https)],
+        ),
+        (
+            "env-mini",
+            vec![],
+            vec![
+                ("MLLM_HF_ENDPOINT", origin.as_str()),
+                ("HF_ENDPOINT", not_https),
+            ],
+        ),
+    ] {
+        let file = dir.path().join(format!("{name}.yaml"));
+        std::fs::write(
+            &file,
+            format!("name: {name}\nengine: vllm\nmodel: {{hf: org/model}}\n"),
+        )
+        .unwrap();
+        let mut argv = vec!["deploy", "model", "--file", file.to_str().unwrap()];
+        argv.extend(args);
+        let mut env = vec![management[0]];
+        env.extend(extra);
+        json_of(&mllm(dir.path(), home.path(), &argv, &env));
+    }
+    let refused = mllm(
+        dir.path(),
+        home.path(),
+        &["deploy", "model", "--file", hf.to_str().unwrap()],
+        &[management[0], ("MLLM_HF_ENDPOINT", not_https)],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("MLLM_HF_ENDPOINT"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
     server.abort();
     let _ = app.shutdown().await;
 }

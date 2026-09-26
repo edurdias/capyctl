@@ -1635,3 +1635,116 @@ fn the_models_root_variable_is_optional() {
         std::env::remove_var(name);
     }
 }
+
+/// Owner rule 2026-09-25 (every setting three ways, SPEC §15.2): the
+/// standalone installation's settings follow CLI flag > environment > the
+/// document's `host:` block > default, and the document alone can declare
+/// the engine (`host.local_engine.vllm`) with no variable set.
+// T03 T21
+#[test]
+fn the_standalone_installation_follows_flag_env_document_default() {
+    use crate::roles::EngineOverrides;
+    use mllm_config::effective::InstallationDrift;
+    let Some(_guard) = isolated("the_standalone_installation_follows_flag_env_document_default")
+    else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().expect("a temporary installation");
+    let bin = fake_engine_bin(dir.path());
+    let runtime = private_runtime(dir.path());
+    for name in [
+        "MLLM_VLLM_BIN",
+        "MLLM_SGLANG_BIN",
+        "MLLM_RUNTIME_DIR",
+        "MLLM_ENGINE_FINGERPRINT",
+        "MLLM_KV_CACHE_BYTES",
+        "MLLM_ENGINE_ARGS",
+        "MLLM_DEEP_PARK",
+        "MLLM_TRUST_REMOTE_CODE",
+        "MLLM_INSTALLATION_DRIFT",
+        "MLLM_ENGINE_PORTS",
+        "MLLM_STANDALONE_ENGINE_PORTS",
+    ] {
+        std::env::remove_var(name);
+    }
+    std::env::set_var("MLLM_MODELS_ROOT", dir.path());
+    let host = serde_json::json!({
+        "local_engine": {
+            "vllm": bin, "build_fingerprint": "yaml-fp", "args": ["--yaml"],
+            "kv_cache": "1GiB", "deep_park": "off", "trust_remote_code": false,
+            "installation_drift": "refuse",
+        },
+        "runtime_dir": runtime,
+        "resource_policy": {"endpoint_port_range": {"start": 20200, "end": 20209}},
+    });
+    let provider = |flags: EngineOverrides| {
+        let provider = crate::roles::EnvEngineProvider::new().with_flags(flags);
+        provider.configure(&host).expect("the document is valid");
+        provider
+            .installation()
+            .expect("the document declares an installation")
+    };
+    // The document alone.
+    let yaml = provider(EngineOverrides::default());
+    assert_eq!(yaml.executable, bin);
+    assert_eq!(yaml.build_fingerprint, "yaml-fp");
+    assert_eq!(yaml.args, ["--yaml"]);
+    assert_eq!(yaml.engine_config["memory"]["kv_cache"], "1GiB");
+    assert!(yaml.kv_cache_declared);
+    assert!(!yaml.deep_park);
+    assert!(!yaml.trust_remote_code);
+    assert_eq!(yaml.installation_drift, InstallationDrift::Refuse);
+    assert_eq!(yaml.engine_ports, (20200, 20209));
+    // The environment wins over the document.
+    std::env::set_var("MLLM_ENGINE_FINGERPRINT", "env-fp");
+    std::env::set_var("MLLM_ENGINE_ARGS", "--env");
+    std::env::set_var("MLLM_KV_CACHE_BYTES", "2GiB");
+    std::env::set_var("MLLM_DEEP_PARK", "on");
+    std::env::set_var("MLLM_TRUST_REMOTE_CODE", "1");
+    std::env::set_var("MLLM_INSTALLATION_DRIFT", "warn");
+    std::env::set_var("MLLM_ENGINE_PORTS", "20300-20309");
+    let env = provider(EngineOverrides::default());
+    assert_eq!(env.build_fingerprint, "env-fp");
+    assert_eq!(env.args, ["--env"]);
+    assert_eq!(env.engine_config["memory"]["kv_cache"], "2GiB");
+    assert!(env.deep_park);
+    assert!(env.trust_remote_code);
+    assert_eq!(env.installation_drift, InstallationDrift::Warn);
+    assert_eq!(env.engine_ports, (20300, 20309));
+    // The flags win over both.
+    let flagged = provider(EngineOverrides {
+        build_fingerprint: Some("flag-fp".into()),
+        args: Some(vec!["--flag".into()]),
+        kv_cache: Some("3GiB".into()),
+        deep_park: Some(false),
+        trust_remote_code: Some(false),
+        installation_drift: Some(InstallationDrift::Refuse),
+        engine_ports: Some((20400, 20409)),
+        ..Default::default()
+    });
+    assert_eq!(flagged.build_fingerprint, "flag-fp");
+    assert_eq!(flagged.args, ["--flag"]);
+    assert_eq!(flagged.engine_config["memory"]["kv_cache"], "3GiB");
+    assert!(!flagged.deep_park);
+    assert!(!flagged.trust_remote_code);
+    assert_eq!(flagged.installation_drift, InstallationDrift::Refuse);
+    assert_eq!(flagged.engine_ports, (20400, 20409));
+    // A malformed document value is refused with its path.
+    let refused = crate::roles::EnvEngineProvider::new()
+        .configure(&serde_json::json!({"local_engine": {"deep_park": "maybe"}}))
+        .expect_err("a malformed switch is refused")
+        .to_string();
+    assert!(refused.contains("host.local_engine.deep_park"), "{refused}");
+    for name in [
+        "MLLM_MODELS_ROOT",
+        "MLLM_ENGINE_FINGERPRINT",
+        "MLLM_ENGINE_ARGS",
+        "MLLM_KV_CACHE_BYTES",
+        "MLLM_DEEP_PARK",
+        "MLLM_TRUST_REMOTE_CODE",
+        "MLLM_INSTALLATION_DRIFT",
+        "MLLM_ENGINE_PORTS",
+    ] {
+        std::env::remove_var(name);
+    }
+}

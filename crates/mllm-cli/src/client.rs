@@ -880,12 +880,14 @@ pub async fn execute_with_start_options(
         Command::Deploy {
             file: Some(file),
             revision: Some(expected),
+            hf_endpoint,
             ..
         } => {
             // SPEC §14: an explicit, revision-aware update of the deployment
             // the file names. The server refuses a stale revision
             // (`revision_conflict`) and replays an exact retry by request id.
-            let config = read_deployment_file(file).await?;
+            let config =
+                read_deployment_file(file, hf_endpoint.as_deref(), state_dir, config).await?;
             let name = config["name"]
                 .as_str()
                 .ok_or_else(|| error("invalid_config", "Deployment file names no deployment"))?
@@ -930,8 +932,10 @@ pub async fn execute_with_start_options(
             activate,
             wait,
             revision: None,
+            hf_endpoint,
         } => {
-            let config = read_deployment_file(file).await?;
+            let config =
+                read_deployment_file(file, hf_endpoint.as_deref(), state_dir, config).await?;
             api.begin_request(
                 &journal_root,
                 request_id,
@@ -1138,8 +1142,17 @@ pub async fn execute_with_start_options(
 /// A deployment document from `--file`, bounded and strictly parsed, with
 /// the defaults a minimal file leaves out (owner decision 2026-09-25,
 /// `crate::deployment_file`).
-async fn read_deployment_file(file: &std::path::Path) -> Result<Value, StructuredError> {
-    crate::deployment_file::prepare(&crate::deployment_file::read_text(file)?).await
+async fn read_deployment_file(
+    file: &std::path::Path,
+    hf_endpoint: Option<&str>,
+    state_dir: &Path,
+    config: Option<&Path>,
+) -> Result<Value, StructuredError> {
+    // Owner rule 2026-09-25: `--hf-endpoint` > `MLLM_HF_ENDPOINT` >
+    // `HF_ENDPOINT` > the role document's `model_sources.huggingface_endpoint`
+    // > Hugging Face.
+    let endpoint = crate::deployment_file::pin_endpoint(hf_endpoint, state_dir, config)?;
+    crate::deployment_file::prepare(&crate::deployment_file::read_text(file)?, &endpoint).await
 }
 
 /// SPEC §17 (M80): the latency view query for a resolved deployment view, by

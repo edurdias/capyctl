@@ -138,6 +138,11 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ),
             ]),
         ),
+        // Owner rule 2026-09-25: the engines' port range, as on a host.
+        (
+            "endpoint_port_range",
+            FieldSpec::Struct(&[("start", SCALAR), ("end", SCALAR)]),
+        ),
     ];
     const DEVICE: FieldSpec = FieldSpec::Struct(&[("id", SCALAR), ("sharing", SCALAR)]);
     const ALLOCATION: FieldSpec = FieldSpec::Struct(&[
@@ -201,6 +206,9 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         ("allowed_hosts", FieldSpec::Seq(&SCALAR)),
         ("huggingface_endpoint", SCALAR),
         ("path", SCALAR),
+        // Owner rule 2026-09-25: the protected file holding the host's
+        // Hugging Face token (a secret is a file or a variable, never a flag).
+        ("huggingface_token_file", SCALAR),
     ]);
     const MODEL: &[(&str, FieldSpec)] = &[
         // Spec §7: `path` predates `source` and still means a local source.
@@ -212,6 +220,19 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
     // Spec §7: the directory a host keeps model weights under. A host states it
     // once; a deployment's relative local path is resolved against it.
     const MODEL_STORE: FieldSpec = FieldSpec::RequiredStruct(&[("path", SCALAR)]);
+    // Owner rule 2026-09-25 (`crate::engine_settings`): the role's own engine
+    // installation, the YAML form of `--vllm-bin` / `MLLM_VLLM_BIN` and the
+    // rest; published as the runtime profile `local`.
+    const LOCAL_ENGINE: FieldSpec = FieldSpec::Struct(&[
+        ("vllm", SCALAR),
+        ("sglang", SCALAR),
+        ("build_fingerprint", SCALAR),
+        ("args", FieldSpec::Seq(&SCALAR)),
+        ("kv_cache", BYTES),
+        ("deep_park", SCALAR),
+        ("trust_remote_code", SCALAR),
+        ("installation_drift", SCALAR),
+    ]);
     const DOMAIN: FieldSpec = FieldSpec::Struct(&[
         ("managed_limit", BYTES),
         ("free_reserve", BYTES),
@@ -348,6 +369,10 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
         // `~/models`) and the model-source policy, as on a host.
         ("model_store", MODEL_STORE),
         ("model_sources", MODEL_SOURCES),
+        // Owner rule 2026-09-25: the engine installation and the runtime
+        // directory, as on a host.
+        ("local_engine", LOCAL_ENGINE),
+        ("runtime_dir", SCALAR),
         ("resource_policy", FieldSpec::Struct(RESOURCE_POLICY)),
         // Emitted empty by the generator; empty allowlist accepts `{}`
         // only until profile shapes are specified.
@@ -409,6 +434,7 @@ pub fn schema(kind: ConfigKind) -> &'static KindSchema {
                 ("state_dir", SCALAR),
                 ("identity_dir", SCALAR),
                 ("runtime_dir", SCALAR),
+                ("local_engine", LOCAL_ENGINE),
                 (
                     "ingress",
                     FieldSpec::Struct(&[

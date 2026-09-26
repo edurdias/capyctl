@@ -469,6 +469,7 @@ fn a_server_host_allows_model_sources_by_default() {
         models_root: Some("/srv/env-models".into()),
         sources: Some(SourceSwitch::Allowed),
         sources_max: Some("64GiB".into()),
+        ..Default::default()
     };
     let from_env = policy(&disabled, &none, &env);
     assert_eq!(from_env.model_store, Path::new("/srv/env-models"));
@@ -478,9 +479,112 @@ fn a_server_host_allows_model_sources_by_default() {
         models_root: Some("/srv/flag-models".into()),
         sources: Some(SourceSwitch::Denied),
         sources_max: None,
+        ..Default::default()
     };
     let from_flag = policy(&disabled, &flags, &env);
     assert_eq!(from_flag.model_store, Path::new("/srv/flag-models"));
     assert_eq!(from_flag.model_sources.http, SourceSwitch::Denied);
     assert_eq!(from_flag.model_sources.max_bytes, Some(64 << 30));
+}
+
+// T21 T03 (owner rule 2026-09-25: every setting three ways; standalone is a
+// server plus one host): a host's engine settings follow CLI flag >
+// environment > YAML > default, and what it publishes is the result: the
+// `local_engine` profile, the runtime directory and the engine port range.
+#[test]
+fn a_host_states_its_engine_settings_three_ways() {
+    use mllm_config::engine_settings::EngineOverrides;
+    let root = Path::new("/var/lib/mllm/host");
+    let yaml = serde_json::json!({
+        "schema_version": 1, "kind": "host", "name": "h",
+        "state_dir": root, "identity_dir": root.join("identity"),
+        "runtime_dir": "/yaml/runtime",
+        "resource_policy": {"endpoint_port_range": {"start": 9200, "end": 9299}},
+        "local_engine": {"vllm": "/yaml/vllm", "deep_park": "on", "installation_drift": "warn"},
+    });
+    let env = EngineOverrides {
+        vllm: Some("/env/vllm".into()),
+        runtime_dir: Some("/env/runtime".into()),
+        engine_ports: Some((9100, 9199)),
+        deep_park: Some(false),
+        ..Default::default()
+    };
+    let flags = EngineOverrides {
+        vllm: Some("/flag/vllm".into()),
+        engine_ports: Some((9000, 9099)),
+        ..Default::default()
+    };
+    let none = EngineOverrides::default();
+    let host = |document: &serde_json::Value, flags: &EngineOverrides, env: &EngineOverrides| {
+        HostConfig::parse(&document.to_string())
+            .unwrap()
+            .with_engines(flags, env, &|path| Ok(format!("probed {}", path.display())))
+            .unwrap()
+    };
+    let published = |config: &HostConfig| {
+        (
+            config.profiles["local"]["executable"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            config.runtime_dir.display().to_string(),
+            config.document["resource_policy"]["endpoint_port_range"]["start"]
+                .as_u64()
+                .unwrap(),
+            config.profiles["local"]["security"]["deep_park"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+    };
+    let flagged = host(&yaml, &flags, &env);
+    assert_eq!(
+        published(&flagged),
+        (
+            "/flag/vllm".into(),
+            "/env/runtime".into(),
+            9000,
+            "disabled".into()
+        )
+    );
+    assert!(flagged.document.get("local_engine").is_none());
+    assert_eq!(
+        flagged.profiles["local"]["build_fingerprint"],
+        "probed /flag/vllm"
+    );
+    assert_eq!(
+        published(&host(&yaml, &none, &env)),
+        (
+            "/env/vllm".into(),
+            "/env/runtime".into(),
+            9100,
+            "disabled".into()
+        )
+    );
+    assert_eq!(
+        published(&host(&yaml, &none, &none)),
+        (
+            "/yaml/vllm".into(),
+            "/yaml/runtime".into(),
+            9200,
+            "enabled".into()
+        )
+    );
+    // Nothing stated: no local profile, the managed runtime, no port range.
+    let bare = serde_json::json!({
+        "schema_version": 1, "kind": "host", "name": "h",
+        "state_dir": root, "identity_dir": root.join("identity"),
+    });
+    let defaults = host(&bare, &none, &none);
+    assert!(defaults.profiles.is_empty());
+    assert!(!defaults.runtime_dir_declared);
+    assert_eq!(defaults.runtime_dir, root.join("runtime"));
+    assert!(defaults.document.get("resource_policy").is_none());
+    // A host has no generated deployment to give a KV cache.
+    let mut kv = bare.clone();
+    kv["local_engine"] = serde_json::json!({"kv_cache": "8GiB"});
+    assert!(HostConfig::parse(&kv.to_string())
+        .unwrap()
+        .with_engines(&none, &none, &|_| Ok("fp".into()))
+        .is_err());
 }

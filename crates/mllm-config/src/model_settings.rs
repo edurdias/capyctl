@@ -18,7 +18,13 @@
 //! - Downloads live under the models directory, `<model_store>/sources`
 //!   (e.g. `~/models/sources`), so copies downloaded before an upgrade are
 //!   reused; `model_sources.path` names another directory (downloads then
-//!   live in `<path>/sources`).
+//!   live in `<path>/sources`). It is stated three ways too:
+//!   `--model-sources-path`, `MLLM_MODEL_SOURCES_PATH`, `model_sources.path`.
+//! - The Hugging Face endpoint downloads use (owner rule 2026-09-25, every
+//!   setting three ways): `--hf-endpoint`, `MLLM_HF_ENDPOINT` (else the
+//!   Hugging Face tools' own `HF_ENDPOINT`), or
+//!   `model_sources.huggingface_endpoint`; default `https://huggingface.co`.
+//!   A host fetches over HTTPS only.
 //!
 //! Precedence, for every setting: CLI flag > environment > YAML > default.
 //! The resolved values are written into the host document before it is
@@ -38,6 +44,14 @@ pub const MODELS_ROOT_ENV: &str = "MLLM_MODELS_ROOT";
 pub const MODEL_SOURCES_ENV: &str = "MLLM_MODEL_SOURCES";
 /// The variable naming the sources store's ceiling, e.g. `500GiB`.
 pub const MODEL_SOURCES_MAX_ENV: &str = "MLLM_MODEL_SOURCES_MAX";
+/// The variable naming the sources store (`model_sources.path`).
+pub const MODEL_SOURCES_PATH_ENV: &str = "MLLM_MODEL_SOURCES_PATH";
+/// The variable naming the Hugging Face endpoint
+/// (`model_sources.huggingface_endpoint`).
+pub const HF_ENDPOINT_ENV: &str = "MLLM_HF_ENDPOINT";
+/// The Hugging Face tools' own endpoint variable, read after
+/// [`HF_ENDPOINT_ENV`].
+pub const HF_TOOLS_ENDPOINT_ENV: &str = "HF_ENDPOINT";
 /// The models directory under the home directory when nothing names one.
 pub const DEFAULT_MODELS_DIR: &str = "models";
 fn refuse(path: &str, detail: impl Into<String>) -> ConfigError {
@@ -53,6 +67,10 @@ pub struct ModelOverrides {
     pub sources: Option<SourceSwitch>,
     /// `--model-sources-max` / `MLLM_MODEL_SOURCES_MAX`, as written.
     pub sources_max: Option<String>,
+    /// `--model-sources-path` / `MLLM_MODEL_SOURCES_PATH` (absolute).
+    pub sources_path: Option<PathBuf>,
+    /// `--hf-endpoint` / `MLLM_HF_ENDPOINT` (else `HF_ENDPOINT`), as written.
+    pub hf_endpoint: Option<String>,
 }
 
 impl ModelOverrides {
@@ -70,6 +88,15 @@ impl ModelOverrides {
             sources_max: get(MODEL_SOURCES_MAX_ENV)
                 .map(|value| max_bytes(MODEL_SOURCES_MAX_ENV, &value).map(|_| value))
                 .transpose()?,
+            sources_path: get(MODEL_SOURCES_PATH_ENV)
+                .map(|value| absolute(MODEL_SOURCES_PATH_ENV, &value))
+                .transpose()?,
+            hf_endpoint: match get(HF_ENDPOINT_ENV) {
+                Some(value) => Some(hf_endpoint(HF_ENDPOINT_ENV, &value)?),
+                None => get(HF_TOOLS_ENDPOINT_ENV)
+                    .map(|value| hf_endpoint(HF_TOOLS_ENDPOINT_ENV, &value))
+                    .transpose()?,
+            },
         })
     }
 
@@ -100,6 +127,14 @@ pub fn max_bytes(name: &str, text: &str) -> Result<i64, ConfigError> {
                 format!("must be a positive byte size such as 500GiB; got {text:?}"),
             )
         })
+}
+
+/// A Hugging Face endpoint a host downloads from: an `https://` URL
+/// (ADR 0008: a host fetches over HTTPS only).
+pub fn hf_endpoint(name: &str, text: &str) -> Result<String, ConfigError> {
+    crate::model_source::https_host(text)
+        .map(|_| text.trim_end_matches('/').to_owned())
+        .ok_or_else(|| refuse(name, format!("must be an https:// URL; got {text:?}")))
 }
 
 /// An absolute directory; a relative one is made absolute against the
@@ -191,6 +226,12 @@ pub fn resolve(
     }
     if let Some(max) = flag.sources_max.as_ref().or(env.sources_max.as_ref()) {
         sources.max_bytes = Some(max.clone());
+    }
+    if let Some(path) = flag.sources_path.as_ref().or(env.sources_path.as_ref()) {
+        sources.path = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(endpoint) = flag.hf_endpoint.as_ref().or(env.hf_endpoint.as_ref()) {
+        sources.huggingface_endpoint = Some(endpoint.clone());
     }
     // Owner ruling 2026-09-25: with no `model_sources.path`, downloads stay
     // in `<model_store>/sources` (ModelSourcePolicy::root), the layout every
@@ -377,6 +418,55 @@ mod tests {
         );
     }
 
+    // T14 T03 (owner rule 2026-09-25: every setting three ways): the sources
+    // store and the Hugging Face endpoint follow flag > environment > YAML >
+    // default; `MLLM_HF_ENDPOINT` wins over the tools' `HF_ENDPOINT`.
+    #[test]
+    fn the_sources_path_and_endpoint_follow_flag_env_document_default() {
+        let yaml = json!({"model_sources": {
+            "path": "/yaml/downloads", "huggingface_endpoint": "https://yaml.example"}});
+        let env = env_layer(&[
+            (MODEL_SOURCES_PATH_ENV, "/env/downloads"),
+            (HF_ENDPOINT_ENV, "https://env.example/"),
+            (HF_TOOLS_ENDPOINT_ENV, "https://tools.example"),
+        ])
+        .unwrap();
+        let flag = ModelOverrides {
+            sources_path: Some("/flag/downloads".into()),
+            hf_endpoint: Some("https://flag.example".into()),
+            ..Default::default()
+        };
+        let none = ModelOverrides::default();
+        let seen = |flag: &ModelOverrides, env: &ModelOverrides, document: &Value| {
+            let settings = resolve(document, flag, env, home().as_deref()).unwrap();
+            (
+                settings.policy.root(&settings.models_root).to_path_buf(),
+                settings.policy.huggingface_endpoint().to_owned(),
+            )
+        };
+        assert_eq!(
+            seen(&flag, &env, &yaml),
+            ("/flag/downloads".into(), "https://flag.example".into())
+        );
+        assert_eq!(
+            seen(&none, &env, &yaml),
+            ("/env/downloads".into(), "https://env.example".into())
+        );
+        assert_eq!(
+            seen(&none, &none, &yaml),
+            ("/yaml/downloads".into(), "https://yaml.example".into())
+        );
+        assert_eq!(
+            seen(&none, &none, &json!({})),
+            (
+                "/home/user/models".into(),
+                crate::model_source::DEFAULT_HUGGINGFACE_ENDPOINT.into()
+            )
+        );
+        let tools = env_layer(&[(HF_TOOLS_ENDPOINT_ENV, "https://tools.example")]).unwrap();
+        assert_eq!(tools.hf_endpoint.as_deref(), Some("https://tools.example"));
+    }
+
     // T03: malformed variables are refused with their names.
     #[test]
     fn malformed_variables_are_refused() {
@@ -384,6 +474,8 @@ mod tests {
             (MODEL_SOURCES_ENV, "yes"),
             (MODEL_SOURCES_MAX_ENV, "lots"),
             (MODEL_SOURCES_MAX_ENV, "0GiB"),
+            (HF_ENDPOINT_ENV, "http://mirror.example"),
+            (HF_TOOLS_ENDPOINT_ENV, "not a url"),
         ] {
             let error = env_layer(&[(key, value)]).unwrap_err();
             assert_eq!(error.path, key);

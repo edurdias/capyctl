@@ -17,6 +17,9 @@ fn main() -> ExitCode {
     // here, so every command and role names the same absolute document (and
     // the engines file beside it) whatever it does later.
     invocation.config = invocation.config.as_deref().map(mllm_cli::engine::absolute);
+    // Owner rule 2026-09-25: the state root, `--state-dir` > `MLLM_STATE_DIR`
+    // > the per-user default, resolved once for every command.
+    let state_root = state_root(invocation.state_dir.as_deref());
     // Owner decision 2026-09-25: `--format json` is machine mode, exactly as
     // `--output json` was (and still is): JSON results and JSON errors.
     let format = match invocation.format.as_deref() {
@@ -44,10 +47,7 @@ fn main() -> ExitCode {
             Ok(runtime) => runtime,
             Err(_) => return ExitCode::from(output::ExitCode::INTERNAL.0 as u8),
         };
-        return match runtime.block_on(mllm_cli::remote_roles::execute(
-            &invocation,
-            &default_state_dir(),
-        )) {
+        return match runtime.block_on(mllm_cli::remote_roles::execute(&invocation, &state_root)) {
             Ok(value) => {
                 emit(&value, view, &Default::default());
                 warn_development_controls(&value, format);
@@ -76,10 +76,12 @@ fn main() -> ExitCode {
             std::env::var(key).ok().filter(|value| !value.is_empty())
         });
         return run_standalone(
+            &state_root,
             config.as_deref(),
             invocation.listen,
             invocation.no_inference_auth,
             &invocation.model_overrides,
+            &invocation.engine_overrides,
             format,
         );
     }
@@ -92,7 +94,7 @@ fn main() -> ExitCode {
         return match runtime.block_on(mllm_cli::engine::execute(
             &invocation.command,
             invocation.config.as_deref(),
-            &default_state_dir(),
+            &state_root,
         )) {
             Ok(value) => {
                 emit(&value, view, &Default::default());
@@ -120,7 +122,7 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::drain::execute(
             host.as_deref(),
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
             invocation.request_id.as_deref(),
             *wait,
@@ -144,7 +146,7 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::revoke::execute(
             host,
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
             invocation.request_id.as_deref(),
         )) {
@@ -174,7 +176,7 @@ fn main() -> ExitCode {
             host_config,
             *apply,
             referenced_file.as_deref(),
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
         )) {
             Ok(value) => {
@@ -207,7 +209,7 @@ fn main() -> ExitCode {
         };
         return match runtime.block_on(mllm_cli::client::execute_with_start_options(
             &invocation.command,
-            &default_state_dir(),
+            &state_root,
             invocation.config.as_deref(),
             invocation.request_id.as_deref(),
             invocation.initialize_timeout_ms,
@@ -216,12 +218,9 @@ fn main() -> ExitCode {
         )) {
             Ok(value) => {
                 let names = match view {
-                    Some(view) if view.needs_host_names() => {
-                        runtime.block_on(mllm_cli::client::host_names(
-                            &default_state_dir(),
-                            invocation.config.as_deref(),
-                        ))
-                    }
+                    Some(view) if view.needs_host_names() => runtime.block_on(
+                        mllm_cli::client::host_names(&state_root, invocation.config.as_deref()),
+                    ),
                     _ => Default::default(),
                 };
                 emit(&value, view, &names);
@@ -277,13 +276,14 @@ fn warn_development_controls(value: &serde_json::Value, format: OutputFormat) {
 
 /// Foreground standalone boot with authenticated management and inference.
 fn run_standalone(
+    state_dir: &std::path::Path,
     config: Option<&std::path::Path>,
     listen: Option<std::net::SocketAddr>,
     no_inference_auth: bool,
     models: &roles::ModelOverrides,
+    engines: &roles::EngineOverrides,
     format: OutputFormat,
 ) -> ExitCode {
-    let state_dir = default_state_dir();
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -296,11 +296,12 @@ fn run_standalone(
         }
     };
     match runtime.block_on(serve_standalone(
-        &state_dir,
+        state_dir,
         config,
         listen,
         no_inference_auth,
         models,
+        engines,
     )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -328,6 +329,7 @@ async fn serve_standalone(
     listen: Option<std::net::SocketAddr>,
     no_inference_auth: bool,
     models: &roles::ModelOverrides,
+    engines: &roles::EngineOverrides,
 ) -> Result<(), roles::StartError> {
     use mllm_cli::{exposure, shutdown};
     let bound = match config {
@@ -341,11 +343,17 @@ async fn serve_standalone(
     if let Some(warning) = roles::deprecated_inference_env_warning(listen) {
         eprintln!("{warning}");
     }
+    // Owner rule 2026-09-25: a deprecated variable name is warned about once.
+    for warning in
+        mllm_config::engine_settings::deprecation_warnings(&|key| std::env::var(key).ok())
+    {
+        eprintln!("{warning}");
+    }
     let management_address = roles::standalone_management_address()?;
     let mut signals = shutdown::Signals::install()?;
     // Owner decision 2026-09-25: `--models-root`, `--model-sources` and
     // `--model-sources-max` win over the environment and the document.
-    let app = roles::start_standalone_with_models(state_dir, config, models).await?;
+    let app = roles::start_standalone_with_settings(state_dir, config, models, engines).await?;
     // Design §9: `--listen` > MLLM_INFERENCE_ADDR > the document.
     let inference_address = roles::effective_inference_address(app.inference_bind(), listen)?;
     // Design §9: `--no-inference-auth` > MLLM_INFERENCE_AUTH > the document.
@@ -418,10 +426,17 @@ async fn serve_standalone(
     Ok(())
 }
 
-/// F0 default state root: `$MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`,
-/// else `~/.local/state/mllm` (SPEC §16.5 standalone shape).
-fn default_state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MLLM_STATE_DIR") {
+/// The state root (owner rule 2026-09-25, flag > environment > default):
+/// `--state-dir`, else `$MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else
+/// `~/.local/state/mllm` (SPEC §16.5 standalone shape). It locates the
+/// implicit role documents, so a document cannot name it; a standalone
+/// document's `state_dir` values must lie under it (SPEC §15.3), and a
+/// server or host document's `state_dir` is that role's own state.
+fn state_root(flag: Option<&std::path::Path>) -> PathBuf {
+    if let Some(dir) = flag {
+        return dir.to_path_buf();
+    }
+    if let Some(dir) = std::env::var_os("MLLM_STATE_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);

@@ -10,9 +10,12 @@
 //! - a model path starting with `~/` is expanded against this user's home
 //!   directory, as a shell would;
 //! - `deploy model` pins a `hf: owner/repo[@branch-or-tag]` shorthand to the
-//!   commit it names now, asking the Hugging Face API at `HF_ENDPOINT` (the
-//!   Hugging Face variable, default `https://huggingface.co`), so the server
-//!   only ever stores a pinned source (ADR 0008). `validate config` never
+//!   commit it names now, asking the Hugging Face API at the endpoint named
+//!   by `--hf-endpoint`, else `MLLM_HF_ENDPOINT`, else the Hugging Face
+//!   tools' `HF_ENDPOINT`, else the role document's
+//!   `model_sources.huggingface_endpoint` (owner rule 2026-09-25: every
+//!   setting three ways), else `https://huggingface.co`, so the server only
+//!   ever stores a pinned source (ADR 0008). `validate config` never
 //!   contacts the network, so it refuses an unpinned reference with the way to
 //!   pin it.
 
@@ -27,7 +30,7 @@ use serde_json::Value;
 use crate::output::StructuredError;
 
 /// The Hugging Face endpoint variable (the one the Hugging Face tools read).
-pub const HF_ENDPOINT_ENV: &str = "HF_ENDPOINT";
+pub const HF_ENDPOINT_ENV: &str = mllm_config::model_settings::HF_TOOLS_ENDPOINT_ENV;
 /// Bound on a deployment file read.
 const MAX_BYTES: usize = 1024 * 1024;
 
@@ -76,39 +79,86 @@ pub fn with_home_expanded(text: &str) -> String {
 /// The deployment document `deploy model --file` sends: the file with a `~/`
 /// model path expanded and a Hugging Face reference pinned, strictly parsed
 /// and completed with the defaults.
-pub async fn prepare(text: &str) -> Result<Value, StructuredError> {
+pub async fn prepare(text: &str, endpoint: &reqwest::Url) -> Result<Value, StructuredError> {
     let mut document =
         mllm_config::parse_document(text).map_err(|error| invalid(error.to_string()))?;
     expand_home(&mut document, home().as_deref());
     if let Some((repo, reference)) = unpinned_hf(&document) {
-        let commit = pin(&repo, &reference).await?;
+        let commit = pin(endpoint, &repo, &reference).await?;
         pin_hf(&mut document, &repo, &commit);
     }
     mllm_config::parse_strict_value(ConfigKind::Deployment, document)
         .map_err(|error| invalid(error.to_string()))
 }
 
-/// The endpoint the pin is asked of: `HF_ENDPOINT`, else Hugging Face. HTTPS
-/// only, except a loopback `http://` origin (a local mirror or a test).
-fn endpoint() -> Result<reqwest::Url, StructuredError> {
-    let text = std::env::var(HF_ENDPOINT_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_HUGGINGFACE_ENDPOINT.to_owned());
+/// The endpoint the pin is asked of (owner rule 2026-09-25): `flag`
+/// (`--hf-endpoint`), else `MLLM_HF_ENDPOINT`, else `HF_ENDPOINT`, else the
+/// role document's `model_sources.huggingface_endpoint`, else Hugging Face.
+/// The role document is the host or standalone document `config` names
+/// (`--config`, `MLLM_CONFIG`), else the implicit standalone document under
+/// the state root, when there is one. HTTPS only, except a loopback `http://`
+/// origin (a local mirror or a test).
+pub fn pin_endpoint(
+    flag: Option<&str>,
+    state_dir: &Path,
+    config: Option<&Path>,
+) -> Result<reqwest::Url, StructuredError> {
+    pin_endpoint_with(flag, &|key| std::env::var(key).ok(), state_dir, config)
+}
+
+/// [`pin_endpoint`], reading the environment through `get`.
+fn pin_endpoint_with(
+    flag: Option<&str>,
+    get: &dyn Fn(&str) -> Option<String>,
+    state_dir: &Path,
+    config: Option<&Path>,
+) -> Result<reqwest::Url, StructuredError> {
+    let env = |key: &str| get(key).filter(|value| !value.is_empty());
+    let config = config
+        .map(Path::to_path_buf)
+        .or_else(|| env("MLLM_CONFIG").map(PathBuf::from));
+    let (name, text) = match (
+        flag,
+        env(mllm_config::model_settings::HF_ENDPOINT_ENV),
+        env(HF_ENDPOINT_ENV),
+    ) {
+        (Some(flag), _, _) => ("--hf-endpoint", flag.to_owned()),
+        (None, Some(value), _) => (mllm_config::model_settings::HF_ENDPOINT_ENV, value),
+        (None, None, Some(value)) => (HF_ENDPOINT_ENV, value),
+        (None, None, None) => match document_endpoint(state_dir, config.as_deref()) {
+            Some(value) => ("model_sources.huggingface_endpoint", value),
+            None => ("endpoint", DEFAULT_HUGGINGFACE_ENDPOINT.to_owned()),
+        },
+    };
     let url = reqwest::Url::parse(text.trim_end_matches('/'))
-        .map_err(|_| invalid(format!("{HF_ENDPOINT_ENV} is not a URL: {text:?}")))?;
+        .map_err(|_| invalid(format!("{name} is not a URL: {text:?}")))?;
     let loopback =
         url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
     if url.scheme() != "https" && !loopback {
-        return Err(invalid(format!(
-            "{HF_ENDPOINT_ENV} must be an https:// URL: {text:?}"
-        )));
+        return Err(invalid(format!("{name} must be an https:// URL: {text:?}")));
     }
     Ok(url)
 }
 
+/// `model_sources.huggingface_endpoint` of the host document `config` names
+/// (or its standalone `host:` block), else of the implicit standalone
+/// document; `None` when there is no such document or it names none. Best
+/// effort: an unreadable document states nothing here (the role refuses it).
+fn document_endpoint(state_dir: &Path, config: Option<&Path>) -> Option<String> {
+    let path = config
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state_dir.join("config").join("standalone.yaml"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let document = mllm_config::parse_document(&text).ok()?;
+    let sources = match document["kind"].as_str() {
+        Some("standalone") => &document["host"]["model_sources"],
+        _ => &document["model_sources"],
+    };
+    sources["huggingface_endpoint"].as_str().map(str::to_owned)
+}
+
 /// ADR 0008: the commit `reference` (a branch or tag) of `repo` names now.
-async fn pin(repo: &str, reference: &str) -> Result<String, StructuredError> {
+async fn pin(base: &reqwest::Url, repo: &str, reference: &str) -> Result<String, StructuredError> {
     // The repository shape is the one a pinned source accepts.
     ModelSource::HuggingFace {
         repo: repo.to_owned(),
@@ -127,7 +177,6 @@ async fn pin(repo: &str, reference: &str) -> Result<String, StructuredError> {
             "model.hf: `{reference}` is not a branch or tag name; write `{repo}@<40-character commit>`"
         )));
     }
-    let base = endpoint()?;
     let url = format!(
         "{}/api/models/{repo}/revision/{reference}",
         base.as_str().trim_end_matches('/')
@@ -143,14 +192,22 @@ async fn pin(repo: &str, reference: &str) -> Result<String, StructuredError> {
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|_| unpinnable("no HTTP client"))?;
-    let response = client
-        .get(&url)
+    // Owner rule 2026-09-25: a private repository is pinned with the token
+    // in `MLLM_HF_TOKEN` (else `HF_TOKEN`); a secret is never a flag.
+    let mut request = client.get(&url);
+    if let Some(token) = mllm_agent::sources::HF_TOKEN_VARIABLES
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    {
+        request = request.bearer_auth(token.trim());
+    }
+    let response = request
         .send()
         .await
         .map_err(|_| unpinnable("Hugging Face cannot be reached"))?;
     if !response.status().is_success() {
         return Err(unpinnable(&format!(
-            "Hugging Face answered {}; a private repository must be pinned by hand",
+            "Hugging Face answered {}; a private repository needs MLLM_HF_TOKEN or HF_TOKEN, or a pinned commit",
             response.status().as_u16()
         )));
     }
@@ -163,4 +220,75 @@ async fn pin(repo: &str, reference: &str) -> Result<String, StructuredError> {
         .filter(|sha| is_commit_sha(sha))
         .map(str::to_owned)
         .ok_or_else(|| unpinnable("the answer names no commit"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T03 (owner rule 2026-09-25: every setting three ways): the endpoint a
+    // `hf:` reference is pinned against follows `--hf-endpoint` >
+    // `MLLM_HF_ENDPOINT` > `HF_ENDPOINT` > the role document's
+    // `model_sources.huggingface_endpoint` (a named host document, or the
+    // standalone document's `host:` block) > Hugging Face.
+    #[test]
+    fn the_pin_endpoint_follows_flag_env_document_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host = dir.path().join("host.yaml");
+        std::fs::write(
+            &host,
+            "kind: host\nmodel_sources:\n  huggingface_endpoint: https://host-doc.example\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/standalone.yaml"),
+            "kind: standalone\nhost:\n  model_sources:\n    huggingface_endpoint: https://implicit.example\n",
+        )
+        .unwrap();
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let all: &[(&str, &str)] = &[
+            ("MLLM_HF_ENDPOINT", "https://mllm-env.example"),
+            ("HF_ENDPOINT", "https://tools-env.example"),
+        ];
+        let tools: &[(&str, &str)] = &[("HF_ENDPOINT", "https://tools-env.example")];
+        let named: &[(&str, &str)] = &[("MLLM_CONFIG", "/nowhere/host.yaml")];
+        let seen = |flag: Option<&str>, get: &dyn Fn(&str) -> Option<String>, config| {
+            pin_endpoint_with(flag, get, dir.path(), config)
+                .unwrap()
+                .as_str()
+                .trim_end_matches('/')
+                .to_owned()
+        };
+        assert_eq!(
+            seen(Some("https://flag.example"), &env(all), Some(&host)),
+            "https://flag.example"
+        );
+        assert_eq!(
+            seen(None, &env(all), Some(&host)),
+            "https://mllm-env.example"
+        );
+        assert_eq!(
+            seen(None, &env(tools), Some(&host)),
+            "https://tools-env.example"
+        );
+        assert_eq!(
+            seen(None, &env(&[]), Some(&host)),
+            "https://host-doc.example"
+        );
+        assert_eq!(seen(None, &env(&[]), None), "https://implicit.example");
+        // A named document that cannot be read states nothing.
+        assert_eq!(seen(None, &env(named), None), "https://huggingface.co");
+        // Not https and not loopback: refused, naming the source.
+        let error = pin_endpoint_with(Some("http://mirror.example"), &env(&[]), dir.path(), None)
+            .unwrap_err();
+        assert!(error.message.contains("--hf-endpoint"), "{}", error.message);
+    }
 }

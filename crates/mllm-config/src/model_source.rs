@@ -456,6 +456,10 @@ pub struct RawModelSources {
     /// The directory downloads are kept under (`<path>/sources/...`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// A protected file holding the Hugging Face token this host uses for a
+    /// source that names no `token_ref` (owner rule 2026-09-25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub huggingface_token_file: Option<String>,
 }
 
 /// ADR 0008, SPEC §7: the host's policy for remote model sources. The sources
@@ -480,6 +484,13 @@ pub struct ModelSourcePolicy {
     /// default (owner ruling 2026-09-25), so existing copies are reused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<std::path::PathBuf>,
+    /// Owner rule 2026-09-25 (a secret is never a CLI flag): the protected
+    /// file whose contents are the Hugging Face token for a source that
+    /// names no `token_ref`. `MLLM_HF_TOKEN` (or `HF_TOKEN`) in the host's
+    /// environment wins over it. The document names the file, never the
+    /// token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub huggingface_token_file: Option<std::path::PathBuf>,
 }
 
 impl Default for ModelSourcePolicy {
@@ -491,6 +502,7 @@ impl Default for ModelSourcePolicy {
             allowed_hosts: Vec::new(),
             huggingface_endpoint: None,
             path: None,
+            huggingface_token_file: None,
         }
     }
 }
@@ -522,6 +534,16 @@ impl ModelSourcePolicy {
         if path.as_ref().is_some_and(|path| !path.is_absolute()) {
             return Err(invalid("model_sources.path", "must be absolute"));
         }
+        let huggingface_token_file = raw.huggingface_token_file.map(std::path::PathBuf::from);
+        if huggingface_token_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(invalid(
+                "model_sources.huggingface_token_file",
+                "must be absolute",
+            ));
+        }
         let policy = Self {
             huggingface: raw.huggingface.unwrap_or_default(),
             http: raw.http.unwrap_or_default(),
@@ -534,6 +556,7 @@ impl ModelSourcePolicy {
                 .collect(),
             huggingface_endpoint: raw.huggingface_endpoint,
             path,
+            huggingface_token_file,
         };
         if policy.max_bytes.is_some_and(|bytes| bytes <= 0) {
             return Err(invalid("model_sources.max_bytes", "must be positive"));
@@ -572,6 +595,10 @@ impl ModelSourcePolicy {
             huggingface_endpoint: self.huggingface_endpoint.clone(),
             path: self
                 .path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            huggingface_token_file: self
+                .huggingface_token_file
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
         }
