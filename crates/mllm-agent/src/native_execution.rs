@@ -1972,6 +1972,16 @@ mod tests {
         root: &std::path::Path,
         identity_dir: &std::path::Path,
     ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        checkpoint_fixture_with(root, identity_dir, |_| {})
+    }
+
+    /// [`checkpoint_fixture`] with an edit of the host document before it is
+    /// parsed.
+    fn checkpoint_fixture_with(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
         std::fs::create_dir_all(root.join("models/toy")).unwrap();
         std::fs::write(root.join("models/toy/config.json"), "{}").unwrap();
         std::fs::write(root.join("models/toy/model.safetensors"), "weights").unwrap();
@@ -2008,6 +2018,7 @@ mod tests {
         ] {
             document[field] = fixture["host"][field].clone();
         }
+        edit(&mut document);
         let config = HostConfig::parse(&document.to_string()).unwrap();
         let policy = mllm_config::remote_resources::policy_fingerprint(&config.document);
         let executor = NativeHostExecution::new(
@@ -2472,6 +2483,17 @@ mod tests {
         identity_dir: &std::path::Path,
         residency: &str,
     ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
+        sglang_fixture_with(root, identity_dir, residency, |_| {})
+    }
+
+    /// [`sglang_fixture`] with an edit of the host document before it is
+    /// parsed (a `host_backed` launch needs distinct host and device memory).
+    fn sglang_fixture_with(
+        root: &std::path::Path,
+        identity_dir: &std::path::Path,
+        residency: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (Arc<NativeHostExecution>, serde_json::Value, String) {
         std::fs::create_dir_all(root.join("models/toy")).unwrap();
         std::fs::write(root.join("models/toy/config.json"), "{}").unwrap();
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
@@ -2492,6 +2514,7 @@ mod tests {
         profile["engine"] = "sglang".into();
         profile["args"] = serde_json::json!([]);
         profile["security"]["admin_credential_ref"] = "secret://admin-key".into();
+        edit(&mut document);
         let config = HostConfig::parse(&document.to_string()).unwrap();
         let policy = mllm_config::remote_resources::policy_fingerprint(&config.document);
         let executor = NativeHostExecution::new(
@@ -2745,6 +2768,103 @@ mod tests {
             .record_capabilities(&plan.profile_name, "", without_saver_hooks());
         assert_eq!(
             restart.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("checkpoint_mismatch"))
+        );
+    }
+
+    /// ADR 0010 decision 5: `host_backed` resolves only where host and device
+    /// memory are distinct.
+    fn distinct_memory(document: &mut serde_json::Value) {
+        document["resource_policy"]["domains"]["unified"]["memory"] = "distinct".into();
+    }
+
+    /// ADR 0008 (controller ruling, discrete GPU design §5): the launch-time
+    /// capability gate covers both parking tiers. A `host_backed` launch parks
+    /// with SGLang's memory saver and weights CPU backup, or vLLM's sleep mode,
+    /// which the probe's `deep_park` capability covers; a build the probe found
+    /// without it refuses the launch before any effect with the typed reason
+    /// `capability_missing:deep_park` (its hint names `restart_only`). With
+    /// the capability available the launch passes the gate and stops at the
+    /// fixture's unrecorded checkpoint, the next gate.
+    // T21 T22
+    #[test]
+    fn a_build_without_the_park_capability_refuses_a_host_backed_launch() {
+        let report =
+            |names: &[&str], missing: &str, label: &str| crate::installation::CapabilityReport {
+                missing: names
+                    .iter()
+                    .map(|name| {
+                        let labels = if *name == missing {
+                            vec![label.to_owned()]
+                        } else {
+                            vec![]
+                        };
+                        ((*name).to_owned(), labels)
+                    })
+                    .collect(),
+            };
+        let sglang = ["core", "deep_park", "metrics", "observation"];
+        let vllm = ["core", "deep_park", "metrics"];
+
+        // SGLang: without the memory saver hooks, then with them.
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, deployment, policy) = sglang_fixture_with(
+            root.path(),
+            identity_dir.path(),
+            "host_backed",
+            distinct_memory,
+        );
+        sglang_runtime(root.path());
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+            panic!("a launch");
+        };
+        assert_eq!(
+            executor.resolve(&launch).unwrap().residency,
+            mllm_config::effective::Residency::HostBacked
+        );
+        let installations = executor.profiles.accepted().installations.clone();
+        installations.record_capabilities(&plan.profile_name, "", without_saver_hooks());
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("capability_missing:deep_park"))
+        );
+        installations.record_capabilities(&plan.profile_name, "", report(&sglang, "", ""));
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("checkpoint_mismatch"))
+        );
+
+        // vLLM: without sleep mode, then with it.
+        let root = directory();
+        let identity_dir = directory();
+        let (executor, mut deployment, policy) =
+            checkpoint_fixture_with(root.path(), identity_dir.path(), distinct_memory);
+        deployment["residency"] = "host_backed".into();
+        let (mut launch, _) = launch_with(&deployment, &policy, "");
+        launch.identity.payload_digest = launch.canonical_digest();
+        let MemberAction::LaunchSingle(plan) = launch.action.clone() else {
+            panic!("a launch");
+        };
+        assert_eq!(
+            executor.resolve(&launch).unwrap().residency,
+            mllm_config::effective::Residency::HostBacked
+        );
+        let installations = executor.profiles.accepted().installations.clone();
+        installations.record_capabilities(
+            &plan.profile_name,
+            "",
+            report(&vllm, "deep_park", "destination:enable_sleep_mode"),
+        );
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
+            Err(LaunchVerdict::Refused("capability_missing:deep_park"))
+        );
+        installations.record_capabilities(&plan.profile_name, "", report(&vllm, "", ""));
+        assert_eq!(
+            executor.admit_launch(&launch, &plan, GpuReading::Now),
             Err(LaunchVerdict::Refused("checkpoint_mismatch"))
         );
     }

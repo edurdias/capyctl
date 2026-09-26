@@ -11,7 +11,7 @@
 //! The reason is one closed category (`mllm_protocol::execution::POLICY_REFUSALS`).
 use super::{GpuReading, NativeHostExecution};
 use crate::{checkpoint::CheckpointError, journal::JournalError, session::SessionError};
-use mllm_config::effective::{DomainMemory, Residency};
+use mllm_config::effective::DomainMemory;
 use mllm_protocol::{
     execution::{MemberAction, MemberCommand, SingleLaunchPlan},
     pb,
@@ -151,10 +151,13 @@ pub(crate) fn charges_device(effective: &mllm_config::effective::EffectiveDeploy
 impl NativeHostExecution {
     /// ADR 0008 (owner decision 2026-09-23): refuse a launch whose declared
     /// residency depends on a capability the installation's launch-time probe
-    /// found missing. Only `deep` depends on one today (`deep_park`), so a
-    /// `restart_only` deployment is never probed and serves on a build without
-    /// the saver hooks. An unknown report (no probe helper, a probe that did
-    /// not answer) refuses nothing; the protected entry probes again.
+    /// found missing. Both parking tiers depend on `deep_park` (controller
+    /// ruling, discrete GPU design §5): `deep`, and `host_backed`, which parks
+    /// with SGLang's memory saver and weights CPU backup or vLLM's sleep mode,
+    /// the shapes that probe covers. A `restart_only` deployment is never
+    /// probed and serves on a build without them. An unknown report (no probe
+    /// helper, a probe that did not answer) refuses nothing; the protected
+    /// entry probes again.
     pub(super) fn launch_capability(
         &self,
         effective: &mllm_config::effective::EffectiveDeployment,
@@ -162,9 +165,12 @@ impl NativeHostExecution {
         installation: &str,
         installations: &crate::installation::InstallationRegistry,
     ) -> Result<(), &'static str> {
-        if effective.residency != Residency::Deep {
+        if !effective.residency.parks() {
             return Ok(());
         }
+        // Kept for both tiers, as `park_capability` refuses the Park of
+        // either: a `host_backed` wake of a modelopt checkpoint from the CPU
+        // backup is unproven, so it fails closed at launch too.
         if deep_wake_cannot_reload(effective) {
             return Err("capability_missing:deep_park");
         }
@@ -187,7 +193,8 @@ impl NativeHostExecution {
     }
 
     /// ADR 0008: the closed reason a Park of this launch is refused for when
-    /// its installation lacks what deep parking drives, or `None`.
+    /// its installation lacks what parking (`deep` or `host_backed`) drives,
+    /// or `None`.
     pub(super) fn park_capability(
         &self,
         effective: &mllm_config::effective::EffectiveDeployment,

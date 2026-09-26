@@ -192,6 +192,19 @@ class CapabilityProbeTests(unittest.TestCase):
                          ("core", "deep_park"))
         self.assertEqual(capabilities.sglang_required({"memory_saver": False}), ("core",))
 
+    # T21 T22 / ADR 0019: `host_backed` parks with the memory saver too, so it
+    # needs deep_park, whose probe reads the weights CPU backup field; a build
+    # whose ServerArgs lacks that field lacks deep_park.
+    def test_host_backed_needs_deep_park_including_the_weights_backup_field(self):
+        self.assertEqual(capabilities.sglang_required(
+            {"memory_saver": True, "cpu_weight_backup": True}), ("core", "deep_park"))
+        import types
+        arguments = types.SimpleNamespace(ServerArgs=type("ServerArgs", (), {
+            "__struct_fields__": ("enable_memory_saver",)}))
+        missing = capabilities.sglang_deep_park(arguments, None, lambda name: None)
+        self.assertIn("ServerArgs.enable_weights_cpu_backup", missing)
+        self.assertNotIn("ServerArgs.enable_memory_saver", missing)
+
     def test_record_fields_read_struct_and_dataclass_shapes(self):
         import dataclasses
 

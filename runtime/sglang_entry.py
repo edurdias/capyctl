@@ -649,8 +649,8 @@ def _hint(code):
     """One fixed operator hint per capability category; never native detail."""
     if code == "capability_missing:deep_park":
         return (" (this SGLang installation lacks the memory saver hooks or routes"
-                " deep parking needs; declare residency restart_only, or use a build"
-                " that provides them)")
+                " parking (deep or host_backed) needs; declare residency restart_only,"
+                " or use a build that provides them)")
     if code == "capability_missing:core":
         return " (this SGLang installation lacks an interface every launch needs)"
     return ""

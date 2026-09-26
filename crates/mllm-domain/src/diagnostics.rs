@@ -15,7 +15,7 @@ pub const MAX_REASON_BYTES: usize = 512;
 const HINTS: &[(&str, &str)] = &[
     (
         "capability_missing:deep_park",
-        "this engine installation lacks what deep parking needs; declare residency restart_only, or use a build that provides it",
+        "this engine installation lacks what parking (deep or host_backed) needs; declare residency restart_only, or use a build that provides it",
     ),
     (
         "capability_missing:core",
