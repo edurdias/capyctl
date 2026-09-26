@@ -59,9 +59,11 @@ upgrades and rollback.
 
 ## Quickstart: one machine
 
-Standalone runs the server and one host in a single process, with every
-listener on loopback. It uses one engine installation, vLLM or SGLang, taken
-from the environment:
+Standalone runs the server and one host in a single process. It uses one
+engine installation, vLLM or SGLang, named by a variable (as here), by
+`--vllm-bin` / `--sglang-bin`, or by `host.local_engine` in its document; every
+setting works those three ways (see
+[`docs/operations/configuration.md`](docs/operations/configuration.md)):
 
 ```bash
 export MLLM_VLLM_BIN=/path/to/venv/bin/vllm   # or MLLM_SGLANG_BIN
@@ -196,6 +198,9 @@ Upgrade the server first, then the hosts one at a time.
 
 - [`docs/operations/install.md`](docs/operations/install.md): install,
   services, upgrades, rollback and exit codes.
+- [`docs/operations/configuration.md`](docs/operations/configuration.md):
+  every setting, with its YAML field, flag and environment variable, and the
+  one precedence rule (flag, then variable, then YAML, then default).
 - [`docs/examples/`](docs/examples/): example server, host, standalone and
   deployment documents. A test checks that `mllm validate config` accepts
   them; they show the schema and are not tested engine recipes.

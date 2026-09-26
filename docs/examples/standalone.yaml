@@ -1,8 +1,9 @@
 # mllm standalone role document: an embedded server and host on one machine,
 # with local-only authenticated listeners. `mllm start standalone` generates
-# this shape under its state directory when none exists; the engine
-# installation comes from the environment (MLLM_VLLM_BIN or MLLM_SGLANG_BIN,
-# ...), not from this file. The listeners serve plain HTTP on loopback, so
+# this shape under its state directory when none exists. The engine
+# installation is named here (`host.local_engine`), by a flag (--vllm-bin) or
+# by a variable (MLLM_VLLM_BIN); a flag wins over a variable, which wins over
+# this file (docs/operations/configuration.md lists every setting). The listeners serve plain HTTP on loopback, so
 # there is no `tls` block (SPEC §16.5). Models live in ~/models unless
 # `host.model_store.path` (or --models-root, MLLM_MODELS_ROOT) names another
 # directory; Hugging Face and HTTP downloads are allowed with a 500 GiB cap
@@ -40,5 +41,10 @@ host:
   #   huggingface: allowed      # or disabled
   #   http: allowed             # or disabled
   #   max_bytes: 500GiB
+  # local_engine:
+  #   vllm: /opt/vllm/bin/vllm  # or sglang: /opt/sglang/bin/python3
+  #   deep_park: "on"           # or "off"
+  #   installation_drift: warn  # or refuse
+  # runtime_dir: /home/operator/mllm/runtime   # development only
 shutdown:
   drain_timeout: "30s"

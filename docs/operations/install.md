@@ -12,6 +12,9 @@ host. Running a unit is
 not evidence that an engine recipe works; engine qualification stays with the
 live runbooks.
 
+Every setting mllm reads, with its YAML field, flag and environment variable,
+is listed in the [settings reference](configuration.md).
+
 ## Restart is not drain
 
 Read this before anything else.
@@ -371,8 +374,11 @@ from a directory you maintain yourself.
 Without `--config`, `mllm start standalone` loads its role document from
 `<MLLM_STATE_DIR>/config/standalone.yaml`, generating it (and the protected
 credentials) on first start, and writes the managed runtime to
-`<MLLM_STATE_DIR>/runtime`. Its engine installation always comes from the
-environment. Put that environment in `/etc/mllm/standalone.env`:
+`<MLLM_STATE_DIR>/runtime`. Its engine installation comes from a flag, the
+environment or the document's `host.local_engine` (see the
+[settings reference](configuration.md#engine-installation)); with the
+packaged unit the environment is simplest. Put it in
+`/etc/mllm/standalone.env`:
 
 ```bash
 # /etc/mllm/standalone.env (root:mllm 0640)
@@ -407,9 +413,9 @@ Where each setting comes from, highest precedence first:
 |---|---|
 | Role document | `--config <file>`, else `$MLLM_CONFIG`, else `<state root>/config/standalone.yaml`, else generated there. |
 | Registered engines (`engines.yaml`) | Beside the document named by `--config` or `$MLLM_CONFIG`, else `$XDG_CONFIG_HOME/mllm/engines.yaml` (`~/.config/mllm/engines.yaml`). `mllm engine` uses the same rule, so it and the running role read the same file. A host follows the same rule. |
-| State root | `MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
-| Listener addresses | `MLLM_STANDALONE_INFERENCE_ADDR` / `MLLM_STANDALONE_MANAGEMENT_ADDR` for one run (loopback only), else `127.0.0.1:8443` / `127.0.0.1:7443`. The document may state only those defaults. |
-| Engine installation | The environment (`MLLM_VLLM_BIN` or `MLLM_SGLANG_BIN`, ...), or engines registered with `mllm engine add`. |
+| State root | `--state-dir`, else `MLLM_STATE_DIR`, else `$XDG_STATE_HOME/mllm`, else `~/.local/state/mllm`. The document may state `server.state_dir` and `host.state_dir` only as `<state root>/server` and `<state root>/host` (relative paths resolve against the document's directory); any other value is refused. |
+| Listener addresses | Inference: `--listen`, else `MLLM_INFERENCE_ADDR`, else `server.listeners.inference.bind`, else `0.0.0.0:8443`. Management: `MLLM_STANDALONE_MANAGEMENT_ADDR` (loopback only), else `127.0.0.1:7443`, the only value the document may state. |
+| Engine installation | `--vllm-bin` / `--sglang-bin` and the other engine flags, else `MLLM_VLLM_BIN` / `MLLM_SGLANG_BIN` and the other variables, else `host.local_engine`, `host.runtime_dir` and `host.resource_policy.endpoint_port_range`; plus engines registered with `mllm engine add`. See the [settings reference](configuration.md#engine-installation). |
 | Models directory | `--models-root`, else `MLLM_MODELS_ROOT`, else `host.model_store.path`, else `~/models` (created). See "Models and downloads". |
 | Model downloads | `--model-sources` / `--model-sources-max`, else `MLLM_MODEL_SOURCES` / `MLLM_MODEL_SOURCES_MAX`, else `host.model_sources`, else allowed with a 500 GiB cap. |
 | Drain bound, switching, observability | The role document in use. |
@@ -441,7 +447,9 @@ document, or the `host:` block of the standalone document), then the default.
 | Models directory (relative model paths resolve here) | `--models-root <dir>` | `MLLM_MODELS_ROOT` | `model_store.path` | `~/models` |
 | Hugging Face and HTTP downloads | `--model-sources allowed\|disabled` | `MLLM_MODEL_SOURCES` | `model_sources.huggingface`, `model_sources.http` | `allowed` |
 | Cap on all downloaded models | `--model-sources-max <size>` | `MLLM_MODEL_SOURCES_MAX` | `model_sources.max_bytes` | `500GiB` |
-| Where downloads are kept | | | `model_sources.path` | the models directory (`~/models/sources`) |
+| Where downloads are kept | `--model-sources-path <dir>` | `MLLM_MODEL_SOURCES_PATH` | `model_sources.path` | the models directory (`~/models/sources`) |
+| Hugging Face endpoint | `--hf-endpoint <url>` | `MLLM_HF_ENDPOINT`, else `HF_ENDPOINT` | `model_sources.huggingface_endpoint` | `https://huggingface.co` |
+| Hugging Face token for a source that names none (never a flag) | | `MLLM_HF_TOKEN`, else `HF_TOKEN` | `model_sources.huggingface_token_file` | none |
 
 A deployment that names a pinned Hugging Face revision or an HTTP URL with its
 SHA-256 is downloaded by the host it is placed on, into

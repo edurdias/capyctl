@@ -13,6 +13,12 @@ identity_dir: /var/lib/mllm/host/identity
 # to <state_dir>/runtime at every start. Name runtime_dir only to run from a
 # directory you maintain yourself (development); mllm never writes to it.
 # runtime_dir: /home/operator/mllm/runtime
+# The host's own installation may also be named here instead of (or besides)
+# runtime_profiles; it is published as the profile `local` (both engines:
+# `local-vllm` and `local-sglang`). --vllm-bin or MLLM_VLLM_BIN name it too
+# (docs/operations/configuration.md).
+# local_engine:
+#   vllm: /opt/vllm/bin/vllm
 hardware_fingerprint: example-hw-1
 environment_fingerprint: example-env-1
 # Relative model paths in deployments resolve under this directory.

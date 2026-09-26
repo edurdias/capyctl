@@ -39,9 +39,10 @@ Group=mllm
 #   ExecStart=/usr/local/bin/mllm start standalone --config <file>
 # A missing or invalid explicit file then fails the start (exit 2, not
 # restarted); it is never replaced by defaults (SPEC §15.2, R13).
-# The engine installation always comes from the environment (MLLM_VLLM_BIN or
-# MLLM_SGLANG_BIN, ...), which belongs in the environment file, as do the
-# optional MLLM_MODELS_ROOT (default ~/models) and MLLM_MODEL_SOURCES. The leading '-' makes the file optional.
+# The engine installation (MLLM_VLLM_BIN or MLLM_SGLANG_BIN, ...) belongs in
+# the environment file, as do the optional MLLM_MODELS_ROOT (default ~/models)
+# and MLLM_MODEL_SOURCES; the role document's host.local_engine names it too
+# (docs/operations/configuration.md). The leading '-' makes the file optional.
 Environment=MLLM_STATE_DIR=/var/lib/mllm/standalone
 # mllm's runtime helpers are compiled into the binary and written to
 # /var/lib/mllm/standalone/runtime (owner-only) at every start; MLLM_RUNTIME_DIR, for
